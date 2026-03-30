@@ -1,0 +1,40 @@
+name: Deploy Web To Railway
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate Railway token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
+            echo "Missing GitHub secret: RAILWAY_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Deploy apps/web to Railway
+        run: >
+          npx @railway/cli@4.35.1 deployment up apps/web
+          --path-as-root
+          --project 6ce777ae-1ef1-423c-b53c-b50dcedc58a4
+          --environment production
+          --service web
+          --ci
+          --message "GitHub Actions deploy ${GITHUB_SHA}"

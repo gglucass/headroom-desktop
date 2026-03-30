@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>Headroom</title>
+    <style>
+      :root {
+        font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      #boot-loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top left, rgba(214, 205, 165, 0.56), transparent 22%),
+          linear-gradient(180deg, #e7e3dd 0%, #dedad2 100%);
+        color: #241f1d;
+        z-index: 999;
+        transition: opacity 200ms ease;
+      }
+
+      #boot-loading.boot-loading--done {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .boot-loading__panel {
+        width: min(560px, calc(100vw - 40px));
+        border: 1px solid rgba(36, 31, 29, 0.1);
+        border-radius: 22px;
+        background: rgba(255, 251, 245, 0.92);
+        box-shadow: 0 20px 60px rgba(36, 31, 29, 0.12);
+        padding: 24px 22px;
+      }
+
+      .boot-loading__title {
+        margin: 0 0 10px;
+        font-size: 1.4rem;
+      }
+
+      .boot-loading__copy {
+        margin: 0;
+        font-size: 0.9rem;
+        color: #615953;
+      }
+
+      .boot-loading__track {
+        margin-top: 14px;
+        width: 100%;
+        height: 10px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(36, 31, 29, 0.12);
+      }
+
+      .boot-loading__fill {
+        display: block;
+        width: 16%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #89bc32, #3ca67d);
+        transition: width 240ms ease;
+      }
+
+      .boot-loading__status {
+        margin: 10px 0 0;
+        font-size: 0.86rem;
+        color: #4f4742;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot-loading" aria-live="polite">
+      <div class="boot-loading__panel">
+        <h1 class="boot-loading__title">Launching Headroom</h1>
+        <p class="boot-loading__copy">
+          Starting local services and loading your dashboard.
+        </p>
+        <div class="boot-loading__track">
+          <span class="boot-loading__fill"></span>
+        </div>
+        <p class="boot-loading__status" id="boot-loading-status">
+          Opening launch window...
+        </p>
+      </div>
+    </div>
+    <div id="root"></div>
+    <script>
+      (function () {
+        var statusEl = document.getElementById("boot-loading-status");
+        var fillEl = document.querySelector(".boot-loading__fill");
+        var steps = [
+          { percent: 20, text: "Opening launch window..." },
+          { percent: 42, text: "Loading local dashboard data..." },
+          { percent: 65, text: "Checking install status..." },
+          { percent: 84, text: "Verifying runtime health..." },
+          { percent: 94, text: "Rendering interface..." }
+        ];
+        var index = 0;
+        var boost = 0;
+        var timer = window.setInterval(function () {
+          var step = steps[index % steps.length];
+          var percent = Math.min(96, step.percent + boost);
+          if (fillEl) {
+            fillEl.style.width = percent + "%";
+          }
+          if (statusEl) {
+            statusEl.textContent = step.text;
+          }
+          index += 1;
+          if (index % steps.length === 0) {
+            boost += 1;
+          }
+        }, 520);
+        window.addEventListener("headroom:boot-progress", function (event) {
+          window.clearInterval(timer);
+          var detail = event && event.detail ? event.detail : {};
+          if (fillEl && typeof detail.percent === "number") {
+            fillEl.style.width = Math.max(0, Math.min(100, detail.percent)) + "%";
+          }
+          if (statusEl && typeof detail.status === "string" && detail.status.length > 0) {
+            statusEl.textContent = detail.status;
+          }
+        });
+        window.addEventListener("headroom:boot-complete", function () {
+          window.clearInterval(timer);
+        });
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
