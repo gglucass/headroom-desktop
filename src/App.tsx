@@ -709,7 +709,10 @@ export default function App() {
       }
 
       updateStartup("runtime", 80, "Verifying runtime health…");
-      const runtimeResult = await invoke<RuntimeStatus>("get_runtime_status").catch(() => null);
+      const [runtimeResult] = await Promise.all([
+        invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+        refreshConnectors(),
+      ]);
       if (!active) {
         return;
       }
