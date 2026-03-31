@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -1223,8 +1222,21 @@ fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
 }
 
 fn is_headroom_proxy_reachable() -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 6767));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(450)).is_ok()
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    ["127.0.0.1", "localhost"].iter().any(|host| {
+        client
+            .get(format!("http://{host}:6767/health"))
+            .send()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    })
 }
 
 fn resolve_default_shell_targets() -> Vec<PathBuf> {

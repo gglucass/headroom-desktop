@@ -292,3 +292,123 @@ pub struct ResearchCandidate {
     pub decision: CandidateDecision,
     pub notes: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeUsageWindow {
+    /// 0–100 percentage consumed
+    pub utilization: f64,
+    pub resets_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeExtraUsage {
+    pub is_enabled: bool,
+    pub monthly_limit: Option<f64>,
+    pub used_credits: Option<f64>,
+    /// 0–100 percentage consumed
+    pub utilization: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeUsage {
+    pub five_hour: Option<ClaudeUsageWindow>,
+    pub seven_day: Option<ClaudeUsageWindow>,
+    pub extra_usage: Option<ClaudeExtraUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAuthMethod {
+    ClaudeAiOauth,
+    ApiKey,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudePlanTier {
+    Free,
+    Pro,
+    Max5x,
+    Max20x,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadroomSubscriptionTier {
+    Pro,
+    Max5x,
+    Max20x,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingGateReason {
+    SignInRequired,
+    WeeklyUsageLimitReached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAccountProfile {
+    pub auth_method: ClaudeAuthMethod,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub account_uuid: Option<String>,
+    pub organization_uuid: Option<String>,
+    pub billing_type: Option<String>,
+    pub account_created_at: Option<DateTime<Utc>>,
+    pub subscription_created_at: Option<DateTime<Utc>>,
+    pub has_extra_usage_enabled: bool,
+    pub plan_tier: ClaudePlanTier,
+    pub plan_detection_source: Option<String>,
+    pub weekly_utilization_pct: Option<f64>,
+    pub five_hour_utilization_pct: Option<f64>,
+    pub extra_usage_monthly_limit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomAccountProfile {
+    pub email: String,
+    pub trial_started_at: Option<DateTime<Utc>>,
+    pub trial_ends_at: Option<DateTime<Utc>>,
+    pub trial_active: bool,
+    pub subscription_active: bool,
+    pub subscription_tier: Option<HeadroomSubscriptionTier>,
+    pub invite_code: Option<String>,
+    pub accepted_invites_count: usize,
+    pub invite_bonus_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomPricingStatus {
+    pub authenticated: bool,
+    pub local_grace_started_at: DateTime<Utc>,
+    pub local_grace_ends_at: DateTime<Utc>,
+    pub local_grace_active: bool,
+    pub needs_authentication: bool,
+    pub optimization_allowed: bool,
+    pub should_nudge: bool,
+    pub gate_reason: Option<PricingGateReason>,
+    pub gate_message: String,
+    pub nudge_threshold_percent: Option<f64>,
+    pub disable_threshold_percent: Option<f64>,
+    pub effective_disable_threshold_percent: Option<f64>,
+    pub recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
+    pub recommended_subscription_price_usd: Option<f64>,
+    pub claude: ClaudeAccountProfile,
+    pub account: Option<HeadroomAccountProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomAuthCodeRequest {
+    pub email: String,
+    pub expires_in_seconds: u64,
+}

@@ -212,3 +212,64 @@ export interface HeadroomLearnApiKeyStatus {
   provider?: string | null;
   source?: string | null;
 }
+
+export type ClaudeAuthMethod = "claude_ai_oauth" | "api_key" | "unknown";
+
+export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "unknown";
+
+export type HeadroomSubscriptionTier = "pro" | "max5x" | "max20x";
+
+export type PricingGateReason = "sign_in_required" | "weekly_usage_limit_reached";
+
+export interface ClaudeAccountProfile {
+  authMethod: ClaudeAuthMethod;
+  email?: string | null;
+  displayName?: string | null;
+  accountUuid?: string | null;
+  organizationUuid?: string | null;
+  billingType?: string | null;
+  accountCreatedAt?: string | null;
+  subscriptionCreatedAt?: string | null;
+  hasExtraUsageEnabled: boolean;
+  planTier: ClaudePlanTier;
+  planDetectionSource?: string | null;
+  weeklyUtilizationPct?: number | null;
+  fiveHourUtilizationPct?: number | null;
+  extraUsageMonthlyLimit?: number | null;
+}
+
+export interface HeadroomAccountProfile {
+  email: string;
+  trialStartedAt?: string | null;
+  trialEndsAt?: string | null;
+  trialActive: boolean;
+  subscriptionActive: boolean;
+  subscriptionTier?: HeadroomSubscriptionTier | null;
+  inviteCode?: string | null;
+  acceptedInvitesCount: number;
+  inviteBonusPercent: number;
+}
+
+export interface HeadroomPricingStatus {
+  authenticated: boolean;
+  localGraceStartedAt: string;
+  localGraceEndsAt: string;
+  localGraceActive: boolean;
+  needsAuthentication: boolean;
+  optimizationAllowed: boolean;
+  shouldNudge: boolean;
+  gateReason?: PricingGateReason | null;
+  gateMessage: string;
+  nudgeThresholdPercent?: number | null;
+  disableThresholdPercent?: number | null;
+  effectiveDisableThresholdPercent?: number | null;
+  recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
+  recommendedSubscriptionPriceUsd?: number | null;
+  claude: ClaudeAccountProfile;
+  account?: HeadroomAccountProfile | null;
+}
+
+export interface HeadroomAuthCodeRequest {
+  email: string;
+  expiresInSeconds: number;
+}

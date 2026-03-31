@@ -14,10 +14,15 @@ import {
   Bell,
   Brain,
   Cpu,
+  CopySimple,
   CurrencyDollar,
+  EnvelopeSimple,
   GearSix,
   House,
   Heart,
+  IdentificationCard,
+  Key,
+  SignOut,
   Sliders,
   Sparkle,
 } from "@phosphor-icons/react";
@@ -64,10 +69,20 @@ import {
   type SavingsChartDatum
 } from "./lib/dashboardHelpers";
 import { mockDashboard } from "./lib/mockData";
+import {
+  authMethodLabel,
+  claudePlanLabel,
+  formatPercentValue,
+  formatRemainingDays,
+  pricingTone,
+  subscriptionTierLabel
+} from "./lib/pricing";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
   BootstrapProgress,
+  HeadroomAuthCodeRequest,
+  HeadroomPricingStatus,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -81,7 +96,7 @@ import type {
 
 type TrayView = "home" | "optimization" | "health" | "notifications" | "upgrade" | "settings";
 type PricingAudience = "individual" | "teamEnterprise";
-type UpgradePlanId = "free" | "pro" | "team" | "enterprise";
+type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
 
 interface NavItem {
   id: TrayView;
@@ -182,6 +197,14 @@ const POLAR_PRO_CHECKOUT_URL = (
   import.meta.env.VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL ??
   ""
 ).trim();
+const POLAR_MAX5X_CHECKOUT_URL = (
+  import.meta.env.VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL ??
+  ""
+).trim();
+const POLAR_MAX20X_CHECKOUT_URL = (
+  import.meta.env.VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL ??
+  ""
+).trim();
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
   ""
@@ -192,6 +215,8 @@ const CONTACT_FORM_URL = (
 ).trim();
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
+
+const authCodeExpiryFallbackSeconds = 900;
 
 async function loadDashboard(): Promise<DashboardState> {
   try {
@@ -278,19 +303,51 @@ function getUpgradePlans(audience: PricingAudience): {
         },
         {
           id: "pro",
-          name: "Pro",
-          tagline: "Continuity across contexts",
-          price: "$4",
+          name: "Headroom Pro",
+          tagline: "For Claude Pro accounts",
+          price: "$5",
           billingLines: ["USD / month", "billed annually"],
           featureIntro: "Everything in Free, plus:",
           features: [
-            "Support Headroom while in beta",
-            "Track sessions across devices",
-            "Sync learned patterns"
+            "Unlimited optimization after your trial",
+            "No weekly usage gating on Claude Pro",
+            "Support continued Headroom development"
           ],
-          ctaLabel: "Get Pro plan",
+          ctaLabel: "Get Headroom Pro",
           ctaVariant: "primary",
           disabled: !POLAR_PRO_CHECKOUT_URL
+        },
+        {
+          id: "max5x",
+          name: "Headroom Max x5",
+          tagline: "For Claude Max x5 accounts",
+          price: "$25",
+          billingLines: ["USD / month", "billed annually"],
+          featureIntro: "Includes:",
+          features: [
+            "Unlimited optimization after your trial",
+            "No weekly usage gating on Claude Max x5",
+            "Best fit for higher-throughput coding sessions"
+          ],
+          ctaLabel: "Get Headroom Max x5",
+          ctaVariant: "secondary",
+          disabled: !POLAR_MAX5X_CHECKOUT_URL
+        },
+        {
+          id: "max20x",
+          name: "Headroom Max x20",
+          tagline: "For Claude Max x20 accounts",
+          price: "$50",
+          billingLines: ["USD / month", "billed annually"],
+          featureIntro: "Includes:",
+          features: [
+            "Unlimited optimization after your trial",
+            "No weekly usage gating on Claude Max x20",
+            "Best fit for the heaviest Claude Code usage"
+          ],
+          ctaLabel: "Get Headroom Max x20",
+          ctaVariant: "secondary",
+          disabled: !POLAR_MAX20X_CHECKOUT_URL
         }
       ],
       featuredPlanId: "pro"
@@ -598,6 +655,20 @@ export default function App() {
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
   const [headroomApiKeyStatus, setHeadroomApiKeyStatus] =
     useState<HeadroomLearnApiKeyStatus>(idleHeadroomLearnApiKeyStatus);
+  const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
+  const [pricingBusy, setPricingBusy] = useState(false);
+  const [pricingError, setPricingError] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authCode, setAuthCode] = useState("");
+  const [inviteCodeDraft, setInviteCodeDraft] = useState("");
+  const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
+  const [authCodeExpirySeconds, setAuthCodeExpirySeconds] = useState(authCodeExpiryFallbackSeconds);
+  const [authRequestBusy, setAuthRequestBusy] = useState(false);
+  const [authVerifyBusy, setAuthVerifyBusy] = useState(false);
+  const [authFlowError, setAuthFlowError] = useState<string | null>(null);
+  const [authFlowSuccess, setAuthFlowSuccess] = useState<string | null>(null);
+  const [inviteCopyState, setInviteCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const desktopActivationSentRef = useRef(false);
   const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [apiKeyProvider, setApiKeyProvider] = useState<ApiProvider>("anthropic");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -631,6 +702,7 @@ export default function App() {
       : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
   const upgradePlansState = getUpgradePlans(pricingAudience);
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
+  const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
   const showInstallProgress =
     bootstrapping ||
     bootstrapProgress.running ||
@@ -644,6 +716,7 @@ export default function App() {
     !showClientSetupStep &&
     !showProxyVerificationStep &&
     (bootstrapProgress.complete || showPostInstallGuide || dashboard.bootstrapComplete);
+  const pricingStatusTone = pricingTone(pricingStatus);
 
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
@@ -658,6 +731,28 @@ export default function App() {
     }
     rtkActivityRef.current.scrollTop = rtkActivityRef.current.scrollHeight;
   }, [showRtkDetails, rtkActivityLines]);
+
+  useEffect(() => {
+    if (inviteCopyState === "idle") {
+      return;
+    }
+    const timeout = window.setTimeout(() => setInviteCopyState("idle"), 2000);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [inviteCopyState]);
+
+  useEffect(() => {
+    if (!authEmail && pricingStatus?.claude.email) {
+      setAuthEmail(pricingStatus.claude.email);
+    }
+  }, [authEmail, pricingStatus?.claude.email]);
+
+  useEffect(() => {
+    if (!pricingStatus?.authenticated) {
+      desktopActivationSentRef.current = false;
+    }
+  }, [pricingStatus?.authenticated]);
 
   useEffect(() => {
     let active = true;
@@ -709,8 +804,9 @@ export default function App() {
       }
 
       updateStartup("runtime", 80, "Verifying runtime health…");
-      const [runtimeResult] = await Promise.all([
+      const [runtimeResult, pricingResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+        invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
         refreshConnectors(),
       ]);
       if (!active) {
@@ -718,6 +814,9 @@ export default function App() {
       }
       if (runtimeResult) {
         setRuntimeStatus(runtimeResult);
+      }
+      if (pricingResult) {
+        setPricingStatus(pricingResult);
       }
 
       updateStartup(
@@ -1225,6 +1324,43 @@ export default function App() {
     });
   }, [claudeConnectorEnabled]);
 
+  useEffect(() => {
+    void refreshPricingStatus();
+    const interval = window.setInterval(() => {
+      void refreshPricingStatus();
+    }, 60_000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    const claudeConnector = getClaudeConnector(connectors);
+    if (!pricingStatus || pricingStatus.optimizationAllowed || !claudeConnector?.enabled) {
+      return;
+    }
+    if (connectorsBusy) {
+      return;
+    }
+    void toggleConnector(claudeConnector, false);
+  }, [connectors, connectorsBusy, pricingStatus]);
+
+  useEffect(() => {
+    const runtimeHealthyNow =
+      runtimeStatus?.running === true &&
+      runtimeStatus?.proxyReachable === true &&
+      connectorPhase === "healthy";
+    if (!pricingStatus?.authenticated || !runtimeHealthyNow || desktopActivationSentRef.current) {
+      return;
+    }
+    desktopActivationSentRef.current = true;
+    void invoke<HeadroomPricingStatus>("activate_headroom_account")
+      .then((status) => setPricingStatus(status))
+      .catch(() => {
+        desktopActivationSentRef.current = false;
+      });
+  }, [connectorPhase, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
+
   // Poll logs while verifying; dismiss when a matching line appears after the anchor
   useEffect(() => {
     if (connectorPhase !== "verifying") return;
@@ -1496,6 +1632,21 @@ export default function App() {
     }
   }
 
+  async function refreshPricingStatus() {
+    setPricingBusy(true);
+    try {
+      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      setPricingStatus(status);
+      setPricingError(null);
+    } catch (error) {
+      setPricingError(
+        error instanceof Error ? error.message : "Could not load pricing status."
+      );
+    } finally {
+      setPricingBusy(false);
+    }
+  }
+
   async function refreshClaudeProjects() {
     setClaudeProjectsBusy(true);
     try {
@@ -1638,6 +1789,93 @@ export default function App() {
     await invoke("open_external_link", { url });
   }
 
+  async function handleRequestAuthCode() {
+    if (!authEmailValid) {
+      setAuthFlowError("Enter a valid email address.");
+      return;
+    }
+    setAuthRequestBusy(true);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      const result = await invoke<HeadroomAuthCodeRequest>("request_headroom_auth_code", {
+        email: authEmail.trim()
+      });
+      setAuthCodeRequestedFor(result.email);
+      setAuthCodeExpirySeconds(result.expiresInSeconds);
+      setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not send sign-in code."
+      );
+    } finally {
+      setAuthRequestBusy(false);
+    }
+  }
+
+  async function handleVerifyAuthCode() {
+    if (!authEmailValid) {
+      setAuthFlowError("Enter a valid email address.");
+      return;
+    }
+    if (!authCode.trim()) {
+      setAuthFlowError("Enter the authentication code from your email.");
+      return;
+    }
+    setAuthVerifyBusy(true);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
+        email: authEmail.trim(),
+        code: authCode.trim(),
+        inviteCode: inviteCodeDraft.trim() || null
+      });
+      setPricingStatus(status);
+      setAuthCode("");
+      setAuthCodeRequestedFor(null);
+      setInviteCodeDraft("");
+      setAuthFlowSuccess("Headroom account connected.");
+      await refreshConnectors();
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not verify sign-in code."
+      );
+    } finally {
+      setAuthVerifyBusy(false);
+    }
+  }
+
+  async function handleSignOutHeadroomAccount() {
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      await invoke("sign_out_headroom_account");
+      setPricingStatus(await invoke<HeadroomPricingStatus>("get_headroom_pricing_status"));
+      setAuthCode("");
+      setAuthCodeRequestedFor(null);
+      setInviteCodeDraft("");
+      setAuthFlowSuccess("Signed out of Headroom.");
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not sign out of Headroom."
+      );
+    }
+  }
+
+  async function handleCopyInviteCode() {
+    const code = pricingStatus?.account?.inviteCode;
+    if (!code) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(code);
+      setInviteCopyState("copied");
+    } catch {
+      setInviteCopyState("error");
+    }
+  }
+
   async function openApiKeyGuideLink(url: string, label: string) {
     setApiKeyError(null);
     try {
@@ -1661,6 +1899,18 @@ export default function App() {
             kind: "external" as const,
             url: POLAR_PRO_CHECKOUT_URL,
             missing: "Set VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL to enable Pro checkout."
+          };
+        case "max5x":
+          return {
+            kind: "external" as const,
+            url: POLAR_MAX5X_CHECKOUT_URL,
+            missing: "Set VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL to enable Max x5 checkout."
+          };
+        case "max20x":
+          return {
+            kind: "external" as const,
+            url: POLAR_MAX20X_CHECKOUT_URL,
+            missing: "Set VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL to enable Max x20 checkout."
           };
         case "team":
           return {
@@ -2419,6 +2669,27 @@ export default function App() {
       } as const;
     }
 
+    if (pricingStatus?.needsAuthentication) {
+      return {
+        tone: "degraded",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
+    if (pricingStatus && !pricingStatus.optimizationAllowed) {
+      return {
+        tone: "disabled",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
+    if (pricingStatus?.shouldNudge) {
+      return {
+        tone: "starting",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
     if (runtimeHealthy) {
       if (connectorPhase === "disabled") {
         return {
@@ -2485,6 +2756,14 @@ export default function App() {
     return [...topProjects, pinnedClaudeProject];
   })();
   const hiddenClaudeProjectsCount = sortedClaudeProjects.length - visibleClaudeProjects.length;
+  const detectedClaudePlanLabel = claudePlanLabel(pricingStatus?.claude.planTier ?? "unknown");
+  const detectedAuthMethod = authMethodLabel(pricingStatus?.claude.authMethod ?? "unknown");
+  const trialDaysRemaining = formatRemainingDays(pricingStatus?.account?.trialEndsAt);
+  const localGraceDaysRemaining = formatRemainingDays(pricingStatus?.localGraceEndsAt ?? null);
+  const recommendedHeadroomTier = subscriptionTierLabel(
+    pricingStatus?.recommendedSubscriptionTier ?? null
+  );
+  const weeklyUtilizationLabel = formatPercentValue(pricingStatus?.claude.weeklyUtilizationPct);
 
   return (
     <main className="tray-shell">
@@ -2887,6 +3166,215 @@ export default function App() {
                 </button>
               ))}
             </div>
+          </section>
+
+          <section className={`pricing-status-card pricing-status-card--${pricingStatusTone}`}>
+            <div className="pricing-status-card__header">
+              <div>
+                <p className="pricing-status-card__eyebrow">Current access</p>
+                <h2>
+                  {pricingBusy && !pricingStatus
+                    ? "Loading Headroom pricing status..."
+                    : pricingStatus?.gateMessage ?? "Pricing status unavailable."}
+                </h2>
+              </div>
+              {pricingStatus?.authenticated ? (
+                <button
+                  className="secondary-button secondary-button--small pricing-status-card__signout"
+                  onClick={() => void handleSignOutHeadroomAccount()}
+                  type="button"
+                >
+                  <SignOut size={16} weight="bold" />
+                  Sign out
+                </button>
+              ) : null}
+            </div>
+
+            <div className="pricing-status-grid">
+              <article className="pricing-metric">
+                <span className="pricing-metric__label">
+                  <IdentificationCard size={15} weight="bold" />
+                  Claude plan
+                </span>
+                <strong>{detectedClaudePlanLabel}</strong>
+                <small>{detectedAuthMethod}</small>
+              </article>
+              <article className="pricing-metric">
+                <span className="pricing-metric__label">
+                  <Cpu size={15} weight="bold" />
+                  Weekly usage
+                </span>
+                <strong>{weeklyUtilizationLabel}</strong>
+                <small>
+                  Nudge at {formatPercentValue(pricingStatus?.nudgeThresholdPercent)} • Pause at{" "}
+                  {formatPercentValue(pricingStatus?.effectiveDisableThresholdPercent)}
+                </small>
+              </article>
+              <article className="pricing-metric">
+                <span className="pricing-metric__label">
+                  <Sparkle size={15} weight="bold" />
+                  Headroom access
+                </span>
+                <strong>
+                  {pricingStatus?.account?.subscriptionActive
+                    ? subscriptionTierLabel(pricingStatus.account.subscriptionTier)
+                    : pricingStatus?.account?.trialActive
+                      ? "14-day trial"
+                      : pricingStatus?.authenticated
+                        ? "Free Headroom"
+                        : "Not signed in"}
+                </strong>
+                <small>
+                  {pricingStatus?.account?.trialActive && trialDaysRemaining != null
+                    ? `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in trial`
+                    : !pricingStatus?.authenticated && localGraceDaysRemaining != null
+                      ? `${localGraceDaysRemaining} day${localGraceDaysRemaining === 1 ? "" : "s"} left before sign-in is required`
+                      : pricingStatus?.account?.subscriptionActive
+                        ? "Unlimited optimization unlocked"
+                        : "Invite friends or upgrade to extend access"}
+                </small>
+              </article>
+              <article className="pricing-metric">
+                <span className="pricing-metric__label">
+                  <CurrencyDollar size={15} weight="bold" />
+                  Recommended plan
+                </span>
+                <strong>{recommendedHeadroomTier}</strong>
+                <small>
+                  {pricingStatus?.recommendedSubscriptionPriceUsd != null
+                    ? `$${pricingStatus.recommendedSubscriptionPriceUsd}/month billed annually`
+                    : "No paid plan needed on Claude Free"}
+                </small>
+              </article>
+            </div>
+
+            {pricingStatus?.account?.inviteCode ? (
+              <div className="pricing-status-card__invite">
+                <div>
+                  <p className="pricing-status-card__invite-label">Invite bonus</p>
+                  <strong>
+                    +{formatPercentValue(pricingStatus.account.inviteBonusPercent)} pause threshold
+                  </strong>
+                  <span>
+                    {pricingStatus.account.acceptedInvitesCount} accepted invite
+                    {pricingStatus.account.acceptedInvitesCount === 1 ? "" : "s"} so far
+                  </span>
+                </div>
+                <div className="pricing-status-card__invite-actions">
+                  <code>{pricingStatus.account.inviteCode}</code>
+                  <button
+                    className="secondary-button secondary-button--small"
+                    onClick={() => void handleCopyInviteCode()}
+                    type="button"
+                  >
+                    <CopySimple size={16} weight="bold" />
+                    {inviteCopyState === "copied"
+                      ? "Copied"
+                      : inviteCopyState === "error"
+                        ? "Copy failed"
+                        : "Copy code"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="pricing-auth-card">
+            <div className="pricing-auth-card__header">
+              <div>
+                <p className="pricing-status-card__eyebrow">Authentication</p>
+                <h2>
+                  {pricingStatus?.authenticated
+                    ? "Your Headroom account is connected"
+                    : "Sign in with email to unlock your Headroom trial"}
+                </h2>
+              </div>
+            </div>
+            <div className="pricing-auth-card__grid">
+              <label className="pricing-auth-field">
+                <span>Email</span>
+                <div className="pricing-auth-field__input">
+                  <EnvelopeSimple size={16} weight="bold" />
+                  <input
+                    onChange={(event) => {
+                      setAuthEmail(event.target.value);
+                      setAuthFlowError(null);
+                    }}
+                    placeholder={pricingStatus?.claude.email ?? "you@example.com"}
+                    type="email"
+                    value={authEmail}
+                  />
+                </div>
+              </label>
+              <label className="pricing-auth-field">
+                <span>Authentication code</span>
+                <div className="pricing-auth-field__input">
+                  <Key size={16} weight="bold" />
+                  <input
+                    onChange={(event) => {
+                      setAuthCode(event.target.value);
+                      setAuthFlowError(null);
+                    }}
+                    placeholder={
+                      authCodeRequestedFor
+                        ? `Enter the code sent to ${authCodeRequestedFor}`
+                        : "Request a code first"
+                    }
+                    type="text"
+                    value={authCode}
+                  />
+                </div>
+              </label>
+              <label className="pricing-auth-field">
+                <span>Invite code (optional)</span>
+                <div className="pricing-auth-field__input">
+                  <Sparkle size={16} weight="bold" />
+                  <input
+                    onChange={(event) => {
+                      setInviteCodeDraft(event.target.value);
+                      setAuthFlowError(null);
+                    }}
+                    placeholder="Paste a friend's invite code"
+                    type="text"
+                    value={inviteCodeDraft}
+                  />
+                </div>
+              </label>
+            </div>
+            <div className="pricing-auth-card__actions">
+              <button
+                className="secondary-button"
+                disabled={!authEmailValid || authRequestBusy}
+                onClick={() => void handleRequestAuthCode()}
+                type="button"
+              >
+                {authRequestBusy ? "Sending..." : "Email me a code"}
+              </button>
+              <button
+                className="primary-button"
+                disabled={!authEmailValid || !authCode.trim() || authVerifyBusy}
+                onClick={() => void handleVerifyAuthCode()}
+                type="button"
+              >
+                {authVerifyBusy ? "Verifying..." : "Verify and continue"}
+              </button>
+            </div>
+            <p className="pricing-auth-card__hint">
+              Codes expire after roughly {Math.ceil(authCodeExpirySeconds / 60)} minutes. The
+              first 24 hours stay open without account auth; the 14-day trial starts when you
+              create your account.
+            </p>
+            {authFlowError ? (
+              <p className="install-progress__error">{authFlowError}</p>
+            ) : null}
+            {authFlowSuccess ? (
+              <p className="upgrade-plan-card__contact-status upgrade-plan-card__contact-status--success">
+                {authFlowSuccess}
+              </p>
+            ) : null}
+            {pricingError ? (
+              <p className="install-progress__error">{pricingError}</p>
+            ) : null}
           </section>
 
           <section
