@@ -870,6 +870,7 @@ select {
 }
 
 .upgrade-plan-card {
+  position: relative;
   display: grid;
   min-height: 100%;
   border-radius: 26px;
@@ -882,6 +883,34 @@ select {
 .upgrade-plan-card--featured {
   border-color: rgba(79, 158, 145, 0.32);
   box-shadow: 0 20px 42px rgba(65, 111, 97, 0.12);
+}
+
+.upgrade-plan-card--under-construction .upgrade-plan-card__title-block {
+  padding-right: 78px;
+}
+
+.upgrade-plan-card__ribbon {
+  position: absolute;
+  top: 20px;
+  right: -62px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 240px;
+  height: 34px;
+  background: linear-gradient(135deg, #dc8f1a, #c14b24);
+  color: #fff8eb;
+  font-size: var(--text-xxs);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-transform: uppercase;
+  transform-origin: center;
+  transform: rotate(38deg);
+  box-shadow: 0 10px 24px rgba(110, 56, 18, 0.22);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .upgrade-plan-card__top,

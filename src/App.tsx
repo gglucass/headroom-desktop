@@ -284,9 +284,9 @@ function getUpgradePlans(audience: PricingAudience): {
           billingLines: ["USD / month", "billed annually"],
           featureIntro: "Everything in Free, plus:",
           features: [
+            "Support Headroom while in beta",
             "Track sessions across devices",
-            "Sync learned patterns",
-            "Priority support"
+            "Sync learned patterns"
           ],
           ctaLabel: "Get Pro plan",
           ctaVariant: "primary",
@@ -2894,6 +2894,7 @@ export default function App() {
           >
             {upgradePlansState.plans.map((plan) => {
               const isFeatured = plan.id === upgradePlansState.featuredPlanId;
+              const isUnderConstruction = plan.id === "pro";
               const buttonClassName =
                 plan.ctaVariant === "primary"
                   ? "primary-button upgrade-plan-card__button"
@@ -2901,9 +2902,12 @@ export default function App() {
 
               return (
                 <article
-                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}`}
+                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isUnderConstruction ? " upgrade-plan-card--under-construction" : ""}`}
                   key={plan.id}
                 >
+                  {isUnderConstruction ? (
+                    <span className="upgrade-plan-card__ribbon">BETA</span>
+                  ) : null}
                   <div className="upgrade-plan-card__top">
                     <div className="upgrade-plan-card__title-block">
                       <span className="upgrade-plan-card__icon" aria-hidden="true">
