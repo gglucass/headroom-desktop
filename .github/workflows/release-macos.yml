@@ -75,7 +75,7 @@ jobs:
             fi
           done
 
-          if [[ -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY:-}" ]]; then
+          if [[ -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_PRIVATE_KEY_P8:-}" ]]; then
             exit 0
           fi
 
@@ -104,6 +104,13 @@ jobs:
             echo "Git tag ${GITHUB_REF_NAME} does not match app version ${expected_tag}." >&2
             exit 1
           fi
+
+      - name: Debug secrets presence
+        shell: bash
+        run: |
+          echo "APPLE_API_PRIVATE_KEY_P8 set: $([[ -n "${APPLE_API_PRIVATE_KEY_P8:-}" ]] && echo YES || echo NO)"
+          echo "APPLE_API_KEY set: $([[ -n "${APPLE_API_KEY:-}" ]] && echo YES || echo NO)"
+          echo "APPLE_API_ISSUER set: $([[ -n "${APPLE_API_ISSUER:-}" ]] && echo YES || echo NO)"
 
       - name: Prepare App Store Connect API key
         if: ${{ env.APPLE_API_PRIVATE_KEY_P8 != '' }}

@@ -1,166 +1,223 @@
 #[cfg(target_os = "macos")]
 mod platform {
     use std::ffi::c_void;
-    use std::os::raw::{c_char, c_uint};
-    use std::ptr;
+    use std::os::raw::c_long;
 
     type OSStatus = i32;
-    type SecKeychainItemRef = *mut c_void;
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFDataRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFIndex = c_long;
 
     const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+
+    // Opaque type for taking addresses of CoreFoundation callback structs.
+    #[repr(C)]
+    struct CFDictionaryCallBacks([u8; 0]);
 
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
-        fn CFRelease(cf: *const c_void);
+        static kCFBooleanTrue: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: CFDictionaryCallBacks;
+        static kCFTypeDictionaryValueCallBacks: CFDictionaryCallBacks;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: u32,
+            is_external: u8,
+        ) -> CFStringRef;
+        fn CFDataCreate(alloc: *const c_void, bytes: *const u8, length: CFIndex) -> CFDataRef;
+        fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+        fn CFDataGetLength(data: CFDataRef) -> CFIndex;
+        fn CFDictionaryCreate(
+            allocator: *const c_void,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
     }
 
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
-        fn SecKeychainAddGenericPassword(
-            keychain: *const c_void,
-            service_name_length: c_uint,
-            service_name: *const c_char,
-            account_name_length: c_uint,
-            account_name: *const c_char,
-            password_length: c_uint,
-            password_data: *const c_void,
-            item_ref: *mut SecKeychainItemRef,
-        ) -> OSStatus;
-        fn SecKeychainFindGenericPassword(
-            keychain_or_array: *const c_void,
-            service_name_length: c_uint,
-            service_name: *const c_char,
-            account_name_length: c_uint,
-            account_name: *const c_char,
-            password_length: *mut c_uint,
-            password_data: *mut *mut c_void,
-            item_ref: *mut SecKeychainItemRef,
-        ) -> OSStatus;
-        fn SecKeychainItemModifyAttributesAndData(
-            item_ref: SecKeychainItemRef,
-            attr_list: *const c_void,
-            length: c_uint,
-            data: *const c_void,
-        ) -> OSStatus;
-        fn SecKeychainItemDelete(item_ref: SecKeychainItemRef) -> OSStatus;
-        fn SecKeychainItemFreeContent(attr_list: *mut c_void, data: *mut c_void) -> OSStatus;
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecValueData: CFStringRef;
+        static kSecUseDataProtectionKeychain: CFStringRef;
+        static kSecReturnData: CFStringRef;
+        static kSecMatchLimit: CFStringRef;
+        static kSecMatchLimitOne: CFStringRef;
+        fn SecItemAdd(attributes: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemUpdate(query: CFDictionaryRef, attrs_to_update: CFDictionaryRef) -> OSStatus;
+        fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
+    }
+
+    unsafe fn cf_string(s: &str) -> CFStringRef {
+        CFStringCreateWithBytes(
+            std::ptr::null(),
+            s.as_ptr(),
+            s.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        )
+    }
+
+    unsafe fn callbacks_key() -> *const c_void {
+        &kCFTypeDictionaryKeyCallBacks as *const CFDictionaryCallBacks as *const c_void
+    }
+
+    unsafe fn callbacks_val() -> *const c_void {
+        &kCFTypeDictionaryValueCallBacks as *const CFDictionaryCallBacks as *const c_void
+    }
+
+    // Builds a base lookup dict: {kSecClass, kSecAttrService, kSecAttrAccount, kSecUseDataProtectionKeychain}.
+    // The returned CFDictionaryRef retains the strings; caller must CFRelease the dict.
+    unsafe fn base_query(service: &str, account: &str) -> CFDictionaryRef {
+        let svc = cf_string(service);
+        let acc = cf_string(account);
+        let keys: [CFTypeRef; 4] = [kSecClass, kSecAttrService, kSecAttrAccount, kSecUseDataProtectionKeychain];
+        let values: [CFTypeRef; 4] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue];
+        let dict = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            4,
+            callbacks_key(),
+            callbacks_val(),
+        );
+        // Dict retains svc and acc; release our references.
+        CFRelease(svc);
+        CFRelease(acc);
+        dict
     }
 
     pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
-        let mut password_length = 0;
-        let mut password_data = ptr::null_mut();
-        let mut item_ref = ptr::null_mut();
-        let status = unsafe {
-            SecKeychainFindGenericPassword(
-                ptr::null(),
-                service.len() as c_uint,
-                service.as_ptr().cast(),
-                account.len() as c_uint,
-                account.as_ptr().cast(),
-                &mut password_length,
-                &mut password_data,
-                &mut item_ref,
-            )
-        };
-        if status == ERR_SEC_ITEM_NOT_FOUND {
-            return Ok(None);
-        }
-        check_status(status, "read keychain secret")?;
-
-        let bytes = unsafe {
-            std::slice::from_raw_parts(password_data.cast::<u8>(), password_length as usize)
-        }
-        .to_vec();
-
         unsafe {
-            let _ = SecKeychainItemFreeContent(ptr::null_mut(), password_data);
-            if !item_ref.is_null() {
-                CFRelease(item_ref.cast());
-            }
-        }
+            let svc = cf_string(service);
+            let acc = cf_string(account);
+            let keys: [CFTypeRef; 6] = [
+                kSecClass,
+                kSecAttrService,
+                kSecAttrAccount,
+                kSecUseDataProtectionKeychain,
+                kSecReturnData,
+                kSecMatchLimit,
+            ];
+            let values: [CFTypeRef; 6] = [
+                kSecClassGenericPassword,
+                svc,
+                acc,
+                kCFBooleanTrue,
+                kCFBooleanTrue,
+                kSecMatchLimitOne,
+            ];
+            let query = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                6,
+                callbacks_key(),
+                callbacks_val(),
+            );
+            CFRelease(svc);
+            CFRelease(acc);
 
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|err| format!("Keychain secret for {account} was not valid UTF-8: {err}"))
+            let mut result: CFTypeRef = std::ptr::null();
+            let status = SecItemCopyMatching(query, &mut result);
+            CFRelease(query);
+
+            if status == ERR_SEC_ITEM_NOT_FOUND {
+                return Ok(None);
+            }
+            check_status(status, "read keychain secret")?;
+
+            let data: CFDataRef = result;
+            let len = CFDataGetLength(data) as usize;
+            let ptr = CFDataGetBytePtr(data);
+            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+            CFRelease(result);
+
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|err| format!("Keychain secret for {account} was not valid UTF-8: {err}"))
+        }
     }
 
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
-        if let Some(item_ref) = find_item(service, account)? {
-            let status = unsafe {
-                SecKeychainItemModifyAttributesAndData(
-                    item_ref,
-                    ptr::null(),
-                    secret.len() as c_uint,
-                    secret.as_ptr().cast(),
-                )
-            };
-            unsafe {
-                CFRelease(item_ref.cast());
+        unsafe {
+            // Try to update an existing item first.
+            let query = base_query(service, account);
+            let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
+            let attr_keys: [CFTypeRef; 1] = [kSecValueData];
+            let attr_vals: [CFTypeRef; 1] = [data];
+            let attrs = CFDictionaryCreate(
+                std::ptr::null(),
+                attr_keys.as_ptr(),
+                attr_vals.as_ptr(),
+                1,
+                callbacks_key(),
+                callbacks_val(),
+            );
+            let status = SecItemUpdate(query, attrs);
+            CFRelease(attrs);
+            CFRelease(data);
+            CFRelease(query);
+
+            if status != ERR_SEC_ITEM_NOT_FOUND {
+                return check_status(status, "update keychain secret");
             }
-            check_status(status, "update keychain secret")
-        } else {
-            let mut item_ref = ptr::null_mut();
-            let status = unsafe {
-                SecKeychainAddGenericPassword(
-                    ptr::null(),
-                    service.len() as c_uint,
-                    service.as_ptr().cast(),
-                    account.len() as c_uint,
-                    account.as_ptr().cast(),
-                    secret.len() as c_uint,
-                    secret.as_ptr().cast(),
-                    &mut item_ref,
-                )
-            };
-            unsafe {
-                if !item_ref.is_null() {
-                    CFRelease(item_ref.cast());
-                }
-            }
-            check_status(status, "write keychain secret")
+
+            // Item doesn't exist yet — add it.
+            let svc = cf_string(service);
+            let acc = cf_string(account);
+            let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
+            let keys: [CFTypeRef; 5] = [
+                kSecClass,
+                kSecAttrService,
+                kSecAttrAccount,
+                kSecUseDataProtectionKeychain,
+                kSecValueData,
+            ];
+            let values: [CFTypeRef; 5] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue, data];
+            let add_dict = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                5,
+                callbacks_key(),
+                callbacks_val(),
+            );
+            let add_status = SecItemAdd(add_dict, std::ptr::null_mut());
+            CFRelease(add_dict);
+            CFRelease(data);
+            CFRelease(svc);
+            CFRelease(acc);
+            check_status(add_status, "write keychain secret")
         }
     }
 
     pub fn has_secret(service: &str, account: &str) -> Result<bool, String> {
-        let Some(item_ref) = find_item(service, account)? else {
-            return Ok(false);
-        };
-        unsafe {
-            CFRelease(item_ref.cast());
-        }
-        Ok(true)
+        read_secret(service, account).map(|opt| opt.is_some())
     }
 
     pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
-        let Some(item_ref) = find_item(service, account)? else {
-            return Ok(());
-        };
-        let status = unsafe { SecKeychainItemDelete(item_ref) };
         unsafe {
-            CFRelease(item_ref.cast());
+            let query = base_query(service, account);
+            let status = SecItemDelete(query);
+            CFRelease(query);
+            if status == ERR_SEC_ITEM_NOT_FOUND {
+                return Ok(());
+            }
+            check_status(status, "delete keychain secret")
         }
-        check_status(status, "delete keychain secret")
-    }
-
-    fn find_item(service: &str, account: &str) -> Result<Option<SecKeychainItemRef>, String> {
-        let mut item_ref = ptr::null_mut();
-        let status = unsafe {
-            SecKeychainFindGenericPassword(
-                ptr::null(),
-                service.len() as c_uint,
-                service.as_ptr().cast(),
-                account.len() as c_uint,
-                account.as_ptr().cast(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut item_ref,
-            )
-        };
-        if status == ERR_SEC_ITEM_NOT_FOUND {
-            return Ok(None);
-        }
-        check_status(status, "find keychain secret")?;
-        Ok(Some(item_ref))
     }
 
     fn check_status(status: OSStatus, action: &str) -> Result<(), String> {
