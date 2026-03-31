@@ -23,11 +23,11 @@ export function claudePlanLabel(plan: ClaudePlanTier) {
 export function subscriptionTierLabel(tier?: HeadroomSubscriptionTier | null) {
   switch (tier) {
     case "pro":
-      return "Headroom Pro";
+      return "Pro";
     case "max5x":
-      return "Headroom Max x5";
+      return "Max x5";
     case "max20x":
-      return "Headroom Max x20";
+      return "Max x20";
     default:
       return "No paid Headroom plan";
   }

@@ -24,23 +24,30 @@ struct LocalPricingState {
     first_seen_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalClaudeConfig {
-    oauth_account: Option<LocalClaudeOauthAccount>,
+#[derive(Debug, Clone)]
+struct ClaudeOauthProfile {
+    account: ClaudeOauthProfileAccount,
+    organization: Option<ClaudeOauthProfileOrganization>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalClaudeOauthAccount {
-    account_uuid: Option<String>,
-    email_address: Option<String>,
-    organization_uuid: Option<String>,
-    has_extra_usage_enabled: Option<bool>,
-    billing_type: Option<String>,
-    account_created_at: Option<DateTime<Utc>>,
-    subscription_created_at: Option<DateTime<Utc>>,
+#[derive(Debug, Clone)]
+struct ClaudeOauthProfileAccount {
+    uuid: Option<String>,
+    email: Option<String>,
     display_name: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeOauthProfileOrganization {
+    uuid: Option<String>,
+    billing_type: Option<String>,
+    subscription_created_at: Option<DateTime<Utc>>,
+    has_extra_usage_enabled: bool,
+    /// e.g. "claude_pro", "claude_max", "claude_enterprise"
+    organization_type: Option<String>,
+    /// e.g. "default_claude_ai", "claude_max_5x", "claude_max_20x"
+    rate_limit_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,10 +156,7 @@ pub fn request_auth_code(email: &str) -> Result<HeadroomAuthCodeRequest, String>
 
     Ok(HeadroomAuthCodeRequest {
         email: body.email,
-        expires_in_seconds: body
-            .expires_in_seconds
-            .max(1)
-            .min(AUTH_CODE_EXPIRY_SECONDS),
+        expires_in_seconds: body.expires_in_seconds.max(1).min(AUTH_CODE_EXPIRY_SECONDS),
     })
 }
 
@@ -339,19 +343,23 @@ fn evaluate_pricing_status(
         if account.subscription_active {
             gate_message = "Headroom subscription active. Optimization stays fully enabled.".into();
         } else if account.trial_active {
-            gate_message = "Your 14-day Headroom trial is active with unlimited optimization.".into();
+            gate_message =
+                "Your 14-day Headroom trial is active with unlimited optimization.".into();
         } else {
             let pricing = pricing_policy_for_plan(&claude.plan_tier);
-            nudge_threshold_percent = pricing.as_ref().map(|policy| policy.nudge_threshold_percent);
-            disable_threshold_percent =
-                pricing.as_ref().map(|policy| policy.disable_threshold_percent);
+            nudge_threshold_percent = pricing
+                .as_ref()
+                .map(|policy| policy.nudge_threshold_percent);
+            disable_threshold_percent = pricing
+                .as_ref()
+                .map(|policy| policy.disable_threshold_percent);
             effective_disable_threshold_percent = pricing.as_ref().map(|policy| {
-                (policy.disable_threshold_percent + account.invite_bonus_percent).min(
-                    policy.disable_threshold_percent + 50.0,
-                )
+                (policy.disable_threshold_percent + account.invite_bonus_percent)
+                    .min(policy.disable_threshold_percent + 50.0)
             });
-            recommended_subscription_tier =
-                pricing.as_ref().map(|policy| policy.recommended_tier.clone());
+            recommended_subscription_tier = pricing
+                .as_ref()
+                .map(|policy| policy.recommended_tier.clone());
             recommended_subscription_price_usd =
                 pricing.as_ref().map(|policy| policy.monthly_price_usd);
 
@@ -425,107 +433,236 @@ fn evaluate_pricing_status(
     }
 }
 
-fn detect_claude_profile(state: &AppState) -> ClaudeAccountProfile {
-    let config = read_local_claude_config();
-    let oauth = config.oauth_account.as_ref();
-    let usage = fetch_claude_usage(state).ok();
-    let (plan_tier, plan_detection_source) = detect_plan_tier(oauth, usage.as_ref());
-    let auth_method = if state
+pub fn detect_claude_profile(state: &AppState) -> ClaudeAccountProfile {
+    let token = state
         .claude_bearer_token
         .lock()
         .ok()
-        .and_then(|token| token.clone())
-        .is_some()
-        || oauth.is_some()
-    {
-        ClaudeAuthMethod::ClaudeAiOauth
+        .and_then(|t| t.clone());
+
+    let Some(token) = token else {
+        // No token yet — proxy hasn't seen a request through. Return a minimal
+        // profile so the app can show "send a message first" messaging.
+        return ClaudeAccountProfile {
+            auth_method: ClaudeAuthMethod::Unknown,
+            email: None,
+            display_name: None,
+            account_uuid: None,
+            organization_uuid: None,
+            billing_type: None,
+            account_created_at: None,
+            subscription_created_at: None,
+            has_extra_usage_enabled: false,
+            plan_tier: ClaudePlanTier::Unknown,
+            plan_detection_source: None,
+            weekly_utilization_pct: None,
+            five_hour_utilization_pct: None,
+            extra_usage_monthly_limit: None,
+        };
+    };
+
+    let profile = fetch_oauth_profile(&token).ok();
+    let usage = fetch_claude_usage(state).ok();
+
+    let (plan_tier, plan_detection_source) = if let Some(ref p) = profile {
+        detect_plan_tier_from_profile(p)
     } else {
-        ClaudeAuthMethod::Unknown
+        (ClaudePlanTier::Unknown, None)
     };
 
     ClaudeAccountProfile {
-        auth_method,
-        email: oauth.and_then(|value| value.email_address.clone()),
-        display_name: oauth.and_then(|value| value.display_name.clone()),
-        account_uuid: oauth.and_then(|value| value.account_uuid.clone()),
-        organization_uuid: oauth.and_then(|value| value.organization_uuid.clone()),
-        billing_type: oauth.and_then(|value| value.billing_type.clone()),
-        account_created_at: oauth.and_then(|value| value.account_created_at),
-        subscription_created_at: oauth.and_then(|value| value.subscription_created_at),
-        has_extra_usage_enabled: oauth
-            .and_then(|value| value.has_extra_usage_enabled)
+        auth_method: ClaudeAuthMethod::ClaudeAiOauth,
+        email: profile.as_ref().and_then(|p| p.account.email.clone()),
+        display_name: profile
+            .as_ref()
+            .and_then(|p| p.account.display_name.clone()),
+        account_uuid: profile.as_ref().and_then(|p| p.account.uuid.clone()),
+        organization_uuid: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().and_then(|o| o.uuid.clone())),
+        billing_type: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().and_then(|o| o.billing_type.clone())),
+        account_created_at: profile.as_ref().and_then(|p| p.account.created_at),
+        subscription_created_at: profile.as_ref().and_then(|p| {
+            p.organization
+                .as_ref()
+                .and_then(|o| o.subscription_created_at)
+        }),
+        has_extra_usage_enabled: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().map(|o| o.has_extra_usage_enabled))
             .unwrap_or(false),
         plan_tier,
         plan_detection_source,
         weekly_utilization_pct: usage
             .as_ref()
-            .and_then(|value| value.seven_day.as_ref().map(|window| window.utilization)),
+            .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
         five_hour_utilization_pct: usage
             .as_ref()
-            .and_then(|value| value.five_hour.as_ref().map(|window| window.utilization)),
+            .and_then(|u| u.five_hour.as_ref().map(|w| w.utilization)),
         extra_usage_monthly_limit: usage
             .as_ref()
-            .and_then(|value| value.extra_usage.as_ref().and_then(|extra| extra.monthly_limit)),
+            .and_then(|u| u.extra_usage.as_ref().and_then(|e| e.monthly_limit)),
     }
 }
 
-fn read_local_claude_config() -> LocalClaudeConfig {
-    let path = dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".claude.json");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return LocalClaudeConfig { oauth_account: None };
-        }
-    };
-    serde_json::from_slice(&bytes).unwrap_or(LocalClaudeConfig { oauth_account: None })
-}
+fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, String> {
+    let response = http_client()?
+        .get("https://api.anthropic.com/api/oauth/profile")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("Content-Type", "application/json")
+        .send()
+        .map_err(|err| format!("Could not fetch Claude OAuth profile: {err}"))?;
 
-fn detect_plan_tier(
-    oauth: Option<&LocalClaudeOauthAccount>,
-    usage: Option<&ClaudeUsage>,
-) -> (ClaudePlanTier, Option<String>) {
-    let Some(oauth) = oauth else {
-        return (ClaudePlanTier::Unknown, None);
-    };
-
-    let monthly_limit = usage.and_then(|value| {
-        value
-            .extra_usage
-            .as_ref()
-            .and_then(|extra| if extra.is_enabled { extra.monthly_limit } else { None })
-    });
-
-    if oauth.subscription_created_at.is_none() {
-        return (ClaudePlanTier::Free, Some("local_oauth_account".into()));
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not fetch Claude OAuth profile (status {}).",
+            response.status().as_u16()
+        ));
     }
 
-    if let Some(limit) = monthly_limit {
-        if limit >= 100.0 {
+    let body: serde_json::Value = response
+        .json()
+        .map_err(|err| format!("Could not parse Claude OAuth profile: {err}"))?;
+
+    parse_oauth_profile_value(&body)
+        .ok_or_else(|| "Claude OAuth profile response was missing account details.".to_string())
+}
+
+fn parse_oauth_profile_value(value: &serde_json::Value) -> Option<ClaudeOauthProfile> {
+    let root = value
+        .get("profile")
+        .or_else(|| value.get("data"))
+        .unwrap_or(value);
+    let account_value = root.get("account").unwrap_or(root);
+
+    Some(ClaudeOauthProfile {
+        account: ClaudeOauthProfileAccount {
+            uuid: json_string(account_value, &["uuid", "account_uuid"]),
+            email: json_string(account_value, &["email", "email_address"]),
+            display_name: json_string(account_value, &["display_name", "displayName"]),
+            created_at: json_datetime(account_value, &["created_at", "createdAt"]),
+        },
+        organization: root
+            .get("organization")
+            .and_then(parse_oauth_profile_organization),
+    })
+}
+
+fn parse_oauth_profile_organization(
+    value: &serde_json::Value,
+) -> Option<ClaudeOauthProfileOrganization> {
+    Some(ClaudeOauthProfileOrganization {
+        uuid: json_string(value, &["uuid", "organization_uuid"]),
+        billing_type: json_string(value, &["billing_type", "billingType"]),
+        subscription_created_at: json_datetime(
+            value,
+            &["subscription_created_at", "subscriptionCreatedAt"],
+        ),
+        has_extra_usage_enabled: json_bool(
+            value,
+            &["has_extra_usage_enabled", "hasExtraUsageEnabled"],
+        )
+        .unwrap_or(false),
+        organization_type: json_string(value, &["organization_type", "organizationType"]),
+        rate_limit_tier: json_string(value, &["rate_limit_tier", "rateLimitTier"]),
+    })
+}
+
+fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTier, Option<String>) {
+    let Some(org) = profile.organization.as_ref() else {
+        return (ClaudePlanTier::Free, Some("oauth_profile.account".into()));
+    };
+
+    if let Some(rate_limit_tier) = org.rate_limit_tier.as_deref() {
+        let normalized = rate_limit_tier.trim().to_ascii_lowercase();
+        if normalized.contains("20x") {
             return (
                 ClaudePlanTier::Max20x,
-                Some("usage.extra_usage.monthly_limit".into()),
+                Some("oauth_profile.organization.rateLimitTier".into()),
             );
         }
-        return (
-            ClaudePlanTier::Max5x,
-            Some("usage.extra_usage.monthly_limit".into()),
-        );
+        if normalized.contains("5x") {
+            return (
+                ClaudePlanTier::Max5x,
+                Some("oauth_profile.organization.rateLimitTier".into()),
+            );
+        }
+        if normalized == "default_claude_ai" {
+            let organization_type = org.organization_type.as_deref().unwrap_or_default();
+            if organization_type.eq_ignore_ascii_case("claude_max") {
+                return (
+                    ClaudePlanTier::Max5x,
+                    Some("oauth_profile.organization.organizationType".into()),
+                );
+            }
+            if organization_type.eq_ignore_ascii_case("claude_pro")
+                || organization_type.eq_ignore_ascii_case("claude_enterprise")
+            {
+                return (
+                    ClaudePlanTier::Pro,
+                    Some("oauth_profile.organization.organizationType".into()),
+                );
+            }
+        }
     }
 
-    if oauth.has_extra_usage_enabled.unwrap_or(false) {
+    if let Some(organization_type) = org.organization_type.as_deref() {
+        let normalized = organization_type.trim().to_ascii_lowercase();
+        if normalized == "claude_max" {
+            return (
+                ClaudePlanTier::Max5x,
+                Some("oauth_profile.organization.organizationType".into()),
+            );
+        }
+        if normalized == "claude_pro" || normalized == "claude_enterprise" {
+            return (
+                ClaudePlanTier::Pro,
+                Some("oauth_profile.organization.organizationType".into()),
+            );
+        }
+        if normalized == "claude_free" || normalized == "free" {
+            return (
+                ClaudePlanTier::Free,
+                Some("oauth_profile.organization.organizationType".into()),
+            );
+        }
+    }
+
+    if org.subscription_created_at.is_none() {
         return (
-            ClaudePlanTier::Max5x,
-            Some("local_oauth_account.hasExtraUsageEnabled".into()),
+            ClaudePlanTier::Free,
+            Some("oauth_profile.organization.subscriptionCreatedAt".into()),
         );
     }
 
     (
-        ClaudePlanTier::Pro,
-        Some("local_oauth_account.subscriptionCreatedAt".into()),
+        ClaudePlanTier::Unknown,
+        Some("oauth_profile.organization".into()),
     )
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|entry| entry.as_str()))
+        .map(str::to_string)
+}
+
+fn json_bool(value: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|entry| entry.as_bool()))
+}
+
+fn json_datetime(value: &serde_json::Value, keys: &[&str]) -> Option<DateTime<Utc>> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|entry| entry.as_str())
+            .and_then(|entry| DateTime::parse_from_rfc3339(entry).ok())
+            .map(|entry| entry.to_utc())
+    })
 }
 
 fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountProfile {
@@ -633,7 +770,11 @@ fn api_url(path: &str) -> String {
         .ok()
         .or_else(|| option_env!("HEADROOM_ACCOUNT_API_BASE_URL").map(str::to_string))
         .unwrap_or_else(|| DEFAULT_ACCOUNT_API_BASE_URL.to_string());
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 fn non_empty_string(value: String) -> Option<String> {

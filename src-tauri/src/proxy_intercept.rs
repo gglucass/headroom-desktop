@@ -38,8 +38,7 @@ pub fn spawn(token_slot: SharedToken) {
 }
 
 async fn run(token_slot: SharedToken) -> std::io::Result<()> {
-    let listener =
-        TcpListener::bind(("127.0.0.1", INTERCEPT_PORT)).await?;
+    let listener = TcpListener::bind(("127.0.0.1", INTERCEPT_PORT)).await?;
 
     loop {
         let (client, _) = listener.accept().await?;
@@ -65,9 +64,7 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
     }
 
     // Forward to the headroom backend.
-    let Ok(mut backend) =
-        TcpStream::connect(("127.0.0.1", HEADROOM_BACKEND_PORT)).await
-    else {
+    let Ok(mut backend) = TcpStream::connect(("127.0.0.1", HEADROOM_BACKEND_PORT)).await else {
         // headroom not up yet — send a 502 so the client gets a clean error.
         let _ = client
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -91,10 +88,7 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
 /// Read exactly one HTTP message (headers + body) from `stream` into `buf`.
 /// Stops once we have a complete framed message so we can inspect headers
 /// before forwarding, without blocking waiting for more data.
-async fn read_http_message(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<()> {
+async fn read_http_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
     let mut tmp = [0u8; 4096];
 
     loop {
@@ -131,8 +125,7 @@ async fn read_http_message(
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 fn parse_content_length(headers: &[u8]) -> usize {

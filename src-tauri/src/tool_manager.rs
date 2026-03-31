@@ -569,7 +569,10 @@ impl ToolManager {
             .filter_map(|path| read_headroom_learn_metadata_from_path(&path))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
-        candidates.into_iter().next().map(|candidate| candidate.metadata)
+        candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.metadata)
     }
 
     fn headroom_learn_memory_paths(&self, project_path: &str) -> Vec<PathBuf> {

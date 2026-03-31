@@ -288,6 +288,9 @@ impl AppState {
 
             let project_path = extract_cwd_from_session_file(&latest_file)
                 .unwrap_or_else(|| decode_project_folder_name(&folder_name));
+            let project_path = std::fs::canonicalize(&project_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(project_path);
             if project_path.trim().is_empty() {
                 continue;
             }
@@ -777,7 +780,8 @@ fn build_claude_code_project(
         .unwrap_or_else(|| project_path.clone());
 
     let last_learn_ran_at = tool_manager.headroom_learn_last_run_at(&project_path);
-    let has_persisted_learnings = tool_manager.headroom_learn_has_persisted_learnings(&project_path);
+    let has_persisted_learnings =
+        tool_manager.headroom_learn_has_persisted_learnings(&project_path);
     let last_learn_pattern_count = tool_manager.headroom_learn_pattern_count(&project_path);
     let active_days_since_last_learn = if let Some(ref learn_at_str) = last_learn_ran_at {
         chrono::DateTime::parse_from_rfc3339(learn_at_str)

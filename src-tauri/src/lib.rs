@@ -25,10 +25,10 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    BootstrapProgress, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
-    ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    ResearchCandidate, RuntimeStatus,
+    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus,
+    ClientSetupResult, ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
+    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus, ResearchCandidate,
+    RuntimeStatus,
 };
 use crate::state::AppState;
 
@@ -37,6 +37,8 @@ const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS"
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
+const HEADROOM_CLAUDE_TOKEN_SERVICE: &str = "com.garm.headroom";
+const HEADROOM_CLAUDE_TOKEN_ACCOUNT: &str = "claude-bearer-token";
 const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
 const HEADROOM_LEARN_ANTHROPIC_ACCOUNT: &str = "anthropic";
 const HEADROOM_LEARN_GEMINI_ACCOUNT: &str = "gemini";
@@ -290,7 +292,14 @@ fn get_claude_usage(state: State<'_, AppState>) -> Result<ClaudeUsage, String> {
 }
 
 #[tauri::command]
-fn get_headroom_pricing_status(state: State<'_, AppState>) -> Result<HeadroomPricingStatus, String> {
+fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
+    pricing::detect_claude_profile(&state)
+}
+
+#[tauri::command]
+fn get_headroom_pricing_status(
+    state: State<'_, AppState>,
+) -> Result<HeadroomPricingStatus, String> {
     pricing::get_pricing_status(&state)
 }
 
@@ -667,6 +676,7 @@ pub fn run() {
             get_tool_logs,
             get_claude_code_projects,
             get_claude_usage,
+            get_claude_profile,
             get_headroom_pricing_status,
             request_headroom_auth_code,
             verify_headroom_auth_code,
