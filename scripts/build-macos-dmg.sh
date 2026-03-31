@@ -86,10 +86,9 @@ fi
 
 export CI="${CI:-true}"
 
-TARGET_ARGS=()
-if [[ -n "${TARGET:-}" ]]; then
-  TARGET_ARGS+=(--target "${TARGET}")
-fi
-
 cd "${REPO_ROOT}"
-npx tauri build --bundles dmg --ci "${TARGET_ARGS[@]}"
+if [[ -n "${TARGET:-}" ]]; then
+  npx tauri build --bundles dmg --ci --target "${TARGET}"
+else
+  npx tauri build --bundles dmg --ci
+fi
