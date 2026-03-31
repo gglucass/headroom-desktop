@@ -34,6 +34,7 @@ pub struct AppState {
     savings_tracker: Mutex<SavingsTracker>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
+    cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
 }
 
@@ -88,6 +89,7 @@ impl AppState {
             savings_tracker: Mutex::new(savings_tracker),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
+            cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
         };
 
@@ -146,6 +148,22 @@ impl AppState {
         stats
     }
 
+    fn cached_headroom_history(&self) -> Option<HeadroomSavingsHistoryResponse> {
+        const TTL: Duration = Duration::from_secs(8);
+        let mut cache = self
+            .cached_headroom_history
+            .lock()
+            .expect("cached_headroom_history poisoned");
+        if let Some((history, at)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return history.clone();
+            }
+        }
+        let history = fetch_headroom_savings_history();
+        *cache = Some((history.clone(), Instant::now()));
+        history
+    }
+
     fn cached_rtk_gain_summary(&self) -> Option<RtkGainSummary> {
         const TTL: Duration = Duration::from_secs(10);
         let mut cache = self
@@ -186,27 +204,45 @@ impl AppState {
                 (SavingsTotalsSnapshot::default(), Vec::new(), Vec::new())
             };
 
-        if let Some(stats) = self.cached_headroom_stats() {
-            if let Some((updated, updated_daily)) = self.record_savings_snapshot(&stats) {
-                snapshot = updated;
-                daily_savings = updated_daily;
-                if let Ok(tracker) = self.savings_tracker.lock() {
-                    hourly_savings = tracker.hourly_savings();
-                }
-            } else {
-                if let Some(requests) = stats.session_requests {
-                    snapshot.session_requests = requests;
-                }
-                if let Some(saved_usd) = stats.session_estimated_savings_usd {
-                    snapshot.session_estimated_savings_usd = saved_usd;
-                }
-                if let Some(saved_tokens) = stats.session_estimated_tokens_saved {
-                    snapshot.session_estimated_tokens_saved = saved_tokens;
-                }
-                if let Some(savings_pct) = stats.session_savings_pct {
-                    snapshot.session_savings_pct = savings_pct;
+        let stats = self.cached_headroom_stats();
+        let history = self.cached_headroom_history();
+
+        if history.is_none() {
+            if let Some(stats) = stats.as_ref() {
+                if let Some((updated, updated_daily)) = self.record_savings_snapshot(stats) {
+                    snapshot = updated;
+                    daily_savings = updated_daily;
+                    if let Ok(tracker) = self.savings_tracker.lock() {
+                        hourly_savings = tracker.hourly_savings();
+                    }
                 }
             }
+        }
+
+        if let Some(stats) = stats.as_ref() {
+            if let Some(requests) = stats.session_requests {
+                snapshot.session_requests = requests;
+            }
+            if let Some(saved_usd) = stats.session_estimated_savings_usd {
+                snapshot.session_estimated_savings_usd = saved_usd;
+            }
+            if let Some(saved_tokens) = stats.session_estimated_tokens_saved {
+                snapshot.session_estimated_tokens_saved = saved_tokens;
+            }
+            if let Some(savings_pct) = stats.session_savings_pct {
+                snapshot.session_savings_pct = savings_pct;
+            }
+        }
+
+        if let Some(history) = history.as_ref() {
+            if let Some(saved_usd) = history.lifetime_estimated_savings_usd {
+                snapshot.lifetime_estimated_savings_usd = saved_usd;
+            }
+            if let Some(saved_tokens) = history.lifetime_estimated_tokens_saved {
+                snapshot.lifetime_estimated_tokens_saved = saved_tokens;
+            }
+            daily_savings = history.daily_savings();
+            hourly_savings = history.hourly_savings();
         }
 
         DashboardState {
@@ -750,7 +786,8 @@ fn build_claude_code_project(
         .unwrap_or_else(|| project_path.clone());
 
     let last_learn_ran_at = tool_manager.headroom_learn_last_run_at(&project_path);
-    let has_persisted_learnings = tool_manager.headroom_learn_has_persisted_learnings(&project_path);
+    let has_persisted_learnings =
+        tool_manager.headroom_learn_has_persisted_learnings(&project_path);
     let last_learn_pattern_count = tool_manager.headroom_learn_pattern_count(&project_path);
     let active_days_since_last_learn = if let Some(ref learn_at_str) = last_learn_ran_at {
         chrono::DateTime::parse_from_rfc3339(learn_at_str)
@@ -1616,6 +1653,49 @@ struct HeadroomDashboardStats {
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct HeadroomSavingsRollupPoint {
+    timestamp: chrono::DateTime<Utc>,
+    tokens_saved: u64,
+    compression_savings_usd_delta: f64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct HeadroomSavingsHistoryResponse {
+    lifetime_estimated_savings_usd: Option<f64>,
+    lifetime_estimated_tokens_saved: Option<u64>,
+    hourly: Vec<HeadroomSavingsRollupPoint>,
+    daily: Vec<HeadroomSavingsRollupPoint>,
+}
+
+impl HeadroomSavingsHistoryResponse {
+    fn daily_savings(&self) -> Vec<DailySavingsPoint> {
+        self.daily
+            .iter()
+            .map(|point| DailySavingsPoint {
+                date: local_day_key(point.timestamp.with_timezone(&Local)),
+                estimated_savings_usd: point.compression_savings_usd_delta,
+                estimated_tokens_saved: point.tokens_saved,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            })
+            .collect()
+    }
+
+    fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
+        self.hourly
+            .iter()
+            .map(|point| HourlySavingsPoint {
+                hour: local_hour_key(point.timestamp.with_timezone(&Local)),
+                estimated_savings_usd: point.compression_savings_usd_delta,
+                estimated_tokens_saved: point.tokens_saved,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            })
+            .collect()
+    }
+}
+
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     if !is_headroom_proxy_reachable() {
         return None;
@@ -1641,6 +1721,38 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
+    if !is_headroom_proxy_reachable() {
+        return None;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
+
+    let hosts = ["127.0.0.1", "localhost"];
+
+    for host in hosts {
+        let url = format!("http://{host}:6767/stats-history");
+        let response = match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => response,
+            _ => continue,
+        };
+
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+
+        if let Some(parsed) = parse_headroom_stats_history_from_json(&body) {
             return Some(parsed);
         }
     }
@@ -1795,6 +1907,35 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     }
 }
 
+fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsHistoryResponse> {
+    let root = serde_json::from_str::<Value>(body).ok()?;
+    let lifetime_estimated_tokens_saved = value_at_path_u64(&root, &["lifetime", "tokens_saved"]);
+    let lifetime_estimated_savings_usd =
+        value_at_path_f64(&root, &["lifetime", "compression_savings_usd"]);
+    let hourly = value_at_path(&root, &["series", "hourly"])
+        .and_then(parse_savings_rollup_series)
+        .unwrap_or_default();
+    let daily = value_at_path(&root, &["series", "daily"])
+        .and_then(parse_savings_rollup_series)
+        .unwrap_or_default();
+
+    if lifetime_estimated_tokens_saved.is_none()
+        && lifetime_estimated_savings_usd.is_none()
+        && hourly.is_empty()
+        && daily.is_empty()
+    {
+        None
+    } else {
+        Some(HeadroomSavingsHistoryResponse {
+            lifetime_estimated_savings_usd: lifetime_estimated_savings_usd
+                .map(|value| value.max(0.0)),
+            lifetime_estimated_tokens_saved,
+            hourly,
+            daily,
+        })
+    }
+}
+
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
     let value = value_at_path(root, path)?;
     parse_u64_value(value)
@@ -1829,6 +1970,17 @@ fn parse_savings_history(value: &Value) -> Option<Vec<HeadroomSavingsHistoryPoin
     Some(points)
 }
 
+fn parse_savings_rollup_series(value: &Value) -> Option<Vec<HeadroomSavingsRollupPoint>> {
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let points = items
+        .iter()
+        .filter_map(parse_savings_rollup_point)
+        .collect::<Vec<_>>();
+    Some(points)
+}
+
 fn parse_savings_history_point(value: &Value) -> Option<HeadroomSavingsHistoryPoint> {
     match value {
         Value::Array(items) if items.len() >= 2 => {
@@ -1855,6 +2007,30 @@ fn parse_savings_history_point(value: &Value) -> Option<HeadroomSavingsHistoryPo
         }
         _ => None,
     }
+}
+
+fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoint> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+
+    let timestamp = map
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .and_then(parse_history_timestamp)?;
+
+    Some(HeadroomSavingsRollupPoint {
+        timestamp,
+        tokens_saved: map
+            .get("tokens_saved")
+            .and_then(parse_u64_value)
+            .unwrap_or_default(),
+        compression_savings_usd_delta: map
+            .get("compression_savings_usd_delta")
+            .and_then(parse_f64_value)
+            .unwrap_or_default()
+            .max(0.0),
+    })
 }
 
 fn parse_history_timestamp(text: &str) -> Option<chrono::DateTime<Utc>> {
@@ -2342,9 +2518,9 @@ mod tests {
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
     use super::{
-        parse_headroom_stats_from_json, AppState, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
-        SavingsObservation, SavingsTracker,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, AppState,
+        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
 
     fn make_tracker() -> SavingsTracker {
@@ -2622,6 +2798,12 @@ mod tests {
     fn parse_headroom_stats_uses_compression_scoped_savings_fields() {
         let parsed = parse_headroom_stats_from_json(
             r#"{
+                "persistent_savings": {
+                    "lifetime": {
+                        "tokens_saved": 2400,
+                        "compression_savings_usd": 0.84
+                    }
+                },
                 "requests": { "total": 5 },
                 "tokens": {
                     "saved": 1200,
@@ -2646,6 +2828,74 @@ mod tests {
         assert_eq!(parsed.session_actual_cost_usd, Some(1.23));
         assert_eq!(parsed.session_total_tokens_sent, Some(3_600));
         assert_eq!(parsed.savings_history.len(), 1);
+    }
+
+    #[test]
+    fn parse_headroom_stats_history_reads_hourly_and_daily_rollups() {
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+                "lifetime": {
+                    "tokens_saved": 205,
+                    "compression_savings_usd": 0.205
+                },
+                "series": {
+                    "hourly": [
+                        {
+                            "timestamp": "2026-03-27T09:00:00Z",
+                            "tokens_saved": 150,
+                            "compression_savings_usd_delta": 0.15,
+                            "total_tokens_saved": 150,
+                            "compression_savings_usd": 0.15
+                        },
+                        {
+                            "timestamp": "2026-03-27T10:00:00Z",
+                            "tokens_saved": 25,
+                            "compression_savings_usd_delta": 0.025,
+                            "total_tokens_saved": 175,
+                            "compression_savings_usd": 0.175
+                        }
+                    ],
+                    "daily": [
+                        {
+                            "timestamp": "2026-03-27T00:00:00Z",
+                            "tokens_saved": 175,
+                            "compression_savings_usd_delta": 0.175,
+                            "total_tokens_saved": 175,
+                            "compression_savings_usd": 0.175
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parsed history");
+
+        assert_eq!(parsed.lifetime_estimated_tokens_saved, Some(205));
+        assert_eq!(parsed.lifetime_estimated_savings_usd, Some(0.205));
+        assert_eq!(parsed.hourly.len(), 2);
+        assert_eq!(parsed.hourly[0].tokens_saved, 150);
+        assert!((parsed.hourly[0].compression_savings_usd_delta - 0.15).abs() < 1e-9);
+        assert_eq!(parsed.daily.len(), 1);
+
+        let daily_points = parsed.daily_savings();
+        assert_eq!(daily_points.len(), 1);
+        assert_eq!(daily_points[0].date, "2026-03-27");
+        assert_eq!(daily_points[0].estimated_tokens_saved, 175);
+        assert!((daily_points[0].estimated_savings_usd - 0.175).abs() < 1e-9);
+        assert_eq!(daily_points[0].actual_cost_usd, 0.0);
+        assert_eq!(daily_points[0].total_tokens_sent, 0);
+
+        let hourly_points = parsed.hourly_savings();
+        assert_eq!(hourly_points.len(), 2);
+        let expected_hour = Utc
+            .with_ymd_and_hms(2026, 3, 27, 9, 0, 0)
+            .single()
+            .expect("hour")
+            .with_timezone(&Local)
+            .format("%Y-%m-%dT%H:00")
+            .to_string();
+        assert_eq!(hourly_points[0].hour, expected_hour);
+        assert_eq!(hourly_points[0].estimated_tokens_saved, 150);
+        assert!((hourly_points[0].estimated_savings_usd - 0.15).abs() < 1e-9);
     }
 
     #[test]
