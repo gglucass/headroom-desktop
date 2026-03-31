@@ -19,6 +19,7 @@ use tauri::Manager;
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
@@ -30,6 +31,7 @@ use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
 const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
@@ -561,10 +563,19 @@ fn quit_headroom(app: AppHandle) {
     app.exit(0);
 }
 
+fn launched_from_autostart() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
+}
+
 pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_LAUNCH_ARG])
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -573,10 +584,17 @@ pub fn run() {
                 app.set_dock_visibility(false);
             }
 
+            let launched_from_autostart = launched_from_autostart();
+            if let Ok(false) = app.autolaunch().is_enabled() {
+                if let Err(err) = app.autolaunch().enable() {
+                    eprintln!("failed to enable autostart: {err}");
+                }
+            }
+
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
-            if state.should_present_on_launch() {
+            if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
             let app_handle = app.handle().clone();
