@@ -39,7 +39,7 @@ The marketing/download website now lives in a separate private repo so the deskt
 
 ## Dependency pinning policy
 
-- Headroom is pinned in-app to `headroom-ai[all]==0.5.6` from PyPI for stable releases.
+- Headroom is pinned in-app to `headroom-ai[all]==0.5.16` from PyPI for stable releases.
 - For each new Headroom app release, validate compatibility against the latest released Headroom version before deciding whether to bump the pin.
 
 ## macOS release flow

@@ -266,7 +266,7 @@ function getUpgradePlans(audience: PricingAudience): {
           name: "Free",
           tagline: "Local savings & optimizations",
           price: "$0",
-          billingLines: ["/ month", "free forever"],
+          billingLines: ["/ month", "free"],
           featureIntro: "Includes:",
           features: [
             "Run locally on 1 device",
