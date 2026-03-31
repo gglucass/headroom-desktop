@@ -18,9 +18,10 @@ Headroom is a local-first desktop tray app for coding-focused LLM workflows. It 
 
 - `src/`: React/Tauri frontend
 - `src-tauri/`: Rust backend and Tauri configuration
-- `apps/web/`: Rails website for app download
 - `research/`: tool inclusion research artifacts
 - `docs/`: architecture notes
+
+The marketing/download website now lives in a separate private repo so the desktop app can stay open source without exposing the web app source.
 
 ## Client setup
 
@@ -71,13 +72,3 @@ Run Rust tests with:
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
-
-Run the Rails website with:
-
-```bash
-cd apps/web
-bundle install
-bin/rails server
-```
-
-Optional: set `HEADROOM_MAC_DOWNLOAD_URL` to show an active download button on `/`.
