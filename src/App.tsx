@@ -69,8 +69,6 @@ import {
 } from "./lib/dashboardHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
-  authMethodLabel,
-  claudePlanLabel,
   formatPercentValue,
   formatRemainingDays,
   subscriptionTierLabel
@@ -331,13 +329,12 @@ function getUpgradePlans(
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Everything in Free, plus:",
         features: [
-          "Unlimited usage with Claude Pro",
+          "Unlimited use with Claude Pro",
           "Track sessions across devices",
           "Email-based support"
         ],
         ctaLabel: "Get Pro",
-        ctaVariant: "primary",
-        disabled: !POLAR_PRO_CHECKOUT_URL
+        ctaVariant: "primary"
       },
       max5x: {
         id: "max5x",
@@ -347,13 +344,12 @@ function getUpgradePlans(
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [
-          "Unlimited usage with Claude Max x5",
+          "Unlimited use with Claude Max x5",
           "Track sessions across devices",
           "Email-based support"
         ],
         ctaLabel: "Get Max x5",
-        ctaVariant: "primary",
-        disabled: !POLAR_MAX5X_CHECKOUT_URL
+        ctaVariant: "primary"
       },
       max20x: {
         id: "max20x",
@@ -363,13 +359,12 @@ function getUpgradePlans(
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [
-          "Unlimited usage with Claude Max x20",
+          "Unlimited use with Claude Max x20",
           "Track sessions across devices",
           "Priority support"
         ],
         ctaLabel: "Get Max x20",
-        ctaVariant: "primary",
-        disabled: !POLAR_MAX20X_CHECKOUT_URL
+        ctaVariant: "primary"
       }
     };
 
@@ -1975,21 +1970,15 @@ export default function App() {
           };
         case "pro":
           return {
-            kind: "external" as const,
-            url: POLAR_PRO_CHECKOUT_URL,
-            missing: "Set VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL to enable Pro checkout."
+            kind: "checkout" as const
           };
         case "max5x":
           return {
-            kind: "external" as const,
-            url: POLAR_MAX5X_CHECKOUT_URL,
-            missing: "Set VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL to enable Max x5 checkout."
+            kind: "checkout" as const
           };
         case "max20x":
           return {
-            kind: "external" as const,
-            url: POLAR_MAX20X_CHECKOUT_URL,
-            missing: "Set VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL to enable Max x20 checkout."
+            kind: "checkout" as const
           };
         case "team":
           return {
@@ -2020,6 +2009,28 @@ export default function App() {
 
     if (!pricingStatus?.authenticated) {
       openUpgradeAuthView(planId);
+      return;
+    }
+
+    if (action.kind === "checkout") {
+      setUpgradeActionBusy(planId);
+      setUpgradeActionError(null);
+
+      try {
+        const url = await invoke<string>("create_headroom_checkout_session", {
+          subscriptionTier: planId
+        });
+        await openExternalLink(url);
+        window.setTimeout(() => {
+          void refreshPricingStatus();
+        }, 5_000);
+      } catch (error) {
+        setUpgradeActionError(
+          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not start checkout."
+        );
+      } finally {
+        setUpgradeActionBusy(null);
+      }
       return;
     }
 
@@ -2840,8 +2851,6 @@ export default function App() {
     return [...topProjects, pinnedClaudeProject];
   })();
   const hiddenClaudeProjectsCount = sortedClaudeProjects.length - visibleClaudeProjects.length;
-  const detectedClaudePlanLabel = claudePlanLabel(pricingStatus?.claude.planTier ?? "unknown");
-  const detectedAuthMethod = authMethodLabel(pricingStatus?.claude.authMethod ?? "unknown");
   const trialDaysRemaining = formatRemainingDays(pricingStatus?.account?.trialEndsAt);
   const localGraceHoursRemaining = (() => {
     const target = pricingStatus?.localGraceEndsAt
@@ -2869,63 +2878,30 @@ export default function App() {
   const upgradeAuthMessage = pendingUpgradePlanLabel
     ? `Sign in with email to upgrade to the ${pendingUpgradePlanLabel} plan`
     : "Sign in with email to unlock your 14-day Headroom trial";
-  const accountPlanSummary = (() => {
-    if (!pricingStatus?.authenticated) {
-      return "Not signed in";
-    }
-    if (!pricingStatus.account) {
-      return "Syncing account...";
-    }
-    if (pricingStatus.account?.subscriptionActive) {
-      return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
-    }
-    if (pricingStatus.account?.trialActive) {
-      if (trialDaysRemaining != null) {
-        return `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in 14-day trial`;
-      }
-      return "14-day Headroom trial";
-    }
-    return "Trial expired";
-  })();
-  const accountStatusSummary = (() => {
-    if (!pricingStatus) {
-      return "Loading account status...";
-    }
-    if (!pricingStatus.authenticated) {
-      return "Create a Headroom account to unlock the 14-day trial.";
-    }
-    if (!pricingStatus.account) {
-      return "Signed in. Headroom is syncing your account details.";
-    }
-    if (pricingStatus.account?.subscriptionActive) {
-      return "Unlimited optimization is unlocked.";
-    }
-    if (pricingStatus.account?.trialActive) {
-      return "Unlimited optimization is active during the trial.";
-    }
-    return `Weekly access is capped at ${weeklyLimitPercentLabel} of your Claude Code limits until you upgrade.`;
-  })();
-  const accountEmailSummary = (() => {
+  const accountDisplayEmail = (() => {
     const enteredEmail = authEmail.trim();
     return (
       pricingStatus?.account?.email ??
-      (enteredEmail || pricingStatus?.claude.email || "No account connected")
+      (enteredEmail || pricingStatus?.claude.email || "unknown email")
     );
   })();
-  const accountPlanMeta = (() => {
+  const accountPlanName = (() => {
     if (!pricingStatus?.authenticated) {
-      return "Upgrade to continue using Headroom without limits";
+      return null;
     }
     if (!pricingStatus.account) {
-      return "Plan details are syncing";
+      return "Syncing plan...";
     }
     if (pricingStatus.account.subscriptionActive) {
-      return "Unlimited optimization unlocked";
+      return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
     }
     if (pricingStatus.account.trialActive) {
-      return "Upgrade any time to keep unlimited optimization";
+      if (trialDaysRemaining != null) {
+        return `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in trial`;
+      }
+      return "14-day trial";
     }
-    return "Upgrade to continue using Headroom without limits";
+    return "Trial expired";
   })();
   const upgradeTrialCallout = (() => {
     if (pricingBusy && !pricingStatus) {
@@ -2979,7 +2955,7 @@ export default function App() {
           : "14 days";
       return {
         tone: "warning" as const,
-        message: `${daysLabel} of Headroom trial to go. Upgrade to continue using Headroom without limits.`,
+        message: `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`,
         actionLabel: "Upgrade",
         onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
       };
@@ -3658,15 +3634,17 @@ export default function App() {
 
             <section className="panel-stack">
               <article className="soft-card panel-card settings-account-card">
-                <div className="panel-card__header">
-                  <div>
-                    <h3>Headroom account</h3>
-                    <p>
-                      {pricingStatus?.authenticated
-                        ? "Signed in"
-                        : "Not signed in"}
-                    </p>
-                  </div>
+                <div className="settings-account-row">
+                  <p className="settings-account-copy">
+                    Headroom account:{" "}
+                    {pricingStatus?.authenticated ? (
+                      <>
+                        {accountDisplayEmail} <em>({accountPlanName})</em>
+                      </>
+                    ) : (
+                      <em>not signed in</em>
+                    )}
+                  </p>
                   {pricingStatus?.authenticated ? (
                     <button
                       className="secondary-button secondary-button--small"
@@ -3682,35 +3660,9 @@ export default function App() {
                       onClick={() => openUpgradeAuthView()}
                       type="button"
                     >
-                      Create account
+                      Sign in
                     </button>
                   )}
-                </div>
-                <div className="settings-account-grid">
-                  <article className="pricing-metric">
-                    <span className="pricing-metric__label">Status</span>
-                    <strong>{pricingStatus?.authenticated ? "Signed in" : "Not signed in"}</strong>
-                    <small>{accountStatusSummary}</small>
-                  </article>
-                  <article className="pricing-metric">
-                    <span className="pricing-metric__label">Email</span>
-                    <strong>{accountEmailSummary}</strong>
-                    <small>
-                      {pricingStatus?.claude.email
-                        ? `Claude Code email: ${pricingStatus.claude.email}`
-                        : "Claude Code email not detected yet"}
-                    </small>
-                  </article>
-                  <article className="pricing-metric">
-                    <span className="pricing-metric__label">Headroom plan</span>
-                    <strong>{accountPlanSummary}</strong>
-                    <small>{accountPlanMeta}</small>
-                  </article>
-                  <article className="pricing-metric">
-                    <span className="pricing-metric__label">Claude Code plan</span>
-                    <strong>{detectedClaudePlanLabel}</strong>
-                    <small>{detectedAuthMethod}</small>
-                  </article>
                 </div>
               </article>
 

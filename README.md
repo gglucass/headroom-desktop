@@ -39,7 +39,7 @@ The marketing/download website now lives in a separate private repo so the deskt
 
 ## Dependency pinning policy
 
-- Headroom is pinned in-app to `headroom-ai[all]==0.5.16` from PyPI for stable releases.
+- Headroom is pinned in-app to `headroom-ai[all]==0.5.17` from PyPI for stable releases.
 - For each new Headroom app release, validate compatibility against the latest released Headroom version before deciding whether to bump the pin.
 
 ## macOS release flow
@@ -57,15 +57,29 @@ npm install
 npm run tauri dev
 ```
 
-To enable the live Pro checkout button in the desktop app, set a Polar Checkout Link in a local `.env` file:
+To enable the live pricing/auth flow in the desktop app, set these placeholders in a local `.env` file:
 
 ```bash
-VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-product-price"
+HEADROOM_ACCOUNT_API_BASE_URL="https://headroom.garm.com/api/v1"
+VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-pro-product"
+VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max5x-product"
+VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max20x-product"
+VITE_HEADROOM_SALES_CONTACT_URL="mailto:hello@headroom.garm.com"
+VITE_HEADROOM_CONTACT_FORM_URL="https://headroom.garm.com/contact_request"
 ```
 
 Polar's official checkout-link API/docs:
 - [Create Checkout Link](https://polar.sh/docs/api-reference/checkout-links/create)
 - [Create Checkout Session](https://polar.sh/docs/api-reference/checkouts/create-session)
+
+For production macOS releases, set the same values as GitHub Actions repository variables so the packaged app points at the deployed web service:
+
+- `HEADROOM_ACCOUNT_API_BASE_URL`
+- `VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL`
+- `VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL`
+- `VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL`
+- `VITE_HEADROOM_SALES_CONTACT_URL`
+- `VITE_HEADROOM_CONTACT_FORM_URL`
 
 Run Rust tests with:
 

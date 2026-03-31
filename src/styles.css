@@ -2281,14 +2281,25 @@ details[open] .optimize-minimal__details summary::after {
 }
 
 .settings-account-card {
-  gap: 14px;
+  padding: 14px 16px;
 }
 
-.settings-account-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.settings-account-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
-  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.settings-account-copy {
+  margin: 0;
+  color: #2b2521;
+  font-size: var(--text-sm);
+}
+
+.settings-account-copy em {
+  color: #6a615a;
 }
 
 .quit-button {
@@ -2810,8 +2821,7 @@ html.window-hiding {
   }
 
   .pricing-status-grid,
-  .pricing-auth-card__grid,
-  .settings-account-grid {
+  .pricing-auth-card__grid {
     grid-template-columns: 1fr;
   }
 

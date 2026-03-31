@@ -16,15 +16,15 @@ use tar::Archive;
 
 use crate::models::{ManagedTool, ToolStatus};
 
-const HEADROOM_VERSION: &str = "0.5.16";
+const HEADROOM_VERSION: &str = "0.5.17";
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
-const HEADROOM_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/2d/fa/f3939c585ce4c8e66774d11c11aae602e67ae908adabf7ba45b712c73099/headroom_ai-0.5.16-py3-none-any.whl";
+const HEADROOM_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ef/61/d5cb570d4e47926d3b2e734f94a64719fdd54eeb123f9906a1a38ef4121d/headroom_ai-0.5.17-py3-none-any.whl";
 const HEADROOM_WHEEL_SHA256: &str =
-    "08f24754f18de22bdb19e846e2544053139a254b115db1b94e5bf1a6a0b9d5bc";
+    "865f10441db39f4087218127d298451c38024609fc5f02bbdb820dc375e9553c";
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const RTK_VERSION: &str = "0.33.1";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
@@ -777,7 +777,7 @@ impl ToolManager {
         let wheel_path = self
             .runtime
             .downloads_dir
-            .join("headroom_ai-0.5.16-py3-none-any.whl");
+            .join(format!("headroom_ai-{HEADROOM_VERSION}-py3-none-any.whl"));
         download_to_path(&artifact.url, &wheel_path, artifact.sha256)?;
 
         run_python_command(

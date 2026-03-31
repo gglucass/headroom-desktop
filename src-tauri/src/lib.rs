@@ -27,8 +27,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::models::{
     BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus,
     ClientSetupResult, ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus, ResearchCandidate,
-    RuntimeStatus,
+    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus,
 };
 use crate::state::AppState;
 
@@ -326,6 +326,13 @@ fn sign_out_headroom_account() -> Result<(), String> {
 #[tauri::command]
 fn activate_headroom_account(state: State<'_, AppState>) -> Result<HeadroomPricingStatus, String> {
     pricing::activate_account(&state)
+}
+
+#[tauri::command]
+fn create_headroom_checkout_session(
+    subscription_tier: HeadroomSubscriptionTier,
+) -> Result<String, String> {
+    pricing::create_checkout_session(subscription_tier)
 }
 
 #[tauri::command]
@@ -682,6 +689,7 @@ pub fn run() {
             verify_headroom_auth_code,
             sign_out_headroom_account,
             activate_headroom_account,
+            create_headroom_checkout_session,
             get_headroom_learn_status,
             get_headroom_learn_api_key_status,
             set_headroom_learn_api_key,

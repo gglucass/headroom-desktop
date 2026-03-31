@@ -98,6 +98,24 @@ struct VerifyCodePayload<'a> {
     invite_code: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutSessionPayload {
+    subscription_tier: HeadroomSubscriptionTier,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutSessionResponse {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiErrorResponse {
+    error: Option<String>,
+}
+
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
     let local_state = load_or_initialize_local_state()?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
@@ -252,6 +270,43 @@ pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, Strin
         Some(remote_account_to_profile(body.account)),
         claude,
     ))
+}
+
+pub fn create_checkout_session(
+    subscription_tier: HeadroomSubscriptionTier,
+) -> Result<String, String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before starting checkout.".to_string())?;
+    let response = http_client()?
+        .post(api_url("desktop/checkout"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&CheckoutSessionPayload { subscription_tier })
+        .send()
+        .map_err(|err| format!("Could not create checkout session: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(
+            api_error.unwrap_or_else(|| {
+                format!("Could not create checkout session (status {status}).")
+            }),
+        );
+    }
+
+    response
+        .json::<CheckoutSessionResponse>()
+        .map(|body| body.url)
+        .map_err(|err| format!("Could not parse checkout response: {err}"))
 }
 
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
