@@ -12,18 +12,8 @@ permissions:
 
 jobs:
   release:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS Apple Silicon
-            runner: macos-latest
-            target: aarch64-apple-darwin
-          - name: macOS Intel
-            runner: macos-latest
-            target: x86_64-apple-darwin
+    name: macOS Apple Silicon
+    runs-on: macos-latest
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: ${{ format('["https://github.com/{0}/releases/latest/download/latest.json"]', github.repository) }}
@@ -56,7 +46,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -155,4 +145,4 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
-          args: --target ${{ matrix.target }}
+          args: --target aarch64-apple-darwin
