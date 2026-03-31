@@ -910,7 +910,7 @@ select {
 }
 
 .upgrade-plan-card__top {
-  gap: 4px;
+  gap: 7px;
   border-bottom: 1px solid rgba(36, 31, 29, 0.08);
 }
 
@@ -985,7 +985,7 @@ select {
   width: 100%;
   justify-content: center;
   padding-block: 0px;
-  min-height: 18px;
+  min-height: 42px;
   font-size: 0.95rem;
 }
 

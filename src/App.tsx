@@ -299,7 +299,8 @@ function SavingsChartTooltip({
 
 function getUpgradePlans(
   audience: PricingAudience,
-  claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"]
+  claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
+  recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"]
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -395,6 +396,19 @@ function getUpgradePlans(
       return {
         plans: [freePlan, ...orderedPaidPlans],
         featuredPlanId: activePaidPlanId
+      };
+    }
+
+    if (recommendedSubscriptionTier) {
+      const orderedPaidPlans = [
+        paidPlans[recommendedSubscriptionTier],
+        ...(["pro", "max5x", "max20x"] as const)
+          .filter((planId) => planId !== recommendedSubscriptionTier)
+          .map((planId) => paidPlans[planId])
+      ];
+      return {
+        plans: [freePlan, ...orderedPaidPlans],
+        featuredPlanId: recommendedSubscriptionTier
       };
     }
 
@@ -767,7 +781,11 @@ export default function App() {
     pendingLearnProjectPath
       ? "Saving stores this key in macOS Keychain, then Headroom reads it immediately to start Learn for the selected project."
       : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
-  const upgradePlansState = getUpgradePlans(pricingAudience, pricingStatus?.claude.planTier);
+  const upgradePlansState = getUpgradePlans(
+    pricingAudience,
+    pricingStatus?.claude.planTier,
+    pricingStatus?.recommendedSubscriptionTier
+  );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
   const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
   const showInstallProgress =
