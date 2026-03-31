@@ -17,7 +17,8 @@ use tar::Archive;
 use crate::models::{ManagedTool, ToolStatus};
 
 const HEADROOM_VERSION: &str = "0.5.16";
-const HEADROOM_PROXY_PORT: &str = "6767";
+// headroom binds on 6768; the intercept layer on 6767 forwards to it.
+const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
@@ -324,9 +325,10 @@ impl ToolManager {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         startup_error = Some(format!(
-                            "headroom {} exited with status {} before opening port 6767 (log: {})",
+                            "headroom {} exited with status {} before opening port {} (log: {})",
                             args.join(" "),
                             status,
+                            HEADROOM_PROXY_PORT,
                             log_path.display()
                         ));
                         break;
@@ -567,7 +569,10 @@ impl ToolManager {
             .filter_map(|path| read_headroom_learn_metadata_from_path(&path))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
-        candidates.into_iter().next().map(|candidate| candidate.metadata)
+        candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.metadata)
     }
 
     fn headroom_learn_memory_paths(&self, project_path: &str) -> Vec<PathBuf> {
@@ -988,7 +993,9 @@ impl ToolManager {
 }
 
 fn is_local_proxy_reachable() -> bool {
-    let address: SocketAddr = match "127.0.0.1:6767".parse() {
+    // Check headroom's actual backend port (6768), not the intercept port (6767),
+    // because the intercept starts before headroom and would always be reachable.
+    let address: SocketAddr = match "127.0.0.1:6768".parse() {
         Ok(address) => address,
         Err(_) => return false,
     };

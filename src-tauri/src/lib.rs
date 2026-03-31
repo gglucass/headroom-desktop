@@ -2,6 +2,8 @@ mod client_adapters;
 mod insights;
 mod keychain;
 mod models;
+mod pricing;
+mod proxy_intercept;
 mod research;
 mod state;
 mod storage;
@@ -23,9 +25,10 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    BootstrapProgress, ClaudeCodeProject, ClientConnectorStatus, ClientSetupResult,
-    ClientSetupVerification, DashboardState, HeadroomLearnApiKeyStatus, HeadroomLearnStatus,
-    ResearchCandidate, RuntimeStatus,
+    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus,
+    ClientSetupResult, ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
+    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus, ResearchCandidate,
+    RuntimeStatus,
 };
 use crate::state::AppState;
 
@@ -34,6 +37,8 @@ const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS"
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
+const HEADROOM_CLAUDE_TOKEN_SERVICE: &str = "com.garm.headroom";
+const HEADROOM_CLAUDE_TOKEN_ACCOUNT: &str = "claude-bearer-token";
 const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
 const HEADROOM_LEARN_ANTHROPIC_ACCOUNT: &str = "anthropic";
 const HEADROOM_LEARN_GEMINI_ACCOUNT: &str = "gemini";
@@ -279,6 +284,48 @@ fn get_claude_code_projects(state: State<'_, AppState>) -> Result<Vec<ClaudeCode
     state
         .list_claude_code_projects()
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn get_claude_usage(state: State<'_, AppState>) -> Result<ClaudeUsage, String> {
+    pricing::fetch_claude_usage(&state)
+}
+
+#[tauri::command]
+fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
+    pricing::detect_claude_profile(&state)
+}
+
+#[tauri::command]
+fn get_headroom_pricing_status(
+    state: State<'_, AppState>,
+) -> Result<HeadroomPricingStatus, String> {
+    pricing::get_pricing_status(&state)
+}
+
+#[tauri::command]
+fn request_headroom_auth_code(email: String) -> Result<HeadroomAuthCodeRequest, String> {
+    pricing::request_auth_code(&email)
+}
+
+#[tauri::command]
+fn verify_headroom_auth_code(
+    state: State<'_, AppState>,
+    email: String,
+    code: String,
+    invite_code: Option<String>,
+) -> Result<HeadroomPricingStatus, String> {
+    pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())
+}
+
+#[tauri::command]
+fn sign_out_headroom_account() -> Result<(), String> {
+    pricing::sign_out()
+}
+
+#[tauri::command]
+fn activate_headroom_account(state: State<'_, AppState>) -> Result<HeadroomPricingStatus, String> {
+    pricing::activate_account(&state)
 }
 
 #[tauri::command]
@@ -594,6 +641,8 @@ pub fn run() {
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
+            // Start the intercept layer before anything else touches port 6767.
+            proxy_intercept::spawn(std::sync::Arc::clone(&state.claude_bearer_token));
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
@@ -626,6 +675,13 @@ pub fn run() {
             get_rtk_activity,
             get_tool_logs,
             get_claude_code_projects,
+            get_claude_usage,
+            get_claude_profile,
+            get_headroom_pricing_status,
+            request_headroom_auth_code,
+            verify_headroom_auth_code,
+            sign_out_headroom_account,
+            activate_headroom_account,
             get_headroom_learn_status,
             get_headroom_learn_api_key_status,
             set_headroom_learn_api_key,

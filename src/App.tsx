@@ -13,11 +13,15 @@ import {
   PiggyBank,
   Bell,
   Brain,
+  CaretLeft,
   Cpu,
   CurrencyDollar,
+  EnvelopeSimple,
   GearSix,
   House,
   Heart,
+  Key,
+  SignOut,
   Sliders,
   Sparkle,
 } from "@phosphor-icons/react";
@@ -64,10 +68,19 @@ import {
   type SavingsChartDatum
 } from "./lib/dashboardHelpers";
 import { mockDashboard } from "./lib/mockData";
+import {
+  authMethodLabel,
+  claudePlanLabel,
+  formatPercentValue,
+  formatRemainingDays,
+  subscriptionTierLabel
+} from "./lib/pricing";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
   BootstrapProgress,
+  HeadroomAuthCodeRequest,
+  HeadroomPricingStatus,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -79,9 +92,29 @@ import type {
   RuntimeStatus,
 } from "./lib/types";
 
-type TrayView = "home" | "optimization" | "health" | "notifications" | "upgrade" | "settings";
+type TrayView =
+  | "home"
+  | "optimization"
+  | "health"
+  | "notifications"
+  | "upgrade"
+  | "upgradeAuth"
+  | "settings";
 type PricingAudience = "individual" | "teamEnterprise";
-type UpgradePlanId = "free" | "pro" | "team" | "enterprise";
+type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
+
+function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
+  switch (planId) {
+    case "pro":
+      return "Pro";
+    case "max5x":
+      return "Max x5";
+    case "max20x":
+      return "Max x20";
+    default:
+      return null;
+  }
+}
 
 interface NavItem {
   id: TrayView;
@@ -182,6 +215,14 @@ const POLAR_PRO_CHECKOUT_URL = (
   import.meta.env.VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL ??
   ""
 ).trim();
+const POLAR_MAX5X_CHECKOUT_URL = (
+  import.meta.env.VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL ??
+  ""
+).trim();
+const POLAR_MAX20X_CHECKOUT_URL = (
+  import.meta.env.VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL ??
+  ""
+).trim();
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
   ""
@@ -192,6 +233,8 @@ const CONTACT_FORM_URL = (
 ).trim();
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
+
+const authCodeExpiryFallbackSeconds = 900;
 
 async function loadDashboard(): Promise<DashboardState> {
   try {
@@ -254,44 +297,139 @@ function SavingsChartTooltip({
   );
 }
 
-function getUpgradePlans(audience: PricingAudience): {
+function getUpgradePlans(
+  audience: PricingAudience,
+  claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
+  recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"]
+): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
 } {
   if (audience === "individual") {
+    const freePlan: UpgradePlan = {
+      id: "free",
+      name: "Free",
+      tagline: "Limited usage with Claude",
+      price: "$0",
+      billingLines: ["/ month", "free"],
+      featureIntro: "Includes:",
+      features: [
+        "Unlocks cost savings and stats",
+        "Use with 25% of your Claude plan",
+        "Optimize Claude Code practices"
+      ],
+      ctaLabel: "Stay on Free plan",
+      ctaVariant: "secondary"
+    };
+
+    const paidPlans: Record<"pro" | "max5x" | "max20x", UpgradePlan> = {
+      pro: {
+        id: "pro",
+        name: "Pro",
+        tagline: "Unlock unlimited savings",
+        price: "$5",
+        billingLines: ["USD / month", "billed annually"],
+        featureIntro: "Everything in Free, plus:",
+        features: [
+          "Unlimited usage with Claude Pro",
+          "Track sessions across devices",
+          "Email-based support"
+        ],
+        ctaLabel: "Get Pro",
+        ctaVariant: "primary",
+        disabled: !POLAR_PRO_CHECKOUT_URL
+      },
+      max5x: {
+        id: "max5x",
+        name: "Max x5",
+        tagline: "For Claude Max x5 accounts",
+        price: "$25",
+        billingLines: ["USD / month", "billed annually"],
+        featureIntro: "Includes:",
+        features: [
+          "Unlimited usage with Claude Max x5",
+          "Track sessions across devices",
+          "Email-based support"
+        ],
+        ctaLabel: "Get Max x5",
+        ctaVariant: "primary",
+        disabled: !POLAR_MAX5X_CHECKOUT_URL
+      },
+      max20x: {
+        id: "max20x",
+        name: "Max x20",
+        tagline: "For Claude Max x20 accounts",
+        price: "$50",
+        billingLines: ["USD / month", "billed annually"],
+        featureIntro: "Includes:",
+        features: [
+          "Unlimited usage with Claude Max x20",
+          "Track sessions across devices",
+          "Priority support"
+        ],
+        ctaLabel: "Get Max x20",
+        ctaVariant: "primary",
+        disabled: !POLAR_MAX20X_CHECKOUT_URL
+      }
+    };
+
+    const activePaidPlanId = (() => {
+      switch (claudePlanTier) {
+        case "pro":
+          return "pro" as const;
+        case "max5x":
+          return "max5x" as const;
+        case "max20x":
+          return "max20x" as const;
+        default:
+          return null;
+      }
+    })();
+
+    if (activePaidPlanId) {
+      const orderedPaidPlans = [
+        paidPlans[activePaidPlanId],
+        ...(["pro", "max5x", "max20x"] as const)
+          .filter((planId) => planId !== activePaidPlanId)
+          .map((planId) => paidPlans[planId])
+      ];
+      return {
+        plans: [freePlan, ...orderedPaidPlans],
+        featuredPlanId: activePaidPlanId
+      };
+    }
+
+    if (recommendedSubscriptionTier) {
+      const orderedPaidPlans = [
+        paidPlans[recommendedSubscriptionTier],
+        ...(["pro", "max5x", "max20x"] as const)
+          .filter((planId) => planId !== recommendedSubscriptionTier)
+          .map((planId) => paidPlans[planId])
+      ];
+      return {
+        plans: [freePlan, ...orderedPaidPlans],
+        featuredPlanId: recommendedSubscriptionTier
+      };
+    }
+
+    if (claudePlanTier === "unknown") {
+      return {
+        plans: [
+          freePlan,
+          paidPlans.max5x,
+          paidPlans.pro,
+          paidPlans.max20x
+        ],
+        featuredPlanId: "max5x"
+      };
+    }
+
     return {
       plans: [
-        {
-          id: "free",
-          name: "Free",
-          tagline: "Local savings & optimizations",
-          price: "$0",
-          billingLines: ["/ month", "free"],
-          featureIntro: "Includes:",
-          features: [
-            "Run locally on 1 device",
-            "Savings dashboard and stats",
-            "Optimize Claude Code practices"
-          ],
-          ctaLabel: "Stay on Free plan",
-          ctaVariant: "secondary"
-        },
-        {
-          id: "pro",
-          name: "Pro",
-          tagline: "Continuity across contexts",
-          price: "$4",
-          billingLines: ["USD / month", "billed annually"],
-          featureIntro: "Everything in Free, plus:",
-          features: [
-            "Support Headroom while in beta",
-            "Track sessions across devices",
-            "Sync learned patterns"
-          ],
-          ctaLabel: "Get Pro plan",
-          ctaVariant: "primary",
-          disabled: !POLAR_PRO_CHECKOUT_URL
-        }
+        freePlan,
+        paidPlans.pro,
+        paidPlans.max5x,
+        paidPlans.max20x
       ],
       featuredPlanId: "pro"
     };
@@ -598,6 +736,20 @@ export default function App() {
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
   const [headroomApiKeyStatus, setHeadroomApiKeyStatus] =
     useState<HeadroomLearnApiKeyStatus>(idleHeadroomLearnApiKeyStatus);
+  const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
+  const [pricingBusy, setPricingBusy] = useState(false);
+  const [pricingError, setPricingError] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authCode, setAuthCode] = useState("");
+  const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
+  const [authCodeExpirySeconds, setAuthCodeExpirySeconds] = useState(authCodeExpiryFallbackSeconds);
+  const [authRequestBusy, setAuthRequestBusy] = useState(false);
+  const [authVerifyBusy, setAuthVerifyBusy] = useState(false);
+  const [authFlowError, setAuthFlowError] = useState<string | null>(null);
+  const [authFlowSuccess, setAuthFlowSuccess] = useState<string | null>(null);
+  const [pendingUpgradePlanId, setPendingUpgradePlanId] = useState<UpgradePlanId | null>(null);
+  const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
+  const desktopActivationSentRef = useRef(false);
   const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [apiKeyProvider, setApiKeyProvider] = useState<ApiProvider>("anthropic");
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -629,8 +781,13 @@ export default function App() {
     pendingLearnProjectPath
       ? "Saving stores this key in macOS Keychain, then Headroom reads it immediately to start Learn for the selected project."
       : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
-  const upgradePlansState = getUpgradePlans(pricingAudience);
+  const upgradePlansState = getUpgradePlans(
+    pricingAudience,
+    pricingStatus?.claude.planTier,
+    pricingStatus?.recommendedSubscriptionTier
+  );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
+  const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
   const showInstallProgress =
     bootstrapping ||
     bootstrapProgress.running ||
@@ -644,7 +801,6 @@ export default function App() {
     !showClientSetupStep &&
     !showProxyVerificationStep &&
     (bootstrapProgress.complete || showPostInstallGuide || dashboard.bootstrapComplete);
-
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -658,6 +814,22 @@ export default function App() {
     }
     rtkActivityRef.current.scrollTop = rtkActivityRef.current.scrollHeight;
   }, [showRtkDetails, rtkActivityLines]);
+
+  useEffect(() => {
+    if (!authEmail && pricingStatus?.claude.email) {
+      setAuthEmail(pricingStatus.claude.email);
+    }
+  }, [authEmail, pricingStatus?.claude.email]);
+
+  useEffect(() => {
+    setShowAllUpgradePlans(false);
+  }, [pricingAudience]);
+
+  useEffect(() => {
+    if (!pricingStatus?.authenticated) {
+      desktopActivationSentRef.current = false;
+    }
+  }, [pricingStatus?.authenticated]);
 
   useEffect(() => {
     let active = true;
@@ -709,8 +881,9 @@ export default function App() {
       }
 
       updateStartup("runtime", 80, "Verifying runtime health…");
-      const [runtimeResult] = await Promise.all([
+      const [runtimeResult, pricingResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+        invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
         refreshConnectors(),
       ]);
       if (!active) {
@@ -718,6 +891,9 @@ export default function App() {
       }
       if (runtimeResult) {
         setRuntimeStatus(runtimeResult);
+      }
+      if (pricingResult) {
+        setPricingStatus(pricingResult);
       }
 
       updateStartup(
@@ -1225,6 +1401,43 @@ export default function App() {
     });
   }, [claudeConnectorEnabled]);
 
+  useEffect(() => {
+    void refreshPricingStatus();
+    const interval = window.setInterval(() => {
+      void refreshPricingStatus();
+    }, 60_000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    const claudeConnector = getClaudeConnector(connectors);
+    if (!pricingStatus || pricingStatus.optimizationAllowed || !claudeConnector?.enabled) {
+      return;
+    }
+    if (connectorsBusy) {
+      return;
+    }
+    void toggleConnector(claudeConnector, false);
+  }, [connectors, connectorsBusy, pricingStatus]);
+
+  useEffect(() => {
+    const runtimeHealthyNow =
+      runtimeStatus?.running === true &&
+      runtimeStatus?.proxyReachable === true &&
+      connectorPhase === "healthy";
+    if (!pricingStatus?.authenticated || !runtimeHealthyNow || desktopActivationSentRef.current) {
+      return;
+    }
+    desktopActivationSentRef.current = true;
+    void invoke<HeadroomPricingStatus>("activate_headroom_account")
+      .then((status) => setPricingStatus(status))
+      .catch(() => {
+        desktopActivationSentRef.current = false;
+      });
+  }, [connectorPhase, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
+
   // Poll logs while verifying; dismiss when a matching line appears after the anchor
   useEffect(() => {
     if (connectorPhase !== "verifying") return;
@@ -1496,6 +1709,21 @@ export default function App() {
     }
   }
 
+  async function refreshPricingStatus() {
+    setPricingBusy(true);
+    try {
+      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
+      setPricingStatus(status);
+      setPricingError(null);
+    } catch (error) {
+      setPricingError(
+        error instanceof Error ? error.message : "Could not load pricing status."
+      );
+    } finally {
+      setPricingBusy(false);
+    }
+  }
+
   async function refreshClaudeProjects() {
     setClaudeProjectsBusy(true);
     try {
@@ -1638,6 +1866,95 @@ export default function App() {
     await invoke("open_external_link", { url });
   }
 
+  function openUpgradeAuthView(planId: UpgradePlanId | null = null) {
+    setActiveView("upgradeAuth");
+    setPendingUpgradePlanId(planId);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+  }
+
+  function resetUpgradeAuthStep() {
+    setAuthCode("");
+    setAuthCodeRequestedFor(null);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+  }
+
+  async function handleRequestAuthCode() {
+    if (!authEmailValid) {
+      setAuthFlowError("Enter a valid email address.");
+      return;
+    }
+    setAuthRequestBusy(true);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      const result = await invoke<HeadroomAuthCodeRequest>("request_headroom_auth_code", {
+        email: authEmail.trim()
+      });
+      setAuthCodeRequestedFor(result.email);
+      setAuthCodeExpirySeconds(result.expiresInSeconds);
+      setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not send sign-in code."
+      );
+    } finally {
+      setAuthRequestBusy(false);
+    }
+  }
+
+  async function handleVerifyAuthCode() {
+    if (!authEmailValid) {
+      setAuthFlowError("Enter a valid email address.");
+      return;
+    }
+    if (!authCode.trim()) {
+      setAuthFlowError("Enter the authentication code from your email.");
+      return;
+    }
+    setAuthVerifyBusy(true);
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
+        email: authEmail.trim(),
+        code: authCode.trim(),
+        inviteCode: null
+      });
+      setPricingStatus(status);
+      setAuthCode("");
+      setAuthCodeRequestedFor(null);
+      setAuthFlowSuccess("Headroom account connected.");
+      setPendingUpgradePlanId(null);
+      setActiveView("upgrade");
+      await refreshConnectors();
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not verify sign-in code."
+      );
+    } finally {
+      setAuthVerifyBusy(false);
+    }
+  }
+
+  async function handleSignOutHeadroomAccount() {
+    setAuthFlowError(null);
+    setAuthFlowSuccess(null);
+    try {
+      await invoke("sign_out_headroom_account");
+      setPricingStatus(await invoke<HeadroomPricingStatus>("get_headroom_pricing_status"));
+      setAuthCode("");
+      setAuthCodeRequestedFor(null);
+      setAuthFlowSuccess("Signed out of Headroom.");
+      setPendingUpgradePlanId(null);
+    } catch (error) {
+      setAuthFlowError(
+        error instanceof Error ? error.message : "Could not sign out of Headroom."
+      );
+    }
+  }
+
   async function openApiKeyGuideLink(url: string, label: string) {
     setApiKeyError(null);
     try {
@@ -1661,6 +1978,18 @@ export default function App() {
             kind: "external" as const,
             url: POLAR_PRO_CHECKOUT_URL,
             missing: "Set VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL to enable Pro checkout."
+          };
+        case "max5x":
+          return {
+            kind: "external" as const,
+            url: POLAR_MAX5X_CHECKOUT_URL,
+            missing: "Set VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL to enable Max x5 checkout."
+          };
+        case "max20x":
+          return {
+            kind: "external" as const,
+            url: POLAR_MAX20X_CHECKOUT_URL,
+            missing: "Set VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL to enable Max x20 checkout."
           };
         case "team":
           return {
@@ -1686,6 +2015,11 @@ export default function App() {
     if (action.kind === "internal") {
       setUpgradeActionError(null);
       setActiveView("home");
+      return;
+    }
+
+    if (!pricingStatus?.authenticated) {
+      openUpgradeAuthView(planId);
       return;
     }
 
@@ -2419,6 +2753,27 @@ export default function App() {
       } as const;
     }
 
+    if (pricingStatus?.needsAuthentication) {
+      return {
+        tone: "degraded",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
+    if (pricingStatus && !pricingStatus.optimizationAllowed) {
+      return {
+        tone: "disabled",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
+    if (pricingStatus?.shouldNudge) {
+      return {
+        tone: "starting",
+        title: pricingStatus.gateMessage
+      } as const;
+    }
+
     if (runtimeHealthy) {
       if (connectorPhase === "disabled") {
         return {
@@ -2485,6 +2840,258 @@ export default function App() {
     return [...topProjects, pinnedClaudeProject];
   })();
   const hiddenClaudeProjectsCount = sortedClaudeProjects.length - visibleClaudeProjects.length;
+  const detectedClaudePlanLabel = claudePlanLabel(pricingStatus?.claude.planTier ?? "unknown");
+  const detectedAuthMethod = authMethodLabel(pricingStatus?.claude.authMethod ?? "unknown");
+  const trialDaysRemaining = formatRemainingDays(pricingStatus?.account?.trialEndsAt);
+  const localGraceHoursRemaining = (() => {
+    const target = pricingStatus?.localGraceEndsAt
+      ? new Date(pricingStatus.localGraceEndsAt).getTime()
+      : Number.NaN;
+    if (Number.isNaN(target)) {
+      return null;
+    }
+    return Math.max(0, Math.ceil((target - Date.now()) / 3_600_000));
+  })();
+  const weeklyLimitPercentLabel = formatPercentValue(
+    pricingStatus?.effectiveDisableThresholdPercent ?? pricingStatus?.disableThresholdPercent
+  );
+  const upgradeDefaultPlanId =
+    pricingAudience === "individual"
+      ? pricingStatus?.recommendedSubscriptionTier ?? upgradePlansState.featuredPlanId
+      : "enterprise";
+  const upgradeDefaultPlan = upgradePlansState.plans.find((plan) => plan.id === upgradeDefaultPlanId) ?? null;
+  const visibleUpgradePlans =
+    showAllUpgradePlans || upgradePlansState.plans.length <= 2
+      ? upgradePlansState.plans
+      : upgradePlansState.plans.slice(0, 2);
+  const hasHiddenUpgradePlans = visibleUpgradePlans.length < upgradePlansState.plans.length;
+  const pendingUpgradePlanLabel = upgradePlanIntentLabel(pendingUpgradePlanId);
+  const upgradeAuthMessage = pendingUpgradePlanLabel
+    ? `Sign in with email to upgrade to the ${pendingUpgradePlanLabel} plan`
+    : "Sign in with email to unlock your 14-day Headroom trial";
+  const accountPlanSummary = (() => {
+    if (!pricingStatus?.authenticated) {
+      return "Not signed in";
+    }
+    if (!pricingStatus.account) {
+      return "Syncing account...";
+    }
+    if (pricingStatus.account?.subscriptionActive) {
+      return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
+    }
+    if (pricingStatus.account?.trialActive) {
+      if (trialDaysRemaining != null) {
+        return `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in 14-day trial`;
+      }
+      return "14-day Headroom trial";
+    }
+    return "Trial expired";
+  })();
+  const accountStatusSummary = (() => {
+    if (!pricingStatus) {
+      return "Loading account status...";
+    }
+    if (!pricingStatus.authenticated) {
+      return "Create a Headroom account to unlock the 14-day trial.";
+    }
+    if (!pricingStatus.account) {
+      return "Signed in. Headroom is syncing your account details.";
+    }
+    if (pricingStatus.account?.subscriptionActive) {
+      return "Unlimited optimization is unlocked.";
+    }
+    if (pricingStatus.account?.trialActive) {
+      return "Unlimited optimization is active during the trial.";
+    }
+    return `Weekly access is capped at ${weeklyLimitPercentLabel} of your Claude Code limits until you upgrade.`;
+  })();
+  const accountEmailSummary = (() => {
+    const enteredEmail = authEmail.trim();
+    return (
+      pricingStatus?.account?.email ??
+      (enteredEmail || pricingStatus?.claude.email || "No account connected")
+    );
+  })();
+  const accountPlanMeta = (() => {
+    if (!pricingStatus?.authenticated) {
+      return "Upgrade to continue using Headroom without limits";
+    }
+    if (!pricingStatus.account) {
+      return "Plan details are syncing";
+    }
+    if (pricingStatus.account.subscriptionActive) {
+      return "Unlimited optimization unlocked";
+    }
+    if (pricingStatus.account.trialActive) {
+      return "Upgrade any time to keep unlimited optimization";
+    }
+    return "Upgrade to continue using Headroom without limits";
+  })();
+  const upgradeTrialCallout = (() => {
+    if (pricingBusy && !pricingStatus) {
+      return {
+        tone: "neutral" as const,
+        message: "Loading your Headroom access..."
+      };
+    }
+    if (!pricingStatus) {
+      return {
+        tone: "neutral" as const,
+        message: "Headroom pricing status is unavailable right now."
+      };
+    }
+    if (!pricingStatus.authenticated) {
+      if (!pricingStatus.localGraceActive) {
+        return {
+          tone: "expired" as const,
+          message: "Local Headroom trial expired. Create an account to extend to 14 days.",
+          actionLabel: "Sign up",
+          onAction: openUpgradeAuthView
+        };
+      }
+      const hoursLabel =
+        localGraceHoursRemaining != null
+          ? `${localGraceHoursRemaining} hour${localGraceHoursRemaining === 1 ? "" : "s"}`
+          : "24 hours";
+      return {
+        tone: "warning" as const,
+        message: `${hoursLabel} to go in your trial period. Create an account to extend trial to 14 days.`,
+        actionLabel: "Sign up",
+        onAction: openUpgradeAuthView
+      };
+    }
+    if (!pricingStatus.account) {
+      return {
+        tone: "neutral" as const,
+        message: "Headroom account connected. Syncing your trial and plan details..."
+      };
+    }
+    if (pricingStatus.account?.subscriptionActive) {
+      return {
+        tone: "healthy" as const,
+        message: `${subscriptionTierLabel(pricingStatus.account.subscriptionTier)} is active. Headroom can keep optimizing without limits.`
+      };
+    }
+    if (pricingStatus.account?.trialActive) {
+      const daysLabel =
+        trialDaysRemaining != null
+          ? `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"}`
+          : "14 days";
+      return {
+        tone: "warning" as const,
+        message: `${daysLabel} of Headroom trial to go. Upgrade to continue using Headroom without limits.`,
+        actionLabel: "Upgrade",
+        onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
+      };
+    }
+    return {
+      tone: pricingStatus.optimizationAllowed ? "warning" as const : "expired" as const,
+      message: `Trial expired. You can only use Headroom for ${weeklyLimitPercentLabel} of your weekly Claude Code limits. To continue using Headroom without limits.`,
+      actionLabel: "Upgrade",
+      onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
+    };
+  })();
+  const pricingAuthCard = (
+    <section className="pricing-auth-card pricing-auth-card--standalone">
+      <div className="pricing-auth-card__header">
+        <div>
+          <h2>{upgradeAuthMessage}.</h2>
+        </div>
+      </div>
+      {!authCodeRequestedFor ? (
+        <>
+          <div className="pricing-auth-card__grid pricing-auth-card__grid--single">
+            <label className="pricing-auth-field">
+              <span>Email</span>
+              <div className="pricing-auth-field__input">
+                <EnvelopeSimple size={16} weight="bold" />
+                <input
+                  onChange={(event) => {
+                    setAuthEmail(event.target.value);
+                    setAuthFlowError(null);
+                  }}
+                  placeholder={pricingStatus?.claude.email ?? "you@example.com"}
+                  type="email"
+                  value={authEmail}
+                />
+              </div>
+            </label>
+          </div>
+          <div className="pricing-auth-card__actions">
+            <button
+              className="primary-button"
+              disabled={!authEmailValid || authRequestBusy}
+              onClick={() => void handleRequestAuthCode()}
+              type="button"
+            >
+              {authRequestBusy ? "Sending..." : "Sign in"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="pricing-auth-card__code-step">
+            <p className="pricing-auth-card__step-copy">
+              Enter the authentication code we sent to <strong>{authCodeRequestedFor}</strong>.
+            </p>
+            <button
+              className="link-button pricing-auth-card__change-email"
+              onClick={resetUpgradeAuthStep}
+              type="button"
+            >
+              Use a different email
+            </button>
+          </div>
+          <div className="pricing-auth-card__grid pricing-auth-card__grid--single">
+            <label className="pricing-auth-field">
+              <span>Authentication code</span>
+              <div className="pricing-auth-field__input">
+                <Key size={16} weight="bold" />
+                <input
+                  onChange={(event) => {
+                    setAuthCode(event.target.value);
+                    setAuthFlowError(null);
+                  }}
+                  placeholder={`Enter the code sent to ${authCodeRequestedFor}`}
+                  type="text"
+                  value={authCode}
+                />
+              </div>
+            </label>
+          </div>
+          <div className="pricing-auth-card__actions">
+            <button
+              className="secondary-button"
+              disabled={authRequestBusy}
+              onClick={() => void handleRequestAuthCode()}
+              type="button"
+            >
+              {authRequestBusy ? "Sending..." : "Resend code"}
+            </button>
+            <button
+              className="primary-button"
+              disabled={!authCode.trim() || authVerifyBusy}
+              onClick={() => void handleVerifyAuthCode()}
+              type="button"
+            >
+              {authVerifyBusy ? "Verifying..." : "Verify and continue"}
+            </button>
+          </div>
+        </>
+      )}
+      {authFlowError ? (
+        <p className="install-progress__error">{authFlowError}</p>
+      ) : null}
+      {authFlowSuccess ? (
+        <p className="upgrade-plan-card__contact-status upgrade-plan-card__contact-status--success">
+          {authFlowSuccess}
+        </p>
+      ) : null}
+      {pricingError ? (
+        <p className="install-progress__error">{pricingError}</p>
+      ) : null}
+    </section>
+  );
 
   return (
     <main className="tray-shell">
@@ -2511,7 +3118,7 @@ export default function App() {
         </nav>
         <div className="tray-sidebar__footer">
           <button
-            className={`upgrade-pill${activeView === "upgrade" ? " is-active" : ""}`}
+            className={`upgrade-pill${activeView === "upgrade" || activeView === "upgradeAuth" ? " is-active" : ""}`}
             onMouseDown={() => setActiveView("upgrade")}
             type="button"
           >
@@ -2866,7 +3473,7 @@ export default function App() {
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
-            <h1>Plans that grow with you</h1>
+            <h1>Plans based on your Claude subscription</h1>
             <div className="upgrade-toggle" aria-label="Upgrade audiences" role="tablist">
               {[
                 { id: "individual" as const, label: "Individual" },
@@ -2890,24 +3497,42 @@ export default function App() {
           </section>
 
           <section
-            className={`upgrade-plan-grid${upgradePlansState.plans.length === 1 ? " upgrade-plan-grid--single" : ""}`}
+            className={`upgrade-trial-callout upgrade-trial-callout--${upgradeTrialCallout.tone}`}
           >
-            {upgradePlansState.plans.map((plan) => {
+            <div className="upgrade-trial-callout__content">
+              <p className="upgrade-trial-callout__message">
+                {upgradeTrialCallout.message}
+              </p>
+            </div>
+            {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (
+              <button
+                className="primary-button upgrade-trial-callout__button"
+                disabled={authRequestBusy || authVerifyBusy || upgradeActionBusy !== null}
+                onClick={() => upgradeTrialCallout.onAction?.()}
+                type="button"
+              >
+                {upgradeTrialCallout.actionLabel}
+              </button>
+            ) : null}
+          </section>
+
+          <section
+            className={`upgrade-plan-grid${visibleUpgradePlans.length === 1 ? " upgrade-plan-grid--single" : ""}`}
+          >
+            {visibleUpgradePlans.map((plan) => {
               const isFeatured = plan.id === upgradePlansState.featuredPlanId;
-              const isUnderConstruction = plan.id === "pro";
               const buttonClassName =
-                plan.ctaVariant === "primary"
+                plan.id === "free"
+                  ? "primary-button upgrade-plan-card__button upgrade-plan-card__button--free"
+                  : plan.ctaVariant === "primary"
                   ? "primary-button upgrade-plan-card__button"
                   : "secondary-button upgrade-plan-card__button";
 
               return (
                 <article
-                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isUnderConstruction ? " upgrade-plan-card--under-construction" : ""}`}
+                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}`}
                   key={plan.id}
                 >
-                  {isUnderConstruction ? (
-                    <span className="upgrade-plan-card__ribbon">BETA</span>
-                  ) : null}
                   <div className="upgrade-plan-card__top">
                     <div className="upgrade-plan-card__title-block">
                       <span className="upgrade-plan-card__icon" aria-hidden="true">
@@ -2969,7 +3594,6 @@ export default function App() {
 
                   {plan.features.length > 0 ? (
                     <div className="upgrade-plan-card__features">
-                      <p className="upgrade-plan-card__feature-intro">{plan.featureIntro}</p>
                       <ul>
                         {plan.features.map((feature) => (
                           <li key={feature}>{feature}</li>
@@ -2991,10 +3615,38 @@ export default function App() {
               );
             })}
           </section>
+          {pricingAudience === "individual" && (hasHiddenUpgradePlans || showAllUpgradePlans) ? (
+            <button
+              className="upgrade-plan-grid__toggle"
+              onClick={() => setShowAllUpgradePlans((current) => !current)}
+              type="button"
+            >
+              {showAllUpgradePlans ? "show fewer plans" : "show more plans"}
+            </button>
+          ) : null}
 
           {upgradeActionError ? (
             <p className="install-progress__error">{upgradeActionError}</p>
           ) : null}
+        </div>
+
+        <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgradeAuth"}>
+          <section className="upgrade-auth-view">
+            <div className="upgrade-auth-view__header">
+              <div className="upgrade-auth-view__title-row">
+                <button
+                  aria-label="Back to upgrade plans"
+                  className="upgrade-auth-view__back"
+                  onClick={() => setActiveView("upgrade")}
+                  type="button"
+                >
+                  <CaretLeft size={16} weight="bold" />
+                </button>
+                <h1>Create account</h1>
+              </div>
+            </div>
+            {pricingAuthCard}
+          </section>
         </div>
 
         <div className="tray-content" hidden={activeView !== "settings"}>
@@ -3005,6 +3657,63 @@ export default function App() {
             </section>
 
             <section className="panel-stack">
+              <article className="soft-card panel-card settings-account-card">
+                <div className="panel-card__header">
+                  <div>
+                    <h3>Headroom account</h3>
+                    <p>
+                      {pricingStatus?.authenticated
+                        ? "Signed in"
+                        : "Not signed in"}
+                    </p>
+                  </div>
+                  {pricingStatus?.authenticated ? (
+                    <button
+                      className="secondary-button secondary-button--small"
+                      onClick={() => void handleSignOutHeadroomAccount()}
+                      type="button"
+                    >
+                      <SignOut size={16} weight="bold" />
+                      Sign out
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary-button secondary-button--small"
+                      onClick={() => openUpgradeAuthView()}
+                      type="button"
+                    >
+                      Create account
+                    </button>
+                  )}
+                </div>
+                <div className="settings-account-grid">
+                  <article className="pricing-metric">
+                    <span className="pricing-metric__label">Status</span>
+                    <strong>{pricingStatus?.authenticated ? "Signed in" : "Not signed in"}</strong>
+                    <small>{accountStatusSummary}</small>
+                  </article>
+                  <article className="pricing-metric">
+                    <span className="pricing-metric__label">Email</span>
+                    <strong>{accountEmailSummary}</strong>
+                    <small>
+                      {pricingStatus?.claude.email
+                        ? `Claude Code email: ${pricingStatus.claude.email}`
+                        : "Claude Code email not detected yet"}
+                    </small>
+                  </article>
+                  <article className="pricing-metric">
+                    <span className="pricing-metric__label">Headroom plan</span>
+                    <strong>{accountPlanSummary}</strong>
+                    <small>{accountPlanMeta}</small>
+                  </article>
+                  <article className="pricing-metric">
+                    <span className="pricing-metric__label">Claude Code plan</span>
+                    <strong>{detectedClaudePlanLabel}</strong>
+                    <small>{detectedAuthMethod}</small>
+                  </article>
+                </div>
+              </article>
+
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div />
