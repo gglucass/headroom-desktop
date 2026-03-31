@@ -209,18 +209,6 @@ const apiKeyGuides: Record<ApiProvider, ApiKeyGuide> = {
   }
 };
 
-const POLAR_PRO_CHECKOUT_URL = (
-  import.meta.env.VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL ??
-  ""
-).trim();
-const POLAR_MAX5X_CHECKOUT_URL = (
-  import.meta.env.VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL ??
-  ""
-).trim();
-const POLAR_MAX20X_CHECKOUT_URL = (
-  import.meta.env.VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL ??
-  ""
-).trim();
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
   ""
