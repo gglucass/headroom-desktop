@@ -348,18 +348,25 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
 }
 
 pub fn clear_client_setups() -> Result<()> {
-    // Snapshot before disabling — disable_client_setup removes entries from configured_clients.
-    let mut state = load_setup_state();
-    if !state.configured_clients.is_empty() {
-        state.remembered_clients = state.configured_clients.clone();
-        state.remembered_shell_files = state.managed_shell_files.clone();
-        write_setup_state(&state)?;
-    }
+    // Capture snapshot before disabling. We re-apply it afterwards because
+    // disable_client_setup also clears remembered_clients as a side effect,
+    // which would otherwise erase the snapshot we need for restore_client_setups.
+    let pre = load_setup_state();
+    let snapshot_clients = pre.configured_clients.clone();
+    let snapshot_shell_files = pre.managed_shell_files.clone();
 
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup(spec.id);
     }
     let _ = disable_client_setup("codex_gui");
+
+    // Re-save the remembered snapshot so restore_client_setups works on next launch.
+    if !snapshot_clients.is_empty() {
+        let mut state = load_setup_state();
+        state.remembered_clients = snapshot_clients;
+        state.remembered_shell_files = snapshot_shell_files;
+        write_setup_state(&state)?;
+    }
 
     Ok(())
 }
