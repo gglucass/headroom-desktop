@@ -61,12 +61,12 @@ npm run tauri dev
 To enable the live pricing/auth flow in the desktop app, set these placeholders in a local `.env` file:
 
 ```bash
-HEADROOM_ACCOUNT_API_BASE_URL="https://headroom.garm.com/api/v1"
+HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
 VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-pro-product"
 VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max5x-product"
 VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max20x-product"
-VITE_HEADROOM_SALES_CONTACT_URL="mailto:hello@headroom.garm.com"
-VITE_HEADROOM_CONTACT_FORM_URL="https://headroom.garm.com/contact_request"
+VITE_HEADROOM_SALES_CONTACT_URL="mailto:hello@extraheadroom.com"
+VITE_HEADROOM_CONTACT_FORM_URL="https://extraheadroom.com/contact_request"
 ```
 
 Polar's official checkout-link API/docs:

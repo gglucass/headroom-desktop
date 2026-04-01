@@ -15,7 +15,11 @@ use crate::storage::{app_data_dir, config_file};
 
 const HEADROOM_ACCOUNT_KEYCHAIN_SERVICE: &str = "com.garm.headroom.account";
 const HEADROOM_ACCOUNT_SESSION_ACCOUNT: &str = "session-token";
+const PRODUCTION_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
+#[cfg(debug_assertions)]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
+#[cfg(not(debug_assertions))]
+const DEFAULT_ACCOUNT_API_BASE_URL: &str = PRODUCTION_ACCOUNT_API_BASE_URL;
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 24;
 const AUTH_CODE_EXPIRY_SECONDS: u64 = 900;
 
@@ -818,15 +822,25 @@ fn http_client() -> Result<Client, String> {
 }
 
 fn api_url(path: &str) -> String {
-    let base = std::env::var("HEADROOM_ACCOUNT_API_BASE_URL")
-        .ok()
-        .or_else(|| option_env!("HEADROOM_ACCOUNT_API_BASE_URL").map(str::to_string))
-        .unwrap_or_else(|| DEFAULT_ACCOUNT_API_BASE_URL.to_string());
+    let base = resolve_account_api_base_url(
+        std::env::var("HEADROOM_ACCOUNT_API_BASE_URL").ok(),
+        option_env!("HEADROOM_ACCOUNT_API_BASE_URL"),
+    );
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn resolve_account_api_base_url(
+    runtime_env: Option<String>,
+    compile_time_env: Option<&str>,
+) -> String {
+    runtime_env
+        .and_then(non_empty_string)
+        .or_else(|| compile_time_env.and_then(|value| non_empty_string(value.to_string())))
+        .unwrap_or_else(|| DEFAULT_ACCOUNT_API_BASE_URL.to_string())
 }
 
 fn non_empty_string(value: String) -> Option<String> {
@@ -868,5 +882,44 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
             monthly_price_usd: 50.0,
         }),
         ClaudePlanTier::Unknown => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_account_api_base_url, DEFAULT_ACCOUNT_API_BASE_URL,
+        PRODUCTION_ACCOUNT_API_BASE_URL,
+    };
+
+    #[test]
+    fn runtime_env_overrides_compile_time_env() {
+        let resolved = resolve_account_api_base_url(
+            Some("https://runtime.example/api/v1".into()),
+            Some("https://compile.example/api/v1"),
+        );
+
+        assert_eq!(resolved, "https://runtime.example/api/v1");
+    }
+
+    #[test]
+    fn compile_time_env_used_when_runtime_missing() {
+        let resolved =
+            resolve_account_api_base_url(None, Some("https://compile.example/api/v1"));
+
+        assert_eq!(resolved, "https://compile.example/api/v1");
+    }
+
+    #[test]
+    fn blank_values_fall_back_to_default() {
+        let resolved = resolve_account_api_base_url(Some("   ".into()), Some(" "));
+
+        assert_eq!(resolved, DEFAULT_ACCOUNT_API_BASE_URL);
+    }
+
+    #[test]
+    fn release_default_points_at_production_api() {
+        #[cfg(not(debug_assertions))]
+        assert_eq!(DEFAULT_ACCOUNT_API_BASE_URL, PRODUCTION_ACCOUNT_API_BASE_URL);
     }
 }
