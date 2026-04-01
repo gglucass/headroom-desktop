@@ -130,10 +130,11 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
     let session_token = read_session_token()?;
-    let (authenticated, account) = if let Some(token) = session_token.as_deref() {
+    let (authenticated, account, account_sync_error) = if let Some(token) = session_token.as_deref()
+    {
         merge_background_account_sync(Some(token), fetch_remote_account(token))
     } else {
-        (false, None)
+        (false, None, None)
     };
 
     let claude = detect_claude_profile(state);
@@ -143,6 +144,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         local_state.first_seen_at,
         local_grace_ends_at,
         local_grace_active,
+        account_sync_error,
         account,
         claude,
     ))
@@ -224,6 +226,7 @@ pub fn verify_auth_code(
         local_state.first_seen_at,
         local_grace_ends_at,
         Utc::now() < local_grace_ends_at,
+        None,
         Some(remote_account_to_profile(body.account)),
         claude,
     ))
@@ -266,6 +269,7 @@ pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, Strin
         local_state.first_seen_at,
         local_grace_ends_at,
         Utc::now() < local_grace_ends_at,
+        None,
         Some(remote_account_to_profile(body.account)),
         claude,
     ))
@@ -370,6 +374,7 @@ fn evaluate_pricing_status(
     local_grace_started_at: DateTime<Utc>,
     local_grace_ends_at: DateTime<Utc>,
     local_grace_active: bool,
+    account_sync_error: Option<String>,
     account: Option<HeadroomAccountProfile>,
     claude: ClaudeAccountProfile,
 ) -> HeadroomPricingStatus {
@@ -469,6 +474,7 @@ fn evaluate_pricing_status(
         local_grace_started_at,
         local_grace_ends_at,
         local_grace_active,
+        account_sync_error,
         needs_authentication,
         optimization_allowed,
         should_nudge,
@@ -485,6 +491,10 @@ fn evaluate_pricing_status(
 }
 
 pub fn detect_claude_profile(state: &AppState) -> ClaudeAccountProfile {
+    state.cached_claude_profile()
+}
+
+pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile {
     let token = state
         .claude_bearer_token
         .lock()
@@ -733,17 +743,26 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
 fn merge_background_account_sync(
     session_token: Option<&str>,
     sync_result: Result<RemoteAccountResponse, RemoteAccountSyncError>,
-) -> (bool, Option<HeadroomAccountProfile>) {
+) -> (bool, Option<HeadroomAccountProfile>, Option<String>) {
     if session_token.is_none() {
-        return (false, None);
+        return (false, None, None);
     }
 
     match sync_result {
         // Background polling should not silently drop the locally stored session.
         // Explicit auth-required actions still clear the token if the server says it
         // is expired, but passive refreshes keep the user signed in locally.
-        Ok(account) => (true, Some(remote_account_to_profile(account))),
-        Err(RemoteAccountSyncError::Unauthorized | RemoteAccountSyncError::Other) => (true, None),
+        Ok(account) => (true, Some(remote_account_to_profile(account)), None),
+        Err(RemoteAccountSyncError::Unauthorized) => (
+            true,
+            None,
+            Some("Headroom account connected, but your plan details could not be refreshed. Sign in again if this keeps happening.".into()),
+        ),
+        Err(RemoteAccountSyncError::Other) => (
+            true,
+            None,
+            Some("Headroom account connected, but your plan details are unavailable right now.".into()),
+        ),
     }
 }
 
@@ -944,32 +963,35 @@ mod tests {
 
     #[test]
     fn unauthorized_background_sync_keeps_local_session_authenticated() {
-        let (authenticated, account) = merge_background_account_sync(
+        let (authenticated, account, error) = merge_background_account_sync(
             Some("session-token"),
             Err(RemoteAccountSyncError::Unauthorized),
         );
 
         assert!(authenticated);
         assert!(account.is_none());
+        assert!(error.is_some());
     }
 
     #[test]
     fn transient_background_sync_error_keeps_local_session_authenticated() {
-        let (authenticated, account) = merge_background_account_sync(
+        let (authenticated, account, error) = merge_background_account_sync(
             Some("session-token"),
             Err(RemoteAccountSyncError::Other),
         );
 
         assert!(authenticated);
         assert!(account.is_none());
+        assert!(error.is_some());
     }
 
     #[test]
     fn successful_background_sync_returns_remote_account_profile() {
-        let (authenticated, account) =
+        let (authenticated, account, error) =
             merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
 
         assert!(authenticated);
+        assert!(error.is_none());
         assert_eq!(
             account.as_ref().map(|value| value.email.as_str()),
             Some("user@example.com")

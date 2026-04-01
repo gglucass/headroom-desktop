@@ -567,6 +567,7 @@ export default function App() {
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
+  const pricingRefreshInFlightRef = useRef(false);
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
@@ -1567,6 +1568,10 @@ export default function App() {
   }
 
   async function refreshPricingStatus() {
+    if (pricingRefreshInFlightRef.current) {
+      return;
+    }
+    pricingRefreshInFlightRef.current = true;
     setPricingBusy(true);
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
@@ -1577,6 +1582,7 @@ export default function App() {
         error instanceof Error ? error.message : "Could not load pricing status."
       );
     } finally {
+      pricingRefreshInFlightRef.current = false;
       setPricingBusy(false);
     }
   }
@@ -2780,7 +2786,7 @@ export default function App() {
       return null;
     }
     if (!pricingStatus.account) {
-      return "Syncing plan...";
+      return pricingStatus.accountSyncError ? "Plan unavailable" : "Syncing plan...";
     }
     if (pricingStatus.account.subscriptionActive) {
       return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
@@ -2829,7 +2835,9 @@ export default function App() {
     if (!pricingStatus.account) {
       return {
         tone: "neutral" as const,
-        message: "Headroom account connected. Syncing your trial and plan details..."
+        message:
+          pricingStatus.accountSyncError ??
+          "Headroom account connected. Syncing your trial and plan details..."
       };
     }
     if (pricingStatus.account?.subscriptionActive) {

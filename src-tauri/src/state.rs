@@ -14,9 +14,9 @@ use uuid::Uuid;
 use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integration_status};
 use crate::insights::generate_daily_insights;
 use crate::models::{
-    BootstrapProgress, ClaudeCodeProject, ClientStatus, DailyInsight, DailySavingsPoint,
-    DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus,
-    RuntimeStatus, UsageEvent,
+    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus, DailyInsight,
+    DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
+    RtkRuntimeStatus, RuntimeStatus, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
@@ -39,6 +39,7 @@ pub struct AppState {
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
+    cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +98,7 @@ impl AppState {
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
+            cached_claude_profile: Mutex::new(None),
         };
 
         Ok(state)
@@ -138,6 +140,36 @@ impl AppState {
         let clients = detect_clients();
         *cache = Some((clients.clone(), Instant::now()));
         clients
+    }
+
+    pub fn cached_claude_profile(&self) -> ClaudeAccountProfile {
+        const TTL: Duration = Duration::from_secs(300);
+
+        let current_token = self
+            .claude_bearer_token
+            .lock()
+            .ok()
+            .and_then(|token| token.clone());
+
+        {
+            let cache = self
+                .cached_claude_profile
+                .lock()
+                .expect("cached_claude_profile poisoned");
+            if let Some((cached_token, profile, at)) = &*cache {
+                if *cached_token == current_token && at.elapsed() < TTL {
+                    return profile.clone();
+                }
+            }
+        }
+
+        let profile = pricing::detect_claude_profile_uncached(self);
+        let mut cache = self
+            .cached_claude_profile
+            .lock()
+            .expect("cached_claude_profile poisoned");
+        *cache = Some((current_token, profile.clone(), Instant::now()));
+        profile
     }
 
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {

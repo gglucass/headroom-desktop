@@ -10,6 +10,7 @@ function makePricingStatus(
     localGraceStartedAt: "2026-04-01T08:00:00Z",
     localGraceEndsAt: "2026-04-02T08:00:00Z",
     localGraceActive: true,
+    accountSyncError: null,
     needsAuthentication: false,
     optimizationAllowed: true,
     shouldNudge: false,

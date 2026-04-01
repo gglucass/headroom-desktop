@@ -392,6 +392,7 @@ pub struct HeadroomPricingStatus {
     pub local_grace_started_at: DateTime<Utc>,
     pub local_grace_ends_at: DateTime<Utc>,
     pub local_grace_active: bool,
+    pub account_sync_error: Option<String>,
     pub needs_authentication: bool,
     pub optimization_allowed: bool,
     pub should_nudge: bool,

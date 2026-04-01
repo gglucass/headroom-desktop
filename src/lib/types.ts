@@ -255,6 +255,7 @@ export interface HeadroomPricingStatus {
   localGraceStartedAt: string;
   localGraceEndsAt: string;
   localGraceActive: boolean;
+  accountSyncError?: string | null;
   needsAuthentication: boolean;
   optimizationAllowed: boolean;
   shouldNudge: boolean;
