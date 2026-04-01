@@ -70,6 +70,8 @@ import {
 } from "./lib/dashboardHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
+  cachePricingStatus,
+  type CachedPricing,
   formatPercentValue,
   formatRemainingDays,
   subscriptionTierLabel
@@ -225,6 +227,34 @@ type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
 
 const authCodeExpiryFallbackSeconds = 900;
 
+function describeInvokeError(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.trim()
+  ) {
+    return error.message;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "error" in error &&
+    typeof error.error === "string" &&
+    error.error.trim()
+  ) {
+    return error.error;
+  }
+  return fallback;
+}
+
 async function loadDashboard(): Promise<DashboardState> {
   try {
     return await invoke<DashboardState>("get_dashboard_state");
@@ -290,7 +320,7 @@ function getUpgradePlans(
   audience: PricingAudience,
   claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
   recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"],
-  headroomSubscriptionTier?: HeadroomPricingStatus["account"]["subscriptionTier"]
+  headroomSubscriptionTier?: HeadroomSubscriptionTier | null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -450,11 +480,6 @@ function delay(ms: number) {
 }
 
 const PRICING_CACHE_KEY = "headroom.cachedPricing";
-interface CachedPricing {
-  planTier?: ClaudePlanTier;
-  recommendedSubscriptionTier?: HeadroomSubscriptionTier;
-  subscriptionTier?: HeadroomSubscriptionTier;
-}
 function readCachedPricing(): CachedPricing {
   try {
     const raw = localStorage.getItem(PRICING_CACHE_KEY);
@@ -796,7 +821,7 @@ export default function App() {
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
     pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
-    pricingStatus?.account.subscriptionTier ?? cachedPricing.subscriptionTier
+    pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier
   );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
   const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
@@ -845,11 +870,7 @@ export default function App() {
 
   useEffect(() => {
     if (!pricingStatus) return;
-    writeCachedPricing({
-      planTier: pricingStatus.claude.planTier,
-      recommendedSubscriptionTier: pricingStatus.recommendedSubscriptionTier ?? undefined,
-      subscriptionTier: pricingStatus.account.subscriptionTier ?? undefined,
-    });
+    writeCachedPricing(cachePricingStatus(pricingStatus));
   }, [pricingStatus]);
 
   useEffect(() => {
@@ -1938,9 +1959,7 @@ export default function App() {
       setAuthCodeExpirySeconds(result.expiresInSeconds);
       setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
     } catch (error) {
-      setAuthFlowError(
-        error instanceof Error ? error.message : "Could not send sign-in code."
-      );
+      setAuthFlowError(describeInvokeError(error, "Could not send sign-in code."));
     } finally {
       setAuthRequestBusy(false);
     }
@@ -1972,9 +1991,7 @@ export default function App() {
       setActiveView("upgrade");
       await refreshConnectors();
     } catch (error) {
-      setAuthFlowError(
-        error instanceof Error ? error.message : "Could not verify sign-in code."
-      );
+      setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
     } finally {
       setAuthVerifyBusy(false);
     }

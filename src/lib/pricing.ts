@@ -5,6 +5,12 @@ import type {
   HeadroomSubscriptionTier,
 } from "./types";
 
+export interface CachedPricing {
+  planTier?: ClaudePlanTier;
+  recommendedSubscriptionTier?: HeadroomSubscriptionTier;
+  subscriptionTier?: HeadroomSubscriptionTier;
+}
+
 export function claudePlanLabel(plan: ClaudePlanTier) {
   switch (plan) {
     case "free":
@@ -78,4 +84,12 @@ export function pricingTone(status: HeadroomPricingStatus | null) {
     return "trial";
   }
   return "healthy";
+}
+
+export function cachePricingStatus(status: HeadroomPricingStatus): CachedPricing {
+  return {
+    planTier: status.claude.planTier,
+    recommendedSubscriptionTier: status.recommendedSubscriptionTier ?? undefined,
+    subscriptionTier: status.account?.subscriptionTier ?? undefined,
+  };
 }
