@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Headroom",
-  "version": "0.1.7",
-  "identifier": "com.garm.headroom",
+  "version": "0.1.8",
+  "identifier": "com.extraheadroom.headroom",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",

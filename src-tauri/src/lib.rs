@@ -39,7 +39,7 @@ const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
-const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
+const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.headroom-learn";
 const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
 const HEADROOM_LEARN_ANTHROPIC_ACCOUNT: &str = "anthropic";
 const HEADROOM_LEARN_GEMINI_ACCOUNT: &str = "gemini";
