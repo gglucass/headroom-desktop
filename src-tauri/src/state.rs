@@ -55,7 +55,10 @@ pub struct HeadroomLearnRuntimeState {
 
 impl AppState {
     pub fn new() -> Result<Self> {
-        let base_dir = app_data_dir();
+        Self::new_in(app_data_dir())
+    }
+
+    fn new_in(base_dir: PathBuf) -> Result<Self> {
         ensure_data_dirs(&base_dir)?;
 
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
@@ -2428,7 +2431,8 @@ mod tests {
 
     #[test]
     fn dashboard_includes_managed_tools() {
-        let state = AppState::new().expect("app state");
+        let base_dir = temp_test_dir("headroom-app-state");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
         let dashboard = state.dashboard();
 
         assert!(dashboard.tools.iter().any(|tool| tool.id == "headroom"));
@@ -2437,6 +2441,8 @@ mod tests {
             .insights
             .iter()
             .any(|insight| !insight.title.is_empty()));
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 
     #[test]

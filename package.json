@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,11 @@
     "build:mac:dmg": "./scripts/build-macos-dmg.sh",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:frontend": "vitest run",
+    "test:desktop": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:all": "npm run test:frontend && npm run test:desktop",
+    "release:check": "./scripts/verify-release.sh"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

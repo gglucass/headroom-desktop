@@ -87,6 +87,8 @@ fi
 export CI="${CI:-true}"
 
 cd "${REPO_ROOT}"
+./scripts/verify-release.sh
+
 if [[ -n "${TARGET:-}" ]]; then
   npx tauri build --bundles dmg --ci --target "${TARGET}"
 else

@@ -87,3 +87,11 @@ Run Rust tests with:
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+Run the full release gate with:
+
+```bash
+npm run test:all
+```
+
+Both the GitHub macOS release workflow and the local `npm run build:mac:dmg` path now run `./scripts/verify-release.sh` first, so a new release build will stop before publishing if either the frontend or desktop tests fail.

@@ -15,12 +15,10 @@ use crate::storage::{app_data_dir, config_file};
 
 const HEADROOM_ACCOUNT_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.account";
 const HEADROOM_ACCOUNT_SESSION_ACCOUNT: &str = "session-token";
-#[cfg(any(not(debug_assertions), test))]
-const PRODUCTION_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 #[cfg(debug_assertions)]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
-const DEFAULT_ACCOUNT_API_BASE_URL: &str = PRODUCTION_ACCOUNT_API_BASE_URL;
+const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 24;
 const AUTH_CODE_EXPIRY_SECONDS: u64 = 900;
 
@@ -888,10 +886,7 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        resolve_account_api_base_url, DEFAULT_ACCOUNT_API_BASE_URL,
-        PRODUCTION_ACCOUNT_API_BASE_URL,
-    };
+    use super::{resolve_account_api_base_url, DEFAULT_ACCOUNT_API_BASE_URL};
 
     #[test]
     fn runtime_env_overrides_compile_time_env() {
@@ -921,6 +916,6 @@ mod tests {
     #[test]
     fn release_default_points_at_production_api() {
         #[cfg(not(debug_assertions))]
-        assert_eq!(DEFAULT_ACCOUNT_API_BASE_URL, PRODUCTION_ACCOUNT_API_BASE_URL);
+        assert_eq!(DEFAULT_ACCOUNT_API_BASE_URL, "https://extraheadroom.com/api/v1");
     }
 }

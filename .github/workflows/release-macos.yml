@@ -158,6 +158,10 @@ jobs:
         if: steps.release_guard.outputs.should_release == 'true'
         run: npm ci
 
+      - name: Run release checks
+        if: steps.release_guard.outputs.should_release == 'true'
+        run: ./scripts/verify-release.sh
+
       - name: Build and publish Tauri release
         if: steps.release_guard.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@action-v0.6.2
