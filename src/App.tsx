@@ -1264,6 +1264,13 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
+    if (activeView !== "home" || !startupReady) {
+      return;
+    }
+    void Promise.all([refreshConnectors(), refreshRuntimeStatus()]);
+  }, [activeView, startupReady]);
+
+  useEffect(() => {
     if (claudeProjects.length === 0) {
       setSelectedClaudeProjectPath(null);
       return;
@@ -1558,7 +1565,7 @@ export default function App() {
   }
 
   function getConnectorUnavailableReason(connector: ClientConnectorStatus) {
-    if (connector.installed) {
+    if (canConfigureConnectorWithoutDetection(connector)) {
       return null;
     }
     return (
@@ -1567,8 +1574,22 @@ export default function App() {
     );
   }
 
+  function canConfigureConnectorWithoutDetection(connector: ClientConnectorStatus) {
+    return connector.installed || connector.clientId === "claude_code";
+  }
+
   function getConnectorSupportWarning(connector: ClientConnectorStatus) {
     return connectorSupportWarnings[connector.clientId] ?? null;
+  }
+
+  function getConnectorDetectionWarning(connector: ClientConnectorStatus) {
+    if (connector.installed) {
+      return null;
+    }
+    if (connector.clientId === "claude_code") {
+      return connectorUnavailableReasons[connector.clientId];
+    }
+    return null;
   }
 
   function getClaudeConnector(connectorsToCheck: ClientConnectorStatus[]) {
@@ -2373,10 +2394,14 @@ export default function App() {
     const launcherConnectors =
       connectors.length > 0 ? connectors : launcherConnectorFallback;
     const sortedLauncherConnectors = sortClientConnectors(launcherConnectors);
-    const installedConnectors = sortedLauncherConnectors.filter((connector) => connector.installed);
-    const unavailableConnectors = sortedLauncherConnectors.filter((connector) => !connector.installed);
+    const availableConnectors = sortedLauncherConnectors.filter((connector) =>
+      canConfigureConnectorWithoutDetection(connector)
+    );
+    const unavailableConnectors = sortedLauncherConnectors.filter(
+      (connector) => !canConfigureConnectorWithoutDetection(connector)
+    );
     const enabledConnectorCount = launcherConnectors.filter((connector) => connector.enabled).length;
-    const requireSelection = installedConnectors.length > 0;
+    const requireSelection = availableConnectors.length > 0;
 
     return (
       <LauncherShell
@@ -2389,8 +2414,9 @@ export default function App() {
           <h1>Connect Claude Code</h1>
           <p>Toggle to automatically configure Claude Code to route through Headroom.</p>
           <div className="connector-list">
-            {installedConnectors.map((connector) => {
+            {availableConnectors.map((connector) => {
               const unavailableReason = getConnectorUnavailableReason(connector);
+              const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
               const needsRestart = connector.enabled && !connector.verified;
               return (
@@ -2445,6 +2471,9 @@ export default function App() {
                       <p className="connector-item__restart">
                         Restart {connector.name} to apply changes.
                       </p>
+                    ) : null}
+                    {detectionWarning ? (
+                      <p className="connector-item__reason">{detectionWarning}</p>
                     ) : null}
                     {unavailableReason ? (
                       <p className="connector-item__reason">{unavailableReason}</p>
@@ -3665,7 +3694,9 @@ export default function App() {
                         ? "Claude Code connection"
                         : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
-                    const toggleDisabled = connectorsBusy || !connector.installed;
+                    const detectionWarning = getConnectorDetectionWarning(connector);
+                    const toggleDisabled =
+                      connectorsBusy || !canConfigureConnectorWithoutDetection(connector);
                     return (
                       <article className="connector-item" key={connector.clientId}>
                         <div>
@@ -3698,6 +3729,9 @@ export default function App() {
                             <p className="connector-item__restart">
                               Restart {connector.name} to start routing through Headroom.
                             </p>
+                          ) : null}
+                          {detectionWarning ? (
+                            <p className="connector-item__reason">{detectionWarning}</p>
                           ) : null}
                           {unavailableReason ? (
                             <p className="connector-item__reason">{unavailableReason}</p>
