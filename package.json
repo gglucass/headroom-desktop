@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
+    "@sentry/react": "^10.47.0",
     "@tauri-apps/api": "^2.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

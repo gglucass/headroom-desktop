@@ -1,7 +1,14 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import * as Sentry from "@sentry/react";
 import App from "./App";
 import "./styles.css";
+
+Sentry.init({
+  dsn: import.meta.env.VITE_SENTRY_DSN,
+  integrations: [Sentry.browserTracingIntegration()],
+  tracesSampleRate: 0.1,
+});
 
 function hideBootLoading() {
   const bootLoading = document.getElementById("boot-loading");
@@ -22,6 +29,8 @@ window.addEventListener("headroom:boot-complete", () => {
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <Sentry.ErrorBoundary fallback={<p>Something went wrong.</p>} showDialog>
+      <App />
+    </Sentry.ErrorBoundary>
   </React.StrictMode>
 );
