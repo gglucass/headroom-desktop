@@ -92,3 +92,55 @@ if [[ -n "${TARGET:-}" ]]; then
 else
   npx tauri build --bundles dmg --ci
 fi
+
+rename_built_dmg() {
+  local version="$1"
+  local bundle_dir="${REPO_ROOT}/src-tauri/target"
+
+  if [[ -n "${TARGET:-}" ]]; then
+    bundle_dir="${bundle_dir}/${TARGET}"
+  fi
+
+  bundle_dir="${bundle_dir}/release/bundle/dmg"
+
+  if [[ ! -d "${bundle_dir}" ]]; then
+    echo "Expected DMG output directory not found: ${bundle_dir}" >&2
+    exit 1
+  fi
+
+  shopt -s nullglob
+  local dmgs=("${bundle_dir}"/*.dmg)
+  shopt -u nullglob
+
+  if [[ ${#dmgs[@]} -eq 0 ]]; then
+    echo "No DMG artifact found in ${bundle_dir}." >&2
+    exit 1
+  fi
+
+  local desired_path="${bundle_dir}/Headroom_${version}.dmg"
+  local source_path=""
+
+  for candidate in "${dmgs[@]}"; do
+    if [[ "${candidate}" != "${desired_path}" ]]; then
+      source_path="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${source_path}" ]]; then
+    source_path="${desired_path}"
+  fi
+
+  if [[ "${source_path}" != "${desired_path}" ]]; then
+    mv -f "${source_path}" "${desired_path}"
+
+    if [[ -f "${source_path}.sig" ]]; then
+      mv -f "${source_path}.sig" "${desired_path}.sig"
+    fi
+  fi
+
+  echo "DMG ready at ${desired_path}"
+}
+
+APP_VERSION="$(node -p "require('./package.json').version")"
+rename_built_dmg "${APP_VERSION}"

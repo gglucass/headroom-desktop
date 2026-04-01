@@ -24,7 +24,7 @@ export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-deskto
 npm run build:mac:dmg
 ```
 
-This produces a signed `.dmg` in `src-tauri/target/release/bundle/dmg/` for the current machine architecture.
+This produces a signed `Headroom_<version>.dmg` in `src-tauri/target/release/bundle/dmg/`.
 
 If you want a universal build, install both Rust macOS targets first and then run:
 

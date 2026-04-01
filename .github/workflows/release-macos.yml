@@ -146,6 +146,7 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
+          releaseAssetNamePattern: '[name]_[version][ext]'
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           args: --target aarch64-apple-darwin
