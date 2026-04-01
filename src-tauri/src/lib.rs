@@ -16,11 +16,12 @@ use std::sync::Mutex;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::ActivationPolicy;
 use tauri::Manager;
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
