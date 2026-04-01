@@ -15,6 +15,7 @@ use crate::storage::{app_data_dir, config_file};
 
 const HEADROOM_ACCOUNT_KEYCHAIN_SERVICE: &str = "com.garm.headroom.account";
 const HEADROOM_ACCOUNT_SESSION_ACCOUNT: &str = "session-token";
+#[cfg(any(not(debug_assertions), test))]
 const PRODUCTION_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 #[cfg(debug_assertions)]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";

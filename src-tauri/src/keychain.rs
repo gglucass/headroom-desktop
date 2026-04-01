@@ -104,7 +104,6 @@ mod platform {
         static kSecAttrService: CFStringRef;
         static kSecAttrAccount: CFStringRef;
         static kSecValueData: CFStringRef;
-        static kSecUseDataProtectionKeychain: CFStringRef;
         static kSecReturnData: CFStringRef;
         static kSecMatchLimit: CFStringRef;
         static kSecMatchLimitOne: CFStringRef;
@@ -132,22 +131,17 @@ mod platform {
         &kCFTypeDictionaryValueCallBacks as *const CFDictionaryCallBacks as *const c_void
     }
 
-    // Base lookup dict with kSecUseDataProtectionKeychain; caller must CFRelease.
+    // Base lookup dict for the standard macOS keychain; caller must CFRelease.
     unsafe fn base_query(service: &str, account: &str) -> CFDictionaryRef {
         let svc = cf_string(service);
         let acc = cf_string(account);
-        let keys: [CFTypeRef; 4] = [
-            kSecClass,
-            kSecAttrService,
-            kSecAttrAccount,
-            kSecUseDataProtectionKeychain,
-        ];
-        let values: [CFTypeRef; 4] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue];
+        let keys: [CFTypeRef; 3] = [kSecClass, kSecAttrService, kSecAttrAccount];
+        let values: [CFTypeRef; 3] = [kSecClassGenericPassword, svc, acc];
         let dict = CFDictionaryCreate(
             std::ptr::null(),
             keys.as_ptr(),
             values.as_ptr(),
-            4,
+            3,
             callbacks_key(),
             callbacks_val(),
         );
@@ -160,19 +154,17 @@ mod platform {
         unsafe {
             let svc = cf_string(service);
             let acc = cf_string(account);
-            let keys: [CFTypeRef; 6] = [
+            let keys: [CFTypeRef; 5] = [
                 kSecClass,
                 kSecAttrService,
                 kSecAttrAccount,
-                kSecUseDataProtectionKeychain,
                 kSecReturnData,
                 kSecMatchLimit,
             ];
-            let values: [CFTypeRef; 6] = [
+            let values: [CFTypeRef; 5] = [
                 kSecClassGenericPassword,
                 svc,
                 acc,
-                kCFBooleanTrue,
                 kCFBooleanTrue,
                 kSecMatchLimitOne,
             ];
@@ -180,7 +172,7 @@ mod platform {
                 std::ptr::null(),
                 keys.as_ptr(),
                 values.as_ptr(),
-                6,
+                5,
                 callbacks_key(),
                 callbacks_val(),
             );
@@ -234,19 +226,18 @@ mod platform {
             let svc = cf_string(service);
             let acc = cf_string(account);
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
-            let keys: [CFTypeRef; 5] = [
+            let keys: [CFTypeRef; 4] = [
                 kSecClass,
                 kSecAttrService,
                 kSecAttrAccount,
-                kSecUseDataProtectionKeychain,
                 kSecValueData,
             ];
-            let values: [CFTypeRef; 5] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue, data];
+            let values: [CFTypeRef; 4] = [kSecClassGenericPassword, svc, acc, data];
             let add_dict = CFDictionaryCreate(
                 std::ptr::null(),
                 keys.as_ptr(),
                 values.as_ptr(),
-                5,
+                4,
                 callbacks_key(),
                 callbacks_val(),
             );
