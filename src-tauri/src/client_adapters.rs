@@ -54,19 +54,10 @@ enum ShellFamily {
 pub fn detect_clients() -> Vec<ClientStatus> {
     let setup_state = load_setup_state();
 
-    vec![detect_client(
+    vec![detect_claude_code_client(is_configured(
+        &setup_state,
         "claude_code",
-        "Claude Code",
-        &[
-            "/usr/local/bin/claude",
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude-code",
-            "/opt/homebrew/bin/claude-code",
-        ],
-        &["claude", "claude-code"],
-        "Route Claude Code through Headroom's localhost proxy so prompts stay lean.",
-        is_configured(&setup_state, "claude_code"),
-    )]
+    ))]
 }
 
 pub fn ensure_rtk_integrations(
@@ -1451,24 +1442,16 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir())
 }
 
-fn detect_client(
-    id: &str,
-    name: &str,
-    candidates: &[&str],
-    binary_names: &[&str],
-    configured_note: &str,
-    configured: bool,
-) -> ClientStatus {
-    let executable = candidates
-        .iter()
-        .map(PathBuf::from)
+fn detect_claude_code_client(configured: bool) -> ClientStatus {
+    let executable = claude_code_candidate_paths()
+        .into_iter()
         .find(|path| path.exists())
-        .or_else(|| find_on_path(binary_names));
+        .or_else(|| find_on_path(&["claude", "claude-code"]));
 
-    match executable {
-        Some(path) => ClientStatus {
-            id: id.into(),
-            name: name.into(),
+    if let Some(path) = executable {
+        return ClientStatus {
+            id: "claude_code".into(),
+            name: "Claude Code".into(),
             installed: true,
             configured,
             health: if configured {
@@ -1484,19 +1467,121 @@ fn detect_client(
             } else {
                 vec![
                     format!("Detected at {}", path.display()),
-                    configured_note.into(),
+                    "Route Claude Code through Headroom's localhost proxy so prompts stay lean."
+                        .into(),
                 ]
             },
-        },
-        None => ClientStatus {
-            id: id.into(),
-            name: name.into(),
-            installed: false,
-            configured: false,
-            health: ClientHealth::NotDetected,
-            notes: vec!["Not detected on this machine yet.".into()],
-        },
+        };
     }
+
+    if claude_code_user_state_exists(&home_dir()) {
+        return ClientStatus {
+            id: "claude_code".into(),
+            name: "Claude Code".into(),
+            installed: true,
+            configured,
+            health: if configured {
+                ClientHealth::Healthy
+            } else {
+                ClientHealth::Attention
+            },
+            notes: if configured {
+                vec![
+                    "Detected Claude Code data in ~/.claude.".into(),
+                    "Configured by Headroom.".into(),
+                ]
+            } else {
+                vec![
+                    "Detected Claude Code data in ~/.claude.".into(),
+                    "Claude Code appears to be installed, but Headroom could not resolve the CLI from its current launch PATH. This is common when Headroom starts outside your shell and Claude was installed via nvm or another user-local toolchain.".into(),
+                ]
+            },
+        };
+    }
+
+    ClientStatus {
+        id: "claude_code".into(),
+        name: "Claude Code".into(),
+        installed: false,
+        configured: false,
+        health: ClientHealth::NotDetected,
+        notes: vec!["Not detected on this machine yet.".into()],
+    }
+}
+
+fn claude_code_candidate_paths() -> Vec<PathBuf> {
+    let home = home_dir();
+    let binary_names = ["claude", "claude-code"];
+    let mut candidates = vec![
+        PathBuf::from("/usr/local/bin/claude"),
+        PathBuf::from("/opt/homebrew/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude-code"),
+        PathBuf::from("/opt/homebrew/bin/claude-code"),
+    ];
+
+    let user_bin_dirs = vec![
+        home.join(".local").join("bin"),
+        home.join("bin"),
+        home.join(".npm-global").join("bin"),
+        home.join(".yarn").join("bin"),
+        home.join(".config")
+            .join("yarn")
+            .join("global")
+            .join("node_modules")
+            .join(".bin"),
+        home.join(".volta").join("bin"),
+        home.join(".bun").join("bin"),
+        home.join(".asdf").join("shims"),
+        home.join(".mise").join("shims"),
+        home.join(".nodenv").join("shims"),
+    ];
+
+    candidates.extend(binary_candidates_in_dirs(&user_bin_dirs, &binary_names));
+    candidates.extend(nvm_binary_candidates(&home, &binary_names));
+    dedupe_paths(candidates)
+}
+
+fn binary_candidates_in_dirs(directories: &[PathBuf], binary_names: &[&str]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for directory in directories {
+        for binary_name in binary_names {
+            candidates.push(directory.join(binary_name));
+            if cfg!(windows) {
+                for ext in windows_path_extensions() {
+                    candidates.push(directory.join(format!("{binary_name}{ext}")));
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn nvm_binary_candidates(home: &Path, binary_names: &[&str]) -> Vec<PathBuf> {
+    let mut candidates = binary_candidates_in_dirs(
+        &[home.join(".nvm").join("current").join("bin")],
+        binary_names,
+    );
+    let versions_dir = home.join(".nvm").join("versions").join("node");
+    let Ok(entries) = std::fs::read_dir(versions_dir) else {
+        return candidates;
+    };
+
+    let mut version_bins = entries
+        .flatten()
+        .map(|entry| entry.path().join("bin"))
+        .collect::<Vec<_>>();
+    version_bins.sort();
+    version_bins.reverse();
+    candidates.extend(binary_candidates_in_dirs(&version_bins, binary_names));
+    candidates
+}
+
+fn claude_code_user_state_exists(home: &Path) -> bool {
+    let claude_root = home.join(".claude");
+    claude_root.join("settings.json").exists()
+        || claude_root.join("projects").exists()
+        || claude_root.join("sessions").exists()
+        || claude_root.join("statsig").exists()
 }
 
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
@@ -1517,8 +1602,13 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
 
 fn find_on_path(binary_names: &[&str]) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let path_entries = std::env::split_paths(&path_var);
+    find_on_path_entries(std::env::split_paths(&path_var), binary_names)
+}
 
+fn find_on_path_entries<I>(path_entries: I, binary_names: &[&str]) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
     for entry in path_entries {
         for binary_name in binary_names {
             let candidate = entry.join(binary_name);
@@ -1559,13 +1649,16 @@ fn windows_path_extensions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
     use super::{
-        build_headroom_rtk_hook, claude_hook_present_in_value, default_shell_targets_for_family,
-        entry_contains_hook, normalize_setup_state, normalized_setup_id, parse_json_object,
+        build_headroom_rtk_hook, claude_code_user_state_exists, claude_hook_present_in_value,
+        default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
+        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
         serialize_paths, shell_double_quote, ClientSetupState, ShellFamily,
     };
 
@@ -1715,5 +1808,61 @@ mod tests {
             &json!({ "hooks": [] }),
             "headroom-rtk-rewrite.sh"
         ));
+    }
+
+    #[test]
+    fn nvm_binary_candidates_include_installed_versions() {
+        let home = unique_temp_dir("headroom-nvm-detect");
+        let version_bin = home
+            .join(".nvm")
+            .join("versions")
+            .join("node")
+            .join("v22.17.1")
+            .join("bin");
+        fs::create_dir_all(&version_bin).expect("create nvm bin");
+        fs::write(version_bin.join("claude"), "").expect("write fake claude binary");
+
+        let candidates = nvm_binary_candidates(&home, &["claude"]);
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate == &version_bin.join("claude")));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn path_lookup_scans_supplied_entries() {
+        let home = unique_temp_dir("headroom-path-detect");
+        let bin_dir = home.join("custom-bin");
+        fs::create_dir_all(&bin_dir).expect("create custom bin");
+        fs::write(bin_dir.join("claude"), "").expect("write fake claude binary");
+
+        let detected = find_on_path_entries(vec![bin_dir.clone()], &["claude"]);
+
+        assert_eq!(detected, Some(bin_dir.join("claude")));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_user_state_detection_accepts_settings_or_projects() {
+        let home = unique_temp_dir("headroom-claude-home");
+        let claude_root = home.join(".claude");
+        fs::create_dir_all(&claude_root).expect("create claude root");
+        assert!(!claude_code_user_state_exists(&home));
+
+        fs::write(claude_root.join("settings.json"), "{}").expect("write settings");
+        assert!(claude_code_user_state_exists(&home));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
     }
 }
