@@ -296,11 +296,8 @@ pub fn create_checkout_session(
             .ok()
             .and_then(|body| body.error)
             .filter(|value| !value.trim().is_empty());
-        return Err(
-            api_error.unwrap_or_else(|| {
-                format!("Could not create checkout session (status {status}).")
-            }),
-        );
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not create checkout session (status {status}).")));
     }
 
     response

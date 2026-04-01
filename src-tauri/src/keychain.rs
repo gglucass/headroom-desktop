@@ -136,9 +136,21 @@ mod platform {
     unsafe fn base_query(service: &str, account: &str) -> CFDictionaryRef {
         let svc = cf_string(service);
         let acc = cf_string(account);
-        let keys: [CFTypeRef; 4] = [kSecClass, kSecAttrService, kSecAttrAccount, kSecUseDataProtectionKeychain];
+        let keys: [CFTypeRef; 4] = [
+            kSecClass,
+            kSecAttrService,
+            kSecAttrAccount,
+            kSecUseDataProtectionKeychain,
+        ];
         let values: [CFTypeRef; 4] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue];
-        let dict = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 4, callbacks_key(), callbacks_val());
+        let dict = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            4,
+            callbacks_key(),
+            callbacks_val(),
+        );
         CFRelease(svc);
         CFRelease(acc);
         dict
@@ -148,9 +160,30 @@ mod platform {
         unsafe {
             let svc = cf_string(service);
             let acc = cf_string(account);
-            let keys: [CFTypeRef; 6] = [kSecClass, kSecAttrService, kSecAttrAccount, kSecUseDataProtectionKeychain, kSecReturnData, kSecMatchLimit];
-            let values: [CFTypeRef; 6] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue, kCFBooleanTrue, kSecMatchLimitOne];
-            let query = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 6, callbacks_key(), callbacks_val());
+            let keys: [CFTypeRef; 6] = [
+                kSecClass,
+                kSecAttrService,
+                kSecAttrAccount,
+                kSecUseDataProtectionKeychain,
+                kSecReturnData,
+                kSecMatchLimit,
+            ];
+            let values: [CFTypeRef; 6] = [
+                kSecClassGenericPassword,
+                svc,
+                acc,
+                kCFBooleanTrue,
+                kCFBooleanTrue,
+                kSecMatchLimitOne,
+            ];
+            let query = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                6,
+                callbacks_key(),
+                callbacks_val(),
+            );
             CFRelease(svc);
             CFRelease(acc);
 
@@ -181,7 +214,14 @@ mod platform {
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
             let attr_keys: [CFTypeRef; 1] = [kSecValueData];
             let attr_vals: [CFTypeRef; 1] = [data];
-            let attrs = CFDictionaryCreate(std::ptr::null(), attr_keys.as_ptr(), attr_vals.as_ptr(), 1, callbacks_key(), callbacks_val());
+            let attrs = CFDictionaryCreate(
+                std::ptr::null(),
+                attr_keys.as_ptr(),
+                attr_vals.as_ptr(),
+                1,
+                callbacks_key(),
+                callbacks_val(),
+            );
             let status = SecItemUpdate(query, attrs);
             CFRelease(attrs);
             CFRelease(data);
@@ -194,9 +234,22 @@ mod platform {
             let svc = cf_string(service);
             let acc = cf_string(account);
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
-            let keys: [CFTypeRef; 5] = [kSecClass, kSecAttrService, kSecAttrAccount, kSecUseDataProtectionKeychain, kSecValueData];
+            let keys: [CFTypeRef; 5] = [
+                kSecClass,
+                kSecAttrService,
+                kSecAttrAccount,
+                kSecUseDataProtectionKeychain,
+                kSecValueData,
+            ];
             let values: [CFTypeRef; 5] = [kSecClassGenericPassword, svc, acc, kCFBooleanTrue, data];
-            let add_dict = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 5, callbacks_key(), callbacks_val());
+            let add_dict = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                5,
+                callbacks_key(),
+                callbacks_val(),
+            );
             let add_status = SecItemAdd(add_dict, std::ptr::null_mut());
             CFRelease(add_dict);
             CFRelease(data);
@@ -226,7 +279,9 @@ mod platform {
         if status == 0 {
             Ok(())
         } else {
-            Err(format!("{action} failed with macOS Security status {status}."))
+            Err(format!(
+                "{action} failed with macOS Security status {status}."
+            ))
         }
     }
 }

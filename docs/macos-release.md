@@ -20,7 +20,7 @@ export APPLE_API_ISSUER="your-app-store-connect-issuer-id"
 export APPLE_API_KEY="your-app-store-connect-key-id"
 export APPLE_API_KEY_PATH="$HOME/.private_keys/AuthKey_ABC123XYZ.p8"
 export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
-export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/<owner>/<repo>/releases/latest/download/latest.json"]'
+export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
 npm run build:mac:dmg
 ```
 
@@ -52,7 +52,7 @@ Example:
 
 ```bash
 export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
-export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/<owner>/<repo>/releases/latest/download/latest.json"]'
+export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
 ```
 
 These values are compiled into the release build. If they are missing, Headroom still runs, but update checks stay disabled for that build.
@@ -177,6 +177,7 @@ Current behavior:
 - lets the user manually check from Settings
 - prompts before download/install
 - asks the user to restart after install completes
+- production builds fall back to `https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json` when no explicit updater env vars are injected
 
 ## Recommended next step
 

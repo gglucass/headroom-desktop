@@ -37,6 +37,7 @@ import {
   YAxis
 } from "recharts";
 import headroomLogo from "./assets/headroom-logo.svg";
+import packageJson from "../package.json";
 import {
   aggregateClientConnectors,
   addDays,
@@ -77,8 +78,10 @@ import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
   BootstrapProgress,
+  ClaudePlanTier,
   HeadroomAuthCodeRequest,
   HeadroomPricingStatus,
+  HeadroomSubscriptionTier,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -444,6 +447,24 @@ function delay(ms: number) {
   });
 }
 
+const PRICING_CACHE_KEY = "headroom.cachedPricing";
+interface CachedPricing {
+  planTier?: ClaudePlanTier;
+  recommendedSubscriptionTier?: HeadroomSubscriptionTier;
+}
+function readCachedPricing(): CachedPricing {
+  try {
+    const raw = localStorage.getItem(PRICING_CACHE_KEY);
+    if (raw) return JSON.parse(raw) as CachedPricing;
+  } catch {}
+  return {};
+}
+function writeCachedPricing(pricing: CachedPricing) {
+  try {
+    localStorage.setItem(PRICING_CACHE_KEY, JSON.stringify(pricing));
+  } catch {}
+}
+
 type SavingsChartView = "month" | "day";
 
 function DailySavingsChart({
@@ -621,6 +642,7 @@ interface LauncherShellProps {
   spinnerClassName: string;
   copyClassName: string;
   onMouseDown: (event: MouseEvent<HTMLElement>) => void;
+  version: string;
   children: ReactNode;
   showSpinner?: boolean;
 }
@@ -637,6 +659,7 @@ function LauncherShell({
   spinnerClassName,
   copyClassName,
   onMouseDown,
+  version,
   children,
   showSpinner = true,
 }: LauncherShellProps) {
@@ -648,7 +671,7 @@ function LauncherShell({
       >
         <div className="hero__badge hero__badge--launcher">
           <img src={headroomLogo} alt="" aria-hidden="true" />
-          <span>v0.1.0</span>
+          <span>v{version}</span>
         </div>
         {showSpinner && (
           <img
@@ -720,6 +743,7 @@ export default function App() {
   const [headroomApiKeyStatus, setHeadroomApiKeyStatus] =
     useState<HeadroomLearnApiKeyStatus>(idleHeadroomLearnApiKeyStatus);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
+  const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState("");
@@ -755,6 +779,7 @@ export default function App() {
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
   const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
+  const appSemver = appUpdateConfig?.currentVersion ?? packageJson.version;
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
   const mainWindowLastSeenDayRef = useRef(formatDayKey(new Date()));
   const backgroundUpdateCheckStartedRef = useRef(false);
@@ -766,8 +791,8 @@ export default function App() {
       : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
-    pricingStatus?.claude.planTier,
-    pricingStatus?.recommendedSubscriptionTier
+    pricingStatus?.claude.planTier ?? cachedPricing.planTier,
+    pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier
   );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
   const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
@@ -813,6 +838,14 @@ export default function App() {
       desktopActivationSentRef.current = false;
     }
   }, [pricingStatus?.authenticated]);
+
+  useEffect(() => {
+    if (!pricingStatus) return;
+    writeCachedPricing({
+      planTier: pricingStatus.claude.planTier,
+      recommendedSubscriptionTier: pricingStatus.recommendedSubscriptionTier ?? undefined,
+    });
+  }, [pricingStatus]);
 
   useEffect(() => {
     let active = true;
@@ -2308,6 +2341,7 @@ export default function App() {
         spinnerClassName="intro-shell__spinner"
         copyClassName="intro-shell__copy intro-shell__copy--first-run"
         onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
         showSpinner={bootstrapping}
       >
         <h1>
@@ -2409,6 +2443,7 @@ export default function App() {
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
         onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
       >
         <div className="post-install__lead">
           <h1>Connect Claude Code</h1>
@@ -2593,6 +2628,7 @@ export default function App() {
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
         onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
       >
         <div className="post-install__lead">
           <h1>Test your setup</h1>
@@ -2669,6 +2705,7 @@ export default function App() {
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
         onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
       >
         <div className="post-install__lead">
           <h1>
@@ -2883,7 +2920,7 @@ export default function App() {
   );
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
-      ? pricingStatus?.recommendedSubscriptionTier ?? upgradePlansState.featuredPlanId
+      ? (pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier ?? upgradePlansState.featuredPlanId)
       : "enterprise";
   const upgradeDefaultPlan = upgradePlansState.plans.find((plan) => plan.id === upgradeDefaultPlanId) ?? null;
   const visibleUpgradePlans =
@@ -3771,7 +3808,7 @@ export default function App() {
                 <div className="runtime-status">
                   <div className="runtime-status__topline">
                     <span className="runtime-status__section-title">
-                      Headroom app ({dashboard.appVersion})
+                      Headroom app ({appSemver})
                     </span>
                   </div>
                   <div className="runtime-status__section-action-row">

@@ -46,6 +46,7 @@ The marketing/download website now lives in a separate private repo so the deskt
 
 - Headroom is wired for outside-the-App-Store macOS updates using Tauri's official updater flow.
 - The app checks in the background, prompts before installing, and asks the user to restart after the update is installed.
+- Production builds default to the official GitHub Releases feed at `https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json`.
 - Release setup details live in [`docs/macos-release.md`](docs/macos-release.md).
 
 ## Development

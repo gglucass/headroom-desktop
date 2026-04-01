@@ -34,6 +34,9 @@ use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
+const DEFAULT_UPDATER_ENDPOINT: &str =
+    "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
@@ -714,31 +717,50 @@ pub fn run() {
 }
 
 fn release_updater_config() -> Result<Option<ReleaseUpdaterConfig>, String> {
-    let Some(pubkey) = UPDATER_PUBLIC_KEY
+    let configured_pubkey = UPDATER_PUBLIC_KEY
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|value| !value.is_empty());
+    let configured_endpoints = UPDATER_ENDPOINTS
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let endpoint_spec = UPDATER_ENDPOINTS
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
+    match (configured_pubkey, configured_endpoints) {
+        (Some(pubkey), Some(endpoint_spec)) => {
+            build_release_updater_config(pubkey, endpoint_spec).map(Some)
+        }
+        (Some(_), None) => Err(
             "Updater public key is configured, but HEADROOM_UPDATER_ENDPOINTS is missing."
-                .to_string()
-        })?;
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "HEADROOM_UPDATER_ENDPOINTS is configured, but HEADROOM_UPDATER_PUBLIC_KEY is missing."
+                .to_string(),
+        ),
+        (None, None) => {
+            if cfg!(debug_assertions) {
+                Ok(None)
+            } else {
+                build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
+                    .map(Some)
+            }
+        }
+    }
+}
 
+fn build_release_updater_config(
+    pubkey: &str,
+    endpoint_spec: &str,
+) -> Result<ReleaseUpdaterConfig, String> {
     let endpoints = parse_updater_endpoint_list(endpoint_spec)?;
 
     if endpoints.is_empty() {
         return Err("HEADROOM_UPDATER_ENDPOINTS did not include any valid URLs.".into());
     }
 
-    Ok(Some(ReleaseUpdaterConfig {
+    Ok(ReleaseUpdaterConfig {
         pubkey: pubkey.to_string(),
         endpoints,
-    }))
+    })
 }
 
 fn parse_updater_endpoint_list(raw: &str) -> Result<Vec<reqwest::Url>, String> {
@@ -1708,8 +1730,9 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_tray_window_position, parse_updater_endpoint_list, physical_rect_from_rect,
-        MonitorBounds, PhysicalRect,
+        build_release_updater_config, compute_tray_window_position, parse_updater_endpoint_list,
+        physical_rect_from_rect, MonitorBounds, PhysicalRect, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
@@ -1751,6 +1774,20 @@ mod tests {
         let insecure = parse_updater_endpoint_list("http://updates.example.com/latest.json")
             .expect_err("http endpoint should fail");
         assert!(insecure.contains("must use HTTPS"));
+    }
+
+    #[test]
+    fn updater_release_config_accepts_official_default_feed() {
+        let config =
+            build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
+                .expect("official updater config");
+
+        assert_eq!(config.pubkey, DEFAULT_UPDATER_PUBLIC_KEY);
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
+        );
     }
 
     #[test]
