@@ -289,7 +289,8 @@ function SavingsChartTooltip({
 function getUpgradePlans(
   audience: PricingAudience,
   claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
-  recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"]
+  recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"],
+  headroomSubscriptionTier?: HeadroomPricingStatus["account"]["subscriptionTier"]
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -368,7 +369,8 @@ function getUpgradePlans(
         case "max20x":
           return "max20x" as const;
         default:
-          return null;
+          // Fall back to Headroom subscription tier when Claude plan detection fails
+          return headroomSubscriptionTier ?? null;
       }
     })();
 
@@ -451,6 +453,7 @@ const PRICING_CACHE_KEY = "headroom.cachedPricing";
 interface CachedPricing {
   planTier?: ClaudePlanTier;
   recommendedSubscriptionTier?: HeadroomSubscriptionTier;
+  subscriptionTier?: HeadroomSubscriptionTier;
 }
 function readCachedPricing(): CachedPricing {
   try {
@@ -792,7 +795,8 @@ export default function App() {
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-    pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier
+    pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
+    pricingStatus?.account.subscriptionTier ?? cachedPricing.subscriptionTier
   );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
   const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
@@ -844,6 +848,7 @@ export default function App() {
     writeCachedPricing({
       planTier: pricingStatus.claude.planTier,
       recommendedSubscriptionTier: pricingStatus.recommendedSubscriptionTier ?? undefined,
+      subscriptionTier: pricingStatus.account.subscriptionTier ?? undefined,
     });
   }, [pricingStatus]);
 
