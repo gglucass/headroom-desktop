@@ -226,12 +226,7 @@ mod platform {
             let svc = cf_string(service);
             let acc = cf_string(account);
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
-            let keys: [CFTypeRef; 4] = [
-                kSecClass,
-                kSecAttrService,
-                kSecAttrAccount,
-                kSecValueData,
-            ];
+            let keys: [CFTypeRef; 4] = [kSecClass, kSecAttrService, kSecAttrAccount, kSecValueData];
             let values: [CFTypeRef; 4] = [kSecClassGenericPassword, svc, acc, data];
             let add_dict = CFDictionaryCreate(
                 std::ptr::null(),

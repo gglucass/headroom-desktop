@@ -265,18 +265,18 @@ impl ToolManager {
     }
 
     pub fn start_headroom_background(&self) -> Result<Child> {
-        let entrypoint = self.headroom_entrypoint();
-        if !entrypoint.exists() {
-            bail!("headroom entrypoint not found at {}", entrypoint.display());
+        let python = self.managed_python();
+        if !python.exists() {
+            bail!("headroom managed python not found at {}", python.display());
         }
 
-        let startup_variants: &[&[&str]] = &[&["proxy", "--port", HEADROOM_PROXY_PORT]];
+        let startup_variants = headroom_startup_variants();
         let mut errors = Vec::new();
         let logs_dir = self.runtime.logs_dir();
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
 
-        for args in startup_variants {
+        for args in &startup_variants {
             let variant = if args.is_empty() {
                 "default".to_string()
             } else {
@@ -289,15 +289,12 @@ impl ToolManager {
                 .open(&log_path)
                 .with_context(|| format!("opening {}", log_path.display()))?;
 
-            let mut child = Command::new(&entrypoint)
-                .args(*args)
+            let mut child = Command::new(&python)
+                .args(args)
                 .current_dir(&self.runtime.root_dir)
                 .env("PYTHONNOUSERSITE", "1")
                 .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
                 .env("PIP_NO_INPUT", "1")
-                // Headroom's upstream HTTP/2 path can be brittle on some networks;
-                // force HTTP/1.1 for proxy stability.
-                .env("HEADROOM_HTTP2", "0")
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(
@@ -308,7 +305,11 @@ impl ToolManager {
                 .stderr(Stdio::from(log_file))
                 .spawn()
                 .with_context(|| {
-                    format!("starting headroom background process: {}", args.join(" "))
+                    format!(
+                        "starting headroom background process: {} {}",
+                        python.display(),
+                        args.join(" ")
+                    )
                 })?;
 
             let mut startup_ok = false;
@@ -1003,6 +1004,16 @@ fn is_local_proxy_reachable() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
+fn headroom_startup_variants() -> Vec<Vec<&'static str>> {
+    vec![vec![
+        "-m",
+        "headroom.proxy.server",
+        "--port",
+        HEADROOM_PROXY_PORT,
+        "--no-http2",
+    ]]
+}
+
 struct DownloadArtifact {
     url: String,
     sha256: Option<&'static str>,
@@ -1232,7 +1243,7 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedRuntime, ToolManager};
+    use super::{headroom_startup_variants, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT};
 
     #[test]
     fn managed_python_paths_live_inside_headroom_root() {
@@ -1260,6 +1271,20 @@ mod tests {
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
         assert!(runtime.bin_dir.join("rtk").exists());
+    }
+
+    #[test]
+    fn managed_headroom_startup_uses_supported_proxy_args() {
+        assert_eq!(
+            headroom_startup_variants(),
+            vec![vec![
+                "-m",
+                "headroom.proxy.server",
+                "--port",
+                HEADROOM_PROXY_PORT,
+                "--no-http2",
+            ]]
+        );
     }
 
     #[test]

@@ -982,16 +982,45 @@ select {
 }
 
 .upgrade-plan-card__button {
+  display: inline-flex;
+  align-items: center;
   width: 100%;
+  box-sizing: border-box;
   justify-content: center;
-  padding-block: 0px;
+  padding: 12px 16px;
   min-height: 42px;
   font-size: 0.95rem;
+  border-radius: 20px;
+  border: 1px solid transparent;
+  box-shadow: none;
 }
 
-.upgrade-plan-card__button--free {
+.primary-button.upgrade-plan-card__button,
+.primary-button.upgrade-plan-card__button:hover,
+.primary-button.upgrade-plan-card__button:active,
+.secondary-button.upgrade-plan-card__button,
+.secondary-button.upgrade-plan-card__button:hover,
+.secondary-button.upgrade-plan-card__button:active {
+  box-shadow: none;
+}
+
+.primary-button.upgrade-plan-card__button {
+  background: linear-gradient(135deg, #202322, #4f8b75);
+  color: #fff8eb;
+}
+
+.secondary-button.upgrade-plan-card__button {
   background: #f1ebe7;
   color: #26211f;
+  border-color: rgba(36, 31, 29, 0.14);
+}
+
+.primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade),
+.primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade):hover,
+.primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade):active {
+  background: #f1ebe7;
+  color: #26211f;
+  border-color: rgba(36, 31, 29, 0.14);
 }
 
 .upgrade-plan-card__button--downgrade {

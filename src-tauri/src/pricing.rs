@@ -900,8 +900,7 @@ mod tests {
 
     #[test]
     fn compile_time_env_used_when_runtime_missing() {
-        let resolved =
-            resolve_account_api_base_url(None, Some("https://compile.example/api/v1"));
+        let resolved = resolve_account_api_base_url(None, Some("https://compile.example/api/v1"));
 
         assert_eq!(resolved, "https://compile.example/api/v1");
     }
@@ -916,6 +915,9 @@ mod tests {
     #[test]
     fn release_default_points_at_production_api() {
         #[cfg(not(debug_assertions))]
-        assert_eq!(DEFAULT_ACCOUNT_API_BASE_URL, "https://extraheadroom.com/api/v1");
+        assert_eq!(
+            DEFAULT_ACCOUNT_API_BASE_URL,
+            "https://extraheadroom.com/api/v1"
+        );
     }
 }

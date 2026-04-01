@@ -702,10 +702,21 @@ impl AppState {
 
         // Also clean up detached/orphaned Headroom-managed headroom proxies
         // so quitting the UI cannot leave the background listener behind.
-        let headroom_entrypoint = self.tool_manager.headroom_entrypoint();
-        let command_pattern = format!("{} proxy --port 6768", headroom_entrypoint.display());
-        if let Err(err) = kill_processes_by_command_pattern(&command_pattern) {
-            eprintln!("failed to clean detached headroom proxy processes: {err}");
+        let managed_python = self.tool_manager.managed_python();
+        let command_patterns = [
+            format!(
+                "{} -m headroom.proxy.server --port 6768 --no-http2",
+                managed_python.display()
+            ),
+            format!(
+                "{} proxy --port 6768",
+                self.tool_manager.headroom_entrypoint().display()
+            ),
+        ];
+        for pattern in command_patterns {
+            if let Err(err) = kill_processes_by_command_pattern(&pattern) {
+                eprintln!("failed to clean detached headroom proxy processes: {err}");
+            }
         }
     }
 
