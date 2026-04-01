@@ -7,7 +7,7 @@
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub const INTERCEPT_PORT: u16 = 6767;
@@ -48,11 +48,11 @@ async fn run(token_slot: SharedToken) -> std::io::Result<()> {
 }
 
 async fn handle(mut client: TcpStream, token_slot: SharedToken) {
-    // Read the full request from the client into memory.
-    // Requests are typically small (a few KB of headers + JSON body for LLM
-    // calls); we read up to 64 MB to handle large prompts.
+    // Read only through the end of the HTTP headers. We only need headers to
+    // capture the bearer token, and forwarding early avoids deadlocks with
+    // `Expect: 100-continue` request flows.
     let mut buf = Vec::with_capacity(4096);
-    if read_http_message(&mut client, &mut buf).await.is_err() {
+    if read_http_headers(&mut client, &mut buf).await.is_err() {
         return;
     }
 
@@ -76,19 +76,18 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
         return;
     }
 
-    // Pipe the rest of both directions concurrently.
-    let (mut cr, mut cw) = client.into_split();
-    let (mut br, mut bw) = backend.into_split();
-
-    let c2b = tokio::io::copy(&mut cr, &mut bw);
-    let b2c = tokio::io::copy(&mut br, &mut cw);
-    let _ = tokio::join!(c2b, b2c);
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 }
 
-/// Read exactly one HTTP message (headers + body) from `stream` into `buf`.
-/// Stops once we have a complete framed message so we can inspect headers
-/// before forwarding, without blocking waiting for more data.
-async fn read_http_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
+/// Read through the end of the HTTP headers from `stream` into `buf`.
+///
+/// Forwarding immediately after the header block is enough for token capture
+/// and avoids hanging on protocols that wait for a `100 Continue` response
+/// before sending the request body.
+async fn read_http_headers<R>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut tmp = [0u8; 4096];
 
     loop {
@@ -101,44 +100,14 @@ async fn read_http_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io
         }
         buf.extend_from_slice(&tmp[..n]);
 
-        // Find the end of the HTTP headers.
-        let Some(header_end) = find_header_end(buf) else {
-            continue;
-        };
-
-        // Parse Content-Length so we know how much body to wait for.
-        let header_section = &buf[..header_end];
-        let content_length = parse_content_length(header_section);
-        let body_so_far = buf.len().saturating_sub(header_end + 4);
-
-        if body_so_far >= content_length {
+        if find_header_end(buf).is_some() {
             return Ok(());
         }
-
-        // Keep reading until we have the full body.
-        let remaining = content_length - body_so_far;
-        let prev_len = buf.len();
-        buf.resize(prev_len + remaining, 0);
-        stream.read_exact(&mut buf[prev_len..]).await?;
-        return Ok(());
     }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &[u8]) -> usize {
-    let text = std::str::from_utf8(headers).unwrap_or("");
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                return n;
-            }
-        }
-    }
-    0
 }
 
 /// Extract the bearer token value from raw HTTP request bytes, if present.
@@ -157,4 +126,49 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_bearer, find_header_end, read_http_headers};
+    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn finds_header_boundary() {
+        let request = b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\r\n{\"x\":1}";
+        assert_eq!(find_header_end(request), Some(43));
+    }
+
+    #[test]
+    fn extracts_bearer_token_case_insensitively() {
+        let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
+        assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
+    }
+
+    #[tokio::test]
+    async fn header_read_does_not_wait_for_continue_body() {
+        let (mut client, mut server_stream) = duplex(1024);
+
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(
+                    b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+                )
+                .await
+                .expect("write headers");
+        });
+
+        let mut buf = Vec::new();
+        timeout(
+            Duration::from_millis(250),
+            read_http_headers(&mut server_stream, &mut buf),
+        )
+        .await
+        .expect("headers should complete without waiting for body")
+        .expect("header read succeeds");
+
+        assert!(buf.windows(4).any(|window| window == b"\r\n\r\n"));
+        writer.await.expect("writer task");
+    }
 }
