@@ -40,6 +40,7 @@ import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
 import {
   describeInvokeError,
+  getNextLowerUpgradePlanId,
   getUpgradePlans,
   upgradePlanIntentLabel,
   type PricingAudience,
@@ -613,7 +614,8 @@ export default function App() {
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
     pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
-    pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier
+    pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
+    pricingStatus?.account?.subscriptionActive ?? false
   );
   const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
   const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
@@ -1818,6 +1820,10 @@ export default function App() {
   }
 
   async function handleUpgradeAction(planId: UpgradePlanId) {
+    const activeHeadroomPlanId =
+      pricingStatus?.account?.subscriptionActive
+        ? pricingStatus.account.subscriptionTier ?? null
+        : null;
     const action = (() => {
       switch (planId) {
         case "free":
@@ -1826,15 +1832,15 @@ export default function App() {
           };
         case "pro":
           return {
-            kind: "checkout" as const
+            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
           };
         case "max5x":
           return {
-            kind: "checkout" as const
+            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
           };
         case "max20x":
           return {
-            kind: "checkout" as const
+            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
           };
         case "team":
           return {
@@ -1891,7 +1897,7 @@ export default function App() {
     }
 
     if (!action.url) {
-      setUpgradeActionError(action.missing);
+      setUpgradeActionError(action.missing ?? "Could not open the selected plan link.");
       return;
     }
 
@@ -2737,10 +2743,26 @@ export default function App() {
       ? (pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier ?? upgradePlansState.featuredPlanId)
       : "enterprise";
   const upgradeDefaultPlan = upgradePlansState.plans.find((plan) => plan.id === upgradeDefaultPlanId) ?? null;
-  const visibleUpgradePlans =
-    showAllUpgradePlans || upgradePlansState.plans.length <= 2
-      ? upgradePlansState.plans
-      : upgradePlansState.plans.slice(0, 2);
+  const activeHeadroomPlanId =
+    pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
+      ? pricingStatus.account.subscriptionTier ?? null
+      : null;
+  const downgradePlanId = getNextLowerUpgradePlanId(activeHeadroomPlanId);
+  const visibleUpgradePlans = (() => {
+    if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
+      return upgradePlansState.plans;
+    }
+
+    if (pricingAudience === "individual" && activeHeadroomPlanId && downgradePlanId) {
+      const visiblePlanIds = new Set<UpgradePlanId>([activeHeadroomPlanId, downgradePlanId]);
+      const activeWindowPlans = upgradePlansState.plans.filter((plan) => visiblePlanIds.has(plan.id));
+      if (activeWindowPlans.length === 2) {
+        return activeWindowPlans;
+      }
+    }
+
+    return upgradePlansState.plans.slice(0, 2);
+  })();
   const hasHiddenUpgradePlans = visibleUpgradePlans.length < upgradePlansState.plans.length;
   const pendingUpgradePlanLabel = upgradePlanIntentLabel(pendingUpgradePlanId);
   const upgradeAuthMessage = pendingUpgradePlanLabel
@@ -3365,12 +3387,14 @@ export default function App() {
           >
             {visibleUpgradePlans.map((plan) => {
               const isFeatured = plan.id === upgradePlansState.featuredPlanId;
+              const downgradeButtonClassName =
+                plan.ctaTone === "downgrade" ? " upgrade-plan-card__button--downgrade" : "";
               const buttonClassName =
                 plan.id === "free"
-                  ? "primary-button upgrade-plan-card__button upgrade-plan-card__button--free"
+                  ? `primary-button upgrade-plan-card__button upgrade-plan-card__button--free${downgradeButtonClassName}`
                   : plan.ctaVariant === "primary"
-                  ? "primary-button upgrade-plan-card__button"
-                  : "secondary-button upgrade-plan-card__button";
+                  ? `primary-button upgrade-plan-card__button${downgradeButtonClassName}`
+                  : `secondary-button upgrade-plan-card__button${downgradeButtonClassName}`;
 
               return (
                 <article

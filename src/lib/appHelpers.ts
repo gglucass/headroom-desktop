@@ -5,6 +5,10 @@ import type {
 
 export type PricingAudience = "individual" | "teamEnterprise";
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
+type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
+type PaidUpgradePlanId = HeadroomSubscriptionTier;
+
+const INDIVIDUAL_PLAN_ORDER: IndividualUpgradePlanId[] = ["free", "pro", "max5x", "max20x"];
 
 export interface UpgradePlan {
   id: UpgradePlanId;
@@ -17,6 +21,7 @@ export interface UpgradePlan {
   features: string[];
   ctaLabel: string;
   ctaVariant: "primary" | "secondary";
+  ctaTone?: "default" | "downgrade";
   disabled?: boolean;
 }
 
@@ -61,11 +66,27 @@ export function describeInvokeError(error: unknown, fallback: string) {
   return fallback;
 }
 
+export function getNextLowerUpgradePlanId(
+  planId?: PaidUpgradePlanId | null
+): IndividualUpgradePlanId | null {
+  switch (planId) {
+    case "pro":
+      return "free";
+    case "max5x":
+      return "pro";
+    case "max20x":
+      return "max5x";
+    default:
+      return null;
+  }
+}
+
 export function getUpgradePlans(
   audience: PricingAudience,
   claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
   recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"],
-  headroomSubscriptionTier?: HeadroomSubscriptionTier | null
+  headroomSubscriptionTier?: HeadroomSubscriptionTier | null,
+  hasActiveHeadroomSubscription = false
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -84,7 +105,8 @@ export function getUpgradePlans(
         "Optimize Claude Code practices"
       ],
       ctaLabel: "Stay on Free plan",
-      ctaVariant: "secondary"
+      ctaVariant: "secondary",
+      ctaTone: "default"
     };
 
     const paidPlans: Record<"pro" | "max5x" | "max20x", UpgradePlan> = {
@@ -101,7 +123,8 @@ export function getUpgradePlans(
           "Email-based support"
         ],
         ctaLabel: "Get Pro",
-        ctaVariant: "primary"
+        ctaVariant: "primary",
+        ctaTone: "default"
       },
       max5x: {
         id: "max5x",
@@ -116,7 +139,8 @@ export function getUpgradePlans(
           "Email-based support"
         ],
         ctaLabel: "Get Max x5",
-        ctaVariant: "primary"
+        ctaVariant: "primary",
+        ctaTone: "default"
       },
       max20x: {
         id: "max20x",
@@ -131,9 +155,65 @@ export function getUpgradePlans(
           "Priority support"
         ],
         ctaLabel: "Get Max x20",
-        ctaVariant: "primary"
+        ctaVariant: "primary",
+        ctaTone: "default"
       }
     };
+
+    const activeHeadroomPlanId =
+      hasActiveHeadroomSubscription && headroomSubscriptionTier
+        ? headroomSubscriptionTier
+        : null;
+
+    const withRelativeCta = (plan: UpgradePlan): UpgradePlan => {
+      if (!activeHeadroomPlanId) {
+        return plan;
+      }
+
+      const planRank = INDIVIDUAL_PLAN_ORDER.indexOf(plan.id as IndividualUpgradePlanId);
+      const activeRank = INDIVIDUAL_PLAN_ORDER.indexOf(activeHeadroomPlanId);
+      if (planRank === -1 || activeRank === -1) {
+        return plan;
+      }
+
+      if (plan.id === activeHeadroomPlanId) {
+        return {
+          ...plan,
+          ctaLabel: `Stay on ${plan.name} plan`,
+          ctaVariant: "secondary",
+          ctaTone: "default"
+        };
+      }
+
+      if (planRank < activeRank) {
+        return {
+          ...plan,
+          ctaLabel: `Downgrade to ${plan.name} plan`,
+          ctaVariant: "secondary",
+          ctaTone: "downgrade"
+        };
+      }
+
+      return {
+        ...plan,
+        ctaLabel: `Upgrade to ${plan.name}`,
+        ctaVariant: "primary",
+        ctaTone: "default"
+      };
+    };
+
+    if (activeHeadroomPlanId) {
+      const orderedPaidPlans = [
+        paidPlans[activeHeadroomPlanId],
+        ...(["pro", "max5x", "max20x"] as const)
+          .filter((planId) => planId !== activeHeadroomPlanId)
+          .map((planId) => paidPlans[planId])
+      ].map(withRelativeCta);
+      return {
+        plans: [withRelativeCta(freePlan), ...orderedPaidPlans],
+        featuredPlanId: activeHeadroomPlanId
+      };
+    }
 
     const activePaidPlanId = (() => {
       switch (claudePlanTier) {
@@ -209,7 +289,8 @@ export function getUpgradePlans(
         featureIntro: "",
         features: [],
         ctaLabel: "Submit",
-        ctaVariant: "primary"
+        ctaVariant: "primary",
+        ctaTone: "default"
       }
     ],
     featuredPlanId: "enterprise"

@@ -1494,11 +1494,19 @@ impl SavingsTracker {
         actual_cost_usd: f64,
         total_tokens_sent: u64,
     ) {
+        let mut should_remove = false;
         if let Some(entry) = self.daily_savings.get_mut(day_key) {
             entry.estimated_savings_usd = (entry.estimated_savings_usd - usd.max(0.0)).max(0.0);
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            should_remove = entry.estimated_savings_usd <= 0.0
+                && entry.estimated_tokens_saved == 0
+                && entry.actual_cost_usd <= 0.0
+                && entry.total_tokens_sent == 0;
+        }
+        if should_remove {
+            self.daily_savings.remove(day_key);
         }
     }
 
@@ -1528,11 +1536,19 @@ impl SavingsTracker {
         actual_cost_usd: f64,
         total_tokens_sent: u64,
     ) {
+        let mut should_remove = false;
         if let Some(entry) = self.hourly_savings.get_mut(hour_key) {
             entry.estimated_savings_usd = (entry.estimated_savings_usd - usd.max(0.0)).max(0.0);
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            should_remove = entry.estimated_savings_usd <= 0.0
+                && entry.estimated_tokens_saved == 0
+                && entry.actual_cost_usd <= 0.0
+                && entry.total_tokens_sent == 0;
+        }
+        if should_remove {
+            self.hourly_savings.remove(hour_key);
         }
     }
 

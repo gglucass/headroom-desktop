@@ -994,6 +994,18 @@ select {
   color: #26211f;
 }
 
+.upgrade-plan-card__button--downgrade {
+  background: #fff2e7;
+  color: #8a4a17;
+  border: 1px solid rgba(205, 112, 36, 0.42);
+  box-shadow: none;
+}
+
+.upgrade-plan-card__button--downgrade:hover,
+.upgrade-plan-card__button--downgrade:active {
+  box-shadow: none;
+}
+
 .upgrade-plan-card__contact-form {
   display: grid;
   gap: 10px;

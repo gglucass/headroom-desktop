@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   describeInvokeError,
+  getNextLowerUpgradePlanId,
   getUpgradePlans,
   upgradePlanIntentLabel,
 } from "./appHelpers";
@@ -21,6 +22,13 @@ describe("app helpers", () => {
     expect(describeInvokeError({ message: "typed message" }, "fallback")).toBe("typed message");
     expect(describeInvokeError({ error: "nested error" }, "fallback")).toBe("nested error");
     expect(describeInvokeError({ message: "   " }, "fallback")).toBe("fallback");
+  });
+
+  it("returns the next lower visible plan for paid subscriptions", () => {
+    expect(getNextLowerUpgradePlanId("pro")).toBe("free");
+    expect(getNextLowerUpgradePlanId("max5x")).toBe("pro");
+    expect(getNextLowerUpgradePlanId("max20x")).toBe("max5x");
+    expect(getNextLowerUpgradePlanId(null)).toBeNull();
   });
 
   it("prioritizes the active individual subscription plan", () => {
@@ -68,5 +76,17 @@ describe("app helpers", () => {
       id: "enterprise",
       ctaLabel: "Submit",
     });
+  });
+
+  it("makes individual plan buttons relative to the active paid Headroom plan", () => {
+    const result = getUpgradePlans("individual", "max20x", undefined, "pro", true);
+
+    expect(result.featuredPlanId).toBe("pro");
+    expect(result.plans.map((plan) => [plan.id, plan.ctaLabel])).toEqual([
+      ["free", "Downgrade to Free plan"],
+      ["pro", "Stay on Pro plan"],
+      ["max5x", "Upgrade to Max x5"],
+      ["max20x", "Upgrade to Max x20"],
+    ]);
   });
 });
