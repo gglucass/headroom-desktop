@@ -119,35 +119,31 @@ struct ApiErrorResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum RemoteAccountSyncError {
+    Unauthorized,
+    Other,
+}
+
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
     let local_state = load_or_initialize_local_state()?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
     let session_token = read_session_token()?;
-    let mut authenticated = session_token.is_some();
-    let account = if let Some(token) = session_token.as_deref() {
-        match fetch_remote_account(token) {
-            Ok(account) => Some(account),
-            Err(err) if err == "UNAUTHORIZED" => {
-                clear_session_token()?;
-                authenticated = false;
-                None
-            }
-            Err(_) => None,
-        }
+    let (authenticated, account) = if let Some(token) = session_token.as_deref() {
+        merge_background_account_sync(Some(token), fetch_remote_account(token))
     } else {
-        None
+        (false, None)
     };
 
     let claude = detect_claude_profile(state);
-    let account_profile = account.map(remote_account_to_profile);
 
     Ok(evaluate_pricing_status(
         authenticated,
         local_state.first_seen_at,
         local_grace_ends_at,
         local_grace_active,
-        account_profile,
+        account,
         claude,
     ))
 }
@@ -734,6 +730,23 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
     }
 }
 
+fn merge_background_account_sync(
+    session_token: Option<&str>,
+    sync_result: Result<RemoteAccountResponse, RemoteAccountSyncError>,
+) -> (bool, Option<HeadroomAccountProfile>) {
+    if session_token.is_none() {
+        return (false, None);
+    }
+
+    match sync_result {
+        // Background polling should not silently drop the locally stored session.
+        // Explicit auth-required actions still clear the token if the server says it
+        // is expired, but passive refreshes keep the user signed in locally.
+        Ok(account) => (true, Some(remote_account_to_profile(account))),
+        Err(RemoteAccountSyncError::Unauthorized | RemoteAccountSyncError::Other) => (true, None),
+    }
+}
+
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
     if let Ok(bytes) = std::fs::read(&path) {
@@ -789,28 +802,26 @@ fn clear_session_token() -> Result<(), String> {
     )
 }
 
-fn fetch_remote_account(token: &str) -> Result<RemoteAccountResponse, String> {
-    let response = http_client()?
+fn fetch_remote_account(token: &str) -> Result<RemoteAccountResponse, RemoteAccountSyncError> {
+    let response = http_client()
+        .map_err(|_| RemoteAccountSyncError::Other)?
         .get(api_url("desktop/account"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|err| format!("Could not sync Headroom account: {err}"))?;
+        .map_err(|_| RemoteAccountSyncError::Other)?;
 
     if response.status().as_u16() == 401 {
-        return Err("UNAUTHORIZED".into());
+        return Err(RemoteAccountSyncError::Unauthorized);
     }
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Could not sync Headroom account (status {}).",
-            response.status().as_u16()
-        ));
+        return Err(RemoteAccountSyncError::Other);
     }
 
     response
         .json::<RemoteAccountEnvelope>()
         .map(|body| body.account)
-        .map_err(|err| format!("Could not parse Headroom account response: {err}"))
+        .map_err(|_| RemoteAccountSyncError::Other)
 }
 
 fn http_client() -> Result<Client, String> {
@@ -886,7 +897,26 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_account_api_base_url, DEFAULT_ACCOUNT_API_BASE_URL};
+    use chrono::Utc;
+
+    use super::{
+        merge_background_account_sync, resolve_account_api_base_url, HeadroomSubscriptionTier,
+        RemoteAccountResponse, RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+    };
+
+    fn sample_remote_account() -> RemoteAccountResponse {
+        RemoteAccountResponse {
+            email: "user@example.com".into(),
+            trial_started_at: Some(Utc::now()),
+            trial_ends_at: Some(Utc::now()),
+            trial_active: true,
+            subscription_active: true,
+            subscription_tier: Some(HeadroomSubscriptionTier::Pro),
+            invite_code: Some("invite-code".into()),
+            accepted_invites_count: 2,
+            invite_bonus_percent: 10.0,
+        }
+    }
 
     #[test]
     fn runtime_env_overrides_compile_time_env() {
@@ -910,6 +940,46 @@ mod tests {
         let resolved = resolve_account_api_base_url(Some("   ".into()), Some(" "));
 
         assert_eq!(resolved, DEFAULT_ACCOUNT_API_BASE_URL);
+    }
+
+    #[test]
+    fn unauthorized_background_sync_keeps_local_session_authenticated() {
+        let (authenticated, account) = merge_background_account_sync(
+            Some("session-token"),
+            Err(RemoteAccountSyncError::Unauthorized),
+        );
+
+        assert!(authenticated);
+        assert!(account.is_none());
+    }
+
+    #[test]
+    fn transient_background_sync_error_keeps_local_session_authenticated() {
+        let (authenticated, account) = merge_background_account_sync(
+            Some("session-token"),
+            Err(RemoteAccountSyncError::Other),
+        );
+
+        assert!(authenticated);
+        assert!(account.is_none());
+    }
+
+    #[test]
+    fn successful_background_sync_returns_remote_account_profile() {
+        let (authenticated, account) =
+            merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
+
+        assert!(authenticated);
+        assert_eq!(
+            account.as_ref().map(|value| value.email.as_str()),
+            Some("user@example.com")
+        );
+        assert!(matches!(
+            account
+                .as_ref()
+                .and_then(|value| value.subscription_tier.clone()),
+            Some(HeadroomSubscriptionTier::Pro)
+        ));
     }
 
     #[test]
