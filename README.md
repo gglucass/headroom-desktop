@@ -17,6 +17,12 @@ Headroom is signed and notarized, so macOS will open it without Gatekeeper warni
 
 ---
 
+![Headroom dashboard showing $204 saved across 66.8M tokens](docs/screenshot-1.png)
+
+---
+
+> **Note:** Headroom currently supports **Claude Code** only. Support for additional clients is planned.
+
 Headroom is a local-first macOS tray app that routes your coding clients through a local optimization pipeline. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics — all without touching your system environment.
 
 ## How it works
