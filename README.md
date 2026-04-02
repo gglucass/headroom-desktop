@@ -56,20 +56,30 @@ Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source
 | Code search (100 results) | 17,765 | 1,408 | **92%** |
 | SRE incident debugging | 65,694 | 5,118 | **92%** |
 | GitHub issue triage | 54,174 | 14,761 | **73%** |
-| Multi-tool agent session | 15,662 | 6,100 | **76%** |
 | Codebase exploration | 78,502 | 41,254 | **47%** |
+
+These are individual examples from the headroom docs, not averages.
 
 ### Accuracy benchmarks
 
-| Benchmark | Dataset | Accuracy / Recall | Compression |
-|-----------|---------|-------------------|-------------|
-| HTML extraction | Scrapinghub (181 pages) | 98.2% recall, 0.919 F1 | 94.9% |
-| JSON compression | Production logs, needle-in-haystack | 4/4 correct (100%) | 87.6% |
-| QA accuracy (SQuAD v2 / HotpotQA) | Original HTML vs. extracted | +0.02 F1 delta | — |
-| Multi-tool agent | Agno, 4 tools, memory leak task | All findings correct | 76.3% |
-| CCR lossless retrieval | Needle-in-haystack | 100% | 77% |
+Measured against standard open-source datasets (N=100 each):
 
-The QA accuracy result is worth calling out: compression *improved* F1 by +0.02 in that test, because stripping HTML noise helped the model focus on relevant content.
+| Benchmark | Task | Accuracy | Compression |
+|-----------|------|----------|-------------|
+| SQuAD v2 | Reading comprehension | 97% | 19% |
+| BFCL | Tool / function calling | 97% | 32% |
+| GSM8K | Math reasoning | 87% | — |
+| TruthfulQA | Factual accuracy | 56% | — |
+
+The GSM8K and TruthfulQA rows have no compression applied — they test whether the pipeline degrades baseline model accuracy, not whether it compresses well.
+
+### Content-specific results
+
+| Benchmark | Notes | Accuracy | Compression |
+|-----------|-------|----------|-------------|
+| HTML extraction (Scrapinghub, 181 pages) | 98.2% recall; precision/F1 measured against ground-truth article bodies | 0.919 F1 | 94.9% |
+| JSON compression (production logs) | 100 entries, critical error at position 67; task: find error + details | 4/4 correct | 87.6% |
+| QA preservation (SQuAD v2 + HotpotQA) | Compares answers from raw HTML vs. extracted content — baseline is noisy HTML, not clean text | +0.02 F1 vs. raw HTML | — |
 
 ### What compresses well vs. what doesn't
 
