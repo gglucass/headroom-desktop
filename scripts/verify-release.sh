@@ -5,8 +5,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${REPO_ROOT}"
 
-echo "Running frontend tests..."
-npm run test:frontend
+echo "Running frontend coverage..."
+npm run test:coverage
 
 echo "Running desktop tests..."
 npm run test:desktop

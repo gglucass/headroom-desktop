@@ -42,6 +42,20 @@ node -e "
   fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
 "
 
+# Update package-lock.json when present
+node -e "
+  const fs = require('fs');
+  const path = '${REPO_ROOT}/package-lock.json';
+  if (fs.existsSync(path)) {
+    const lock = JSON.parse(fs.readFileSync(path, 'utf8'));
+    lock.version = '${VERSION}';
+    if (lock.packages && lock.packages['']) {
+      lock.packages[''].version = '${VERSION}';
+    }
+    fs.writeFileSync(path, JSON.stringify(lock, null, 2) + '\n');
+  }
+"
+
 # Update tauri.conf.json
 node -e "
   const fs = require('fs');
@@ -51,4 +65,19 @@ node -e "
   fs.writeFileSync(path, JSON.stringify(conf, null, 2) + '\n');
 "
 
-echo "Done. Both package.json and src-tauri/tauri.conf.json set to ${VERSION}."
+# Update Cargo.toml package version
+node -e "
+  const fs = require('fs');
+  const path = '${REPO_ROOT}/src-tauri/Cargo.toml';
+  const current = fs.readFileSync(path, 'utf8');
+  const updated = current.replace(
+    /(\\[package\\]\\s+name = \"headroom-desktop\"\\s+version = \")[^\"]+\"/,
+    (_, prefix) => prefix + '${VERSION}' + '\"'
+  );
+  if (updated === current) {
+    throw new Error('Failed to update src-tauri/Cargo.toml version');
+  }
+  fs.writeFileSync(path, updated);
+"
+
+echo "Done. Updated package.json, package-lock.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml to ${VERSION}."

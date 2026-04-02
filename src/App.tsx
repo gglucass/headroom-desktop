@@ -1041,6 +1041,8 @@ export default function App() {
           return;
         }
 
+        void refreshConnectors();
+
         const inactiveForMs = mainWindowLastBlurAtRef.current
           ? now.getTime() - mainWindowLastBlurAtRef.current
           : 0;
