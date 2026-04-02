@@ -45,6 +45,51 @@ The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fet
 
 **Tool inclusion policy:** only tools that run entirely locally, inside Headroom-managed storage, with a stable CLI surface make it in. No cloud dependencies, no host profile mutations. See [`research/tool-compatibility-matrix.md`](research/tool-compatibility-matrix.md).
 
+## Compression benchmarks
+
+Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline.
+
+### Real workload results
+
+| Scenario | Tokens before | Tokens after | Savings |
+|----------|--------------|--------------|---------|
+| Code search (100 results) | 17,765 | 1,408 | **92%** |
+| SRE incident debugging | 65,694 | 5,118 | **92%** |
+| GitHub issue triage | 54,174 | 14,761 | **73%** |
+| Multi-tool agent session | 15,662 | 6,100 | **76%** |
+| Codebase exploration | 78,502 | 41,254 | **47%** |
+
+### Accuracy benchmarks
+
+| Benchmark | Dataset | Accuracy / Recall | Compression |
+|-----------|---------|-------------------|-------------|
+| HTML extraction | Scrapinghub (181 pages) | 98.2% recall, 0.919 F1 | 94.9% |
+| JSON compression | Production logs, needle-in-haystack | 4/4 correct (100%) | 87.6% |
+| QA accuracy (SQuAD v2 / HotpotQA) | Original HTML vs. extracted | +0.02 F1 delta | — |
+| Multi-tool agent | Agno, 4 tools, memory leak task | All findings correct | 76.3% |
+| CCR lossless retrieval | Needle-in-haystack | 100% | 77% |
+
+The QA accuracy result is worth calling out: compression *improved* F1 by +0.02 in that test, because stripping HTML noise helped the model focus on relevant content.
+
+### What compresses well vs. what doesn't
+
+| Content type | Typical savings | Notes |
+|-------------|-----------------|-------|
+| JSON arrays (search results, API responses, DB rows) | 86–100% | Primary use case |
+| Structured logs | 82–95% | Errors and anomalies always preserved |
+| Agentic conversations (25–50 turns) | 56–81% | |
+| Plain text / documentation | 43–46% | Cost savings only, adds latency |
+| Source code | Mostly passthrough | Code in active messages is protected by default — see limitations |
+
+### Limitations worth knowing
+
+- **Code compression is intentionally conservative.** Code in recent messages (last 4 by default) and any conversation where the user is asking about code (`analyze`, `debug`, `fix`, etc.) is never compressed. The savings from code come from dropping old, no-longer-relevant messages — not from stripping function bodies.
+- **Short content is skipped.** Arrays under 5 items and content under 200 tokens pass through unchanged.
+- **Text compression (LLMLingua) adds latency.** It requires a ~2 GB model download on first use and doesn't break even on fast models. Useful for cost reduction, not speed.
+- **Plain-text RAG results pass through.** Compression targets tool outputs and JSON; plain text in user messages is not compressed.
+
+Full methodology and reproducible benchmarks: [chopratejas/headroom benchmarks](https://chopratejas.github.io/headroom/benchmarks/) · [limitations](https://chopratejas.github.io/headroom/LIMITATIONS/)
+
 ## Interesting design decisions
 
 - **Zero host pollution.** Headroom owns its entire dependency tree. Uninstalling the app leaves your shell, your Python, and your PATH exactly as they were (except for the optional `rtk` PATH addition, which is reversible).
