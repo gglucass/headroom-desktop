@@ -39,6 +39,16 @@ import {
 import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
 import {
+  getAppUpdateInstallStatusCopy,
+  getBlockedAppUpdateCheckPatch,
+  loadAppUpdateConfiguration,
+  runAppUpdateCheck,
+  runAppUpdateInstall,
+  sendAppUpdateNotification,
+  shouldNotifyAboutAvailableAppUpdate,
+  type AppUpdateStatePatch,
+} from "./lib/appUpdate";
+import {
   describeInvokeError,
   getNextLowerUpgradePlanId,
   getUpgradePlans,
@@ -205,6 +215,8 @@ const CONTACT_FORM_URL = (
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
 
 const authCodeExpiryFallbackSeconds = 900;
+const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
+const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 async function loadDashboard(): Promise<DashboardState> {
   try {
@@ -603,7 +615,10 @@ export default function App() {
   const appSemver = appUpdateConfig?.currentVersion ?? packageJson.version;
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
   const mainWindowLastSeenDayRef = useRef(formatDayKey(new Date()));
-  const backgroundUpdateCheckStartedRef = useRef(false);
+  const appUpdateKnownVersionRef = useRef<string | null>(null);
+  const appUpdateReadyToRestartRef = useRef(false);
+  const appUpdateBusyRef = useRef(false);
+  const appUpdateInstallBusyRef = useRef(false);
   const hasShownLearnKeyReadNoticeRef = useRef(false);
   const apiKeyGuide = apiKeyGuides[apiKeyProvider];
   const apiKeyDialogStorageCopy =
@@ -1072,23 +1087,52 @@ export default function App() {
     if (
       !startupReady ||
       windowLabel !== "main" ||
-      backgroundUpdateCheckStartedRef.current ||
       !appUpdateConfig
     ) {
       return;
     }
-
-    backgroundUpdateCheckStartedRef.current = true;
     if (!appUpdateConfig.enabled || appUpdateConfig.configurationError) {
       return;
     }
 
-    const timer = window.setTimeout(() => {
-      void checkForAppUpdate({ background: true });
-    }, 12_000);
+    const runBackgroundCheck = () => {
+      if (
+        appUpdateReadyToRestartRef.current ||
+        appUpdateBusyRef.current ||
+        appUpdateInstallBusyRef.current
+      ) {
+        return;
+      }
+      void checkForAppUpdate({
+        background: true,
+        knownUpdateVersion: appUpdateKnownVersionRef.current,
+      });
+    };
 
-    return () => window.clearTimeout(timer);
+    const timer = window.setTimeout(runBackgroundCheck, APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS);
+    const interval = window.setInterval(runBackgroundCheck, APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+      window.clearInterval(interval);
+    };
   }, [appUpdateConfig, startupReady, windowLabel]);
+
+  useEffect(() => {
+    appUpdateKnownVersionRef.current = appUpdateAvailable?.version ?? null;
+  }, [appUpdateAvailable?.version]);
+
+  useEffect(() => {
+    appUpdateReadyToRestartRef.current = appUpdateReadyToRestart;
+  }, [appUpdateReadyToRestart]);
+
+  useEffect(() => {
+    appUpdateBusyRef.current = appUpdateBusy;
+  }, [appUpdateBusy]);
+
+  useEffect(() => {
+    appUpdateInstallBusyRef.current = appUpdateInstallBusy;
+  }, [appUpdateInstallBusy]);
 
   useEffect(() => {
     if (activeView !== "settings") {
@@ -1450,36 +1494,50 @@ export default function App() {
     ) ?? null;
   }
 
-  async function refreshAppUpdateConfiguration() {
-    try {
-      const config = await invoke<AppUpdateConfiguration>("get_app_update_configuration");
-      setAppUpdateConfig(config);
-      if (config.configurationError) {
-        setAppUpdateStatusCopy(config.configurationError);
-      }
-    } catch (error) {
-      setAppUpdateStatusCopy(
-        error instanceof Error ? error.message : "Could not load app update settings."
-      );
+  function applyAppUpdatePatch(patch: AppUpdateStatePatch) {
+    if (Object.prototype.hasOwnProperty.call(patch, "config")) {
+      setAppUpdateConfig(patch.config ?? null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "availableUpdate")) {
+      setAppUpdateAvailable(patch.availableUpdate ?? null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "readyToRestart")) {
+      setAppUpdateReadyToRestart(patch.readyToRestart ?? false);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "showDialog")) {
+      setShowAppUpdateDialog(patch.showDialog ?? false);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "statusCopy")) {
+      setAppUpdateStatusCopy(patch.statusCopy ?? null);
     }
   }
 
-  async function checkForAppUpdate({ background = false }: { background?: boolean } = {}) {
-    const config =
-      appUpdateConfig ?? (await invoke<AppUpdateConfiguration>("get_app_update_configuration"));
-    setAppUpdateConfig(config);
+  async function refreshAppUpdateConfiguration() {
+    applyAppUpdatePatch(await loadAppUpdateConfiguration());
+  }
 
-    if (config.configurationError) {
-      if (!background) {
-        setAppUpdateStatusCopy(config.configurationError);
-      }
+  async function checkForAppUpdate({
+    background = false,
+    knownUpdateVersion = null,
+  }: {
+    background?: boolean;
+    knownUpdateVersion?: string | null;
+  } = {}) {
+    let config = appUpdateConfig;
+
+    if (!config) {
+      const configPatch = await loadAppUpdateConfiguration();
+      applyAppUpdatePatch(configPatch);
+      config = configPatch.config ?? null;
+    }
+
+    if (!config) {
       return;
     }
 
-    if (!config.enabled) {
-      if (!background) {
-        setAppUpdateStatusCopy("Update checks are not configured in this build yet.");
-      }
+    const blockedPatch = getBlockedAppUpdateCheckPatch(config, background);
+    if (blockedPatch) {
+      applyAppUpdatePatch(blockedPatch);
       return;
     }
 
@@ -1489,25 +1547,21 @@ export default function App() {
     }
 
     try {
-      const update = await invoke<AvailableAppUpdate | null>("check_for_app_update");
+      const patch = await runAppUpdateCheck({ background, knownUpdateVersion });
+      applyAppUpdatePatch(patch);
 
-      if (update) {
-        setAppUpdateAvailable(update);
-        setAppUpdateReadyToRestart(false);
-        setAppUpdateStatusCopy(`Update available: ${update.version}.`);
-        setShowAppUpdateDialog(true);
-      } else {
-        setAppUpdateAvailable(null);
-        setAppUpdateReadyToRestart(false);
-        if (!background) {
-          setAppUpdateStatusCopy("Up to date.");
+      if (background && patch.availableUpdate) {
+        const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
+        if (
+          shouldNotifyAboutAvailableAppUpdate({
+            background,
+            availableUpdate: patch.availableUpdate,
+            knownUpdateVersion,
+            windowVisible,
+          })
+        ) {
+          await sendAppUpdateNotification(patch.availableUpdate.version);
         }
-      }
-    } catch (error) {
-      if (!background) {
-        setAppUpdateStatusCopy(
-          error instanceof Error ? error.message : "Could not check for updates."
-        );
       }
     } finally {
       setAppUpdateBusy(false);
@@ -1520,19 +1574,13 @@ export default function App() {
     }
 
     setAppUpdateInstallBusy(true);
-    setAppUpdateStatusCopy(`Downloading Headroom ${appUpdateAvailable.version}…`);
+    const installStatusCopy = getAppUpdateInstallStatusCopy(appUpdateAvailable);
+    if (installStatusCopy) {
+      setAppUpdateStatusCopy(installStatusCopy);
+    }
 
     try {
-      await invoke("install_app_update");
-      setAppUpdateReadyToRestart(true);
-      setAppUpdateStatusCopy(
-        `Headroom ${appUpdateAvailable.version} is installed and ready to restart.`
-      );
-      setShowAppUpdateDialog(true);
-    } catch (error) {
-      setAppUpdateStatusCopy(
-        error instanceof Error ? error.message : "Could not install the update."
-      );
+      applyAppUpdatePatch(await runAppUpdateInstall({ availableUpdate: appUpdateAvailable }));
     } finally {
       setAppUpdateInstallBusy(false);
     }

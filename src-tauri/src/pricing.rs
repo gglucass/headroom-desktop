@@ -896,19 +896,19 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
             nudge_threshold_percent: 10.0,
             disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Pro,
-            monthly_price_usd: 5.0,
+            monthly_price_usd: 2.5,
         }),
         ClaudePlanTier::Max5x => Some(PricingPolicy {
             nudge_threshold_percent: 5.0,
             disable_threshold_percent: 10.0,
             recommended_tier: HeadroomSubscriptionTier::Max5x,
-            monthly_price_usd: 25.0,
+            monthly_price_usd: 12.5,
         }),
         ClaudePlanTier::Max20x => Some(PricingPolicy {
             nudge_threshold_percent: 2.5,
             disable_threshold_percent: 5.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
-            monthly_price_usd: 50.0,
+            monthly_price_usd: 25.0,
         }),
         ClaudePlanTier::Unknown => None,
     }
@@ -919,9 +919,11 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        merge_background_account_sync, resolve_account_api_base_url, HeadroomSubscriptionTier,
-        RemoteAccountResponse, RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        merge_background_account_sync, pricing_policy_for_plan, resolve_account_api_base_url,
+        HeadroomSubscriptionTier, RemoteAccountResponse, RemoteAccountSyncError,
+        DEFAULT_ACCOUNT_API_BASE_URL,
     };
+    use crate::models::ClaudePlanTier;
 
     fn sample_remote_account() -> RemoteAccountResponse {
         RemoteAccountResponse {
@@ -1002,6 +1004,25 @@ mod tests {
                 .and_then(|value| value.subscription_tier.clone()),
             Some(HeadroomSubscriptionTier::Pro)
         ));
+    }
+
+    #[test]
+    fn pricing_policy_uses_the_reduced_monthly_prices() {
+        assert_eq!(
+            pricing_policy_for_plan(&ClaudePlanTier::Pro)
+                .map(|policy| policy.monthly_price_usd),
+            Some(2.5)
+        );
+        assert_eq!(
+            pricing_policy_for_plan(&ClaudePlanTier::Max5x)
+                .map(|policy| policy.monthly_price_usd),
+            Some(12.5)
+        );
+        assert_eq!(
+            pricing_policy_for_plan(&ClaudePlanTier::Max20x)
+                .map(|policy| policy.monthly_price_usd),
+            Some(25.0)
+        );
     }
 
     #[test]

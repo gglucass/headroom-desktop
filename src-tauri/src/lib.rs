@@ -11,8 +11,10 @@ mod storage;
 mod tool_manager;
 
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::Mutex;
+use std::{future::Future};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -50,7 +52,41 @@ const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 
-struct PendingAppUpdate(Mutex<Option<Update>>);
+type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+trait InstallableAppUpdate: Send {
+    fn metadata(&self) -> AvailableAppUpdate;
+    fn install(self) -> InstallPendingUpdateFuture;
+}
+
+struct TauriPendingUpdate(Update);
+
+impl InstallableAppUpdate for TauriPendingUpdate {
+    fn metadata(&self) -> AvailableAppUpdate {
+        let published_at = self.0.date.as_ref().and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+
+        AvailableAppUpdate {
+            current_version: self.0.current_version.clone(),
+            version: self.0.version.clone(),
+            published_at,
+            notes: self.0.body.clone(),
+        }
+    }
+
+    fn install(self) -> InstallPendingUpdateFuture {
+        Box::pin(async move {
+            self.0
+                .download_and_install(|_, _| {}, || {})
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+}
+
+struct PendingAppUpdate(Mutex<Option<TauriPendingUpdate>>);
 
 #[derive(Debug, Clone)]
 struct ReleaseUpdaterConfig {
@@ -58,7 +94,7 @@ struct ReleaseUpdaterConfig {
     endpoints: Vec<reqwest::Url>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct AppUpdateConfiguration {
     enabled: bool,
@@ -67,7 +103,7 @@ struct AppUpdateConfiguration {
     configuration_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct AvailableAppUpdate {
     current_version: String,
@@ -121,23 +157,34 @@ async fn check_for_app_update(
         .build()
         .map_err(|err| err.to_string())?;
 
-    let update = updater.check().await.map_err(|err| err.to_string())?;
+    let checked_update = updater
+        .check()
+        .await
+        .map(|update| update.map(TauriPendingUpdate))
+        .map_err(|err| err.to_string());
+
+    store_checked_update(checked_update, &pending_update.0)
+}
+
+#[tauri::command]
+async fn install_app_update(pending_update: State<'_, PendingAppUpdate>) -> Result<(), String> {
+    install_pending_update(&pending_update.0).await
+}
+
+fn store_checked_update<U>(
+    checked_update: Result<Option<U>, String>,
+    pending_update: &Mutex<Option<U>>,
+) -> Result<Option<AvailableAppUpdate>, String>
+where
+    U: InstallableAppUpdate,
+{
+    let update = checked_update?;
     let mut pending = pending_update
-        .0
         .lock()
         .map_err(|_| "Failed to lock pending update state.".to_string())?;
 
     if let Some(update) = update {
-        let published_at = update.date.as_ref().and_then(|date| {
-            date.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        });
-        let metadata = AvailableAppUpdate {
-            current_version: update.current_version.clone(),
-            version: update.version.clone(),
-            published_at,
-            notes: update.body.clone(),
-        };
+        let metadata = update.metadata();
         *pending = Some(update);
         Ok(Some(metadata))
     } else {
@@ -146,11 +193,12 @@ async fn check_for_app_update(
     }
 }
 
-#[tauri::command]
-async fn install_app_update(pending_update: State<'_, PendingAppUpdate>) -> Result<(), String> {
+async fn install_pending_update<U>(pending_update: &Mutex<Option<U>>) -> Result<(), String>
+where
+    U: InstallableAppUpdate,
+{
     let update = {
         let mut pending = pending_update
-            .0
             .lock()
             .map_err(|_| "Failed to lock pending update state.".to_string())?;
         pending
@@ -158,16 +206,57 @@ async fn install_app_update(pending_update: State<'_, PendingAppUpdate>) -> Resu
             .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
     };
 
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|err| err.to_string())
+    update.install().await
 }
 
 #[tauri::command]
 fn restart_app(app: AppHandle) {
     analytics::shutdown(&app);
     app.request_restart();
+}
+
+#[tauri::command]
+fn show_app_update_notification(version: String) -> Result<(), String> {
+    show_app_update_notification_impl(&version)
+}
+
+fn app_update_notification_body(version: &str) -> String {
+    let trimmed = version.trim();
+    let lead = if trimmed.is_empty() {
+        "A Headroom update is ready to install.".to_string()
+    } else {
+        format!("Headroom {trimmed} is ready to install.")
+    };
+
+    format!("{lead} Open Headroom to review the release and install it.")
+}
+
+#[cfg(target_os = "macos")]
+fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
+    let title = "Headroom Update Available";
+    let body = app_update_notification_body(version);
+    let title_json = serde_json::to_string(title).map_err(|err| err.to_string())?;
+    let body_json = serde_json::to_string(&body).map_err(|err| err.to_string())?;
+    let script = format!(
+        "const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification({body_json}, {{ withTitle: {title_json} }});"
+    );
+
+    let status = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &script])
+        .status()
+        .map_err(|err| format!("Could not show update notification: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Update notification helper exited with {status}."))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
+    let _ = app_update_notification_body(version);
+    Ok(())
 }
 
 #[tauri::command]
@@ -772,6 +861,7 @@ pub fn run() {
             check_for_app_update,
             install_app_update,
             restart_app,
+            show_app_update_notification,
             get_research_candidates,
             bootstrap_runtime,
             start_bootstrap,
@@ -1834,11 +1924,38 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_release_updater_config, compute_tray_window_position, parse_updater_endpoint_list,
-        physical_rect_from_rect, MonitorBounds, PhysicalRect, DEFAULT_UPDATER_ENDPOINT,
+        app_update_notification_body, build_release_updater_config, compute_tray_window_position,
+        install_pending_update, parse_updater_endpoint_list, physical_rect_from_rect,
+        store_checked_update, AvailableAppUpdate, InstallPendingUpdateFuture,
+        InstallableAppUpdate, MonitorBounds, PhysicalRect, DEFAULT_UPDATER_ENDPOINT,
         DEFAULT_UPDATER_PUBLIC_KEY,
     };
+    use std::sync::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
+
+    struct FakePendingUpdate {
+        metadata: AvailableAppUpdate,
+        install_result: Result<(), String>,
+    }
+
+    impl InstallableAppUpdate for FakePendingUpdate {
+        fn metadata(&self) -> AvailableAppUpdate {
+            self.metadata.clone()
+        }
+
+        fn install(self) -> InstallPendingUpdateFuture {
+            Box::pin(async move { self.install_result })
+        }
+    }
+
+    fn sample_available_update(version: &str) -> AvailableAppUpdate {
+        AvailableAppUpdate {
+            current_version: "0.2.9".into(),
+            version: version.into(),
+            published_at: Some("2026-04-02T12:00:00Z".into()),
+            notes: Some("Bug fixes.".into()),
+        }
+    }
 
     #[test]
     fn updater_endpoint_parser_accepts_json_arrays() {
@@ -1892,6 +2009,122 @@ mod tests {
             config.endpoints[0].as_str(),
             "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
         );
+    }
+
+    #[test]
+    fn app_update_notification_body_mentions_the_target_version() {
+        assert_eq!(
+            app_update_notification_body("0.3.0"),
+            "Headroom 0.3.0 is ready to install. Open Headroom to review the release and install it."
+        );
+        assert_eq!(
+            app_update_notification_body("   "),
+            "A Headroom update is ready to install. Open Headroom to review the release and install it."
+        );
+    }
+
+    #[test]
+    fn store_checked_update_tracks_available_update_metadata() {
+        let pending = Mutex::new(None);
+        let metadata = sample_available_update("0.3.0");
+
+        let result = store_checked_update(
+            Ok(Some(FakePendingUpdate {
+                metadata: metadata.clone(),
+                install_result: Ok(()),
+            })),
+            &pending,
+        )
+        .expect("available update");
+
+        assert_eq!(result, Some(metadata.clone()));
+        let stored = pending.lock().expect("pending lock");
+        assert_eq!(stored.as_ref().expect("pending update").metadata(), metadata);
+    }
+
+    #[test]
+    fn store_checked_update_clears_pending_update_when_feed_is_current() {
+        let pending = Mutex::new(Some(FakePendingUpdate {
+            metadata: sample_available_update("0.3.0"),
+            install_result: Ok(()),
+        }));
+
+        let result =
+            store_checked_update::<FakePendingUpdate>(Ok(None), &pending).expect("no update");
+
+        assert_eq!(result, None);
+        assert!(pending.lock().expect("pending lock").is_none());
+    }
+
+    #[test]
+    fn store_checked_update_preserves_pending_update_when_check_errors() {
+        let existing = sample_available_update("0.3.0");
+        let pending = Mutex::new(Some(FakePendingUpdate {
+            metadata: existing.clone(),
+            install_result: Ok(()),
+        }));
+
+        let error = store_checked_update::<FakePendingUpdate>(
+            Err("feed unavailable".into()),
+            &pending,
+        )
+        .expect_err("check failure should bubble up");
+
+        assert_eq!(error, "feed unavailable");
+        let stored = pending.lock().expect("pending lock");
+        assert_eq!(stored.as_ref().expect("pending update").metadata(), existing);
+    }
+
+    #[test]
+    fn install_pending_update_requires_a_checked_update() {
+        let pending = Mutex::new(None::<FakePendingUpdate>);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let error = runtime
+            .block_on(install_pending_update(&pending))
+            .expect_err("missing update should fail");
+
+        assert_eq!(error, "No downloaded update is ready to install.");
+    }
+
+    #[test]
+    fn install_pending_update_runs_the_installer_and_clears_the_slot() {
+        let pending = Mutex::new(Some(FakePendingUpdate {
+            metadata: sample_available_update("0.3.0"),
+            install_result: Ok(()),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        runtime
+            .block_on(install_pending_update(&pending))
+            .expect("install succeeds");
+
+        assert!(pending.lock().expect("pending lock").is_none());
+    }
+
+    #[test]
+    fn install_pending_update_returns_install_failures_after_taking_the_slot() {
+        let pending = Mutex::new(Some(FakePendingUpdate {
+            metadata: sample_available_update("0.3.0"),
+            install_result: Err("signature mismatch".into()),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let error = runtime
+            .block_on(install_pending_update(&pending))
+            .expect_err("install failure");
+
+        assert_eq!(error, "signature mismatch");
+        assert!(pending.lock().expect("pending lock").is_none());
     }
 
     #[test]
