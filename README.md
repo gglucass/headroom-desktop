@@ -9,7 +9,7 @@
 ### Install
 
 1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. Download the `.dmg` file (e.g. `Headroom_0.2.7.dmg`)
+2. Download the `.dmg` file (e.g. `Headroom_0.2.8.dmg`)
 3. Open the DMG, drag **Headroom** to Applications
 4. Launch Headroom — it appears in your menu bar and walks you through setup
 
@@ -137,6 +137,7 @@ For the live auth and pricing flow, create a `.env`:
 
 ```bash
 HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
+HEADROOM_APTABASE_APP_KEY="REPLACE_WITH_APTABASE_APP_KEY"
 VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-pro-product"
 VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max5x-product"
 VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max20x-product"

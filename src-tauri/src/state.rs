@@ -129,6 +129,18 @@ impl AppState {
         }
     }
 
+    pub fn launch_count(&self) -> u64 {
+        self.launch_profile.launch_count
+    }
+
+    pub fn launch_experience_label(&self) -> &'static str {
+        match self.launch_profile.launch_experience {
+            LaunchExperience::FirstRun => "first_run",
+            LaunchExperience::Resume => "resume",
+            LaunchExperience::Dashboard => "dashboard",
+        }
+    }
+
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
         const TTL: Duration = Duration::from_secs(8);
         let mut cache = self.cached_clients.lock().expect("cached_clients poisoned");

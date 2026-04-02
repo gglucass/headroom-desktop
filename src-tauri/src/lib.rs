@@ -1,3 +1,4 @@
+mod analytics;
 mod client_adapters;
 mod insights;
 mod keychain;
@@ -15,6 +16,7 @@ use std::sync::Mutex;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
@@ -164,6 +166,7 @@ async fn install_app_update(pending_update: State<'_, PendingAppUpdate>) -> Resu
 
 #[tauri::command]
 fn restart_app(app: AppHandle) {
+    analytics::shutdown(&app);
     app.request_restart();
 }
 
@@ -195,8 +198,19 @@ fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, Strin
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
+        let already_installed = state.tool_manager.python_runtime_installed();
         state.begin_bootstrap()?;
+        if already_installed {
+            analytics::track_event(
+                &app,
+                "bootstrap_skipped",
+                Some(json!({ "reason": "already_installed" })),
+            );
+            return Ok(());
+        }
     }
+
+    analytics::track_event(&app, "bootstrap_started", None);
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
@@ -207,6 +221,11 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             .bootstrap_all_with_progress(|step| state.update_bootstrap_step(step));
         if let Err(err) = result {
             state.mark_bootstrap_failed(format!("Installation failed: {err}"));
+            analytics::track_event(
+                &app_handle,
+                "bootstrap_failed",
+                Some(json!({ "phase": "install_runtime" })),
+            );
             return;
         }
 
@@ -228,10 +247,16 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             state.mark_bootstrap_failed(format!(
                 "Install completed but Headroom failed to start: {err}"
             ));
+            analytics::track_event(
+                &app_handle,
+                "bootstrap_failed",
+                Some(json!({ "phase": "start_runtime" })),
+            );
             return;
         }
 
         state.mark_bootstrap_complete();
+        analytics::track_event(&app_handle, "bootstrap_completed", None);
     });
 
     Ok(())
@@ -309,18 +334,33 @@ fn get_headroom_pricing_status(
 }
 
 #[tauri::command]
-fn request_headroom_auth_code(email: String) -> Result<HeadroomAuthCodeRequest, String> {
-    pricing::request_auth_code(&email)
+fn request_headroom_auth_code(
+    app: AppHandle,
+    email: String,
+) -> Result<HeadroomAuthCodeRequest, String> {
+    let request = pricing::request_auth_code(&email)?;
+    analytics::track_event(&app, "auth_code_requested", None);
+    Ok(request)
 }
 
 #[tauri::command]
 fn verify_headroom_auth_code(
+    app: AppHandle,
     state: State<'_, AppState>,
     email: String,
     code: String,
     invite_code: Option<String>,
 ) -> Result<HeadroomPricingStatus, String> {
-    pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())
+    let used_invite_code = invite_code
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let status = pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())?;
+    analytics::track_event(
+        &app,
+        "auth_verified",
+        Some(json!({ "invite_code_used": used_invite_code })),
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -329,15 +369,29 @@ fn sign_out_headroom_account() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn activate_headroom_account(state: State<'_, AppState>) -> Result<HeadroomPricingStatus, String> {
-    pricing::activate_account(&state)
+fn activate_headroom_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<HeadroomPricingStatus, String> {
+    let status = pricing::activate_account(&state)?;
+    analytics::track_event(&app, "account_activated", None);
+    Ok(status)
 }
 
 #[tauri::command]
 fn create_headroom_checkout_session(
+    app: AppHandle,
     subscription_tier: HeadroomSubscriptionTier,
 ) -> Result<String, String> {
-    pricing::create_checkout_session(subscription_tier)
+    let url = pricing::create_checkout_session(subscription_tier.clone())?;
+    analytics::track_event(
+        &app,
+        "checkout_started",
+        Some(json!({
+            "subscription_tier": subscription_tier_label(&subscription_tier)
+        })),
+    );
+    Ok(url)
 }
 
 #[tauri::command]
@@ -464,6 +518,11 @@ fn open_external_link(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn track_analytics_event(app: AppHandle, name: String, properties: Option<Value>) {
+    analytics::track_event(&app, &name, properties);
+}
+
+#[tauri::command]
 async fn submit_contact_request(url: String, email: String) -> Result<(), String> {
     let trimmed = email.trim();
     if trimmed.is_empty() || !trimmed.contains('@') {
@@ -489,8 +548,19 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn apply_client_setup(client_id: String) -> Result<ClientSetupResult, String> {
-    client_adapters::apply_client_setup(&client_id).map_err(|err| err.to_string())
+fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupResult, String> {
+    let result = client_adapters::apply_client_setup(&client_id).map_err(|err| err.to_string())?;
+    analytics::track_event(
+        &app,
+        "client_setup_applied",
+        Some(json!({
+            "client_id": result.client_id.clone(),
+            "already_configured": result.already_configured,
+            "verified": result.verification.verified,
+            "proxy_reachable": result.verification.proxy_reachable
+        })),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -504,8 +574,14 @@ fn get_client_connectors(state: State<'_, AppState>) -> Result<Vec<ClientConnect
 }
 
 #[tauri::command]
-fn disable_client_setup(client_id: String) -> Result<(), String> {
-    client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())
+fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
+    client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
+    analytics::track_event(
+        &app,
+        "client_setup_disabled",
+        Some(json!({ "client_id": client_id })),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -519,6 +595,7 @@ fn pause_headroom(app: AppHandle) -> Result<(), String> {
     state.set_runtime_paused(true);
     state.stop_headroom();
     client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
+    analytics::track_event(&app, "runtime_paused", None);
     Ok(())
 }
 
@@ -529,6 +606,7 @@ fn start_headroom(app: AppHandle) -> Result<(), String> {
     std::thread::spawn(|| {
         client_adapters::restore_client_setups();
     });
+    analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
 }
 
@@ -619,6 +697,7 @@ fn quit_headroom(app: AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
     state.stop_headroom();
     let _ = client_adapters::clear_client_setups();
+    analytics::shutdown(&app);
     app.exit(0);
 }
 
@@ -629,13 +708,15 @@ fn launched_from_autostart() -> bool {
 pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .args([AUTOSTART_LAUNCH_ARG])
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
@@ -650,15 +731,28 @@ pub fn run() {
                 }
             }
 
+            app.manage(analytics::AnalyticsClient::new(
+                app.package_info().version.to_string(),
+            ));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
+            let app_handle = app.handle().clone();
+            analytics::track_event(
+                &app_handle,
+                "app_started",
+                Some(json!({
+                    "launch_experience": state.launch_experience_label(),
+                    "launch_count": state.launch_count(),
+                    "runtime_installed": state.tool_manager.python_runtime_installed(),
+                    "autostart_launch": launched_from_autostart
+                })),
+            );
             // Start the intercept layer before anything else touches port 6767.
             proxy_intercept::spawn(std::sync::Arc::clone(&state.claude_bearer_token));
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
-            let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch();
@@ -706,6 +800,7 @@ pub fn run() {
             clear_client_setups,
             pause_headroom,
             start_headroom,
+            track_analytics_event,
             show_dashboard_window,
             open_headroom_dashboard,
             open_external_link,
@@ -715,6 +810,14 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
+    match tier {
+        HeadroomSubscriptionTier::Pro => "pro",
+        HeadroomSubscriptionTier::Max5x => "max5x",
+        HeadroomSubscriptionTier::Max20x => "max20x",
+    }
 }
 
 fn release_updater_config() -> Result<Option<ReleaseUpdaterConfig>, String> {

@@ -84,6 +84,7 @@ import {
   formatRemainingDays,
   subscriptionTierLabel
 } from "./lib/pricing";
+import { trackInstallMilestoneOnce } from "./lib/analytics";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -667,6 +668,50 @@ export default function App() {
     if (!pricingStatus) return;
     writeCachedPricing(cachePricingStatus(pricingStatus));
   }, [pricingStatus]);
+
+  useEffect(() => {
+    const claudeConnector = getClaudeConnector(connectors);
+    if (!claudeConnector?.installed) {
+      return;
+    }
+    trackInstallMilestoneOnce("claude_code_detected", {
+      enabled: claudeConnector.enabled,
+      verified: claudeConnector.verified
+    });
+  }, [connectors]);
+
+  useEffect(() => {
+    const claudeConnector = getClaudeConnector(connectors);
+    if (!claudeConnector?.enabled) {
+      return;
+    }
+    trackInstallMilestoneOnce("optimization_enabled", {
+      verified: claudeConnector.verified
+    });
+  }, [connectors]);
+
+  useEffect(() => {
+    if (dashboard.lifetimeRequests <= 0) {
+      return;
+    }
+    trackInstallMilestoneOnce("first_optimized_request", {
+      lifetime_requests: dashboard.lifetimeRequests,
+      launch_experience: dashboard.launchExperience
+    });
+  }, [dashboard.launchExperience, dashboard.lifetimeRequests]);
+
+  useEffect(() => {
+    if (
+      dashboard.lifetimeEstimatedTokensSaved <= 0 &&
+      dashboard.lifetimeEstimatedSavingsUsd <= 0
+    ) {
+      return;
+    }
+    trackInstallMilestoneOnce("first_savings_recorded", {
+      lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
+      lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
+    });
+  }, [dashboard.lifetimeEstimatedSavingsUsd, dashboard.lifetimeEstimatedTokensSaved]);
 
   useEffect(() => {
     let active = true;
@@ -2935,14 +2980,6 @@ export default function App() {
           </div>
           <div className="pricing-auth-card__actions">
             <button
-              className="secondary-button"
-              disabled={authRequestBusy}
-              onClick={() => void handleRequestAuthCode()}
-              type="button"
-            >
-              {authRequestBusy ? "Sending..." : "Resend code"}
-            </button>
-            <button
               className="primary-button"
               disabled={!authCode.trim() || authVerifyBusy}
               onClick={() => void handleVerifyAuthCode()}
@@ -2950,6 +2987,17 @@ export default function App() {
             >
               {authVerifyBusy ? "Verifying..." : "Verify and continue"}
             </button>
+            <p className="pricing-auth-card__resend">
+              Didn't receive a code?{" "}
+              <button
+                className="link-button"
+                disabled={authRequestBusy}
+                onClick={() => void handleRequestAuthCode()}
+                type="button"
+              >
+                {authRequestBusy ? "Sending..." : "Resend code"}
+              </button>
+            </p>
           </div>
         </>
       )}
