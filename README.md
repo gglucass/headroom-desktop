@@ -9,7 +9,7 @@
 ### Install
 
 1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. Download the `.dmg` file (e.g. `Headroom_0.2.8.dmg`)
+2. Download the `.dmg` file (e.g. `Headroom_0.2.9.dmg`)
 3. Open the DMG, drag **Headroom** to Applications
 4. Launch Headroom — it appears in your menu bar and walks you through setup
 

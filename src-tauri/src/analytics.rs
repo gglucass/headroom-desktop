@@ -4,12 +4,12 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rand::Rng;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Url;
 use serde_json::{json, Map, Value};
 use tauri::{webview_version, AppHandle, Manager};
-use uuid::Uuid;
 
 const HEADROOM_APTABASE_APP_KEY: Option<&str> = option_env!("HEADROOM_APTABASE_APP_KEY");
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
@@ -147,7 +147,7 @@ impl AnalyticsClient {
 impl TrackingSession {
     fn new() -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: new_session_id(),
             last_touch: chrono::Utc::now(),
         }
     }
@@ -259,9 +259,25 @@ fn flush_queue(client: &Client, config: &AnalyticsConfig, queue: &mut VecDeque<V
             .send();
         match response {
             Ok(response) if response.status().is_success() => {}
-            Ok(response) if response.status().is_server_error() => failed.extend(events),
-            Ok(_) => {}
-            Err(_) => failed.extend(events),
+            Ok(response) if response.status().is_server_error() => {
+                eprintln!(
+                    "aptabase server error {} while sending {} event(s)",
+                    response.status(),
+                    events.len()
+                );
+                failed.extend(events);
+            }
+            Ok(response) => {
+                eprintln!(
+                    "aptabase rejected {} event(s) with status {}",
+                    events.len(),
+                    response.status()
+                );
+            }
+            Err(err) => {
+                eprintln!("aptabase send failed for {} event(s): {err}", events.len());
+                failed.extend(events);
+            }
         }
     }
 
@@ -325,15 +341,17 @@ fn sanitize_value(value: Value) -> Option<Value> {
 }
 
 fn system_properties() -> SystemProperties {
+    let info = os_info::get();
     SystemProperties {
         is_debug: cfg!(debug_assertions),
-        os_name: match std::env::consts::OS {
-            "macos" => "macOS".to_string(),
-            "windows" => "Windows".to_string(),
-            other => other.to_string(),
+        os_name: match info.os_type() {
+            os_info::Type::Macos => "macOS".to_string(),
+            os_info::Type::Windows => "Windows".to_string(),
+            _ if std::env::var("container").is_ok() => "Flatpak".to_string(),
+            _ => info.os_type().to_string(),
         },
-        os_version: String::new(),
-        locale: std::env::var("LANG").unwrap_or_default(),
+        os_version: info.version().to_string(),
+        locale: sys_locale::get_locale().unwrap_or_default(),
         engine_name: engine_name().to_string(),
         engine_version: webview_version().unwrap_or_default(),
     }
@@ -362,11 +380,18 @@ fn engine_name() -> &'static str {
     }
 }
 
+fn new_session_id() -> String {
+    let epoch_in_seconds = chrono::Utc::now().timestamp().max(0) as u64;
+    let mut rng = rand::rng();
+    let random: u64 = rng.random_range(0..=99_999_999);
+    format!("{epoch_in_seconds}{random:08}")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{sanitize_properties, AnalyticsConfig};
+    use super::{new_session_id, sanitize_properties, AnalyticsConfig};
 
     #[test]
     fn sanitize_properties_keeps_supported_values() {
@@ -405,5 +430,12 @@ mod tests {
             "https://eu.aptabase.com/api/v0/events"
         );
         std::env::remove_var("HEADROOM_APTABASE_APP_KEY");
+    }
+
+    #[test]
+    fn session_ids_follow_aptabase_format() {
+        let session_id = new_session_id();
+        assert_eq!(session_id.len(), 18);
+        assert!(session_id.chars().all(|ch| ch.is_ascii_digit()));
     }
 }
