@@ -2,6 +2,8 @@ mod client_adapters;
 mod insights;
 mod keychain;
 mod models;
+mod pricing;
+mod proxy_intercept;
 mod research;
 mod state;
 mod storage;
@@ -14,27 +16,37 @@ use std::sync::Mutex;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+#[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 use tauri::Manager;
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    BootstrapProgress, ClaudeCodeProject, ClientConnectorStatus, ClientSetupResult,
-    ClientSetupVerification, DashboardState, HeadroomLearnApiKeyStatus, HeadroomLearnStatus,
-    ResearchCandidate, RuntimeStatus,
+    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus,
+    ClientSetupResult, ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
+    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus,
 };
 use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
+const DEFAULT_UPDATER_ENDPOINT: &str =
+    "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
+const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
-const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.garm.headroom.headroom-learn";
+const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.headroom-learn";
 const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
 const HEADROOM_LEARN_ANTHROPIC_ACCOUNT: &str = "anthropic";
 const HEADROOM_LEARN_GEMINI_ACCOUNT: &str = "gemini";
+const MAIN_WINDOW_WIDTH: u32 = 760;
+const MAIN_WINDOW_HEIGHT: u32 = 560;
+const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 
 struct PendingAppUpdate(Mutex<Option<Update>>);
 
@@ -277,6 +289,55 @@ fn get_claude_code_projects(state: State<'_, AppState>) -> Result<Vec<ClaudeCode
     state
         .list_claude_code_projects()
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn get_claude_usage(state: State<'_, AppState>) -> Result<ClaudeUsage, String> {
+    pricing::fetch_claude_usage(&state)
+}
+
+#[tauri::command]
+fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
+    pricing::detect_claude_profile(&state)
+}
+
+#[tauri::command]
+fn get_headroom_pricing_status(
+    state: State<'_, AppState>,
+) -> Result<HeadroomPricingStatus, String> {
+    pricing::get_pricing_status(&state)
+}
+
+#[tauri::command]
+fn request_headroom_auth_code(email: String) -> Result<HeadroomAuthCodeRequest, String> {
+    pricing::request_auth_code(&email)
+}
+
+#[tauri::command]
+fn verify_headroom_auth_code(
+    state: State<'_, AppState>,
+    email: String,
+    code: String,
+    invite_code: Option<String>,
+) -> Result<HeadroomPricingStatus, String> {
+    pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())
+}
+
+#[tauri::command]
+fn sign_out_headroom_account() -> Result<(), String> {
+    pricing::sign_out()
+}
+
+#[tauri::command]
+fn activate_headroom_account(state: State<'_, AppState>) -> Result<HeadroomPricingStatus, String> {
+    pricing::activate_account(&state)
+}
+
+#[tauri::command]
+fn create_headroom_checkout_session(
+    subscription_tier: HeadroomSubscriptionTier,
+) -> Result<String, String> {
+    pricing::create_checkout_session(subscription_tier)
 }
 
 #[tauri::command]
@@ -561,10 +622,19 @@ fn quit_headroom(app: AppHandle) {
     app.exit(0);
 }
 
+fn launched_from_autostart() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
+}
+
 pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_LAUNCH_ARG])
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -573,10 +643,19 @@ pub fn run() {
                 app.set_dock_visibility(false);
             }
 
+            let launched_from_autostart = launched_from_autostart();
+            if let Ok(false) = app.autolaunch().is_enabled() {
+                if let Err(err) = app.autolaunch().enable() {
+                    eprintln!("failed to enable autostart: {err}");
+                }
+            }
+
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
-            if state.should_present_on_launch() {
+            // Start the intercept layer before anything else touches port 6767.
+            proxy_intercept::spawn(std::sync::Arc::clone(&state.claude_bearer_token));
+            if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
             let app_handle = app.handle().clone();
@@ -608,6 +687,14 @@ pub fn run() {
             get_rtk_activity,
             get_tool_logs,
             get_claude_code_projects,
+            get_claude_usage,
+            get_claude_profile,
+            get_headroom_pricing_status,
+            request_headroom_auth_code,
+            verify_headroom_auth_code,
+            sign_out_headroom_account,
+            activate_headroom_account,
+            create_headroom_checkout_session,
             get_headroom_learn_status,
             get_headroom_learn_api_key_status,
             set_headroom_learn_api_key,
@@ -631,31 +718,50 @@ pub fn run() {
 }
 
 fn release_updater_config() -> Result<Option<ReleaseUpdaterConfig>, String> {
-    let Some(pubkey) = UPDATER_PUBLIC_KEY
+    let configured_pubkey = UPDATER_PUBLIC_KEY
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|value| !value.is_empty());
+    let configured_endpoints = UPDATER_ENDPOINTS
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let endpoint_spec = UPDATER_ENDPOINTS
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
+    match (configured_pubkey, configured_endpoints) {
+        (Some(pubkey), Some(endpoint_spec)) => {
+            build_release_updater_config(pubkey, endpoint_spec).map(Some)
+        }
+        (Some(_), None) => Err(
             "Updater public key is configured, but HEADROOM_UPDATER_ENDPOINTS is missing."
-                .to_string()
-        })?;
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "HEADROOM_UPDATER_ENDPOINTS is configured, but HEADROOM_UPDATER_PUBLIC_KEY is missing."
+                .to_string(),
+        ),
+        (None, None) => {
+            if cfg!(debug_assertions) {
+                Ok(None)
+            } else {
+                build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
+                    .map(Some)
+            }
+        }
+    }
+}
 
+fn build_release_updater_config(
+    pubkey: &str,
+    endpoint_spec: &str,
+) -> Result<ReleaseUpdaterConfig, String> {
     let endpoints = parse_updater_endpoint_list(endpoint_spec)?;
 
     if endpoints.is_empty() {
         return Err("HEADROOM_UPDATER_ENDPOINTS did not include any valid URLs.".into());
     }
 
-    Ok(Some(ReleaseUpdaterConfig {
+    Ok(ReleaseUpdaterConfig {
         pubkey: pubkey.to_string(),
         endpoints,
-    }))
+    })
 }
 
 fn parse_updater_endpoint_list(raw: &str) -> Result<Vec<reqwest::Url>, String> {
@@ -1486,29 +1592,150 @@ fn hide_launcher_window(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicalRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
 fn position_tray_window(window: &tauri::WebviewWindow, rect: Rect) -> tauri::Result<()> {
-    let window_width = 760.0;
-    let (tray_x, tray_y) = match rect.position {
-        Position::Physical(position) => (position.x as f64, position.y as f64),
-        Position::Logical(position) => (position.x, position.y),
+    let scale_factor = window.scale_factor()?;
+    let tray_rect = physical_rect_from_rect(rect, scale_factor);
+    let window_size = window
+        .outer_size()
+        .unwrap_or_else(|_| PhysicalSize::new(MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT));
+    let monitor_bounds = resolve_monitor_bounds(window, tray_rect);
+    let target = compute_tray_window_position(tray_rect, window_size, monitor_bounds);
+
+    window.set_position(Position::Physical(target))
+}
+
+fn physical_rect_from_rect(rect: Rect, scale_factor: f64) -> PhysicalRect {
+    let (x, y) = match rect.position {
+        Position::Physical(position) => (position.x, position.y),
+        Position::Logical(position) => (
+            (position.x * scale_factor).round() as i32,
+            (position.y * scale_factor).round() as i32,
+        ),
     };
-    let (tray_width, tray_height) = match rect.size {
-        tauri::Size::Physical(size) => (size.width as f64, size.height as f64),
-        tauri::Size::Logical(size) => (size.width, size.height),
+    let (width, height) = match rect.size {
+        tauri::Size::Physical(size) => (
+            i32::try_from(size.width).unwrap_or(i32::MAX),
+            i32::try_from(size.height).unwrap_or(i32::MAX),
+        ),
+        tauri::Size::Logical(size) => (
+            (size.width * scale_factor).round() as i32,
+            (size.height * scale_factor).round() as i32,
+        ),
     };
 
-    let tray_midpoint = tray_x + (tray_width / 2.0);
-    let target_x = (tray_midpoint - (window_width / 2.0)).round() as i32;
-    let target_y = (tray_y + tray_height + 10.0).round() as i32;
+    PhysicalRect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
 
-    window.set_position(Position::Physical(PhysicalPosition::new(
-        target_x, target_y,
-    )))
+fn resolve_monitor_bounds(
+    window: &tauri::WebviewWindow,
+    tray_rect: PhysicalRect,
+) -> Option<MonitorBounds> {
+    let anchor_x = tray_rect.x + (tray_rect.width / 2);
+    let anchor_y = tray_rect.y + (tray_rect.height / 2);
+
+    if let Ok(monitors) = window.available_monitors() {
+        if let Some(bounds) = monitors
+            .into_iter()
+            .map(monitor_bounds_from_monitor)
+            .find(|bounds| point_within_monitor(*bounds, anchor_x, anchor_y))
+        {
+            return Some(bounds);
+        }
+    }
+
+    window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(monitor_bounds_from_monitor)
+}
+
+fn monitor_bounds_from_monitor(monitor: tauri::Monitor) -> MonitorBounds {
+    MonitorBounds {
+        x: monitor.position().x,
+        y: monitor.position().y,
+        width: i32::try_from(monitor.size().width).unwrap_or(i32::MAX),
+        height: i32::try_from(monitor.size().height).unwrap_or(i32::MAX),
+    }
+}
+
+fn point_within_monitor(bounds: MonitorBounds, x: i32, y: i32) -> bool {
+    let max_x = bounds.x.saturating_add(bounds.width);
+    let max_y = bounds.y.saturating_add(bounds.height);
+    x >= bounds.x && x < max_x && y >= bounds.y && y < max_y
+}
+
+fn compute_tray_window_position(
+    tray_rect: PhysicalRect,
+    window_size: PhysicalSize<u32>,
+    monitor_bounds: Option<MonitorBounds>,
+) -> PhysicalPosition<i32> {
+    let window_width = i32::try_from(window_size.width).unwrap_or(i32::MAX);
+    let window_height = i32::try_from(window_size.height).unwrap_or(i32::MAX);
+    let centered_x = tray_rect
+        .x
+        .saturating_add(tray_rect.width / 2)
+        .saturating_sub(window_width / 2);
+    let below_y = tray_rect
+        .y
+        .saturating_add(tray_rect.height)
+        .saturating_add(TRAY_WINDOW_VERTICAL_GAP);
+
+    if let Some(bounds) = monitor_bounds {
+        let max_x = bounds
+            .x
+            .saturating_add(bounds.width.saturating_sub(window_width).max(0));
+        let clamped_x = centered_x.clamp(bounds.x, max_x);
+
+        let max_y = bounds
+            .y
+            .saturating_add(bounds.height.saturating_sub(window_height).max(0));
+        let above_y = tray_rect
+            .y
+            .saturating_sub(window_height)
+            .saturating_sub(TRAY_WINDOW_VERTICAL_GAP);
+        let target_y =
+            if below_y.saturating_add(window_height) <= bounds.y.saturating_add(bounds.height) {
+                below_y
+            } else {
+                above_y.clamp(bounds.y, max_y)
+            };
+
+        return PhysicalPosition::new(clamped_x, target_y);
+    }
+
+    PhysicalPosition::new(centered_x, below_y)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_updater_endpoint_list;
+    use super::{
+        build_release_updater_config, compute_tray_window_position, parse_updater_endpoint_list,
+        physical_rect_from_rect, MonitorBounds, PhysicalRect, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
+    };
+    use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
     #[test]
     fn updater_endpoint_parser_accepts_json_arrays() {
@@ -1548,5 +1775,83 @@ mod tests {
         let insecure = parse_updater_endpoint_list("http://updates.example.com/latest.json")
             .expect_err("http endpoint should fail");
         assert!(insecure.contains("must use HTTPS"));
+    }
+
+    #[test]
+    fn updater_release_config_accepts_official_default_feed() {
+        let config =
+            build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
+                .expect("official updater config");
+
+        assert_eq!(config.pubkey, DEFAULT_UPDATER_PUBLIC_KEY);
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"
+        );
+    }
+
+    #[test]
+    fn tray_window_position_clamps_to_right_monitor_edge() {
+        let target = compute_tray_window_position(
+            PhysicalRect {
+                x: 1430,
+                y: 0,
+                width: 24,
+                height: 24,
+            },
+            PhysicalSize::new(760, 560),
+            Some(MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            }),
+        );
+
+        assert_eq!(target.x, 680);
+        assert_eq!(target.y, 34);
+    }
+
+    #[test]
+    fn tray_window_position_moves_above_when_bottom_would_overflow() {
+        let target = compute_tray_window_position(
+            PhysicalRect {
+                x: 500,
+                y: 730,
+                width: 24,
+                height: 24,
+            },
+            PhysicalSize::new(760, 560),
+            Some(MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            }),
+        );
+
+        assert_eq!(target.x, 132);
+        assert_eq!(target.y, 160);
+    }
+
+    #[test]
+    fn logical_tray_rects_are_converted_with_scale_factor() {
+        let rect = Rect {
+            position: Position::Logical(LogicalPosition::new(100.0, 20.0)),
+            size: Size::Logical(LogicalSize::new(12.0, 12.0)),
+        };
+
+        let physical = physical_rect_from_rect(rect, 2.0);
+
+        assert_eq!(
+            physical,
+            PhysicalRect {
+                x: 200,
+                y: 40,
+                width: 24,
+                height: 24,
+            }
+        );
     }
 }

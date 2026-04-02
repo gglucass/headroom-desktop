@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -15,10 +14,11 @@ use uuid::Uuid;
 use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integration_status};
 use crate::insights::generate_daily_insights;
 use crate::models::{
-    BootstrapProgress, ClaudeCodeProject, ClientStatus, DailyInsight, DailySavingsPoint,
-    DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus,
-    RuntimeStatus, UsageEvent,
+    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus, DailyInsight,
+    DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
+    RtkRuntimeStatus, RuntimeStatus, UsageEvent,
 };
+use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
 use crate::tool_manager::{BootstrapStepUpdate, ManagedRuntime, RtkGainSummary, ToolManager};
 
@@ -30,12 +30,17 @@ pub struct AppState {
     pub runtime_starting: Mutex<bool>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
+    /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
+    /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
+    /// Wrapped in Arc so the proxy_intercept task can share it without going through AppState.
+    pub claude_bearer_token: Arc<Mutex<Option<String>>>,
     launch_profile: LaunchProfile,
     savings_tracker: Mutex<SavingsTracker>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
     cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
+    cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +57,10 @@ pub struct HeadroomLearnRuntimeState {
 
 impl AppState {
     pub fn new() -> Result<Self> {
-        let base_dir = app_data_dir();
+        Self::new_in(app_data_dir())
+    }
+
+    fn new_in(base_dir: PathBuf) -> Result<Self> {
         ensure_data_dirs(&base_dir)?;
 
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
@@ -75,6 +83,7 @@ impl AppState {
                 current_step_eta_seconds: 0,
                 overall_percent: 0,
             }),
+            claude_bearer_token: Arc::new(Mutex::new(None)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
                 running: false,
                 project_path: None,
@@ -91,6 +100,7 @@ impl AppState {
             cached_headroom_stats: Mutex::new(None),
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
+            cached_claude_profile: Mutex::new(None),
         };
 
         Ok(state)
@@ -98,6 +108,8 @@ impl AppState {
 
     pub fn warm_runtime_on_launch(&self) {
         if self.tool_manager.python_runtime_installed() {
+            self.enforce_pricing_gate();
+
             if let Err(err) = ensure_rtk_integrations(
                 &self.tool_manager.rtk_entrypoint(),
                 &self.tool_manager.managed_python(),
@@ -130,6 +142,36 @@ impl AppState {
         let clients = detect_clients();
         *cache = Some((clients.clone(), Instant::now()));
         clients
+    }
+
+    pub fn cached_claude_profile(&self) -> ClaudeAccountProfile {
+        const TTL: Duration = Duration::from_secs(300);
+
+        let current_token = self
+            .claude_bearer_token
+            .lock()
+            .ok()
+            .and_then(|token| token.clone());
+
+        {
+            let cache = self
+                .cached_claude_profile
+                .lock()
+                .expect("cached_claude_profile poisoned");
+            if let Some((cached_token, profile, at)) = &*cache {
+                if *cached_token == current_token && at.elapsed() < TTL {
+                    return profile.clone();
+                }
+            }
+        }
+
+        let profile = pricing::detect_claude_profile_uncached(self);
+        let mut cache = self
+            .cached_claude_profile
+            .lock()
+            .expect("cached_claude_profile poisoned");
+        *cache = Some((current_token, profile.clone(), Instant::now()));
+        profile
     }
 
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
@@ -317,6 +359,9 @@ impl AppState {
 
             let project_path = extract_cwd_from_session_file(&latest_file)
                 .unwrap_or_else(|| decode_project_folder_name(&folder_name));
+            let project_path = std::fs::canonicalize(&project_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(project_path);
             if project_path.trim().is_empty() {
                 continue;
             }
@@ -574,6 +619,11 @@ impl AppState {
             return Ok(());
         }
 
+        if !self.pricing_allows_optimization() {
+            self.enforce_pricing_gate();
+            return Ok(());
+        }
+
         if self.runtime_is_paused() {
             return Ok(());
         }
@@ -628,25 +678,25 @@ impl AppState {
         let (rtk_path_configured, rtk_hook_configured) =
             rtk_integration_status().unwrap_or((false, false));
         let rtk_gain_summary = self.cached_rtk_gain_summary();
-        let (running, headroom_pid) = {
+        let headroom_pid = {
             let mut process = self
                 .headroom_process
                 .lock()
                 .expect("headroom process state poisoned");
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
-                    Ok(None) => (true, Some(existing.id())),
+                    Ok(None) => Some(existing.id()),
                     Ok(Some(_)) | Err(_) => {
                         *process = None;
-                        (false, None)
+                        None
                     }
                 }
             } else {
-                (false, None)
+                None
             }
         };
 
-        let effective_running = running || (installed && !paused && proxy_reachable);
+        let effective_running = installed && !paused && proxy_reachable;
 
         RuntimeStatus {
             installed,
@@ -720,10 +770,36 @@ impl AppState {
 
         // Also clean up detached/orphaned Headroom-managed headroom proxies
         // so quitting the UI cannot leave the background listener behind.
-        let headroom_entrypoint = self.tool_manager.headroom_entrypoint();
-        let command_pattern = format!("{} proxy --port 6767", headroom_entrypoint.display());
-        if let Err(err) = kill_processes_by_command_pattern(&command_pattern) {
-            eprintln!("failed to clean detached headroom proxy processes: {err}");
+        let managed_python = self.tool_manager.managed_python();
+        let command_patterns = [
+            format!(
+                "{} -m headroom.proxy.server --port 6768 --no-http2",
+                managed_python.display()
+            ),
+            format!(
+                "{} proxy --port 6768",
+                self.tool_manager.headroom_entrypoint().display()
+            ),
+        ];
+        for pattern in command_patterns {
+            if let Err(err) = kill_processes_by_command_pattern(&pattern) {
+                eprintln!("failed to clean detached headroom proxy processes: {err}");
+            }
+        }
+    }
+
+    fn pricing_allows_optimization(&self) -> bool {
+        pricing::get_pricing_status(self)
+            .map(|status| status.optimization_allowed)
+            .unwrap_or(true)
+    }
+
+    fn enforce_pricing_gate(&self) {
+        match pricing::get_pricing_status(self) {
+            Ok(status) if !status.optimization_allowed => {
+                let _ = crate::client_adapters::disable_client_setup("claude_code");
+            }
+            _ => {}
         }
     }
 }
@@ -1497,11 +1573,19 @@ impl SavingsTracker {
         actual_cost_usd: f64,
         total_tokens_sent: u64,
     ) {
+        let mut should_remove = false;
         if let Some(entry) = self.daily_savings.get_mut(day_key) {
             entry.estimated_savings_usd = (entry.estimated_savings_usd - usd.max(0.0)).max(0.0);
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            should_remove = entry.estimated_savings_usd <= 0.0
+                && entry.estimated_tokens_saved == 0
+                && entry.actual_cost_usd <= 0.0
+                && entry.total_tokens_sent == 0;
+        }
+        if should_remove {
+            self.daily_savings.remove(day_key);
         }
     }
 
@@ -1531,11 +1615,19 @@ impl SavingsTracker {
         actual_cost_usd: f64,
         total_tokens_sent: u64,
     ) {
+        let mut should_remove = false;
         if let Some(entry) = self.hourly_savings.get_mut(hour_key) {
             entry.estimated_savings_usd = (entry.estimated_savings_usd - usd.max(0.0)).max(0.0);
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            should_remove = entry.estimated_savings_usd <= 0.0
+                && entry.estimated_tokens_saved == 0
+                && entry.actual_cost_usd <= 0.0
+                && entry.total_tokens_sent == 0;
+        }
+        if should_remove {
+            self.hourly_savings.remove(hour_key);
         }
     }
 
@@ -2469,17 +2561,21 @@ fn parse_f64_from_text(text: &str) -> Option<f64> {
 }
 
 fn is_headroom_proxy_reachable() -> bool {
-    is_proxy_reachable_at("127.0.0.1:6767") || is_proxy_reachable_at("localhost:6767")
-}
-
-fn is_proxy_reachable_at(endpoint: &str) -> bool {
-    let addresses: Vec<SocketAddr> = match endpoint.to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(client) => client,
         Err(_) => return false,
     };
-    addresses
-        .iter()
-        .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(350)).is_ok())
+
+    ["127.0.0.1", "localhost"].iter().any(|host| {
+        client
+            .get(format!("http://{host}:6767/health"))
+            .send()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    })
 }
 
 fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
@@ -2569,7 +2665,8 @@ mod tests {
 
     #[test]
     fn dashboard_includes_managed_tools() {
-        let state = AppState::new().expect("app state");
+        let base_dir = temp_test_dir("headroom-app-state");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
         let dashboard = state.dashboard();
 
         assert!(dashboard.tools.iter().any(|tool| tool.id == "headroom"));
@@ -2578,6 +2675,8 @@ mod tests {
             .insights
             .iter()
             .any(|insight| !insight.title.is_empty()));
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 
     #[test]

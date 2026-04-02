@@ -7,6 +7,39 @@ Headroom is set up for outside-the-App-Store macOS distribution with:
 - user-confirmed install prompts
 - Apple code signing and notarization
 
+## Build a signed DMG locally
+
+If your Apple Developer access is ready on your Mac, the fastest local path is:
+
+```bash
+npm install
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export TAURI_SIGNING_PRIVATE_KEY="$(cat .secrets/tauri-updater/private.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="your-updater-key-password"
+export APPLE_API_ISSUER="your-app-store-connect-issuer-id"
+export APPLE_API_KEY="your-app-store-connect-key-id"
+export APPLE_API_KEY_PATH="$HOME/.private_keys/AuthKey_ABC123XYZ.p8"
+export HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
+export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
+export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+npm run build:mac:dmg
+```
+
+This produces a signed `Headroom_<version>.dmg` in `src-tauri/target/release/bundle/dmg/`.
+
+If you want a universal build, install both Rust macOS targets first and then run:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+TARGET=universal-apple-darwin npm run build:mac:dmg
+```
+
+The local helper script sets `CI=true` for Tauri's DMG bundler, validates the required secrets, and supports either:
+
+- `APPLE_API_KEY_PATH` for a local App Store Connect private key file
+- `APPLE_API_PRIVATE_KEY_P8` if you prefer storing the key contents directly in an environment variable
+- `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` if you want Apple ID notarization instead
+
 ## What the app expects
 
 This build reads two compile-time environment variables:
@@ -20,10 +53,44 @@ Example:
 
 ```bash
 export HEADROOM_UPDATER_PUBLIC_KEY="$(cat .secrets/tauri-updater/public.key)"
-export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/<owner>/<repo>/releases/latest/download/latest.json"]'
+export HEADROOM_UPDATER_ENDPOINTS='["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
 ```
 
 These values are compiled into the release build. If they are missing, Headroom still runs, but update checks stay disabled for that build.
+
+## Environment variables to set
+
+Required for a signed local DMG in this repo:
+
+- `HEADROOM_ACCOUNT_API_BASE_URL`
+  The deployed Headroom account API base URL, for example `https://extraheadroom.com/api/v1`. Release builds now fail fast if this is missing so packaged sign-in cannot silently point at localhost.
+- `APPLE_SIGNING_IDENTITY`
+  Your Developer ID Application certificate name from Keychain Access, for example `Developer ID Application: Your Name (TEAMID)`.
+- `TAURI_SIGNING_PRIVATE_KEY`
+  The private updater signing key contents because this repo builds updater artifacts alongside the DMG.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+  The password for that updater signing key.
+
+Required for notarization, choose one mode:
+
+- App Store Connect API mode:
+  `APPLE_API_ISSUER`, `APPLE_API_KEY`, and either `APPLE_API_KEY_PATH` or `APPLE_API_PRIVATE_KEY_P8`
+- Apple ID mode:
+  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`
+
+Recommended for production builds of Headroom so auto-update stays enabled:
+
+- `HEADROOM_UPDATER_PUBLIC_KEY`
+  The public half of the Tauri updater signing keypair.
+- `HEADROOM_UPDATER_ENDPOINTS`
+  A JSON array or comma-separated list of HTTPS update feed URLs.
+
+Optional, usually only needed outside your own machine:
+
+- `APPLE_CERTIFICATE`
+  Base64-encoded `.p12` signing certificate export. Useful for CI or a clean machine without the certificate already installed in your login keychain.
+- `APPLE_CERTIFICATE_PASSWORD`
+  Password for the exported `.p12` certificate.
 
 ## Repository configuration
 
@@ -113,6 +180,7 @@ Current behavior:
 - lets the user manually check from Settings
 - prompts before download/install
 - asks the user to restart after install completes
+- production builds fall back to `https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json` when no explicit updater env vars are injected
 
 ## Recommended next step
 
@@ -129,7 +197,8 @@ This repo now includes a workflow at `.github/workflows/release-macos.yml`.
 
 It:
 
-- runs on manual dispatch only
-- builds both `aarch64-apple-darwin` and `x86_64-apple-darwin`
+- runs on manual dispatch
+- also runs automatically when a version bump to `package.json` / `src-tauri/tauri.conf.json` is pushed to `main`
+- builds the Apple Silicon (`aarch64-apple-darwin`) release bundle
 - signs and notarizes the app
 - uploads updater artifacts and `latest.json` to the GitHub Release

@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.1.0"
+version = "0.2.7"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -26,6 +26,7 @@ serde_json = "=1.0.149"
 sha2 = "=0.10.9"
 tar = "0.4"
 tauri = { version = "=2.10.3", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5.1"
 tauri-plugin-updater = "2.10.0"
 time = "=0.3.47"
 tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread", "process", "fs", "time"] }

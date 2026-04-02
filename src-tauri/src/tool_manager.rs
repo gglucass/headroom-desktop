@@ -16,14 +16,15 @@ use tar::Archive;
 
 use crate::models::{ManagedTool, ToolStatus};
 
-const HEADROOM_VERSION: &str = "0.5.6";
-const HEADROOM_PROXY_PORT: &str = "6767";
+const HEADROOM_VERSION: &str = "0.5.17";
+// headroom binds on 6768; the intercept layer on 6767 forwards to it.
+const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
-const HEADROOM_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/84/35/4f6f01ce76f391a378e83a99008b186b6237baf5dbfc6571d42a5595c5f4/headroom_ai-0.5.6-py3-none-any.whl";
+const HEADROOM_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ef/61/d5cb570d4e47926d3b2e734f94a64719fdd54eeb123f9906a1a38ef4121d/headroom_ai-0.5.17-py3-none-any.whl";
 const HEADROOM_WHEEL_SHA256: &str =
-    "fd09f1e13f8b9faaab2647d968a46b26a1f7df0c4ad51e1e318bd6804f6e915b";
+    "865f10441db39f4087218127d298451c38024609fc5f02bbdb820dc375e9553c";
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const RTK_VERSION: &str = "0.33.1";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
@@ -264,18 +265,18 @@ impl ToolManager {
     }
 
     pub fn start_headroom_background(&self) -> Result<Child> {
-        let entrypoint = self.headroom_entrypoint();
-        if !entrypoint.exists() {
-            bail!("headroom entrypoint not found at {}", entrypoint.display());
+        let python = self.managed_python();
+        if !python.exists() {
+            bail!("headroom managed python not found at {}", python.display());
         }
 
-        let startup_variants: &[&[&str]] = &[&["proxy", "--port", HEADROOM_PROXY_PORT]];
+        let startup_variants = headroom_startup_variants();
         let mut errors = Vec::new();
         let logs_dir = self.runtime.logs_dir();
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
 
-        for args in startup_variants {
+        for args in &startup_variants {
             let variant = if args.is_empty() {
                 "default".to_string()
             } else {
@@ -288,15 +289,12 @@ impl ToolManager {
                 .open(&log_path)
                 .with_context(|| format!("opening {}", log_path.display()))?;
 
-            let mut child = Command::new(&entrypoint)
-                .args(*args)
+            let mut child = Command::new(&python)
+                .args(args)
                 .current_dir(&self.runtime.root_dir)
                 .env("PYTHONNOUSERSITE", "1")
                 .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
                 .env("PIP_NO_INPUT", "1")
-                // Headroom's upstream HTTP/2 path can be brittle on some networks;
-                // force HTTP/1.1 for proxy stability.
-                .env("HEADROOM_HTTP2", "0")
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(
@@ -307,7 +305,11 @@ impl ToolManager {
                 .stderr(Stdio::from(log_file))
                 .spawn()
                 .with_context(|| {
-                    format!("starting headroom background process: {}", args.join(" "))
+                    format!(
+                        "starting headroom background process: {} {}",
+                        python.display(),
+                        args.join(" ")
+                    )
                 })?;
 
             let mut startup_ok = false;
@@ -324,9 +326,10 @@ impl ToolManager {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         startup_error = Some(format!(
-                            "headroom {} exited with status {} before opening port 6767 (log: {})",
+                            "headroom {} exited with status {} before opening port {} (log: {})",
                             args.join(" "),
                             status,
+                            HEADROOM_PROXY_PORT,
                             log_path.display()
                         ));
                         break;
@@ -567,7 +570,10 @@ impl ToolManager {
             .filter_map(|path| read_headroom_learn_metadata_from_path(&path))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
-        candidates.into_iter().next().map(|candidate| candidate.metadata)
+        candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.metadata)
     }
 
     fn headroom_learn_memory_paths(&self, project_path: &str) -> Vec<PathBuf> {
@@ -772,7 +778,7 @@ impl ToolManager {
         let wheel_path = self
             .runtime
             .downloads_dir
-            .join("headroom_ai-0.5.6-py3-none-any.whl");
+            .join(format!("headroom_ai-{HEADROOM_VERSION}-py3-none-any.whl"));
         download_to_path(&artifact.url, &wheel_path, artifact.sha256)?;
 
         run_python_command(
@@ -988,12 +994,24 @@ impl ToolManager {
 }
 
 fn is_local_proxy_reachable() -> bool {
-    let address: SocketAddr = match "127.0.0.1:6767".parse() {
+    // Check headroom's actual backend port (6768), not the intercept port (6767),
+    // because the intercept starts before headroom and would always be reachable.
+    let address: SocketAddr = match "127.0.0.1:6768".parse() {
         Ok(address) => address,
         Err(_) => return false,
     };
 
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
+}
+
+fn headroom_startup_variants() -> Vec<Vec<&'static str>> {
+    vec![vec![
+        "-m",
+        "headroom.proxy.server",
+        "--port",
+        HEADROOM_PROXY_PORT,
+        "--no-http2",
+    ]]
 }
 
 struct DownloadArtifact {
@@ -1225,7 +1243,7 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedRuntime, ToolManager};
+    use super::{headroom_startup_variants, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT};
 
     #[test]
     fn managed_python_paths_live_inside_headroom_root() {
@@ -1253,6 +1271,20 @@ mod tests {
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
         assert!(runtime.bin_dir.join("rtk").exists());
+    }
+
+    #[test]
+    fn managed_headroom_startup_uses_supported_proxy_args() {
+        assert_eq!(
+            headroom_startup_variants(),
+            vec![vec![
+                "-m",
+                "headroom.proxy.server",
+                "--port",
+                HEADROOM_PROXY_PORT,
+                "--no-http2",
+            ]]
+        );
     }
 
     #[test]
