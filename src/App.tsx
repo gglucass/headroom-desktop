@@ -588,9 +588,7 @@ export default function App() {
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [pendingLearnProjectPath, setPendingLearnProjectPath] = useState<string | null>(null);
   const apiKeyInputRef = useRef<HTMLInputElement | null>(null);
-  const [nomAnimTick, setNomAnimTick] = useState(0);
-  const [nomBarChars, setNomBarChars] = useState(46);
-  const nomBarRef = useRef<HTMLParagraphElement | null>(null);
+
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
   const [stepEtaSeedSeconds, setStepEtaSeedSeconds] = useState(0);
@@ -999,39 +997,6 @@ export default function App() {
     setStepBasePercent(bootstrapProgress.overallPercent);
   }, [bootstrapProgress, showInstallProgress, stepSignature]);
 
-  useEffect(() => {
-    const element = nomBarRef.current;
-    if (!element) {
-      return;
-    }
-
-    const updateChars = () => {
-      const availableWidth = element.clientWidth;
-      if (availableWidth <= 0) {
-        return;
-      }
-      // Keep this visually tight and readable instead of stretching indefinitely.
-      const computed = Math.floor((availableWidth - 32) / 8.2);
-      setNomBarChars(Math.max(40, Math.min(64, computed)));
-    };
-
-    updateChars();
-    const observer = new ResizeObserver(() => updateChars());
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [windowLabel, bootstrapping]);
-
-  useEffect(() => {
-    if (windowLabel !== "launcher") {
-      return;
-    }
-
-    const interval = window.setInterval(() => {
-      setNomAnimTick((tick) => tick + 1);
-    }, 220);
-
-    return () => window.clearInterval(interval);
-  }, [windowLabel]);
 
   useEffect(() => {
     if (!isLastScreen) return;
@@ -1447,20 +1412,6 @@ export default function App() {
     const mins = Math.floor(remainingSeconds / 60);
     const secs = remainingSeconds % 60;
     return `ETA: ${mins}m ${secs}s`;
-  }
-
-  function renderProgressBar(percent: number, tick: number, width: number) {
-    const clampedWidth = Math.max(40, Math.min(64, width));
-    const clampedPercent = Math.min(100, Math.max(0, Math.round(percent)));
-    const biteIndex = Math.round((clampedPercent / 100) * clampedWidth);
-    const filled = "=".repeat(Math.max(0, biteIndex));
-    const remaining = (tick % 2 === 0 ? "." : "-").repeat(
-      Math.max(0, clampedWidth - biteIndex)
-    );
-    const cursorMarker = ["C", "c", "<"][tick % 3];
-    return `[${filled}${cursorMarker}${remaining}] ${clampedPercent
-      .toString()
-      .padStart(3, " ")}%`;
   }
 
   function getConnectorUnavailableReason(connector: ClientConnectorStatus) {
@@ -2266,9 +2217,12 @@ export default function App() {
         <div className="install-progress-shell">
           {showInstallProgress ? (
             <div className="install-progress" aria-live="polite">
-              <p className="install-progress__ascii" ref={nomBarRef}>
-                {renderProgressBar(renderPercent, nomAnimTick, nomBarChars)}
-              </p>
+              <div className="install-progress__bar-track">
+                <div
+                  className="install-progress__bar-fill"
+                  style={{ width: `${renderPercent}%` }}
+                />
+              </div>
               <div className="install-progress__meta">
                 <p>{statusCopy}</p>
                 <span>
