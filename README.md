@@ -1,64 +1,78 @@
 # Headroom Desktop
 
-Headroom is a local-first desktop tray app for coding-focused LLM workflows. It routes supported clients through a local optimization pipeline powered by `headroom`.
+**Cut your LLM API bills by 60–90% without changing how you code.**
 
-## What is implemented here
+[![Website](https://img.shields.io/badge/extraheadroom.com-website-blue?style=for-the-badge)](https://extraheadroom.com)&nbsp;&nbsp;[![Download for macOS](https://img.shields.io/github/v/release/gglucass/headroom-desktop?label=Download%20for%20macOS&style=for-the-badge&logo=apple&logoColor=white&color=000000)](https://github.com/gglucass/headroom-desktop/releases/latest)
 
-- Tauri 2 desktop shell scaffold with a playful dashboard-oriented UI
-- Rust backend modules for:
-  - local dashboard state
-  - self-contained managed Python bootstrap/runtime layout
-  - managed tool installation for Headroom and RTK
-  - client detection
-  - daily insights
-  - research compatibility matrix
-- Research and architecture docs aligned with the v1 plan
+> **Requires macOS on Apple Silicon (M1 or later)**
+
+### Install
+
+1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
+2. Download the `.dmg` file (e.g. `Headroom_0.2.7.dmg`)
+3. Open the DMG, drag **Headroom** to Applications
+4. Launch Headroom — it appears in your menu bar and walks you through setup
+
+Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings.
+
+---
+
+Headroom is a local-first macOS tray app that routes your coding clients through a local optimization pipeline. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics — all without touching your system environment.
+
+## How it works
+
+Headroom sits in your menu bar and does three things:
+
+1. **Installs a managed Python runtime** into Headroom-owned storage — isolated from your system Python, no `pip install --user` pollution.
+2. **Chains token-saving tools** (`headroom` for prompt optimization, `rtk` for CLI output compression) between your client and the LLM API.
+3. **Shows you the math** — daily and monthly savings charts, per-client token stats, and pipeline health.
+
+The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fetched on first launch and kept in `~/Library/Application Support/Headroom`.
+
+## Bundled tools
+
+| Tool | What it does | Default |
+|------|-------------|---------|
+| [headroom](https://pypi.org/project/headroom-ai/) | Prompt optimization pipeline (Python) | Required |
+| [rtk](https://github.com/gglucass/rtk) | Rewrites Claude Code bash commands to strip noise before it reaches the context window | Auto-enabled |
+| vitals | Project health scanner — flags stale deps, large files, drift | Included |
+
+**Tool inclusion policy:** only tools that run entirely locally, inside Headroom-managed storage, with a stable CLI surface make it in. No cloud dependencies, no host profile mutations. See [`research/tool-compatibility-matrix.md`](research/tool-compatibility-matrix.md).
+
+## Interesting design decisions
+
+- **Zero host pollution.** Headroom owns its entire dependency tree. Uninstalling the app leaves your shell, your Python, and your PATH exactly as they were (except for the optional `rtk` PATH addition, which is reversible).
+- **Rust shell, Python brain.** The Tauri/Rust layer handles tray lifecycle, managed installs, client detection, and update delivery. The optimization work happens in Python, where the headroom ecosystem lives.
+- **Client config with rollback.** When Headroom edits a supported client's config (e.g. Claude Code settings), it writes a backup first. Disabling or uninstalling restores the original.
+- **Open source shell, private web.** The desktop app is MIT-licensed and open source. The marketing site and account backend live in a separate private repo — so contributors can build and run the full desktop experience without needing backend access.
 
 ## Project structure
 
-- `src/`: React/Tauri frontend
-- `src-tauri/`: Rust backend and Tauri configuration
-- `research/`: tool inclusion research artifacts
-- `docs/`: architecture notes
-
-The marketing/download website now lives in a separate private repo so the desktop app can stay open source without exposing the web app source.
-
-## Client setup
-
-- Headroom configures supported clients to route through its local optimization pipeline.
-- Headroom installs `rtk` into Headroom-managed storage, adds it to the user's shell `PATH`, and enables Claude Code bash auto-rewrite by default.
-- The current app UI focuses on setup, savings visibility, and runtime health.
-
-## Next implementation steps
-
-1. Replace the bootstrap placeholders with real managed Python downloads and package installs inside Headroom-managed storage.
-2. Implement the local proxy/gateway that routes supported client traffic through Headroom.
-3. Add config adapters that can safely modify supported client settings with rollback support.
-4. Add optional tools after the Headroom + RTK baseline is stable.
-5. Add persistent telemetry storage and real historical insights.
-
-## Dependency pinning policy
-
-- Headroom is pinned in-app to `headroom-ai[all]==0.5.17` from PyPI for stable releases.
-- For each new Headroom app release, validate compatibility against the latest released Headroom version before deciding whether to bump the pin.
+```
+src/              React + Tauri frontend (tray UI, onboarding, savings dashboard)
+src-tauri/        Rust backend
+  state.rs        Dashboard state and data shaping
+  tool_manager.rs Bootstrap, Python runtime, and tool installation
+  client_adapters.rs  Client detection and guided setup
+  insights.rs     Daily local recommendation engine
+research/         Tool vetting artifacts and compatibility matrix
+docs/             Architecture notes, release process
+```
 
 ## macOS release flow
 
-- Headroom is wired for outside-the-App-Store macOS updates using Tauri's official updater flow.
-- The app checks in the background, prompts before installing, and asks the user to restart after the update is installed.
-- Production builds default to the official GitHub Releases feed at `https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json`.
-- Release setup details live in [`docs/macos-release.md`](docs/macos-release.md).
+Updates ship outside the App Store via Tauri's built-in updater. The app polls GitHub Releases in the background, prompts before installing, and requests a restart to finish. Both local DMG builds and the GitHub Actions workflow run `./scripts/verify-release.sh` — a failing test blocks the build before anything is published.
+
+See [`docs/macos-release.md`](docs/macos-release.md) for the full release setup.
 
 ## Development
-
-Install dependencies and then run:
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-To enable the live pricing/auth flow in the desktop app, set these placeholders in a local `.env` file:
+For the live auth and pricing flow, create a `.env`:
 
 ```bash
 HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
@@ -69,29 +83,15 @@ VITE_HEADROOM_SALES_CONTACT_URL="mailto:hello@extraheadroom.com"
 VITE_HEADROOM_CONTACT_FORM_URL="https://extraheadroom.com/contact_request"
 ```
 
-Polar's official checkout-link API/docs:
-- [Create Checkout Link](https://polar.sh/docs/api-reference/checkout-links/create)
-- [Create Checkout Session](https://polar.sh/docs/api-reference/checkouts/create-session)
+Set the same keys as GitHub Actions repository variables for production DMG builds.
 
-For production macOS releases, set the same values as GitHub Actions repository variables so the packaged app points at the deployed web service:
-
-- `HEADROOM_ACCOUNT_API_BASE_URL`
-- `VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL`
-- `VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL`
-- `VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL`
-- `VITE_HEADROOM_SALES_CONTACT_URL`
-- `VITE_HEADROOM_CONTACT_FORM_URL`
-
-Run Rust tests with:
+Run tests:
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run test:all          # frontend + Rust
+cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 ```
 
-Run the full release gate with:
+## Dependency pinning
 
-```bash
-npm run test:all
-```
-
-Both the GitHub macOS release workflow and the local `npm run build:mac:dmg` path now run `./scripts/verify-release.sh` first, so a new release build will stop before publishing if either the frontend or desktop tests fail.
+`headroom-ai[all]==0.5.17` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.
