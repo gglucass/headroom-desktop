@@ -9,7 +9,7 @@
 ### Install
 
 1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. Download the `.dmg` file (e.g. `Headroom_0.2.7.dmg`)
+2. Download the `.dmg` file (e.g. `Headroom_0.2.9.dmg`)
 3. Open the DMG, drag **Headroom** to Applications
 4. Launch Headroom — it appears in your menu bar and walks you through setup
 
@@ -47,29 +47,25 @@ The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fet
 
 ## Compression benchmarks
 
-Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline.
+Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline, summarized from the current published benchmarks page.
 
-### Real workload results
+### Current benchmark summary
 
-| Scenario | Tokens before | Tokens after | Savings |
-|----------|--------------|--------------|---------|
-| Code search (100 results) | 17,765 | 1,408 | **92%** |
-| SRE incident debugging | 65,694 | 5,118 | **92%** |
-| GitHub issue triage | 54,174 | 14,761 | **73%** |
-| Multi-tool agent session | 15,662 | 6,100 | **76%** |
-| Codebase exploration | 78,502 | 41,254 | **47%** |
+| Benchmark | What it tests | Result |
+|-----------|---------------|--------|
+| Scrapinghub article extraction | Extract article bodies from 181 HTML pages while removing boilerplate | 0.919 F1, 98.2% recall, **94.9% compression** |
+| SmartCrusher JSON compression | Find a critical error in 100 production log entries after compression | 4/4 correct, **87.6% compression** |
+| QA accuracy preservation | Ask the same questions on raw HTML vs. extracted content | 0.87 F1 vs. 0.85 baseline, 62% exact match vs. 60% |
+| Multi-tool agent test | 4-tool agent investigating a memory leak with compressed tool output | 6,100 vs. 15,662 tokens sent, **76.3% compression**, same findings |
 
-### Accuracy benchmarks
+### Benchmark details
 
-| Benchmark | Dataset | Accuracy / Recall | Compression |
-|-----------|---------|-------------------|-------------|
-| HTML extraction | Scrapinghub (181 pages) | 98.2% recall, 0.919 F1 | 94.9% |
-| JSON compression | Production logs, needle-in-haystack | 4/4 correct (100%) | 87.6% |
-| QA accuracy (SQuAD v2 / HotpotQA) | Original HTML vs. extracted | +0.02 F1 delta | — |
-| Multi-tool agent | Agno, 4 tools, memory leak task | All findings correct | 76.3% |
-| CCR lossless retrieval | Needle-in-haystack | 100% | 77% |
-
-The QA accuracy result is worth calling out: compression *improved* F1 by +0.02 in that test, because stripping HTML noise helped the model focus on relevant content.
+| Benchmark | Setup | Accuracy | Compression |
+|-----------|-------|----------|-------------|
+| HTML extraction | Scrapinghub article extraction benchmark, 181 pages | 0.919 F1, 0.879 precision, 0.982 recall | 94.9% |
+| JSON compression | 100 production log entries, critical error at position 67 | 4/4 correct answers | 87.6% |
+| QA preservation | SQuAD v2 + HotpotQA on raw HTML vs. extracted content | +0.02 F1, +2% exact match vs. raw HTML | — |
+| Multi-tool agent test | Agno agent with 4 tools investigating a memory leak | Same findings as baseline | 76.3% |
 
 ### What compresses well vs. what doesn't
 
@@ -127,6 +123,7 @@ For the live auth and pricing flow, create a `.env`:
 
 ```bash
 HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
+HEADROOM_APTABASE_APP_KEY="REPLACE_WITH_APTABASE_APP_KEY"
 VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-pro-product"
 VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max5x-product"
 VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max20x-product"
@@ -145,4 +142,4 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 
 ## Dependency pinning
 
-`headroom-ai[all]==0.5.17` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.
+`headroom-ai[all]==0.5.18` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.

@@ -89,4 +89,15 @@ describe("app helpers", () => {
       ["max20x", "Upgrade to Max x20"],
     ]);
   });
+
+  it("shows the reduced monthly prices for paid individual plans", () => {
+    const result = getUpgradePlans("individual");
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["free", "$0"],
+      ["pro", "$2.50"],
+      ["max5x", "$12"],
+      ["max20x", "$25"],
+    ]);
+  });
 });

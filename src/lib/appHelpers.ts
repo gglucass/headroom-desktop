@@ -114,7 +114,7 @@ export function getUpgradePlans(
         id: "pro",
         name: "Pro",
         tagline: "Unlock unlimited savings",
-        price: "$5",
+        price: "$2.50",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Everything in Free, plus:",
         features: [
@@ -130,7 +130,7 @@ export function getUpgradePlans(
         id: "max5x",
         name: "Max x5",
         tagline: "For Claude Max x5 accounts",
-        price: "$25",
+        price: "$12",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [
@@ -146,7 +146,7 @@ export function getUpgradePlans(
         id: "max20x",
         name: "Max x20",
         tagline: "For Claude Max x20 accounts",
-        price: "$50",
+        price: "$25",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [

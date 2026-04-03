@@ -423,23 +423,20 @@ select {
   align-items: flex-start;
 }
 
-.install-progress__ascii {
-  margin: 0;
+.install-progress__bar-track {
   width: 100%;
-  display: block;
-  padding: 6px 8px;
-  border-radius: 10px;
-  background: rgba(36, 31, 29, 0.045);
-  border: 1px solid rgba(36, 31, 29, 0.12);
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
-  font-size: var(--text-xs);
-  letter-spacing: 0.01em;
-  color: #59514a;
-  user-select: none;
+  height: 6px;
+  background: rgba(36, 31, 29, 0.1);
+  border-radius: 100px;
   overflow: hidden;
-  text-overflow: clip;
-  white-space: nowrap;
-  text-align: center;
+}
+
+.install-progress__bar-fill {
+  height: 100%;
+  border-radius: 100px;
+  background: linear-gradient(90deg, #89bc32, #3ca67d);
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  min-width: 8px;
 }
 
 .install-progress__meta strong {
@@ -1280,7 +1277,15 @@ select {
 
 .pricing-auth-card__actions {
   display: flex;
+  flex-direction: column;
   gap: 10px;
+}
+
+.pricing-auth-card__resend {
+  margin: 0;
+  color: #655d57;
+  font-size: var(--text-sm);
+  text-align: center;
 }
 
 .pricing-auth-card__code-step {
@@ -2866,8 +2871,7 @@ html.window-hiding {
     grid-template-columns: 1fr;
   }
 
-  .pricing-status-card__invite,
-  .pricing-auth-card__actions {
+  .pricing-status-card__invite {
     flex-direction: column;
     align-items: stretch;
   }
