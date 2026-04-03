@@ -148,6 +148,9 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
         );
     }
 
+    let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+    *savings_state.0.lock().unwrap() = dashboard.session_estimated_savings_usd;
+
     dashboard
 }
 
@@ -943,6 +946,7 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            app.manage(TraySessionSavings(Mutex::new(0.0)));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
@@ -1701,7 +1705,8 @@ enum TrayRuntimeVisual {
 
 struct TrayRuntimeIcons {
     off: tauri::image::Image<'static>,
-    running: tauri::image::Image<'static>,
+    running_rgba: Vec<u8>,
+    running_dims: (u32, u32),
     booting_frames: Vec<tauri::image::Image<'static>>,
 }
 
@@ -1717,6 +1722,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     std::thread::spawn(move || {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
+        let mut last_displayed_dollars: Option<u32> = None;
 
         loop {
             let visual = {
@@ -1738,11 +1744,25 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             icons.booting_frames[frame_index % icons.booting_frames.len()].clone();
                         let _ = tray.set_icon(Some(icon));
                         frame_index = (frame_index + 1) % icons.booting_frames.len();
+                        last_non_booting = Some(TrayRuntimeVisual::Booting);
                     }
                     TrayRuntimeVisual::Running => {
-                        if last_non_booting != Some(TrayRuntimeVisual::Running) {
-                            let _ = tray.set_icon(Some(icons.running.clone()));
+                        let dollars = {
+                            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+                            let v = *savings_state.0.lock().unwrap();
+                            let d = v.floor() as u32;
+                            #[cfg(debug_assertions)]
+                            let d = d.max(128);
+                            d
+                        };
+                        let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
+                        let changed_dollars = last_displayed_dollars != Some(dollars);
+                        if changed_visual || changed_dollars {
+                            let (bw, bh) = icons.running_dims;
+                            let (new_rgba, new_w, new_h) = build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
+                            let _ = tray.set_icon(Some(tauri::image::Image::new_owned(new_rgba, new_w, new_h)));
                             last_non_booting = Some(TrayRuntimeVisual::Running);
+                            last_displayed_dollars = Some(dollars);
                         }
                     }
                     TrayRuntimeVisual::Off => {
@@ -1779,7 +1799,8 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
 
     Ok(TrayRuntimeIcons {
         off: tauri::image::Image::new_owned(off_rgba, width, height),
-        running: tauri::image::Image::new_owned(rgba, width, height),
+        running_rgba: rgba,
+        running_dims: (width, height),
         booting_frames: vec![
             tauri::image::Image::new_owned(booting_base, width, height),
             tauri::image::Image::new_owned(booting_90, width, height),
@@ -1857,6 +1878,107 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
             let _ = window.hide();
         }
         _ => {}
+    }
+}
+
+struct TraySessionSavings(Mutex<f64>);
+
+// Returns a (possibly wider) RGBA image with whole-dollar savings stacked
+// vertically to the right of the base icon. Returns the base unchanged when
+// dollars == 0.
+fn build_running_with_savings(
+    base: &[u8],
+    base_w: u32,
+    base_h: u32,
+    dollars: u32,
+) -> (Vec<u8>, u32, u32) {
+    if dollars == 0 {
+        return (base.to_vec(), base_w, base_h);
+    }
+
+    const CHAR_W: usize = 3;
+    const CHAR_H: usize = 5;
+    const H_MARGIN: usize = 2; // pixel gap between icon and text column
+
+    let text = if dollars >= 1000 {
+        format!("{}K", dollars / 1000)
+    } else {
+        dollars.to_string()
+    };
+    let chars: Vec<u8> = text.bytes().collect();
+    let n = chars.len();
+
+    // 2-digit values get a slightly larger gap since there's room.
+    let row_gap_px: usize = if n <= 2 { 2 } else { 1 };
+
+    // Largest dot size that fits: n*CHAR_H*dot + (n-1)*row_gap_px <= base_h
+    let available = (base_h as usize).saturating_sub(n.saturating_sub(1) * row_gap_px);
+    let max_dot = if n <= 2 { 3 } else { 2 };
+    let dot = (available / (n * CHAR_H)).clamp(1, max_dot);
+
+    let col_px_w = CHAR_W * dot + H_MARGIN;
+    let new_w = base_w + col_px_w as u32;
+    let h = base_h as usize;
+    let bw = base_w as usize;
+    let nw = new_w as usize;
+
+    let mut out = vec![0u8; nw * h * 4];
+
+    // Copy base icon into left portion.
+    for y in 0..h {
+        let src = y * bw * 4;
+        let dst = y * nw * 4;
+        out[dst..dst + bw * 4].copy_from_slice(&base[src..src + bw * 4]);
+    }
+
+    // Stack digits vertically in the right column, centred on the icon height.
+    let total_h = n * CHAR_H * dot + n.saturating_sub(1) * row_gap_px;
+    let y0 = h.saturating_sub(total_h) / 2;
+    let x0 = bw + H_MARGIN;
+
+    for (ci, &c) in chars.iter().enumerate() {
+        let glyph = pixel_char(c);
+        let cy = y0 + ci * (CHAR_H * dot + row_gap_px);
+        for (row, cols) in glyph.iter().enumerate() {
+            for (col, &on) in cols.iter().enumerate() {
+                if on == 0 {
+                    continue;
+                }
+                for dy in 0..dot {
+                    for dx in 0..dot {
+                        let px = x0 + col * dot + dx;
+                        let py = cy + row * dot + dy;
+                        if px < nw && py < h {
+                            let i = (py * nw + px) * 4;
+                            out[i] = 80;
+                            out[i + 1] = 210;
+                            out[i + 2] = 100;
+                            out[i + 3] = 240;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (out, new_w, base_h)
+}
+
+// Each glyph is [[col0, col1, col2]; 5 rows], top to bottom.
+fn pixel_char(c: u8) -> [[u8; 3]; 5] {
+    match c {
+        b'0' => [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
+        b'1' => [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
+        b'2' => [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
+        b'3' => [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        b'4' => [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
+        b'5' => [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
+        b'6' => [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
+        b'7' => [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
+        b'8' => [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
+        b'9' => [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        b'K' => [[1,0,1],[1,1,0],[1,0,0],[1,1,0],[1,0,1]],
+        _    => [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]],
     }
 }
 
