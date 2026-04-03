@@ -65,7 +65,7 @@ function makeStatus(overrides: Partial<HeadroomPricingStatus> = {}): HeadroomPri
     claude: {
       email: null,
       displayName: null,
-      planTier: "claude_free",
+      planTier: "free",
       hasExtraUsageEnabled: false,
       claudeAuthMethod: "oauth",
     },

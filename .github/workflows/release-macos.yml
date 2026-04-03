@@ -189,9 +189,8 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
-          releaseAssetNamePattern: '[name]_[version][ext]'
-          uploadUpdaterJson: true
-          uploadUpdaterSignatures: true
+          assetNamePattern: '[name]_[version][ext]'
+          includeUpdaterJson: true
           args: --target aarch64-apple-darwin
 
       - name: Rename DMG to friendly filename
