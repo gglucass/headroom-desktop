@@ -47,39 +47,25 @@ The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fet
 
 ## Compression benchmarks
 
-Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline.
+Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline, summarized from the current published benchmarks page.
 
-### Real workload results
+### Current benchmark summary
 
-| Scenario | Tokens before | Tokens after | Savings |
-|----------|--------------|--------------|---------|
-| Code search (100 results) | 17,765 | 1,408 | **92%** |
-| SRE incident debugging | 65,694 | 5,118 | **92%** |
-| GitHub issue triage | 54,174 | 14,761 | **73%** |
-| Codebase exploration | 78,502 | 41,254 | **47%** |
+| Benchmark | What it tests | Result |
+|-----------|---------------|--------|
+| Scrapinghub article extraction | Extract article bodies from 181 HTML pages while removing boilerplate | 0.919 F1, 98.2% recall, **94.9% compression** |
+| SmartCrusher JSON compression | Find a critical error in 100 production log entries after compression | 4/4 correct, **87.6% compression** |
+| QA accuracy preservation | Ask the same questions on raw HTML vs. extracted content | 0.87 F1 vs. 0.85 baseline, 62% exact match vs. 60% |
+| Multi-tool agent test | 4-tool agent investigating a memory leak with compressed tool output | 6,100 vs. 15,662 tokens sent, **76.3% compression**, same findings |
 
-These are individual examples from the headroom docs, not averages.
+### Benchmark details
 
-### Accuracy benchmarks
-
-Measured against standard open-source datasets (N=100 each):
-
-| Benchmark | Task | Accuracy | Compression |
-|-----------|------|----------|-------------|
-| SQuAD v2 | Reading comprehension | 97% | 19% |
-| BFCL | Tool / function calling | 97% | 32% |
-| GSM8K | Math reasoning | 87% | — |
-| TruthfulQA | Factual accuracy | 56% | — |
-
-The GSM8K and TruthfulQA rows have no compression applied — they test whether the pipeline degrades baseline model accuracy, not whether it compresses well.
-
-### Content-specific results
-
-| Benchmark | Notes | Accuracy | Compression |
+| Benchmark | Setup | Accuracy | Compression |
 |-----------|-------|----------|-------------|
-| HTML extraction (Scrapinghub, 181 pages) | 98.2% recall; precision/F1 measured against ground-truth article bodies | 0.919 F1 | 94.9% |
-| JSON compression (production logs) | 100 entries, critical error at position 67; task: find error + details | 4/4 correct | 87.6% |
-| QA preservation (SQuAD v2 + HotpotQA) | Compares answers from raw HTML vs. extracted content — baseline is noisy HTML, not clean text | +0.02 F1 vs. raw HTML | — |
+| HTML extraction | Scrapinghub article extraction benchmark, 181 pages | 0.919 F1, 0.879 precision, 0.982 recall | 94.9% |
+| JSON compression | 100 production log entries, critical error at position 67 | 4/4 correct answers | 87.6% |
+| QA preservation | SQuAD v2 + HotpotQA on raw HTML vs. extracted content | +0.02 F1, +2% exact match vs. raw HTML | — |
+| Multi-tool agent test | Agno agent with 4 tools investigating a memory leak | Same findings as baseline | 76.3% |
 
 ### What compresses well vs. what doesn't
 
@@ -156,4 +142,4 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 
 ## Dependency pinning
 
-`headroom-ai[all]==0.5.17` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.
+`headroom-ai[all]==0.5.18` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.
