@@ -1817,6 +1817,8 @@ struct HeadroomSavingsRollupPoint {
     timestamp: chrono::DateTime<Utc>,
     tokens_saved: u64,
     compression_savings_usd_delta: f64,
+    total_input_tokens_delta: u64,
+    total_input_cost_usd_delta: f64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1835,8 +1837,8 @@ impl HeadroomSavingsHistoryResponse {
                 date: local_day_key(point.timestamp.with_timezone(&Local)),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
-                actual_cost_usd: 0.0,
-                total_tokens_sent: 0,
+                actual_cost_usd: point.total_input_cost_usd_delta,
+                total_tokens_sent: point.total_input_tokens_delta,
             })
             .collect()
     }
@@ -1848,8 +1850,8 @@ impl HeadroomSavingsHistoryResponse {
                 hour: local_hour_key(point.timestamp.with_timezone(&Local)),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
-                actual_cost_usd: 0.0,
-                total_tokens_sent: 0,
+                actual_cost_usd: point.total_input_cost_usd_delta,
+                total_tokens_sent: point.total_input_tokens_delta,
             })
             .collect()
     }
@@ -2186,6 +2188,15 @@ fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoin
             .unwrap_or_default(),
         compression_savings_usd_delta: map
             .get("compression_savings_usd_delta")
+            .and_then(parse_f64_value)
+            .unwrap_or_default()
+            .max(0.0),
+        total_input_tokens_delta: map
+            .get("total_input_tokens_delta")
+            .and_then(parse_u64_value)
+            .unwrap_or_default(),
+        total_input_cost_usd_delta: map
+            .get("total_input_cost_usd_delta")
             .and_then(parse_f64_value)
             .unwrap_or_default()
             .max(0.0),
