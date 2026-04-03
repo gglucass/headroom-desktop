@@ -202,11 +202,13 @@ jobs:
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
           TAG="v${VERSION}"
-          OLD_NAME="Headroom_${VERSION}_aarch64.dmg"
           NEW_NAME="Headroom_${VERSION}_mac.dmg"
 
-          gh release download "$TAG" --pattern "$OLD_NAME" --dir "$RUNNER_TEMP"
-          gh release upload "$TAG" "$RUNNER_TEMP/${OLD_NAME}#${NEW_NAME}" --clobber
+          gh release download "$TAG" --pattern "*.dmg" --dir "$RUNNER_TEMP"
+          DMG_PATH=$(ls "$RUNNER_TEMP"/*.dmg | head -1)
+          OLD_NAME=$(basename "$DMG_PATH")
+
+          gh release upload "$TAG" "${DMG_PATH}#${NEW_NAME}" --clobber
 
           ASSET_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$OLD_NAME\") | .id")
           if [[ -n "$ASSET_ID" ]]; then
