@@ -48,6 +48,7 @@ import {
   shouldNotifyAboutAvailableAppUpdate,
   type AppUpdateStatePatch,
 } from "./lib/appUpdate";
+import { maybeFireTrialNotifications } from "./lib/trialNotifications";
 import {
   describeInvokeError,
   getNextLowerUpgradePlanId,
@@ -1654,6 +1655,7 @@ export default function App() {
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
       setPricingStatus(status);
+      void maybeFireTrialNotifications(status);
       setPricingError(null);
     } catch (error) {
       setPricingError(

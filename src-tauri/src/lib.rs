@@ -300,6 +300,34 @@ fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn show_notification(title: String, body: String) -> Result<(), String> {
+    show_notification_impl(&title, &body)
+}
+
+#[cfg(target_os = "macos")]
+fn show_notification_impl(title: &str, body: &str) -> Result<(), String> {
+    let title_json = serde_json::to_string(title).map_err(|e| e.to_string())?;
+    let body_json = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let script = format!(
+        "const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification({body_json}, {{ withTitle: {title_json} }});"
+    );
+    let status = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &script])
+        .status()
+        .map_err(|e| format!("Could not show notification: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Notification helper exited with {status}."))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_notification_impl(_title: &str, _body: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
 fn get_research_candidates() -> Vec<ResearchCandidate> {
     research::candidate_matrix()
 }
@@ -954,6 +982,7 @@ pub fn run() {
             install_app_update,
             restart_app,
             show_app_update_notification,
+            show_notification,
             get_research_candidates,
             bootstrap_runtime,
             start_bootstrap,

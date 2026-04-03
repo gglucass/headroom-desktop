@@ -193,3 +193,23 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           args: --target aarch64-apple-darwin
+
+      - name: Rename DMG to friendly filename
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+          OLD_NAME="Headroom_${VERSION}_aarch64.dmg"
+          NEW_NAME="Headroom_${VERSION}_mac.dmg"
+
+          gh release download "$TAG" --pattern "$OLD_NAME" --dir "$RUNNER_TEMP"
+          gh release upload "$TAG" "$RUNNER_TEMP/${OLD_NAME}#${NEW_NAME}" --clobber
+
+          ASSET_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$OLD_NAME\") | .id")
+          if [[ -n "$ASSET_ID" ]]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          fi
