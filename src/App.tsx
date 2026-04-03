@@ -57,6 +57,12 @@ import {
   type UpgradePlanId
 } from "./lib/appHelpers";
 import {
+  bootstrapFailureSignature,
+  buildBootstrapFailureReport,
+  buildBootstrapInvokeFailureReport,
+  reportBootstrapFailure
+} from "./lib/bootstrapSentry";
+import {
   aggregateClientConnectors,
   addDays,
   addMonths,
@@ -613,6 +619,7 @@ export default function App() {
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
   const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
   const appSemver = appUpdateConfig?.currentVersion ?? packageJson.version;
+  const bootstrapFailureSignatureRef = useRef("");
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
   const mainWindowLastSeenDayRef = useRef(formatDayKey(new Date()));
   const appUpdateKnownVersionRef = useRef<string | null>(null);
@@ -858,6 +865,12 @@ export default function App() {
           setBootstrapProgress(progress);
 
           if (progress.failed) {
+            const failureReport = buildBootstrapFailureReport(progress);
+            const failureSignature = bootstrapFailureSignature(failureReport);
+            if (bootstrapFailureSignatureRef.current !== failureSignature) {
+              bootstrapFailureSignatureRef.current = failureSignature;
+              reportBootstrapFailure(failureReport);
+            }
             setBootstrapError(progress.message);
             setBootstrapping(false);
             completionHandled = true;
@@ -1361,6 +1374,7 @@ export default function App() {
   }, [connectorPhase]);
 
   async function handleBootstrap() {
+    bootstrapFailureSignatureRef.current = "";
     setBootstrapError(null);
     setBootstrapProgress({
       running: true,
@@ -1374,8 +1388,26 @@ export default function App() {
     setBootstrapping(true);
     try {
       await invoke("start_bootstrap");
+    } catch (error) {
+      const failureReport = buildBootstrapInvokeFailureReport(error);
+      const failureSignature = bootstrapFailureSignature(failureReport);
+      if (bootstrapFailureSignatureRef.current !== failureSignature) {
+        bootstrapFailureSignatureRef.current = failureSignature;
+        reportBootstrapFailure(failureReport, error);
+      }
+      setBootstrapError(failureReport.message);
+      setBootstrapProgress({
+        running: false,
+        complete: false,
+        failed: true,
+        currentStep: failureReport.currentStep,
+        message: failureReport.message,
+        currentStepEtaSeconds: failureReport.currentStepEtaSeconds,
+        overallPercent: failureReport.overallPercent
+      });
+      setBootstrapping(false);
     } finally {
-      // completion/failure is managed by progress polling
+      // Most completion paths are still managed by progress polling.
     }
   }
 

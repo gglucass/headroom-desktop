@@ -32,6 +32,10 @@ const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
 const PYTHON_SHA256_MACOS_X86_64: &str =
     "f76a921e71e9c8954cccd00f176b7083041527b3b4223670d05bbb2f51209d3f";
+const PYTHON_SHA256_LINUX_X86_64: &str =
+    "c74addcd1b033a6e4d60ead3ab47fcc995569027e01d3061c4a934f363c4a0cf";
+const PYTHON_SHA256_LINUX_AARCH64: &str =
+    "d2a6c0d4ceea088f635b309a59d5d700a256656423225f96ddfb71d532adb1aa";
 
 #[derive(Debug, Clone)]
 pub struct BootstrapStepUpdate {
@@ -1041,6 +1045,20 @@ fn python_distribution_artifact() -> Result<DownloadArtifact> {
                 PYTHON_STANDALONE_RELEASE
             ),
             sha256: Some(PYTHON_SHA256_MACOS_X86_64),
+        }),
+        ("linux", "x86_64") => Ok(DownloadArtifact {
+            url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{}/cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+                PYTHON_STANDALONE_RELEASE
+            ),
+            sha256: Some(PYTHON_SHA256_LINUX_X86_64),
+        }),
+        ("linux", "aarch64") => Ok(DownloadArtifact {
+            url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{}/cpython-3.12.12+20251014-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+                PYTHON_STANDALONE_RELEASE
+            ),
+            sha256: Some(PYTHON_SHA256_LINUX_AARCH64),
         }),
         (os, arch) => bail!("unsupported Headroom managed Python target: {os}/{arch}"),
     }

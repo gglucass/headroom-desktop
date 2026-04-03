@@ -39,6 +39,7 @@ use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
@@ -53,6 +54,21 @@ const MAIN_WINDOW_HEIGHT: u32 = 560;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 
 type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitSource {
+    SettingsButton,
+    TrayMenu,
+}
+
+impl QuitSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SettingsButton => "settings_button",
+            Self::TrayMenu => "tray_menu",
+        }
+    }
+}
 
 trait InstallableAppUpdate: Send {
     fn metadata(&self) -> AvailableAppUpdate;
@@ -150,12 +166,18 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: 0,
             configuration_error: None,
         },
-        Err(err) => AppUpdateConfiguration {
-            enabled: false,
-            current_version: app.package_info().version.to_string(),
-            endpoint_count: 0,
-            configuration_error: Some(err),
-        },
+        Err(ref err) => {
+            sentry::capture_message(
+                &format!("app update configuration error: {err}"),
+                sentry::Level::Error,
+            );
+            AppUpdateConfiguration {
+                enabled: false,
+                current_version: app.package_info().version.to_string(),
+                endpoint_count: 0,
+                configuration_error: Some(err.clone()),
+            }
+        }
     }
 }
 
@@ -293,6 +315,10 @@ fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, Strin
         &state.tool_manager.managed_python(),
     ) {
         eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
+        sentry::capture_message(
+            &format!("RTK integrations failed after bootstrap_runtime: {err}"),
+            sentry::Level::Warning,
+        );
     }
     state
         .ensure_headroom_running()
@@ -341,6 +367,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             &state.tool_manager.managed_python(),
         ) {
             eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
+            sentry::capture_message(
+                &format!("RTK integrations failed after start_bootstrap thread: {err}"),
+                sentry::Level::Warning,
+            );
         }
 
         state.update_bootstrap_step(crate::tool_manager::BootstrapStepUpdate {
@@ -656,18 +686,33 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
 
 #[tauri::command]
 fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupResult, String> {
-    let result = client_adapters::apply_client_setup(&client_id).map_err(|err| err.to_string())?;
-    analytics::track_event(
-        &app,
-        "client_setup_applied",
-        Some(json!({
-            "client_id": result.client_id.clone(),
-            "already_configured": result.already_configured,
-            "verified": result.verification.verified,
-            "proxy_reachable": result.verification.proxy_reachable
-        })),
-    );
-    Ok(result)
+    match client_adapters::apply_client_setup(&client_id) {
+        Ok(result) => {
+            analytics::track_event(
+                &app,
+                "client_setup_applied",
+                Some(json!({
+                    "client_id": result.client_id.clone(),
+                    "already_configured": result.already_configured,
+                    "verified": result.verification.verified,
+                    "proxy_reachable": result.verification.proxy_reachable
+                })),
+            );
+            Ok(result)
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            if !msg.starts_with("Automatic setup is not supported yet")
+                && !msg.starts_with("Codex integration has been disabled")
+            {
+                sentry::capture_message(
+                    &format!("client setup failed for {client_id}: {msg}"),
+                    sentry::Level::Error,
+                );
+            }
+            Err(msg)
+        }
+    }
 }
 
 #[tauri::command]
@@ -801,18 +846,47 @@ fn hide_launcher_animated(app: AppHandle) {
 
 #[tauri::command]
 fn quit_headroom(app: AppHandle) {
-    let state: tauri::State<'_, AppState> = app.state();
-    state.stop_headroom();
-    let _ = client_adapters::clear_client_setups();
-    analytics::shutdown(&app);
-    app.exit(0);
+    exit_headroom(&app, QuitSource::SettingsButton);
 }
 
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
 
+fn exit_headroom(app: &AppHandle, source: QuitSource) {
+    let runtime_paused = {
+        let state: tauri::State<'_, AppState> = app.state();
+        let runtime_paused = state.runtime_is_paused();
+        state.stop_headroom();
+        let _ = client_adapters::clear_client_setups();
+        runtime_paused
+    };
+
+    analytics::track_event(
+        app,
+        "app_quit_requested",
+        Some(app_quit_requested_properties(source, runtime_paused)),
+    );
+    analytics::shutdown(app);
+    app.exit(0);
+}
+
+fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
+    json!({
+        "source": source.label(),
+        "runtime_paused": runtime_paused,
+    })
+}
+
 pub fn run() {
+    let _sentry = sentry::init((
+        SENTRY_DSN.unwrap_or(""),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+
     let state = AppState::new().expect("failed to create app state");
 
     let builder = tauri::Builder::default()
@@ -1445,6 +1519,27 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 } else {
                     output_tail.join("\n")
                 };
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_tag("flow", "headroom_learn");
+                        scope.set_context(
+                            "learn",
+                            sentry::protocol::Context::Other(
+                                [
+                                    ("exit_status".into(), output.status.to_string().into()),
+                                    ("output_tail".into(), fail_tail.clone().into()),
+                                ]
+                                .into(),
+                            ),
+                        );
+                    },
+                    || {
+                        sentry::capture_message(
+                            "headroom learn exited with non-zero status",
+                            sentry::Level::Error,
+                        )
+                    },
+                );
                 (
                     format!("headroom learn failed for {project_name}."),
                     false,
@@ -1459,15 +1554,21 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 )
             }
         }
-        Err(err) => (
-            format!("headroom learn failed for {project_name}."),
-            false,
-            Some(format!("Could not start headroom learn: {err}")),
-            Vec::new(),
-            String::new(),
-            String::new(),
-            "spawn_error".to_string(),
-        ),
+        Err(err) => {
+            sentry::capture_message(
+                &format!("headroom learn spawn failed: {err}"),
+                sentry::Level::Error,
+            );
+            (
+                format!("headroom learn failed for {project_name}."),
+                false,
+                Some(format!("Could not start headroom learn: {err}")),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                "spawn_error".to_string(),
+            )
+        }
     };
 
     let log_path = state.tool_manager.headroom_learn_log_path(project_path);
@@ -1542,10 +1643,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "quit" => {
-                let state: tauri::State<'_, AppState> = app.state();
-                state.stop_headroom();
-                let _ = client_adapters::clear_client_setups();
-                app.exit(0);
+                exit_headroom(app, QuitSource::TrayMenu);
             }
             "pause" => {
                 let state: tauri::State<'_, AppState> = app.state();
@@ -1767,6 +1865,10 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     }
     if let Err(err) = state.ensure_headroom_running() {
         eprintln!("failed to ensure headroom runtime for tray: {err}");
+        sentry::capture_message(
+            &format!("ensure_runtime_ready_for_tray failed: {err}"),
+            sentry::Level::Error,
+        );
     }
 }
 
@@ -1951,12 +2053,13 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_notification_body, build_release_updater_config, compute_tray_window_position,
-        install_pending_update, lifetime_token_milestone_kind, parse_updater_endpoint_list,
-        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect,
-        DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
+        compute_tray_window_position, install_pending_update, lifetime_token_milestone_kind,
+        parse_updater_endpoint_list, physical_rect_from_rect, store_checked_update,
+        AvailableAppUpdate, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
+        PhysicalRect, QuitSource, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
+    use serde_json::json;
     use std::sync::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
@@ -1982,6 +2085,24 @@ mod tests {
             published_at: Some("2026-04-02T12:00:00Z".into()),
             notes: Some("Bug fixes.".into()),
         }
+    }
+
+    #[test]
+    fn app_quit_requested_properties_include_source_and_runtime_state() {
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::SettingsButton, false),
+            json!({
+                "source": "settings_button",
+                "runtime_paused": false,
+            })
+        );
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::TrayMenu, true),
+            json!({
+                "source": "tray_menu",
+                "runtime_paused": true,
+            })
+        );
     }
 
     #[test]

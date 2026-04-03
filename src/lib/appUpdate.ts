@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import * as Sentry from "@sentry/react";
 
 import { describeInvokeError } from "./appHelpers";
 import type { AppUpdateConfiguration, AvailableAppUpdate } from "./types";
@@ -75,11 +76,13 @@ export async function runAppUpdateCheck({
       ...(background ? {} : { statusCopy: "Up to date." }),
     };
   } catch (error) {
-    return background
-      ? {}
-      : {
-          statusCopy: describeInvokeError(error, "Could not check for updates."),
-        };
+    if (background) {
+      Sentry.captureException(error, { tags: { flow: "app_update_check" } });
+      return {};
+    }
+    return {
+      statusCopy: describeInvokeError(error, "Could not check for updates."),
+    };
   }
 }
 
@@ -137,6 +140,7 @@ export async function runAppUpdateInstall({
       statusCopy: `Headroom ${availableUpdate.version} is installed and ready to restart.`,
     };
   } catch (error) {
+    Sentry.captureException(error, { tags: { flow: "app_update_install" } });
     return {
       statusCopy: describeInvokeError(error, "Could not install the update."),
     };

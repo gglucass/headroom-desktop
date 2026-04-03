@@ -1,0 +1,165 @@
+name: Release Linux App
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - package.json
+      - src-tauri/tauri.conf.json
+  workflow_dispatch:
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Validate release version state
+        id: release_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json', 'utf8')).version")"
+          expected_tag="v${package_version}"
+          should_release=true
+
+          if [[ "$package_version" != "$tauri_version" ]]; then
+            echo "package.json version ($package_version) does not match src-tauri/tauri.conf.json version ($tauri_version)." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            before_sha="${{ github.event.before }}"
+            if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
+              previous_package_version="$(
+                git show "${before_sha}:package.json" \
+                  | node -e "const fs = require('fs'); console.log(JSON.parse(fs.readFileSync(0, 'utf8')).version);"
+              )"
+              previous_tauri_version="$(
+                git show "${before_sha}:src-tauri/tauri.conf.json" \
+                  | node -e "const fs = require('fs'); console.log(JSON.parse(fs.readFileSync(0, 'utf8')).version);"
+              )"
+
+              if [[ "${previous_package_version}" == "${package_version}" ]] && [[ "${previous_tauri_version}" == "${tauri_version}" ]]; then
+                should_release=false
+                echo "No app version bump detected relative to ${before_sha}; skipping release."
+              fi
+            fi
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "$expected_tag" ]]; then
+              echo "Git tag ${GITHUB_REF_NAME} does not match app version ${expected_tag}." >&2
+              exit 1
+            fi
+          fi
+
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release configuration
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            HEADROOM_ACCOUNT_API_BASE_URL
+            HEADROOM_APTABASE_APP_KEY
+            HEADROOM_UPDATER_PUBLIC_KEY
+            TAURI_SIGNING_PRIVATE_KEY
+            TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          )
+
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret or variable: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install frontend dependencies
+        if: steps.release_guard.outputs.should_release == 'true'
+        run: npm ci
+
+      - name: Run release checks
+        if: steps.release_guard.outputs.should_release == 'true'
+        run: ./scripts/verify-release.sh
+
+      - name: Build and publish Tauri release
+        if: steps.release_guard.outputs.should_release == 'true'
+        uses: tauri-apps/tauri-action@action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEADROOM_UPDATER_ENDPOINTS: ${{ env.HEADROOM_UPDATER_ENDPOINTS }}
+          HEADROOM_UPDATER_PUBLIC_KEY: ${{ env.HEADROOM_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tagName: v__VERSION__
+          releaseName: Headroom v__VERSION__
+          releaseBody: |
+            Linux release artifacts for Headroom.
+          generateReleaseNotes: true
+          releaseDraft: false
+          prerelease: false
+          releaseAssetNamePattern: '[name]_[version][ext]'
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          args: --target x86_64-unknown-linux-gnu
