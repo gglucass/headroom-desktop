@@ -10,19 +10,18 @@ import {
 } from "./bootstrapSentry";
 import type { BootstrapProgress } from "./types";
 
-vi.mock("@sentry/react", () => {
-  const captureException = vi.fn();
-  const withScope = vi.fn((cb: (scope: unknown) => void) => {
-    cb({
-      setLevel: vi.fn(),
-      setTag: vi.fn(),
-      setFingerprint: vi.fn(),
-      setContext: vi.fn(),
-      setExtra: vi.fn(),
-    });
-  });
-  return { captureException, withScope };
-});
+const mockScope = vi.hoisted(() => ({
+  setLevel: vi.fn(),
+  setTag: vi.fn(),
+  setFingerprint: vi.fn(),
+  setContext: vi.fn(),
+  setExtra: vi.fn(),
+}));
+
+vi.mock("@sentry/react", () => ({
+  captureException: vi.fn(),
+  withScope: vi.fn((cb: (scope: unknown) => void) => cb(mockScope)),
+}));
 
 function makeFailedProgress(message: string): BootstrapProgress {
   return {
@@ -99,8 +98,7 @@ describe("bootstrap sentry helpers", () => {
 
 describe("reportBootstrapFailure", () => {
   beforeEach(() => {
-    vi.mocked(Sentry.captureException).mockClear();
-    vi.mocked(Sentry.withScope).mockClear();
+    vi.clearAllMocks();
   });
 
   it("calls withScope and captureException", () => {
@@ -120,37 +118,17 @@ describe("reportBootstrapFailure", () => {
 
   it("includes cause as extra when provided", () => {
     const report = buildBootstrapFailureReport(makeFailedProgress("Installation failed: disk full"));
-    const scope = {
-      setLevel: vi.fn(),
-      setTag: vi.fn(),
-      setFingerprint: vi.fn(),
-      setContext: vi.fn(),
-      setExtra: vi.fn(),
-    };
-    vi.mocked(Sentry.withScope).mockImplementationOnce((cb) => {
-      cb(scope);
-    });
 
     reportBootstrapFailure(report, new Error("underlying cause"));
 
-    expect(scope.setExtra).toHaveBeenCalledWith("cause", expect.any(String));
+    expect(mockScope.setExtra).toHaveBeenCalledWith("cause", expect.any(String));
   });
 
   it("does not set extra when cause is not provided", () => {
     const report = buildBootstrapFailureReport(makeFailedProgress("Installation failed: disk full"));
-    const scope = {
-      setLevel: vi.fn(),
-      setTag: vi.fn(),
-      setFingerprint: vi.fn(),
-      setContext: vi.fn(),
-      setExtra: vi.fn(),
-    };
-    vi.mocked(Sentry.withScope).mockImplementationOnce((cb) => {
-      cb(scope);
-    });
 
     reportBootstrapFailure(report);
 
-    expect(scope.setExtra).not.toHaveBeenCalled();
+    expect(mockScope.setExtra).not.toHaveBeenCalled();
   });
 });
