@@ -217,6 +217,10 @@ impl AppState {
     }
 
     pub fn dashboard(&self) -> DashboardState {
+        self.dashboard_with_lifetime_token_milestones().0
+    }
+
+    pub fn dashboard_with_lifetime_token_milestones(&self) -> (DashboardState, Vec<u64>) {
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
         let recent_usage = self
@@ -239,14 +243,16 @@ impl AppState {
             } else {
                 (SavingsTotalsSnapshot::default(), Vec::new(), Vec::new())
             };
+        let mut lifetime_token_milestones = Vec::new();
 
         if let Some(stats) = self.cached_headroom_stats() {
-            if let Some((updated, updated_daily)) = self.record_savings_snapshot(&stats) {
+            if let Some((updated, updated_daily, updated_hourly, milestones)) =
+                self.record_savings_snapshot(&stats)
+            {
                 snapshot = updated;
                 daily_savings = updated_daily;
-                if let Ok(tracker) = self.savings_tracker.lock() {
-                    hourly_savings = tracker.hourly_savings();
-                }
+                hourly_savings = updated_hourly;
+                lifetime_token_milestones = milestones;
             } else {
                 if let Some(requests) = stats.session_requests {
                     snapshot.session_requests = requests;
@@ -263,25 +269,28 @@ impl AppState {
             }
         }
 
-        DashboardState {
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            launch_experience: self.launch_profile.launch_experience.clone(),
-            bootstrap_complete: self.tool_manager.python_runtime_installed(),
-            python_runtime_installed: self.tool_manager.python_runtime_installed(),
-            lifetime_requests: snapshot.lifetime_requests,
-            lifetime_estimated_savings_usd: snapshot.lifetime_estimated_savings_usd,
-            lifetime_estimated_tokens_saved: snapshot.lifetime_estimated_tokens_saved,
-            session_requests: snapshot.session_requests,
-            session_estimated_savings_usd: snapshot.session_estimated_savings_usd,
-            session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
-            session_savings_pct: snapshot.session_savings_pct,
-            daily_savings,
-            hourly_savings,
-            tools,
-            clients,
-            recent_usage,
-            insights,
-        }
+        (
+            DashboardState {
+                app_version: env!("CARGO_PKG_VERSION").into(),
+                launch_experience: self.launch_profile.launch_experience.clone(),
+                bootstrap_complete: self.tool_manager.python_runtime_installed(),
+                python_runtime_installed: self.tool_manager.python_runtime_installed(),
+                lifetime_requests: snapshot.lifetime_requests,
+                lifetime_estimated_savings_usd: snapshot.lifetime_estimated_savings_usd,
+                lifetime_estimated_tokens_saved: snapshot.lifetime_estimated_tokens_saved,
+                session_requests: snapshot.session_requests,
+                session_estimated_savings_usd: snapshot.session_estimated_savings_usd,
+                session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
+                session_savings_pct: snapshot.session_savings_pct,
+                daily_savings,
+                hourly_savings,
+                tools,
+                clients,
+                recent_usage,
+                insights,
+            },
+            lifetime_token_milestones,
+        )
     }
 
     pub fn list_claude_code_projects(&self) -> Result<Vec<ClaudeCodeProject>> {
@@ -487,11 +496,23 @@ impl AppState {
     fn record_savings_snapshot(
         &self,
         stats: &HeadroomDashboardStats,
-    ) -> Option<(SavingsTotalsSnapshot, Vec<DailySavingsPoint>)> {
+    ) -> Option<(
+        SavingsTotalsSnapshot,
+        Vec<DailySavingsPoint>,
+        Vec<HourlySavingsPoint>,
+        Vec<u64>,
+    )> {
         if let Ok(mut tracker) = self.savings_tracker.lock() {
             let snapshot = tracker.observe(stats)?;
             let daily_savings = tracker.daily_savings();
-            return Some((snapshot, daily_savings));
+            let hourly_savings = tracker.hourly_savings();
+            let lifetime_token_milestones = tracker.take_pending_lifetime_token_milestones();
+            return Some((
+                snapshot,
+                daily_savings,
+                hourly_savings,
+                lifetime_token_milestones,
+            ));
         }
         None
     }
@@ -1021,6 +1042,9 @@ struct SavingsTotalsSnapshot {
     lifetime_estimated_tokens_saved: u64,
 }
 
+const FIRST_LIFETIME_TOKEN_MILESTONES: [u64; 2] = [1_000_000, 5_000_000];
+const REPEATING_LIFETIME_TOKEN_MILESTONE_STEP: u64 = 10_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct SavingsRecord {
@@ -1110,6 +1134,7 @@ struct SavingsTracker {
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
+    pending_lifetime_token_milestones: Vec<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -1162,6 +1187,7 @@ impl SavingsTracker {
             hourly_savings: persisted_state
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
+            pending_lifetime_token_milestones: Vec::new(),
             last_written_at: None,
         };
         tracker.persist_state()?;
@@ -1236,6 +1262,10 @@ impl SavingsTracker {
                 total_tokens_sent: bucket.total_tokens_sent,
             })
             .collect()
+    }
+
+    fn take_pending_lifetime_token_milestones(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_lifetime_token_milestones)
     }
 
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
@@ -1349,6 +1379,7 @@ impl SavingsTracker {
             || delta_usd > 0.000_001
             || delta_actual_cost_usd > 0.000_001
             || session_buckets_changed;
+        let previous_lifetime_tokens_saved = self.lifetime_estimated_tokens_saved;
         if delta_requests > 0 || delta_tokens > 0 || delta_usd > 0.0 {
             self.lifetime_requests = self.lifetime_requests.saturating_add(delta_requests);
             self.lifetime_estimated_savings_usd += delta_usd;
@@ -1356,6 +1387,11 @@ impl SavingsTracker {
                 .lifetime_estimated_tokens_saved
                 .saturating_add(delta_tokens);
         }
+        self.pending_lifetime_token_milestones
+            .extend(lifetime_token_milestones_crossed(
+                previous_lifetime_tokens_saved,
+                self.lifetime_estimated_tokens_saved,
+            ));
 
         let baseline_hourly_buckets = if (first_observation || reset_detected)
             && (session_requests > 0
@@ -1648,6 +1684,25 @@ impl SavingsTracker {
             .with_context(|| format!("writing {}", self.state_path.display()))?;
         Ok(())
     }
+}
+
+fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) -> Vec<u64> {
+    if current_total <= previous_total {
+        return Vec::new();
+    }
+
+    let mut milestones = FIRST_LIFETIME_TOKEN_MILESTONES
+        .into_iter()
+        .filter(|threshold| previous_total < *threshold && current_total >= *threshold)
+        .collect::<Vec<_>>();
+
+    let first_repeating_index = previous_total / REPEATING_LIFETIME_TOKEN_MILESTONE_STEP + 1;
+    let last_repeating_index = current_total / REPEATING_LIFETIME_TOKEN_MILESTONE_STEP;
+    for index in first_repeating_index..=last_repeating_index {
+        milestones.push(index.saturating_mul(REPEATING_LIFETIME_TOKEN_MILESTONE_STEP));
+    }
+
+    milestones
 }
 
 fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsState>> {
@@ -2451,9 +2506,9 @@ mod tests {
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
     use super::{
-        parse_headroom_stats_from_json, AppState, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
-        SavingsObservation, SavingsTracker,
+        lifetime_token_milestones_crossed, parse_headroom_stats_from_json, AppState,
+        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
 
     fn make_tracker() -> SavingsTracker {
@@ -2476,6 +2531,7 @@ mod tests {
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
+            pending_lifetime_token_milestones: Vec::new(),
             last_written_at: None,
         }
     }
@@ -2514,6 +2570,58 @@ mod tests {
             .any(|insight| !insight.title.is_empty()));
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn lifetime_token_milestones_include_firsts_and_repeating_tens() {
+        assert_eq!(
+            lifetime_token_milestones_crossed(0, 5_000_000),
+            vec![1_000_000, 5_000_000]
+        );
+        assert_eq!(
+            lifetime_token_milestones_crossed(9_500_000, 21_000_000),
+            vec![10_000_000, 20_000_000]
+        );
+    }
+
+    #[test]
+    fn tracker_queues_new_lifetime_token_milestones_once() {
+        let mut tracker = make_tracker();
+
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(1),
+                session_estimated_savings_usd: Some(1.0),
+                session_estimated_tokens_saved: Some(12_000_000),
+                session_savings_pct: Some(50.0),
+                session_actual_cost_usd: Some(0.5),
+                session_total_tokens_sent: Some(12_000_000),
+                savings_history: Vec::new(),
+            })
+            .expect("snapshot");
+
+        assert_eq!(
+            tracker.take_pending_lifetime_token_milestones(),
+            vec![1_000_000, 5_000_000, 10_000_000]
+        );
+        assert!(tracker.take_pending_lifetime_token_milestones().is_empty());
+
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(2),
+                session_estimated_savings_usd: Some(2.0),
+                session_estimated_tokens_saved: Some(21_000_000),
+                session_savings_pct: Some(50.0),
+                session_actual_cost_usd: Some(1.0),
+                session_total_tokens_sent: Some(21_000_000),
+                savings_history: Vec::new(),
+            })
+            .expect("snapshot");
+
+        assert_eq!(
+            tracker.take_pending_lifetime_token_milestones(),
+            vec![20_000_000]
+        );
     }
 
     #[test]

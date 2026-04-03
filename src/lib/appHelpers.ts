@@ -130,7 +130,7 @@ export function getUpgradePlans(
         id: "max5x",
         name: "Max x5",
         tagline: "For Claude Max x5 accounts",
-        price: "$12.50",
+        price: "$12",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [

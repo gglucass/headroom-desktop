@@ -10,11 +10,11 @@ mod state;
 mod storage;
 mod tool_manager;
 
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Mutex;
-use std::{future::Future};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -113,8 +113,26 @@ struct AvailableAppUpdate {
 }
 
 #[tauri::command]
-fn get_dashboard_state(state: State<'_, AppState>) -> DashboardState {
-    state.dashboard()
+fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardState {
+    let (dashboard, lifetime_token_milestones) = state.dashboard_with_lifetime_token_milestones();
+
+    for milestone_tokens_saved in lifetime_token_milestones {
+        analytics::track_event(
+            &app,
+            "lifetime_tokens_saved_milestone_reached",
+            Some(json!({
+                "milestone_tokens_saved": milestone_tokens_saved,
+                "milestone_millions": milestone_tokens_saved / 1_000_000,
+                "milestone_kind": lifetime_token_milestone_kind(milestone_tokens_saved),
+                "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
+                "lifetime_requests": dashboard.lifetime_requests,
+                "launch_count": state.launch_count(),
+                "launch_experience": state.launch_experience_label()
+            })),
+        );
+    }
+
+    dashboard
 }
 
 #[tauri::command]
@@ -907,6 +925,15 @@ fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
         HeadroomSubscriptionTier::Pro => "pro",
         HeadroomSubscriptionTier::Max5x => "max5x",
         HeadroomSubscriptionTier::Max20x => "max20x",
+    }
+}
+
+fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
+    match milestone_tokens_saved {
+        1_000_000 => "first_1m",
+        5_000_000 => "first_5m",
+        10_000_000 => "first_10m",
+        _ => "repeating_10m",
     }
 }
 
@@ -1925,10 +1952,10 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         app_update_notification_body, build_release_updater_config, compute_tray_window_position,
-        install_pending_update, parse_updater_endpoint_list, physical_rect_from_rect,
-        store_checked_update, AvailableAppUpdate, InstallPendingUpdateFuture,
-        InstallableAppUpdate, MonitorBounds, PhysicalRect, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        install_pending_update, lifetime_token_milestone_kind, parse_updater_endpoint_list,
+        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
+        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect,
+        DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use std::sync::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
@@ -2039,7 +2066,10 @@ mod tests {
 
         assert_eq!(result, Some(metadata.clone()));
         let stored = pending.lock().expect("pending lock");
-        assert_eq!(stored.as_ref().expect("pending update").metadata(), metadata);
+        assert_eq!(
+            stored.as_ref().expect("pending update").metadata(),
+            metadata
+        );
     }
 
     #[test]
@@ -2064,15 +2094,16 @@ mod tests {
             install_result: Ok(()),
         }));
 
-        let error = store_checked_update::<FakePendingUpdate>(
-            Err("feed unavailable".into()),
-            &pending,
-        )
-        .expect_err("check failure should bubble up");
+        let error =
+            store_checked_update::<FakePendingUpdate>(Err("feed unavailable".into()), &pending)
+                .expect_err("check failure should bubble up");
 
         assert_eq!(error, "feed unavailable");
         let stored = pending.lock().expect("pending lock");
-        assert_eq!(stored.as_ref().expect("pending update").metadata(), existing);
+        assert_eq!(
+            stored.as_ref().expect("pending update").metadata(),
+            existing
+        );
     }
 
     #[test]
@@ -2189,5 +2220,13 @@ mod tests {
                 height: 24,
             }
         );
+    }
+
+    #[test]
+    fn token_milestone_kind_labels_first_and_repeating_thresholds() {
+        assert_eq!(lifetime_token_milestone_kind(1_000_000), "first_1m");
+        assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
+        assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
+        assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
     }
 }
