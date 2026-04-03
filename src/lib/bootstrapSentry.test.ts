@@ -1,12 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import * as Sentry from "@sentry/react";
 
 import {
   bootstrapFailureSignature,
   buildBootstrapFailureReport,
   buildBootstrapInvokeFailureReport,
   inferBootstrapFailurePhase,
+  reportBootstrapFailure,
 } from "./bootstrapSentry";
 import type { BootstrapProgress } from "./types";
+
+vi.mock("@sentry/react", () => {
+  const captureException = vi.fn();
+  const withScope = vi.fn((cb: (scope: unknown) => void) => {
+    cb({
+      setLevel: vi.fn(),
+      setTag: vi.fn(),
+      setFingerprint: vi.fn(),
+      setContext: vi.fn(),
+      setExtra: vi.fn(),
+    });
+  });
+  return { captureException, withScope };
+});
 
 function makeFailedProgress(message: string): BootstrapProgress {
   return {
@@ -78,5 +94,63 @@ describe("bootstrap sentry helpers", () => {
     expect(bootstrapFailureSignature(progressReport)).not.toBe(
       bootstrapFailureSignature(invokeReport)
     );
+  });
+});
+
+describe("reportBootstrapFailure", () => {
+  beforeEach(() => {
+    vi.mocked(Sentry.captureException).mockClear();
+    vi.mocked(Sentry.withScope).mockClear();
+  });
+
+  it("calls withScope and captureException", () => {
+    const report = buildBootstrapFailureReport(
+      makeFailedProgress("Installation failed: disk full")
+    );
+
+    reportBootstrapFailure(report);
+
+    expect(Sentry.withScope).toHaveBeenCalledOnce();
+    expect(Sentry.captureException).toHaveBeenCalledOnce();
+    const err = vi.mocked(Sentry.captureException).mock.calls[0][0] as Error;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("BootstrapFailedError");
+    expect(err.message).toBe("Installation failed: disk full");
+  });
+
+  it("includes cause as extra when provided", () => {
+    const report = buildBootstrapFailureReport(makeFailedProgress("Installation failed: disk full"));
+    const scope = {
+      setLevel: vi.fn(),
+      setTag: vi.fn(),
+      setFingerprint: vi.fn(),
+      setContext: vi.fn(),
+      setExtra: vi.fn(),
+    };
+    vi.mocked(Sentry.withScope).mockImplementationOnce((cb) => {
+      cb(scope);
+    });
+
+    reportBootstrapFailure(report, new Error("underlying cause"));
+
+    expect(scope.setExtra).toHaveBeenCalledWith("cause", expect.any(String));
+  });
+
+  it("does not set extra when cause is not provided", () => {
+    const report = buildBootstrapFailureReport(makeFailedProgress("Installation failed: disk full"));
+    const scope = {
+      setLevel: vi.fn(),
+      setTag: vi.fn(),
+      setFingerprint: vi.fn(),
+      setContext: vi.fn(),
+      setExtra: vi.fn(),
+    };
+    vi.mocked(Sentry.withScope).mockImplementationOnce((cb) => {
+      cb(scope);
+    });
+
+    reportBootstrapFailure(report);
+
+    expect(scope.setExtra).not.toHaveBeenCalled();
   });
 });
