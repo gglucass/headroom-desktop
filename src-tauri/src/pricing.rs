@@ -20,6 +20,9 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 24;
+// Set to true in dev builds to skip sign-in requirement (indefinite trial)
+#[cfg(debug_assertions)]
+const INDEFINITE_TRIAL: bool = true;
 const AUTH_CODE_EXPIRY_SECONDS: u64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +424,8 @@ fn evaluate_pricing_status(
     account: Option<HeadroomAccountProfile>,
     claude: ClaudeAccountProfile,
 ) -> HeadroomPricingStatus {
+    #[cfg(debug_assertions)]
+    let local_grace_active = if INDEFINITE_TRIAL { true } else { local_grace_active };
     let needs_authentication = !authenticated && !local_grace_active;
     let mut optimization_allowed = true;
     let mut should_nudge = false;

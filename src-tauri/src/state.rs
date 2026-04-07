@@ -121,10 +121,11 @@ impl AppState {
                 );
             }
 
-            // If Headroom ships a newer pinned Headroom version than what's
-            // installed, silently upgrade before starting the proxy.
-            if self.tool_manager.headroom_needs_upgrade() {
-                if let Err(err) = self.tool_manager.upgrade_headroom() {
+            // If a newer eligible 0.5.X release exists on PyPI (at least
+            // HEADROOM_UPGRADE_HOLD_DAYS old, or >= HEADROOM_MIN_VERSION),
+            // silently upgrade before starting the proxy.
+            if let Some(release) = self.tool_manager.check_headroom_upgrade() {
+                if let Err(err) = self.tool_manager.upgrade_headroom(&release) {
                     eprintln!("failed to auto-upgrade headroom: {err}");
                     sentry::capture_message(
                         &format!("headroom auto-upgrade failed: {err}"),
@@ -313,8 +314,13 @@ impl AppState {
             if let Some(saved_tokens) = history.lifetime_estimated_tokens_saved {
                 snapshot.lifetime_estimated_tokens_saved = saved_tokens;
             }
-            daily_savings = history.daily_savings();
-            hourly_savings = history.hourly_savings();
+            daily_savings =
+                merge_daily_savings(daily_savings, history.daily_savings(), "2026-04-09");
+            hourly_savings = merge_hourly_savings(
+                hourly_savings,
+                history.hourly_savings(),
+                "2026-04-09T00:00",
+            );
         }
 
         (
@@ -2692,6 +2698,54 @@ fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
         let _ = pattern;
         Ok(())
     }
+}
+
+/// Merge daily savings from tracker (pre-cutoff) and native headroom history (post-cutoff).
+/// For days before `cutoff_date` (exclusive), the tracker is preferred.
+/// For days on/after `cutoff_date`, native history is preferred.
+/// Falls back to whichever source has data when the preferred one is absent.
+fn merge_daily_savings(
+    tracker: Vec<DailySavingsPoint>,
+    history: Vec<DailySavingsPoint>,
+    cutoff_date: &str,
+) -> Vec<DailySavingsPoint> {
+    use std::collections::BTreeMap;
+    let mut by_date: BTreeMap<String, DailySavingsPoint> = BTreeMap::new();
+    // Insert history first so tracker can overwrite pre-cutoff days
+    for p in history {
+        by_date.insert(p.date.clone(), p);
+    }
+    // Tracker overwrites all pre-cutoff entries; post-cutoff entries are only inserted
+    // if history didn't already have them (i.e. they remain from above).
+    for p in tracker {
+        if p.date.as_str() < cutoff_date {
+            by_date.insert(p.date.clone(), p);
+        } else {
+            by_date.entry(p.date.clone()).or_insert(p);
+        }
+    }
+    by_date.into_values().collect()
+}
+
+/// Same logic as `merge_daily_savings` but for hourly buckets keyed by hour string.
+fn merge_hourly_savings(
+    tracker: Vec<HourlySavingsPoint>,
+    history: Vec<HourlySavingsPoint>,
+    cutoff_hour: &str,
+) -> Vec<HourlySavingsPoint> {
+    use std::collections::BTreeMap;
+    let mut by_hour: BTreeMap<String, HourlySavingsPoint> = BTreeMap::new();
+    for p in history {
+        by_hour.insert(p.hour.clone(), p);
+    }
+    for p in tracker {
+        if p.hour.as_str() < cutoff_hour {
+            by_hour.insert(p.hour.clone(), p);
+        } else {
+            by_hour.entry(p.hour.clone()).or_insert(p);
+        }
+    }
+    by_hour.into_values().collect()
 }
 
 #[cfg(test)]

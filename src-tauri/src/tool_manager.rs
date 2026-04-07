@@ -16,15 +16,20 @@ use tar::Archive;
 
 use crate::models::{ManagedTool, ToolStatus};
 
-const HEADROOM_VERSION: &str = "0.5.18";
+/// Minimum acceptable version. Upgrades to versions below this are applied
+/// immediately regardless of the release-age hold period.
+const HEADROOM_MIN_VERSION: &str = "0.5.19";
+/// The major.minor series we track for auto-upgrades (e.g. "0.5").
+const HEADROOM_SERIES: &str = "0.5";
+/// Days a new release must be on PyPI before it is eligible for auto-upgrade
+/// (unless it is at or above HEADROOM_MIN_VERSION).
+const HEADROOM_UPGRADE_HOLD_DAYS: i64 = 7;
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
-const HEADROOM_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/65/02/918998e5e723f6817bac438b821c5cd8a81bb6e04dd3f94ae48667989855/headroom_ai-0.5.18-py3-none-any.whl";
-const HEADROOM_WHEEL_SHA256: &str =
-    "3bfbd678b17630255151279d3e677a1cb82c9ce9fb7fea5af87ae80d83e80af0";
+
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const RTK_VERSION: &str = "0.33.1";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
@@ -166,8 +171,8 @@ impl ToolManager {
                 description: "Default optimizer stage for every supported client.".into(),
                 runtime: "python".into(),
                 source_url: "https://pypi.org/project/headroom-ai/".into(),
-                version: HEADROOM_VERSION.into(),
-                checksum: Some(HEADROOM_WHEEL_SHA256.into()),
+                version: HEADROOM_MIN_VERSION.into(),
+                checksum: None,
                 required: true,
             },
             ManagedToolManifest {
@@ -625,27 +630,33 @@ impl ToolManager {
             .map(|parsed| parsed.summary)
     }
 
-    /// Returns true when the installed Headroom version doesn't match the
-    /// version pinned in this build of Headroom.
-    pub fn headroom_needs_upgrade(&self) -> bool {
-        match self.installed_headroom_version() {
-            Some(installed) => installed != HEADROOM_VERSION,
-            None => false, // no receipt → not yet bootstrapped, not an upgrade case
+    /// Queries PyPI for the best eligible 0.5.X release and returns it if it
+    /// is newer than what is installed. Returns None when already up to date,
+    /// when PyPI is unreachable, or when no receipt exists yet (bootstrap
+    /// handles first-install separately).
+    pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
+        let installed = self.installed_headroom_version()?;
+        let best = fetch_best_headroom_release()?;
+        let installed_semver = parse_semver(&installed)?;
+        let best_semver = parse_semver(&best.version)?;
+        if best_semver > installed_semver {
+            Some(best)
+        } else {
+            None
         }
     }
 
-    /// Re-installs Headroom (and MCP) to bring it up to the pinned version.
-    /// Call this when `headroom_needs_upgrade()` returns true.
-    pub fn upgrade_headroom(&self) -> Result<()> {
+    /// Applies a previously-fetched release, upgrading Headroom in place.
+    pub fn upgrade_headroom(&self, release: &HeadroomRelease) -> Result<()> {
         let old = self
             .installed_headroom_version()
             .unwrap_or("unknown".into());
         eprintln!(
-            "headroom: upgrading headroom from {} to {}",
-            old, HEADROOM_VERSION
+            "headroom: upgrading from {} to {}",
+            old, release.version
         );
-        self.install_headroom()
-            .context("upgrading headroom to pinned version")
+        self.install_headroom_release(release)
+            .context("upgrading headroom")
     }
 
     pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
@@ -776,14 +787,20 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Bootstrap path: fetches the best eligible release from PyPI, then installs it.
     fn install_headroom(&self) -> Result<()> {
+        let release = fetch_best_headroom_release()
+            .ok_or_else(|| anyhow::anyhow!("could not fetch headroom release info from PyPI"))?;
+        self.install_headroom_release(&release)
+    }
+
+    fn install_headroom_release(&self, release: &HeadroomRelease) -> Result<()> {
         let lock_path = self.write_headroom_requirements_lock()?;
-        let artifact = headroom_distribution_artifact();
         let wheel_path = self
             .runtime
             .downloads_dir
-            .join(format!("headroom_ai-{HEADROOM_VERSION}-py3-none-any.whl"));
-        download_to_path(&artifact.url, &wheel_path, artifact.sha256)?;
+            .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
+        download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256))?;
 
         run_python_command(
             &self.runtime.managed_python(),
@@ -838,10 +855,10 @@ impl ToolManager {
                 "pipExecutable": self.runtime.managed_pip(),
                 "entrypoint": self.runtime.venv_dir.join("bin").join("headroom"),
                 "source": self.manifests[0].source_url,
-                "version": self.manifests[0].version,
+                "version": release.version,
                 "artifact": {
-                    "url": HEADROOM_WHEEL_URL,
-                    "sha256": HEADROOM_WHEEL_SHA256,
+                    "url": release.wheel_url,
+                    "sha256": release.sha256,
                     "requirementsLockSha256": sha256_bytes(HEADROOM_REQUIREMENTS_LOCK.as_bytes())
                 },
                 "mcp": mcp_install,
@@ -1023,11 +1040,97 @@ struct DownloadArtifact {
     sha256: Option<&'static str>,
 }
 
-fn headroom_distribution_artifact() -> DownloadArtifact {
-    DownloadArtifact {
-        url: HEADROOM_WHEEL_URL.into(),
-        sha256: Some(HEADROOM_WHEEL_SHA256),
+/// Metadata for a specific headroom-ai release fetched from PyPI.
+pub(crate) struct HeadroomRelease {
+    version: String,
+    wheel_url: String,
+    sha256: String,
+}
+
+/// Parses a "major.minor.patch" version string into a comparable tuple.
+fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = v.splitn(3, '.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Queries PyPI for the latest eligible release in HEADROOM_SERIES.
+///
+/// A release is eligible when either:
+///   - it has been on PyPI for at least HEADROOM_UPGRADE_HOLD_DAYS, or
+///   - its version is >= HEADROOM_MIN_VERSION (the minimum required version
+///     ships immediately regardless of age).
+///
+/// Returns None when PyPI is unreachable or no eligible release is found.
+fn fetch_best_headroom_release() -> Option<HeadroomRelease> {
+    let resp = reqwest::blocking::get("https://pypi.org/pypi/headroom-ai/json").ok()?;
+    let json: serde_json::Value = resp.json().ok()?;
+    let releases = json["releases"].as_object()?;
+
+    let now = chrono::Utc::now();
+    let min_semver = parse_semver(HEADROOM_MIN_VERSION)?;
+    let series_prefix = format!("{}.", HEADROOM_SERIES);
+
+    let mut best: Option<((u32, u32, u32), HeadroomRelease)> = None;
+
+    for (version_str, files) in releases {
+        if !version_str.starts_with(&series_prefix) {
+            continue;
+        }
+        let semver = match parse_semver(version_str) {
+            Some(v) => v,
+            None => continue,
+        };
+        let files_arr = match files.as_array() {
+            Some(f) => f,
+            None => continue,
+        };
+        let wheel = match files_arr.iter().find(|f| {
+            f["packagetype"].as_str() == Some("bdist_wheel")
+                && f["python_version"].as_str() == Some("py3")
+        }) {
+            Some(w) => w,
+            None => continue,
+        };
+        let upload_time_str = match wheel["upload_time_iso_8601"].as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let upload_time = match chrono::DateTime::parse_from_rfc3339(upload_time_str) {
+            Ok(t) => t.with_timezone(&chrono::Utc),
+            Err(_) => continue,
+        };
+        let age_days = now.signed_duration_since(upload_time).num_days();
+        let is_old_enough = age_days >= HEADROOM_UPGRADE_HOLD_DAYS;
+        let is_forced = semver >= min_semver;
+
+        if !is_old_enough && !is_forced {
+            continue;
+        }
+
+        if best.as_ref().map(|(v, _)| semver > *v).unwrap_or(true) {
+            let wheel_url = match wheel["url"].as_str() {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+            let sha256 = match wheel["digests"]["sha256"].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            best = Some((
+                semver,
+                HeadroomRelease {
+                    version: version_str.clone(),
+                    wheel_url,
+                    sha256,
+                },
+            ));
+        }
     }
+
+    best.map(|(_, release)| release)
 }
 
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
