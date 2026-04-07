@@ -96,8 +96,8 @@ describe("app helpers", () => {
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
       ["pro", "$2.50"],
-      ["max5x", "$12"],
-      ["max20x", "$25"],
+      ["max5x", "$10"],
+      ["max20x", "$20"],
     ]);
   });
 });
