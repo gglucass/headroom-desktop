@@ -146,6 +146,7 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
                 "launch_experience": state.launch_experience_label()
             })),
         );
+        pricing::report_milestone(milestone_tokens_saved);
     }
 
     let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
@@ -541,7 +542,8 @@ fn activate_headroom_account(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::activate_account(&state)?;
+    let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
+    let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
     analytics::track_event(&app, "account_activated", None);
     Ok(status)
 }
@@ -949,6 +951,7 @@ pub fn run() {
             app.manage(TraySessionSavings(Mutex::new(0.0)));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
+            spawn_tray_savings_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::track_event(
@@ -1752,7 +1755,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             let v = *savings_state.0.lock().unwrap();
                             let d = v.floor() as u32;
                             #[cfg(debug_assertions)]
-                            let d = d.max(128);
+                            let d = d.max(1);
                             d
                         };
                         let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
@@ -1777,6 +1780,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             }
 
             std::thread::sleep(std::time::Duration::from_millis(260));
+        }
+    });
+}
+
+fn spawn_tray_savings_updater(app: AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let state: tauri::State<'_, AppState> = app.state();
+            let savings = state.dashboard().session_estimated_savings_usd;
+            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+            *savings_state.0.lock().unwrap() = savings;
         }
     });
 }

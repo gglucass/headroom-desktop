@@ -15,6 +15,7 @@ export interface UpgradePlan {
   name: string;
   tagline: string;
   price: string;
+  originalPrice?: string;
   billingLines: [string, string];
   centeredPriceLabel?: string;
   featureIntro: string;
@@ -115,6 +116,7 @@ export function getUpgradePlans(
         name: "Pro",
         tagline: "Unlock unlimited savings",
         price: "$2.50",
+        originalPrice: "$5",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Everything in Free, plus:",
         features: [
@@ -130,7 +132,8 @@ export function getUpgradePlans(
         id: "max5x",
         name: "Max x5",
         tagline: "For Claude Max x5 accounts",
-        price: "$12",
+        price: "$10",
+        originalPrice: "$20",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [
@@ -146,7 +149,8 @@ export function getUpgradePlans(
         id: "max20x",
         name: "Max x20",
         tagline: "For Claude Max x20 accounts",
-        price: "$25",
+        price: "$20",
+        originalPrice: "$40",
         billingLines: ["USD / month", "billed annually"],
         featureIntro: "Includes:",
         features: [

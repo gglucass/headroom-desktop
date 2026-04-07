@@ -246,12 +246,16 @@ pub fn sign_out() -> Result<(), String> {
     clear_session_token()
 }
 
-pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+pub fn activate_account(
+    state: &AppState,
+    lifetime_tokens_saved: u64,
+) -> Result<HeadroomPricingStatus, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before activating desktop access.".to_string())?;
     let response = http_client()?
         .post(api_url("desktop/account/activate"))
         .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
         .send()
         .map_err(|err| {
             let msg = format!("Could not activate Headroom desktop access: {err}");
@@ -293,6 +297,25 @@ pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, Strin
         Some(remote_account_to_profile(body.account)),
         claude,
     ))
+}
+
+/// Fire-and-forget: reports a milestone to the server so it can trigger
+/// the feedback email for users who were below the threshold at sign-up.
+/// Silently no-ops if the user is not signed in or the request fails.
+pub fn report_milestone(milestone_tokens_saved: u64) {
+    let token = match read_session_token() {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = client
+        .post(api_url("desktop/milestones"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "milestone_tokens_saved": milestone_tokens_saved }))
+        .send();
 }
 
 pub fn create_checkout_session(

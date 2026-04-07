@@ -3476,6 +3476,10 @@ export default function App() {
             ) : null}
           </section>
 
+          <section className="upgrade-trial-callout upgrade-sale-banner">
+            <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
+          </section>
+
           <section
             className={`upgrade-plan-grid${visibleUpgradePlans.length === 1 ? " upgrade-plan-grid--single" : ""}`}
           >
@@ -3509,7 +3513,15 @@ export default function App() {
                       <div className="upgrade-plan-card__price-note">{plan.centeredPriceLabel}</div>
                     ) : (
                       <div className="upgrade-plan-card__price-block">
-                        <strong>{plan.price}</strong>
+                        <div>
+                          {plan.originalPrice ? (
+                            <div className="upgrade-plan-card__sale-row">
+                              <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
+                              <span className="upgrade-plan-card__sale-badge">50% off</span>
+                            </div>
+                          ) : null}
+                          <strong>{plan.price}</strong>
+                        </div>
                         <span>
                           {plan.billingLines[0]}
                           <br />
@@ -3887,6 +3899,12 @@ export default function App() {
                   ) : null}
                 </div>
               </article>
+              <a
+                className="contact-link"
+                href="mailto:support@extraheadroom.com"
+              >
+                Contact us
+              </a>
               <button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}
