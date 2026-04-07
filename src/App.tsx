@@ -101,7 +101,7 @@ import {
   formatRemainingDays,
   subscriptionTierLabel
 } from "./lib/pricing";
-import { trackInstallMilestoneOnce } from "./lib/analytics";
+import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -1948,6 +1948,12 @@ export default function App() {
     if (!action) {
       return;
     }
+
+    trackAnalyticsEvent("upgrade_button_clicked", {
+      plan_id: planId,
+      action_kind: action.kind,
+      email: pricingStatus?.account?.email ?? pricingStatus?.claude?.email ?? undefined,
+    });
 
     if (action.kind === "internal") {
       setUpgradeActionError(null);
