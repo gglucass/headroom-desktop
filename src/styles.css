@@ -949,8 +949,37 @@ select {
 
 .upgrade-plan-card__price-block {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 10px;
+}
+
+.upgrade-sale-banner {
+  border-color: rgba(79, 158, 145, 0.28);
+  background: linear-gradient(180deg, rgba(242, 251, 247, 0.96), rgba(255, 255, 255, 0.94));
+}
+
+.upgrade-plan-card__sale-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.3rem;
+}
+
+.upgrade-plan-card__original-price {
+  font-size: 0.85rem;
+  color: #a09890;
+  text-decoration: line-through;
+}
+
+.upgrade-plan-card__sale-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #2a6b50;
+  background: rgba(108, 191, 155, 0.22);
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.3rem;
 }
 
 .upgrade-plan-card__price-block strong {
@@ -2346,6 +2375,20 @@ details[open] .optimize-minimal__details summary::after {
 
 .settings-account-copy em {
   color: #6a615a;
+}
+
+.contact-link {
+  display: block;
+  text-align: center;
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+
+.contact-link:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
 }
 
 .quit-button {

@@ -31,6 +31,10 @@ pub fn spawn(token_slot: SharedToken) {
             rt.block_on(async move {
                 if let Err(e) = run(token_slot).await {
                     eprintln!("[proxy_intercept] fatal: {e}");
+                    sentry::capture_message(
+                        &format!("proxy_intercept fatal error: {e}"),
+                        sentry::Level::Fatal,
+                    );
                 }
             });
         })

@@ -1,4 +1,4 @@
-name: Release macOS App
+name: Release Linux App
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: macos-release-${{ github.ref }}
+  group: linux-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -18,19 +18,12 @@ permissions:
 
 jobs:
   release:
-    name: macOS Apple Silicon
-    runs-on: macos-latest
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
       HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY_P8: ${{ secrets.APPLE_API_PRIVATE_KEY_P8 }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
@@ -44,6 +37,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,7 +61,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: x86_64-unknown-linux-gnu
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -114,9 +122,6 @@ jobs:
             HEADROOM_ACCOUNT_API_BASE_URL
             HEADROOM_APTABASE_APP_KEY
             HEADROOM_UPDATER_PUBLIC_KEY
-            APPLE_CERTIFICATE
-            APPLE_CERTIFICATE_PASSWORD
-            APPLE_SIGNING_IDENTITY
             TAURI_SIGNING_PRIVATE_KEY
             TAURI_SIGNING_PRIVATE_KEY_PASSWORD
           )
@@ -127,34 +132,6 @@ jobs:
               exit 1
             fi
           done
-
-          if [[ -n "${APPLE_API_ISSUER:-}" && -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_PRIVATE_KEY_P8:-}" ]]; then
-            exit 0
-          fi
-
-          if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
-            exit 0
-          fi
-
-          echo "Configure either App Store Connect notarization secrets or Apple ID notarization secrets." >&2
-          exit 1
-
-      - name: Debug secrets presence
-        if: steps.release_guard.outputs.should_release == 'true'
-        shell: bash
-        run: |
-          echo "APPLE_API_PRIVATE_KEY_P8 set: $([[ -n "${APPLE_API_PRIVATE_KEY_P8:-}" ]] && echo YES || echo NO)"
-          echo "APPLE_API_KEY set: $([[ -n "${APPLE_API_KEY:-}" ]] && echo YES || echo NO)"
-          echo "APPLE_API_ISSUER set: $([[ -n "${APPLE_API_ISSUER:-}" ]] && echo YES || echo NO)"
-
-      - name: Prepare App Store Connect API key
-        if: steps.release_guard.outputs.should_release == 'true' && env.APPLE_API_PRIVATE_KEY_P8 != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
-          printf '%s' "$APPLE_API_PRIVATE_KEY_P8" > "$key_path"
-          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
         if: steps.release_guard.outputs.should_release == 'true'
@@ -171,13 +148,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEADROOM_UPDATER_ENDPOINTS: ${{ env.HEADROOM_UPDATER_ENDPOINTS }}
           HEADROOM_UPDATER_PUBLIC_KEY: ${{ env.HEADROOM_UPDATER_PUBLIC_KEY }}
-          APPLE_CERTIFICATE: ${{ env.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ env.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ env.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
-          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -185,10 +155,11 @@ jobs:
           tagName: v__VERSION__
           releaseName: Headroom v__VERSION__
           releaseBody: |
-            macOS release artifacts for Headroom.
+            Linux release artifacts for Headroom.
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
-          assetNamePattern: '[name]_[version]_mac[ext]'
-          includeUpdaterJson: true
-          args: --target aarch64-apple-darwin
+          releaseAssetNamePattern: '[name]_[version][ext]'
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          args: --target x86_64-unknown-linux-gnu

@@ -39,6 +39,7 @@ use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
@@ -53,6 +54,21 @@ const MAIN_WINDOW_HEIGHT: u32 = 560;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 
 type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitSource {
+    SettingsButton,
+    TrayMenu,
+}
+
+impl QuitSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SettingsButton => "settings_button",
+            Self::TrayMenu => "tray_menu",
+        }
+    }
+}
 
 trait InstallableAppUpdate: Send {
     fn metadata(&self) -> AvailableAppUpdate;
@@ -130,7 +146,11 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
                 "launch_experience": state.launch_experience_label()
             })),
         );
+        pricing::report_milestone(milestone_tokens_saved);
     }
+
+    let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+    *savings_state.0.lock().unwrap() = dashboard.session_estimated_savings_usd;
 
     dashboard
 }
@@ -150,12 +170,18 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: 0,
             configuration_error: None,
         },
-        Err(err) => AppUpdateConfiguration {
-            enabled: false,
-            current_version: app.package_info().version.to_string(),
-            endpoint_count: 0,
-            configuration_error: Some(err),
-        },
+        Err(ref err) => {
+            sentry::capture_message(
+                &format!("app update configuration error: {err}"),
+                sentry::Level::Error,
+            );
+            AppUpdateConfiguration {
+                enabled: false,
+                current_version: app.package_info().version.to_string(),
+                endpoint_count: 0,
+                configuration_error: Some(err.clone()),
+            }
+        }
     }
 }
 
@@ -278,6 +304,34 @@ fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn show_notification(title: String, body: String) -> Result<(), String> {
+    show_notification_impl(&title, &body)
+}
+
+#[cfg(target_os = "macos")]
+fn show_notification_impl(title: &str, body: &str) -> Result<(), String> {
+    let title_json = serde_json::to_string(title).map_err(|e| e.to_string())?;
+    let body_json = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let script = format!(
+        "const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification({body_json}, {{ withTitle: {title_json} }});"
+    );
+    let status = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &script])
+        .status()
+        .map_err(|e| format!("Could not show notification: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Notification helper exited with {status}."))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_notification_impl(_title: &str, _body: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
 fn get_research_candidates() -> Vec<ResearchCandidate> {
     research::candidate_matrix()
 }
@@ -293,6 +347,10 @@ fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, Strin
         &state.tool_manager.managed_python(),
     ) {
         eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
+        sentry::capture_message(
+            &format!("RTK integrations failed after bootstrap_runtime: {err}"),
+            sentry::Level::Warning,
+        );
     }
     state
         .ensure_headroom_running()
@@ -341,6 +399,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             &state.tool_manager.managed_python(),
         ) {
             eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
+            sentry::capture_message(
+                &format!("RTK integrations failed after start_bootstrap thread: {err}"),
+                sentry::Level::Warning,
+            );
         }
 
         state.update_bootstrap_step(crate::tool_manager::BootstrapStepUpdate {
@@ -480,7 +542,8 @@ fn activate_headroom_account(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::activate_account(&state)?;
+    let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
+    let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
     analytics::track_event(&app, "account_activated", None);
     Ok(status)
 }
@@ -656,18 +719,33 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
 
 #[tauri::command]
 fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupResult, String> {
-    let result = client_adapters::apply_client_setup(&client_id).map_err(|err| err.to_string())?;
-    analytics::track_event(
-        &app,
-        "client_setup_applied",
-        Some(json!({
-            "client_id": result.client_id.clone(),
-            "already_configured": result.already_configured,
-            "verified": result.verification.verified,
-            "proxy_reachable": result.verification.proxy_reachable
-        })),
-    );
-    Ok(result)
+    match client_adapters::apply_client_setup(&client_id) {
+        Ok(result) => {
+            analytics::track_event(
+                &app,
+                "client_setup_applied",
+                Some(json!({
+                    "client_id": result.client_id.clone(),
+                    "already_configured": result.already_configured,
+                    "verified": result.verification.verified,
+                    "proxy_reachable": result.verification.proxy_reachable
+                })),
+            );
+            Ok(result)
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            if !msg.starts_with("Automatic setup is not supported yet")
+                && !msg.starts_with("Codex integration has been disabled")
+            {
+                sentry::capture_message(
+                    &format!("client setup failed for {client_id}: {msg}"),
+                    sentry::Level::Error,
+                );
+            }
+            Err(msg)
+        }
+    }
 }
 
 #[tauri::command]
@@ -801,18 +879,47 @@ fn hide_launcher_animated(app: AppHandle) {
 
 #[tauri::command]
 fn quit_headroom(app: AppHandle) {
-    let state: tauri::State<'_, AppState> = app.state();
-    state.stop_headroom();
-    let _ = client_adapters::clear_client_setups();
-    analytics::shutdown(&app);
-    app.exit(0);
+    exit_headroom(&app, QuitSource::SettingsButton);
 }
 
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
 
+fn exit_headroom(app: &AppHandle, source: QuitSource) {
+    let runtime_paused = {
+        let state: tauri::State<'_, AppState> = app.state();
+        let runtime_paused = state.runtime_is_paused();
+        state.stop_headroom();
+        let _ = client_adapters::clear_client_setups();
+        runtime_paused
+    };
+
+    analytics::track_event(
+        app,
+        "app_quit_requested",
+        Some(app_quit_requested_properties(source, runtime_paused)),
+    );
+    analytics::shutdown(app);
+    app.exit(0);
+}
+
+fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
+    json!({
+        "source": source.label(),
+        "runtime_paused": runtime_paused,
+    })
+}
+
 pub fn run() {
+    let _sentry = sentry::init((
+        SENTRY_DSN.unwrap_or(""),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ));
+
     let state = AppState::new().expect("failed to create app state");
 
     let builder = tauri::Builder::default()
@@ -841,8 +948,10 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            app.manage(TraySessionSavings(Mutex::new(0.0)));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
+            spawn_tray_savings_updater(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::track_event(
@@ -880,6 +989,7 @@ pub fn run() {
             install_app_update,
             restart_app,
             show_app_update_notification,
+            show_notification,
             get_research_candidates,
             bootstrap_runtime,
             start_bootstrap,
@@ -1445,6 +1555,27 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 } else {
                     output_tail.join("\n")
                 };
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_tag("flow", "headroom_learn");
+                        scope.set_context(
+                            "learn",
+                            sentry::protocol::Context::Other(
+                                [
+                                    ("exit_status".into(), output.status.to_string().into()),
+                                    ("output_tail".into(), fail_tail.clone().into()),
+                                ]
+                                .into(),
+                            ),
+                        );
+                    },
+                    || {
+                        sentry::capture_message(
+                            "headroom learn exited with non-zero status",
+                            sentry::Level::Error,
+                        )
+                    },
+                );
                 (
                     format!("headroom learn failed for {project_name}."),
                     false,
@@ -1459,15 +1590,21 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 )
             }
         }
-        Err(err) => (
-            format!("headroom learn failed for {project_name}."),
-            false,
-            Some(format!("Could not start headroom learn: {err}")),
-            Vec::new(),
-            String::new(),
-            String::new(),
-            "spawn_error".to_string(),
-        ),
+        Err(err) => {
+            sentry::capture_message(
+                &format!("headroom learn spawn failed: {err}"),
+                sentry::Level::Error,
+            );
+            (
+                format!("headroom learn failed for {project_name}."),
+                false,
+                Some(format!("Could not start headroom learn: {err}")),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                "spawn_error".to_string(),
+            )
+        }
     };
 
     let log_path = state.tool_manager.headroom_learn_log_path(project_path);
@@ -1542,10 +1679,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "quit" => {
-                let state: tauri::State<'_, AppState> = app.state();
-                state.stop_headroom();
-                let _ = client_adapters::clear_client_setups();
-                app.exit(0);
+                exit_headroom(app, QuitSource::TrayMenu);
             }
             "pause" => {
                 let state: tauri::State<'_, AppState> = app.state();
@@ -1574,7 +1708,8 @@ enum TrayRuntimeVisual {
 
 struct TrayRuntimeIcons {
     off: tauri::image::Image<'static>,
-    running: tauri::image::Image<'static>,
+    running_rgba: Vec<u8>,
+    running_dims: (u32, u32),
     booting_frames: Vec<tauri::image::Image<'static>>,
 }
 
@@ -1590,6 +1725,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     std::thread::spawn(move || {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
+        let mut last_displayed_dollars: Option<u32> = None;
 
         loop {
             let visual = {
@@ -1611,11 +1747,25 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             icons.booting_frames[frame_index % icons.booting_frames.len()].clone();
                         let _ = tray.set_icon(Some(icon));
                         frame_index = (frame_index + 1) % icons.booting_frames.len();
+                        last_non_booting = Some(TrayRuntimeVisual::Booting);
                     }
                     TrayRuntimeVisual::Running => {
-                        if last_non_booting != Some(TrayRuntimeVisual::Running) {
-                            let _ = tray.set_icon(Some(icons.running.clone()));
+                        let dollars = {
+                            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+                            let v = *savings_state.0.lock().unwrap();
+                            let d = v.floor() as u32;
+                            #[cfg(debug_assertions)]
+                            let d = d.max(1);
+                            d
+                        };
+                        let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
+                        let changed_dollars = last_displayed_dollars != Some(dollars);
+                        if changed_visual || changed_dollars {
+                            let (bw, bh) = icons.running_dims;
+                            let (new_rgba, new_w, new_h) = build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
+                            let _ = tray.set_icon(Some(tauri::image::Image::new_owned(new_rgba, new_w, new_h)));
                             last_non_booting = Some(TrayRuntimeVisual::Running);
+                            last_displayed_dollars = Some(dollars);
                         }
                     }
                     TrayRuntimeVisual::Off => {
@@ -1630,6 +1780,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             }
 
             std::thread::sleep(std::time::Duration::from_millis(260));
+        }
+    });
+}
+
+fn spawn_tray_savings_updater(app: AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let state: tauri::State<'_, AppState> = app.state();
+            let savings = state.dashboard().session_estimated_savings_usd;
+            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+            *savings_state.0.lock().unwrap() = savings;
         }
     });
 }
@@ -1652,7 +1814,8 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
 
     Ok(TrayRuntimeIcons {
         off: tauri::image::Image::new_owned(off_rgba, width, height),
-        running: tauri::image::Image::new_owned(rgba, width, height),
+        running_rgba: rgba,
+        running_dims: (width, height),
         booting_frames: vec![
             tauri::image::Image::new_owned(booting_base, width, height),
             tauri::image::Image::new_owned(booting_90, width, height),
@@ -1733,6 +1896,107 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
     }
 }
 
+struct TraySessionSavings(Mutex<f64>);
+
+// Returns a (possibly wider) RGBA image with whole-dollar savings stacked
+// vertically to the right of the base icon. Returns the base unchanged when
+// dollars == 0.
+fn build_running_with_savings(
+    base: &[u8],
+    base_w: u32,
+    base_h: u32,
+    dollars: u32,
+) -> (Vec<u8>, u32, u32) {
+    if dollars == 0 {
+        return (base.to_vec(), base_w, base_h);
+    }
+
+    const CHAR_W: usize = 3;
+    const CHAR_H: usize = 5;
+    const H_MARGIN: usize = 2; // pixel gap between icon and text column
+
+    let text = if dollars >= 1000 {
+        format!("{}K", dollars / 1000)
+    } else {
+        dollars.to_string()
+    };
+    let chars: Vec<u8> = text.bytes().collect();
+    let n = chars.len();
+
+    // 2-digit values get a slightly larger gap since there's room.
+    let row_gap_px: usize = if n <= 2 { 2 } else { 1 };
+
+    // Largest dot size that fits: n*CHAR_H*dot + (n-1)*row_gap_px <= base_h
+    let available = (base_h as usize).saturating_sub(n.saturating_sub(1) * row_gap_px);
+    let max_dot = if n <= 2 { 3 } else { 2 };
+    let dot = (available / (n * CHAR_H)).clamp(1, max_dot);
+
+    let col_px_w = CHAR_W * dot + H_MARGIN;
+    let new_w = base_w + col_px_w as u32;
+    let h = base_h as usize;
+    let bw = base_w as usize;
+    let nw = new_w as usize;
+
+    let mut out = vec![0u8; nw * h * 4];
+
+    // Copy base icon into left portion.
+    for y in 0..h {
+        let src = y * bw * 4;
+        let dst = y * nw * 4;
+        out[dst..dst + bw * 4].copy_from_slice(&base[src..src + bw * 4]);
+    }
+
+    // Stack digits vertically in the right column, centred on the icon height.
+    let total_h = n * CHAR_H * dot + n.saturating_sub(1) * row_gap_px;
+    let y0 = h.saturating_sub(total_h) / 2;
+    let x0 = bw + H_MARGIN;
+
+    for (ci, &c) in chars.iter().enumerate() {
+        let glyph = pixel_char(c);
+        let cy = y0 + ci * (CHAR_H * dot + row_gap_px);
+        for (row, cols) in glyph.iter().enumerate() {
+            for (col, &on) in cols.iter().enumerate() {
+                if on == 0 {
+                    continue;
+                }
+                for dy in 0..dot {
+                    for dx in 0..dot {
+                        let px = x0 + col * dot + dx;
+                        let py = cy + row * dot + dy;
+                        if px < nw && py < h {
+                            let i = (py * nw + px) * 4;
+                            out[i] = 80;
+                            out[i + 1] = 210;
+                            out[i + 2] = 100;
+                            out[i + 3] = 240;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (out, new_w, base_h)
+}
+
+// Each glyph is [[col0, col1, col2]; 5 rows], top to bottom.
+fn pixel_char(c: u8) -> [[u8; 3]; 5] {
+    match c {
+        b'0' => [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
+        b'1' => [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
+        b'2' => [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
+        b'3' => [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        b'4' => [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
+        b'5' => [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
+        b'6' => [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
+        b'7' => [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
+        b'8' => [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
+        b'9' => [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        b'K' => [[1,0,1],[1,1,0],[1,0,0],[1,1,0],[1,0,1]],
+        _    => [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]],
+    }
+}
+
 fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
     if !onboarding_complete(app) {
         if let Some(window) = app.get_webview_window("main") {
@@ -1767,6 +2031,10 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     }
     if let Err(err) = state.ensure_headroom_running() {
         eprintln!("failed to ensure headroom runtime for tray: {err}");
+        sentry::capture_message(
+            &format!("ensure_runtime_ready_for_tray failed: {err}"),
+            sentry::Level::Error,
+        );
     }
 }
 
@@ -1951,12 +2219,13 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_update_notification_body, build_release_updater_config, compute_tray_window_position,
-        install_pending_update, lifetime_token_milestone_kind, parse_updater_endpoint_list,
-        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect,
-        DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
+        compute_tray_window_position, install_pending_update, lifetime_token_milestone_kind,
+        parse_updater_endpoint_list, physical_rect_from_rect, store_checked_update,
+        AvailableAppUpdate, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
+        PhysicalRect, QuitSource, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
+    use serde_json::json;
     use std::sync::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
@@ -1982,6 +2251,24 @@ mod tests {
             published_at: Some("2026-04-02T12:00:00Z".into()),
             notes: Some("Bug fixes.".into()),
         }
+    }
+
+    #[test]
+    fn app_quit_requested_properties_include_source_and_runtime_state() {
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::SettingsButton, false),
+            json!({
+                "source": "settings_button",
+                "runtime_paused": false,
+            })
+        );
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::TrayMenu, true),
+            json!({
+                "source": "tray_menu",
+                "runtime_paused": true,
+            })
+        );
     }
 
     #[test]

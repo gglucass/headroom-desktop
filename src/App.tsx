@@ -48,6 +48,7 @@ import {
   shouldNotifyAboutAvailableAppUpdate,
   type AppUpdateStatePatch,
 } from "./lib/appUpdate";
+import { maybeFireTrialNotifications } from "./lib/trialNotifications";
 import {
   describeInvokeError,
   getNextLowerUpgradePlanId,
@@ -56,6 +57,12 @@ import {
   type PricingAudience,
   type UpgradePlanId
 } from "./lib/appHelpers";
+import {
+  bootstrapFailureSignature,
+  buildBootstrapFailureReport,
+  buildBootstrapInvokeFailureReport,
+  reportBootstrapFailure
+} from "./lib/bootstrapSentry";
 import {
   aggregateClientConnectors,
   addDays,
@@ -613,6 +620,7 @@ export default function App() {
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
   const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
   const appSemver = appUpdateConfig?.currentVersion ?? packageJson.version;
+  const bootstrapFailureSignatureRef = useRef("");
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
   const mainWindowLastSeenDayRef = useRef(formatDayKey(new Date()));
   const appUpdateKnownVersionRef = useRef<string | null>(null);
@@ -858,6 +866,12 @@ export default function App() {
           setBootstrapProgress(progress);
 
           if (progress.failed) {
+            const failureReport = buildBootstrapFailureReport(progress);
+            const failureSignature = bootstrapFailureSignature(failureReport);
+            if (bootstrapFailureSignatureRef.current !== failureSignature) {
+              bootstrapFailureSignatureRef.current = failureSignature;
+              reportBootstrapFailure(failureReport);
+            }
             setBootstrapError(progress.message);
             setBootstrapping(false);
             completionHandled = true;
@@ -1361,6 +1375,7 @@ export default function App() {
   }, [connectorPhase]);
 
   async function handleBootstrap() {
+    bootstrapFailureSignatureRef.current = "";
     setBootstrapError(null);
     setBootstrapProgress({
       running: true,
@@ -1374,8 +1389,26 @@ export default function App() {
     setBootstrapping(true);
     try {
       await invoke("start_bootstrap");
+    } catch (error) {
+      const failureReport = buildBootstrapInvokeFailureReport(error);
+      const failureSignature = bootstrapFailureSignature(failureReport);
+      if (bootstrapFailureSignatureRef.current !== failureSignature) {
+        bootstrapFailureSignatureRef.current = failureSignature;
+        reportBootstrapFailure(failureReport, error);
+      }
+      setBootstrapError(failureReport.message);
+      setBootstrapProgress({
+        running: false,
+        complete: false,
+        failed: true,
+        currentStep: failureReport.currentStep,
+        message: failureReport.message,
+        currentStepEtaSeconds: failureReport.currentStepEtaSeconds,
+        overallPercent: failureReport.overallPercent
+      });
+      setBootstrapping(false);
     } finally {
-      // completion/failure is managed by progress polling
+      // Most completion paths are still managed by progress polling.
     }
   }
 
@@ -1622,6 +1655,7 @@ export default function App() {
     try {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
       setPricingStatus(status);
+      void maybeFireTrialNotifications(status);
       setPricingError(null);
     } catch (error) {
       setPricingError(
@@ -3442,6 +3476,10 @@ export default function App() {
             ) : null}
           </section>
 
+          <section className="upgrade-trial-callout upgrade-sale-banner">
+            <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
+          </section>
+
           <section
             className={`upgrade-plan-grid${visibleUpgradePlans.length === 1 ? " upgrade-plan-grid--single" : ""}`}
           >
@@ -3475,7 +3513,15 @@ export default function App() {
                       <div className="upgrade-plan-card__price-note">{plan.centeredPriceLabel}</div>
                     ) : (
                       <div className="upgrade-plan-card__price-block">
-                        <strong>{plan.price}</strong>
+                        <div>
+                          {plan.originalPrice ? (
+                            <div className="upgrade-plan-card__sale-row">
+                              <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
+                              <span className="upgrade-plan-card__sale-badge">50% off</span>
+                            </div>
+                          ) : null}
+                          <strong>{plan.price}</strong>
+                        </div>
                         <span>
                           {plan.billingLines[0]}
                           <br />
@@ -3853,6 +3899,12 @@ export default function App() {
                   ) : null}
                 </div>
               </article>
+              <a
+                className="contact-link"
+                href="mailto:support@extraheadroom.com"
+              >
+                Contact us
+              </a>
               <button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}

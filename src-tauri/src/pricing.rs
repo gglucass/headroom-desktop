@@ -160,18 +160,28 @@ pub fn request_auth_code(email: &str) -> Result<HeadroomAuthCodeRequest, String>
         .post(api_url("desktop/auth/request_code"))
         .json(&RequestCodePayload { email: &trimmed })
         .send()
-        .map_err(|err| format!("Could not request sign-in code: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not request sign-in code: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Could not request sign-in code (status {}).",
-            response.status().as_u16()
-        ));
+        let status = response.status().as_u16();
+        let msg = format!("Could not request sign-in code (status {status}).");
+        if status >= 500 {
+            sentry::capture_message(&msg, sentry::Level::Error);
+        }
+        return Err(msg);
     }
 
     let body: RequestCodeResponse = response
         .json()
-        .map_err(|err| format!("Could not parse sign-in response: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not parse sign-in response: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
 
     Ok(HeadroomAuthCodeRequest {
         email: body.email,
@@ -236,14 +246,22 @@ pub fn sign_out() -> Result<(), String> {
     clear_session_token()
 }
 
-pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+pub fn activate_account(
+    state: &AppState,
+    lifetime_tokens_saved: u64,
+) -> Result<HeadroomPricingStatus, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before activating desktop access.".to_string())?;
     let response = http_client()?
         .post(api_url("desktop/account/activate"))
         .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
         .send()
-        .map_err(|err| format!("Could not activate Headroom desktop access: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not activate Headroom desktop access: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -251,15 +269,21 @@ pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, Strin
     }
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Could not activate Headroom desktop access (status {}).",
-            response.status().as_u16()
-        ));
+        let status = response.status().as_u16();
+        let msg = format!("Could not activate Headroom desktop access (status {status}).");
+        if status >= 500 {
+            sentry::capture_message(&msg, sentry::Level::Error);
+        }
+        return Err(msg);
     }
 
     let body: RemoteAccountEnvelope = response
         .json()
-        .map_err(|err| format!("Could not parse Headroom activation response: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not parse Headroom activation response: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
     let local_state = load_or_initialize_local_state()?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
@@ -273,6 +297,25 @@ pub fn activate_account(state: &AppState) -> Result<HeadroomPricingStatus, Strin
         Some(remote_account_to_profile(body.account)),
         claude,
     ))
+}
+
+/// Fire-and-forget: reports a milestone to the server so it can trigger
+/// the feedback email for users who were below the threshold at sign-up.
+/// Silently no-ops if the user is not signed in or the request fails.
+pub fn report_milestone(milestone_tokens_saved: u64) {
+    let token = match read_session_token() {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = client
+        .post(api_url("desktop/milestones"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "milestone_tokens_saved": milestone_tokens_saved }))
+        .send();
 }
 
 pub fn create_checkout_session(
@@ -575,18 +618,28 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, String> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Content-Type", "application/json")
         .send()
-        .map_err(|err| format!("Could not fetch Claude OAuth profile: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not fetch Claude OAuth profile: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Could not fetch Claude OAuth profile (status {}).",
-            response.status().as_u16()
-        ));
+        let status = response.status().as_u16();
+        let msg = format!("Could not fetch Claude OAuth profile (status {status}).");
+        if status >= 500 {
+            sentry::capture_message(&msg, sentry::Level::Error);
+        }
+        return Err(msg);
     }
 
     let body: serde_json::Value = response
         .json()
-        .map_err(|err| format!("Could not parse Claude OAuth profile: {err}"))?;
+        .map_err(|err| {
+            let msg = format!("Could not parse Claude OAuth profile: {err}");
+            sentry::capture_message(&msg, sentry::Level::Error);
+            msg
+        })?;
 
     parse_oauth_profile_value(&body)
         .ok_or_else(|| "Claude OAuth profile response was missing account details.".to_string())
@@ -1009,18 +1062,15 @@ mod tests {
     #[test]
     fn pricing_policy_uses_the_reduced_monthly_prices() {
         assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Pro)
-                .map(|policy| policy.monthly_price_usd),
+            pricing_policy_for_plan(&ClaudePlanTier::Pro).map(|policy| policy.monthly_price_usd),
             Some(2.5)
         );
         assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Max5x)
-                .map(|policy| policy.monthly_price_usd),
+            pricing_policy_for_plan(&ClaudePlanTier::Max5x).map(|policy| policy.monthly_price_usd),
             Some(12.5)
         );
         assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Max20x)
-                .map(|policy| policy.monthly_price_usd),
+            pricing_policy_for_plan(&ClaudePlanTier::Max20x).map(|policy| policy.monthly_price_usd),
             Some(25.0)
         );
     }

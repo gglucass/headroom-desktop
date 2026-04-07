@@ -115,6 +115,10 @@ impl AppState {
                 &self.tool_manager.managed_python(),
             ) {
                 eprintln!("failed to ensure RTK integrations during app launch: {err}");
+                sentry::capture_message(
+                    &format!("RTK integrations failed during warm_runtime_on_launch: {err}"),
+                    sentry::Level::Warning,
+                );
             }
 
             // If Headroom ships a newer pinned Headroom version than what's
@@ -122,11 +126,19 @@ impl AppState {
             if self.tool_manager.headroom_needs_upgrade() {
                 if let Err(err) = self.tool_manager.upgrade_headroom() {
                     eprintln!("failed to auto-upgrade headroom: {err}");
+                    sentry::capture_message(
+                        &format!("headroom auto-upgrade failed: {err}"),
+                        sentry::Level::Error,
+                    );
                 }
             }
 
             if let Err(err) = self.ensure_headroom_running() {
                 eprintln!("failed to auto-start headroom during app launch: {err}");
+                sentry::capture_message(
+                    &format!("headroom auto-start failed during launch: {err}"),
+                    sentry::Level::Error,
+                );
             }
         }
     }
