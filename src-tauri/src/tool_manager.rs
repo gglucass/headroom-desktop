@@ -24,6 +24,8 @@ const HEADROOM_SERIES: &str = "0.5";
 /// Days a new release must be on PyPI before it is eligible for auto-upgrade
 /// (unless it is at or above HEADROOM_MIN_VERSION).
 const HEADROOM_UPGRADE_HOLD_DAYS: i64 = 7;
+/// Known-bad releases that should never be auto-installed.
+const HEADROOM_BLOCKED_VERSIONS: &[&str] = &["0.5.20"];
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
@@ -631,32 +633,34 @@ impl ToolManager {
     }
 
     /// Queries PyPI for the best eligible 0.5.X release and returns it if it
-    /// is newer than what is installed. Returns None when already up to date,
-    /// when PyPI is unreachable, or when no receipt exists yet (bootstrap
-    /// handles first-install separately).
+    /// differs from what is installed. This allows us to upgrade within the
+    /// supported series while also downgrading users off blocked releases.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
         let installed = self.installed_headroom_version()?;
-        let best = fetch_best_headroom_release()?;
         let installed_semver = parse_semver(&installed)?;
+        let best = fetch_best_headroom_release()?;
         let best_semver = parse_semver(&best.version)?;
-        if best_semver > installed_semver {
+        let installed_is_blocked = is_blocked_headroom_version(&installed);
+
+        if installed_is_blocked || best_semver > installed_semver {
             Some(best)
         } else {
             None
         }
     }
 
-    /// Applies a previously-fetched release, upgrading Headroom in place.
+    /// Applies a previously-fetched release, upgrading or downgrading
+    /// Headroom in place.
     pub fn upgrade_headroom(&self, release: &HeadroomRelease) -> Result<()> {
         let old = self
             .installed_headroom_version()
             .unwrap_or("unknown".into());
         eprintln!(
-            "headroom: upgrading from {} to {}",
+            "headroom: syncing from {} to {}",
             old, release.version
         );
         self.install_headroom_release(release)
-            .context("upgrading headroom")
+            .context("syncing headroom release")
     }
 
     pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
@@ -1012,6 +1016,7 @@ impl ToolManager {
             ToolStatus::NotInstalled
         }
     }
+
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -1035,6 +1040,23 @@ fn headroom_startup_variants() -> Vec<Vec<&'static str>> {
     ]]
 }
 
+fn patch_headroom_proxy_server_security_attr(contents: &str) -> Option<String> {
+    if contents.contains("self.security =") || !contents.contains("if self.security:") {
+        return None;
+    }
+
+    let anchor = "        # Initialize providers\n";
+    if !contents.contains(anchor) {
+        return None;
+    }
+
+    Some(contents.replacen(
+        anchor,
+        "        self.security = None\n\n        # Initialize providers\n",
+        1,
+    ))
+}
+
 struct DownloadArtifact {
     url: String,
     sha256: Option<&'static str>,
@@ -1056,7 +1078,12 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Queries PyPI for the latest eligible release in HEADROOM_SERIES.
+fn is_blocked_headroom_version(version: &str) -> bool {
+    HEADROOM_BLOCKED_VERSIONS.contains(&version)
+}
+
+/// Queries PyPI for the latest eligible release in HEADROOM_SERIES, excluding
+/// known-bad versions.
 ///
 /// A release is eligible when either:
 ///   - it has been on PyPI for at least HEADROOM_UPGRADE_HOLD_DAYS, or
@@ -1076,7 +1103,7 @@ fn fetch_best_headroom_release() -> Option<HeadroomRelease> {
     let mut best: Option<((u32, u32, u32), HeadroomRelease)> = None;
 
     for (version_str, files) in releases {
-        if !version_str.starts_with(&series_prefix) {
+        if !version_str.starts_with(&series_prefix) || is_blocked_headroom_version(version_str) {
             continue;
         }
         let semver = match parse_semver(version_str) {
@@ -1364,7 +1391,10 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{headroom_startup_variants, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT};
+    use super::{
+        headroom_startup_variants, is_blocked_headroom_version, parse_semver, ManagedRuntime,
+        ToolManager, HEADROOM_PROXY_PORT,
+    };
 
     #[test]
     fn managed_python_paths_live_inside_headroom_root() {
@@ -1406,6 +1436,18 @@ mod tests {
                 "--no-http2",
             ]]
         );
+    }
+
+    #[test]
+    fn parse_semver_parses_three_part_versions() {
+        assert_eq!(parse_semver("0.5.19"), Some((0, 5, 19)));
+    }
+
+    #[test]
+    fn blocked_headroom_versions_exclude_known_bad_release() {
+        assert!(is_blocked_headroom_version("0.5.20"));
+        assert!(!is_blocked_headroom_version("0.5.19"));
+        assert!(!is_blocked_headroom_version("0.5.21"));
     }
 
     #[test]

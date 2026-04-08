@@ -45,7 +45,7 @@ function daysFromNow(n: number): string {
 function makeStatus(overrides: Partial<HeadroomPricingStatus> = {}): HeadroomPricingStatus {
   const now = new Date();
   const graceStart = hoursAgo(2);
-  const graceEnd = new Date(new Date(graceStart).getTime() + 24 * 60 * 60 * 1000).toISOString();
+  const graceEnd = new Date(new Date(graceStart).getTime() + 72 * 60 * 60 * 1000).toISOString();
   return {
     authenticated: false,
     localGraceStartedAt: graceStart,
@@ -117,10 +117,11 @@ describe("maybeFireTrialNotifications", () => {
   });
 
   describe("grace period notifications", () => {
-    it("fires the 1-hour notification when exactly 1 hour has elapsed", async () => {
+    it("fires the 16-hour-left notification when 16 or fewer hours remain", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(1.1) });
+      const graceEnd = hoursFromNow(15.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -130,10 +131,11 @@ describe("maybeFireTrialNotifications", () => {
       });
     });
 
-    it("fires the 8-hour notification when 8+ hours have elapsed", async () => {
+    it("fires the 8-hour-left notification when 8 or fewer hours remain", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(9) });
+      const graceEnd = hoursFromNow(7.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -143,10 +145,11 @@ describe("maybeFireTrialNotifications", () => {
       });
     });
 
-    it("fires the 16-hour notification when 16+ hours have elapsed", async () => {
+    it("fires the 1-hour-left notification when 1 or fewer hours remain", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(17) });
+      const graceEnd = hoursFromNow(0.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -156,10 +159,11 @@ describe("maybeFireTrialNotifications", () => {
       });
     });
 
-    it("does not fire when less than 1 hour has elapsed", async () => {
+    it("does not fire when more than 16 hours remain", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(0.5) });
+      const graceEnd = hoursFromNow(17);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -168,8 +172,9 @@ describe("maybeFireTrialNotifications", () => {
 
     it("does not repeat a threshold that was already sent", async () => {
       isVisibleMock.mockResolvedValue(false);
-      installStorage({ headroom_grace_notif_threshold: "1" }); // 8h threshold already sent
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(9) });
+      installStorage({ headroom_grace_notif_threshold: "1" }); // 8h-left threshold already sent
+      const graceEnd = hoursFromNow(7.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -178,8 +183,9 @@ describe("maybeFireTrialNotifications", () => {
 
     it("sends the next threshold when a lower one was already sent", async () => {
       isVisibleMock.mockResolvedValue(false);
-      installStorage({ headroom_grace_notif_threshold: "0" }); // 1h sent, 8h not yet
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(9) });
+      installStorage({ headroom_grace_notif_threshold: "0" }); // 16h-left sent, 8h-left not yet
+      const graceEnd = hoursFromNow(7.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -188,8 +194,9 @@ describe("maybeFireTrialNotifications", () => {
 
     it("records the threshold index in localStorage after sending", async () => {
       isVisibleMock.mockResolvedValue(false);
-      const storage = installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(1.1) });
+      installStorage();
+      const graceEnd = hoursFromNow(15.5);
+      const status = makeStatus({ localGraceEndsAt: graceEnd });
 
       await maybeFireTrialNotifications(status);
 
@@ -204,7 +211,7 @@ describe("maybeFireTrialNotifications", () => {
       installStorage();
       const status = makeStatus({
         authenticated: true,
-        localGraceStartedAt: hoursAgo(9),
+        localGraceEndsAt: hoursFromNow(7.5),
       });
 
       await maybeFireTrialNotifications(status);
@@ -217,7 +224,7 @@ describe("maybeFireTrialNotifications", () => {
       installStorage();
       const status = makeStatus({
         localGraceActive: false,
-        localGraceStartedAt: hoursAgo(25),
+        localGraceStartedAt: hoursAgo(73),
       });
 
       await maybeFireTrialNotifications(status);
@@ -227,11 +234,9 @@ describe("maybeFireTrialNotifications", () => {
 
     it("uses urgent copy when fewer than 3 hours remain", async () => {
       isVisibleMock.mockResolvedValue(false);
-      installStorage({ headroom_grace_notif_threshold: "1" }); // 8h sent, 16h eligible
-      const graceStarted = hoursAgo(22);
-      const graceEnd = new Date(new Date(graceStarted).getTime() + 24 * 60 * 60 * 1000).toISOString();
+      installStorage({ headroom_grace_notif_threshold: "1" }); // 8h-left sent, 1h-left eligible
+      const graceEnd = hoursFromNow(0.5);
       const status = makeStatus({
-        localGraceStartedAt: graceStarted,
         localGraceEndsAt: graceEnd,
       });
 
@@ -247,7 +252,7 @@ describe("maybeFireTrialNotifications", () => {
       isVisibleMock.mockResolvedValue(false);
       invokeMock.mockRejectedValueOnce(new Error("notifications disabled"));
       installStorage();
-      const status = makeStatus({ localGraceStartedAt: hoursAgo(1.1) });
+      const status = makeStatus({ localGraceEndsAt: hoursFromNow(15.5) });
 
       await expect(maybeFireTrialNotifications(status)).resolves.toBeUndefined();
     });

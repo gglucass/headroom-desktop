@@ -3,11 +3,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type { HeadroomPricingStatus } from "./types";
 
-// Offsets from localGraceStartedAt at which to fire grace period notifications.
-const GRACE_THRESHOLDS_MS = [
-  1 * 60 * 60 * 1000,  // 1 hour
-  8 * 60 * 60 * 1000,  // 8 hours
-  16 * 60 * 60 * 1000, // 16 hours
+// Remaining-time thresholds at which to fire grace period notifications.
+const GRACE_HOURS_LEFT_THRESHOLDS = [
+  16,
+  8,
+  1,
 ];
 
 const GRACE_THRESHOLD_KEY = "headroom_grace_notif_threshold";
@@ -34,26 +34,25 @@ export async function maybeFireTrialNotifications(
 async function maybeFireGraceNotification(
   status: HeadroomPricingStatus
 ): Promise<void> {
-  const graceStarted = new Date(status.localGraceStartedAt).getTime();
+  const graceEndsAt = new Date(status.localGraceEndsAt).getTime();
   const now = Date.now();
-  const elapsed = now - graceStarted;
+  const hoursLeftRaw = (graceEndsAt - now) / (60 * 60 * 1000);
   const lastSent = parseInt(localStorage.getItem(GRACE_THRESHOLD_KEY) ?? "-1", 10);
 
   let nextIndex = -1;
-  for (let i = GRACE_THRESHOLDS_MS.length - 1; i >= 0; i--) {
-    if (elapsed >= GRACE_THRESHOLDS_MS[i] && i > lastSent) {
+  for (let i = GRACE_HOURS_LEFT_THRESHOLDS.length - 1; i >= 0; i--) {
+    if (hoursLeftRaw <= GRACE_HOURS_LEFT_THRESHOLDS[i] && i > lastSent) {
       nextIndex = i;
       break;
     }
   }
   if (nextIndex === -1) return;
 
-  const graceEndsAt = new Date(status.localGraceEndsAt).getTime();
   const hoursLeft = Math.max(0, Math.round((graceEndsAt - now) / (60 * 60 * 1000)));
   const body =
     hoursLeft <= 2
       ? `Less than ${hoursLeft + 1} hour(s) left. Create a Headroom account to start your 14-day trial.`
-      : `${hoursLeft} hours left in your free day. Create an account to unlock a 14-day trial.`;
+      : `${hoursLeft} hours left in your 72-hour access window. Create an account to unlock a 14-day trial.`;
 
   await sendNotification("Start Your Headroom Trial", body);
   localStorage.setItem(GRACE_THRESHOLD_KEY, String(nextIndex));

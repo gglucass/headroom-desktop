@@ -19,7 +19,7 @@ const HEADROOM_ACCOUNT_SESSION_ACCOUNT: &str = "session-token";
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
-const LOCAL_GRACE_PERIOD_HOURS: i64 = 24;
+const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
 // Set to true in dev builds to skip sign-in requirement (indefinite trial)
 #[cfg(debug_assertions)]
 const INDEFINITE_TRIAL: bool = true;
@@ -513,7 +513,7 @@ fn evaluate_pricing_status(
                 .into();
     } else {
         gate_message =
-            "Headroom is active during your first local day. Create an account to unlock the 14-day trial before this grace period ends."
+            "Headroom is active during your first 72 hours. Create an account to unlock the 14-day trial before this grace period ends."
                 .into();
     }
 

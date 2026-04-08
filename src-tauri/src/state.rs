@@ -108,6 +108,7 @@ impl AppState {
 
     pub fn warm_runtime_on_launch(&self) {
         if self.tool_manager.python_runtime_installed() {
+            self.set_runtime_starting(true);
             self.enforce_pricing_gate();
 
             if let Err(err) = ensure_rtk_integrations(
@@ -121,14 +122,14 @@ impl AppState {
                 );
             }
 
-            // If a newer eligible 0.5.X release exists on PyPI (at least
-            // HEADROOM_UPGRADE_HOLD_DAYS old, or >= HEADROOM_MIN_VERSION),
-            // silently upgrade before starting the proxy.
+            // If a newer eligible 0.5.X release exists on PyPI, or the
+            // installed version is explicitly blocked, silently sync it before
+            // starting the proxy.
             if let Some(release) = self.tool_manager.check_headroom_upgrade() {
                 if let Err(err) = self.tool_manager.upgrade_headroom(&release) {
-                    eprintln!("failed to auto-upgrade headroom: {err}");
+                    eprintln!("failed to sync headroom release: {err}");
                     sentry::capture_message(
-                        &format!("headroom auto-upgrade failed: {err}"),
+                        &format!("headroom release sync failed: {err}"),
                         sentry::Level::Error,
                     );
                 }
@@ -141,6 +142,8 @@ impl AppState {
                     sentry::Level::Error,
                 );
             }
+
+            self.set_runtime_starting(false);
         }
     }
 

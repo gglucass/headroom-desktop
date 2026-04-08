@@ -969,6 +969,9 @@ pub fn run() {
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
+            if state.tool_manager.python_runtime_installed() {
+                state.set_runtime_starting(true);
+            }
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch();

@@ -10,12 +10,12 @@ import {
   type ReactNode
 } from "react";
 import {
-  PiggyBank,
   Bell,
   Brain,
   CaretLeft,
   Cpu,
   CurrencyDollar,
+  Info,
   EnvelopeSimple,
   GearSix,
   House,
@@ -235,10 +235,12 @@ async function loadDashboard(): Promise<DashboardState> {
 
 function SavingsChartTooltip({
   active,
-  payload
+  payload,
+  chartMode
 }: {
   active?: boolean;
-  payload?: Array<{ payload: SavingsChartDatum }>;
+  payload?: ReadonlyArray<{ payload?: SavingsChartDatum }>;
+  chartMode: SavingsChartMode;
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) {
@@ -248,40 +250,43 @@ function SavingsChartTooltip({
   return (
     <div className="savings-chart__tooltip">
       <strong>{point.bucketLabel}</strong>
-      <div className="savings-chart__tooltip-group">
-        <span className="savings-chart__tooltip-label">Dollars</span>
-        <span className="savings-chart__tooltip-item">
-          <i
-            aria-hidden="true"
-            className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
-          />
-          Saved {currencyExact(point.estimatedSavingsUsd)}
-        </span>
-        <span className="savings-chart__tooltip-item">
-          <i
-            aria-hidden="true"
-            className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
-          />
-          Spent {currencyExact(point.actualCostUsd)}
-        </span>
-      </div>
-      <div className="savings-chart__tooltip-group">
-        <span className="savings-chart__tooltip-label">Tokens</span>
-        <span className="savings-chart__tooltip-item">
-          <i
-            aria-hidden="true"
-            className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
-          />
-          Saved {compactNumber(point.estimatedTokensSaved)} tokens
-        </span>
-        <span className="savings-chart__tooltip-item">
-          <i
-            aria-hidden="true"
-            className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
-          />
-          Spent {compactNumber(point.totalTokensSent)} tokens
-        </span>
-      </div>
+      {chartMode === "usd" ? (
+        <div className="savings-chart__tooltip-group">
+          <span className="savings-chart__tooltip-label">Dollars</span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
+            />
+            Saved {currencyExact(point.estimatedSavingsUsd)}
+          </span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
+            />
+            Spent {currencyExact(point.actualCostUsd)}
+          </span>
+        </div>
+      ) : (
+        <div className="savings-chart__tooltip-group">
+          <span className="savings-chart__tooltip-label">Tokens</span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
+            />
+            Saved {compactNumber(point.estimatedTokensSaved)} tokens
+          </span>
+          <span className="savings-chart__tooltip-item">
+            <i
+              aria-hidden="true"
+              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
+            />
+            Spent {compactNumber(point.totalTokensSent)} tokens
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -307,15 +312,20 @@ function writeCachedPricing(pricing: CachedPricing) {
 }
 
 type SavingsChartView = "month" | "day";
+type SavingsChartMode = "usd" | "tokens";
 
 function DailySavingsChart({
   data,
   hourlyData,
-  resetSignal
+  resetSignal,
+  chartMode,
+  setChartMode
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
   resetSignal: number;
+  chartMode: SavingsChartMode;
+  setChartMode: (mode: SavingsChartMode) => void;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -348,25 +358,40 @@ function DailySavingsChart({
         <div className="savings-chart__panel-header">
           <div className="savings-chart__title-row">
             <strong>History</strong>
-            <div className="savings-chart__view-toggle" aria-label="History view">
+            <div className="savings-chart__toggle" aria-label="Metric">
               <button
-                className={`savings-chart__view-button${view === "month" ? " is-active" : ""}`}
+                className={`savings-chart__toggle-button${chartMode === "usd" ? " is-active" : ""}`}
+                onClick={() => setChartMode("usd")}
+                type="button"
+              >
+                $
+              </button>
+              <button
+                className={`savings-chart__toggle-button${chartMode === "tokens" ? " is-active" : ""}`}
+                onClick={() => setChartMode("tokens")}
+                type="button"
+              >
+                tokens
+              </button>
+            </div>
+          </div>
+          <div className="savings-chart__nav">
+            <div className="savings-chart__toggle" aria-label="History view">
+              <button
+                className={`savings-chart__toggle-button${view === "month" ? " is-active" : ""}`}
                 onClick={() => setView("month")}
                 type="button"
               >
                 month
               </button>
-              <span aria-hidden="true">/</span>
               <button
-                className={`savings-chart__view-button${view === "day" ? " is-active" : ""}`}
+                className={`savings-chart__toggle-button${view === "day" ? " is-active" : ""}`}
                 onClick={() => setView("day")}
                 type="button"
               >
                 day
               </button>
             </div>
-          </div>
-          <div className="savings-chart__nav">
             <button
               className="savings-chart__nav-button"
               disabled={view === "month" ? !canViewPreviousMonth : !canViewPreviousDay}
@@ -395,12 +420,22 @@ function DailySavingsChart({
           </div>
         </div>
         <div className="savings-chart__canvas savings-chart__canvas--combined">
+          <div className="savings-chart__overlay" aria-hidden="true">
+            <span className="savings-chart__overlay-total">
+              {chartMode === "usd"
+                ? currency(chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0))
+                : compactNumber(chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0))}
+            </span>
+            <span className="savings-chart__overlay-label">
+              {view === "day" ? "saved today" : "saved this month"}
+            </span>
+          </div>
           <ResponsiveContainer height="100%" width="100%">
             <BarChart
               barCategoryGap="5%"
               barGap={1}
               data={chartData}
-              margin={{ top: 8, right: 2, left: 2, bottom: 0 }}
+              margin={{ top: 64, right: 2, left: 2, bottom: 0 }}
             >
               <defs>
                 <linearGradient id="actualUsdGradient" x1="0" x2="0" y1="0" y2="1">
@@ -432,39 +467,61 @@ function DailySavingsChart({
               />
               <YAxis hide yAxisId="usd" />
               <YAxis hide yAxisId="tokens" />
-              <Tooltip content={<SavingsChartTooltip />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
-              <Bar
-                dataKey="actualCostUsd"
-                fill="url(#actualUsdGradient)"
-                maxBarSize={20}
-                stackId="usd"
-                yAxisId="usd"
-              />
-              <Bar
-                dataKey="estimatedSavingsUsd"
-                fill="url(#savingsUsdGradient)"
-                maxBarSize={16}
-                radius={[1, 1, 0, 0]}
-                stackId="usd"
-                yAxisId="usd"
-              />
-              <Bar
-                dataKey="totalTokensSent"
-                fill="url(#actualTokensGradient)"
-                maxBarSize={16}
-                stackId="tokens"
-                yAxisId="tokens"
-              />
-              <Bar
-                dataKey="estimatedTokensSaved"
-                fill="url(#savingsTokensGradient)"
-                maxBarSize={16}
-                radius={[1, 1, 0, 0]}
-                stackId="tokens"
-                stroke="#EBCC6E"
-                strokeWidth={1.5}
-                yAxisId="tokens"
-              />
+              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
+              {chartMode === "usd" && (
+                <>
+                  <Bar
+                    dataKey="actualCostUsd"
+                    fill="url(#actualUsdGradient)"
+                    maxBarSize={16}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                  <Bar
+                    dataKey="estimatedSavingsUsd"
+                    fill="url(#savingsUsdGradient)"
+                    maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                </>
+              )}
+              {chartMode === "tokens" && (
+                <>
+                  <Bar
+                    dataKey="totalTokensSent"
+                    fill="url(#actualTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
+                  />
+                  <Bar
+                    dataKey="estimatedTokensSaved"
+                    fill="url(#savingsTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
+                    shape={(props: any) => {
+                      const { x, y, width, height, fill } = props;
+                      if (!width || !height) return <g />;
+                      const sw = 1.5;
+                      return (
+                        <rect
+                          x={x + sw / 2}
+                          y={y + sw / 2}
+                          width={Math.max(0, width - sw)}
+                          height={Math.max(0, height - sw)}
+                          fill={fill}
+                          stroke="#EBCC6E"
+                          strokeWidth={sw}
+                          rx={1}
+                        />
+                      );
+                    }}
+                  />
+                </>
+              )}
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -613,6 +670,8 @@ export default function App() {
   const [stepEtaSeedSeconds, setStepEtaSeedSeconds] = useState(0);
   const [stepBasePercent, setStepBasePercent] = useState(0);
   const [chartResetSignal, setChartResetSignal] = useState(0);
+  const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
+  const [showSavingsInfo, setShowSavingsInfo] = useState(false);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState("");
@@ -783,7 +842,7 @@ export default function App() {
         }
       }
 
-      updateStartup("runtime", 80, "Verifying runtime health…");
+      updateStartup("runtime", 80, "Preparing Headroom runtime…");
       const [runtimeResult, pricingResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
         invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
@@ -2176,8 +2235,6 @@ export default function App() {
     }, 400);
   }
 
-  const sessionSavingsPct = Math.round(dashboard.sessionSavingsPct);
-  const sessionTotalTokensSaved = dashboard.sessionEstimatedTokensSaved;
   const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
   const headroomVersion = headroomTool?.version ?? "Unknown";
   const lifetimeTotalTokensSent = dashboard.dailySavings.reduce(
@@ -2905,7 +2962,7 @@ export default function App() {
       if (!pricingStatus.localGraceActive) {
         return {
           tone: "expired" as const,
-          message: "Local Headroom trial expired. Create an account to extend to 14 days.",
+          message: "Your 72-hour Headroom access expired. Create an account to extend to 14 days.",
           actionLabel: "Sign up",
           onAction: openUpgradeAuthView
         };
@@ -2913,10 +2970,10 @@ export default function App() {
       const hoursLabel =
         localGraceHoursRemaining != null
           ? `${localGraceHoursRemaining} hour${localGraceHoursRemaining === 1 ? "" : "s"}`
-          : "24 hours";
+          : "72 hours";
       return {
         tone: "warning" as const,
-        message: `${hoursLabel} to go in your trial period. Create an account to extend trial to 14 days.`,
+        message: `${hoursLabel} left in your 72-hour access window. Create an account to extend your trial to 14 days.`,
         actionLabel: "Sign up",
         onAction: openUpgradeAuthView
       };
@@ -3127,32 +3184,41 @@ export default function App() {
               )}
             </section>
 
-            <section className="stat-grid">
-              <article className="soft-card stat-card">
+            <section className="stat-grid stat-grid--2col">
+              <article
+                className={`soft-card stat-card stat-card--clickable${chartMode === "usd" ? " is-active" : ""}`}
+                onClick={() => setChartMode("usd")}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => e.key === "Enter" && setChartMode("usd")}
+              >
                 <span className="stat-card__label">
                   <CurrencyDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Savings this session
+                  Total costs saved (estimate)
+                  <button
+                    className="stat-card__info-button"
+                    onClick={(e) => { e.stopPropagation(); setShowSavingsInfo(true); }}
+                    type="button"
+                    aria-label="How savings are calculated"
+                  >
+                    <Info size={13} weight="bold" />
+                  </button>
                 </span>
-                <strong className="stat-value--green">{currency(dashboard.sessionEstimatedSavingsUsd)}</strong>
+                <strong className="stat-value--green">{currency(dashboard.lifetimeEstimatedSavingsUsd)}</strong>
               </article>
-              <article className="soft-card stat-card">
+              <article
+                className={`soft-card stat-card stat-card--clickable${chartMode === "tokens" ? " is-active" : ""}`}
+                onClick={() => setChartMode("tokens")}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => e.key === "Enter" && setChartMode("tokens")}
+              >
                 <span className="stat-card__label">
                   <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Token savings
+                  Total tokens saved
                 </span>
                 <strong className="stat-value--blue">
-                  {compactNumber(sessionTotalTokensSaved)}
-                  {sessionSavingsPct > 0 && <span className="stat-secondary"> {sessionSavingsPct}%</span>}
-                </strong>
-              </article>
-              <article className="soft-card stat-card">
-                <span className="stat-card__label">
-                  <PiggyBank aria-hidden="true" className="stat-card__icon" size={15} weight="bold" />
-                  All-time savings
-                </span>
-                <strong className="stat-value--muted">
-                  {currency(dashboard.lifetimeEstimatedSavingsUsd)}
-                  <span className="stat-secondary"> / {compactNumber(dashboard.lifetimeEstimatedTokensSaved)}</span>
+                  {compactNumber(dashboard.lifetimeEstimatedTokensSaved)}
                 </strong>
               </article>
             </section>
@@ -3161,6 +3227,8 @@ export default function App() {
               data={dashboard.dailySavings}
               hourlyData={dashboard.hourlySavings}
               resetSignal={chartResetSignal}
+              chartMode={chartMode}
+              setChartMode={setChartMode}
             />
 
           </div>
@@ -3921,6 +3989,33 @@ export default function App() {
             </section>
           </div>
 
+          {showSavingsInfo && (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => setShowSavingsInfo(false)}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>How savings are calculated</h3>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude.</p>
+                <p>Savings = tokens removed &times; API token prices.</p>
+                <p>This is an optimistic estimate.</p>
+                <p>Without Headroom, when tokens are sent to Claude for the first time they would be stored in their cache. Once in the cache, whenever these same tokens are sent again Claude applies a 90% discount to their cost. In our testing, this can reduce the actual savings by at most 50%.</p>
+                <p>Even accounting for caching, you've likely saved at least <strong>{currency(dashboard.lifetimeEstimatedSavingsUsd * 0.5)}</strong>.</p>
+                <div className="modal-actions">
+                  <button
+                    className="button button--primary"
+                    onClick={() => setShowSavingsInfo(false)}
+                    type="button"
+                  >
+                    Got it
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {showAppUpdateDialog && appUpdateAvailable ? (
             <div className="modal-backdrop" role="dialog" aria-modal="true">
               <div className="modal-card">
@@ -3941,14 +4036,6 @@ export default function App() {
                     Published: {formatDateTime(appUpdateAvailable.publishedAt ?? null)}
                   </li>
                 </ul>
-                {appUpdateAvailable.notes ? (
-                  <>
-                    <label htmlFor="app-update-notes">Release notes</label>
-                    <pre id="app-update-notes" className="app-update-notes">
-                      {appUpdateAvailable.notes}
-                    </pre>
-                  </>
-                ) : null}
                 <div className="modal-actions">
                   <button
                     className="secondary-button"

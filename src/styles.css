@@ -1609,6 +1609,10 @@ select {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.stat-grid--2col {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .home-grid {
   grid-template-columns: 1.3fr 1fr;
 }
@@ -1625,6 +1629,35 @@ select {
   padding: 20px 16px;
   min-height: 110px;
   background: #fefdfc;
+}
+
+.stat-card__info-button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #b0a89e;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  line-height: 1;
+}
+
+.stat-card__info-button:hover {
+  color: #6e645c;
+}
+
+.stat-card--clickable {
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+
+.stat-card--clickable:hover {
+  border-color: rgba(36, 31, 29, 0.2);
+}
+
+.stat-card--clickable.is-active {
+  border-color: #c4a35a;
 }
 
 .panel-card {
@@ -1726,26 +1759,32 @@ select {
   text-align: center;
 }
 
-.savings-chart__view-toggle {
+.savings-chart__toggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
+  background: rgba(36, 31, 29, 0.07);
+  border-radius: 999px;
+  padding: 2px;
+}
+
+.savings-chart__toggle-button {
+  border: 0;
+  padding: 3px 9px;
+  background: transparent;
+  border-radius: 999px;
   font-size: var(--text-xs);
   color: #8a817a;
-}
-
-.savings-chart__view-button {
-  border: 0;
-  padding: 0;
-  background: transparent;
-  color: inherit;
-  font-size: inherit;
+  font-weight: 500;
   cursor: pointer;
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
 }
 
-.savings-chart__view-button.is-active {
+.savings-chart__toggle-button.is-active {
+  background: #fff;
   color: #2f2925;
-  font-weight: 700;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(36, 31, 29, 0.12);
 }
 
 .savings-chart__nav {
@@ -1753,6 +1792,32 @@ select {
   gap: 6px;
   align-items: center;
   justify-content: flex-end;
+}
+
+.savings-chart__overlay {
+  position: absolute;
+  top: 10px;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+  z-index: 1;
+  gap: 1px;
+}
+
+.savings-chart__overlay-total {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #2f2925;
+  line-height: 1.2;
+}
+
+.savings-chart__overlay-label {
+  font-size: 0.7rem;
+  color: #9e948e;
+  font-weight: 400;
 }
 
 .savings-chart__nav-button {
@@ -1773,10 +1838,11 @@ select {
 
 .savings-chart__canvas {
   width: 100%;
+  position: relative;
 }
 
 .savings-chart__canvas--combined {
-  height: 208px;
+  height: 240px;
 }
 
 .savings-chart__tooltip {
@@ -2217,20 +2283,6 @@ details[open] .optimize-minimal__details summary::after {
   justify-content: flex-end;
   gap: 8px;
   align-items: center;
-}
-
-.app-update-notes {
-  margin: 0;
-  max-height: 180px;
-  overflow: auto;
-  border-radius: 10px;
-  background: #f8f5f1;
-  border: 1px solid rgba(36, 31, 29, 0.12);
-  padding: 10px;
-  font-size: var(--text-xs);
-  line-height: 1.45;
-  white-space: pre-wrap;
-  color: #2b2521;
 }
 
 .api-key-guide {

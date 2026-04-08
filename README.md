@@ -142,4 +142,10 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 
 ## Dependency pinning
 
-`headroom-ai[all]==0.5.18` is the current pinned PyPI version. Before each app release, validate against the latest published headroom version and bump the pin deliberately.
+`headroom-ai` auto-upgrades to the latest `0.5.X` release on startup. The upgrade logic is in `src-tauri/src/tool_manager.rs` and is controlled by three constants:
+
+- `HEADROOM_MIN_VERSION` - floor version; upgrades to this version (or above) are applied immediately regardless of age. Bump this when a specific release must ship to all users right away.
+- `HEADROOM_SERIES` - the major.minor series to track (e.g. `"0.5"`). Update this when moving to a new minor series.
+- `HEADROOM_UPGRADE_HOLD_DAYS` - new releases younger than this (default: 7 days) are skipped unless they are at or above `HEADROOM_MIN_VERSION`.
+
+The app queries `https://pypi.org/pypi/headroom-ai/json` at launch, picks the highest eligible release, verifies its sha256 (from PyPI metadata), and installs it if newer than what is installed. If PyPI is unreachable the existing install is left untouched.
