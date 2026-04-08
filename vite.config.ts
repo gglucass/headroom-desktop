@@ -1,9 +1,8 @@
 import react from "@vitejs/plugin-react";
-import cssInjectedByJs from "vite-plugin-css-injected-by-js";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  plugins: [react(), cssInjectedByJs()],
+  plugins: [react()],
   clearScreen: false,
   test: {
     coverage: {
