@@ -6,6 +6,10 @@ import App from "./App";
 import "./styles.css";
 
 Clarity.init(import.meta.env.VITE_CLARITY_PROJECT_ID);
+Clarity.consent(!document.hidden);
+document.addEventListener("visibilitychange", () => {
+  Clarity.consent(!document.hidden);
+});
 
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,
