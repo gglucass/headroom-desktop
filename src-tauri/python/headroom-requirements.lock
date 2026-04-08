@@ -1,5 +1,5 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: Headroom managed runtime freeze captured on 2026-04-03 for headroom-ai[all]==0.5.18.
+# Source: Headroom managed runtime freeze captured on 2026-04-03 for headroom-ai[all]==0.5.21.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5

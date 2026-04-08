@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::process::Command;
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -150,7 +150,14 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
     }
 
     let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-    *savings_state.0.lock().unwrap() = dashboard.session_estimated_savings_usd;
+    let today_key = Local::now().format("%Y-%m-%d").to_string();
+    let today_savings = dashboard
+        .daily_savings
+        .iter()
+        .find(|p| p.date == today_key)
+        .map(|p| p.estimated_savings_usd)
+        .unwrap_or(0.0);
+    *savings_state.0.lock().unwrap() = today_savings;
 
     dashboard
 }
@@ -1792,7 +1799,14 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let state: tauri::State<'_, AppState> = app.state();
-            let savings = state.dashboard().session_estimated_savings_usd;
+            let dashboard = state.dashboard();
+            let today_key = Local::now().format("%Y-%m-%d").to_string();
+            let savings = dashboard
+                .daily_savings
+                .iter()
+                .find(|p| p.date == today_key)
+                .map(|p| p.estimated_savings_usd)
+                .unwrap_or(0.0);
             let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
             *savings_state.0.lock().unwrap() = savings;
         }

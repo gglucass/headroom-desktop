@@ -80,6 +80,33 @@
         font-size: 0.86rem;
         color: #4f4742;
       }
+
+      @media (prefers-color-scheme: dark) {
+        #boot-loading {
+          background:
+            radial-gradient(circle at top left, rgba(60, 55, 40, 0.5), transparent 22%),
+            linear-gradient(180deg, #1e1c19 0%, #1a1815 100%);
+          color: #f2ede8;
+        }
+
+        .boot-loading__panel {
+          background: rgba(38, 34, 30, 0.95);
+          border-color: rgba(255, 255, 255, 0.1);
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+        }
+
+        .boot-loading__copy {
+          color: rgba(242, 237, 232, 0.6);
+        }
+
+        .boot-loading__track {
+          background: rgba(255, 255, 255, 0.1);
+        }
+
+        .boot-loading__status {
+          color: rgba(242, 237, 232, 0.55);
+        }
+      }
     </style>
   </head>
   <body>

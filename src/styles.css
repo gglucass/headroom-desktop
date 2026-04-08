@@ -2414,6 +2414,11 @@ details[open] .optimize-minimal__details summary::after {
   color: var(--text-muted);
   font-size: var(--text-sm);
   text-decoration: none;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  width: 100%;
 }
 
 .contact-link:hover {
@@ -2972,6 +2977,14 @@ html.window-hiding {
     border-right-color: rgba(255, 255, 255, 0.08);
   }
 
+  .tray-nav__item {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  .tray-nav__item.is-active {
+    color: #f2ede8;
+  }
+
   .tray-nav__item .tray-nav__icon {
     color: rgba(242, 237, 232, 0.75);
   }
@@ -3030,6 +3043,69 @@ html.window-hiding {
   .upgrade-trial-callout {
     background: rgba(255, 255, 255, 0.07);
     border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-trial-callout--healthy {
+    background: rgba(79, 158, 145, 0.1);
+    border-color: rgba(79, 158, 145, 0.25);
+  }
+
+  .upgrade-trial-callout--warning {
+    background: rgba(220, 143, 26, 0.1);
+    border-color: rgba(220, 143, 26, 0.22);
+  }
+
+  .upgrade-trial-callout--expired {
+    background: rgba(193, 75, 36, 0.1);
+    border-color: rgba(193, 75, 36, 0.22);
+  }
+
+  .upgrade-trial-callout__message {
+    color: rgba(242, 237, 232, 0.85);
+  }
+
+  /* Pricing status card variants */
+  .pricing-status-card--trial {
+    background: rgba(220, 143, 26, 0.08);
+    border-color: rgba(220, 143, 26, 0.22);
+  }
+
+  .pricing-status-card--blocked {
+    background: rgba(193, 75, 36, 0.08);
+    border-color: rgba(193, 75, 36, 0.22);
+  }
+
+  /* Pricing metric */
+  .pricing-metric strong {
+    color: #f2ede8;
+  }
+
+  .pricing-metric small,
+  .pricing-metric__label,
+  .pricing-auth-field {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  /* Pricing auth input */
+  .pricing-auth-field__input {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f2ede8;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  /* Invite section */
+  .pricing-status-card__invite-label {
+    color: #6cbf9b;
+  }
+
+  .pricing-status-card__invite span {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  .pricing-status-card__invite-actions code {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #f2ede8;
   }
 
   .settings-action-card {
@@ -3139,5 +3215,299 @@ html.window-hiding {
 
   .pricing-status-card__invite {
     background: rgba(95, 166, 136, 0.12);
+  }
+
+  /* Text: primary */
+  .stat-card__icon,
+  .savings-chart__panel-header strong,
+  .savings-chart__overlay-total,
+  .optimize-card__title-icon,
+  .settings-account-copy,
+  .app-update-card__summary,
+  .runtime-status strong,
+  .summary-row strong,
+  .link-button:hover {
+    color: #f2ede8;
+  }
+
+  /* Text: secondary/muted */
+  .callout-banner p,
+  .activity-item p,
+  .candidate-item p,
+  .client-item p,
+  .tip-card p,
+  .tip-card small,
+  .savings-chart__range-label,
+  .savings-chart__toggle-button,
+  .savings-chart__tooltip-label,
+  .savings-chart__overlay-label,
+  .optimize-project-row__name small,
+  .optimize-project-row__status,
+  .optimize-card__blurb,
+  .optimize-minimal__blurb,
+  .optimize-minimal__meta,
+  .headroom-learn__progress p,
+  .settings-account-copy em,
+  .app-update-card__meta,
+  .runtime-status__grid,
+  .runtime-status__label,
+  .runtime-status__summary,
+  .runtime-status__section-context,
+  .runtime-status p,
+  .connector-item p,
+  .connector-tooltip,
+  .loading-copy,
+  .modal-card p,
+  .modal-card label,
+  .api-key-guide,
+  .link-button,
+  .launcher-restart-hint,
+  .proxy-verify-item__message,
+  .upgrade-plan-card__title-block p,
+  .upgrade-plan-card__price-block span,
+  .upgrade-plan-card__features li {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  .optimize-project-row__name strong,
+  .runtime-status__section-title {
+    color: rgba(242, 237, 232, 0.9);
+  }
+
+  .optimize-minimal__mono {
+    color: rgba(242, 237, 232, 0.7);
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .runtime-status__indicator--off {
+    color: rgba(242, 237, 232, 0.3);
+  }
+
+  /* Chart */
+  .savings-chart__toggle {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .savings-chart__toggle-button.is-active {
+    background: rgba(255, 255, 255, 0.14);
+    color: #f2ede8;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+
+  .savings-chart__nav-button {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .savings-chart__tooltip {
+    background: #2e2b28;
+    border-color: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+  }
+
+  .savings-chart__tooltip strong {
+    color: #f2ede8;
+  }
+
+  /* Dividers */
+  .activity-item,
+  .summary-row,
+  .client-item,
+  .candidate-item,
+  .connector-item {
+    border-top-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-plan-card__action {
+    border-bottom-color: rgba(255, 255, 255, 0.08);
+  }
+
+  /* Badges/chips */
+  .hero__stats span,
+  .summary-row span,
+  .activity-item__meta span,
+  .tool-row__title span,
+  .client-item span,
+  .candidate-item span,
+  .tip-card__meta span,
+  .connector-state,
+  .connector-help {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+  }
+
+  .connector-state.is-good {
+    background: rgba(108, 191, 155, 0.2);
+    color: #6cbf9b;
+  }
+
+  .connector-state.is-warning {
+    background: rgba(228, 193, 124, 0.2);
+    color: #e4c17c;
+  }
+
+  .connector-state.is-muted {
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(242, 237, 232, 0.5);
+  }
+
+  .connector-warning-help {
+    background: rgba(203, 128, 39, 0.2);
+    color: #e4a84a;
+  }
+
+  /* Tool sections */
+  .tool-stats article {
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .tool-log-viewer {
+    background: rgba(0, 0, 0, 0.2);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .tool-log-viewer pre {
+    color: rgba(242, 237, 232, 0.8);
+  }
+
+  /* Upgrade pill */
+  .upgrade-pill {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .upgrade-pill.is-active {
+    background: rgba(79, 158, 145, 0.2);
+    color: #6cbf9b;
+    border-color: rgba(79, 158, 145, 0.3);
+  }
+
+  /* Upgrade plan card */
+  .upgrade-plan-card {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .upgrade-plan-card--featured {
+    border-color: rgba(95, 166, 136, 0.4);
+  }
+
+  .upgrade-plan-card__icon {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+  }
+
+  .upgrade-plan-card--featured .upgrade-plan-card__icon {
+    background: rgba(79, 158, 145, 0.2);
+    color: #6cbf9b;
+  }
+
+  .upgrade-plan-card__price-block strong {
+    color: #f2ede8;
+  }
+
+  .upgrade-plan-card__original-price {
+    color: rgba(242, 237, 232, 0.4);
+  }
+
+  .upgrade-plan-card__sale-badge {
+    color: #6cbf9b;
+    background: rgba(108, 191, 155, 0.18);
+  }
+
+  .upgrade-plan-card__action {
+    border-bottom-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-sale-banner {
+    background: rgba(79, 158, 145, 0.1);
+    border-color: rgba(79, 158, 145, 0.25);
+  }
+
+  .upgrade-plan-grid__toggle {
+    color: rgba(242, 237, 232, 0.5);
+  }
+
+  .upgrade-plan-grid__toggle:hover {
+    color: #f2ede8;
+  }
+
+  /* Upgrade plan buttons */
+  .secondary-button.upgrade-plan-card__button,
+  .primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade),
+  .primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade):hover,
+  .primary-button.upgrade-plan-card__button--free:not(.upgrade-plan-card__button--downgrade):active {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(242, 237, 232, 0.8);
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+
+  .upgrade-plan-card__button--downgrade {
+    background: rgba(138, 74, 23, 0.18);
+    color: #e4a06a;
+    border-color: rgba(205, 112, 36, 0.3);
+  }
+
+  /* Client picker */
+  .client-picker__item {
+    background: rgba(255, 255, 255, 0.07);
+    color: rgba(242, 237, 232, 0.8);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  /* Switch */
+  .connector-switch {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.16);
+  }
+
+  /* Modal */
+  .modal-card input,
+  .modal-card select {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f2ede8;
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+
+  /* Settings action card */
+  .settings-action-card:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  .settings-action-card--danger {
+    background: rgba(138, 61, 61, 0.12);
+    border-color: rgba(138, 61, 61, 0.2);
+  }
+
+  .settings-action-card--danger:hover {
+    background: rgba(138, 61, 61, 0.18);
+  }
+
+  /* Semantic status badges */
+  [data-health="healthy"],
+  [data-status="healthy"],
+  [data-decision="include"],
+  [data-severity="info"] {
+    background: rgba(133, 191, 156, 0.15);
+    color: #6cbf9b;
+  }
+
+  [data-health="attention"],
+  [data-status="degraded"],
+  [data-decision="research"],
+  [data-severity="warning"] {
+    background: rgba(255, 204, 128, 0.15);
+    color: #e4c17c;
+  }
+
+  [data-health="not_detected"],
+  [data-status="not installed"],
+  [data-status="not_installed"],
+  [data-decision="defer"],
+  [data-severity="critical"] {
+    background: rgba(218, 151, 151, 0.15);
+    color: #e08080;
   }
 }

@@ -3976,12 +3976,13 @@ export default function App() {
                   ) : null}
                 </div>
               </article>
-              <a
+              <button
                 className="contact-link"
-                href="mailto:support@extraheadroom.com"
+                onClick={() => void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
+                type="button"
               >
                 Contact us
-              </a>
+              </button>
               <button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}

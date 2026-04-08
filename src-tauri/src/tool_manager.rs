@@ -18,7 +18,7 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Minimum acceptable version. Upgrades to versions below this are applied
 /// immediately regardless of the release-age hold period.
-const HEADROOM_MIN_VERSION: &str = "0.5.19";
+const HEADROOM_MIN_VERSION: &str = "0.5.21";
 /// The major.minor series we track for auto-upgrades (e.g. "0.5").
 const HEADROOM_SERIES: &str = "0.5";
 /// Days a new release must be on PyPI before it is eligible for auto-upgrade
@@ -1040,23 +1040,6 @@ fn headroom_startup_variants() -> Vec<Vec<&'static str>> {
     ]]
 }
 
-fn patch_headroom_proxy_server_security_attr(contents: &str) -> Option<String> {
-    if contents.contains("self.security =") || !contents.contains("if self.security:") {
-        return None;
-    }
-
-    let anchor = "        # Initialize providers\n";
-    if !contents.contains(anchor) {
-        return None;
-    }
-
-    Some(contents.replacen(
-        anchor,
-        "        self.security = None\n\n        # Initialize providers\n",
-        1,
-    ))
-}
-
 struct DownloadArtifact {
     url: String,
     sha256: Option<&'static str>,
@@ -1440,14 +1423,14 @@ mod tests {
 
     #[test]
     fn parse_semver_parses_three_part_versions() {
-        assert_eq!(parse_semver("0.5.19"), Some((0, 5, 19)));
+        assert_eq!(parse_semver("0.5.21"), Some((0, 5, 21)));
     }
 
     #[test]
     fn blocked_headroom_versions_exclude_known_bad_release() {
         assert!(is_blocked_headroom_version("0.5.20"));
-        assert!(!is_blocked_headroom_version("0.5.19"));
         assert!(!is_blocked_headroom_version("0.5.21"));
+        assert!(!is_blocked_headroom_version("0.5.22"));
     }
 
     #[test]
