@@ -1,8 +1,11 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
+import Clarity from "@microsoft/clarity";
 import App from "./App";
 import "./styles.css";
+
+Clarity.init(import.meta.env.VITE_CLARITY_PROJECT_ID);
 
 Sentry.init({
   dsn: import.meta.env.VITE_SENTRY_DSN,

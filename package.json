@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
     "release:check": "./scripts/verify-release.sh"
   },
   "dependencies": {
+    "@microsoft/clarity": "^1.0.2",
     "@phosphor-icons/react": "^2.1.10",
     "@sentry/react": "^10.47.0",
     "@tauri-apps/api": "^2.0.0",
