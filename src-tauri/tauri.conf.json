@@ -23,7 +23,11 @@
         "skipTaskbar": true,
         "decorations": false,
         "center": true,
-        "backgroundColor": "#e7e3dd"
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       },
       {
         "label": "launcher",
@@ -37,7 +41,11 @@
         "skipTaskbar": true,
         "decorations": false,
         "center": true,
-        "backgroundColor": "#e7e3dd"
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {

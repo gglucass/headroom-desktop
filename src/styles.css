@@ -1,9 +1,8 @@
 :root {
-  font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
   color: #241f1d;
-  background:
-    radial-gradient(circle at top left, rgba(214, 205, 165, 0.6), transparent 25%),
-    linear-gradient(180deg, #e7e3dd 0%, #dedad2 100%);
+  background: transparent;
+  color-scheme: light dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -95,7 +94,7 @@ select {
 }
 
 .intro-shell__copy h1 {
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
   font-size: clamp(2rem, 5vw, 3rem);
   line-height: 0.98;
   margin: 18px 0 22px;
@@ -203,8 +202,8 @@ select {
 .client-setup-card {
   margin-top: 12px;
   border: 1px solid rgba(36, 31, 29, 0.1);
-  border-radius: 16px;
-  background: #f7f5f2;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.55);
   padding: 12px 13px;
 }
 
@@ -331,8 +330,8 @@ select {
 .intro-shell__checklist article,
 .soft-card {
   border: 1px solid rgba(36, 31, 29, 0.08);
-  border-radius: 22px;
-  background: #f7f5f2;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.55);
 }
 
 .intro-shell__checklist article {
@@ -533,8 +532,8 @@ select {
 
 .hero__stats article {
   border: 1px solid rgba(36, 31, 29, 0.08);
-  border-radius: 22px;
-  background: rgba(255, 255, 255, 0.74);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.55);
   padding: 18px;
 }
 
@@ -564,17 +563,16 @@ select {
 .primary-button,
 .secondary-button {
   border: 0;
-  border-radius: 20px;
+  border-radius: 8px;
   cursor: pointer;
-  font-weight: 700;
-  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+  font-weight: 600;
+  transition: opacity 120ms ease;
 }
 
 .primary-button {
-  background: linear-gradient(135deg, #202322, #4f8b75);
-  color: #fff8eb;
+  background: #4f8b75;
+  color: #fff;
   padding: 14px 20px;
-  box-shadow: 0 12px 24px rgba(36, 31, 29, 0.18);
 }
 
 .primary-button--large {
@@ -583,7 +581,7 @@ select {
 }
 
 .secondary-button {
-  background: #f1ebe7;
+  background: #e8e2dc;
   color: #26211f;
   border: 1px solid rgba(36, 31, 29, 0.14);
   padding: 12px 16px;
@@ -606,16 +604,13 @@ select {
 }
 
 .primary-button:hover,
-.secondary-button:hover,
-.tray-nav__item:hover {
-  transform: translateY(-1px);
+.secondary-button:hover {
+  opacity: 0.85;
 }
 
 .primary-button:active,
 .secondary-button:active {
-  transform: translateY(1px);
-  box-shadow: none;
-  opacity: 0.85;
+  opacity: 0.7;
   transition: none;
 }
 
@@ -634,7 +629,7 @@ select {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);
   height: 100vh;
-  background: #f8f7f6;
+  background: transparent;
   overflow-x: hidden;
   overflow-y: auto;
 }
@@ -644,8 +639,8 @@ select {
   flex-direction: column;
   gap: 12px;
   padding: 18px 8px 14px;
-  background: #FAF3E9;
-  border-right: 1px solid rgba(36, 31, 29, 0.12);
+  background: rgba(0, 0, 0, 0.05);
+  border-right: 1px solid rgba(36, 31, 29, 0.08);
   overflow: visible;
   z-index: 2;
 }
@@ -704,13 +699,12 @@ select {
   text-transform: none;
   cursor: pointer;
   line-height: 1;
-  transition: transform 120ms ease, background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+  transition: background 120ms ease, color 120ms ease, opacity 120ms ease;
 }
 
 .upgrade-pill:hover {
-  transform: translateY(-1px);
   background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 8px 16px rgba(36, 31, 29, 0.08);
+  opacity: 0.85;
 }
 
 .upgrade-pill.is-active {
@@ -730,7 +724,7 @@ select {
   place-items: center;
   width: 46px;
   height: 46px;
-  border-radius: 16px;
+  border-radius: 10px;
   background: transparent;
   transition: background 120ms ease, box-shadow 120ms ease;
 }
@@ -827,7 +821,7 @@ select {
   padding: 4px;
   width: auto;
   max-width: max-content;
-  border-radius: 18px;
+  border-radius: 10px;
   background: rgba(36, 31, 29, 0.07);
   justify-self: center;
 }
@@ -842,12 +836,12 @@ select {
   font-weight: 700;
   padding: 9px 12px;
   cursor: pointer;
-  transition: background 140ms ease, color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+  transition: background 140ms ease, color 140ms ease, opacity 140ms ease;
   white-space: nowrap;
 }
 
 .upgrade-toggle__item:hover {
-  transform: translateY(-1px);
+  opacity: 0.85;
 }
 
 .upgrade-toggle__item.is-active {
@@ -885,18 +879,18 @@ select {
 
 .upgrade-plan-card {
   position: relative;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   min-height: 100%;
-  border-radius: 26px;
+  border-radius: 14px;
   border: 1px solid rgba(36, 31, 29, 0.1);
-  background: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.7);
   overflow: hidden;
-  box-shadow: 0 16px 30px rgba(36, 31, 29, 0.05);
 }
 
 .upgrade-plan-card--featured {
   border-color: rgba(79, 158, 145, 0.32);
-  box-shadow: 0 20px 42px rgba(65, 111, 97, 0.12);
+  box-shadow: 0 4px 12px rgba(65, 111, 97, 0.12);
 }
 
 .upgrade-plan-card__top,
@@ -906,9 +900,15 @@ select {
   padding: 14px;
 }
 
-.upgrade-plan-card__top {
-  gap: 7px;
+.upgrade-plan-card__action {
+  padding: 0 14px 14px;
   border-bottom: 1px solid rgba(36, 31, 29, 0.08);
+}
+
+.upgrade-plan-card__top {
+  flex: 1;
+  gap: 7px;
+  border-bottom: none;
 }
 
 .upgrade-plan-card__title-block {
@@ -1016,23 +1016,14 @@ select {
   padding: 12px 16px;
   min-height: 42px;
   font-size: 0.95rem;
-  border-radius: 20px;
+  border-radius: 8px;
   border: 1px solid transparent;
   box-shadow: none;
 }
 
-.primary-button.upgrade-plan-card__button,
-.primary-button.upgrade-plan-card__button:hover,
-.primary-button.upgrade-plan-card__button:active,
-.secondary-button.upgrade-plan-card__button,
-.secondary-button.upgrade-plan-card__button:hover,
-.secondary-button.upgrade-plan-card__button:active {
-  box-shadow: none;
-}
-
 .primary-button.upgrade-plan-card__button {
-  background: linear-gradient(135deg, #202322, #4f8b75);
-  color: #fff8eb;
+  background: #4f8b75;
+  color: #fff;
 }
 
 .secondary-button.upgrade-plan-card__button {
@@ -1071,7 +1062,7 @@ select {
   min-height: 46px;
   padding: 0 14px;
   border: 1px solid rgba(36, 31, 29, 0.14);
-  border-radius: 16px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.82);
   color: #241f1d;
 }
@@ -1083,12 +1074,9 @@ select {
 }
 
 .upgrade-plan-card__contact-submit.is-ready {
-  background: linear-gradient(135deg, #202322, #4f8b75);
-  color: #fff8eb;
-  border-color: rgba(151, 199, 29, 0.5);
-  box-shadow:
-    inset 0 0 0 1px rgba(191, 220, 16, 0.24),
-    0 12px 22px rgba(65, 111, 97, 0.14);
+  background: #4f8b75;
+  color: #fff;
+  border-color: transparent;
   cursor: pointer;
   opacity: 1;
 }
@@ -1135,10 +1123,9 @@ select {
   display: grid;
   gap: 14px;
   padding: 18px 20px;
-  border-radius: 24px;
+  border-radius: 12px;
   border: 1px solid rgba(36, 31, 29, 0.09);
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 16px 30px rgba(36, 31, 29, 0.05);
+  background: rgba(255, 255, 255, 0.65);
 }
 
 .pricing-status-card--healthy {
@@ -1147,7 +1134,7 @@ select {
 
 .pricing-status-card--trial {
   border-color: rgba(220, 143, 26, 0.22);
-  background: linear-gradient(180deg, rgba(255, 249, 239, 0.96), rgba(255, 255, 255, 0.94));
+  background: rgba(255, 249, 235, 0.65);
 }
 
 .pricing-status-card--warning {
@@ -1156,7 +1143,7 @@ select {
 
 .pricing-status-card--blocked {
   border-color: rgba(193, 75, 36, 0.24);
-  background: linear-gradient(180deg, rgba(255, 245, 242, 0.96), rgba(255, 255, 255, 0.94));
+  background: rgba(255, 243, 240, 0.65);
 }
 
 .pricing-status-card__header,
@@ -1177,9 +1164,7 @@ select {
 .pricing-status-card__eyebrow {
   margin: 0;
   font-size: var(--text-xs);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 600;
   color: #7b7068;
 }
 
@@ -1193,7 +1178,7 @@ select {
   display: grid;
   gap: 4px;
   padding: 14px;
-  border-radius: 18px;
+  border-radius: 10px;
   background: rgba(36, 31, 29, 0.04);
 }
 
@@ -1222,7 +1207,7 @@ select {
   gap: 14px;
   align-items: center;
   padding: 14px 16px;
-  border-radius: 18px;
+  border-radius: 10px;
   background: rgba(79, 158, 145, 0.09);
 }
 
@@ -1235,9 +1220,7 @@ select {
 .pricing-status-card__invite-label {
   margin: 0 0 4px;
   font-size: var(--text-xs);
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-weight: 600;
   color: #44766c;
 }
 
@@ -1289,7 +1272,7 @@ select {
   align-items: center;
   min-height: 48px;
   padding: 0 12px;
-  border-radius: 16px;
+  border-radius: 8px;
   border: 1px solid rgba(36, 31, 29, 0.12);
   background: rgba(255, 255, 255, 0.84);
   color: #3a342f;
@@ -1404,25 +1387,24 @@ select {
   gap: 10px;
   align-items: center;
   padding: 12px 16px;
-  border-radius: 18px;
+  border-radius: 10px;
   border: 1px solid rgba(36, 31, 29, 0.09);
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 16px 30px rgba(36, 31, 29, 0.05);
+  background: rgba(255, 255, 255, 0.65);
 }
 
 .upgrade-trial-callout--healthy {
   border-color: rgba(79, 158, 145, 0.28);
-  background: linear-gradient(180deg, rgba(242, 251, 247, 0.96), rgba(255, 255, 255, 0.94));
+  background: rgba(237, 250, 245, 0.65);
 }
 
 .upgrade-trial-callout--warning {
   border-color: rgba(220, 143, 26, 0.24);
-  background: linear-gradient(180deg, rgba(255, 249, 239, 0.96), rgba(255, 255, 255, 0.94));
+  background: rgba(255, 249, 235, 0.65);
 }
 
 .upgrade-trial-callout--expired {
   border-color: rgba(193, 75, 36, 0.24);
-  background: linear-gradient(180deg, rgba(255, 245, 242, 0.96), rgba(255, 255, 255, 0.94));
+  background: rgba(255, 243, 240, 0.65);
 }
 
 .upgrade-trial-callout--neutral {
@@ -1463,8 +1445,8 @@ select {
   align-items: center;
   gap: 10px;
   padding: 14px 18px;
-  border-radius: 16px;
-  background: #FAF3E9;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.55);
   margin-bottom: 10px;
 }
 
@@ -1628,7 +1610,7 @@ select {
   justify-content: space-between;
   padding: 20px 16px;
   min-height: 110px;
-  background: #fefdfc;
+  background: rgba(255, 255, 255, 0.55);
 }
 
 .stat-card__info-button {
@@ -1727,10 +1709,9 @@ select {
   display: grid;
   gap: 14px;
   padding: 14px;
-  border-radius: 20px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(250, 247, 242, 0.88));
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.55);
   border: 1px solid rgba(36, 31, 29, 0.08);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
 }
 
 .savings-chart__panel-header {
@@ -1874,9 +1855,7 @@ select {
 
 .savings-chart__tooltip-label {
   font-size: var(--text-xxs);
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-weight: 600;
   color: #7a7068;
 }
 
@@ -2034,8 +2013,7 @@ select {
 .optimize-card {
   padding: 0;
   overflow: hidden;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(250, 247, 242, 0.88));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.55);
 }
 
 .optimize-card__head {
@@ -2075,7 +2053,7 @@ select {
 
 .optimize-card__body {
   padding: 14px;
-  background: #f7f5f2;
+  background: rgba(255, 255, 255, 0.55);
 }
 
 .optimize-minimal {
@@ -2242,10 +2220,10 @@ details[open] .optimize-minimal__details summary::after {
 
 .modal-card {
   width: min(420px, calc(100vw - 32px));
-  border-radius: 16px;
-  background: #fff;
+  border-radius: 10px;
+  background: #f7f5f3;
   border: 1px solid rgba(36, 31, 29, 0.12);
-  box-shadow: 0 14px 34px rgba(36, 31, 29, 0.2);
+  box-shadow: 0 8px 24px rgba(36, 31, 29, 0.18);
   padding: 14px;
   display: grid;
   gap: 8px;
@@ -2831,8 +2809,8 @@ details[open] .optimize-minimal__details summary::after {
 
 .settings-action-card {
   border: 1px solid rgba(36, 31, 29, 0.08);
-  border-radius: 16px;
-  background: #f3efea;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.55);
   color: #201c1a;
   cursor: pointer;
   padding: 14px;
@@ -2919,7 +2897,7 @@ details[open] .optimize-minimal__details summary::after {
 
 .secondary-button {
   padding: 10px 14px;
-  border-radius: 16px;
+  border-radius: 8px;
 }
 
 .secondary-button {
@@ -2980,5 +2958,186 @@ html.window-hiding {
 
   .upgrade-trial-callout__button {
     justify-self: start;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f2ede8;
+  }
+
+  /* Sidebar */
+  .tray-sidebar {
+    background: rgba(255, 255, 255, 0.04);
+    border-right-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .tray-nav__item .tray-nav__icon {
+    color: rgba(242, 237, 232, 0.75);
+  }
+
+  .tray-nav__item.is-active .tray-nav__icon {
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.18);
+    color: #f2ede8;
+  }
+
+  .tray-nav__item:hover .tray-nav__icon {
+    background: rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.14);
+  }
+
+  /* Surfaces */
+  .soft-card,
+  .intro-shell__checklist article {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .hero__stats article {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .stat-card {
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .callout-banner {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .savings-chart__panel {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-plan-card {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .upgrade-plan-card--featured {
+    border-color: rgba(95, 166, 136, 0.4);
+  }
+
+  .pricing-status-card {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-trial-callout {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .settings-action-card {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.08);
+    color: #f2ede8;
+  }
+
+  .optimize-card {
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .optimize-card__head {
+    background: rgba(255, 255, 255, 0.04);
+    border-bottom-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .optimize-card__body {
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  .modal-card {
+    background: #2e2b28;
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .client-setup-card {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  /* Text */
+  h1, h2, h3 {
+    color: #f2ede8;
+  }
+
+  .content-header h2 {
+    color: #f2ede8;
+  }
+
+  .content-header p,
+  .panel-card p,
+  .stat-card p {
+    color: rgba(242, 237, 232, 0.6);
+  }
+
+  .stat-card__label {
+    color: rgba(242, 237, 232, 0.75);
+  }
+
+  .stat-card strong {
+    color: #f2ede8;
+  }
+
+  /* Buttons */
+  .secondary-button {
+    background: rgba(255, 255, 255, 0.1);
+    color: #f2ede8;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .primary-button {
+    background: #5fa688;
+  }
+
+  /* Inputs */
+  .pricing-auth-field {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.14);
+    color: #f2ede8;
+  }
+
+  .upgrade-plan-card__contact-input {
+    background: rgba(255, 255, 255, 0.1);
+    color: #f2ede8;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .upgrade-toggle {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .upgrade-toggle__item {
+    color: rgba(242, 237, 232, 0.7);
+  }
+
+  .upgrade-toggle__item.is-active {
+    background: rgba(255, 255, 255, 0.14);
+    color: #f2ede8;
+  }
+
+  /* Intro/launcher shell */
+  .intro-shell {
+    background: transparent;
+  }
+
+  .intro-shell__copy h1,
+  .intro-shell__copy h2,
+  .intro-shell__copy p {
+    color: #f2ede8;
+  }
+
+  /* Misc */
+  .pricing-metric {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .pricing-status-card__invite {
+    background: rgba(95, 166, 136, 0.12);
   }
 }

@@ -14,6 +14,7 @@ import {
   Brain,
   CaretLeft,
   Cpu,
+  CurrencyCircleDollar,
   CurrencyDollar,
   Info,
   EnvelopeSimple,
@@ -2973,7 +2974,7 @@ export default function App() {
           : "72 hours";
       return {
         tone: "warning" as const,
-        message: `${hoursLabel} left in your 72-hour access window. Create an account to extend your trial to 14 days.`,
+        message: `${hoursLabel} left in your 72-hour trial. Create an account to extend trial to 14 days.`,
         actionLabel: "Sign up",
         onAction: openUpgradeAuthView
       };
@@ -3193,7 +3194,7 @@ export default function App() {
                 onKeyDown={(e) => e.key === "Enter" && setChartMode("usd")}
               >
                 <span className="stat-card__label">
-                  <CurrencyDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
+                  <CurrencyCircleDollar aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
                   Total costs saved (estimate)
                   <button
                     className="stat-card__info-button"
@@ -3603,6 +3604,8 @@ export default function App() {
                         </span>
                       </div>
                     )}
+                  </div>
+                  <div className="upgrade-plan-card__action">
                     {plan.id === "enterprise" ? (
                       <form className="upgrade-plan-card__contact-form" onSubmit={(event) => void handleContactSubmit(event)}>
                         <input
