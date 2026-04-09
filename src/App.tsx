@@ -2334,10 +2334,10 @@ export default function App() {
             </p>
           </article>
           <article>
-            <strong>Optimize workflow</strong>
+            <strong>Fewer tokens, same result</strong>
             <p>
-              Run tools that improve your setup, so you become a little
-              better at what you do every day.
+              Smart optimization cuts noise before Claude Code sees it, with
+              no impact on the output.
             </p>
           </article>
         </div>
@@ -3167,7 +3167,12 @@ export default function App() {
         <div className="tray-content" hidden={activeView !== "home"}>
             <section className={`callout-banner callout-banner--${calloutBanner.tone}`}>
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
-              <h1>{calloutTitle}</h1>
+              <div className="callout-banner__body">
+                <h1>{calloutTitle}</h1>
+                {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
+                  <p className="callout-banner__subtitle">Now use Claude Code as normal, and check back later to see how much you are saving by using Headroom.</p>
+                )}
+              </div>
               {connectorPhase === "disabled" && claudeConnector && (
                 <button
                   className="callout-banner__action"

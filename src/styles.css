@@ -1441,9 +1441,10 @@ select {
 }
 
 .callout-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  column-gap: 10px;
   padding: 14px 18px;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.55);
@@ -1472,6 +1473,7 @@ select {
 
 .callout-banner__dot {
   flex-shrink: 0;
+  margin-top: 3px;
   width: 11px;
   height: 11px;
   border-radius: 50%;
@@ -1516,6 +1518,19 @@ select {
   background: #ED834E;
   box-shadow: 0 0 0 0 rgba(237, 131, 78, 0.5);
   animation: none;
+}
+
+.callout-banner__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.callout-banner .callout-banner__subtitle {
+  margin: 0;
+  font-size: 11px;
+  color: rgba(0, 0, 0, 0.45);
+  line-height: 1.4;
 }
 
 .callout-banner__action {
@@ -3267,6 +3282,10 @@ html.window-hiding {
   .upgrade-plan-card__price-block span,
   .upgrade-plan-card__features li {
     color: rgba(242, 237, 232, 0.6);
+  }
+
+  .callout-banner .callout-banner__subtitle {
+    color: rgba(242, 237, 232, 0.45);
   }
 
   .optimize-project-row__name strong,

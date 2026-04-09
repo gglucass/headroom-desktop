@@ -39,24 +39,7 @@ export const mockDashboard: DashboardState = {
     }
   ],
   recentUsage: [],
-  insights: [
-    {
-      id: "insight-1",
-      category: "savings",
-      severity: "info",
-      title: "Recent sessions are compressing well",
-      recommendation: "Finish bootstrap to keep Headroom active on every detected workspace.",
-      evidence: "Recent sampled requests show 14-22% prompt reduction."
-    },
-    {
-      id: "insight-2",
-      category: "health",
-      severity: "warning",
-      title: "Runtime is not fully set up yet",
-      recommendation: "Install the managed Python runtime to keep Headroom active.",
-      evidence: "Bootstrap has not completed yet on this machine."
-    }
-  ]
+  insights: []
 };
 
 export const researchCandidates: ResearchCandidate[] = [
