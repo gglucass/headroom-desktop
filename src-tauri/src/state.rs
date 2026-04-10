@@ -318,11 +318,11 @@ impl AppState {
                 snapshot.lifetime_estimated_tokens_saved = saved_tokens;
             }
             daily_savings =
-                merge_daily_savings(daily_savings, history.daily_savings(), "2026-04-09");
+                merge_daily_savings(daily_savings, history.daily_savings(), "2026-04-20");
             hourly_savings = merge_hourly_savings(
                 hourly_savings,
                 history.hourly_savings(),
-                "2026-04-09T00:00",
+                "2026-04-20T00:00",
             );
         }
 
