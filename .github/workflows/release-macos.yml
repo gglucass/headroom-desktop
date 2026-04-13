@@ -38,6 +38,8 @@ jobs:
       VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
       VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
       VITE_CLARITY_PROJECT_ID: ${{ vars.VITE_CLARITY_PROJECT_ID }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
 
     steps:
       - name: Checkout
@@ -181,6 +183,8 @@ jobs:
           APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          HEADROOM_SENTRY_DSN: ${{ env.HEADROOM_SENTRY_DSN }}
+          VITE_SENTRY_DSN: ${{ env.VITE_SENTRY_DSN }}
         with:
           projectPath: .
           tagName: v__VERSION__
