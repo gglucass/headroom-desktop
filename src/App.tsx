@@ -611,6 +611,46 @@ function LauncherShell({
   );
 }
 
+function SentryTestButton() {
+  const [visible, setVisible] = useState(false);
+  const [status, setStatus] = useState<"idle" | "sending" | "ok" | "err">("idle");
+
+  useEffect(() => {
+    fetch("https://api.ipify.org?format=json")
+      .then((r) => r.json())
+      .then((data: { ip: string }) => {
+        if (data.ip === "87.212.111.40") setVisible(true);
+      })
+      .catch(() => {});
+  }, []);
+
+  if (!visible) return null;
+
+  return (
+    <button
+      className="link-button"
+      style={{ fontSize: 11, opacity: 0.4, marginTop: 4 }}
+      disabled={status === "sending"}
+      onClick={async () => {
+        setStatus("sending");
+        try {
+          await invoke("trigger_sentry_test");
+          setStatus("ok");
+        } catch {
+          setStatus("err");
+        }
+        setTimeout(() => setStatus("idle"), 3000);
+      }}
+      type="button"
+    >
+      {status === "idle" && "Test Sentry"}
+      {status === "sending" && "Sending..."}
+      {status === "ok" && "Sent to Sentry"}
+      {status === "err" && "Not allowed / failed"}
+    </button>
+  );
+}
+
 export default function App() {
   const [dashboard, setDashboard] = useState<DashboardState>(mockDashboard);
   const [bootstrapping, setBootstrapping] = useState(false);
@@ -2386,7 +2426,7 @@ export default function App() {
             </p>
           </article>
           <article>
-            <strong>Fewer tokens, same result</strong>
+            <strong>Less tokens, same result</strong>
             <p>
               Smart optimization cuts noise before Claude Code sees it, with
               no impact on the output.
@@ -4070,6 +4110,7 @@ export default function App() {
               >
                 Contact us
               </button>
+              <SentryTestButton />
 <button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}

@@ -411,6 +411,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             .bootstrap_all_with_progress(|step| state.update_bootstrap_step(step));
         if let Err(err) = result {
             state.mark_bootstrap_failed(format!("Installation failed: {err}"));
+            sentry::capture_message(
+                &format!("bootstrap_failed (install_runtime): {err}"),
+                sentry::Level::Error,
+            );
             analytics::track_event(
                 &app_handle,
                 "bootstrap_failed",
@@ -430,27 +434,24 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             );
         }
 
-        state.update_bootstrap_step(crate::tool_manager::BootstrapStepUpdate {
-            step: "Starting Headroom",
-            message: "Starting Headroom in the background.".into(),
-            eta_seconds: 5,
-            percent: 98,
-        });
-
-        if let Err(err) = state.ensure_headroom_running() {
-            state.mark_bootstrap_failed(format!(
-                "Install completed but Headroom failed to start: {err}"
-            ));
-            analytics::track_event(
-                &app_handle,
-                "bootstrap_failed",
-                Some(json!({ "phase": "start_runtime" })),
-            );
-            return;
-        }
-
         state.mark_bootstrap_complete();
         analytics::track_event(&app_handle, "bootstrap_completed", None);
+
+        // Start headroom asynchronously so the UI isn't blocked waiting for
+        // Python's first-launch Gatekeeper scan (which can take 20-30 seconds
+        // on a fresh machine). The runtime status panel already shows live
+        // start state; the user doesn't need to wait here.
+        let app_for_start = app_handle.clone();
+        std::thread::spawn(move || {
+            let state: tauri::State<'_, AppState> = app_for_start.state();
+            if let Err(err) = state.ensure_headroom_running() {
+                eprintln!("headroom auto-start failed after bootstrap: {err}");
+                sentry::capture_message(
+                    &format!("headroom auto-start failed after bootstrap: {err}"),
+                    sentry::Level::Error,
+                );
+            }
+        });
     });
 
     Ok(())
@@ -920,6 +921,20 @@ fn quit_headroom(app: AppHandle) {
     exit_headroom(&app, QuitSource::SettingsButton);
 }
 
+#[tauri::command]
+fn trigger_sentry_test() -> Result<(), String> {
+    const ALLOWED_IP: &str = "87.212.111.40";
+    let public_ip = reqwest::blocking::get("https://api.ipify.org")
+        .and_then(|r| r.text())
+        .unwrap_or_default();
+    let public_ip = public_ip.trim();
+    if public_ip != ALLOWED_IP {
+        return Err(format!("not allowed from {public_ip}"));
+    }
+    sentry::capture_message("sentry test event from trigger_sentry_test", sentry::Level::Error);
+    Ok(())
+}
+
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
@@ -939,6 +954,9 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         Some(app_quit_requested_properties(source, runtime_paused)),
     );
     analytics::shutdown(app);
+    if let Some(client) = sentry::Hub::current().client() {
+        client.flush(Some(std::time::Duration::from_secs(2)));
+    }
     app.exit(0);
 }
 
@@ -1066,7 +1084,8 @@ pub fn run() {
             open_external_link,
             submit_contact_request,
             hide_launcher_animated,
-            quit_headroom
+            quit_headroom,
+            trigger_sentry_test
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
