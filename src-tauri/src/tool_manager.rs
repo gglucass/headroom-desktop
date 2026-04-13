@@ -288,13 +288,24 @@ impl ToolManager {
             bail!("headroom managed python not found at {}", python.display());
         }
 
-        let startup_variants = headroom_startup_variants();
+        // Use the console_scripts entrypoint when available to avoid the Python
+        // -m double-import RuntimeWarning. Fall back to -m if missing.
+        let entrypoint = self.headroom_entrypoint();
+        let startup_variants: Vec<(PathBuf, Vec<&'static str>)> = if entrypoint.exists() {
+            vec![
+                (entrypoint, headroom_entrypoint_startup_args()),
+                (python.clone(), headroom_python_startup_args()),
+            ]
+        } else {
+            vec![(python.clone(), headroom_python_startup_args())]
+        };
+
         let mut errors = Vec::new();
         let logs_dir = self.runtime.logs_dir();
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
 
-        for args in &startup_variants {
+        for (executable, args) in &startup_variants {
             let variant = if args.is_empty() {
                 "default".to_string()
             } else {
@@ -307,7 +318,7 @@ impl ToolManager {
                 .open(&log_path)
                 .with_context(|| format!("opening {}", log_path.display()))?;
 
-            let mut child = Command::new(&python)
+            let mut child = Command::new(executable)
                 .args(args)
                 .current_dir(&self.runtime.root_dir)
                 .env("PYTHONNOUSERSITE", "1")
@@ -325,7 +336,7 @@ impl ToolManager {
                 .with_context(|| {
                     format!(
                         "starting headroom background process: {} {}",
-                        python.display(),
+                        executable.display(),
                         args.join(" ")
                     )
                 })?;
@@ -672,8 +683,8 @@ impl ToolManager {
 
     /// Re-runs the requirements lock install when the compiled lock has changed
     /// since the last install. This repairs missing or outdated deps without
-    /// requiring a headroom version bump. Updates the stored lock sha on success
-    /// so the repair does not re-run on the next launch.
+    /// requiring a headroom version bump. Also re-runs MCP install (which may
+    /// have failed previously if deps were missing) and updates the receipt.
     pub fn repair_stale_requirements(&self) -> Result<()> {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
@@ -691,7 +702,16 @@ impl ToolManager {
         )
         .context("repairing stale headroom requirements")?;
 
-        // Update the stored lock sha so we don't re-repair on the next launch.
+        let mcp_install = match self.install_headroom_mcp() {
+            Ok(()) => json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL }),
+            Err(err) => {
+                eprintln!("headroom MCP setup skipped during repair: {err}");
+                json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
+            }
+        };
+
+        // Update the lock sha and MCP state in the receipt so neither re-runs
+        // unnecessarily on the next launch.
         let receipt_path = self.runtime.tools_dir.join("headroom.json");
         if let Ok(bytes) = std::fs::read(&receipt_path) {
             if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
@@ -700,8 +720,9 @@ impl ToolManager {
                         "requirementsLockSha256".into(),
                         json!(sha256_bytes(requirements_lock.as_bytes())),
                     );
-                    let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
                 }
+                receipt["mcp"] = mcp_install;
+                let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
             }
         }
 
@@ -1090,14 +1111,12 @@ fn is_local_proxy_reachable() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
-fn headroom_startup_variants() -> Vec<Vec<&'static str>> {
-    vec![vec![
-        "-m",
-        "headroom.proxy.server",
-        "--port",
-        HEADROOM_PROXY_PORT,
-        "--no-http2",
-    ]]
+fn headroom_python_startup_args() -> Vec<&'static str> {
+    vec!["-m", "headroom.proxy.server", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
+}
+
+fn headroom_entrypoint_startup_args() -> Vec<&'static str> {
+    vec!["proxy", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
 }
 
 struct DownloadArtifact {
@@ -1453,9 +1472,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        bootstrap_requirements_lock_for_target, headroom_startup_variants,
-        is_blocked_headroom_version, parse_semver, read_headroom_learn_metadata_from_path,
-        sha256_bytes, verify_sha256_file, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT,
+        bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
+        headroom_python_startup_args, is_blocked_headroom_version, parse_semver,
+        read_headroom_learn_metadata_from_path, sha256_bytes, verify_sha256_file, ManagedRuntime,
+        ToolManager, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -1489,14 +1509,12 @@ mod tests {
     #[test]
     fn managed_headroom_startup_uses_supported_proxy_args() {
         assert_eq!(
-            headroom_startup_variants(),
-            vec![vec![
-                "-m",
-                "headroom.proxy.server",
-                "--port",
-                HEADROOM_PROXY_PORT,
-                "--no-http2",
-            ]]
+            headroom_entrypoint_startup_args(),
+            vec!["proxy", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
+        );
+        assert_eq!(
+            headroom_python_startup_args(),
+            vec!["-m", "headroom.proxy.server", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
         );
     }
 
