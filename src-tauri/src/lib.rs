@@ -14,6 +14,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use chrono::{Local, Utc};
@@ -128,6 +129,31 @@ struct AvailableAppUpdate {
     notes: Option<String>,
 }
 
+static ZERO_SPEND_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
+
+fn check_zero_spend_anomaly(dashboard: &DashboardState) {
+    if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
+        return;
+    }
+    let affected_days: Vec<&str> = dashboard
+        .daily_savings
+        .iter()
+        .filter(|p| p.estimated_tokens_saved > 0 && p.actual_cost_usd == 0.0 && p.total_tokens_sent == 0)
+        .map(|p| p.date.as_str())
+        .collect();
+    if affected_days.is_empty() {
+        return;
+    }
+    ZERO_SPEND_ALERT_FIRED.store(true, Ordering::Relaxed);
+    sentry::capture_message(
+        &format!(
+            "graph shows tokens saved but zero tokens spent on days: {}",
+            affected_days.join(", ")
+        ),
+        sentry::Level::Warning,
+    );
+}
+
 #[tauri::command]
 fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardState {
     let (dashboard, lifetime_token_milestones) = state.dashboard_with_lifetime_token_milestones();
@@ -158,6 +184,8 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
         .map(|p| p.estimated_savings_usd)
         .unwrap_or(0.0);
     *savings_state.0.lock().unwrap() = today_savings;
+
+    check_zero_spend_anomaly(&dashboard);
 
     dashboard
 }
@@ -589,6 +617,10 @@ fn set_headroom_learn_api_key(
     provider: String,
     api_key: String,
 ) -> Result<HeadroomLearnApiKeyStatus, String> {
+    if let Some(reason) = crate::state::headroom_learn_platform_message() {
+        return Err(reason);
+    }
+
     let normalized_provider = provider.trim().to_ascii_lowercase();
     let trimmed_key = api_key.trim().to_string();
     if trimmed_key.is_empty() {
@@ -611,6 +643,10 @@ fn set_headroom_learn_api_key(
 
 #[tauri::command]
 fn start_headroom_learn(app: AppHandle, project_path: String) -> Result<(), String> {
+    if let Some(reason) = crate::state::headroom_learn_platform_message() {
+        return Err(reason);
+    }
+
     if !detect_headroom_learn_api_key_status().has_api_key {
         return Err("Add an API key before running headroom learn.".into());
     }

@@ -94,6 +94,13 @@ import {
   type ApiProvider,
   type SavingsChartDatum
 } from "./lib/dashboardHelpers";
+import {
+  buildInitialProxyVerificationRows,
+  getClaudeConnector,
+  getContactRequestValidationError,
+  getLauncherAutoConfigureDecision,
+  isValidEmailAddress
+} from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
   cachePricingStatus,
@@ -690,9 +697,11 @@ export default function App() {
   const hasShownLearnKeyReadNoticeRef = useRef(false);
   const apiKeyGuide = apiKeyGuides[apiKeyProvider];
   const apiKeyDialogStorageCopy =
-    pendingLearnProjectPath
-      ? "Saving stores this key in macOS Keychain, then Headroom reads it immediately to start Learn for the selected project."
-      : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
+    runtimeStatus?.headroomLearnSupported === false
+      ? "Headroom Learn is disabled on this platform preview, so API key storage is unavailable here."
+      : pendingLearnProjectPath
+        ? "Saving stores this key in macOS Keychain, then Headroom reads it immediately to start Learn for the selected project."
+        : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
@@ -700,8 +709,8 @@ export default function App() {
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false
   );
-  const contactEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail.trim());
-  const authEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim());
+  const contactEmailValid = isValidEmailAddress(contactEmail);
+  const authEmailValid = isValidEmailAddress(authEmail);
   const showInstallProgress =
     bootstrapping ||
     bootstrapProgress.running ||
@@ -1581,12 +1590,6 @@ export default function App() {
     return null;
   }
 
-  function getClaudeConnector(connectorsToCheck: ClientConnectorStatus[]) {
-    return aggregateClientConnectors(connectorsToCheck).find(
-      (connector) => connector.clientId === "claude_code"
-    ) ?? null;
-  }
-
   function applyAppUpdatePatch(patch: AppUpdateStatePatch) {
     if (Object.prototype.hasOwnProperty.call(patch, "config")) {
       setAppUpdateConfig(patch.config ?? null);
@@ -1753,6 +1756,14 @@ export default function App() {
   }
 
   function openApiKeyDialog() {
+    if (runtimeStatus?.headroomLearnSupported === false) {
+      setApiKeyError(
+        runtimeStatus.headroomLearnDisabledReason ??
+          "Headroom Learn is unavailable on this platform."
+      );
+      return;
+    }
+
     setApiKeyProvider(resolveApiProvider(headroomApiKeyStatus.provider));
     setShowApiKeyDialog(true);
   }
@@ -1765,13 +1776,17 @@ export default function App() {
       let latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
       setConnectors(latestConnectors);
 
-      const detectedClaudeConnector = getClaudeConnector(latestConnectors);
-      if (!detectedClaudeConnector?.installed) {
+      if (getLauncherAutoConfigureDecision(latestConnectors) === "show_client_setup") {
         setShowClientSetupStep(true);
         return;
       }
 
-      if (!detectedClaudeConnector.enabled) {
+      if (getLauncherAutoConfigureDecision(latestConnectors) === "apply_client_setup") {
+        const detectedClaudeConnector = getClaudeConnector(latestConnectors);
+        if (!detectedClaudeConnector) {
+          setShowClientSetupStep(true);
+          return;
+        }
         await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: detectedClaudeConnector.clientId
         });
@@ -1779,8 +1794,7 @@ export default function App() {
         setConnectors(latestConnectors);
       }
 
-      const configuredClaudeConnector = getClaudeConnector(latestConnectors);
-      if (!configuredClaudeConnector?.enabled) {
+      if (getLauncherAutoConfigureDecision(latestConnectors) !== "begin_proxy_verification") {
         setShowClientSetupStep(true);
         return;
       }
@@ -1805,6 +1819,18 @@ export default function App() {
   }
 
   async function runHeadroomLearn(projectPath: string) {
+    if (runtimeStatus?.headroomLearnSupported === false) {
+      setHeadroomLearnStatus((current) => ({
+        ...current,
+        running: false,
+        summary: "Headroom Learn is unavailable on this platform.",
+        error:
+          runtimeStatus.headroomLearnDisabledReason ??
+          "Headroom Learn is unavailable on this platform."
+      }));
+      return;
+    }
+
     const selectedProject =
       claudeProjects.find((project) => project.projectPath === projectPath) ?? null;
     const displayName = selectedProject?.displayName ?? projectPath;
@@ -2070,19 +2096,14 @@ export default function App() {
   async function handleContactSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!CONTACT_FORM_URL) {
-      setContactSubmitError("Set VITE_HEADROOM_CONTACT_FORM_URL to enable contact requests.");
+    const validationError = getContactRequestValidationError(CONTACT_FORM_URL, contactEmail);
+    if (validationError) {
+      setContactSubmitError(validationError);
       setContactSubmitSuccess(null);
       return;
     }
 
     const trimmed = contactEmail.trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
-      setContactSubmitError("Enter a valid email address.");
-      setContactSubmitSuccess(null);
-      return;
-    }
-
     setContactSubmitBusy(true);
     setContactSubmitError(null);
     setContactSubmitSuccess(null);
@@ -2122,6 +2143,14 @@ export default function App() {
   }
 
   async function saveApiKeyAndRunPending() {
+    if (runtimeStatus?.headroomLearnSupported === false) {
+      setApiKeyError(
+        runtimeStatus.headroomLearnDisabledReason ??
+          "Headroom Learn is unavailable on this platform."
+      );
+      return;
+    }
+
     const trimmed = apiKeyDraft.trim();
     if (!trimmed) {
       setApiKeyError("Enter an API key first.");
@@ -2157,22 +2186,12 @@ export default function App() {
     } catch {
       // fall back to cached state
     }
-    const enabledConnectors = aggregateClientConnectors(fresh)
-      .filter((connector) => connector.enabled && connector.installed)
-      .sort((left, right) => left.name.localeCompare(right.name));
 
     setShowClientSetupStep(false);
     setShowPostInstallGuide(false);
     setShowProxyVerificationStep(true);
     setProxyVerificationHint(null);
-    setProxyVerificationRows(
-      enabledConnectors.map((connector) => ({
-        clientId: connector.clientId,
-        name: connector.name,
-        state: "processing",
-        message: "Waiting for a Claude Code prompt..."
-      }))
-    );
+    setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     try {
       const lines = await invoke<string[]>("get_headroom_logs", { maxLines: 200 });
       proxyVerificationLastSignatureRef.current = lines.join("\n");
@@ -2766,6 +2785,16 @@ export default function App() {
       runtimeStatus.mcpConfigured !== false &&
       runtimeStatus.kompressEnabled !== false
   );
+  const platformPreviewNotice =
+    runtimeStatus?.supportTier === "experimental"
+      ? runtimeStatus.platform === "linux"
+        ? "Linux is currently a preview build. Core proxy routing is supported, but Headroom Learn and secure API key storage are disabled while the platform is hardened."
+        : "This platform is currently in preview."
+      : null;
+  const headroomLearnSupported = runtimeStatus?.headroomLearnSupported !== false;
+  const headroomLearnDisabledReason =
+    runtimeStatus?.headroomLearnDisabledReason ??
+    "Headroom Learn is unavailable on this platform.";
 
   const claudeConnector = getClaudeConnector(connectors);
 
@@ -3169,6 +3198,9 @@ export default function App() {
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
+                {platformPreviewNotice ? (
+                  <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
+                ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use Claude Code as normal, and check back later to see how much you are saving by using Headroom.</p>
                 )}
@@ -3253,7 +3285,17 @@ export default function App() {
                 </p>
               </header>
               <div className="optimize-card__body">
-                {claudeProjectsBusy ? (
+                {!headroomLearnSupported ? (
+                  <div className="optimize-minimal">
+                    <p className="optimize-minimal__meta">
+                      {headroomLearnDisabledReason}
+                    </p>
+                    <p className="optimize-minimal__meta">
+                      Linux preview currently supports the core Headroom proxy,
+                      Claude Code routing, and RTK activity tracking.
+                    </p>
+                  </div>
+                ) : claudeProjectsBusy ? (
                   <p className="loading-copy">Loading projects…</p>
                 ) : claudeProjects.length === 0 ? (
                   <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
@@ -3399,7 +3441,7 @@ export default function App() {
               </div>
             </article>
 
-            {showApiKeyDialog ? (
+            {showApiKeyDialog && headroomLearnSupported ? (
               <div className="modal-backdrop" role="dialog" aria-modal="true">
                 <div className="modal-card">
                   <h3>Add API key</h3>

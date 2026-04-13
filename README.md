@@ -4,16 +4,20 @@
 
 [![Website](https://img.shields.io/badge/extraheadroom.com-website-blue?style=for-the-badge)](https://extraheadroom.com)&nbsp;&nbsp;[![Download for macOS](https://img.shields.io/github/v/release/gglucass/headroom-desktop?label=Download%20for%20macOS&style=for-the-badge&logo=apple&logoColor=white&color=000000)](https://github.com/gglucass/headroom-desktop/releases/latest)
 
-> **Requires macOS on Apple Silicon (M1 or later)**
+> **Stable:** macOS on Apple Silicon (M1 or later)
+>
+> **Preview:** Linux x86_64 builds are experimental and currently support the core proxy flow only.
 
 ### Install
 
 1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. Download the `.dmg` file (e.g. `Headroom_0.2.9.dmg`)
+2. On macOS, download the `.dmg` file (for example `Headroom_0.2.9.dmg`)
 3. Open the DMG, drag **Headroom** to Applications
 4. Launch Headroom — it appears in your menu bar and walks you through setup
 
 Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings.
+
+Linux preview artifacts are published on the same release page. Today they are best treated as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. `Headroom Learn` and secure API-key storage are not supported yet on Linux preview builds.
 
 ---
 
@@ -23,7 +27,7 @@ Headroom is signed and notarized, so macOS will open it without Gatekeeper warni
 
 > **Note:** Headroom currently supports **Claude Code** only. Support for additional clients is planned.
 
-Headroom is a local-first macOS tray app that routes your coding clients through a local optimization pipeline. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics — all without touching your system environment.
+Headroom is a local-first desktop tray app that routes your coding clients through a local optimization pipeline. The stable target is macOS; Linux builds are currently experimental. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics — all without touching your system environment.
 
 ## How it works
 

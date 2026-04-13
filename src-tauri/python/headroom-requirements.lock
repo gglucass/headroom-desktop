@@ -1,5 +1,5 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: Headroom managed runtime freeze captured on 2026-04-03 for headroom-ai[all]==0.5.21.
+# Source: Headroom managed runtime freeze captured on 2026-04-13 for headroom-ai[all]==0.5.24.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
@@ -43,7 +43,7 @@ httpx-sse==0.4.3
 huggingface_hub==1.8.0
 hyperframe==6.1.0
 idna==3.11
-importlib_metadata==9.0.0
+importlib_metadata==8.7.1
 Jinja2==3.1.6
 jiter==0.13.0
 joblib==1.5.3
@@ -70,6 +70,7 @@ nltk==3.9.4
 numpy==2.4.4
 onnxruntime==1.24.4
 openai==2.30.0
+opentelemetry-api==1.41.0
 packaging==26.0
 pandas==3.0.2
 pathvalidate==3.3.1

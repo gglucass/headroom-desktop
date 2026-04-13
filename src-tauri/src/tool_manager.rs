@@ -16,8 +16,8 @@ use tar::Archive;
 
 use crate::models::{ManagedTool, ToolStatus};
 
-/// Minimum acceptable version. Upgrades to versions below this are applied
-/// immediately regardless of the release-age hold period.
+/// Minimum acceptable version. Releases below this floor are skipped entirely.
+/// All releases at or above this floor must still pass the age hold.
 const HEADROOM_MIN_VERSION: &str = "0.5.21";
 /// The major.minor series we track for auto-upgrades (e.g. "0.5").
 const HEADROOM_SERIES: &str = "0.5";
@@ -33,6 +33,8 @@ const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
+const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
+    include_str!("../python/headroom-linux-requirements.lock");
 const RTK_VERSION: &str = "0.33.1";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
@@ -602,6 +604,14 @@ impl ToolManager {
             .map(|v| v.to_string())
     }
 
+    fn installed_requirements_lock_sha(&self) -> Option<String> {
+        self.read_headroom_receipt()?
+            .get("artifact")?
+            .get("requirementsLockSha256")?
+            .as_str()
+            .map(|v| v.to_string())
+    }
+
     pub fn rtk_installed(&self) -> bool {
         self.rtk_entrypoint().exists() && self.runtime.tools_dir.join("rtk.json").exists()
     }
@@ -633,16 +643,20 @@ impl ToolManager {
     }
 
     /// Queries PyPI for the best eligible 0.5.X release and returns it if it
-    /// differs from what is installed. This allows us to upgrade within the
-    /// supported series while also downgrading users off blocked releases.
+    /// differs from what is installed, or if the compiled requirements lock has
+    /// changed since the last install (so updated deps are applied without a
+    /// headroom version bump).
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
         let installed = self.installed_headroom_version()?;
         let installed_semver = parse_semver(&installed)?;
         let best = fetch_best_headroom_release()?;
         let best_semver = parse_semver(&best.version)?;
         let installed_is_blocked = is_blocked_headroom_version(&installed);
+        let lock_is_stale = self
+            .installed_requirements_lock_sha()
+            .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()));
 
-        if installed_is_blocked || best_semver > installed_semver {
+        if installed_is_blocked || best_semver > installed_semver || lock_is_stale {
             Some(best)
         } else {
             None
@@ -799,7 +813,8 @@ impl ToolManager {
     }
 
     fn install_headroom_release(&self, release: &HeadroomRelease) -> Result<()> {
-        let lock_path = self.write_headroom_requirements_lock()?;
+        let requirements_lock = bootstrap_requirements_lock();
+        let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
         let wheel_path = self
             .runtime
             .downloads_dir
@@ -863,7 +878,7 @@ impl ToolManager {
                 "artifact": {
                     "url": release.wheel_url,
                     "sha256": release.sha256,
-                    "requirementsLockSha256": sha256_bytes(HEADROOM_REQUIREMENTS_LOCK.as_bytes())
+                    "requirementsLockSha256": sha256_bytes(requirements_lock.as_bytes())
                 },
                 "mcp": mcp_install,
                 "ml": {
@@ -952,12 +967,12 @@ impl ToolManager {
         )
     }
 
-    fn write_headroom_requirements_lock(&self) -> Result<PathBuf> {
+    fn write_headroom_requirements_lock(&self, contents: &str) -> Result<PathBuf> {
         let lock_path = self
             .runtime
             .downloads_dir
             .join("headroom-requirements.lock");
-        std::fs::write(&lock_path, HEADROOM_REQUIREMENTS_LOCK)
+        std::fs::write(&lock_path, contents)
             .with_context(|| format!("writing {}", lock_path.display()))?;
         Ok(lock_path)
     }
@@ -1112,11 +1127,11 @@ fn fetch_best_headroom_release() -> Option<HeadroomRelease> {
             Ok(t) => t.with_timezone(&chrono::Utc),
             Err(_) => continue,
         };
+        if semver < min_semver {
+            continue;
+        }
         let age_days = now.signed_duration_since(upload_time).num_days();
-        let is_old_enough = age_days >= HEADROOM_UPGRADE_HOLD_DAYS;
-        let is_forced = semver >= min_semver;
-
-        if !is_old_enough && !is_forced {
+        if age_days < HEADROOM_UPGRADE_HOLD_DAYS {
             continue;
         }
 
@@ -1345,6 +1360,20 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn bootstrap_requirements_lock() -> &'static str {
+    bootstrap_requirements_lock_for_target(std::env::consts::OS)
+}
+
+fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
+    match os {
+        // Linux bootstrap only needs the proxy runtime. Installing the full
+        // headroom-ai[all] stack pulls optional native packages like hnswlib
+        // that fail on many fresh Linux systems.
+        "linux" => HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        _ => HEADROOM_REQUIREMENTS_LOCK,
+    }
+}
+
 fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
 }
@@ -1374,9 +1403,14 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
-        headroom_startup_variants, is_blocked_headroom_version, parse_semver, ManagedRuntime,
-        ToolManager, HEADROOM_PROXY_PORT,
+        bootstrap_requirements_lock_for_target, headroom_startup_variants,
+        is_blocked_headroom_version, parse_semver, read_headroom_learn_metadata_from_path,
+        sha256_bytes, verify_sha256_file, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -1431,6 +1465,18 @@ mod tests {
         assert!(is_blocked_headroom_version("0.5.20"));
         assert!(!is_blocked_headroom_version("0.5.21"));
         assert!(!is_blocked_headroom_version("0.5.22"));
+    }
+
+    #[test]
+    fn linux_bootstrap_requirements_skip_optional_memory_and_ml_packages() {
+        let linux_requirements = bootstrap_requirements_lock_for_target("linux");
+
+        assert!(!linux_requirements.contains("hnswlib=="));
+        assert!(!linux_requirements.contains("torch=="));
+        assert!(!linux_requirements.contains("sentence-transformers=="));
+        assert!(linux_requirements.contains("mcp=="));
+        assert!(linux_requirements.contains("onnxruntime=="));
+        assert!(linux_requirements.contains("transformers=="));
     }
 
     #[test]
@@ -1536,5 +1582,55 @@ Plain text without a dash
             super::encode_claude_project_folder_name("/foo"),
             "-foo"
         );
+    }
+
+    #[test]
+    fn read_headroom_learn_metadata_from_path_falls_back_to_file_metadata() {
+        let root = unique_temp_dir("headroom-learn-metadata");
+        fs::create_dir_all(&root).expect("create root");
+        let memory = root.join("MEMORY.md");
+        fs::write(
+            &memory,
+            r#"
+<!-- headroom:learn:start -->
+- First pattern
+- Second pattern
+<!-- headroom:learn:end -->
+"#,
+        )
+        .expect("write memory file");
+
+        let metadata = read_headroom_learn_metadata_from_path(&memory).expect("metadata");
+
+        assert_eq!(metadata.metadata.pattern_count, Some(2));
+        assert!(metadata.metadata.learned_at.is_some());
+        assert!(metadata.sort_key.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_sha256_file_accepts_matching_content_and_rejects_mismatches() {
+        let root = unique_temp_dir("headroom-sha256");
+        fs::create_dir_all(&root).expect("create root");
+        let artifact = root.join("artifact.bin");
+        fs::write(&artifact, b"headroom").expect("write artifact");
+
+        let checksum = sha256_bytes(b"headroom");
+        verify_sha256_file(&artifact, &checksum).expect("matching checksum");
+
+        let err = verify_sha256_file(&artifact, "not-the-right-checksum")
+            .expect_err("mismatched checksum should fail");
+        assert!(err.to_string().contains("checksum mismatch"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
     }
 }

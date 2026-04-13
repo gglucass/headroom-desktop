@@ -218,6 +218,8 @@ pub struct RtkRuntimeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
+    pub platform: String,
+    pub support_tier: String,
     pub installed: bool,
     pub running: bool,
     pub starting: bool,
@@ -228,6 +230,8 @@ pub struct RuntimeStatus {
     pub mcp_error: Option<String>,
     pub ml_installed: Option<bool>,
     pub kompress_enabled: Option<bool>,
+    pub headroom_learn_supported: bool,
+    pub headroom_learn_disabled_reason: Option<String>,
     pub rtk: RtkRuntimeStatus,
 }
 

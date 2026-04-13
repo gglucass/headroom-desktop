@@ -1666,7 +1666,9 @@ mod tests {
         build_headroom_rtk_hook, claude_code_user_state_exists, claude_hook_present_in_value,
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
-        serialize_paths, shell_double_quote, ClientSetupState, ShellFamily,
+        remove_managed_block, serialize_paths, shell_block_contains_in_files,
+        shell_block_contains_text_in_files, shell_double_quote, upsert_managed_block,
+        write_file_if_changed, ClientSetupState, ShellFamily,
     };
 
     #[test]
@@ -1863,6 +1865,223 @@ mod tests {
         assert!(claude_code_user_state_exists(&home));
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_block_upsert_replaces_existing_block_without_duplication() {
+        let root = unique_temp_dir("headroom-managed-block");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zshrc");
+        fs::write(&path, "export PATH=/usr/bin\n").expect("write shell file");
+
+        let first = upsert_managed_block(&path, "claude_code", "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767")
+            .expect("insert managed block");
+        assert!(first.0);
+        assert!(first.1.is_some());
+
+        upsert_managed_block(
+            &path,
+            "claude_code",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767\nexport HEADROOM=1",
+        )
+        .expect("replace managed block");
+
+        let content = fs::read_to_string(&path).expect("read updated shell file");
+        assert_eq!(content.matches("# >>> headroom:claude_code >>>").count(), 1);
+        assert!(content.contains("export PATH=/usr/bin"));
+        assert!(content.contains("export HEADROOM=1"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_managed_block_keeps_surrounding_shell_content_intact() {
+        let root = unique_temp_dir("headroom-remove-block");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zprofile");
+        fs::write(
+            &path,
+            "export PATH=/usr/bin\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\nexport EDITOR=vim\n",
+        )
+        .expect("write shell file");
+
+        let removed = remove_managed_block(&path, "claude_code").expect("remove managed block");
+
+        assert!(removed);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read cleaned shell file"),
+            "export PATH=/usr/bin\nexport EDITOR=vim\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_block_helpers_only_match_content_inside_the_named_block() {
+        let root = unique_temp_dir("headroom-shell-match");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".bashrc");
+        fs::write(
+            &path,
+            "export ANTHROPIC_BASE_URL=https://example.com\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\nexport PATH=/tmp/headroom:$PATH\n# <<< headroom:claude_code <<<\n",
+        )
+        .expect("write shell file");
+
+        assert!(
+            shell_block_contains_in_files(
+                &[path.clone()],
+                "claude_code",
+                "ANTHROPIC_BASE_URL",
+                "http://127.0.0.1:6767",
+            )
+            .expect("detect managed export")
+        );
+        assert!(
+            shell_block_contains_text_in_files(
+                &[path.clone()],
+                "claude_code",
+                "export PATH=",
+            )
+            .expect("detect managed text")
+        );
+        assert!(
+            !shell_block_contains_in_files(
+                &[path],
+                "managed_rtk",
+                "ANTHROPIC_BASE_URL",
+                "http://127.0.0.1:6767",
+            )
+            .expect("ignore other block ids")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_if_changed_skips_backups_when_content_is_unchanged() {
+        let root = unique_temp_dir("headroom-write-file");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("headroom-rtk-rewrite.sh");
+        fs::write(&path, "#!/bin/sh\necho headroom\n").expect("write hook file");
+
+        let changed = write_file_if_changed(&path, "#!/bin/sh\necho headroom\n", false)
+            .expect("skip unchanged write");
+
+        assert_eq!(changed, (false, None));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_block_round_trip_preserves_realistic_zshrc_content() {
+        let root = unique_temp_dir("headroom-zshrc-roundtrip");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zshrc");
+        let original = r#"export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+# pnpm
+export PNPM_HOME="/Users/test/Library/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+"#;
+        fs::write(&path, original).expect("write zshrc");
+
+        upsert_managed_block(
+            &path,
+            "managed_rtk",
+            "export PATH=\"/tmp/headroom/bin:$PATH\"",
+        )
+        .expect("add managed rtk block");
+        upsert_managed_block(
+            &path,
+            "claude_code",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+        )
+        .expect("add claude block");
+
+        remove_managed_block(&path, "claude_code").expect("remove claude block");
+        remove_managed_block(&path, "managed_rtk").expect("remove managed rtk block");
+
+        let final_content = fs::read_to_string(&path).expect("read round-tripped zshrc");
+        assert_eq!(final_content, original);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updating_one_managed_block_does_not_touch_other_blocks_or_user_content() {
+        let root = unique_temp_dir("headroom-multi-block-update");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zprofile");
+        let original = r#"eval "$(/opt/homebrew/bin/brew shellenv)"
+
+# >>> headroom:managed_rtk >>>
+export PATH="/old/headroom/bin:$PATH"
+# <<< headroom:managed_rtk <<<
+
+# >>> headroom:claude_code >>>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
+# <<< headroom:claude_code <<<
+
+eval "$(/opt/homebrew/bin/rbenv init - zsh)"
+"#;
+        fs::write(&path, original).expect("write zprofile");
+
+        upsert_managed_block(
+            &path,
+            "managed_rtk",
+            "export PATH=\"/new/headroom/bin:$PATH\"",
+        )
+        .expect("update managed rtk block");
+
+        let updated = fs::read_to_string(&path).expect("read updated zprofile");
+        assert!(updated.contains("eval \"$(/opt/homebrew/bin/brew shellenv)\""));
+        assert!(updated.contains("eval \"$(/opt/homebrew/bin/rbenv init - zsh)\""));
+        assert!(updated.contains("export PATH=\"/new/headroom/bin:$PATH\""));
+        assert!(updated.contains("export ANTHROPIC_BASE_URL=http://127.0.0.1:6767"));
+        assert_eq!(updated.matches("# >>> headroom:managed_rtk >>>").count(), 1);
+        assert_eq!(updated.matches("# >>> headroom:claude_code >>>").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removing_one_managed_block_leaves_other_managed_blocks_and_user_content() {
+        let root = unique_temp_dir("headroom-remove-single-block");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".zshrc");
+        fs::write(
+            &path,
+            r#"export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+# >>> headroom:managed_rtk >>>
+export PATH="/tmp/headroom/bin:$PATH"
+# <<< headroom:managed_rtk <<<
+
+# >>> headroom:claude_code >>>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
+# <<< headroom:claude_code <<<
+"#,
+        )
+        .expect("write zshrc");
+
+        remove_managed_block(&path, "claude_code").expect("remove claude block");
+
+        let updated = fs::read_to_string(&path).expect("read cleaned zshrc");
+        assert!(updated.contains("export NVM_DIR=\"$HOME/.nvm\""));
+        assert!(updated.contains("[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\""));
+        assert!(updated.contains("# >>> headroom:managed_rtk >>>"));
+        assert!(updated.contains("export PATH=\"/tmp/headroom/bin:$PATH\""));
+        assert!(!updated.contains("# >>> headroom:claude_code >>>"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

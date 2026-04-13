@@ -1,4 +1,4 @@
-name: Release Linux App
+name: Release Linux Preview App
 
 on:
   push:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   release:
-    name: Linux x86_64
+    name: Linux x86_64 Preview
     runs-on: ubuntu-22.04
 
     env:
@@ -155,11 +155,20 @@ jobs:
           tagName: v__VERSION__
           releaseName: Headroom v__VERSION__
           releaseBody: |
-            Linux release artifacts for Headroom.
+            Linux preview artifacts for Headroom.
+
+            Supported in preview:
+            - core Headroom proxy/runtime
+            - Claude Code routing
+            - RTK integration
+
+            Not yet supported in preview:
+            - Headroom Learn
+            - secure API key storage
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
-          releaseAssetNamePattern: '[name]_[version][ext]'
+          releaseAssetNamePattern: '[name]-linux-preview_[version][ext]'
           uploadUpdaterJson: false
           uploadUpdaterSignatures: true
           args: --target x86_64-unknown-linux-gnu

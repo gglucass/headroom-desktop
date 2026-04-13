@@ -145,6 +145,8 @@ export interface ClientConnectorStatus {
 }
 
 export interface RuntimeStatus {
+  platform: string;
+  supportTier: string;
   installed: boolean;
   running: boolean;
   starting: boolean;
@@ -155,6 +157,8 @@ export interface RuntimeStatus {
   mcpError?: string | null;
   mlInstalled?: boolean | null;
   kompressEnabled?: boolean | null;
+  headroomLearnSupported: boolean;
+  headroomLearnDisabledReason?: string | null;
   rtk: {
     installed: boolean;
     version?: string | null;

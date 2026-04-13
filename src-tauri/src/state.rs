@@ -722,6 +722,9 @@ impl AppState {
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
         let mcp_error = self.tool_manager.headroom_mcp_error();
         let ml_installed = self.tool_manager.headroom_ml_installed();
+        let platform = current_platform();
+        let support_tier = current_platform_support_tier();
+        let headroom_learn_disabled_reason = headroom_learn_platform_message();
         let kompress_enabled = if installed && proxy_reachable {
             self.tool_manager.headroom_kompress_enabled()
         } else {
@@ -753,6 +756,8 @@ impl AppState {
         let effective_running = installed && !paused && proxy_reachable;
 
         RuntimeStatus {
+            platform: platform.into(),
+            support_tier: support_tier.into(),
             installed,
             running: effective_running,
             starting: self.runtime_is_starting() && !effective_running,
@@ -763,6 +768,8 @@ impl AppState {
             mcp_error,
             ml_installed,
             kompress_enabled,
+            headroom_learn_supported: headroom_learn_disabled_reason.is_none(),
+            headroom_learn_disabled_reason,
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
                 version: rtk_version,
@@ -855,6 +862,27 @@ impl AppState {
             }
             _ => {}
         }
+    }
+}
+
+pub(crate) fn current_platform() -> &'static str {
+    std::env::consts::OS
+}
+
+pub(crate) fn current_platform_support_tier() -> &'static str {
+    match current_platform() {
+        "linux" => "experimental",
+        _ => "stable",
+    }
+}
+
+pub(crate) fn headroom_learn_platform_message() -> Option<String> {
+    match current_platform() {
+        "linux" => Some(
+            "Headroom Learn is disabled on Linux preview builds. Core proxy routing works, but Learn and secure API key storage are not production-ready yet."
+                .into(),
+        ),
+        _ => None,
     }
 }
 
