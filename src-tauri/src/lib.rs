@@ -935,6 +935,15 @@ fn trigger_sentry_test() -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn is_sentry_test_allowed() -> bool {
+    const ALLOWED_IP: &str = "87.212.111.40";
+    reqwest::blocking::get("https://api.ipify.org")
+        .and_then(|r| r.text())
+        .map(|ip| ip.trim() == ALLOWED_IP)
+        .unwrap_or(false)
+}
+
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
@@ -1085,7 +1094,8 @@ pub fn run() {
             submit_contact_request,
             hide_launcher_animated,
             quit_headroom,
-            trigger_sentry_test
+            trigger_sentry_test,
+            is_sentry_test_allowed
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

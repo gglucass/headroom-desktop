@@ -616,11 +616,8 @@ function SentryTestButton() {
   const [status, setStatus] = useState<"idle" | "sending" | "ok" | "err">("idle");
 
   useEffect(() => {
-    fetch("https://api.ipify.org?format=json")
-      .then((r) => r.json())
-      .then((data: { ip: string }) => {
-        if (data.ip === "87.212.111.40") setVisible(true);
-      })
+    invoke<boolean>("is_sentry_test_allowed")
+      .then((allowed) => { if (allowed) setVisible(true); })
       .catch(() => {});
   }, []);
 
