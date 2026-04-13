@@ -880,7 +880,17 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
-        download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256))?;
+
+        // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
+        let use_wheel = match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+            Ok(()) => true,
+            Err(download_err) => {
+                eprintln!(
+                    "headroom wheel download failed (will fall back to pip index): {download_err}"
+                );
+                false
+            }
+        };
 
         run_python_command(
             &self.runtime.managed_python(),
@@ -896,18 +906,24 @@ impl ToolManager {
         )
         .context("installing locked Headroom dependencies into Headroom-managed virtualenv")?;
 
+        let headroom_spec = format!("headroom-ai=={}", release.version);
+        let headroom_arg = if use_wheel {
+            wheel_path.to_string_lossy().into_owned()
+        } else {
+            headroom_spec.clone()
+        };
         run_python_command(
             &self.runtime.managed_python(),
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--no-deps",
-                wheel_path.to_string_lossy().as_ref(),
-            ],
+            &["-m", "pip", "install", "--no-deps", &headroom_arg],
             &self.runtime.root_dir,
         )
-        .context("installing verified Headroom wheel into Headroom-managed virtualenv")?;
+        .with_context(|| {
+            if use_wheel {
+                "installing verified Headroom wheel into Headroom-managed virtualenv".into()
+            } else {
+                format!("installing {headroom_spec} from PyPI into Headroom-managed virtualenv")
+            }
+        })?;
 
         let mcp_install = match self.install_headroom_mcp() {
             Ok(()) => json!({
@@ -1214,26 +1230,38 @@ fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>
         }
     }
 
-    let response = reqwest::blocking::get(url)
-        .with_context(|| format!("downloading {}", url))?
-        .error_for_status()
-        .with_context(|| format!("downloading {}", url))?;
-
-    let bytes = response.bytes().context("reading download body")?;
-    if let Some(expected_sha256) = expected_sha256 {
-        let actual_checksum = sha256_bytes(&bytes);
-        if actual_checksum != expected_sha256 {
-            bail!(
-                "checksum mismatch for {}: expected {}, got {}",
-                url,
-                expected_sha256,
-                actual_checksum
-            );
+    let mut last_err = anyhow::anyhow!("no attempts made");
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+        }
+        let result = (|| -> Result<()> {
+            let response = reqwest::blocking::get(url)
+                .with_context(|| format!("downloading {}", url))?
+                .error_for_status()
+                .with_context(|| format!("downloading {}", url))?;
+            let bytes = response.bytes().context("reading download body")?;
+            if let Some(expected_sha256) = expected_sha256 {
+                let actual_checksum = sha256_bytes(&bytes);
+                if actual_checksum != expected_sha256 {
+                    bail!(
+                        "checksum mismatch for {}: expected {}, got {}",
+                        url,
+                        expected_sha256,
+                        actual_checksum
+                    );
+                }
+            }
+            std::fs::write(destination, &bytes)
+                .with_context(|| format!("writing {}", destination.display()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
         }
     }
-    std::fs::write(destination, &bytes)
-        .with_context(|| format!("writing {}", destination.display()))?;
-    Ok(())
+    Err(last_err)
 }
 
 fn verify_sha256_file(path: &Path, expected_sha256: &str) -> Result<()> {

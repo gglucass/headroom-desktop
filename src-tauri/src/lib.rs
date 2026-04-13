@@ -410,10 +410,15 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             .tool_manager
             .bootstrap_all_with_progress(|step| state.update_bootstrap_step(step));
         if let Err(err) = result {
-            state.mark_bootstrap_failed(format!("Installation failed: {err}"));
+            let technical_err = format!("{err:#}");
             sentry::capture_message(
-                &format!("bootstrap_failed (install_runtime): {err}"),
+                &format!("bootstrap_failed (install_runtime): {technical_err}"),
                 sentry::Level::Error,
+            );
+            state.mark_bootstrap_failed(
+                "Installation failed: Headroom couldn't download a required file. \
+                Please check your internet connection and try restarting the app. \
+                If this keeps happening, contact support at headroom.ai/support."
             );
             analytics::track_event(
                 &app_handle,
@@ -921,28 +926,6 @@ fn quit_headroom(app: AppHandle) {
     exit_headroom(&app, QuitSource::SettingsButton);
 }
 
-#[tauri::command]
-fn trigger_sentry_test() -> Result<(), String> {
-    const ALLOWED_IP: &str = "87.212.111.40";
-    let public_ip = reqwest::blocking::get("https://api.ipify.org")
-        .and_then(|r| r.text())
-        .unwrap_or_default();
-    let public_ip = public_ip.trim();
-    if public_ip != ALLOWED_IP {
-        return Err(format!("not allowed from {public_ip}"));
-    }
-    sentry::capture_message("sentry test event from trigger_sentry_test", sentry::Level::Error);
-    Ok(())
-}
-
-#[tauri::command]
-fn is_sentry_test_allowed() -> bool {
-    const ALLOWED_IP: &str = "87.212.111.40";
-    reqwest::blocking::get("https://api.ipify.org")
-        .and_then(|r| r.text())
-        .map(|ip| ip.trim() == ALLOWED_IP)
-        .unwrap_or(false)
-}
 
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
@@ -1093,9 +1076,7 @@ pub fn run() {
             open_external_link,
             submit_contact_request,
             hide_launcher_animated,
-            quit_headroom,
-            trigger_sentry_test,
-            is_sentry_test_allowed
+            quit_headroom
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -611,42 +611,6 @@ function LauncherShell({
   );
 }
 
-function SentryTestButton() {
-  const [visible, setVisible] = useState(false);
-  const [status, setStatus] = useState<"idle" | "sending" | "ok" | "err">("idle");
-
-  useEffect(() => {
-    invoke<boolean>("is_sentry_test_allowed")
-      .then((allowed) => { if (allowed) setVisible(true); })
-      .catch(() => {});
-  }, []);
-
-  if (!visible) return null;
-
-  return (
-    <button
-      className="link-button"
-      style={{ fontSize: 11, opacity: 0.4, marginTop: 4 }}
-      disabled={status === "sending"}
-      onClick={async () => {
-        setStatus("sending");
-        try {
-          await invoke("trigger_sentry_test");
-          setStatus("ok");
-        } catch {
-          setStatus("err");
-        }
-        setTimeout(() => setStatus("idle"), 3000);
-      }}
-      type="button"
-    >
-      {status === "idle" && "Test Sentry"}
-      {status === "sending" && "Sending..."}
-      {status === "ok" && "Sent to Sentry"}
-      {status === "err" && "Not allowed / failed"}
-    </button>
-  );
-}
 
 export default function App() {
   const [dashboard, setDashboard] = useState<DashboardState>(mockDashboard);
@@ -4107,7 +4071,6 @@ export default function App() {
               >
                 Contact us
               </button>
-              <SentryTestButton />
 <button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}
