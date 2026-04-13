@@ -16,16 +16,11 @@ use tar::Archive;
 
 use crate::models::{ManagedTool, ToolStatus};
 
-/// Minimum acceptable version. Releases below this floor are skipped entirely.
-/// All releases at or above this floor must still pass the age hold.
-const HEADROOM_MIN_VERSION: &str = "0.5.21";
-/// The major.minor series we track for auto-upgrades (e.g. "0.5").
-const HEADROOM_SERIES: &str = "0.5";
-/// Days a new release must be on PyPI before it is eligible for auto-upgrade
-/// (unless it is at or above HEADROOM_MIN_VERSION).
-const HEADROOM_UPGRADE_HOLD_DAYS: i64 = 7;
-/// Known-bad releases that should never be auto-installed.
-const HEADROOM_BLOCKED_VERSIONS: &[&str] = &["0.5.20"];
+/// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
+/// will be installed if the currently-installed version differs.
+const HEADROOM_PINNED_VERSION: &str = "0.5.24";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/1a/0f/0cd0c1c238b750443396e35b423b492226a3f7831c5b43b4c99971d2430f/headroom_ai-0.5.24-py3-none-any.whl";
+const HEADROOM_PINNED_SHA256: &str = "0cde90f6b7c8a9900759066957fd80a2bad4a0379946cf62096791a4b514699f";
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
@@ -175,7 +170,7 @@ impl ToolManager {
                 description: "Default optimizer stage for every supported client.".into(),
                 runtime: "python".into(),
                 source_url: "https://pypi.org/project/headroom-ai/".into(),
-                version: HEADROOM_MIN_VERSION.into(),
+                version: HEADROOM_PINNED_VERSION.into(),
                 checksum: None,
                 required: true,
             },
@@ -659,20 +654,17 @@ impl ToolManager {
             .map(|parsed| parsed.summary)
     }
 
-    /// Queries PyPI for the best eligible 0.5.X release and returns it if it
-    /// differs from what is installed or the installed version is blocked.
+    /// Returns the pinned release if the installed version differs from the pin.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
         let installed = self.installed_headroom_version()?;
-        let installed_semver = parse_semver(&installed)?;
-        let best = fetch_best_headroom_release()?;
-        let best_semver = parse_semver(&best.version)?;
-        let installed_is_blocked = is_blocked_headroom_version(&installed);
-
-        if installed_is_blocked || best_semver > installed_semver {
-            Some(best)
-        } else {
-            None
+        if installed == HEADROOM_PINNED_VERSION {
+            return None;
         }
+        Some(HeadroomRelease {
+            version: HEADROOM_PINNED_VERSION.into(),
+            wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
+            sha256: HEADROOM_PINNED_SHA256.into(),
+        })
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -872,11 +864,13 @@ impl ToolManager {
         Ok(())
     }
 
-    /// Bootstrap path: fetches the best eligible release from PyPI, then installs it.
+    /// Bootstrap path: installs the pinned headroom release.
     fn install_headroom(&self) -> Result<()> {
-        let release = fetch_best_headroom_release()
-            .ok_or_else(|| anyhow::anyhow!("could not fetch headroom release info from PyPI"))?;
-        self.install_headroom_release(&release)
+        self.install_headroom_release(&HeadroomRelease {
+            version: HEADROOM_PINNED_VERSION.into(),
+            wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
+            sha256: HEADROOM_PINNED_SHA256.into(),
+        })
     }
 
     fn install_headroom_release(&self, release: &HeadroomRelease) -> Result<()> {
@@ -1151,96 +1145,7 @@ pub(crate) struct HeadroomRelease {
     sha256: String,
 }
 
-/// Parses a "major.minor.patch" version string into a comparable tuple.
-fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = v.splitn(3, '.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    let patch = parts.next()?.parse::<u32>().ok()?;
-    Some((major, minor, patch))
-}
 
-fn is_blocked_headroom_version(version: &str) -> bool {
-    HEADROOM_BLOCKED_VERSIONS.contains(&version)
-}
-
-/// Queries PyPI for the latest eligible release in HEADROOM_SERIES, excluding
-/// known-bad versions.
-///
-/// A release is eligible when either:
-///   - it has been on PyPI for at least HEADROOM_UPGRADE_HOLD_DAYS, or
-///   - its version is >= HEADROOM_MIN_VERSION (the minimum required version
-///     ships immediately regardless of age).
-///
-/// Returns None when PyPI is unreachable or no eligible release is found.
-fn fetch_best_headroom_release() -> Option<HeadroomRelease> {
-    let resp = reqwest::blocking::get("https://pypi.org/pypi/headroom-ai/json").ok()?;
-    let json: serde_json::Value = resp.json().ok()?;
-    let releases = json["releases"].as_object()?;
-
-    let now = chrono::Utc::now();
-    let min_semver = parse_semver(HEADROOM_MIN_VERSION)?;
-    let series_prefix = format!("{}.", HEADROOM_SERIES);
-
-    let mut best: Option<((u32, u32, u32), HeadroomRelease)> = None;
-
-    for (version_str, files) in releases {
-        if !version_str.starts_with(&series_prefix) || is_blocked_headroom_version(version_str) {
-            continue;
-        }
-        let semver = match parse_semver(version_str) {
-            Some(v) => v,
-            None => continue,
-        };
-        let files_arr = match files.as_array() {
-            Some(f) => f,
-            None => continue,
-        };
-        let wheel = match files_arr.iter().find(|f| {
-            f["packagetype"].as_str() == Some("bdist_wheel")
-                && f["python_version"].as_str() == Some("py3")
-        }) {
-            Some(w) => w,
-            None => continue,
-        };
-        let upload_time_str = match wheel["upload_time_iso_8601"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let upload_time = match chrono::DateTime::parse_from_rfc3339(upload_time_str) {
-            Ok(t) => t.with_timezone(&chrono::Utc),
-            Err(_) => continue,
-        };
-        if semver < min_semver {
-            continue;
-        }
-        let age_days = now.signed_duration_since(upload_time).num_days();
-        if age_days < HEADROOM_UPGRADE_HOLD_DAYS {
-            continue;
-        }
-
-        if best.as_ref().map(|(v, _)| semver > *v).unwrap_or(true) {
-            let wheel_url = match wheel["url"].as_str() {
-                Some(u) => u.to_string(),
-                None => continue,
-            };
-            let sha256 = match wheel["digests"]["sha256"].as_str() {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            best = Some((
-                semver,
-                HeadroomRelease {
-                    version: version_str.clone(),
-                    wheel_url,
-                    sha256,
-                },
-            ));
-        }
-    }
-
-    best.map(|(_, release)| release)
-}
 
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -1493,9 +1398,8 @@ mod tests {
 
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
-        headroom_python_startup_args, is_blocked_headroom_version, parse_semver,
-        read_headroom_learn_metadata_from_path, sha256_bytes, verify_sha256_file, ManagedRuntime,
-        ToolManager, HEADROOM_PROXY_PORT,
+        headroom_python_startup_args, read_headroom_learn_metadata_from_path,
+        sha256_bytes, verify_sha256_file, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -1536,18 +1440,6 @@ mod tests {
             headroom_python_startup_args(),
             vec!["-m", "headroom.proxy.server", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
         );
-    }
-
-    #[test]
-    fn parse_semver_parses_three_part_versions() {
-        assert_eq!(parse_semver("0.5.21"), Some((0, 5, 21)));
-    }
-
-    #[test]
-    fn blocked_headroom_versions_exclude_known_bad_release() {
-        assert!(is_blocked_headroom_version("0.5.20"));
-        assert!(!is_blocked_headroom_version("0.5.21"));
-        assert!(!is_blocked_headroom_version("0.5.22"));
     }
 
     #[test]

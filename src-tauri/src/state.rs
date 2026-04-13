@@ -304,16 +304,14 @@ impl AppState {
         let stats = self.cached_headroom_stats();
         let history = self.cached_headroom_history();
 
-        if history.is_none() {
-            if let Some(stats) = stats.as_ref() {
-                if let Some((updated, updated_daily, updated_hourly, milestones)) =
-                    self.record_savings_snapshot(stats)
-                {
-                    snapshot = updated;
-                    daily_savings = updated_daily;
-                    hourly_savings = updated_hourly;
-                    lifetime_token_milestones = milestones;
-                }
+        if let Some(stats) = stats.as_ref() {
+            if let Some((updated, updated_daily, updated_hourly, milestones)) =
+                self.record_savings_snapshot(stats)
+            {
+                snapshot = updated;
+                daily_savings = updated_daily;
+                hourly_savings = updated_hourly;
+                lifetime_token_milestones = milestones;
             }
         }
 
@@ -2810,8 +2808,11 @@ mod tests {
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
+    use crate::models::{DailySavingsPoint, HourlySavingsPoint};
+
     use super::{
-        lifetime_token_milestones_crossed, parse_headroom_stats_from_json,
+        lifetime_token_milestones_crossed, merge_daily_savings, merge_hourly_savings,
+        parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, AppState,
         ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
@@ -3802,5 +3803,159 @@ mod tests {
         assert_eq!(tracker.lifetime_requests, 0);
 
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    fn daily(date: &str, tokens: u64, usd: f64) -> DailySavingsPoint {
+        DailySavingsPoint {
+            date: date.to_string(),
+            estimated_tokens_saved: tokens,
+            estimated_savings_usd: usd,
+            actual_cost_usd: 0.0,
+            total_tokens_sent: 0,
+        }
+    }
+
+    fn hourly(hour: &str, tokens: u64) -> HourlySavingsPoint {
+        HourlySavingsPoint {
+            hour: hour.to_string(),
+            estimated_tokens_saved: tokens,
+            estimated_savings_usd: 0.0,
+            actual_cost_usd: 0.0,
+            total_tokens_sent: 0,
+        }
+    }
+
+    // merge_daily_savings
+
+    #[test]
+    fn merge_daily_tracker_preferred_before_cutoff() {
+        let tracker = vec![daily("2026-04-13", 500, 1.0)];
+        let history = vec![daily("2026-04-13", 999, 2.0)];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        // tracker wins pre-cutoff
+        assert_eq!(result[0].estimated_tokens_saved, 500);
+    }
+
+    #[test]
+    fn merge_daily_history_preferred_on_and_after_cutoff() {
+        let tracker = vec![daily("2026-04-20", 100, 0.5)];
+        let history = vec![daily("2026-04-20", 800, 2.0)];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        // history wins on cutoff date
+        assert_eq!(result[0].estimated_tokens_saved, 800);
+    }
+
+    #[test]
+    fn merge_daily_fallback_when_only_tracker_has_post_cutoff_day() {
+        let tracker = vec![daily("2026-04-21", 300, 1.2)];
+        let result = merge_daily_savings(tracker, vec![], "2026-04-20");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 300);
+    }
+
+    #[test]
+    fn merge_daily_fallback_when_only_history_has_pre_cutoff_day() {
+        let history = vec![daily("2026-04-10", 400, 1.5)];
+        let result = merge_daily_savings(vec![], history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 400);
+    }
+
+    #[test]
+    fn merge_daily_combines_days_from_both_sources() {
+        let tracker = vec![daily("2026-04-10", 200, 0.8), daily("2026-04-13", 300, 1.0)];
+        let history = vec![daily("2026-04-20", 500, 2.0), daily("2026-04-21", 600, 2.5)];
+        let mut result = merge_daily_savings(tracker, history, "2026-04-20");
+        result.sort_by(|a, b| a.date.cmp(&b.date));
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].date, "2026-04-10");
+        assert_eq!(result[3].date, "2026-04-21");
+    }
+
+    // merge_hourly_savings
+
+    #[test]
+    fn merge_hourly_tracker_preferred_before_cutoff() {
+        let tracker = vec![hourly("2026-04-13T10:00", 500)];
+        let history = vec![hourly("2026-04-13T10:00", 999)];
+        let result = merge_hourly_savings(tracker, history, "2026-04-20T00:00");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 500);
+    }
+
+    #[test]
+    fn merge_hourly_history_preferred_on_and_after_cutoff() {
+        let tracker = vec![hourly("2026-04-20T09:00", 100)];
+        let history = vec![hourly("2026-04-20T09:00", 800)];
+        let result = merge_hourly_savings(tracker, history, "2026-04-20T00:00");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 800);
+    }
+
+    #[test]
+    fn merge_hourly_empty_tracker_does_not_overwrite_history_for_today() {
+        // Regression: before the fix, when native history was present the tracker was
+        // never updated, so it was empty. Pre-cutoff hours should then fall back to
+        // native history rather than producing empty bars.
+        let tracker: Vec<HourlySavingsPoint> = vec![];
+        let history = vec![
+            hourly("2026-04-13T09:00", 400),
+            hourly("2026-04-13T10:00", 600),
+        ];
+        let mut result = merge_hourly_savings(tracker, history, "2026-04-20T00:00");
+        result.sort_by(|a, b| a.hour.cmp(&b.hour));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].estimated_tokens_saved, 400);
+        assert_eq!(result[1].estimated_tokens_saved, 600);
+    }
+
+    #[test]
+    fn tracker_observe_called_updates_hourly_savings_even_with_history_present() {
+        // Regression: tracker.observe() must be called regardless of whether native
+        // history is available, so that hourly buckets stay current.
+        let today = chrono::Local::now();
+        let hp = |hour: u32, total: u64| -> HeadroomSavingsHistoryPoint {
+            history_point_at(today.year(), today.month(), today.day(), hour, total)
+        };
+        let mut tracker = make_tracker();
+
+        // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
+        tracker.observe(&HeadroomDashboardStats {
+            session_requests: Some(1),
+            session_estimated_savings_usd: Some(1.0),
+            session_estimated_tokens_saved: Some(1_000),
+            session_savings_pct: Some(30.0),
+            session_actual_cost_usd: Some(0.5),
+            session_total_tokens_sent: Some(3_000),
+            savings_history: vec![hp(9, 0), hp(10, 1_000)],
+        });
+        let total_first: u64 = tracker
+            .hourly_savings()
+            .iter()
+            .map(|p| p.estimated_tokens_saved)
+            .sum();
+
+        // Second observation: 3_000 tokens saved, history adds hour 11.
+        tracker.observe(&HeadroomDashboardStats {
+            session_requests: Some(3),
+            session_estimated_savings_usd: Some(3.0),
+            session_estimated_tokens_saved: Some(3_000),
+            session_savings_pct: Some(30.0),
+            session_actual_cost_usd: Some(1.5),
+            session_total_tokens_sent: Some(9_000),
+            savings_history: vec![hp(9, 0), hp(10, 1_000), hp(11, 3_000)],
+        });
+        let total_second: u64 = tracker
+            .hourly_savings()
+            .iter()
+            .map(|p| p.estimated_tokens_saved)
+            .sum();
+
+        assert!(
+            total_second > total_first,
+            "hourly savings should grow with each observe call: first={total_first} second={total_second}"
+        );
     }
 }

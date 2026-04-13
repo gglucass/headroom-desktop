@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
@@ -174,16 +174,6 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
         );
         pricing::report_milestone(milestone_tokens_saved);
     }
-
-    let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-    let today_key = Local::now().format("%Y-%m-%d").to_string();
-    let today_savings = dashboard
-        .daily_savings
-        .iter()
-        .find(|p| p.date == today_key)
-        .map(|p| p.estimated_savings_usd)
-        .unwrap_or(0.0);
-    *savings_state.0.lock().unwrap() = today_savings;
 
     check_zero_spend_anomaly(&dashboard);
 
@@ -597,6 +587,11 @@ fn create_headroom_checkout_session(
         })),
     );
     Ok(url)
+}
+
+#[tauri::command]
+fn get_headroom_billing_portal_url() -> Result<String, String> {
+    pricing::get_billing_portal_url()
 }
 
 #[tauri::command]
@@ -1053,6 +1048,7 @@ pub fn run() {
             sign_out_headroom_account,
             activate_headroom_account,
             create_headroom_checkout_session,
+            get_headroom_billing_portal_url,
             get_headroom_learn_status,
             get_headroom_learn_api_key_status,
             set_headroom_learn_api_key,
@@ -1837,14 +1833,15 @@ fn spawn_tray_savings_updater(app: AppHandle) {
             let state: tauri::State<'_, AppState> = app.state();
             let dashboard = state.dashboard();
             let today_key = Local::now().format("%Y-%m-%d").to_string();
-            let savings = dashboard
-                .daily_savings
+            let savings: f64 = dashboard
+                .hourly_savings
                 .iter()
-                .find(|p| p.date == today_key)
+                .filter(|p| p.hour.starts_with(&today_key))
                 .map(|p| p.estimated_savings_usd)
-                .unwrap_or(0.0);
+                .sum();
             let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
             *savings_state.0.lock().unwrap() = savings;
+            let _ = app.emit("savings-today-updated", savings);
         }
     });
 }

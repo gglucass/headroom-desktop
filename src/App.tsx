@@ -27,6 +27,7 @@ import {
   Sparkle,
 } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Bar,
@@ -340,6 +341,17 @@ function DailySavingsChart({
   const [visibleMonth, setVisibleMonth] = useState(() => currentMonth);
   const [visibleDay, setVisibleDay] = useState(() => today);
   const [view, setView] = useState<SavingsChartView>("day");
+  const [savingsTodayUsd, setSavingsTodayUsd] = useState<number | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<number>("savings-today-updated", (event) => {
+      setSavingsTodayUsd(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
   const firstSavingsMonth = earliestSavingsMonth(data);
   const firstHourlyDay = earliestHourlyDay(hourlyData);
   const monthlyData = buildMonthlySavingsChartData(buildMonthlySavingsWindow(data, visibleMonth));
@@ -431,7 +443,11 @@ function DailySavingsChart({
           <div className="savings-chart__overlay" aria-hidden="true">
             <span className="savings-chart__overlay-total">
               {chartMode === "usd"
-                ? currency(chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0))
+                ? currency(
+                    view === "day" && visibleDay >= today && savingsTodayUsd !== null
+                      ? savingsTodayUsd
+                      : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
+                  )
                 : compactNumber(chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0))}
             </span>
             <span className="savings-chart__overlay-label">
@@ -2000,7 +2016,7 @@ export default function App() {
       switch (planId) {
         case "free":
           return {
-            kind: "internal" as const
+            kind: activeHeadroomPlanId ? "billing_portal" as const : "internal" as const
           };
         case "pro":
           return {
@@ -2067,6 +2083,23 @@ export default function App() {
       } catch (error) {
         setUpgradeActionError(
           error instanceof Error ? error.message : typeof error === "string" ? error : "Could not start checkout."
+        );
+      } finally {
+        setUpgradeActionBusy(null);
+      }
+      return;
+    }
+
+    if (action.kind === "billing_portal") {
+      setUpgradeActionBusy(planId);
+      setUpgradeActionError(null);
+
+      try {
+        const url = await invoke<string>("get_headroom_billing_portal_url");
+        await openExternalLink(url);
+      } catch (error) {
+        setUpgradeActionError(
+          error instanceof Error ? error.message : typeof error === "string" ? error : "Could not open billing portal."
         );
       } finally {
         setUpgradeActionBusy(null);
@@ -4037,7 +4070,7 @@ export default function App() {
               >
                 Contact us
               </button>
-              <button
+<button
                 className="quit-button"
                 onClick={() => void invoke("quit_headroom")}
                 type="button"

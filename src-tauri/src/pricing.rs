@@ -117,6 +117,11 @@ struct CheckoutSessionResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct BillingPortalResponse {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiErrorResponse {
     error: Option<String>,
@@ -353,6 +358,37 @@ pub fn create_checkout_session(
         .json::<CheckoutSessionResponse>()
         .map(|body| body.url)
         .map_err(|err| format!("Could not parse checkout response: {err}"))
+}
+
+pub fn get_billing_portal_url() -> Result<String, String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before accessing billing.".to_string())?;
+    let response = http_client()?
+        .get(api_url("desktop/billing_portal"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|err| format!("Could not reach billing portal: {err}"))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not open billing portal (status {status}).")));
+    }
+
+    response
+        .json::<BillingPortalResponse>()
+        .map(|body| body.url)
+        .map_err(|err| format!("Could not parse billing portal response: {err}"))
 }
 
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
