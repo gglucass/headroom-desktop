@@ -146,6 +146,17 @@ impl AppState {
                 }
             }
 
+            // Independent of version upgrades or requirements repairs: if MCP
+            // is not configured (e.g. it failed during a prior install when deps
+            // were missing), retry it now.
+            if let Err(err) = self.tool_manager.ensure_mcp_configured() {
+                eprintln!("failed to configure headroom MCP: {err}");
+                sentry::capture_message(
+                    &format!("headroom MCP configuration failed: {err}"),
+                    sentry::Level::Warning,
+                );
+            }
+
             if let Err(err) = self.ensure_headroom_running() {
                 eprintln!("failed to auto-start headroom during app launch: {err}");
                 sentry::capture_message(

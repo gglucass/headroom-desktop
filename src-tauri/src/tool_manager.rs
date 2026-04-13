@@ -325,6 +325,7 @@ impl ToolManager {
                 .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
                 .env("PIP_NO_INPUT", "1")
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_HTTP2", "false")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(
                     log_file
@@ -955,6 +956,23 @@ impl ToolManager {
         )
     }
 
+    /// Runs MCP install if the receipt shows it is not configured, then updates
+    /// the receipt. Safe to call at every launch — no-ops when already configured.
+    pub fn ensure_mcp_configured(&self) -> Result<()> {
+        if self.headroom_mcp_configured() == Some(true) {
+            return Ok(());
+        }
+        self.install_headroom_mcp()?;
+        let receipt_path = self.runtime.tools_dir.join("headroom.json");
+        if let Ok(bytes) = std::fs::read(&receipt_path) {
+            if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
+                receipt["mcp"] = json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL });
+                let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
+            }
+        }
+        Ok(())
+    }
+
     fn install_headroom_mcp(&self) -> Result<()> {
         let entrypoint = self.headroom_entrypoint();
         run_command(
@@ -1116,7 +1134,9 @@ fn headroom_python_startup_args() -> Vec<&'static str> {
 }
 
 fn headroom_entrypoint_startup_args() -> Vec<&'static str> {
-    vec!["proxy", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
+    // The CLI `proxy` command does not expose --no-http2; HTTP/2 is controlled
+    // via the HEADROOM_HTTP2 env var when using the entrypoint.
+    vec!["proxy", "--port", HEADROOM_PROXY_PORT]
 }
 
 struct DownloadArtifact {
@@ -1510,7 +1530,7 @@ mod tests {
     fn managed_headroom_startup_uses_supported_proxy_args() {
         assert_eq!(
             headroom_entrypoint_startup_args(),
-            vec!["proxy", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
+            vec!["proxy", "--port", HEADROOM_PROXY_PORT]
         );
         assert_eq!(
             headroom_python_startup_args(),
