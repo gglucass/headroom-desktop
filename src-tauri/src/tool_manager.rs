@@ -211,7 +211,12 @@ impl ToolManager {
                 enabled: true,
                 status: self.detect_status(&manifest.id),
                 source_url: manifest.source_url.clone(),
-                version: manifest.version.clone(),
+                version: if manifest.id == "headroom" {
+                    self.installed_headroom_version()
+                        .unwrap_or_else(|| manifest.version.clone())
+                } else {
+                    manifest.version.clone()
+                },
                 checksum: manifest.checksum.clone(),
             })
             .collect()
@@ -643,24 +648,64 @@ impl ToolManager {
     }
 
     /// Queries PyPI for the best eligible 0.5.X release and returns it if it
-    /// differs from what is installed, or if the compiled requirements lock has
-    /// changed since the last install (so updated deps are applied without a
-    /// headroom version bump).
+    /// differs from what is installed or the installed version is blocked.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
         let installed = self.installed_headroom_version()?;
         let installed_semver = parse_semver(&installed)?;
         let best = fetch_best_headroom_release()?;
         let best_semver = parse_semver(&best.version)?;
         let installed_is_blocked = is_blocked_headroom_version(&installed);
-        let lock_is_stale = self
-            .installed_requirements_lock_sha()
-            .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()));
 
-        if installed_is_blocked || best_semver > installed_semver || lock_is_stale {
+        if installed_is_blocked || best_semver > installed_semver {
             Some(best)
         } else {
             None
         }
+    }
+
+    /// Returns true if the compiled requirements lock differs from what was
+    /// used during the last headroom install.
+    pub fn requirements_are_stale(&self) -> bool {
+        self.installed_requirements_lock_sha()
+            .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()))
+    }
+
+    /// Re-runs the requirements lock install when the compiled lock has changed
+    /// since the last install. This repairs missing or outdated deps without
+    /// requiring a headroom version bump. Updates the stored lock sha on success
+    /// so the repair does not re-run on the next launch.
+    pub fn repair_stale_requirements(&self) -> Result<()> {
+        let requirements_lock = bootstrap_requirements_lock();
+        let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
+        run_python_command(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--requirement",
+                lock_path.to_string_lossy().as_ref(),
+            ],
+            &self.runtime.root_dir,
+        )
+        .context("repairing stale headroom requirements")?;
+
+        // Update the stored lock sha so we don't re-repair on the next launch.
+        let receipt_path = self.runtime.tools_dir.join("headroom.json");
+        if let Ok(bytes) = std::fs::read(&receipt_path) {
+            if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
+                    artifact.insert(
+                        "requirementsLockSha256".into(),
+                        json!(sha256_bytes(requirements_lock.as_bytes())),
+                    );
+                    let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Applies a previously-fetched release, upgrading or downgrading

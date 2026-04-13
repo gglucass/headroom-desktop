@@ -133,6 +133,17 @@ impl AppState {
                         sentry::Level::Error,
                     );
                 }
+            } else if self.tool_manager.requirements_are_stale() {
+                // No version change, but the compiled requirements lock has
+                // changed (e.g. a new dep was added). Repair deps in place
+                // without reinstalling the wheel.
+                if let Err(err) = self.tool_manager.repair_stale_requirements() {
+                    eprintln!("failed to repair stale headroom requirements: {err}");
+                    sentry::capture_message(
+                        &format!("headroom requirements repair failed: {err}"),
+                        sentry::Level::Error,
+                    );
+                }
             }
 
             if let Err(err) = self.ensure_headroom_running() {
