@@ -63,6 +63,7 @@ jobs:
         with:
           workspaces: |
             src-tauri -> target
+          env-vars: HEADROOM_SENTRY_DSN
 
       - name: Validate release version state
         id: release_guard
@@ -122,6 +123,8 @@ jobs:
             APPLE_SIGNING_IDENTITY
             TAURI_SIGNING_PRIVATE_KEY
             TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            HEADROOM_SENTRY_DSN
+            VITE_SENTRY_DSN
           )
 
           for key in "${required[@]}"; do

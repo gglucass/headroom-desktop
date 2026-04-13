@@ -3077,6 +3077,13 @@ export default function App() {
               {authRequestBusy ? "Sending..." : "Sign in"}
             </button>
           </div>
+          <p className="pricing-auth-card__legal">
+            {"By signing in, you agree to our "}
+            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/terms" })} type="button">Terms of Service</button>
+            {" and "}
+            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/privacy" })} type="button">Privacy Policy</button>
+            {"."}
+          </p>
         </>
       ) : (
         <>
