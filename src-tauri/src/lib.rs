@@ -711,11 +711,27 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
     };
 
     #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(trimmed);
-        command
-    };
+    {
+        for opener in ["xdg-open", "gio", "kde-open5", "wslview"] {
+            let mut command = Command::new(opener);
+            if opener == "gio" {
+                command.args(["open", trimmed]);
+            } else {
+                command.arg(trimmed);
+            }
+            match command.status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!("Could not launch external link with {opener}: {err}"))
+                }
+            }
+        }
+        return Err(
+            "No URL opener found. Install xdg-utils (provides xdg-open) to open links.".into(),
+        );
+    }
 
     #[cfg(target_os = "windows")]
     let mut command = {
@@ -724,14 +740,17 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
         command
     };
 
-    let status = command
-        .status()
-        .map_err(|err| format!("Could not launch external link: {err}"))?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = command
+            .status()
+            .map_err(|err| format!("Could not launch external link: {err}"))?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("External link opener exited with {status}."))
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("External link opener exited with {status}."))
+        }
     }
 }
 

@@ -879,6 +879,19 @@ impl ToolManager {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let python = self.runtime.standalone_python();
+            if let Ok(metadata) = std::fs::metadata(&python) {
+                let mut perms = metadata.permissions();
+                if perms.mode() & 0o111 == 0 {
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&python, perms);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1517,7 +1530,13 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     let output = Command::new(binary)
         .args(args)
         .current_dir(cwd)
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONSTARTUP")
         .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
         .output()

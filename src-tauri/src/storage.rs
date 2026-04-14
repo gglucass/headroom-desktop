@@ -3,9 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 pub fn app_data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Headroom")
+    let base = dirs::data_local_dir()
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("Headroom")
 }
 
 pub fn ensure_data_dirs(base_dir: &Path) -> Result<()> {
