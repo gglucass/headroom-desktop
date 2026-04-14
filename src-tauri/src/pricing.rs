@@ -1010,14 +1010,19 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
 
     use super::{
-        merge_background_account_sync, pricing_policy_for_plan, resolve_account_api_base_url,
+        detect_plan_tier_from_profile, evaluate_pricing_status, merge_background_account_sync,
+        pricing_policy_for_plan, remote_account_to_profile, resolve_account_api_base_url,
+        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
         HeadroomSubscriptionTier, RemoteAccountResponse, RemoteAccountSyncError,
         DEFAULT_ACCOUNT_API_BASE_URL,
     };
-    use crate::models::ClaudePlanTier;
+    use crate::models::{
+        ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, HeadroomAccountProfile,
+        PricingGateReason,
+    };
 
     fn sample_remote_account() -> RemoteAccountResponse {
         RemoteAccountResponse {
@@ -1123,5 +1128,407 @@ mod tests {
             DEFAULT_ACCOUNT_API_BASE_URL,
             "https://extraheadroom.com/api/v1"
         );
+    }
+
+    fn empty_claude_profile(plan_tier: ClaudePlanTier) -> ClaudeAccountProfile {
+        ClaudeAccountProfile {
+            auth_method: ClaudeAuthMethod::ClaudeAiOauth,
+            email: None,
+            display_name: None,
+            account_uuid: None,
+            organization_uuid: None,
+            billing_type: None,
+            account_created_at: None,
+            subscription_created_at: None,
+            has_extra_usage_enabled: false,
+            plan_tier,
+            plan_detection_source: None,
+            weekly_utilization_pct: None,
+            five_hour_utilization_pct: None,
+            extra_usage_monthly_limit: None,
+        }
+    }
+
+    fn pro_profile_with_weekly(weekly: f64) -> ClaudeAccountProfile {
+        let mut p = empty_claude_profile(ClaudePlanTier::Pro);
+        p.weekly_utilization_pct = Some(weekly);
+        p
+    }
+
+    fn trial_account() -> HeadroomAccountProfile {
+        HeadroomAccountProfile {
+            email: "user@example.com".into(),
+            trial_started_at: Some(Utc::now()),
+            trial_ends_at: Some(Utc::now()),
+            trial_active: true,
+            subscription_active: false,
+            subscription_tier: None,
+            invite_code: None,
+            accepted_invites_count: 0,
+            invite_bonus_percent: 0.0,
+        }
+    }
+
+    fn expired_account(invite_bonus: f64) -> HeadroomAccountProfile {
+        HeadroomAccountProfile {
+            email: "user@example.com".into(),
+            trial_started_at: None,
+            trial_ends_at: None,
+            trial_active: false,
+            subscription_active: false,
+            subscription_tier: None,
+            invite_code: None,
+            accepted_invites_count: 0,
+            invite_bonus_percent: invite_bonus,
+        }
+    }
+
+    fn grace() -> (DateTime<Utc>, DateTime<Utc>) {
+        let now = Utc::now();
+        (now, now + chrono::Duration::hours(72))
+    }
+
+    #[test]
+    fn trial_active_allows_optimization_without_weekly_gating() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            true,
+            None,
+            Some(trial_account()),
+            pro_profile_with_weekly(95.0),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+        assert!(status.gate_reason.is_none());
+    }
+
+    #[test]
+    fn active_subscription_allows_optimization_even_over_limit() {
+        let (start, end) = grace();
+        let mut account = trial_account();
+        account.trial_active = false;
+        account.subscription_active = true;
+        account.subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            true,
+            None,
+            Some(account),
+            pro_profile_with_weekly(99.0),
+        );
+        assert!(status.optimization_allowed);
+        assert!(status.gate_reason.is_none());
+    }
+
+    #[test]
+    fn free_tier_is_never_gated_by_weekly_usage() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            empty_claude_profile(ClaudePlanTier::Free),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+        assert!(status.nudge_threshold_percent.is_none());
+    }
+
+    #[test]
+    fn unknown_tier_surfaces_detection_prompt() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            empty_claude_profile(ClaudePlanTier::Unknown),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+        assert!(status.gate_message.contains("detect"));
+    }
+
+    #[test]
+    fn pro_below_nudge_threshold_stays_silent() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(5.0),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+    }
+
+    #[test]
+    fn pro_between_nudge_and_disable_nudges() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(15.0),
+        );
+        assert!(status.optimization_allowed);
+        assert!(status.should_nudge);
+    }
+
+    #[test]
+    fn pro_at_disable_threshold_gates_optimization() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(25.0),
+        );
+        assert!(!status.optimization_allowed);
+        assert!(matches!(
+            status.gate_reason,
+            Some(PricingGateReason::WeeklyUsageLimitReached)
+        ));
+    }
+
+    #[test]
+    fn invite_bonus_raises_disable_threshold() {
+        let (start, end) = grace();
+        // Pro disable=25; with +10 bonus -> 35. Usage=30 should not gate.
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(10.0)),
+            pro_profile_with_weekly(30.0),
+        );
+        assert!(status.optimization_allowed);
+        assert!(status.should_nudge);
+        assert_eq!(status.effective_disable_threshold_percent, Some(35.0));
+    }
+
+    #[test]
+    fn invite_bonus_is_capped_at_50_percentage_points() {
+        let (start, end) = grace();
+        // Even if the backend sent 200, the effective cap is +50.
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(200.0)),
+            pro_profile_with_weekly(0.0),
+        );
+        assert_eq!(status.effective_disable_threshold_percent, Some(75.0));
+    }
+
+    #[test]
+    fn missing_weekly_usage_keeps_optimization_on_for_paid_tier() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            empty_claude_profile(ClaudePlanTier::Pro),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+    }
+
+    #[test]
+    fn authenticated_without_account_keeps_optimization_on() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            Some("transient".into()),
+            None,
+            empty_claude_profile(ClaudePlanTier::Pro),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.needs_authentication);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn unauthenticated_without_grace_requires_sign_in() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            false,
+            start,
+            end,
+            false,
+            None,
+            None,
+            empty_claude_profile(ClaudePlanTier::Pro),
+        );
+        assert!(status.needs_authentication);
+        assert!(!status.optimization_allowed);
+        assert!(matches!(
+            status.gate_reason,
+            Some(PricingGateReason::SignInRequired)
+        ));
+    }
+
+    fn oauth_profile(
+        rate_limit_tier: Option<&str>,
+        organization_type: Option<&str>,
+        subscription_created_at: Option<DateTime<Utc>>,
+    ) -> ClaudeOauthProfile {
+        ClaudeOauthProfile {
+            account: ClaudeOauthProfileAccount {
+                uuid: None,
+                email: None,
+                display_name: None,
+                created_at: None,
+            },
+            organization: Some(ClaudeOauthProfileOrganization {
+                uuid: None,
+                billing_type: None,
+                subscription_created_at,
+                has_extra_usage_enabled: false,
+                organization_type: organization_type.map(str::to_string),
+                rate_limit_tier: rate_limit_tier.map(str::to_string),
+            }),
+        }
+    }
+
+    #[test]
+    fn detect_plan_tier_rate_limit_20x_wins() {
+        let p = oauth_profile(Some("claude_max_20x"), Some("claude_pro"), Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_rate_limit_5x_wins() {
+        let p = oauth_profile(Some("claude_max_5x"), Some("claude_pro"), Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_default_rate_limit_with_claude_max_is_max5x() {
+        let p = oauth_profile(Some("default_claude_ai"), Some("claude_max"), Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_default_rate_limit_with_claude_pro_is_pro() {
+        let p = oauth_profile(Some("default_claude_ai"), Some("claude_pro"), Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Pro
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_organization_type_claude_free_is_free() {
+        let p = oauth_profile(None, Some("claude_free"), Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Free
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_missing_organization_is_free() {
+        let p = ClaudeOauthProfile {
+            account: ClaudeOauthProfileAccount {
+                uuid: None,
+                email: None,
+                display_name: None,
+                created_at: None,
+            },
+            organization: None,
+        };
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Free
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_no_subscription_created_at_is_free() {
+        let p = oauth_profile(None, None, None);
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Free
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_with_subscription_but_no_identifying_fields_is_unknown() {
+        let p = oauth_profile(None, None, Some(Utc::now()));
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Unknown
+        ));
+    }
+
+    #[test]
+    fn remote_account_clamps_invite_bonus_to_50() {
+        let raw = RemoteAccountResponse {
+            email: "a@b".into(),
+            trial_started_at: None,
+            trial_ends_at: None,
+            trial_active: false,
+            subscription_active: false,
+            subscription_tier: None,
+            invite_code: None,
+            accepted_invites_count: 0,
+            invite_bonus_percent: 999.0,
+        };
+        assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
+    }
+
+    #[test]
+    fn remote_account_clamps_negative_invite_bonus_to_zero() {
+        let raw = RemoteAccountResponse {
+            email: "a@b".into(),
+            trial_started_at: None,
+            trial_ends_at: None,
+            trial_active: false,
+            subscription_active: false,
+            subscription_tier: None,
+            invite_code: None,
+            accepted_invites_count: 0,
+            invite_bonus_percent: -10.0,
+        };
+        assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
     }
 }
