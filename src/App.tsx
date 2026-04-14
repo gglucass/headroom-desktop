@@ -942,51 +942,65 @@ export default function App() {
 
     let active = true;
     let completionHandled = false;
-    const interval = window.setInterval(() => {
-      void invoke<BootstrapProgress>("get_bootstrap_progress")
-        .then(async (progress) => {
-          if (!active) {
-            return;
-          }
+    let unlisten: (() => void) | undefined;
 
-          setBootstrapProgress(progress);
+    const handleProgress = async (progress: BootstrapProgress) => {
+      if (!active) {
+        return;
+      }
 
-          if (progress.failed) {
-            const failureReport = buildBootstrapFailureReport(progress);
-            const failureSignature = bootstrapFailureSignature(failureReport);
-            if (bootstrapFailureSignatureRef.current !== failureSignature) {
-              bootstrapFailureSignatureRef.current = failureSignature;
-              reportBootstrapFailure(failureReport);
-            }
-            setBootstrapError(progress.message);
-            setBootstrapping(false);
-            completionHandled = true;
-            window.clearInterval(interval);
-            return;
-          }
+      setBootstrapProgress(progress);
 
-          if (progress.complete && !completionHandled) {
-            completionHandled = true;
-            window.clearInterval(interval);
-            setBootstrapping(false);
-            const latestDashboard = await loadDashboard();
-            if (!active) {
-              return;
-            }
-            setDashboard(latestDashboard);
-            if (windowLabel === "launcher" && latestDashboard.launchExperience === "first_run") {
-              setShowInstallStep(true);
-            } else {
-              setShowClientSetupStep(true);
-            }
-          }
-        })
-        .catch(() => {});
-    }, 650);
+      if (progress.failed) {
+        const failureReport = buildBootstrapFailureReport(progress);
+        const failureSignature = bootstrapFailureSignature(failureReport);
+        if (bootstrapFailureSignatureRef.current !== failureSignature) {
+          bootstrapFailureSignatureRef.current = failureSignature;
+          reportBootstrapFailure(failureReport);
+        }
+        setBootstrapError(progress.message);
+        setBootstrapping(false);
+        completionHandled = true;
+        unlisten?.();
+        return;
+      }
+
+      if (progress.complete && !completionHandled) {
+        completionHandled = true;
+        unlisten?.();
+        setBootstrapping(false);
+        const latestDashboard = await loadDashboard();
+        if (!active) {
+          return;
+        }
+        setDashboard(latestDashboard);
+        if (windowLabel === "launcher" && latestDashboard.launchExperience === "first_run") {
+          setShowInstallStep(true);
+        } else {
+          setShowClientSetupStep(true);
+        }
+      }
+    };
+
+    void listen<BootstrapProgress>("bootstrap_progress", (event) => {
+      void handleProgress(event.payload);
+    }).then((fn) => {
+      if (!active) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+
+    // Prime with the current state in case we subscribed mid-flight or the
+    // bootstrap already completed before the listener attached.
+    void invoke<BootstrapProgress>("get_bootstrap_progress")
+      .then((progress) => handleProgress(progress))
+      .catch(() => {});
 
     return () => {
       active = false;
-      window.clearInterval(interval);
+      unlisten?.();
     };
   }, [bootstrapping]);
 

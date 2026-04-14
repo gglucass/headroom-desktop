@@ -385,12 +385,17 @@ fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, Strin
     Ok(state.dashboard())
 }
 
+fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
+    let _ = app.emit("bootstrap_progress", state.bootstrap_progress());
+}
+
 #[tauri::command]
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
         let already_installed = state.tool_manager.python_runtime_installed();
         state.begin_bootstrap()?;
+        emit_bootstrap_progress(&app, &state);
         if already_installed {
             analytics::track_event(
                 &app,
@@ -407,9 +412,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     std::thread::spawn(move || {
         let state: tauri::State<'_, AppState> = app_handle.state();
 
-        let result = state
-            .tool_manager
-            .bootstrap_all_with_progress(|step| state.update_bootstrap_step(step));
+        let result = state.tool_manager.bootstrap_all_with_progress(|step| {
+            state.update_bootstrap_step(step);
+            emit_bootstrap_progress(&app_handle, &state);
+        });
         if let Err(err) = result {
             let technical_err = format!("{err:#}");
             sentry::capture_message(
@@ -421,6 +427,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 Please check your internet connection and try restarting the app. \
                 If this keeps happening, contact support at headroom.ai/support."
             );
+            emit_bootstrap_progress(&app_handle, &state);
             analytics::track_event(
                 &app_handle,
                 "bootstrap_failed",
@@ -441,6 +448,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         }
 
         state.mark_bootstrap_complete();
+        emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);
 
         // Start headroom asynchronously so the UI isn't blocked waiting for
