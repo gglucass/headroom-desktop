@@ -659,11 +659,7 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, String> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Content-Type", "application/json")
         .send()
-        .map_err(|err| {
-            let msg = format!("Could not fetch Claude OAuth profile: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
-            msg
-        })?;
+        .map_err(|err| format!("Could not fetch Claude OAuth profile: {err}"))?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();

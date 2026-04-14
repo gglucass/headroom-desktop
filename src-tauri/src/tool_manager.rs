@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
-use std::net::{SocketAddr, TcpStream};
+use std::io::{BufRead, BufReader};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -300,6 +301,31 @@ impl ToolManager {
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
 
+        // Pre-flight: if port 6768 is already bound, the subprocess will
+        // immediately exit with status 1 when it fails to bind. Distinguish
+        // "ours" (a prior headroom proxy still running, which we can reuse) from
+        // "foreign" (something else is holding the port).
+        match diagnose_proxy_port() {
+            PortState::Free => {}
+            PortState::HeadroomRunning => {
+                bail!(
+                    "headroom proxy already running on port {} (likely a stale process from a prior session). \
+                     Run `lsof -iTCP:{} -sTCP:LISTEN` to find and kill it, then retry.",
+                    HEADROOM_PROXY_PORT,
+                    HEADROOM_PROXY_PORT
+                );
+            }
+            PortState::ForeignOccupant(detail) => {
+                bail!(
+                    "port {} is occupied by a non-headroom process ({}); cannot start proxy. \
+                     Run `lsof -iTCP:{} -sTCP:LISTEN` to identify it.",
+                    HEADROOM_PROXY_PORT,
+                    detail,
+                    HEADROOM_PROXY_PORT
+                );
+            }
+        }
+
         for (executable, args) in &startup_variants {
             let variant = if args.is_empty() {
                 "default".to_string()
@@ -350,12 +376,18 @@ impl ToolManager {
 
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        let tail = tail_log_file(&log_path, 20);
                         startup_error = Some(format!(
-                            "headroom {} exited with status {} before opening port {} (log: {})",
+                            "headroom {} exited with status {} before opening port {} (log: {}){}",
                             args.join(" "),
                             status,
                             HEADROOM_PROXY_PORT,
-                            log_path.display()
+                            log_path.display(),
+                            if tail.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n--- log tail ---\n{}\n--- end log ---", tail)
+                            }
                         ));
                         break;
                     }
@@ -382,12 +414,18 @@ impl ToolManager {
             if let Some(error) = startup_error {
                 errors.push(error);
             } else {
+                let tail = tail_log_file(&log_path, 20);
                 errors.push(format!(
-                    "headroom {} never opened port {} within {}ms (log: {})",
+                    "headroom {} never opened port {} within {}ms (log: {}){}",
                     args.join(" "),
                     HEADROOM_PROXY_PORT,
                     HEADROOM_STARTUP_TIMEOUT_MS,
-                    log_path.display()
+                    log_path.display(),
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n--- log tail ---\n{}\n--- end log ---", tail)
+                    }
                 ));
             }
         }
@@ -1137,6 +1175,84 @@ fn is_local_proxy_reachable() -> bool {
     };
 
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
+}
+
+enum PortState {
+    Free,
+    HeadroomRunning,
+    ForeignOccupant(String),
+}
+
+fn diagnose_proxy_port() -> PortState {
+    // If we can bind the port, nothing is there.
+    if TcpListener::bind(("127.0.0.1", 6768)).is_ok() {
+        return PortState::Free;
+    }
+
+    // Port is held. Probe it: headroom's proxy speaks HTTP and, for an
+    // unrecognized path, responds with an HTTP status line. A foreign
+    // non-HTTP service (SSH, Redis, etc.) will not.
+    let headroom_like = probe_headroom_http(Duration::from_millis(400));
+    if headroom_like {
+        PortState::HeadroomRunning
+    } else {
+        PortState::ForeignOccupant(lsof_listener(6768).unwrap_or_else(|| "unknown process".into()))
+    }
+}
+
+fn probe_headroom_http(timeout: Duration) -> bool {
+    use std::io::{Read, Write};
+    let addr: SocketAddr = match "127.0.0.1:6768".parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    if stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(n) if n >= 5 => buf[..5].eq_ignore_ascii_case(b"HTTP/"),
+        _ => false,
+    }
+}
+
+fn lsof_listener(port: u16) -> Option<String> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-iTCP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().nth(1)?;
+    let mut fields = line.split_whitespace();
+    let cmd = fields.next()?;
+    let pid = fields.next()?;
+    Some(format!("{cmd} pid {pid}"))
+}
+
+fn tail_log_file(path: &Path, max_lines: usize) -> String {
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut lines: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(max_lines);
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if lines.len() == max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    lines.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 fn headroom_python_startup_args() -> Vec<&'static str> {
