@@ -3,7 +3,9 @@ use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -525,7 +527,7 @@ impl ToolManager {
             let cache = self
                 .log_marker_cache
                 .lock()
-                .expect("tool log marker cache poisoned");
+                ;
             if let Some(cached) = cache.as_ref() {
                 if cached.tool_id == tool_id && cached.path == path && cached.modified == modified {
                     return cached.result;
@@ -542,7 +544,7 @@ impl ToolManager {
                 let mut cache = self
                     .log_marker_cache
                     .lock()
-                    .expect("tool log marker cache poisoned");
+                    ;
                 *cache = Some(ToolLogMarkerCache {
                     tool_id: tool_id.to_string(),
                     path,
@@ -559,7 +561,7 @@ impl ToolManager {
                 let mut cache = self
                     .log_marker_cache
                     .lock()
-                    .expect("tool log marker cache poisoned");
+                    ;
                 *cache = Some(ToolLogMarkerCache {
                     tool_id: tool_id.to_string(),
                     path,
@@ -573,7 +575,7 @@ impl ToolManager {
         let mut cache = self
             .log_marker_cache
             .lock()
-            .expect("tool log marker cache poisoned");
+            ;
         *cache = Some(ToolLogMarkerCache {
             tool_id: tool_id.to_string(),
             path,

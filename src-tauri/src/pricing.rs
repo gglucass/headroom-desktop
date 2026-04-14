@@ -394,14 +394,9 @@ pub fn get_billing_portal_url() -> Result<String, String> {
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
     use chrono::DateTime;
 
-    let access_token = state
-        .claude_bearer_token
-        .lock()
-        .map_err(|_| "Token lock poisoned".to_string())?
-        .clone()
-        .ok_or_else(|| {
-            "No Claude AI token captured yet — make sure Claude Code is running and authenticated via Claude AI (not an API key), then try again after the first request passes through the proxy.".to_string()
-        })?;
+    let access_token = state.current_bearer_token().ok_or_else(|| {
+        "No Claude AI token captured yet — make sure Claude Code is running and authenticated via Claude AI (not an API key), then try again after the first request passes through the proxy.".to_string()
+    })?;
 
     let resp = http_client()?
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -579,13 +574,7 @@ pub fn detect_claude_profile(state: &AppState) -> ClaudeAccountProfile {
 }
 
 pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile {
-    let token = state
-        .claude_bearer_token
-        .lock()
-        .ok()
-        .and_then(|t| t.clone());
-
-    let Some(token) = token else {
+    let Some(token) = state.current_bearer_token() else {
         // No token yet — proxy hasn't seen a request through. Return a minimal
         // profile so the app can show "send a message first" messaging.
         return ClaudeAccountProfile {

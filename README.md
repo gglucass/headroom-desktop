@@ -116,6 +116,33 @@ Updates ship outside the App Store via Tauri's built-in updater. The app polls G
 
 See [`docs/macos-release.md`](docs/macos-release.md) for the full release setup.
 
+### Branching and versioning
+
+Two release channels are wired into CI:
+
+- **`main`** — stable channel. Users on the default download get updates from here. Version must be plain `X.Y.Z`.
+- **`staging`** — release candidate channel. Installs via a separate build pointing at the rolling `staging` GitHub release. Version must be `X.Y.Z-rc.N`.
+
+Work happens on `feature/*` branches, which merge into `staging` for testing, which merges into `main` for promotion. `main` is fast-forward only from `staging`.
+
+**Release candidate flow:**
+
+1. Merge work from a feature branch into `staging`.
+2. Bump `package.json` + `src-tauri/tauri.conf.json` to `X.Y.Z-rc.N` (e.g. `0.2.44-rc.1`) and push. `.github/workflows/release-macos-staging.yml` publishes a versioned prerelease tag `vX.Y.Z-rc.N` and mirrors the artifacts to the rolling `staging` release.
+3. The staging test machine auto-updates (it has both endpoints baked in and routes itself to the staging endpoint because its installed version has an `-rc` suffix).
+4. If something is wrong, bump to `rc.2` and push again. Repeat until the build is good.
+
+**Promoting to stable:**
+
+1. Fast-forward merge `staging` → `main`.
+2. Bump version to plain `X.Y.Z` (strip `-rc.N`) and push. `.github/workflows/release-macos.yml` publishes the stable release.
+3. The main workflow **enforces** that a `vX.Y.Z-rc.N` prerelease exists whose commit is an ancestor of the stable commit. If not, the build fails. This guarantees stable only ships code that was tested via the staging channel.
+4. After the stable build is published, the main workflow re-points the rolling `staging` release at the stable DMG. The staging machine receives that as an update, installs it, and — because the new version is plain `X.Y.Z` — automatically switches to the stable endpoint for all future checks.
+
+**Bypassing the rc check:**
+
+For hotfixes where a staging cycle is impractical, include `[skip-rc-check]` in the commit message that bumps the version on `main`. Use sparingly — the guard exists to prevent untested stable releases.
+
 ## Development
 
 ```bash

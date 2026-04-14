@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 usage() {
   echo "Usage: $0 <version>" >&2
-  echo "  version: e.g. 1.2.3 or v1.2.3 (v prefix is stripped)" >&2
+  echo "  version: e.g. 1.2.3, 1.2.3-rc.1, or v1.2.3 (v prefix is stripped)" >&2
   exit 1
 }
 
@@ -26,8 +26,8 @@ fi
 VERSION="${VERSION#v}"
 
 # Validate semver format
-if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "Invalid version: '${VERSION}' (expected x.y.z)" >&2
+if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+  echo "Invalid version: '${VERSION}' (expected x.y.z or x.y.z-rc.N)" >&2
   exit 1
 fi
 

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -11,6 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integration_status};
 use crate::insights::generate_daily_insights;
 use crate::models::{
@@ -33,7 +36,7 @@ pub struct AppState {
     /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
     /// Wrapped in Arc so the proxy_intercept task can share it without going through AppState.
-    pub claude_bearer_token: Arc<Mutex<Option<String>>>,
+    pub claude_bearer_token: Arc<Mutex<Option<BearerToken>>>,
     launch_profile: LaunchProfile,
     savings_tracker: Mutex<SavingsTracker>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
@@ -183,7 +186,7 @@ impl AppState {
 
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
         const TTL: Duration = Duration::from_secs(8);
-        let mut cache = self.cached_clients.lock().expect("cached_clients poisoned");
+        let mut cache = self.cached_clients.lock();
         if let Some((ref clients, at)) = *cache {
             if at.elapsed() < TTL {
                 return clients.clone();
@@ -194,20 +197,27 @@ impl AppState {
         clients
     }
 
+    /// Returns the captured Claude bearer token if it is still within its TTL.
+    /// Returns `None` if no token has been captured or the last capture is
+    /// stale — in either case the caller should prompt the user to send a
+    /// fresh request through the proxy.
+    pub fn current_bearer_token(&self) -> Option<String> {
+        self.claude_bearer_token
+            .lock()
+            .as_ref()
+            .and_then(|token| token.value_if_fresh(BEARER_TOKEN_TTL).map(str::to_string))
+    }
+
     pub fn cached_claude_profile(&self) -> ClaudeAccountProfile {
         const TTL: Duration = Duration::from_secs(300);
 
-        let current_token = self
-            .claude_bearer_token
-            .lock()
-            .ok()
-            .and_then(|token| token.clone());
+        let current_token = self.current_bearer_token();
 
         {
             let cache = self
                 .cached_claude_profile
                 .lock()
-                .expect("cached_claude_profile poisoned");
+                ;
             if let Some((cached_token, profile, at)) = &*cache {
                 if *cached_token == current_token && at.elapsed() < TTL {
                     return profile.clone();
@@ -219,7 +229,7 @@ impl AppState {
         let mut cache = self
             .cached_claude_profile
             .lock()
-            .expect("cached_claude_profile poisoned");
+            ;
         *cache = Some((current_token, profile.clone(), Instant::now()));
         profile
     }
@@ -229,7 +239,7 @@ impl AppState {
         let mut cache = self
             .cached_headroom_stats
             .lock()
-            .expect("cached_headroom_stats poisoned");
+            ;
         if let Some((stats, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return stats.clone();
@@ -245,7 +255,7 @@ impl AppState {
         let mut cache = self
             .cached_headroom_history
             .lock()
-            .expect("cached_headroom_history poisoned");
+            ;
         if let Some((history, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return history.clone();
@@ -261,7 +271,7 @@ impl AppState {
         let mut cache = self
             .cached_rtk_gain_summary
             .lock()
-            .expect("cached_rtk_gain_summary poisoned");
+            ;
         if let Some((stats, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return stats.clone();
@@ -282,22 +292,20 @@ impl AppState {
         let recent_usage = self
             .recent_usage
             .lock()
-            .expect("usage state poisoned")
+            
             .clone();
         let insights = build_insights(
             &recent_usage,
             &clients,
             self.tool_manager.python_runtime_installed(),
         );
-        let (mut snapshot, mut daily_savings, mut hourly_savings) =
-            if let Ok(tracker) = self.savings_tracker.lock() {
-                (
-                    tracker.snapshot(),
-                    tracker.daily_savings(),
-                    tracker.hourly_savings(),
-                )
-            } else {
-                (SavingsTotalsSnapshot::default(), Vec::new(), Vec::new())
+        let (mut snapshot, mut daily_savings, mut hourly_savings) = {
+            let tracker = self.savings_tracker.lock();
+            (
+                tracker.snapshot(),
+                tracker.daily_savings(),
+                tracker.hourly_savings(),
+            )
             };
         let mut lifetime_token_milestones = Vec::new();
 
@@ -472,7 +480,7 @@ impl AppState {
         let mut state = self
             .headroom_learn_state
             .lock()
-            .expect("headroom learn state poisoned");
+            ;
         if state.running {
             return Err("headroom learn is already running.".into());
         }
@@ -504,7 +512,7 @@ impl AppState {
         let mut state = self
             .headroom_learn_state
             .lock()
-            .expect("headroom learn state poisoned");
+            ;
         state.running = false;
         state.finished_at = Some(Utc::now());
         state.success = Some(success);
@@ -520,7 +528,7 @@ impl AppState {
         let state = self
             .headroom_learn_state
             .lock()
-            .expect("headroom learn state poisoned")
+            
             .clone();
 
         let current_project_path = state.project_path.clone();
@@ -579,19 +587,17 @@ impl AppState {
         Vec<HourlySavingsPoint>,
         Vec<u64>,
     )> {
-        if let Ok(mut tracker) = self.savings_tracker.lock() {
-            let snapshot = tracker.observe(stats)?;
-            let daily_savings = tracker.daily_savings();
-            let hourly_savings = tracker.hourly_savings();
-            let lifetime_token_milestones = tracker.take_pending_lifetime_token_milestones();
-            return Some((
-                snapshot,
-                daily_savings,
-                hourly_savings,
-                lifetime_token_milestones,
-            ));
-        }
-        None
+        let mut tracker = self.savings_tracker.lock();
+        let snapshot = tracker.observe(stats)?;
+        let daily_savings = tracker.daily_savings();
+        let hourly_savings = tracker.hourly_savings();
+        let lifetime_token_milestones = tracker.take_pending_lifetime_token_milestones();
+        Some((
+            snapshot,
+            daily_savings,
+            hourly_savings,
+            lifetime_token_milestones,
+        ))
     }
 
     pub fn should_present_on_launch(&self) -> bool {
@@ -601,7 +607,7 @@ impl AppState {
     pub fn bootstrap_progress(&self) -> BootstrapProgress {
         self.bootstrap_progress
             .lock()
-            .expect("bootstrap progress state poisoned")
+            
             .clone()
     }
 
@@ -610,7 +616,7 @@ impl AppState {
         let mut progress = self
             .bootstrap_progress
             .lock()
-            .expect("bootstrap progress state poisoned");
+            ;
         let (next, result) = begin_bootstrap_transition(&progress, python_installed);
         *progress = next;
         result
@@ -620,7 +626,7 @@ impl AppState {
         let mut progress = self
             .bootstrap_progress
             .lock()
-            .expect("bootstrap progress state poisoned");
+            ;
         *progress = apply_bootstrap_step(&progress, step);
     }
 
@@ -628,7 +634,7 @@ impl AppState {
         let mut progress = self
             .bootstrap_progress
             .lock()
-            .expect("bootstrap progress state poisoned");
+            ;
         *progress = bootstrap_complete_state();
     }
 
@@ -636,7 +642,7 @@ impl AppState {
         let mut progress = self
             .bootstrap_progress
             .lock()
-            .expect("bootstrap progress state poisoned");
+            ;
         *progress = bootstrap_failed_state(&progress, message.into());
     }
 
@@ -663,7 +669,7 @@ impl AppState {
         let mut process = self
             .headroom_process
             .lock()
-            .expect("headroom process state poisoned");
+            ;
 
         if let Some(existing) = process.as_mut() {
             match existing.try_wait() {
@@ -711,7 +717,7 @@ impl AppState {
             let mut process = self
                 .headroom_process
                 .lock()
-                .expect("headroom process state poisoned");
+                ;
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
                     Ok(None) => Some(existing.id()),
@@ -758,7 +764,7 @@ impl AppState {
         let mut runtime_paused = self
             .runtime_paused
             .lock()
-            .expect("runtime paused state poisoned");
+            ;
         *runtime_paused = paused;
     }
 
@@ -766,14 +772,14 @@ impl AppState {
         *self
             .runtime_paused
             .lock()
-            .expect("runtime paused state poisoned")
+            
     }
 
     pub fn set_runtime_starting(&self, starting: bool) {
         let mut runtime_starting = self
             .runtime_starting
             .lock()
-            .expect("runtime starting state poisoned");
+            ;
         *runtime_starting = starting;
     }
 
@@ -781,7 +787,7 @@ impl AppState {
         *self
             .runtime_starting
             .lock()
-            .expect("runtime starting state poisoned")
+            
     }
 
     pub fn resume_runtime(&self) -> Result<()> {
@@ -794,7 +800,7 @@ impl AppState {
         let mut process = self
             .headroom_process
             .lock()
-            .expect("headroom process state poisoned");
+            ;
 
         if let Some(mut child) = process.take() {
             let _ = child.kill();
@@ -860,11 +866,10 @@ pub(crate) fn headroom_learn_platform_message() -> Option<String> {
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        if let Ok(mut process) = self.headroom_process.lock() {
-            if let Some(mut child) = process.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        let mut process = self.headroom_process.lock();
+        if let Some(mut child) = process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

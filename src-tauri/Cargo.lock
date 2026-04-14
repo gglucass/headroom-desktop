@@ -1378,7 +1378,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "headroom-desktop"
-version = "0.2.43"
+version = "0.2.44-rc.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1387,6 +1387,7 @@ dependencies = [
  "image",
  "json5",
  "os_info",
+ "parking_lot",
  "rand 0.9.2",
  "reqwest 0.12.28",
  "sentry",

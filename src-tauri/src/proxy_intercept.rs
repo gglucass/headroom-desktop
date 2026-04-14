@@ -5,16 +5,20 @@
 /// As each request passes through, any `Authorization: Bearer …` header is
 /// captured into `AppState::claude_bearer_token` so the usage-stats feature
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::bearer::BearerToken;
 
 pub const INTERCEPT_PORT: u16 = 6767;
 pub const HEADROOM_BACKEND_PORT: u16 = 6768;
 
 /// Shared state written by the intercept layer.
-pub type SharedToken = Arc<Mutex<Option<String>>>;
+pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
 
 /// Spawn the intercept proxy as a background Tokio task.
 /// Returns immediately; the server runs until the process exits.
@@ -62,9 +66,7 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
 
     // Scan headers for a Bearer token and capture it.
     if let Some(token) = extract_bearer(&buf) {
-        if let Ok(mut slot) = token_slot.lock() {
-            *slot = Some(token);
-        }
+        *token_slot.lock() = Some(BearerToken::new(token));
     }
 
     // Forward to the headroom backend.

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -105,7 +105,7 @@ impl AnalyticsClient {
         let dispatcher = self
             .dispatcher
             .lock()
-            .map_err(|_| "analytics dispatcher poisoned".to_string())?;
+            ;
         let handle = dispatcher
             .as_ref()
             .ok_or_else(|| "analytics dispatcher unavailable".to_string())?;
@@ -120,11 +120,7 @@ impl AnalyticsClient {
             return;
         }
 
-        let handle = match self.dispatcher.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
-        let Some(handle) = handle else {
+        let Some(handle) = self.dispatcher.lock().take() else {
             return;
         };
 
@@ -133,7 +129,7 @@ impl AnalyticsClient {
     }
 
     fn session_id(&self) -> String {
-        let mut session = self.session.lock().expect("analytics session poisoned");
+        let mut session = self.session.lock();
         let now = chrono::Utc::now();
         if (now - session.last_touch).num_seconds() > SESSION_TIMEOUT_SECS {
             *session = TrackingSession::new();

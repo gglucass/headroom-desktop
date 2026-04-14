@@ -1,4 +1,5 @@
 mod analytics;
+mod bearer;
 mod client_adapters;
 mod insights;
 mod keychain;
@@ -15,7 +16,8 @@ use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,7 @@ use crate::state::AppState;
 
 const UPDATER_PUBLIC_KEY: Option<&str> = option_env!("HEADROOM_UPDATER_PUBLIC_KEY");
 const UPDATER_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ENDPOINTS");
+const UPDATER_STAGING_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_STAGING_ENDPOINTS");
 const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
@@ -182,16 +185,17 @@ fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardS
 
 #[tauri::command]
 fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
-    match release_updater_config() {
+    let current_version = app.package_info().version.to_string();
+    match release_updater_config(&current_version) {
         Ok(Some(config)) => AppUpdateConfiguration {
             enabled: true,
-            current_version: app.package_info().version.to_string(),
+            current_version,
             endpoint_count: config.endpoints.len(),
             configuration_error: None,
         },
         Ok(None) => AppUpdateConfiguration {
             enabled: false,
-            current_version: app.package_info().version.to_string(),
+            current_version,
             endpoint_count: 0,
             configuration_error: None,
         },
@@ -202,7 +206,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             );
             AppUpdateConfiguration {
                 enabled: false,
-                current_version: app.package_info().version.to_string(),
+                current_version,
                 endpoint_count: 0,
                 configuration_error: Some(err.clone()),
             }
@@ -215,7 +219,8 @@ async fn check_for_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<Option<AvailableAppUpdate>, String> {
-    let config = release_updater_config()?
+    let current_version = app.package_info().version.to_string();
+    let config = release_updater_config(&current_version)?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
 
     let updater = app
@@ -248,9 +253,7 @@ where
     U: InstallableAppUpdate,
 {
     let update = checked_update?;
-    let mut pending = pending_update
-        .lock()
-        .map_err(|_| "Failed to lock pending update state.".to_string())?;
+    let mut pending = pending_update.lock();
 
     if let Some(update) = update {
         let metadata = update.metadata();
@@ -267,9 +270,7 @@ where
     U: InstallableAppUpdate,
 {
     let update = {
-        let mut pending = pending_update
-            .lock()
-            .map_err(|_| "Failed to lock pending update state.".to_string())?;
+        let mut pending = pending_update.lock();
         pending
             .take()
             .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
@@ -1099,13 +1100,27 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
     }
 }
 
-fn release_updater_config() -> Result<Option<ReleaseUpdaterConfig>, String> {
+fn is_prerelease_version(version: &str) -> bool {
+    version.contains('-')
+}
+
+fn release_updater_config(current_version: &str) -> Result<Option<ReleaseUpdaterConfig>, String> {
     let configured_pubkey = UPDATER_PUBLIC_KEY
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let configured_endpoints = UPDATER_ENDPOINTS
+    let configured_stable = UPDATER_ENDPOINTS
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let configured_staging = UPDATER_STAGING_ENDPOINTS
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let prefer_staging = is_prerelease_version(current_version);
+    let configured_endpoints = if prefer_staging {
+        configured_staging.or(configured_stable)
+    } else {
+        configured_stable
+    };
 
     match (configured_pubkey, configured_endpoints) {
         (Some(pubkey), Some(endpoint_spec)) => {
@@ -1804,7 +1819,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Running => {
                         let dollars = {
                             let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-                            let v = *savings_state.0.lock().unwrap();
+                            let v = *savings_state.0.lock();
                             let d = v.floor() as u32;
                             #[cfg(debug_assertions)]
                             let d = d.max(1);
@@ -1850,7 +1865,7 @@ fn spawn_tray_savings_updater(app: AppHandle) {
                 .map(|p| p.estimated_savings_usd)
                 .sum();
             let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-            *savings_state.0.lock().unwrap() = savings;
+            *savings_state.0.lock() = savings;
             let _ = app.emit("savings-today-updated", savings);
         }
     });
@@ -2280,13 +2295,14 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
-        compute_tray_window_position, install_pending_update, lifetime_token_milestone_kind,
+        compute_tray_window_position, install_pending_update, is_prerelease_version,
+        lifetime_token_milestone_kind,
         parse_updater_endpoint_list, physical_rect_from_rect, store_checked_update,
         AvailableAppUpdate, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
         PhysicalRect, QuitSource, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use serde_json::json;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
     struct FakePendingUpdate {
@@ -2372,6 +2388,14 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_versions_are_detected() {
+        assert!(is_prerelease_version("0.2.44-rc.1"));
+        assert!(is_prerelease_version("0.2.44-staging"));
+        assert!(!is_prerelease_version("0.2.44"));
+        assert!(!is_prerelease_version("1.0.0"));
+    }
+
+    #[test]
     fn updater_release_config_accepts_official_default_feed() {
         let config =
             build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
@@ -2412,7 +2436,7 @@ mod tests {
         .expect("available update");
 
         assert_eq!(result, Some(metadata.clone()));
-        let stored = pending.lock().expect("pending lock");
+        let stored = pending.lock();
         assert_eq!(
             stored.as_ref().expect("pending update").metadata(),
             metadata
@@ -2430,7 +2454,7 @@ mod tests {
             store_checked_update::<FakePendingUpdate>(Ok(None), &pending).expect("no update");
 
         assert_eq!(result, None);
-        assert!(pending.lock().expect("pending lock").is_none());
+        assert!(pending.lock().is_none());
     }
 
     #[test]
@@ -2446,7 +2470,7 @@ mod tests {
                 .expect_err("check failure should bubble up");
 
         assert_eq!(error, "feed unavailable");
-        let stored = pending.lock().expect("pending lock");
+        let stored = pending.lock();
         assert_eq!(
             stored.as_ref().expect("pending update").metadata(),
             existing
@@ -2483,7 +2507,7 @@ mod tests {
             .block_on(install_pending_update(&pending))
             .expect("install succeeds");
 
-        assert!(pending.lock().expect("pending lock").is_none());
+        assert!(pending.lock().is_none());
     }
 
     #[test]
@@ -2502,7 +2526,7 @@ mod tests {
             .expect_err("install failure");
 
         assert_eq!(error, "signature mismatch");
-        assert!(pending.lock().expect("pending lock").is_none());
+        assert!(pending.lock().is_none());
     }
 
     #[test]

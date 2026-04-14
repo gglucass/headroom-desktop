@@ -1,16 +1,16 @@
-name: Release macOS App
+name: Release macOS App (Staging)
 
 on:
   push:
     branches:
-      - main
+      - staging
     paths:
       - package.json
       - src-tauri/tauri.conf.json
   workflow_dispatch:
 
 concurrency:
-  group: macos-release-${{ github.ref }}
+  group: macos-release-staging-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   release:
-    name: macOS Apple Silicon
+    name: macOS Apple Silicon (Staging)
     runs-on: macos-latest
 
     env:
@@ -66,18 +66,22 @@ jobs:
             src-tauri -> target
           env-vars: HEADROOM_SENTRY_DSN
 
-      - name: Validate release version state
+      - name: Validate staging version state
         id: release_guard
         shell: bash
         run: |
           set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
           tauri_version="$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json', 'utf8')).version")"
-          expected_tag="v${package_version}"
           should_release=true
 
           if [[ "$package_version" != "$tauri_version" ]]; then
             echo "package.json version ($package_version) does not match src-tauri/tauri.conf.json version ($tauri_version)." >&2
+            exit 1
+          fi
+
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "Staging requires an -rc.N pre-release version (got: $package_version)." >&2
             exit 1
           fi
 
@@ -100,63 +104,8 @@ jobs:
             fi
           fi
 
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            if [[ "${GITHUB_REF_NAME}" != "$expected_tag" ]]; then
-              echo "Git tag ${GITHUB_REF_NAME} does not match app version ${expected_tag}." >&2
-              exit 1
-            fi
-          fi
-
-          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Stable release requires a plain X.Y.Z version (got: $package_version). Pre-release versions ship via the staging workflow." >&2
-            exit 1
-          fi
-
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
-
-      - name: Require validated release candidate
-        if: steps.release_guard.outputs.should_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGE_VERSION: ${{ steps.release_guard.outputs.package_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          commit_message="$(git log -1 --pretty=%B "${GITHUB_SHA}")"
-          if [[ "$commit_message" == *"[skip-rc-check]"* ]]; then
-            echo "Commit message contains [skip-rc-check]; bypassing rc validation."
-            exit 0
-          fi
-
-          rc_tags="$(
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isPrerelease \
-              --jq ".[] | select(.isPrerelease) | .tagName" \
-              | grep -E "^v${PACKAGE_VERSION}-rc\.[0-9]+$" || true
-          )"
-
-          if [[ -z "$rc_tags" ]]; then
-            echo "No release candidate found for v${PACKAGE_VERSION}. Publish an rc via the staging branch first, or add [skip-rc-check] to the commit message to bypass." >&2
-            exit 1
-          fi
-
-          validated=false
-          while IFS= read -r rc_tag; do
-            [[ -z "$rc_tag" ]] && continue
-            rc_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${rc_tag}" --jq '.object.sha')"
-            rc_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${rc_sha}" --jq '.object.sha' 2>/dev/null || echo "$rc_sha")"
-            if git merge-base --is-ancestor "$rc_commit_sha" "$GITHUB_SHA" 2>/dev/null; then
-              echo "Validated: ${rc_tag} (${rc_commit_sha}) is an ancestor of ${GITHUB_SHA}."
-              validated=true
-              break
-            fi
-          done <<< "$rc_tags"
-
-          if [[ "$validated" != "true" ]]; then
-            echo "Found rc tags for v${PACKAGE_VERSION} but none are ancestors of ${GITHUB_SHA}. Promote the tested commit, or add [skip-rc-check] to bypass." >&2
-            exit 1
-          fi
 
       - name: Validate release configuration
         if: steps.release_guard.outputs.should_release == 'true'
@@ -195,14 +144,6 @@ jobs:
           echo "Configure either App Store Connect notarization secrets or Apple ID notarization secrets." >&2
           exit 1
 
-      - name: Debug secrets presence
-        if: steps.release_guard.outputs.should_release == 'true'
-        shell: bash
-        run: |
-          echo "APPLE_API_PRIVATE_KEY_P8 set: $([[ -n "${APPLE_API_PRIVATE_KEY_P8:-}" ]] && echo YES || echo NO)"
-          echo "APPLE_API_KEY set: $([[ -n "${APPLE_API_KEY:-}" ]] && echo YES || echo NO)"
-          echo "APPLE_API_ISSUER set: $([[ -n "${APPLE_API_ISSUER:-}" ]] && echo YES || echo NO)"
-
       - name: Prepare App Store Connect API key
         if: steps.release_guard.outputs.should_release == 'true' && env.APPLE_API_PRIVATE_KEY_P8 != ''
         shell: bash
@@ -220,7 +161,16 @@ jobs:
         if: steps.release_guard.outputs.should_release == 'true'
         run: ./scripts/verify-release.sh
 
-      - name: Build and publish Tauri release
+      - name: Delete previous rolling staging release
+        if: steps.release_guard.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete staging --cleanup-tag --yes --repo "${GITHUB_REPOSITORY}" || true
+
+      - name: Build and publish versioned rc release
         if: steps.release_guard.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
@@ -242,31 +192,30 @@ jobs:
         with:
           projectPath: .
           tagName: v__VERSION__
-          releaseName: Headroom v__VERSION__
+          releaseName: Headroom v__VERSION__ (staging)
           releaseBody: |
-            macOS release artifacts for Headroom.
+            Staging (release candidate) build. Not for general distribution.
           generateReleaseNotes: true
           releaseDraft: false
-          prerelease: false
+          prerelease: true
           assetNamePattern: '[name]_[version]_mac[ext]'
           includeUpdaterJson: true
           args: --target aarch64-apple-darwin
 
-      - name: Mirror stable artifacts to rolling staging release
+      - name: Mirror artifacts to rolling staging release
         if: steps.release_guard.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STABLE_TAG: v${{ steps.release_guard.outputs.package_version }}
+          RC_TAG: v${{ steps.release_guard.outputs.package_version }}
         shell: bash
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
-          gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
-          gh release delete staging --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release download "$RC_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
           gh release create staging \
             --repo "$GITHUB_REPOSITORY" \
             --title "Headroom staging (rolling)" \
-            --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \
+            --notes "Rolling pointer to the latest rc build. Current: $RC_TAG" \
             --prerelease \
             --target "$GITHUB_SHA" \
             "$workdir"/*

@@ -202,3 +202,48 @@ It:
 - builds the Apple Silicon (`aarch64-apple-darwin`) release bundle
 - signs and notarizes the app
 - uploads updater artifacts and `latest.json` to the GitHub Release
+
+## Release channels: stable and staging
+
+There are two channels with separate GitHub Actions workflows:
+
+| Channel | Branch | Workflow | Version format | Endpoint |
+|---------|--------|----------|----------------|----------|
+| Stable | `main` | `release-macos.yml` | `X.Y.Z` | `releases/latest/download/latest.json` |
+| Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging/latest.json` |
+
+### Branching model
+
+- Feature work happens on `feature/*` branches.
+- Feature branches merge into `staging` for release-candidate builds.
+- `staging` fast-forwards into `main` for stable promotion.
+
+### Staging workflow
+
+On each push to `staging` that bumps the version to `X.Y.Z-rc.N`:
+
+1. A versioned prerelease tag `vX.Y.Z-rc.N` is published with signed artifacts and `latest.json`.
+2. The previous rolling `staging` release is deleted and recreated pointing at the new rc's artifacts. The staging endpoint URL stays stable.
+
+The versioned tags give an auditable history of every rc; the rolling `staging` release is what the updater on the test machine actually polls.
+
+### One binary, two channels
+
+Both workflows bake **both** endpoints into every build via `HEADROOM_UPDATER_ENDPOINTS` (stable) and `HEADROOM_UPDATER_STAGING_ENDPOINTS` (staging). At runtime the app picks based on its own version: pre-release suffix (anything containing `-`, e.g. `0.2.44-rc.1`) → staging endpoint; plain `X.Y.Z` → stable endpoint. No separate build flavor required.
+
+### Installing the staging build
+
+Download the DMG attached to the rolling [`staging`](https://github.com/gglucass/headroom-desktop/releases/tag/staging) release on the clean test machine and install it once. Because its version has an `-rc.N` suffix, the app polls the staging endpoint from then on and self-updates as new rcs land.
+
+### Promotion guard
+
+The stable workflow refuses to run unless:
+
+1. The version is plain `X.Y.Z` (no `-rc` suffix).
+2. A `vX.Y.Z-rc.N` prerelease exists on GitHub whose tagged commit is an ancestor of the commit being released. This enforces that stable only ships code that was tested via the staging channel.
+
+To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the commit message that bumps the version on `main`.
+
+### Final update-flow verification
+
+After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging` release at the stable artifacts. The staging test machine receives `X.Y.Z` as an update via the staging endpoint (since `X.Y.Z > X.Y.Z-rc.N` in semver). Once installed, its version is plain `X.Y.Z` and the app automatically switches to the stable endpoint for all future update checks.
