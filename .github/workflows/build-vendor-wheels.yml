@@ -1,0 +1,70 @@
+name: Build vendor wheels
+
+# Builds wheels for sdist-only PyPI packages (currently: hnswlib==0.8.0) and
+# publishes them to the `vendor-wheels-v1` GitHub Release so end-user bootstraps
+# can resolve them via `pip install --find-links` without needing a local C++
+# toolchain. Manually dispatched; re-run when bumping pinned versions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish wheels to"
+        required: true
+        default: "vendor-wheels-v1"
+      hnswlib_version:
+        description: "hnswlib version to build"
+        required: true
+        default: "0.8.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x86_64
+          - os: ubuntu-latest
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build hnswlib wheel
+        run: |
+          python -m pip install --upgrade pip wheel build
+          python -m pip wheel "hnswlib==${{ github.event.inputs.hnswlib_version }}" --no-deps --wheel-dir ./dist
+          ls -la ./dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+          path: ./dist/*.whl
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+          merge-multiple: true
+      - name: List wheels
+        run: ls -la ./dist
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Vendor wheels ($TAG)" \
+              --notes "Pre-built wheels for sdist-only PyPI packages. Consumed by headroom-desktop bootstrap via pip --find-links."
+          fi
+          gh release upload "$TAG" ./dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber

@@ -24,6 +24,10 @@ use crate::models::{ManagedTool, ToolStatus};
 const HEADROOM_PINNED_VERSION: &str = "0.5.24";
 const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/1a/0f/0cd0c1c238b750443396e35b423b492226a3f7831c5b43b4c99971d2430f/headroom_ai-0.5.24-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str = "0cde90f6b7c8a9900759066957fd80a2bad4a0379946cf62096791a4b514699f";
+/// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
+/// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
+const VENDOR_WHEELS_INDEX_URL: &str =
+    "https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1";
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
@@ -951,6 +955,8 @@ impl ToolManager {
                 "-m",
                 "pip",
                 "install",
+                "--find-links",
+                VENDOR_WHEELS_INDEX_URL,
                 "--upgrade",
                 "--requirement",
                 lock_path.to_string_lossy().as_ref(),
@@ -1543,17 +1549,44 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
         .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
 
     if !output.status.success() {
-        return Err(anyhow!(
-            "command failed: {} {}\nstdout:\n{}\nstderr:\n{}",
-            binary.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(anyhow::Error::new(CommandFailure {
+            program: binary.display().to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code(),
+        }));
     }
 
     Ok(())
 }
+
+/// Structured failure from a shell-out. Carried through `anyhow::Error` so callers
+/// can `.context()` as usual, and capture sites (e.g. Sentry) can downcast to pull
+/// stdout/stderr into structured fields instead of a truncated message string.
+#[derive(Debug)]
+pub struct CommandFailure {
+    pub program: String,
+    pub args: Vec<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "command failed: {} {}\nstdout:\n{}\nstderr:\n{}",
+            self.program,
+            self.args.join(" "),
+            self.stdout,
+            self.stderr
+        )
+    }
+}
+
+impl std::error::Error for CommandFailure {}
 
 #[cfg(test)]
 mod tests {
@@ -1564,8 +1597,30 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, read_headroom_learn_metadata_from_path,
-        sha256_bytes, verify_sha256_file, ManagedRuntime, ToolManager, HEADROOM_PROXY_PORT,
+        run_command, sha256_bytes, verify_sha256_file, CommandFailure, ManagedRuntime,
+        ToolManager, HEADROOM_PROXY_PORT,
     };
+
+    #[test]
+    fn run_command_failure_carries_structured_output() {
+        let tmp = std::env::temp_dir();
+        let err = run_command(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "echo hi-out; echo hi-err 1>&2; exit 7"],
+            &tmp,
+        )
+        .expect_err("command should have failed");
+
+        let failure = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CommandFailure>())
+            .expect("CommandFailure should be in the error chain");
+
+        assert_eq!(failure.exit_code, Some(7));
+        assert!(failure.stdout.contains("hi-out"), "stdout: {}", failure.stdout);
+        assert!(failure.stderr.contains("hi-err"), "stderr: {}", failure.stderr);
+        assert_eq!(failure.program, "/bin/sh");
+    }
 
     #[test]
     fn managed_python_paths_live_inside_headroom_root() {

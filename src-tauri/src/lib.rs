@@ -417,11 +417,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             emit_bootstrap_progress(&app_handle, &state);
         });
         if let Err(err) = result {
-            let technical_err = format!("{err:#}");
-            sentry::capture_message(
-                &format!("bootstrap_failed (install_runtime): {technical_err}"),
-                sentry::Level::Error,
-            );
+            capture_bootstrap_failure(&err);
             state.mark_bootstrap_failed(
                 "Installation failed: Headroom couldn't download a required file. \
                 Please check your internet connection and try restarting the app. \
@@ -469,6 +465,48 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// Report a bootstrap failure to Sentry. If the error chain contains a
+/// `CommandFailure`, its full stdout/stderr/exit_code are sent as structured
+/// `extra` fields (which Sentry does NOT truncate at the 8KB message cap),
+/// so we can actually see why pip/venv failed on the user's machine.
+fn capture_bootstrap_failure(err: &anyhow::Error) {
+    let technical_err = format!("{err:#}");
+    let cmd_failure = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>());
+
+    if let Some(failure) = cmd_failure {
+        sentry::with_scope(
+            |scope| {
+                scope.set_extra("program", failure.program.clone().into());
+                scope.set_extra("args", failure.args.join(" ").into());
+                scope.set_extra(
+                    "exit_code",
+                    failure
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into())
+                        .into(),
+                );
+                scope.set_extra("stdout", failure.stdout.clone().into());
+                scope.set_extra("stderr", failure.stderr.clone().into());
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(
+                    "bootstrap_failed (install_runtime)",
+                    sentry::Level::Error,
+                );
+            },
+        );
+    } else {
+        sentry::capture_message(
+            &format!("bootstrap_failed (install_runtime): {technical_err}"),
+            sentry::Level::Error,
+        );
+    }
 }
 
 #[tauri::command]
