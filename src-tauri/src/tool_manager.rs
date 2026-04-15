@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
@@ -345,9 +346,16 @@ impl ToolManager {
                 .open(&log_path)
                 .with_context(|| format!("opening {}", log_path.display()))?;
 
-            let mut child = Command::new(executable)
+            // Wrap with `nice` so headroom yields CPU to foreground apps
+            // (Claude Code, terminal, etc.) when the machine is contended.
+            // On idle systems headroom still runs at full speed.
+            let mut child = Command::new("/usr/bin/nice")
+                .arg("-n")
+                .arg("5")
+                .arg(executable)
                 .args(args)
                 .current_dir(&self.runtime.root_dir)
+                .process_group(0)
                 .env("PYTHONNOUSERSITE", "1")
                 .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
                 .env("PIP_NO_INPUT", "1")

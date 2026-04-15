@@ -803,7 +803,11 @@ impl AppState {
             ;
 
         if let Some(mut child) = process.take() {
-            let _ = child.kill();
+            let pid = child.id() as i32;
+            let _ = std::process::Command::new("/bin/kill")
+                .arg("-TERM")
+                .arg(format!("-{pid}"))
+                .status();
             let _ = child.wait();
         }
 
@@ -868,7 +872,11 @@ impl Drop for AppState {
     fn drop(&mut self) {
         let mut process = self.headroom_process.lock();
         if let Some(mut child) = process.take() {
-            let _ = child.kill();
+            let pid = child.id() as i32;
+            let _ = std::process::Command::new("/bin/kill")
+                .arg("-TERM")
+                .arg(format!("-{pid}"))
+                .status();
             let _ = child.wait();
         }
     }
