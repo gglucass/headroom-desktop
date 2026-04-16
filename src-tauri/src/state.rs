@@ -162,9 +162,9 @@ impl AppState {
 
             if let Err(err) = self.ensure_headroom_running() {
                 eprintln!("failed to auto-start headroom during app launch: {err}");
-                sentry::capture_message(
-                    &format!("headroom auto-start failed during launch: {err}"),
-                    sentry::Level::Error,
+                crate::capture_headroom_start_failure(
+                    "headroom auto-start failed during launch",
+                    &err,
                 );
             }
 

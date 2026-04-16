@@ -223,6 +223,8 @@ export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "unknown";
 
 export type HeadroomSubscriptionTier = "pro" | "max5x" | "max20x";
 
+export type BillingPeriod = "annual" | "monthly";
+
 export type PricingGateReason = "sign_in_required" | "weekly_usage_limit_reached";
 
 export interface ClaudeAccountProfile {
@@ -272,6 +274,7 @@ export interface HeadroomPricingStatus {
   recommendedSubscriptionPriceUsd?: number | null;
   claude: ClaudeAccountProfile;
   account?: HeadroomAccountProfile | null;
+  launchDiscountActive: boolean;
 }
 
 export interface HeadroomAuthCodeRequest {

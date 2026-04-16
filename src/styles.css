@@ -850,6 +850,47 @@ select {
   box-shadow: 0 10px 20px rgba(36, 31, 29, 0.08);
 }
 
+.upgrade-billing-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 12px;
+  padding: 3px;
+}
+
+.upgrade-billing-toggle__item {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #5d5550;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  padding: 6px 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 140ms ease, color 140ms ease;
+  white-space: nowrap;
+}
+
+.upgrade-billing-toggle__item.is-active {
+  background: rgba(255, 255, 255, 0.96);
+  color: #211d1b;
+  box-shadow: 0 1px 4px rgba(36, 31, 29, 0.1);
+}
+
+.upgrade-billing-toggle__save {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #2a6b50;
+  background: rgba(108, 191, 155, 0.2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
 .upgrade-plan-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

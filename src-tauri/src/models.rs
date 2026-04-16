@@ -350,6 +350,13 @@ pub enum HeadroomSubscriptionTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BillingPeriod {
+    Annual,
+    Monthly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingGateReason {
     SignInRequired,
@@ -409,6 +416,7 @@ pub struct HeadroomPricingStatus {
     pub recommended_subscription_price_usd: Option<f64>,
     pub claude: ClaudeAccountProfile,
     pub account: Option<HeadroomAccountProfile>,
+    pub launch_discount_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

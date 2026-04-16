@@ -33,9 +33,9 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus,
-    ClientSetupResult, ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    BillingPeriod, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage,
+    ClientConnectorStatus, ClientSetupResult, ClientSetupVerification, DashboardState,
+    HeadroomAuthCodeRequest, HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
     HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus,
 };
 use crate::state::AppState;
@@ -456,10 +456,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             let state: tauri::State<'_, AppState> = app_for_start.state();
             if let Err(err) = state.ensure_headroom_running() {
                 eprintln!("headroom auto-start failed after bootstrap: {err}");
-                sentry::capture_message(
-                    &format!("headroom auto-start failed after bootstrap: {err}"),
-                    sentry::Level::Error,
-                );
+                capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
             }
         });
     });
@@ -506,6 +503,38 @@ fn capture_bootstrap_failure(err: &anyhow::Error) {
             &format!("bootstrap_failed (install_runtime): {technical_err}"),
             sentry::Level::Error,
         );
+    }
+}
+
+/// Report a headroom proxy startup failure to Sentry. If the error chain
+/// contains a `HeadroomStartupFailure`, its log tail, log path, and invocation
+/// are sent as structured `extra` fields so we can see what Python printed
+/// before failing to bind the port.
+pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
+    let technical_err = format!("{err:#}");
+    let startup_failure = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<tool_manager::HeadroomStartupFailure>());
+
+    let headline = format!("{context}: {technical_err}");
+    let truncated = headline.chars().take(400).collect::<String>();
+
+    if let Some(failure) = startup_failure {
+        sentry::with_scope(
+            |scope| {
+                scope.set_extra("program", failure.program.clone().into());
+                scope.set_extra("args", failure.args.join(" ").into());
+                scope.set_extra("log_path", failure.log_path.clone().into());
+                scope.set_extra("log_tail", failure.log_tail.clone().into());
+                scope.set_extra("reason", failure.reason.clone().into());
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(&truncated, sentry::Level::Error);
+            },
+        );
+    } else {
+        sentry::capture_message(&truncated, sentry::Level::Error);
     }
 }
 
@@ -630,8 +659,9 @@ fn activate_headroom_account(
 fn create_headroom_checkout_session(
     app: AppHandle,
     subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
 ) -> Result<String, String> {
-    let url = pricing::create_checkout_session(subscription_tier.clone())?;
+    let url = pricing::create_checkout_session(subscription_tier.clone(), billing_period)?;
     analytics::track_event(
         &app,
         "checkout_started",
@@ -2171,10 +2201,7 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     }
     if let Err(err) = state.ensure_headroom_running() {
         eprintln!("failed to ensure headroom runtime for tray: {err}");
-        sentry::capture_message(
-            &format!("ensure_runtime_ready_for_tray failed: {err}"),
-            sentry::Level::Error,
-        );
+        capture_headroom_start_failure("ensure_runtime_ready_for_tray failed", &err);
     }
 }
 

@@ -70,6 +70,7 @@ function makeStatus(overrides: Partial<HeadroomPricingStatus> = {}): HeadroomPri
       hasExtraUsageEnabled: false,
     },
     account: null,
+    launchDiscountActive: false,
     ...overrides,
   };
 }

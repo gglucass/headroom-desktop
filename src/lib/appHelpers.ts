@@ -1,9 +1,20 @@
 import type {
+  BillingPeriod,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
 } from "./types";
 
 export type PricingAudience = "individual" | "teamEnterprise";
+export type { BillingPeriod };
+
+const PLAN_PRICES: Record<
+  "pro" | "max5x" | "max20x",
+  Record<BillingPeriod, { full: string; discounted: string }>
+> = {
+  pro:   { annual: { full: "$5",  discounted: "$2.50" }, monthly: { full: "$7.50", discounted: "$3.75" } },
+  max5x: { annual: { full: "$20", discounted: "$10"   }, monthly: { full: "$30",   discounted: "$15"   } },
+  max20x:{ annual: { full: "$40", discounted: "$20"   }, monthly: { full: "$60",   discounted: "$30"   } },
+};
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
 type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
 type PaidUpgradePlanId = HeadroomSubscriptionTier;
@@ -87,7 +98,9 @@ export function getUpgradePlans(
   claudePlanTier?: HeadroomPricingStatus["claude"]["planTier"],
   recommendedSubscriptionTier?: HeadroomPricingStatus["recommendedSubscriptionTier"],
   headroomSubscriptionTier?: HeadroomSubscriptionTier | null,
-  hasActiveHeadroomSubscription = false
+  hasActiveHeadroomSubscription = false,
+  launchDiscountActive = false,
+  billingPeriod: BillingPeriod = "annual"
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -110,58 +123,49 @@ export function getUpgradePlans(
       ctaTone: "default"
     };
 
+    const billingLabel = billingPeriod === "annual" ? "billed annually" : "billed monthly";
+
+    function paidPlan(
+      id: "pro" | "max5x" | "max20x",
+      name: string,
+      tagline: string,
+      featureIntro: string,
+      features: string[],
+      ctaLabel: string
+    ): UpgradePlan {
+      const prices = PLAN_PRICES[id][billingPeriod];
+      const price = launchDiscountActive ? prices.discounted : prices.full;
+      return {
+        id,
+        name,
+        tagline,
+        price,
+        ...(launchDiscountActive ? { originalPrice: prices.full } : {}),
+        billingLines: ["USD / month", billingLabel],
+        featureIntro,
+        features,
+        ctaLabel,
+        ctaVariant: "primary",
+        ctaTone: "default"
+      };
+    }
+
     const paidPlans: Record<"pro" | "max5x" | "max20x", UpgradePlan> = {
-      pro: {
-        id: "pro",
-        name: "Pro",
-        tagline: "Unlock unlimited savings",
-        price: "$2.50",
-        originalPrice: "$5",
-        billingLines: ["USD / month", "billed annually"],
-        featureIntro: "Everything in Free, plus:",
-        features: [
-          "Unlimited use with Claude Pro",
-          "Track sessions across devices",
-          "Email-based support"
-        ],
-        ctaLabel: "Get Pro",
-        ctaVariant: "primary",
-        ctaTone: "default"
-      },
-      max5x: {
-        id: "max5x",
-        name: "Max x5",
-        tagline: "For Claude Max x5 accounts",
-        price: "$10",
-        originalPrice: "$20",
-        billingLines: ["USD / month", "billed annually"],
-        featureIntro: "Includes:",
-        features: [
-          "Unlimited use with Claude Max x5",
-          "Track sessions across devices",
-          "Email-based support"
-        ],
-        ctaLabel: "Get Max x5",
-        ctaVariant: "primary",
-        ctaTone: "default"
-      },
-      max20x: {
-        id: "max20x",
-        name: "Max x20",
-        tagline: "For Claude Max x20 accounts",
-        price: "$20",
-        originalPrice: "$40",
-        billingLines: ["USD / month", "billed annually"],
-        featureIntro: "Includes:",
-        features: [
-          "Unlimited use with Claude Max x20",
-          "Track sessions across devices",
-          "Priority support"
-        ],
-        ctaLabel: "Get Max x20",
-        ctaVariant: "primary",
-        ctaTone: "default"
-      }
+      pro: paidPlan("pro", "Pro", "Unlock unlimited savings", "Everything in Free, plus:", [
+        "Unlimited use with Claude Pro",
+        "Track sessions across devices",
+        "Email-based support"
+      ], "Get Pro"),
+      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 accounts", "Includes:", [
+        "Unlimited use with Claude Max x5",
+        "Track sessions across devices",
+        "Email-based support"
+      ], "Get Max x5"),
+      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 accounts", "Includes:", [
+        "Unlimited use with Claude Max x20",
+        "Track sessions across devices",
+        "Priority support"
+      ], "Get Max x20"),
     };
 
     const activeHeadroomPlanId =

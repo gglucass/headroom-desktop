@@ -33,7 +33,7 @@ const VENDOR_WHEELS_INDEX_URL: &str =
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
-const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 45_000;
+const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 60_000;
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
@@ -303,7 +303,7 @@ impl ToolManager {
             vec![(python.clone(), headroom_python_startup_args())]
         };
 
-        let mut errors = Vec::new();
+        let mut failures: Vec<HeadroomStartupFailure> = Vec::new();
         let logs_dir = self.runtime.logs_dir();
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("creating {}", logs_dir.display()))?;
@@ -378,7 +378,7 @@ impl ToolManager {
                 })?;
 
             let mut startup_ok = false;
-            let mut startup_error: Option<String> = None;
+            let mut reason: Option<String> = None;
 
             let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
             for _ in 0..startup_polls {
@@ -390,29 +390,15 @@ impl ToolManager {
 
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let tail = tail_log_file(&log_path, 20);
-                        startup_error = Some(format!(
-                            "headroom {} exited with status {} before opening port {} (log: {}){}",
-                            args.join(" "),
-                            status,
-                            HEADROOM_PROXY_PORT,
-                            log_path.display(),
-                            if tail.is_empty() {
-                                String::new()
-                            } else {
-                                format!("\n--- log tail ---\n{}\n--- end log ---", tail)
-                            }
+                        reason = Some(format!(
+                            "exited with status {} before opening port {}",
+                            status, HEADROOM_PROXY_PORT
                         ));
                         break;
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        startup_error = Some(format!(
-                            "headroom {} wait check failed: {} (log: {})",
-                            args.join(" "),
-                            err,
-                            log_path.display()
-                        ));
+                        reason = Some(format!("wait check failed: {}", err));
                         break;
                     }
                 }
@@ -425,29 +411,36 @@ impl ToolManager {
             let _ = child.kill();
             let _ = child.wait();
 
-            if let Some(error) = startup_error {
-                errors.push(error);
-            } else {
-                let tail = tail_log_file(&log_path, 20);
-                errors.push(format!(
-                    "headroom {} never opened port {} within {}ms (log: {}){}",
-                    args.join(" "),
-                    HEADROOM_PROXY_PORT,
-                    HEADROOM_STARTUP_TIMEOUT_MS,
-                    log_path.display(),
-                    if tail.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n--- log tail ---\n{}\n--- end log ---", tail)
-                    }
-                ));
-            }
+            let reason = reason.unwrap_or_else(|| {
+                format!(
+                    "never opened port {} within {}ms",
+                    HEADROOM_PROXY_PORT, HEADROOM_STARTUP_TIMEOUT_MS
+                )
+            });
+            failures.push(HeadroomStartupFailure {
+                program: executable.display().to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                log_path: log_path.display().to_string(),
+                log_tail: tail_log_file(&log_path, 20),
+                reason,
+            });
         }
 
-        Err(anyhow!(
-            "unable to keep headroom running in background: {}",
-            errors.join("; ")
-        ))
+        let last = failures.pop().expect("at least one startup variant attempted");
+        let prior_summary = if failures.is_empty() {
+            String::new()
+        } else {
+            let joined = failures
+                .iter()
+                .map(|f| format!("{} {} {}", f.program, f.args.join(" "), f.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(" (prior attempts: {})", joined)
+        };
+        Err(anyhow::Error::from(last).context(format!(
+            "unable to keep headroom running in background{}",
+            prior_summary
+        )))
     }
 
     pub fn latest_tool_log_path(&self, tool_id: &str) -> Option<PathBuf> {
@@ -739,6 +732,8 @@ impl ToolManager {
                 "-m",
                 "pip",
                 "install",
+                "--extra-index-url",
+                "https://pypi.org/simple",
                 "--upgrade",
                 "--requirement",
                 lock_path.to_string_lossy().as_ref(),
@@ -965,6 +960,8 @@ impl ToolManager {
                 "install",
                 "--find-links",
                 VENDOR_WHEELS_INDEX_URL,
+                "--extra-index-url",
+                "https://pypi.org/simple",
                 "--upgrade",
                 "--requirement",
                 lock_path.to_string_lossy().as_ref(),
@@ -981,7 +978,15 @@ impl ToolManager {
         };
         run_python_command(
             &self.runtime.managed_python(),
-            &["-m", "pip", "install", "--no-deps", &headroom_arg],
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--no-deps",
+                &headroom_arg,
+            ],
             &self.runtime.root_dir,
         )
         .with_context(|| {
@@ -1595,6 +1600,38 @@ impl std::fmt::Display for CommandFailure {
 }
 
 impl std::error::Error for CommandFailure {}
+
+/// Structured error emitted when the headroom proxy subprocess fails to open
+/// its port. Capture sites downcast to pull the log tail into Sentry `extra`
+/// fields, which are not subject to the 8KB message cap.
+#[derive(Debug)]
+pub struct HeadroomStartupFailure {
+    pub program: String,
+    pub args: Vec<String>,
+    pub log_path: String,
+    pub log_tail: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for HeadroomStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} (log: {}){}",
+            self.program,
+            self.args.join(" "),
+            self.reason,
+            self.log_path,
+            if self.log_tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n--- log tail ---\n{}\n--- end log ---", self.log_tail)
+            }
+        )
+    }
+}
+
+impl std::error::Error for HeadroomStartupFailure {}
 
 #[cfg(test)]
 mod tests {

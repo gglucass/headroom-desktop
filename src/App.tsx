@@ -56,6 +56,7 @@ import {
   getNextLowerUpgradePlanId,
   getUpgradePlans,
   upgradePlanIntentLabel,
+  type BillingPeriod,
   type PricingAudience,
   type UpgradePlanId
 } from "./lib/appHelpers";
@@ -625,6 +626,7 @@ export default function App() {
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
   const [showInstallStep, setShowInstallStep] = useState(false);
   const [showPostInstallGuide, setShowPostInstallGuide] = useState(false);
   const [showClientSetupStep, setShowClientSetupStep] = useState(false);
@@ -724,7 +726,9 @@ export default function App() {
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
     pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
-    pricingStatus?.account?.subscriptionActive ?? false
+    pricingStatus?.account?.subscriptionActive ?? false,
+    pricingStatus?.launchDiscountActive ?? false,
+    billingPeriod
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -763,6 +767,7 @@ export default function App() {
 
   useEffect(() => {
     setShowAllUpgradePlans(false);
+    if (pricingAudience !== "individual") setBillingPeriod("annual");
   }, [pricingAudience]);
 
   useEffect(() => {
@@ -2089,7 +2094,8 @@ export default function App() {
 
       try {
         const url = await invoke<string>("create_headroom_checkout_session", {
-          subscriptionTier: planId
+          subscriptionTier: planId,
+          billingPeriod
         });
         await openExternalLink(url);
         window.setTimeout(() => {
@@ -3631,6 +3637,22 @@ export default function App() {
                 </button>
               ))}
             </div>
+            {pricingAudience === "individual" ? (
+              <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
+                {(["annual", "monthly"] as const).map((period) => (
+                  <button
+                    key={period}
+                    className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
+                    onClick={() => setBillingPeriod(period)}
+                    type="button"
+                  >
+                    {period === "annual" ? (
+                      <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                    ) : "Monthly"}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </section>
 
           <section
@@ -3653,9 +3675,11 @@ export default function App() {
             ) : null}
           </section>
 
-          <section className="upgrade-trial-callout upgrade-sale-banner">
-            <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
-          </section>
+          {pricingStatus?.launchDiscountActive ? (
+            <section className="upgrade-trial-callout upgrade-sale-banner">
+              <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
+            </section>
+          ) : null}
 
           <section
             className={`upgrade-plan-grid${visibleUpgradePlans.length === 1 ? " upgrade-plan-grid--single" : ""}`}

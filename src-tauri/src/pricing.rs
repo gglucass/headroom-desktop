@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::keychain;
 use crate::models::{
-    ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow,
-    HeadroomAccountProfile, HeadroomAuthCodeRequest, HeadroomPricingStatus,
+    BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage,
+    ClaudeUsageWindow, HeadroomAccountProfile, HeadroomAuthCodeRequest, HeadroomPricingStatus,
     HeadroomSubscriptionTier, PricingGateReason,
 };
 use crate::state::AppState;
@@ -60,6 +60,8 @@ struct ClaudeOauthProfileOrganization {
 #[serde(rename_all = "camelCase")]
 struct RemoteAccountEnvelope {
     account: RemoteAccountResponse,
+    #[serde(default)]
+    launch_discount_active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +83,8 @@ struct RemoteAccountResponse {
 struct VerifyCodeResponse {
     session_token: String,
     account: RemoteAccountResponse,
+    #[serde(default)]
+    launch_discount_active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +112,7 @@ struct VerifyCodePayload<'a> {
 #[serde(rename_all = "camelCase")]
 struct CheckoutSessionPayload {
     subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,12 +143,22 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
     let session_token = read_session_token()?;
-    let (authenticated, account, account_sync_error) = if let Some(token) = session_token.as_deref()
-    {
-        merge_background_account_sync(Some(token), fetch_remote_account(token))
-    } else {
-        (false, None, None)
-    };
+    let (authenticated, account, account_sync_error, launch_discount_active) =
+        if let Some(token) = session_token.as_deref() {
+            let envelope_result = fetch_remote_account(token);
+            let launch_discount_active = envelope_result
+                .as_ref()
+                .map(|e| e.launch_discount_active)
+                .unwrap_or(false);
+            let account_result = envelope_result.map(|e| e.account);
+            let (auth, acc, err) = merge_background_account_sync(Some(token), account_result);
+            (auth, acc, err, launch_discount_active)
+        } else {
+            let launch_discount_active = fetch_public_config()
+                .map(|c| c.launch_discount_active)
+                .unwrap_or(false);
+            (false, None, None, launch_discount_active)
+        };
 
     let claude = detect_claude_profile(state);
 
@@ -155,6 +170,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         account_sync_error,
         account,
         claude,
+        launch_discount_active,
     ))
 }
 
@@ -247,6 +263,7 @@ pub fn verify_auth_code(
         None,
         Some(remote_account_to_profile(body.account)),
         claude,
+        body.launch_discount_active,
     ))
 }
 
@@ -304,6 +321,7 @@ pub fn activate_account(
         None,
         Some(remote_account_to_profile(body.account)),
         claude,
+        body.launch_discount_active,
     ))
 }
 
@@ -328,13 +346,14 @@ pub fn report_milestone(milestone_tokens_saved: u64) {
 
 pub fn create_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
 ) -> Result<String, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before starting checkout.".to_string())?;
     let response = http_client()?
         .post(api_url("desktop/checkout"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&CheckoutSessionPayload { subscription_tier })
+        .json(&CheckoutSessionPayload { subscription_tier, billing_period })
         .send()
         .map_err(|err| format!("Could not create checkout session: {err}"))?;
 
@@ -454,6 +473,7 @@ fn evaluate_pricing_status(
     account_sync_error: Option<String>,
     account: Option<HeadroomAccountProfile>,
     claude: ClaudeAccountProfile,
+    launch_discount_active: bool,
 ) -> HeadroomPricingStatus {
     #[cfg(debug_assertions)]
     let local_grace_active = if INDEFINITE_TRIAL { true } else { local_grace_active };
@@ -566,6 +586,7 @@ fn evaluate_pricing_status(
         recommended_subscription_price_usd,
         claude,
         account,
+        launch_discount_active,
     }
 }
 
@@ -900,7 +921,22 @@ fn clear_session_token() -> Result<(), String> {
     )
 }
 
-fn fetch_remote_account(token: &str) -> Result<RemoteAccountResponse, RemoteAccountSyncError> {
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicConfig {
+    #[serde(default)]
+    launch_discount_active: bool,
+}
+
+fn fetch_public_config() -> Option<PublicConfig> {
+    let response = http_client().ok()?.get(api_url("desktop/config")).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<PublicConfig>().ok()
+}
+
+fn fetch_remote_account(token: &str) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
     let response = http_client()
         .map_err(|_| RemoteAccountSyncError::Other)?
         .get(api_url("desktop/account"))
@@ -918,7 +954,6 @@ fn fetch_remote_account(token: &str) -> Result<RemoteAccountResponse, RemoteAcco
 
     response
         .json::<RemoteAccountEnvelope>()
-        .map(|body| body.account)
         .map_err(|_| RemoteAccountSyncError::Other)
 }
 
@@ -1184,6 +1219,7 @@ mod tests {
             None,
             Some(trial_account()),
             pro_profile_with_weekly(95.0),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
@@ -1205,6 +1241,7 @@ mod tests {
             None,
             Some(account),
             pro_profile_with_weekly(99.0),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(status.gate_reason.is_none());
@@ -1221,6 +1258,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             empty_claude_profile(ClaudePlanTier::Free),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
@@ -1238,6 +1276,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             empty_claude_profile(ClaudePlanTier::Unknown),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
@@ -1255,6 +1294,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             pro_profile_with_weekly(5.0),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
@@ -1271,6 +1311,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             pro_profile_with_weekly(15.0),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(status.should_nudge);
@@ -1287,6 +1328,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             pro_profile_with_weekly(25.0),
+            false,
         );
         assert!(!status.optimization_allowed);
         assert!(matches!(
@@ -1307,6 +1349,7 @@ mod tests {
             None,
             Some(expired_account(10.0)),
             pro_profile_with_weekly(30.0),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(status.should_nudge);
@@ -1325,6 +1368,7 @@ mod tests {
             None,
             Some(expired_account(200.0)),
             pro_profile_with_weekly(0.0),
+            false,
         );
         assert_eq!(status.effective_disable_threshold_percent, Some(75.0));
     }
@@ -1340,6 +1384,7 @@ mod tests {
             None,
             Some(expired_account(0.0)),
             empty_claude_profile(ClaudePlanTier::Pro),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
@@ -1356,6 +1401,7 @@ mod tests {
             Some("transient".into()),
             None,
             empty_claude_profile(ClaudePlanTier::Pro),
+            false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.needs_authentication);
@@ -1373,6 +1419,7 @@ mod tests {
             None,
             None,
             empty_claude_profile(ClaudePlanTier::Pro),
+            false,
         );
         assert!(status.needs_authentication);
         assert!(!status.optimization_allowed);

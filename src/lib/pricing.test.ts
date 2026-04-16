@@ -46,6 +46,7 @@ function makePricingStatus(
       extraUsageMonthlyLimit: null,
     },
     account: null,
+    launchDiscountActive: false,
     ...overrides,
   };
 }
