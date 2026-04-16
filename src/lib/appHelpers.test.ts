@@ -133,4 +133,86 @@ describe("app helpers", () => {
       ["max20x", "$30"],
     ]);
   });
+
+  describe("active plan purchase info", () => {
+    const baseArgs = [
+      "individual" as const,
+      undefined,
+      undefined,
+      "pro" as const,
+      true,
+      false,
+      "annual" as const,
+    ] as const;
+
+    function activePlan(result: ReturnType<typeof getUpgradePlans>) {
+      return result.plans.find((p) => p.id === "pro");
+    }
+
+    it("omits purchase info when subscription amount is missing", () => {
+      const result = getUpgradePlans(...baseArgs, null, "annual", "2026-12-01");
+      expect(activePlan(result)?.purchaseInfo).toBeUndefined();
+    });
+
+    it("omits purchase info when renewal date is missing", () => {
+      // 6000 cents = $5/mo * 12 months
+      const result = getUpgradePlans(...baseArgs, 6000, "annual", null);
+      expect(activePlan(result)?.purchaseInfo).toBeUndefined();
+    });
+
+    it("shows full renewal price when no discount is present", () => {
+      const result = getUpgradePlans(...baseArgs, 6000, "annual", "2026-12-01");
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$5",
+        discountPct: 0,
+      });
+    });
+
+    it("shows full renewal price for a once-off discount", () => {
+      // 100% discount this period (0 cents), but "once" so renewal is full price
+      const result = getUpgradePlans(...baseArgs, 0, "annual", "2026-04-16", "2025-04-16", "once");
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$5",
+        discountPct: 0,
+      });
+    });
+
+    it("shows discounted renewal price for a forever discount", () => {
+      // 3000 cents = $2.50/mo * 12 months (50% off)
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "forever");
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$2.50",
+        discountPct: 50,
+      });
+    });
+
+    it("shows discounted renewal price when repeating discount window has not expired", () => {
+      // Started 2025-04-16, 12-month discount window → expires 2026-04-16
+      // Renewal at 2026-01-01 is within window → discount applies
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-01-01", "2025-04-16", "repeating", 12);
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$2.50",
+        discountPct: 50,
+      });
+    });
+
+    it("shows full renewal price when repeating discount window has expired", () => {
+      // Started 2024-01-01, 12-month window → expired 2025-01-01
+      // Renewal at 2026-04-01 is outside window → full price
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-04-01", "2024-01-01", "repeating", 12);
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$5",
+        discountPct: 0,
+      });
+    });
+
+    it("shows full renewal price for repeating discount with missing window data", () => {
+      // "repeating" but duration_in_months is null → treat as no discount at renewal
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "repeating", null);
+      expect(activePlan(result)?.purchaseInfo).toMatchObject({
+        paidPerMonthLabel: "$5",
+        discountPct: 0,
+      });
+    });
+  });
 });
