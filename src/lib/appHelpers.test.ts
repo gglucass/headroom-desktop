@@ -90,14 +90,47 @@ describe("app helpers", () => {
     ]);
   });
 
-  it("shows the reduced monthly prices for paid individual plans", () => {
+  it("shows full annual prices when launch discount is inactive", () => {
     const result = getUpgradePlans("individual");
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["free", "$0"],
+      ["pro", "$5"],
+      ["max5x", "$20"],
+      ["max20x", "$40"],
+    ]);
+  });
+
+  it("shows discounted annual prices when launch discount is active", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true);
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
       ["pro", "$2.50"],
       ["max5x", "$10"],
       ["max20x", "$20"],
+    ]);
+  });
+
+  it("shows full monthly prices when launch discount is inactive", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, false, "monthly");
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["free", "$0"],
+      ["pro", "$7.50"],
+      ["max5x", "$30"],
+      ["max20x", "$60"],
+    ]);
+  });
+
+  it("shows discounted monthly prices when launch discount is active", () => {
+    const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true, "monthly");
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["free", "$0"],
+      ["pro", "$3.75"],
+      ["max5x", "$15"],
+      ["max20x", "$30"],
     ]);
   });
 });
