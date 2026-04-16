@@ -443,22 +443,26 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             );
         }
 
+        // Show "Starting Headroom" in the install loader while we wait for
+        // the proxy to come up. On a fresh machine macOS Gatekeeper scans the
+        // entire venv on first execution, which can take 30-60 seconds. Keeping
+        // `complete: false` here means the user cannot click Continue until the
+        // proxy is actually reachable, so they never land on the test screen
+        // seeing "proxy not reachable yet".
+        state.mark_bootstrap_proxy_starting();
+        emit_bootstrap_progress(&app_handle, &state);
+
+        if let Err(err) = state.ensure_headroom_running() {
+            eprintln!("headroom auto-start failed after bootstrap: {err}");
+            capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
+            // Fall through to mark_bootstrap_complete anyway so the user is
+            // not stuck on the install loader indefinitely. The test screen
+            // will show a retry option if the proxy is still unreachable.
+        }
+
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);
-
-        // Start headroom asynchronously so the UI isn't blocked waiting for
-        // Python's first-launch Gatekeeper scan (which can take 20-30 seconds
-        // on a fresh machine). The runtime status panel already shows live
-        // start state; the user doesn't need to wait here.
-        let app_for_start = app_handle.clone();
-        std::thread::spawn(move || {
-            let state: tauri::State<'_, AppState> = app_for_start.state();
-            if let Err(err) = state.ensure_headroom_running() {
-                eprintln!("headroom auto-start failed after bootstrap: {err}");
-                capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
-            }
-        });
     });
 
     Ok(())

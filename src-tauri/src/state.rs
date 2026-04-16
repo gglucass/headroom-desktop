@@ -647,6 +647,22 @@ impl AppState {
         *progress = apply_bootstrap_step(&progress, step);
     }
 
+    pub fn mark_bootstrap_proxy_starting(&self) {
+        let mut progress = self
+            .bootstrap_progress
+            .lock()
+            ;
+        *progress = BootstrapProgress {
+            running: true,
+            complete: false,
+            failed: false,
+            current_step: "Starting Headroom".into(),
+            message: "Starting Headroom for the first time (this can take up to a minute)…".into(),
+            current_step_eta_seconds: 45,
+            overall_percent: 95,
+        };
+    }
+
     pub fn mark_bootstrap_complete(&self) {
         let mut progress = self
             .bootstrap_progress
