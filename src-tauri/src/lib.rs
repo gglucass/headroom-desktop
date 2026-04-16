@@ -1172,6 +1172,7 @@ pub fn run() {
             open_external_link,
             submit_contact_request,
             hide_launcher_animated,
+            complete_setup_wizard,
             quit_headroom
         ])
         .run(tauri::generate_context!())
@@ -2207,7 +2208,12 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
 
 fn onboarding_complete(app: &AppHandle) -> bool {
     let state: tauri::State<'_, AppState> = app.state();
-    state.tool_manager.python_runtime_installed()
+    state.tool_manager.python_runtime_installed() && state.setup_wizard_complete()
+}
+
+#[tauri::command]
+fn complete_setup_wizard(state: tauri::State<'_, AppState>) {
+    state.mark_setup_wizard_complete();
 }
 
 fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {

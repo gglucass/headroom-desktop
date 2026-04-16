@@ -37,7 +37,8 @@ pub struct AppState {
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
     /// Wrapped in Arc so the proxy_intercept task can share it without going through AppState.
     pub claude_bearer_token: Arc<Mutex<Option<BearerToken>>>,
-    launch_profile: LaunchProfile,
+    launch_profile: Mutex<LaunchProfile>,
+    launch_profile_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
@@ -68,7 +69,7 @@ impl AppState {
 
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
         let tool_manager = ToolManager::new(runtime);
-        let launch_profile = LaunchProfile::load_or_create(&base_dir)?;
+        let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
 
         let state = Self {
@@ -97,7 +98,8 @@ impl AppState {
                 error: None,
                 output_tail: Vec::new(),
             }),
-            launch_profile,
+            launch_profile: Mutex::new(launch_profile),
+            launch_profile_path,
             savings_tracker: Mutex::new(savings_tracker),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
@@ -173,14 +175,29 @@ impl AppState {
     }
 
     pub fn launch_count(&self) -> u64 {
-        self.launch_profile.launch_count
+        self.launch_profile.lock().launch_count
     }
 
     pub fn launch_experience_label(&self) -> &'static str {
-        match self.launch_profile.launch_experience {
+        match self.launch_profile.lock().launch_experience {
             LaunchExperience::FirstRun => "first_run",
             LaunchExperience::Resume => "resume",
             LaunchExperience::Dashboard => "dashboard",
+        }
+    }
+
+    pub fn setup_wizard_complete(&self) -> bool {
+        self.launch_profile.lock().setup_wizard_complete
+    }
+
+    pub fn mark_setup_wizard_complete(&self) {
+        let mut profile = self.launch_profile.lock();
+        if profile.setup_wizard_complete {
+            return;
+        }
+        profile.setup_wizard_complete = true;
+        if let Ok(bytes) = serde_json::to_vec_pretty(&*profile) {
+            let _ = std::fs::write(&self.launch_profile_path, bytes);
         }
     }
 
@@ -357,7 +374,7 @@ impl AppState {
         (
             DashboardState {
                 app_version: env!("CARGO_PKG_VERSION").into(),
-                launch_experience: self.launch_profile.launch_experience.clone(),
+                launch_experience: self.launch_profile.lock().launch_experience.clone(),
                 bootstrap_complete: self.tool_manager.python_runtime_installed(),
                 python_runtime_installed: self.tool_manager.python_runtime_installed(),
                 lifetime_requests: snapshot.lifetime_requests,
@@ -1051,10 +1068,12 @@ struct LaunchProfile {
     lifetime_requests: usize,
     lifetime_estimated_savings_usd: f64,
     lifetime_estimated_tokens_saved: u64,
+    #[serde(default)]
+    setup_wizard_complete: bool,
 }
 
 impl LaunchProfile {
-    fn load_or_create(base_dir: &std::path::Path) -> Result<Self> {
+    fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, std::path::PathBuf)> {
         let path = config_file(base_dir, "launch-profile.json");
 
         let previous = if path.exists() {
@@ -1069,6 +1088,7 @@ impl LaunchProfile {
                 lifetime_requests: 0,
                 lifetime_estimated_savings_usd: 0.0,
                 lifetime_estimated_tokens_saved: 0,
+                setup_wizard_complete: false,
             }
         };
 
@@ -1097,7 +1117,7 @@ impl LaunchProfile {
         )
         .with_context(|| format!("writing {}", path.display()))?;
 
-        Ok(current)
+        Ok((current, path))
     }
 }
 
@@ -2820,7 +2840,7 @@ fn bootstrap_complete_state() -> BootstrapProgress {
         complete: true,
         failed: false,
         current_step: "Install complete".into(),
-        message: "Headroom is ready. Opening the tray dashboard…".into(),
+        message: "Headroom is ready.".into(),
         current_step_eta_seconds: 0,
         overall_percent: 100,
     }

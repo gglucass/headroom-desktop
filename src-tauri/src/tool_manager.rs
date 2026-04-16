@@ -899,6 +899,20 @@ impl ToolManager {
             }
         }
 
+        // Strip the quarantine attribute from the extracted runtime so macOS
+        // Gatekeeper doesn't scan it on first execution (which can hang the
+        // machine for 20-30 seconds).
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("xattr")
+                .args([
+                    "-rd",
+                    "com.apple.quarantine",
+                    self.runtime.runtime_dir.to_string_lossy().as_ref(),
+                ])
+                .output();
+        }
+
         Ok(())
     }
 

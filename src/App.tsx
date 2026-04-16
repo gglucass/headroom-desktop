@@ -2426,14 +2426,21 @@ export default function App() {
             </button>
           </>
         ) : (
-          <button
-            className="primary-button primary-button--large primary-button--install"
-            disabled={bootstrapping}
-            onClick={() => void handleBootstrap()}
-            type="button"
-          >
-            {bootstrapping ? "Installing Headroom…" : "Install Headroom"}
-          </button>
+          <>
+            {!bootstrapping && (
+              <p className="install-pre-notice">
+                Takes about a minute to install.
+              </p>
+            )}
+            <button
+              className="primary-button primary-button--large primary-button--install"
+              disabled={bootstrapping}
+              onClick={() => void handleBootstrap()}
+              type="button"
+            >
+              {bootstrapping ? "Installing Headroom…" : "Install Headroom"}
+            </button>
+          </>
         )}
         <div className="install-progress-shell">
           {showInstallProgress ? (
@@ -2725,6 +2732,7 @@ export default function App() {
           <button
             className="primary-button primary-button--large primary-button--success"
             onClick={() => {
+              void invoke("complete_setup_wizard");
               setShowProxyVerificationStep(false);
               setShowPostInstallGuide(true);
             }}
