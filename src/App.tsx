@@ -750,7 +750,7 @@ export default function App() {
     !showInstallStep &&
     !showClientSetupStep &&
     !showProxyVerificationStep &&
-    (bootstrapProgress.complete || showPostInstallGuide || dashboard.bootstrapComplete);
+    showPostInstallGuide;
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -2755,9 +2755,7 @@ export default function App() {
     windowLabel === "launcher" &&
     !showInstallStep &&
     !showProxyVerificationStep &&
-    (bootstrapProgress.complete ||
-      showPostInstallGuide ||
-      dashboard.bootstrapComplete)
+    showPostInstallGuide
   ) {
     return (
       <LauncherShell

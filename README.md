@@ -118,6 +118,8 @@ See [`docs/macos-release.md`](docs/macos-release.md) for the full release setup.
 
 ### Branching and versioning
 
+Use `./scripts/bump-version.sh <version>` to update all four version files at once (`package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`). Accepts `X.Y.Z` or `X.Y.Z-rc.N` (leading `v` is stripped).
+
 Two release channels are wired into CI:
 
 - **`main`** — stable channel. Users on the default download get updates from here. Version must be plain `X.Y.Z`.
