@@ -683,19 +683,21 @@ impl AppState {
             return Ok(());
         }
 
-        let mut process = self
-            .headroom_process
-            .lock()
-            ;
+        {
+            let mut process = self
+                .headroom_process
+                .lock()
+                ;
 
-        if let Some(existing) = process.as_mut() {
-            match existing.try_wait() {
-                Ok(None) => return Ok(()),
-                Ok(Some(_)) | Err(_) => {
-                    *process = None;
+            if let Some(existing) = process.as_mut() {
+                match existing.try_wait() {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(_)) | Err(_) => {
+                        *process = None;
+                    }
                 }
             }
-        }
+        } // release lock before the blocking start
 
         self.set_runtime_starting(true);
         let started = self.tool_manager.start_headroom_background();
@@ -703,7 +705,7 @@ impl AppState {
 
         match started {
             Ok(child) => {
-                *process = Some(child);
+                *self.headroom_process.lock() = Some(child);
                 Ok(())
             }
             Err(err) => Err(err),
