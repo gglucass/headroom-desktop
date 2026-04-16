@@ -145,8 +145,17 @@ jobs:
           while IFS= read -r rc_tag; do
             [[ -z "$rc_tag" ]] && continue
             rc_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${rc_tag}" --jq '.object.sha')"
+            # If the tag is annotated, resolve it to the underlying commit. For
+            # lightweight tags the second call 404s and we keep the commit SHA.
             rc_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${rc_sha}" --jq '.object.sha' 2>/dev/null || echo "$rc_sha")"
-            if git merge-base --is-ancestor "$rc_commit_sha" "$GITHUB_SHA" 2>/dev/null; then
+            # Ask GitHub whether this rc commit is an ancestor of GITHUB_SHA.
+            # behind_by == 0 means GITHUB_SHA contains rc_commit_sha in its history.
+            # We query the API instead of `git merge-base --is-ancestor` because
+            # actions/checkout doesn't always make every tagged commit locally
+            # reachable, even with fetch-depth: 0.
+            behind_by="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${rc_commit_sha}...${GITHUB_SHA}" --jq '.behind_by')"
+            echo "Checking ${rc_tag} (${rc_commit_sha}): behind_by=${behind_by}"
+            if [[ "$behind_by" == "0" ]]; then
               echo "Validated: ${rc_tag} (${rc_commit_sha}) is an ancestor of ${GITHUB_SHA}."
               validated=true
               break
