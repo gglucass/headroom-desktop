@@ -728,7 +728,13 @@ export default function App() {
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false,
     pricingStatus?.launchDiscountActive ?? false,
-    billingPeriod
+    billingPeriod,
+    pricingStatus?.account?.subscriptionAmountCents,
+    pricingStatus?.account?.subscriptionBillingPeriod,
+    pricingStatus?.account?.subscriptionRenewsAt,
+    pricingStatus?.account?.subscriptionStartedAt,
+    pricingStatus?.account?.subscriptionDiscountDuration,
+    pricingStatus?.account?.subscriptionDiscountDurationInMonths
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -3663,30 +3669,34 @@ export default function App() {
             ) : null}
           </section>
 
-          <section
-            className={`upgrade-trial-callout upgrade-trial-callout--${upgradeTrialCallout.tone}`}
-          >
-            <div className="upgrade-trial-callout__content">
-              <p className="upgrade-trial-callout__message">
-                {upgradeTrialCallout.message}
-              </p>
-            </div>
-            {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (
-              <button
-                className="primary-button upgrade-trial-callout__button"
-                disabled={authRequestBusy || authVerifyBusy || upgradeActionBusy !== null}
-                onClick={() => upgradeTrialCallout.onAction?.()}
-                type="button"
+          {!activeHeadroomPlanId ? (
+            <>
+              <section
+                className={`upgrade-trial-callout upgrade-trial-callout--${upgradeTrialCallout.tone}`}
               >
-                {upgradeTrialCallout.actionLabel}
-              </button>
-            ) : null}
-          </section>
+                <div className="upgrade-trial-callout__content">
+                  <p className="upgrade-trial-callout__message">
+                    {upgradeTrialCallout.message}
+                  </p>
+                </div>
+                {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (
+                  <button
+                    className="primary-button upgrade-trial-callout__button"
+                    disabled={authRequestBusy || authVerifyBusy || upgradeActionBusy !== null}
+                    onClick={() => upgradeTrialCallout.onAction?.()}
+                    type="button"
+                  >
+                    {upgradeTrialCallout.actionLabel}
+                  </button>
+                ) : null}
+              </section>
 
-          {pricingStatus?.launchDiscountActive ? (
-            <section className="upgrade-trial-callout upgrade-sale-banner">
-              <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
-            </section>
+              {pricingStatus?.launchDiscountActive ? (
+                <section className="upgrade-trial-callout upgrade-sale-banner">
+                  <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
+                </section>
+              ) : null}
+            </>
           ) : null}
 
           <section
@@ -3703,9 +3713,10 @@ export default function App() {
                   ? `primary-button upgrade-plan-card__button${downgradeButtonClassName}`
                   : `secondary-button upgrade-plan-card__button${downgradeButtonClassName}`;
 
+              const isActivePlan = plan.id === activeHeadroomPlanId;
               return (
                 <article
-                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}`}
+                  className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
                   key={plan.id}
                 >
                   <div className="upgrade-plan-card__top">
@@ -3714,7 +3725,12 @@ export default function App() {
                         <Sparkle weight={isFeatured ? "fill" : "duotone"} />
                       </span>
                       <div>
-                        <h2>{plan.name}</h2>
+                        <h2>
+                          {plan.name}
+                          {isActivePlan ? (
+                            <span className="upgrade-plan-card__active-badge">Active</span>
+                          ) : null}
+                        </h2>
                         <p>{plan.tagline}</p>
                       </div>
                     </div>
@@ -3723,7 +3739,7 @@ export default function App() {
                     ) : (
                       <div className="upgrade-plan-card__price-block">
                         <div>
-                          {plan.originalPrice ? (
+                          {plan.originalPrice && !activeHeadroomPlanId ? (
                             <div className="upgrade-plan-card__sale-row">
                               <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
                               <span className="upgrade-plan-card__sale-badge">50% off</span>
@@ -3738,6 +3754,13 @@ export default function App() {
                         </span>
                       </div>
                     )}
+                    {isActivePlan && plan.purchaseInfo ? (
+                      <p className="upgrade-plan-card__purchase-info">
+                        {plan.purchaseInfo.discountPct > 0
+                          ? `Renews ${plan.purchaseInfo.paidPerMonthLabel}/mo on ${plan.purchaseInfo.renewsOn} (${plan.purchaseInfo.discountPct}% off)`
+                          : `Renews ${plan.price}/mo on ${plan.purchaseInfo.renewsOn}`}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="upgrade-plan-card__action">
                     {plan.id === "enterprise" ? (

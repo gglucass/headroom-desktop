@@ -9,17 +9,23 @@ export type { BillingPeriod };
 
 const PLAN_PRICES: Record<
   "pro" | "max5x" | "max20x",
-  Record<BillingPeriod, { full: string; discounted: string }>
+  Record<BillingPeriod, { full: string; fullCents: number; discounted: string }>
 > = {
-  pro:   { annual: { full: "$5",  discounted: "$2.50" }, monthly: { full: "$7.50", discounted: "$3.75" } },
-  max5x: { annual: { full: "$20", discounted: "$10"   }, monthly: { full: "$30",   discounted: "$15"   } },
-  max20x:{ annual: { full: "$40", discounted: "$20"   }, monthly: { full: "$60",   discounted: "$30"   } },
+  pro:   { annual: { full: "$5",  fullCents: 500,  discounted: "$2.50" }, monthly: { full: "$7.50", fullCents: 750,  discounted: "$3.75" } },
+  max5x: { annual: { full: "$20", fullCents: 2000, discounted: "$10"   }, monthly: { full: "$30",   fullCents: 3000, discounted: "$15"   } },
+  max20x:{ annual: { full: "$40", fullCents: 4000, discounted: "$20"   }, monthly: { full: "$60",   fullCents: 6000, discounted: "$30"   } },
 };
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
 type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
 type PaidUpgradePlanId = HeadroomSubscriptionTier;
 
 const INDIVIDUAL_PLAN_ORDER: IndividualUpgradePlanId[] = ["free", "pro", "max5x", "max20x"];
+
+export interface UpgradePlanPurchaseInfo {
+  renewsOn: string;
+  paidPerMonthLabel: string;
+  discountPct: number;
+}
 
 export interface UpgradePlan {
   id: UpgradePlanId;
@@ -35,6 +41,7 @@ export interface UpgradePlan {
   ctaVariant: "primary" | "secondary";
   ctaTone?: "default" | "downgrade";
   disabled?: boolean;
+  purchaseInfo?: UpgradePlanPurchaseInfo;
 }
 
 export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
@@ -100,7 +107,13 @@ export function getUpgradePlans(
   headroomSubscriptionTier?: HeadroomSubscriptionTier | null,
   hasActiveHeadroomSubscription = false,
   launchDiscountActive = false,
-  billingPeriod: BillingPeriod = "annual"
+  billingPeriod: BillingPeriod = "annual",
+  subscriptionAmountCents?: number | null,
+  subscriptionBillingPeriod?: string | null,
+  subscriptionRenewsAt?: string | null,
+  subscriptionStartedAt?: string | null,
+  subscriptionDiscountDuration?: string | null,
+  subscriptionDiscountDurationInMonths?: number | null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -125,6 +138,58 @@ export function getUpgradePlans(
 
     const billingLabel = billingPeriod === "annual" ? "billed annually" : "billed monthly";
 
+    const activeHeadroomPlanId =
+      hasActiveHeadroomSubscription && headroomSubscriptionTier
+        ? headroomSubscriptionTier
+        : null;
+
+    // Compute purchase info for the active plan card when data is available.
+    const activePurchaseInfo = ((): UpgradePlanPurchaseInfo | undefined => {
+      if (!activeHeadroomPlanId || subscriptionAmountCents == null) {
+        return undefined;
+      }
+      const purchasePeriod = (subscriptionBillingPeriod === "annual" || subscriptionBillingPeriod === "monthly")
+        ? subscriptionBillingPeriod
+        : billingPeriod;
+      const fullCents = PLAN_PRICES[activeHeadroomPlanId][purchasePeriod].fullCents;
+
+      // Determine if the discount will still apply at renewal time.
+      const discountAppliesAtRenewal = ((): boolean => {
+        if (!subscriptionDiscountDuration) return false;
+        if (subscriptionDiscountDuration === "forever") return true;
+        if (subscriptionDiscountDuration === "once") return false;
+        // "repeating": check if renewal falls within the discount window
+        if (
+          subscriptionDiscountDuration === "repeating" &&
+          subscriptionDiscountDurationInMonths != null &&
+          subscriptionStartedAt &&
+          subscriptionRenewsAt
+        ) {
+          const discountExpiresAt = new Date(subscriptionStartedAt);
+          discountExpiresAt.setMonth(discountExpiresAt.getMonth() + subscriptionDiscountDurationInMonths);
+          return new Date(subscriptionRenewsAt) < discountExpiresAt;
+        }
+        return false;
+      })();
+
+      // Amount is stored as per-billing-cycle cents; convert to per-month.
+      const paidCentsPerMonth = purchasePeriod === "annual"
+        ? subscriptionAmountCents / 12
+        : subscriptionAmountCents;
+
+      // If the discount won't apply at renewal, show full price for the renewal.
+      const renewalCentsPerMonth = discountAppliesAtRenewal ? paidCentsPerMonth : fullCents;
+      const discountPct = discountAppliesAtRenewal && fullCents > 0
+        ? Math.round((1 - paidCentsPerMonth / fullCents) * 100)
+        : 0;
+      const paidPerMonthLabel = `$${(renewalCentsPerMonth / 100).toFixed(2).replace(/\.00$/, "")}`;
+      const renewsOn = subscriptionRenewsAt
+        ? new Date(subscriptionRenewsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+        : null;
+      if (!renewsOn) return undefined;
+      return { renewsOn, paidPerMonthLabel, discountPct };
+    })();
+
     function paidPlan(
       id: "pro" | "max5x" | "max20x",
       name: string,
@@ -134,13 +199,16 @@ export function getUpgradePlans(
       ctaLabel: string
     ): UpgradePlan {
       const prices = PLAN_PRICES[id][billingPeriod];
-      const price = launchDiscountActive ? prices.discounted : prices.full;
+      // When user has an active plan, always show full prices — no discount badges.
+      const showDiscount = launchDiscountActive && !activeHeadroomPlanId;
+      const price = showDiscount ? prices.discounted : prices.full;
       return {
         id,
         name,
         tagline,
         price,
-        ...(launchDiscountActive ? { originalPrice: prices.full } : {}),
+        ...(showDiscount ? { originalPrice: prices.full } : {}),
+        ...(id === activeHeadroomPlanId && activePurchaseInfo ? { purchaseInfo: activePurchaseInfo } : {}),
         billingLines: ["USD / month", billingLabel],
         featureIntro,
         features,
@@ -167,11 +235,6 @@ export function getUpgradePlans(
         "Priority support"
       ], "Get Max x20"),
     };
-
-    const activeHeadroomPlanId =
-      hasActiveHeadroomSubscription && headroomSubscriptionTier
-        ? headroomSubscriptionTier
-        : null;
 
     const withRelativeCta = (plan: UpgradePlan): UpgradePlan => {
       if (!activeHeadroomPlanId) {

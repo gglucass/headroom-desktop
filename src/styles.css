@@ -941,6 +941,11 @@ select {
   box-shadow: 0 4px 12px rgba(65, 111, 97, 0.12);
 }
 
+.upgrade-plan-card--active {
+  background: linear-gradient(160deg, rgba(220, 244, 236, 0.7) 0%, rgba(240, 250, 245, 0.6) 100%);
+  border-color: rgba(79, 158, 145, 0.4);
+}
+
 .upgrade-plan-card__top,
 .upgrade-plan-card__features {
   display: grid;
@@ -1028,6 +1033,28 @@ select {
   background: rgba(108, 191, 155, 0.22);
   padding: 0.1rem 0.4rem;
   border-radius: 0.3rem;
+}
+
+.upgrade-plan-card__purchase-info {
+  margin: 6px 0 0;
+  font-size: var(--text-xs);
+  color: #4a7a6a;
+  line-height: 1.45;
+}
+
+.upgrade-plan-card__active-badge {
+  display: inline-block;
+  margin-left: 0.45rem;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #215247;
+  background: rgba(79, 158, 145, 0.18);
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.3rem;
+  vertical-align: middle;
+  line-height: 1.6;
 }
 
 .upgrade-plan-card__price-block strong {

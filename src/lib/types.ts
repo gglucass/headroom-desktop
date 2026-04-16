@@ -251,6 +251,12 @@ export interface HeadroomAccountProfile {
   trialActive: boolean;
   subscriptionActive: boolean;
   subscriptionTier?: HeadroomSubscriptionTier | null;
+  subscriptionStartedAt?: string | null;
+  subscriptionRenewsAt?: string | null;
+  subscriptionAmountCents?: number | null;
+  subscriptionBillingPeriod?: string | null;
+  subscriptionDiscountDuration?: string | null;
+  subscriptionDiscountDurationInMonths?: number | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;

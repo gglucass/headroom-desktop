@@ -2208,7 +2208,12 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
 
 fn onboarding_complete(app: &AppHandle) -> bool {
     let state: tauri::State<'_, AppState> = app.state();
-    state.tool_manager.python_runtime_installed() && state.setup_wizard_complete()
+    if !state.tool_manager.python_runtime_installed() {
+        return false;
+    }
+    // Only require wizard completion on the very first launch. Existing users
+    // (launch_count > 1) already went through setup before this flag existed.
+    state.setup_wizard_complete() || state.launch_count() > 1
 }
 
 #[tauri::command]
