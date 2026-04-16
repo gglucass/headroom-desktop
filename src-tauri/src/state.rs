@@ -2710,6 +2710,10 @@ fn parse_f64_from_text(text: &str) -> Option<f64> {
     }
 }
 
+pub(crate) fn headroom_proxy_reachable() -> bool {
+    is_headroom_proxy_reachable()
+}
+
 fn is_headroom_proxy_reachable() -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))

@@ -458,6 +458,17 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             // Fall through to mark_bootstrap_complete anyway so the user is
             // not stuck on the install loader indefinitely. The test screen
             // will show a retry option if the proxy is still unreachable.
+        } else {
+            // 6768 is up, but the intercept layer (6767/health) may still be
+            // initializing. Wait up to 15s for it so the frontend sees
+            // proxyReachable=true the moment the install loader dismisses.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                if state::headroom_proxy_reachable() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
 
         state.mark_bootstrap_complete();
