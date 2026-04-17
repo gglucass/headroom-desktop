@@ -23,7 +23,7 @@ jobs:
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
-      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
       HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -168,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release delete staging --cleanup-tag --yes --repo "${GITHUB_REPOSITORY}" || true
+          gh release delete staging-rolling --cleanup-tag --yes --repo "${GITHUB_REPOSITORY}" || true
 
       - name: Build and publish versioned rc release
         if: steps.release_guard.outputs.should_release == 'true'
@@ -212,7 +212,7 @@ jobs:
           set -euo pipefail
           workdir="$(mktemp -d)"
           gh release download "$RC_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
-          gh release create staging \
+          gh release create staging-rolling \
             --repo "$GITHUB_REPOSITORY" \
             --title "Headroom staging (rolling)" \
             --notes "Rolling pointer to the latest rc build. Current: $RC_TAG" \

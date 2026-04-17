@@ -23,7 +23,7 @@ jobs:
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
-      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
       HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -271,8 +271,8 @@ jobs:
           set -euo pipefail
           workdir="$(mktemp -d)"
           gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
-          gh release delete staging --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          gh release create staging \
+          gh release delete staging-rolling --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create staging-rolling \
             --repo "$GITHUB_REPOSITORY" \
             --title "Headroom staging (rolling)" \
             --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \

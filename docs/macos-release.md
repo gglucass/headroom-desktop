@@ -210,7 +210,7 @@ There are two channels with separate GitHub Actions workflows:
 | Channel | Branch | Workflow | Version format | Endpoint |
 |---------|--------|----------|----------------|----------|
 | Stable | `main` | `release-macos.yml` | `X.Y.Z` | `releases/latest/download/latest.json` |
-| Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging/latest.json` |
+| Staging | `staging` | `release-macos-staging.yml` | `X.Y.Z-rc.N` | `releases/download/staging-rolling/latest.json` |
 
 ### Branching model
 
@@ -233,7 +233,7 @@ Both workflows bake **both** endpoints into every build via `HEADROOM_UPDATER_EN
 
 ### Installing the staging build
 
-Download the DMG attached to the rolling [`staging`](https://github.com/gglucass/headroom-desktop/releases/tag/staging) release on the clean test machine and install it once. Because its version has an `-rc.N` suffix, the app polls the staging endpoint from then on and self-updates as new rcs land.
+Download the DMG attached to the rolling [`staging-rolling`](https://github.com/gglucass/headroom-desktop/releases/tag/staging-rolling) release on the clean test machine and install it once. Because its version has an `-rc.N` suffix, the app polls the staging endpoint from then on and self-updates as new rcs land.
 
 ### Promotion guard
 
