@@ -454,7 +454,18 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.mark_bootstrap_proxy_starting();
         emit_bootstrap_progress(&app_handle, &state);
 
-        if let Err(err) = state.ensure_headroom_running() {
+        // Hold `runtime_starting = true` for the entire spawn + wait window so
+        // the tray spinner and UI share a single source of truth for "headroom
+        // is booting but not yet serving". `ensure_headroom_running` toggles
+        // this flag internally, but flips it back to false the instant
+        // `start_headroom_background()` returns (process spawn only, not
+        // readiness) — so we re-assert it here, *after* that call, and clear
+        // it only once the proxy is reachable (or we time out). This mirrors
+        // `warm_runtime_on_launch`.
+        let ensure_result = state.ensure_headroom_running();
+        state.set_runtime_starting(true);
+
+        if let Err(err) = ensure_result {
             eprintln!("headroom auto-start failed after bootstrap: {err}");
             capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
             // Fall through so the user is not stuck on the install loader
@@ -466,10 +477,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             // 6768 and returns 502 until the backend actually responds, so a
             // 2xx confirms the full chain is live. Gatekeeper's first-launch
             // scan of the bundled venv can take 30-60s, so we wait up to 60s
-            // to match the ETA shown to the user. If the backend never comes
-            // up within this window we still mark bootstrap complete; the
-            // install-step UI keeps Continue disabled until the runtime status
-            // poll confirms proxy reachability.
+            // to match the ETA shown to the user.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 if state::headroom_proxy_reachable() {
@@ -479,6 +487,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             }
         }
 
+        state.set_runtime_starting(false);
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);

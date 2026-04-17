@@ -985,10 +985,14 @@ export default function App() {
           return;
         }
         setDashboard(latestDashboard);
-        if (windowLabel === "launcher" && latestDashboard.launchExperience === "first_run") {
+        // Always land on the install step after a bootstrap completes during
+        // this session, regardless of launchExperience. The install step's
+        // Continue button is gated on runtime.running, so it handles both the
+        // readiness wait and the "Headroom installation present" confirmation
+        // for Resume users whose launch_count > 1 (e.g., they reinstalled the
+        // app without clearing ~/Library/Application Support/Headroom).
+        if (windowLabel === "launcher") {
           setShowInstallStep(true);
-        } else {
-          setShowClientSetupStep(true);
         }
       }
     };
@@ -1165,14 +1169,16 @@ export default function App() {
   }, [windowLabel]);
 
   // Poll runtime status while the install step is visible so the Continue
-  // button unlocks as soon as the proxy is actually reachable. On a cold
-  // first install the Gatekeeper scan can finish after mark_bootstrap_complete
-  // fires, and the main-window poller doesn't run on the launcher.
+  // button unlocks as soon as headroom is fully running (same signal the
+  // tray uses for its solid icon: installed && !paused && proxy_reachable).
+  // On a cold first install the Gatekeeper scan can finish after
+  // mark_bootstrap_complete fires, and the main-window poller doesn't run
+  // on the launcher.
   useEffect(() => {
     if (windowLabel !== "launcher" || !showInstallStep) {
       return;
     }
-    if (runtimeStatus?.proxyReachable) {
+    if (runtimeStatus?.running === true) {
       return;
     }
 
@@ -1182,7 +1188,7 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [windowLabel, showInstallStep, runtimeStatus?.proxyReachable]);
+  }, [windowLabel, showInstallStep, runtimeStatus?.running]);
 
   useEffect(() => {
     if (windowLabel !== "main") {
@@ -2442,7 +2448,7 @@ export default function App() {
         </div>
         {installComplete ? (
           <>
-            {!runtimeStatus?.proxyReachable ? (
+            {runtimeStatus?.running !== true ? (
               <>
                 <p className="launcher-install-notice">Starting Headroom for the first time (this can take up to a minute)…</p>
                 <button
