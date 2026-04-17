@@ -5,11 +5,30 @@ import {
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
   loadAppUpdateConfiguration,
+  maybeFireStaleAppUpdateNotification,
   runAppUpdateCheck,
   runAppUpdateInstall,
   sendAppUpdateNotification,
   shouldNotifyAboutAvailableAppUpdate,
 } from "./appUpdate";
+
+function installStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: vi.fn((key: string) => values.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => {
+        values.set(key, value);
+      }),
+    },
+  });
+  return values;
+}
+
+function daysAgo(n: number): string {
+  return new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+}
 
 const disabledConfig: AppUpdateConfiguration = {
   enabled: false,
@@ -211,5 +230,100 @@ describe("app update helpers", () => {
 
     await expect(sendAppUpdateNotification("0.3.0", invokeFn)).resolves.toBeUndefined();
     expect(invokeFn).toHaveBeenCalledWith("show_app_update_notification", { version: "0.3.0" });
+  });
+});
+
+describe("maybeFireStaleAppUpdateNotification", () => {
+  it("fires when the update is at least 5 days old and has not been notified", async () => {
+    installStorage();
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, publishedAt: daysAgo(6) },
+      invokeFn
+    );
+
+    expect(invokeFn).toHaveBeenCalledWith("show_notification", {
+      title: "Headroom update waiting",
+      body: expect.stringContaining("0.3.0"),
+      action: "update",
+    });
+    expect(localStorage.setItem).toHaveBeenCalledWith(
+      "headroom_stale_update_notified_version",
+      "0.3.0"
+    );
+  });
+
+  it("does not fire when the update is fresher than 5 days", async () => {
+    installStorage();
+    const invokeFn = vi.fn();
+
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, publishedAt: daysAgo(3) },
+      invokeFn
+    );
+
+    expect(invokeFn).not.toHaveBeenCalled();
+  });
+
+  it("does not fire twice for the same version", async () => {
+    installStorage({ headroom_stale_update_notified_version: "0.3.0" });
+    const invokeFn = vi.fn();
+
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, publishedAt: daysAgo(10) },
+      invokeFn
+    );
+
+    expect(invokeFn).not.toHaveBeenCalled();
+  });
+
+  it("fires again for a new version even if a previous one was notified", async () => {
+    installStorage({ headroom_stale_update_notified_version: "0.3.0" });
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, version: "0.4.0", publishedAt: daysAgo(6) },
+      invokeFn
+    );
+
+    expect(invokeFn).toHaveBeenCalledOnce();
+  });
+
+  it("is a no-op when there is no available update", async () => {
+    installStorage();
+    const invokeFn = vi.fn();
+
+    await maybeFireStaleAppUpdateNotification(null, invokeFn);
+
+    expect(invokeFn).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when publishedAt is missing or malformed", async () => {
+    installStorage();
+    const invokeFn = vi.fn();
+
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, publishedAt: null },
+      invokeFn
+    );
+    await maybeFireStaleAppUpdateNotification(
+      { ...availableUpdate, publishedAt: "not-a-date" },
+      invokeFn
+    );
+
+    expect(invokeFn).not.toHaveBeenCalled();
+  });
+
+  it("swallows invoke errors without throwing", async () => {
+    installStorage();
+    const invokeFn = vi.fn().mockRejectedValueOnce(new Error("notifications disabled"));
+
+    await expect(
+      maybeFireStaleAppUpdateNotification(
+        { ...availableUpdate, publishedAt: daysAgo(6) },
+        invokeFn
+      )
+    ).resolves.toBeUndefined();
   });
 });
