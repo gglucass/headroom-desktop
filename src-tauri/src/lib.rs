@@ -1050,6 +1050,56 @@ fn hide_launcher_animated(app: AppHandle) {
 }
 
 #[tauri::command]
+fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable().map_err(|err| err.to_string())?;
+    } else {
+        manager.disable().map_err(|err| err.to_string())?;
+    }
+    manager.is_enabled().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
+    {
+        let state: tauri::State<'_, AppState> = app.state();
+        state.stop_headroom();
+    }
+
+    // Turn off the login item if it was ever enabled, so the system stops
+    // listing Headroom as a background item even if the user later reinstalls.
+    let _ = app.autolaunch().disable();
+
+    let removed = client_adapters::perform_full_cleanup();
+
+    analytics::track_event(
+        &app,
+        "uninstall_completed",
+        Some(json!({ "removed_paths": removed.len() })),
+    );
+    analytics::shutdown(&app);
+    if let Some(client) = sentry::Hub::current().client() {
+        client.flush(Some(std::time::Duration::from_secs(2)));
+    }
+
+    let handle = app.clone();
+    // Give the frontend a moment to receive the command response before the
+    // process exits, so the confirmation toast can render.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        handle.exit(0);
+    });
+
+    Ok(removed)
+}
+
+#[tauri::command]
 fn quit_headroom(app: AppHandle) {
     exit_headroom(&app, QuitSource::SettingsButton);
 }
@@ -1115,11 +1165,9 @@ pub fn run() {
             }
 
             let launched_from_autostart = launched_from_autostart();
-            if let Ok(false) = app.autolaunch().is_enabled() {
-                if let Err(err) = app.autolaunch().enable() {
-                    eprintln!("failed to enable autostart: {err}");
-                }
-            }
+            // Autostart is opt-in. Users enable it explicitly from Settings,
+            // which avoids triggering macOS's "Background item added" prompt
+            // on first launch.
 
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
@@ -1205,6 +1253,9 @@ pub fn run() {
             submit_contact_request,
             hide_launcher_animated,
             complete_setup_wizard,
+            get_autostart_enabled,
+            set_autostart_enabled,
+            uninstall_and_quit,
             quit_headroom
         ])
         .run(tauri::generate_context!())

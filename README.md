@@ -2,6 +2,8 @@
 
 **Cut your LLM API bills by 60–90% without changing how you code.**
 
+> **Pricing:** Headroom has a free tier and paid plans — see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed; account features and paid plans are opt-in.
+
 [![Website](https://img.shields.io/badge/extraheadroom.com-website-blue?style=for-the-badge)](https://extraheadroom.com)&nbsp;&nbsp;[![Download for macOS](https://img.shields.io/github/v/release/gglucass/headroom-desktop?label=Download%20for%20macOS&style=for-the-badge&logo=apple&logoColor=white&color=000000)](https://github.com/gglucass/headroom-desktop/releases/latest)
 
 > **Stable:** macOS on Apple Silicon (M1 or later)

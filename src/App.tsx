@@ -705,6 +705,11 @@ export default function App() {
   const [chartResetSignal, setChartResetSignal] = useState(0);
   const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [showUninstallDialog, setShowUninstallDialog] = useState(false);
+  const [uninstallBusy, setUninstallBusy] = useState(false);
+  const [uninstallError, setUninstallError] = useState<string | null>(null);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState("");
@@ -1274,7 +1279,35 @@ export default function App() {
       refreshRuntimeStatus(),
       appUpdateConfig ? Promise.resolve() : refreshAppUpdateConfiguration()
     ]);
+    void invoke<boolean>("get_autostart_enabled")
+      .then((enabled) => setAutostartEnabled(enabled))
+      .catch(() => setAutostartEnabled(false));
   }, [activeView]);
+
+  async function handleAutostartToggle(nextEnabled: boolean) {
+    setAutostartBusy(true);
+    try {
+      const enabled = await invoke<boolean>("set_autostart_enabled", { enabled: nextEnabled });
+      setAutostartEnabled(enabled);
+    } catch (error) {
+      console.error("Failed to update autostart", error);
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
+
+  async function handleUninstall() {
+    setUninstallBusy(true);
+    setUninstallError(null);
+    try {
+      await invoke<string[]>("uninstall_and_quit");
+    } catch (error) {
+      setUninstallError(
+        typeof error === "string" ? error : "Uninstall failed. Please try again."
+      );
+      setUninstallBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (activeView !== "home") {
@@ -2389,7 +2422,7 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <h1>
-          Headroom cuts Claude Code costs 
+          Headroom cuts Claude Code costs
           <br />
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
         </h1>
@@ -2456,6 +2489,29 @@ export default function App() {
             >
               {bootstrapping ? "Installing Headroom…" : "Install Headroom"}
             </button>
+            {!bootstrapping && (
+              <div className="install-disclosure">
+                <p className="install-disclosure__lead">Clicking Install will:</p>
+                <ul className="install-disclosure__list">
+                  <li>
+                    Download a self-contained Python runtime (~2 GB) into
+                    ~/Library/Application Support/Headroom. Your system Python is untouched.
+                  </li>
+                  <li>
+                    Add a PreToolUse hook to ~/.claude/settings.json and a script at
+                    ~/.claude/hooks/headroom-rtk-rewrite.sh so Claude Code runs through Headroom.
+                    A timestamped backup is written before any edit.
+                  </li>
+                  <li>
+                    Route Claude Code through a local proxy at 127.0.0.1:6767. Prompts never leave your machine.
+                  </li>
+                </ul>
+                <p className="install-disclosure__foot">
+                  Headroom has a free tier and paid plans. Everything above is reversible from
+                  Settings → Uninstall Headroom.
+                </p>
+              </div>
+            )}
           </>
         )}
         <div className="install-progress-shell">
@@ -4123,6 +4179,58 @@ export default function App() {
                   ) : null}
                 </div>
               </article>
+              <article className="soft-card panel-card">
+                <div className="panel-card__header">
+                  <div>
+                    <h3>Startup</h3>
+                  </div>
+                </div>
+                <div className="connector-item">
+                  <div>
+                    <h3>Open Headroom on login</h3>
+                    <p className="connector-item__reason">
+                      Off by default. Turning this on registers Headroom as a macOS login item,
+                      so it's running when you start coding.
+                    </p>
+                  </div>
+                  <div className="connector-item__controls">
+                    <button
+                      aria-checked={autostartEnabled === true}
+                      aria-label={`${autostartEnabled ? "Disable" : "Enable"} open on login`}
+                      className={`connector-switch${autostartEnabled ? " is-on" : ""}`}
+                      disabled={autostartBusy || autostartEnabled === null}
+                      onClick={() => void handleAutostartToggle(!autostartEnabled)}
+                      role="switch"
+                      type="button"
+                    >
+                      <span className="connector-switch__thumb" />
+                    </button>
+                  </div>
+                </div>
+              </article>
+
+              <article className="soft-card panel-card">
+                <div className="panel-card__header">
+                  <div>
+                    <h3>Uninstall</h3>
+                  </div>
+                </div>
+                <p className="connector-item__reason">
+                  Reverses every change Headroom made: removes the managed Python runtime, the Claude Code
+                  hook, and restores <code>~/.claude/settings.json</code> changes. Headroom will quit when done.
+                </p>
+                <button
+                  className="secondary-button secondary-button--small"
+                  onClick={() => {
+                    setUninstallError(null);
+                    setShowUninstallDialog(true);
+                  }}
+                  type="button"
+                >
+                  Uninstall Headroom
+                </button>
+              </article>
+
               <button
                 className="contact-link"
                 onClick={() => void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
@@ -4166,6 +4274,53 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {showUninstallDialog ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              onClick={() => {
+                if (!uninstallBusy) {
+                  setShowUninstallDialog(false);
+                }
+              }}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Uninstall Headroom?</h3>
+                <p>This will:</p>
+                <ul className="api-key-guide">
+                  <li>Restore <code>~/.claude/settings.json</code> (remove Headroom's hook and env)</li>
+                  <li>Delete <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code></li>
+                  <li>Delete <code>~/Library/Application Support/Headroom</code> (Python runtime, logs, caches)</li>
+                  <li>Delete <code>~/.headroom</code> if present</li>
+                  <li>Disable the Headroom login item</li>
+                </ul>
+                <p>You can reinstall at any time by launching Headroom again.</p>
+                {uninstallError ? (
+                  <p className="install-progress__error">{uninstallError}</p>
+                ) : null}
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    disabled={uninstallBusy}
+                    onClick={() => setShowUninstallDialog(false)}
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={uninstallBusy}
+                    onClick={() => void handleUninstall()}
+                    type="button"
+                  >
+                    {uninstallBusy ? "Uninstalling…" : "Uninstall and quit"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           {showAppUpdateDialog && appUpdateAvailable ? (
             <div className="modal-backdrop" role="dialog" aria-modal="true">

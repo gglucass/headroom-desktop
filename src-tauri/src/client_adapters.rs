@@ -371,6 +371,57 @@ pub fn clear_client_setups() -> Result<()> {
     Ok(())
 }
 
+/// Fully uninstalls Headroom's on-disk footprint on a best-effort basis:
+/// reverses every client setup, removes the managed RTK hook script, and
+/// deletes the Headroom application-support directory along with the
+/// `~/.headroom` directory used by the Python runtime.
+///
+/// Returns the list of paths that were successfully removed (useful for
+/// surfacing to the user) alongside any per-step errors that were ignored.
+pub fn perform_full_cleanup() -> Vec<String> {
+    let mut removed: Vec<String> = Vec::new();
+
+    // Reverse settings.json mutations and shell blocks for every known client.
+    if let Err(err) = clear_client_setups() {
+        eprintln!("cleanup: clear_client_setups failed: {err}");
+    }
+
+    let hook_path = headroom_rtk_hook_path();
+    if hook_path.exists() {
+        match std::fs::remove_file(&hook_path) {
+            Ok(_) => removed.push(hook_path.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", hook_path.display()),
+        }
+    }
+
+    // Also wipe the per-client setup-state file so a reinstall starts clean.
+    let setup_state = setup_state_path();
+    if setup_state.exists() {
+        let _ = std::fs::remove_file(&setup_state);
+    }
+
+    let app_dir = app_data_dir();
+    if app_dir.exists() {
+        match std::fs::remove_dir_all(&app_dir) {
+            Ok(_) => removed.push(app_dir.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", app_dir.display()),
+        }
+    }
+
+    let dot_headroom = home_dir().join(".headroom");
+    if dot_headroom.exists() {
+        match std::fs::remove_dir_all(&dot_headroom) {
+            Ok(_) => removed.push(dot_headroom.display().to_string()),
+            Err(err) => eprintln!(
+                "cleanup: removing {} failed: {err}",
+                dot_headroom.display()
+            ),
+        }
+    }
+
+    removed
+}
+
 /// Re-applies setup for all clients that were active at the last pause or quit.
 pub fn restore_client_setups() {
     let state = load_setup_state();
