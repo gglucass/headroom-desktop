@@ -231,6 +231,11 @@ const CONTACT_FORM_URL = (
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
 
+// Which onboarding screen the launcher is currently showing. Linear flow:
+// install → client_setup → proxy_verify → post_install. Back buttons can
+// jump backwards. The install step doubles as the pre-install landing.
+type LauncherStage = "install" | "client_setup" | "proxy_verify" | "post_install";
+
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -627,10 +632,11 @@ export default function App() {
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
   const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
-  const [showInstallStep, setShowInstallStep] = useState(false);
-  const [showPostInstallGuide, setShowPostInstallGuide] = useState(false);
-  const [showClientSetupStep, setShowClientSetupStep] = useState(false);
-  const [showProxyVerificationStep, setShowProxyVerificationStep] = useState(false);
+  // Launcher stage is a single source of truth for which onboarding screen
+  // is showing. Only one screen can be active at a time; transitions go
+  // through `setLauncherStage` so implicit renders from bootstrap/dashboard
+  // flags cannot bypass the install step's readiness gate.
+  const [launcherStage, setLauncherStage] = useState<LauncherStage>("install");
   const [connectors, setConnectors] = useState<ClientConnectorStatus[]>([]);
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
@@ -746,11 +752,7 @@ export default function App() {
     bootstrapProgress.overallPercent > 0;
 
   const isLastScreen =
-    windowLabel === "launcher" &&
-    !showInstallStep &&
-    !showClientSetupStep &&
-    !showProxyVerificationStep &&
-    showPostInstallGuide;
+    windowLabel === "launcher" && launcherStage === "post_install";
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;
@@ -874,9 +876,9 @@ export default function App() {
       }
       if (label === "launcher" && (bootstrapResult.complete || dashboardResult.bootstrapComplete)) {
         if (dashboardResult.launchExperience === "first_run") {
-          setShowInstallStep(true);
+          setLauncherStage("install");
         } else {
-          setShowPostInstallGuide(true);
+          setLauncherStage("post_install");
         }
       }
 
@@ -992,7 +994,7 @@ export default function App() {
         // for Resume users whose launch_count > 1 (e.g., they reinstalled the
         // app without clearing ~/Library/Application Support/Headroom).
         if (windowLabel === "launcher") {
-          setShowInstallStep(true);
+          setLauncherStage("install");
         }
       }
     };
@@ -1020,36 +1022,14 @@ export default function App() {
   }, [bootstrapping]);
 
   useEffect(() => {
-    const launcherStep2Visible =
-      windowLabel === "launcher" &&
-      !showInstallStep &&
-      !showProxyVerificationStep &&
-      !showPostInstallGuide &&
-      (showClientSetupStep || bootstrapProgress.complete || dashboard.bootstrapComplete);
-
-    if (
-      !launcherStep2Visible
-    ) {
+    if (windowLabel !== "launcher" || launcherStage !== "client_setup") {
       return;
     }
     void refreshConnectors();
-  }, [
-    windowLabel,
-    showClientSetupStep,
-    showInstallStep,
-    showProxyVerificationStep,
-    showPostInstallGuide,
-    bootstrapProgress.complete,
-    dashboard.bootstrapComplete
-  ]);
+  }, [windowLabel, launcherStage]);
 
   useEffect(() => {
-    if (
-      windowLabel !== "launcher" ||
-      !showProxyVerificationStep ||
-      showInstallStep ||
-      showPostInstallGuide
-    ) {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
       return;
     }
 
@@ -1123,7 +1103,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, showProxyVerificationStep, showInstallStep, showPostInstallGuide]);
+  }, [windowLabel, launcherStage]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -1175,7 +1155,7 @@ export default function App() {
   // mark_bootstrap_complete fires, and the main-window poller doesn't run
   // on the launcher.
   useEffect(() => {
-    if (windowLabel !== "launcher" || !showInstallStep) {
+    if (windowLabel !== "launcher" || launcherStage !== "install") {
       return;
     }
     if (runtimeStatus?.running === true) {
@@ -1188,7 +1168,7 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [windowLabel, showInstallStep, runtimeStatus?.running]);
+  }, [windowLabel, launcherStage, runtimeStatus?.running]);
 
   useEffect(() => {
     if (windowLabel !== "main") {
@@ -1845,14 +1825,14 @@ export default function App() {
       setConnectors(latestConnectors);
 
       if (getLauncherAutoConfigureDecision(latestConnectors) === "show_client_setup") {
-        setShowClientSetupStep(true);
+        setLauncherStage("client_setup");
         return;
       }
 
       if (getLauncherAutoConfigureDecision(latestConnectors) === "apply_client_setup") {
         const detectedClaudeConnector = getClaudeConnector(latestConnectors);
         if (!detectedClaudeConnector) {
-          setShowClientSetupStep(true);
+          setLauncherStage("client_setup");
           return;
         }
         await invoke<ClientSetupResult>("apply_client_setup", {
@@ -1863,26 +1843,22 @@ export default function App() {
       }
 
       if (getLauncherAutoConfigureDecision(latestConnectors) !== "begin_proxy_verification") {
-        setShowClientSetupStep(true);
+        setLauncherStage("client_setup");
         return;
       }
 
-      setShowClientSetupStep(false);
-      setShowPostInstallGuide(false);
       await beginProxyVerificationStep();
     } catch (error) {
       setConnectorsError(
         error instanceof Error ? error.message : "Could not configure Claude Code automatically."
       );
-      setShowClientSetupStep(true);
+      setLauncherStage("client_setup");
     } finally {
       setConnectorsBusy(false);
     }
   }
 
   async function handleFirstLaunchContinue() {
-    setShowInstallStep(false);
-    setShowPostInstallGuide(false);
     await autoConfigureClaudeCodeForLauncher();
   }
 
@@ -2273,9 +2249,7 @@ export default function App() {
       // fall back to cached state
     }
 
-    setShowClientSetupStep(false);
-    setShowPostInstallGuide(false);
-    setShowProxyVerificationStep(true);
+    setLauncherStage("proxy_verify");
     setProxyVerificationHint(null);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     try {
@@ -2392,12 +2366,7 @@ export default function App() {
   }
 
   if (
-    windowLabel === "launcher" &&
-    (showInstallStep ||
-      (!showPostInstallGuide &&
-        !showClientSetupStep &&
-        !bootstrapProgress.complete &&
-        !dashboard.bootstrapComplete))
+    windowLabel === "launcher" && launcherStage === "install"
   ) {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
@@ -2518,12 +2487,7 @@ export default function App() {
   }
 
   if (
-    windowLabel === "launcher" &&
-    !showInstallStep &&
-    !showProxyVerificationStep &&
-    (showClientSetupStep ||
-      (bootstrapProgress.complete || dashboard.bootstrapComplete)) &&
-    !showPostInstallGuide
+    windowLabel === "launcher" && launcherStage === "client_setup"
   ) {
     const launcherConnectors =
       connectors.length > 0 ? connectors : launcherConnectorFallback;
@@ -2686,10 +2650,7 @@ export default function App() {
           <button
             className="secondary-button post-install__reopen-setup"
             onClick={() => {
-              setShowPostInstallGuide(false);
-              setShowClientSetupStep(false);
-              setShowProxyVerificationStep(false);
-              setShowInstallStep(true);
+              setLauncherStage("install");
             }}
             type="button"
           >
@@ -2699,7 +2660,6 @@ export default function App() {
             className="primary-button primary-button--large primary-button--success"
             disabled={connectorsBusy || (requireSelection && enabledConnectorCount === 0)}
             onClick={() => {
-              setShowInstallStep(false);
               void beginProxyVerificationStep();
             }}
             type="button"
@@ -2712,10 +2672,7 @@ export default function App() {
   }
 
   if (
-    windowLabel === "launcher" &&
-    !showInstallStep &&
-    showProxyVerificationStep &&
-    !showPostInstallGuide
+    windowLabel === "launcher" && launcherStage === "proxy_verify"
   ) {
     const hasEnabledApps = proxyVerificationRows.length > 0;
     const allVerified =
@@ -2769,8 +2726,7 @@ export default function App() {
           <button
             className="secondary-button post-install__reopen-setup"
             onClick={() => {
-              setShowProxyVerificationStep(false);
-              setShowClientSetupStep(true);
+              setLauncherStage("client_setup");
             }}
             type="button"
           >
@@ -2780,8 +2736,7 @@ export default function App() {
             className="primary-button primary-button--large primary-button--success"
             onClick={() => {
               void invoke("complete_setup_wizard");
-              setShowProxyVerificationStep(false);
-              setShowPostInstallGuide(true);
+              setLauncherStage("post_install");
             }}
             type="button"
           >
@@ -2793,10 +2748,7 @@ export default function App() {
   }
 
   if (
-    windowLabel === "launcher" &&
-    !showInstallStep &&
-    !showProxyVerificationStep &&
-    showPostInstallGuide
+    windowLabel === "launcher" && launcherStage === "post_install"
   ) {
     return (
       <LauncherShell
@@ -2848,7 +2800,6 @@ export default function App() {
           <button
             className="secondary-button post-install__reopen-setup"
             onClick={() => {
-              setShowPostInstallGuide(false);
               void beginProxyVerificationStep();
             }}
             type="button"
