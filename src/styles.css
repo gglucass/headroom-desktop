@@ -379,6 +379,39 @@ select {
   line-height: 1.28;
 }
 
+.install-disclosure {
+  margin: 12px 0 0;
+  text-align: left;
+}
+
+.install-disclosure__lead {
+  margin: 0 0 6px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.install-disclosure__list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.install-disclosure__list li {
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  opacity: 0.75;
+}
+
+.install-disclosure__foot {
+  margin: 8px 0 0;
+  font-size: var(--text-xs);
+  line-height: 1.35;
+  opacity: 0.65;
+}
+
 .install-progress {
   margin-top: 14px;
   padding: 0;
