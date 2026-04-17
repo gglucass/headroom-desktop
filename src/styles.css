@@ -312,7 +312,7 @@ select {
 }
 
 .install-pre-notice {
-  margin: 12px 0 10px;
+  margin: 4px 0 4px;
   font-size: var(--text-xs);
   color: #7a7169;
   line-height: 1.5;
@@ -380,7 +380,7 @@ select {
 }
 
 .install-disclosure {
-  margin: 12px 0 0;
+  margin: 4px 0 0;
   text-align: left;
 }
 

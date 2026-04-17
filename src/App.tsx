@@ -2485,7 +2485,7 @@ export default function App() {
             </p>
           </article>
           <article>
-            <strong>Less tokens, same result</strong>
+            <strong>Fewer tokens, no impact</strong>
             <p>
               Smart optimization cuts noise before Claude Code sees it, with
               no impact on the output.
@@ -2538,22 +2538,14 @@ export default function App() {
                 <p className="install-disclosure__lead">Clicking Install will:</p>
                 <ul className="install-disclosure__list">
                   <li>
-                    Download a self-contained Python runtime (~2 GB) into
-                    ~/Library/Application Support/Headroom. Your system Python is untouched.
+                    Download a self-contained Python runtime (~2 GB). Your system Python is untouched.
                   </li>
                   <li>
                     Add a PreToolUse hook to ~/.claude/settings.json and a script at
                     ~/.claude/hooks/headroom-rtk-rewrite.sh so Claude Code runs through Headroom.
                     A timestamped backup is written before any edit.
                   </li>
-                  <li>
-                    Route Claude Code through a local proxy at 127.0.0.1:6767. Prompts never leave your machine.
-                  </li>
                 </ul>
-                <p className="install-disclosure__foot">
-                  Headroom has a free tier and paid plans. Everything above is reversible from
-                  Settings → Uninstall Headroom.
-                </p>
               </div>
             )}
           </>
