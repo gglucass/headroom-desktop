@@ -460,9 +460,17 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             // Fall through so the user is not stuck on the install loader
             // indefinitely. The test screen will show a retry option.
         } else {
-            // 6768 is up, but wait for 6767/health (intercept → headroom) to
-            // confirm the full proxy chain is live before dismissing the loader.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            // The intercept layer on 6767 is always bound by the Rust app, so
+            // reachability really means "headroom's backend on 6768 is up".
+            // We probe it by hitting 6767/health — the intercept forwards to
+            // 6768 and returns 502 until the backend actually responds, so a
+            // 2xx confirms the full chain is live. Gatekeeper's first-launch
+            // scan of the bundled venv can take 30-60s, so we wait up to 60s
+            // to match the ETA shown to the user. If the backend never comes
+            // up within this window we still mark bootstrap complete; the
+            // install-step UI keeps Continue disabled until the runtime status
+            // poll confirms proxy reachability.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 if state::headroom_proxy_reachable() {
                     break;

@@ -1164,6 +1164,26 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [windowLabel]);
 
+  // Poll runtime status while the install step is visible so the Continue
+  // button unlocks as soon as the proxy is actually reachable. On a cold
+  // first install the Gatekeeper scan can finish after mark_bootstrap_complete
+  // fires, and the main-window poller doesn't run on the launcher.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || !showInstallStep) {
+      return;
+    }
+    if (runtimeStatus?.proxyReachable) {
+      return;
+    }
+
+    void refreshRuntimeStatus();
+    const interval = window.setInterval(() => {
+      void refreshRuntimeStatus();
+    }, 1000);
+
+    return () => window.clearInterval(interval);
+  }, [windowLabel, showInstallStep, runtimeStatus?.proxyReachable]);
+
   useEffect(() => {
     if (windowLabel !== "main") {
       return;
@@ -2422,7 +2442,7 @@ export default function App() {
         </div>
         {installComplete ? (
           <>
-            {runtimeStatus?.starting && !runtimeStatus?.proxyReachable ? (
+            {!runtimeStatus?.proxyReachable ? (
               <>
                 <p className="launcher-install-notice">Starting Headroom for the first time (this can take up to a minute)…</p>
                 <button
