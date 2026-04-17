@@ -391,77 +391,77 @@ fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
 
 #[tauri::command]
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
-    {
+    let already_installed = {
         let state: tauri::State<'_, AppState> = app.state();
         let already_installed = state.tool_manager.python_runtime_installed();
         state.begin_bootstrap()?;
         emit_bootstrap_progress(&app, &state);
-        if already_installed {
-            analytics::track_event(
-                &app,
-                "bootstrap_skipped",
-                Some(json!({ "reason": "already_installed" })),
-            );
-            return Ok(());
-        }
-    }
+        already_installed
+    };
 
-    analytics::track_event(&app, "bootstrap_started", None);
+    if already_installed {
+        analytics::track_event(
+            &app,
+            "bootstrap_skipped",
+            Some(json!({ "reason": "already_installed" })),
+        );
+    } else {
+        analytics::track_event(&app, "bootstrap_started", None);
+    }
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
         let state: tauri::State<'_, AppState> = app_handle.state();
 
-        let result = state.tool_manager.bootstrap_all_with_progress(|step| {
-            state.update_bootstrap_step(step);
-            emit_bootstrap_progress(&app_handle, &state);
-        });
-        if let Err(err) = result {
-            capture_bootstrap_failure(&err);
-            state.mark_bootstrap_failed(
-                "Installation failed: Headroom couldn't download a required file. \
-                Please check your internet connection and try restarting the app. \
-                If this keeps happening, contact support at headroom.ai/support."
-            );
-            emit_bootstrap_progress(&app_handle, &state);
-            analytics::track_event(
-                &app_handle,
-                "bootstrap_failed",
-                Some(json!({ "phase": "install_runtime" })),
-            );
-            return;
+        if !already_installed {
+            let result = state.tool_manager.bootstrap_all_with_progress(|step| {
+                state.update_bootstrap_step(step);
+                emit_bootstrap_progress(&app_handle, &state);
+            });
+            if let Err(err) = result {
+                capture_bootstrap_failure(&err);
+                state.mark_bootstrap_failed(
+                    "Installation failed: Headroom couldn't download a required file. \
+                    Please check your internet connection and try restarting the app. \
+                    If this keeps happening, contact support at headroom.ai/support."
+                );
+                emit_bootstrap_progress(&app_handle, &state);
+                analytics::track_event(
+                    &app_handle,
+                    "bootstrap_failed",
+                    Some(json!({ "phase": "install_runtime" })),
+                );
+                return;
+            }
+
+            if let Err(err) = client_adapters::ensure_rtk_integrations(
+                &state.tool_manager.rtk_entrypoint(),
+                &state.tool_manager.managed_python(),
+            ) {
+                eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
+                sentry::capture_message(
+                    &format!("RTK integrations failed after start_bootstrap thread: {err}"),
+                    sentry::Level::Warning,
+                );
+            }
         }
 
-        if let Err(err) = client_adapters::ensure_rtk_integrations(
-            &state.tool_manager.rtk_entrypoint(),
-            &state.tool_manager.managed_python(),
-        ) {
-            eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
-            sentry::capture_message(
-                &format!("RTK integrations failed after start_bootstrap thread: {err}"),
-                sentry::Level::Warning,
-            );
-        }
-
-        // Show "Starting Headroom" in the install loader while we wait for
-        // the proxy to come up. On a fresh machine macOS Gatekeeper scans the
-        // entire venv on first execution, which can take 30-60 seconds. Keeping
-        // `complete: false` here means the user cannot click Continue until the
-        // proxy is actually reachable, so they never land on the test screen
-        // seeing "proxy not reachable yet".
+        // Show "Starting Headroom" in the install loader while we wait for the
+        // proxy to come up. This runs for both fresh installs and already-installed
+        // re-runs. On a fresh machine macOS Gatekeeper scans the entire venv on
+        // first execution (30-60s); keeping `complete: false` here means the user
+        // cannot click Continue until the proxy is actually reachable.
         state.mark_bootstrap_proxy_starting();
         emit_bootstrap_progress(&app_handle, &state);
 
         if let Err(err) = state.ensure_headroom_running() {
             eprintln!("headroom auto-start failed after bootstrap: {err}");
             capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
-            // Fall through to mark_bootstrap_complete anyway so the user is
-            // not stuck on the install loader indefinitely. The test screen
-            // will show a retry option if the proxy is still unreachable.
+            // Fall through so the user is not stuck on the install loader
+            // indefinitely. The test screen will show a retry option.
         } else {
-            // 6768 is up, but the intercept layer (6767/health) may still be
-            // initializing. Wait up to 15s for it so the frontend sees
-            // proxyReachable=true the moment the install loader dismisses.
+            // 6768 is up, but wait for 6767/health (intercept → headroom) to
+            // confirm the full proxy chain is live before dismissing the loader.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             while std::time::Instant::now() < deadline {
                 if state::headroom_proxy_reachable() {

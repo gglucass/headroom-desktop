@@ -2422,14 +2422,29 @@ export default function App() {
         </div>
         {installComplete ? (
           <>
-            <p className="launcher-install-notice">Headroom installation present</p>
-            <button
-              className="primary-button primary-button--large primary-button--success launcher-step1-continue"
-              onClick={() => void handleFirstLaunchContinue()}
-              type="button"
-            >
-              Continue
-            </button>
+            {runtimeStatus?.starting && !runtimeStatus?.proxyReachable ? (
+              <>
+                <p className="launcher-install-notice">Starting Headroom for the first time (this can take up to a minute)…</p>
+                <button
+                  className="primary-button primary-button--large primary-button--install launcher-step1-continue"
+                  disabled
+                  type="button"
+                >
+                  Starting Headroom…
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="launcher-install-notice">Headroom installation present</p>
+                <button
+                  className="primary-button primary-button--large primary-button--success launcher-step1-continue"
+                  onClick={() => void handleFirstLaunchContinue()}
+                  type="button"
+                >
+                  Continue
+                </button>
+              </>
+            )}
           </>
         ) : (
           <>
