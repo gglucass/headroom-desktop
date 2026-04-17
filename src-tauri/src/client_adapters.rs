@@ -259,6 +259,10 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
     })
 }
 
+pub fn is_claude_code_enabled() -> bool {
+    is_configured(&load_setup_state(), "claude_code")
+}
+
 pub fn list_client_connectors(
     detected_clients: &[ClientStatus],
 ) -> Result<Vec<ClientConnectorStatus>> {

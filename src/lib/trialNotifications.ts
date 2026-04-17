@@ -54,7 +54,7 @@ async function maybeFireGraceNotification(
       ? `Less than ${hoursLeft + 1} hour(s) left. Create a Headroom account to start your 14-day trial.`
       : `${hoursLeft} hours left in your 72-hour access window. Create an account to unlock a 14-day trial.`;
 
-  await sendNotification("Start Your Headroom Trial", body);
+  await sendNotification("Start Your Headroom Trial", body, "signup");
   localStorage.setItem(GRACE_THRESHOLD_KEY, String(nextIndex));
 }
 
@@ -75,13 +75,17 @@ async function maybeFireTrialExpiryNotification(
       ? "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled."
       : `Your Headroom trial ends in ${daysLeft} days. Upgrade to keep optimization enabled.`;
 
-  await sendNotification("Headroom Trial Ending Soon", body);
+  await sendNotification("Headroom Trial Ending Soon", body, "billing");
   localStorage.setItem(TRIAL_EXPIRY_DATE_KEY, today);
 }
 
-async function sendNotification(title: string, body: string): Promise<void> {
+async function sendNotification(
+  title: string,
+  body: string,
+  action?: string
+): Promise<void> {
   try {
-    await invoke("show_notification", { title, body });
+    await invoke("show_notification", { title, body, action });
   } catch {
     // best-effort
   }

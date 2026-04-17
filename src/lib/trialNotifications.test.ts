@@ -129,6 +129,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Start Your Headroom Trial",
         body: expect.stringContaining("hours left"),
+        action: "signup",
       });
     });
 
@@ -143,6 +144,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Start Your Headroom Trial",
         body: expect.any(String),
+        action: "signup",
       });
     });
 
@@ -157,6 +159,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Start Your Headroom Trial",
         body: expect.any(String),
+        action: "signup",
       });
     });
 
@@ -246,6 +249,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Start Your Headroom Trial",
         body: expect.stringContaining("hour(s) left"),
+        action: "signup",
       });
     });
 
@@ -274,6 +278,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Headroom Trial Ending Soon",
         body: "Your Headroom trial ends in 3 days. Upgrade to keep optimization enabled.",
+        action: "billing",
       });
     });
 
@@ -291,6 +296,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Headroom Trial Ending Soon",
         body: "Your Headroom trial ends in 2 days. Upgrade to keep optimization enabled.",
+        action: "billing",
       });
     });
 
@@ -308,6 +314,7 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).toHaveBeenCalledWith("show_notification", {
         title: "Headroom Trial Ending Soon",
         body: "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled.",
+        action: "billing",
       });
     });
 

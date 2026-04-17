@@ -48,9 +48,14 @@ import {
   runAppUpdateInstall,
   sendAppUpdateNotification,
   shouldNotifyAboutAvailableAppUpdate,
+  maybeFireStaleAppUpdateNotification,
   type AppUpdateStatePatch,
 } from "./lib/appUpdate";
 import { maybeFireTrialNotifications } from "./lib/trialNotifications";
+import {
+  maybeFireUrgentPricingNotifications,
+  maybeFireUrgentRuntimeNotification,
+} from "./lib/urgentNotifications";
 import {
   describeInvokeError,
   getNextLowerUpgradePlanId,
@@ -304,6 +309,20 @@ function SavingsChartTooltip({
       )}
     </div>
   );
+}
+
+function notificationActionView(action: string | null): TrayView | null {
+  switch (action) {
+    case "signin":
+    case "billing":
+    case "signup":
+      return "upgradeAuth";
+    case "runtime":
+    case "connectors":
+      return "settings";
+    default:
+      return null;
+  }
 }
 
 function delay(ms: number) {
@@ -777,6 +796,26 @@ export default function App() {
       setAuthEmail(pricingStatus.claude.email);
     }
   }, [authEmail, pricingStatus?.claude.email]);
+
+  useEffect(() => {
+    const unlistenPromise = listen<{ action: string | null }>(
+      "notification-clicked",
+      (event) => {
+        const action = event.payload?.action ?? null;
+        if (action === "update") {
+          setShowAppUpdateDialog(true);
+          return;
+        }
+        const view = notificationActionView(action);
+        if (view) {
+          setActiveView(view);
+        }
+      }
+    );
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     setShowAllUpgradePlans(false);
@@ -1739,6 +1778,9 @@ export default function App() {
         ) {
           await sendAppUpdateNotification(patch.availableUpdate.version);
         }
+        if (!windowVisible) {
+          await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
+        }
       }
     } finally {
       setAppUpdateBusy(false);
@@ -1783,6 +1825,7 @@ export default function App() {
     try {
       const runtime = await invoke<RuntimeStatus>("get_runtime_status");
       setRuntimeStatus(runtime);
+      void maybeFireUrgentRuntimeNotification(runtime);
     } catch (error) {
       setConnectorsError(
         error instanceof Error ? error.message : "Could not load runtime status."
@@ -1800,6 +1843,7 @@ export default function App() {
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
       setPricingStatus(status);
       void maybeFireTrialNotifications(status);
+      void maybeFireUrgentPricingNotifications(status);
       setPricingError(null);
     } catch (error) {
       setPricingError(

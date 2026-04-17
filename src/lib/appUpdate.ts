@@ -115,6 +115,41 @@ export async function sendAppUpdateNotification(
   }
 }
 
+const STALE_UPDATE_NOTIFIED_KEY = "headroom_stale_update_notified_version";
+const STALE_UPDATE_THRESHOLD_DAYS = 5;
+
+// Fire a nag notification when an available update has been published
+// for at least 5 days and the user hasn't installed it. Deduped per version.
+export async function maybeFireStaleAppUpdateNotification(
+  availableUpdate: AvailableAppUpdate | null,
+  invokeFn: AppUpdateInvoker = invoke
+): Promise<void> {
+  if (!availableUpdate?.publishedAt) return;
+
+  const publishedMs = Date.parse(availableUpdate.publishedAt);
+  if (Number.isNaN(publishedMs)) return;
+
+  const ageDays = (Date.now() - publishedMs) / (24 * 60 * 60 * 1000);
+  if (ageDays < STALE_UPDATE_THRESHOLD_DAYS) return;
+
+  if (localStorage.getItem(STALE_UPDATE_NOTIFIED_KEY) === availableUpdate.version) {
+    return;
+  }
+
+  try {
+    await invokeFn("show_notification", {
+      title: "Headroom update waiting",
+      body: `Headroom ${availableUpdate.version} has been out for ${Math.floor(
+        ageDays
+      )} days. Open Headroom to install it.`,
+      action: "update",
+    });
+    localStorage.setItem(STALE_UPDATE_NOTIFIED_KEY, availableUpdate.version);
+  } catch {
+    // best-effort
+  }
+}
+
 export function getAppUpdateInstallStatusCopy(
   availableUpdate: AvailableAppUpdate | null
 ): string | null {

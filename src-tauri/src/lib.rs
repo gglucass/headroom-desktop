@@ -286,8 +286,8 @@ fn restart_app(app: AppHandle) {
 }
 
 #[tauri::command]
-fn show_app_update_notification(version: String) -> Result<(), String> {
-    show_app_update_notification_impl(&version)
+fn show_app_update_notification(app: AppHandle, version: String) -> Result<(), String> {
+    show_app_update_notification_impl(&app, &version)
 }
 
 fn app_update_notification_body(version: &str) -> String {
@@ -301,60 +301,76 @@ fn app_update_notification_body(version: &str) -> String {
     format!("{lead} Open Headroom to review the release and install it.")
 }
 
-#[cfg(target_os = "macos")]
-fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
-    let title = "Headroom Update Available";
+fn show_app_update_notification_impl(app: &AppHandle, version: &str) -> Result<(), String> {
     let body = app_update_notification_body(version);
-    let title_json = serde_json::to_string(title).map_err(|err| err.to_string())?;
-    let body_json = serde_json::to_string(&body).map_err(|err| err.to_string())?;
-    let script = format!(
-        "const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification({body_json}, {{ withTitle: {title_json} }});"
-    );
-
-    let status = Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", &script])
-        .status()
-        .map_err(|err| format!("Could not show update notification: {err}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Update notification helper exited with {status}."))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn show_app_update_notification_impl(version: &str) -> Result<(), String> {
-    let _ = app_update_notification_body(version);
-    Ok(())
+    show_notification_impl(app, "Headroom Update Available", &body, Some("update".into()))
 }
 
 #[tauri::command]
-fn show_notification(title: String, body: String) -> Result<(), String> {
-    show_notification_impl(&title, &body)
+fn show_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+    action: Option<String>,
+) -> Result<(), String> {
+    show_notification_impl(&app, &title, &body, action)
 }
 
 #[cfg(target_os = "macos")]
-fn show_notification_impl(title: &str, body: &str) -> Result<(), String> {
-    let title_json = serde_json::to_string(title).map_err(|e| e.to_string())?;
-    let body_json = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    let script = format!(
-        "const app = Application.currentApplication(); app.includeStandardAdditions = true; app.displayNotification({body_json}, {{ withTitle: {title_json} }});"
-    );
-    let status = Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", &script])
-        .status()
-        .map_err(|e| format!("Could not show notification: {e}"))?;
-    if status.success() {
-        Ok(())
+fn show_notification_impl(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    action: Option<String>,
+) -> Result<(), String> {
+    let app_handle = app.clone();
+    let title = title.to_string();
+    let body = body.to_string();
+    let identifier = if tauri::is_dev() {
+        "com.apple.Terminal".to_string()
     } else {
-        Err(format!("Notification helper exited with {status}."))
-    }
+        app.config().identifier.clone()
+    };
+
+    std::thread::spawn(move || {
+        // set_application is guarded by a Once internally, so repeat calls are cheap.
+        let _ = mac_notification_sys::set_application(&identifier);
+        let response = mac_notification_sys::Notification::new()
+            .title(&title)
+            .message(&body)
+            .wait_for_click(true)
+            .send();
+        let clicked = matches!(
+            response,
+            Ok(mac_notification_sys::NotificationResponse::Click)
+                | Ok(mac_notification_sys::NotificationResponse::ActionButton(_))
+                | Ok(mac_notification_sys::NotificationResponse::Reply(_))
+        );
+        if clicked {
+            let _ = show_main_window(&app_handle, None);
+            let _ = app_handle.emit(
+                "notification-clicked",
+                json!({ "action": action }),
+            );
+        }
+    });
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn show_notification_impl(_title: &str, _body: &str) -> Result<(), String> {
-    Ok(())
+fn show_notification_impl(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    _action: Option<String>,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| format!("Could not show notification: {e}"))
 }
 
 #[tauri::command]
@@ -1154,7 +1170,8 @@ pub fn run() {
                 .args([AUTOSTART_LAUNCH_ARG])
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init());
 
     builder
         .setup(|app| {
@@ -1950,6 +1967,7 @@ enum TrayRuntimeVisual {
     Off,
     Booting,
     Running,
+    Disconnected,
 }
 
 struct TrayRuntimeIcons {
@@ -1972,13 +1990,25 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
+        let mut connector_check_counter: u32 = 0;
+        let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled();
 
         loop {
+            // Re-check the Claude connector every ~2s (every 8 ticks at 260ms).
+            if connector_check_counter % 8 == 0 {
+                cached_connector_enabled = client_adapters::is_claude_code_enabled();
+            }
+            connector_check_counter = connector_check_counter.wrapping_add(1);
+
             let visual = {
                 let state: tauri::State<'_, AppState> = app.state();
                 let runtime = state.runtime_status();
                 if runtime.running {
-                    TrayRuntimeVisual::Running
+                    if cached_connector_enabled {
+                        TrayRuntimeVisual::Running
+                    } else {
+                        TrayRuntimeVisual::Disconnected
+                    }
                 } else if runtime.starting {
                     TrayRuntimeVisual::Booting
                 } else {
@@ -2018,6 +2048,23 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         if last_non_booting != Some(TrayRuntimeVisual::Off) {
                             let _ = tray.set_icon(Some(icons.off.clone()));
                             last_non_booting = Some(TrayRuntimeVisual::Off);
+                        }
+                    }
+                    TrayRuntimeVisual::Disconnected => {
+                        if last_non_booting != Some(TrayRuntimeVisual::Disconnected) {
+                            let _ = tray.set_icon(Some(icons.off.clone()));
+                            // Only notify when transitioning from a healthy running
+                            // state — not on first boot or from other non-running states.
+                            if last_non_booting == Some(TrayRuntimeVisual::Running) {
+                                let _ = show_notification_impl(
+                                    &app,
+                                    "Headroom",
+                                    "Claude Code is disconnected — open Headroom to re-enable.",
+                                    Some("connectors".into()),
+                                );
+                            }
+                            last_non_booting = Some(TrayRuntimeVisual::Disconnected);
+                            last_displayed_dollars = None;
                         }
                     }
                 }
