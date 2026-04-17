@@ -31,6 +31,7 @@ pub struct AppState {
     pub headroom_process: Mutex<Option<Child>>,
     pub runtime_paused: Mutex<bool>,
     pub runtime_starting: Mutex<bool>,
+    pub last_startup_error: Mutex<Option<String>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
     /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
@@ -78,6 +79,7 @@ impl AppState {
             headroom_process: Mutex::new(None),
             runtime_paused: Mutex::new(false),
             runtime_starting: Mutex::new(false),
+            last_startup_error: Mutex::new(None),
             bootstrap_progress: Mutex::new(BootstrapProgress {
                 running: false,
                 complete: false,
@@ -696,6 +698,7 @@ impl AppState {
         // If the proxy is already live (e.g. started externally or detached),
         // treat runtime as healthy without forcing a second launcher.
         if is_headroom_proxy_reachable() {
+            *self.last_startup_error.lock() = None;
             return Ok(());
         }
 
@@ -722,9 +725,13 @@ impl AppState {
         match started {
             Ok(child) => {
                 *self.headroom_process.lock() = Some(child);
+                *self.last_startup_error.lock() = None;
                 Ok(())
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                *self.last_startup_error.lock() = Some(format!("{err:#}"));
+                Err(err)
+            }
         }
     }
 
@@ -768,6 +775,8 @@ impl AppState {
 
         let effective_running = installed && !paused && proxy_reachable;
 
+        let startup_error = self.last_startup_error.lock().clone();
+
         RuntimeStatus {
             platform: platform.into(),
             support_tier: support_tier.into(),
@@ -783,6 +792,7 @@ impl AppState {
             kompress_enabled,
             headroom_learn_supported: headroom_learn_disabled_reason.is_none(),
             headroom_learn_disabled_reason,
+            startup_error,
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
                 version: rtk_version,

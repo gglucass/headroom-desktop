@@ -159,6 +159,7 @@ export interface RuntimeStatus {
   kompressEnabled?: boolean | null;
   headroomLearnSupported: boolean;
   headroomLearnDisabledReason?: string | null;
+  startupError?: string | null;
   rtk: {
     installed: boolean;
     version?: string | null;

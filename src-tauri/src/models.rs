@@ -232,6 +232,7 @@ pub struct RuntimeStatus {
     pub kompress_enabled: Option<bool>,
     pub headroom_learn_supported: bool,
     pub headroom_learn_disabled_reason: Option<String>,
+    pub startup_error: Option<String>,
     pub rtk: RtkRuntimeStatus,
 }
 

@@ -2880,7 +2880,7 @@ export default function App() {
     runtimeIssues.push("runtime not installed");
   }
   if (runtimeStatus?.running === false) {
-    runtimeIssues.push("runtime offline");
+    runtimeIssues.push(runtimeStatus.startupError ?? "runtime offline");
   }
   if (runtimeStatus?.proxyReachable === false) {
     runtimeIssues.push("proxy unreachable");
