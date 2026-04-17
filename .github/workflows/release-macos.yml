@@ -144,10 +144,16 @@ jobs:
           validated=false
           while IFS= read -r rc_tag; do
             [[ -z "$rc_tag" ]] && continue
-            rc_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${rc_tag}" --jq '.object.sha')"
-            # If the tag is annotated, resolve it to the underlying commit. For
-            # lightweight tags the second call 404s and we keep the commit SHA.
-            rc_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${rc_sha}" --jq '.object.sha' 2>/dev/null || echo "$rc_sha")"
+            rc_ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${rc_tag}")"
+            rc_sha="$(jq -r '.object.sha' <<< "$rc_ref_json")"
+            rc_type="$(jq -r '.object.type' <<< "$rc_ref_json")"
+            # Annotated tags need a second lookup to get the commit SHA.
+            # Lightweight tags already point directly at the commit.
+            if [[ "$rc_type" == "tag" ]]; then
+              rc_commit_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${rc_sha}" --jq '.object.sha')"
+            else
+              rc_commit_sha="$rc_sha"
+            fi
             # Ask GitHub whether this rc commit is an ancestor of GITHUB_SHA.
             # behind_by == 0 means GITHUB_SHA contains rc_commit_sha in its history.
             # We query the API instead of `git merge-base --is-ancestor` because
