@@ -244,6 +244,7 @@ export interface ClaudeAccountProfile {
   weeklyUtilizationPct?: number | null;
   fiveHourUtilizationPct?: number | null;
   extraUsageMonthlyLimit?: number | null;
+  profileFetchError?: string | null;
 }
 
 export interface HeadroomAccountProfile {

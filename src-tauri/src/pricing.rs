@@ -625,10 +625,14 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile 
             weekly_utilization_pct: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
+            profile_fetch_error: None,
         };
     };
 
-    let profile = fetch_oauth_profile(&token).ok();
+    let (profile, profile_fetch_error) = match fetch_oauth_profile(&token) {
+        Ok(p) => (Some(p), None),
+        Err(msg) => (None, Some(msg)),
+    };
     let usage = fetch_claude_usage(state).ok();
 
     let (plan_tier, plan_detection_source) = if let Some(ref p) = profile {
@@ -671,6 +675,7 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile 
         extra_usage_monthly_limit: usage
             .as_ref()
             .and_then(|u| u.extra_usage.as_ref().and_then(|e| e.monthly_limit)),
+        profile_fetch_error,
     }
 }
 
@@ -681,27 +686,53 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, String> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Content-Type", "application/json")
         .send()
-        .map_err(|err| format!("Could not fetch Claude OAuth profile: {err}"))?;
+        .map_err(|_| {
+            "Couldn't reach Anthropic to refresh your Claude plan. Check your internet connection \
+             and we'll try again shortly."
+                .to_string()
+        })?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let msg = format!("Could not fetch Claude OAuth profile (status {status}).");
+        let user_msg = if status >= 500 {
+            format!(
+                "Anthropic is having trouble serving your Claude plan right now (HTTP {status}). \
+                 We'll keep trying."
+            )
+        } else if status == 401 || status == 403 {
+            "Anthropic rejected our request for your Claude plan. Try signing out of Claude Code \
+             and back in."
+                .to_string()
+        } else {
+            format!(
+                "Anthropic returned an unexpected response for your Claude plan (HTTP {status}). \
+                 We'll try again shortly."
+            )
+        };
         if status >= 500 {
-            sentry::capture_message(&msg, sentry::Level::Error);
+            sentry::capture_message(
+                &format!("Could not fetch Claude OAuth profile (status {status})."),
+                sentry::Level::Error,
+            );
         }
-        return Err(msg);
+        return Err(user_msg);
     }
 
-    let body: serde_json::Value = response
-        .json()
-        .map_err(|err| {
-            let msg = format!("Could not parse Claude OAuth profile: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
-            msg
-        })?;
+    let body: serde_json::Value = response.json().map_err(|err| {
+        sentry::capture_message(
+            &format!("Could not parse Claude OAuth profile: {err}"),
+            sentry::Level::Error,
+        );
+        "We couldn't read the response from Anthropic for your Claude plan. Please report this if \
+         it keeps happening."
+            .to_string()
+    })?;
 
-    parse_oauth_profile_value(&body)
-        .ok_or_else(|| "Claude OAuth profile response was missing account details.".to_string())
+    parse_oauth_profile_value(&body).ok_or_else(|| {
+        "Anthropic's response didn't include your Claude account details. Please report this if \
+         it keeps happening."
+            .to_string()
+    })
 }
 
 fn parse_oauth_profile_value(value: &serde_json::Value) -> Option<ClaudeOauthProfile> {
@@ -1190,6 +1221,7 @@ mod tests {
             weekly_utilization_pct: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
+            profile_fetch_error: None,
         }
     }
 

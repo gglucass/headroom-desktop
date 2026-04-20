@@ -2800,7 +2800,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 
 fn is_headroom_proxy_reachable() -> bool {
     let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1500))
         .build()
     {
         Ok(client) => client,

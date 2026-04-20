@@ -382,6 +382,7 @@ pub struct ClaudeAccountProfile {
     pub weekly_utilization_pct: Option<f64>,
     pub five_hour_utilization_pct: Option<f64>,
     pub extra_usage_monthly_limit: Option<f64>,
+    pub profile_fetch_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

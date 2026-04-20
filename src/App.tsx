@@ -3983,6 +3983,11 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                {pricingStatus?.claude?.profileFetchError ? (
+                  <p className="settings-account-notice">
+                    {pricingStatus.claude.profileFetchError}
+                  </p>
+                ) : null}
               </article>
 
               <article className="soft-card panel-card">
@@ -4227,7 +4232,7 @@ export default function App() {
                   </div>
                   <div>
                     <p className="connector-item__reason">
-                      Turn this on to launch Headroom automatically whenever you restart your computer.
+                      Automatically launch Headroom whenever you login or restart.
                     </p>
                   </div>
                   <div className="connector-item__controls">

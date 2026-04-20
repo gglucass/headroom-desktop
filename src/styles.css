@@ -2540,6 +2540,17 @@ details[open] .optimize-minimal__details summary::after {
   color: #6a615a;
 }
 
+.settings-account-notice {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: #fff4e5;
+  border: 1px solid #f2d3a7;
+  border-radius: 8px;
+  color: #6a4a1f;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
 .contact-link {
   display: block;
   text-align: center;
