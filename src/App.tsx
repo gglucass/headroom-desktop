@@ -2485,7 +2485,7 @@ export default function App() {
             </p>
           </article>
           <article>
-            <strong>Fewer tokens, no impact</strong>
+            <strong>Less tokens, no impact</strong>
             <p>
               Smart optimization cuts noise before Claude Code sees it, with
               no impact on the output.
@@ -4223,7 +4223,7 @@ export default function App() {
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
-                    <h3>Open Headroom on login</h3>
+                    <h3>Open on login</h3>
                   </div>
                   <div>
                     <p className="connector-item__reason">

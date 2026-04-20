@@ -41,6 +41,25 @@ Headroom sits in your menu bar and does three things:
 
 The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fetched on first launch and kept in `~/Library/Application Support/Headroom`.
 
+## What Headroom changes on your system
+
+Full disclosure of every location Headroom writes to, so you can decide before installing. The install screen in the app shows the same list, and the uninstall flow reverses every item.
+
+**On install:**
+
+- Downloads a self-contained Python runtime (~2 GB) to `~/.headroom`. Your system Python is untouched.
+- Adds a `PreToolUse` hook to `~/.claude/settings.json` and a script at `~/.claude/hooks/headroom-rtk-rewrite.sh` so Claude Code routes through Headroom. A timestamped backup of `settings.json` is written before any edit.
+- Creates `~/Library/Application Support/Headroom` for logs, caches, and per-client setup state.
+- Stores your Headroom session token (and any API keys you enter) in the macOS Keychain under services prefixed `com.extraheadroom.headroom`.
+- If you opt into "launch at login," installs a LaunchAgent plist at `~/Library/LaunchAgents/`. Never added otherwise.
+- Adds a managed block to your shell profile (`.zshrc`, `.zprofile`, etc.) that prepends `~/.headroom/bin` to `PATH` so `rtk` is available in your terminals. Every managed block is fenced with `# >>> headroom:... >>>` markers and can be removed by hand if you prefer.
+
+**On quit (or pause):** Headroom tears down everything that would intercept Claude Code — the hook entry, the hook script, the `ANTHROPIC_BASE_URL` redirect, and the managed shell blocks. Claude Code behaves exactly as it did before Headroom was launched. The Python runtime, logs, and keychain entries stay on disk so the next launch is fast.
+
+**On uninstall (Settings → Uninstall Headroom):** Everything listed above is removed, including the LaunchAgent plist, `~/Library/Preferences/com.extraheadroom.headroom*`, `~/Library/Caches/com.extraheadroom.headroom`, and the keychain entries. The uninstall dialog in the app shows the full list before you confirm.
+
+If the proxy dies unexpectedly, a watchdog restarts it; after repeated failures it auto-pauses and strips interception so Claude Code keeps working without intervention.
+
 ## Bundled tools
 
 | Tool | What it does | Default |
@@ -159,14 +178,12 @@ For the live auth and pricing flow, create a `.env`:
 ```bash
 HEADROOM_ACCOUNT_API_BASE_URL="https://extraheadroom.com/api/v1"
 HEADROOM_APTABASE_APP_KEY="REPLACE_WITH_APTABASE_APP_KEY"
-VITE_HEADROOM_POLAR_PRO_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-pro-product"
-VITE_HEADROOM_POLAR_MAX5X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max5x-product"
-VITE_HEADROOM_POLAR_MAX20X_CHECKOUT_URL="https://polar.sh/your-organization/checkout?products=your-max20x-product"
+VITE_SENTRY_DSN="REPLACE_WITH_SENTRY_DSN"
 VITE_HEADROOM_SALES_CONTACT_URL="mailto:hello@extraheadroom.com"
 VITE_HEADROOM_CONTACT_FORM_URL="https://extraheadroom.com/contact_request"
 ```
 
-Set the same keys as GitHub Actions repository variables for production DMG builds.
+See [`.env.example`](.env.example) for the complete list, including the optional updater and macOS signing keys used for release builds. Set the same keys as GitHub Actions repository variables for production DMG builds.
 
 Run tests:
 
@@ -177,10 +194,14 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 
 ## Dependency pinning
 
-`headroom-ai` auto-upgrades to the latest `0.5.X` release on startup. The upgrade logic is in `src-tauri/src/tool_manager.rs` and is controlled by three constants:
+`headroom-ai` is installed from a specific pinned wheel on first run. Automatic upgrades are disabled — the app ships with one known-good version and only changes what it installs when the release artifact itself is updated.
 
-- `HEADROOM_MIN_VERSION` - floor version; upgrades to this version (or above) are applied immediately regardless of age. Bump this when a specific release must ship to all users right away.
-- `HEADROOM_SERIES` - the major.minor series to track (e.g. `"0.5"`). Update this when moving to a new minor series.
-- `HEADROOM_UPGRADE_HOLD_DAYS` - new releases younger than this (default: 7 days) are skipped unless they are at or above `HEADROOM_MIN_VERSION`.
+Three constants in [`src-tauri/src/tool_manager.rs`](src-tauri/src/tool_manager.rs) control the pin:
 
-The app queries `https://pypi.org/pypi/headroom-ai/json` at launch, picks the highest eligible release, verifies its sha256 (from PyPI metadata), and installs it if newer than what is installed. If PyPI is unreachable the existing install is left untouched.
+- `HEADROOM_PINNED_VERSION` — the version string (e.g. `"0.6.5"`). Must match the wheel URL.
+- `HEADROOM_PINNED_WHEEL_URL` — the exact PyPI wheel URL to download.
+- `HEADROOM_PINNED_SHA256` — the wheel's SHA-256, verified after download.
+
+To bump `headroom-ai`: update all three constants together, run the build, and ship a new desktop release. Users pick up the new Python dependency as part of the desktop update flow — there is no separate PyPI check or background upgrade path.
+
+Other bundled components (`rtk`, the Python standalone runtime, the vendor wheels index) are pinned the same way — one version, one checksum, per platform.
