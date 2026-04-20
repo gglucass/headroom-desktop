@@ -29,6 +29,7 @@ pub struct AppState {
     pub tool_manager: ToolManager,
     pub recent_usage: Mutex<Vec<UsageEvent>>,
     pub headroom_process: Mutex<Option<Child>>,
+    lifecycle_lock: Mutex<()>,
     pub runtime_paused: Mutex<bool>,
     pub runtime_starting: Mutex<bool>,
     pub last_startup_error: Mutex<Option<String>>,
@@ -77,6 +78,7 @@ impl AppState {
             tool_manager,
             recent_usage: Mutex::new(Vec::new()),
             headroom_process: Mutex::new(None),
+            lifecycle_lock: Mutex::new(()),
             runtime_paused: Mutex::new(false),
             runtime_starting: Mutex::new(false),
             last_startup_error: Mutex::new(None),
@@ -695,6 +697,23 @@ impl AppState {
             return Ok(());
         }
 
+        // Serialize lifecycle transitions so launch warm-up, tray open, and the
+        // watchdog cannot race into concurrent proxy spawns before port 6768 is
+        // reachable and `headroom_process` has been recorded.
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+
+        // Another caller may have brought the runtime up while we waited.
+        if !self.tool_manager.python_runtime_installed() {
+            return Ok(());
+        }
+        if !self.pricing_allows_optimization() {
+            self.enforce_pricing_gate();
+            return Ok(());
+        }
+        if self.runtime_is_paused() {
+            return Ok(());
+        }
+
         // If the proxy is already live (e.g. started externally or detached),
         // treat runtime as healthy without forcing a second launcher.
         if is_headroom_proxy_reachable() {
@@ -845,6 +864,7 @@ impl AppState {
     }
 
     pub fn stop_headroom(&self) {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
         self.set_runtime_starting(false);
         let mut process = self
             .headroom_process

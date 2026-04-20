@@ -1982,6 +1982,30 @@ struct TrayRuntimeIcons {
     booting_frames: Vec<tauri::image::Image<'static>>,
 }
 
+fn debounced_tray_runtime_visual(
+    raw_visual: TrayRuntimeVisual,
+    last_non_booting: Option<TrayRuntimeVisual>,
+    unhealthy_streak: &mut u8,
+) -> TrayRuntimeVisual {
+    const UNHEALTHY_DEBOUNCE_TICKS: u8 = 8;
+
+    if raw_visual == TrayRuntimeVisual::Unhealthy {
+        *unhealthy_streak = unhealthy_streak.saturating_add(1);
+        if *unhealthy_streak < UNHEALTHY_DEBOUNCE_TICKS {
+            if matches!(
+                last_non_booting,
+                Some(TrayRuntimeVisual::Running) | Some(TrayRuntimeVisual::Disconnected)
+            ) {
+                return last_non_booting.expect("checked Some above");
+            }
+        }
+        return TrayRuntimeVisual::Unhealthy;
+    }
+
+    *unhealthy_streak = 0;
+    raw_visual
+}
+
 fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     let icons = match build_tray_runtime_icons() {
         Ok(icons) => icons,
@@ -1996,6 +2020,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
         let mut last_tooltip: Option<String> = None;
+        let mut unhealthy_streak: u8 = 0;
         let mut connector_check_counter: u32 = 0;
         let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled();
 
@@ -2006,7 +2031,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             }
             connector_check_counter = connector_check_counter.wrapping_add(1);
 
-            let visual = {
+            let raw_visual = {
                 let state: tauri::State<'_, AppState> = app.state();
                 let runtime = state.runtime_status();
                 if runtime.running {
@@ -2028,6 +2053,11 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Off
                 }
             };
+            let visual = debounced_tray_runtime_visual(
+                raw_visual,
+                last_non_booting,
+                &mut unhealthy_streak,
+            );
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
                 let tooltip = match visual {
@@ -2656,11 +2686,12 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
-        compute_tray_window_position, install_pending_update, is_prerelease_version,
-        lifetime_token_milestone_kind,
+        compute_tray_window_position, debounced_tray_runtime_visual, install_pending_update,
+        is_prerelease_version, lifetime_token_milestone_kind,
         parse_updater_endpoint_list, physical_rect_from_rect, store_checked_update,
         AvailableAppUpdate, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
-        PhysicalRect, QuitSource, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use serde_json::json;
     use parking_lot::Mutex;
@@ -2706,6 +2737,54 @@ mod tests {
                 "runtime_paused": true,
             })
         );
+    }
+
+    #[test]
+    fn tray_visual_keeps_running_during_brief_unhealthy_probe_blips() {
+        let mut unhealthy_streak = 0;
+
+        for _ in 0..7 {
+            assert_eq!(
+                debounced_tray_runtime_visual(
+                    TrayRuntimeVisual::Unhealthy,
+                    Some(TrayRuntimeVisual::Running),
+                    &mut unhealthy_streak,
+                ),
+                TrayRuntimeVisual::Running
+            );
+        }
+
+        assert_eq!(
+            debounced_tray_runtime_visual(
+                TrayRuntimeVisual::Unhealthy,
+                Some(TrayRuntimeVisual::Running),
+                &mut unhealthy_streak,
+            ),
+            TrayRuntimeVisual::Unhealthy
+        );
+    }
+
+    #[test]
+    fn tray_visual_resets_unhealthy_streak_after_recovery() {
+        let mut unhealthy_streak = 0;
+
+        assert_eq!(
+            debounced_tray_runtime_visual(
+                TrayRuntimeVisual::Unhealthy,
+                Some(TrayRuntimeVisual::Running),
+                &mut unhealthy_streak,
+            ),
+            TrayRuntimeVisual::Running
+        );
+        assert_eq!(
+            debounced_tray_runtime_visual(
+                TrayRuntimeVisual::Running,
+                Some(TrayRuntimeVisual::Running),
+                &mut unhealthy_streak,
+            ),
+            TrayRuntimeVisual::Running
+        );
+        assert_eq!(unhealthy_streak, 0);
     }
 
     #[test]
