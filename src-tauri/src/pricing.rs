@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::device;
 use crate::keychain;
 use crate::models::{
     BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage,
@@ -28,6 +29,67 @@ const AUTH_CODE_EXPIRY_SECONDS: u64 = 900;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalPricingState {
     first_seen_at: DateTime<Utc>,
+    #[serde(default)]
+    reconcile_with_server: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityPayload {
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chopratejas_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_account_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_email: Option<String>,
+}
+
+impl IdentityPayload {
+    fn for_state(state: &AppState) -> Self {
+        let claude = state.cached_claude_profile();
+        Self::build(Some(&claude))
+    }
+
+    fn device_only() -> Self {
+        Self::build(None)
+    }
+
+    fn build(claude: Option<&ClaudeAccountProfile>) -> Self {
+        let device = device::current();
+        Self {
+            device_id: device.machine_id_digest,
+            chopratejas_instance_id: device.chopratejas_instance_id,
+            claude_account_uuid: claude.and_then(|p| p.account_uuid.clone()),
+            claude_email: claude.and_then(|p| p.email.clone()),
+        }
+    }
+
+    fn apply_headers(&self, mut builder: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        builder = builder.header("X-Headroom-Device-Id", &self.device_id);
+        if let Some(value) = self.chopratejas_instance_id.as_deref() {
+            builder = builder.header("X-Headroom-Chopratejas-Id", value);
+        }
+        if let Some(value) = self.claude_account_uuid.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Uuid", value);
+        }
+        if let Some(value) = self.claude_email.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Email", value);
+        }
+        builder
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraceResponse {
+    first_seen_at: DateTime<Utc>,
+    #[allow(dead_code)]
+    grace_ends_at: Option<DateTime<Utc>>,
+    #[allow(dead_code)]
+    trial_started_at: Option<DateTime<Utc>>,
+    #[allow(dead_code)]
+    trial_ends_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +172,8 @@ struct RequestCodeResponse {
 #[serde(rename_all = "camelCase")]
 struct RequestCodePayload<'a> {
     email: &'a str,
+    #[serde(flatten)]
+    identity: IdentityPayload,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +182,8 @@ struct VerifyCodePayload<'a> {
     email: &'a str,
     code: &'a str,
     invite_code: Option<&'a str>,
+    #[serde(flatten)]
+    identity: IdentityPayload,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,13 +217,14 @@ enum RemoteAccountSyncError {
 }
 
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
-    let local_state = load_or_initialize_local_state()?;
+    let local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
     let session_token = read_session_token()?;
+    let identity = IdentityPayload::for_state(state);
     let (authenticated, account, account_sync_error, launch_discount_active) =
         if let Some(token) = session_token.as_deref() {
-            let envelope_result = fetch_remote_account(token);
+            let envelope_result = fetch_remote_account(token, &identity);
             let launch_discount_active = envelope_result
                 .as_ref()
                 .map(|e| e.launch_discount_active)
@@ -186,7 +253,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     ))
 }
 
-pub fn request_auth_code(email: &str) -> Result<HeadroomAuthCodeRequest, String> {
+pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCodeRequest, String> {
     let trimmed = email.trim().to_ascii_lowercase();
     if trimmed.is_empty() || !trimmed.contains('@') {
         return Err("Enter a valid email address.".into());
@@ -194,7 +261,10 @@ pub fn request_auth_code(email: &str) -> Result<HeadroomAuthCodeRequest, String>
 
     let response = http_client()?
         .post(api_url("desktop/auth/request_code"))
-        .json(&RequestCodePayload { email: &trimmed })
+        .json(&RequestCodePayload {
+            email: &trimmed,
+            identity: IdentityPayload::for_state(state),
+        })
         .send()
         .map_err(|err| {
             let msg = format!("Could not request sign-in code: {err}");
@@ -246,6 +316,7 @@ pub fn verify_auth_code(
             email: &trimmed_email,
             code: trimmed_code,
             invite_code: invite_code.map(str::trim).filter(|value| !value.is_empty()),
+            identity: IdentityPayload::for_state(state),
         })
         .send()
         .map_err(|err| format!("Could not verify sign-in code: {err}"))?;
@@ -263,7 +334,7 @@ pub fn verify_auth_code(
 
     write_session_token(&body.session_token)?;
 
-    let local_state = load_or_initialize_local_state()?;
+    let local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
 
@@ -289,9 +360,12 @@ pub fn activate_account(
 ) -> Result<HeadroomPricingStatus, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before activating desktop access.".to_string())?;
-    let response = http_client()?
+    let identity = IdentityPayload::for_state(state);
+    let builder = http_client()?
         .post(api_url("desktop/account/activate"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {token}"));
+    let response = identity
+        .apply_headers(builder)
         .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
         .send()
         .map_err(|err| {
@@ -321,7 +395,7 @@ pub fn activate_account(
             sentry::capture_message(&msg, sentry::Level::Error);
             msg
         })?;
-    let local_state = load_or_initialize_local_state()?;
+    let local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
 
@@ -349,9 +423,12 @@ pub fn report_milestone(milestone_tokens_saved: u64) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let _ = client
+    let identity = IdentityPayload::device_only();
+    let builder = client
         .post(api_url("desktop/milestones"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {token}"));
+    let _ = identity
+        .apply_headers(builder)
         .json(&serde_json::json!({ "milestone_tokens_saved": milestone_tokens_saved }))
         .send();
 }
@@ -925,7 +1002,14 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
 
     let state = LocalPricingState {
         first_seen_at: Utc::now(),
+        reconcile_with_server: true,
     };
+    write_local_state(&state)?;
+    Ok(state)
+}
+
+fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
+    let path = local_state_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -936,11 +1020,59 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     }
     std::fs::write(
         &path,
-        serde_json::to_vec_pretty(&state)
+        serde_json::to_vec_pretty(state)
             .map_err(|err| format!("Failed to serialize pricing state: {err}"))?,
     )
-    .map_err(|err| format!("Failed to write pricing state {}: {err}", path.display()))?;
-    Ok(state)
+    .map_err(|err| format!("Failed to write pricing state {}: {err}", path.display()))
+}
+
+fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingState, String> {
+    let mut local = load_or_initialize_local_state()?;
+    let identity = IdentityPayload::for_state(state);
+    match fetch_grace_start(&identity) {
+        Ok(response) => {
+            let server_first_seen = response.first_seen_at;
+            let new_first_seen = if local.reconcile_with_server {
+                server_first_seen.min(local.first_seen_at)
+            } else {
+                server_first_seen
+            };
+            if new_first_seen != local.first_seen_at || local.reconcile_with_server {
+                local.first_seen_at = new_first_seen;
+                local.reconcile_with_server = false;
+                if let Err(err) = write_local_state(&local) {
+                    sentry::capture_message(
+                        &format!("Could not persist reconciled grace state: {err}"),
+                        sentry::Level::Warning,
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            // Server unreachable; keep whatever we have locally. reconcile_with_server
+            // stays set if this is a fresh install so the next successful call wins.
+        }
+    }
+    Ok(local)
+}
+
+fn fetch_grace_start(identity: &IdentityPayload) -> Result<GraceResponse, String> {
+    let response = http_client()?
+        .post(api_url("desktop/grace/start"))
+        .json(identity)
+        .send()
+        .map_err(|err| format!("grace/start request failed: {err}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "grace/start returned {}",
+            response.status().as_u16()
+        ));
+    }
+
+    response
+        .json::<GraceResponse>()
+        .map_err(|err| format!("grace/start parse failed: {err}"))
 }
 
 fn local_state_path() -> PathBuf {
@@ -985,11 +1117,16 @@ fn fetch_public_config() -> Option<PublicConfig> {
     response.json::<PublicConfig>().ok()
 }
 
-fn fetch_remote_account(token: &str) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
-    let response = http_client()
+fn fetch_remote_account(
+    token: &str,
+    identity: &IdentityPayload,
+) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
+    let builder = http_client()
         .map_err(|_| RemoteAccountSyncError::Other)?
         .get(api_url("desktop/account"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {token}"));
+    let response = identity
+        .apply_headers(builder)
         .send()
         .map_err(|_| RemoteAccountSyncError::Other)?;
 
@@ -1085,8 +1222,8 @@ mod tests {
         detect_plan_tier_from_profile, evaluate_pricing_status, merge_background_account_sync,
         pricing_policy_for_plan, remote_account_to_profile, resolve_account_api_base_url,
         ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
-        HeadroomSubscriptionTier, RemoteAccountResponse, RemoteAccountSyncError,
-        DEFAULT_ACCOUNT_API_BASE_URL,
+        HeadroomSubscriptionTier, IdentityPayload, LocalPricingState, RemoteAccountResponse,
+        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
         ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, HeadroomAccountProfile,
@@ -1111,6 +1248,28 @@ mod tests {
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
         }
+    }
+
+    #[test]
+    fn identity_payload_serializes_with_camelcase_keys_and_skips_nulls() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            chopratejas_instance_id: None,
+            claude_account_uuid: Some("claude-uuid".into()),
+            claude_email: None,
+        };
+        let json = serde_json::to_value(&identity).unwrap();
+        assert_eq!(json["deviceId"], "abc123");
+        assert_eq!(json["claudeAccountUuid"], "claude-uuid");
+        assert!(json.get("chopratejasInstanceId").is_none());
+        assert!(json.get("claudeEmail").is_none());
+    }
+
+    #[test]
+    fn local_pricing_state_back_compat_parses_old_payload_without_reconcile_flag() {
+        let raw = r#"{"first_seen_at":"2026-04-10T00:00:00Z"}"#;
+        let state: LocalPricingState = serde_json::from_str(raw).unwrap();
+        assert!(!state.reconcile_with_server);
     }
 
     #[test]

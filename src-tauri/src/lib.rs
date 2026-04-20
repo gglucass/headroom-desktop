@@ -1,6 +1,7 @@
 mod analytics;
 mod bearer;
 mod client_adapters;
+mod device;
 mod insights;
 mod keychain;
 mod models;
@@ -168,29 +169,35 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
 }
 
 #[tauri::command]
-fn get_dashboard_state(app: AppHandle, state: State<'_, AppState>) -> DashboardState {
-    let (dashboard, lifetime_token_milestones) = state.dashboard_with_lifetime_token_milestones();
+async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let (dashboard, lifetime_token_milestones) =
+            state.dashboard_with_lifetime_token_milestones();
 
-    for milestone_tokens_saved in lifetime_token_milestones {
-        analytics::track_event(
-            &app,
-            "lifetime_tokens_saved_milestone_reached",
-            Some(json!({
-                "milestone_tokens_saved": milestone_tokens_saved,
-                "milestone_millions": milestone_tokens_saved / 1_000_000,
-                "milestone_kind": lifetime_token_milestone_kind(milestone_tokens_saved),
-                "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
-                "lifetime_requests": dashboard.lifetime_requests,
-                "launch_count": state.launch_count(),
-                "launch_experience": state.launch_experience_label()
-            })),
-        );
-        pricing::report_milestone(milestone_tokens_saved);
-    }
+        for milestone_tokens_saved in lifetime_token_milestones {
+            analytics::track_event(
+                &app,
+                "lifetime_tokens_saved_milestone_reached",
+                Some(json!({
+                    "milestone_tokens_saved": milestone_tokens_saved,
+                    "milestone_millions": milestone_tokens_saved / 1_000_000,
+                    "milestone_kind": lifetime_token_milestone_kind(milestone_tokens_saved),
+                    "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
+                    "lifetime_requests": dashboard.lifetime_requests,
+                    "launch_count": state.launch_count(),
+                    "launch_experience": state.launch_experience_label()
+                })),
+            );
+            pricing::report_milestone(milestone_tokens_saved);
+        }
 
-    check_zero_spend_anomaly(&dashboard);
+        check_zero_spend_anomaly(&dashboard);
 
-    dashboard
+        dashboard
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -677,9 +684,10 @@ fn get_headroom_pricing_status(
 #[tauri::command]
 fn request_headroom_auth_code(
     app: AppHandle,
+    state: State<'_, AppState>,
     email: String,
 ) -> Result<HeadroomAuthCodeRequest, String> {
-    let request = pricing::request_auth_code(&email)?;
+    let request = pricing::request_auth_code(&state, &email)?;
     analytics::track_event(&app, "auth_code_requested", None);
     Ok(request)
 }
