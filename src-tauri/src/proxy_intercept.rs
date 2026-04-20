@@ -6,6 +6,7 @@
 /// captured into `AppState::claude_bearer_token` so the usage-stats feature
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -16,6 +17,10 @@ use crate::bearer::BearerToken;
 
 pub const INTERCEPT_PORT: u16 = 6767;
 pub const HEADROOM_BACKEND_PORT: u16 = 6768;
+
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
@@ -49,9 +54,18 @@ async fn run(token_slot: SharedToken) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", INTERCEPT_PORT)).await?;
 
     loop {
-        let (client, _) = listener.accept().await?;
-        let slot = token_slot.clone();
-        tokio::spawn(handle(client, slot));
+        match listener.accept().await {
+            Ok((client, _)) => {
+                let slot = token_slot.clone();
+                tokio::spawn(handle(client, slot));
+            }
+            Err(e) => {
+                // EMFILE/ENFILE/ECONNABORTED are transient — log and keep serving
+                // so the proxy self-heals once FDs free up, instead of dying.
+                eprintln!("[proxy_intercept] accept error: {e}");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            }
+        }
     }
 }
 
@@ -60,8 +74,14 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
     // capture the bearer token, and forwarding early avoids deadlocks with
     // `Expect: 100-continue` request flows.
     let mut buf = Vec::with_capacity(4096);
-    if read_http_headers(&mut client, &mut buf).await.is_err() {
-        return;
+    match tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        read_http_headers(&mut client, &mut buf),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        _ => return,
     }
 
     // Scan headers for a Bearer token and capture it.
@@ -108,6 +128,13 @@ where
 
         if find_header_end(buf).is_some() {
             return Ok(());
+        }
+
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headers exceed maximum size",
+            ));
         }
     }
 }
