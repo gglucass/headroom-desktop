@@ -2538,12 +2538,13 @@ export default function App() {
                 <p className="install-disclosure__lead">Clicking Install will:</p>
                 <ul className="install-disclosure__list">
                   <li>
-                    Download a self-contained Python runtime (~2 GB). Your system Python is untouched.
+                    Download a self-contained Python runtime (~2 GB) to <code>~/.headroom</code>.
+                    Your system Python is untouched.
                   </li>
                   <li>
-                    Add a PreToolUse hook to ~/.claude/settings.json and a script at
-                    ~/.claude/hooks/headroom-rtk-rewrite.sh so Claude Code runs through Headroom.
-                    A timestamped backup is written before any edit.
+                    Add a PreToolUse hook to <code>~/.claude/settings.json</code> and a script at{" "}
+                    <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code> so Claude Code runs through
+                    Headroom. A timestamped backup is written before any edit.
                   </li>
                 </ul>
               </div>
@@ -2916,7 +2917,11 @@ export default function App() {
     runtimeIssues.push("runtime not installed");
   }
   if (runtimeStatus?.running === false) {
-    runtimeIssues.push(runtimeStatus.startupError ?? "runtime offline");
+    runtimeIssues.push(
+      runtimeStatus.startupErrorHint ??
+        runtimeStatus.startupError ??
+        "runtime offline"
+    );
   }
   if (runtimeStatus?.proxyReachable === false) {
     runtimeIssues.push("proxy unreachable");
@@ -4218,15 +4223,11 @@ export default function App() {
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
-                    <h3>Startup</h3>
-                  </div>
-                </div>
-                <div className="connector-item">
-                  <div>
                     <h3>Open Headroom on login</h3>
+                  </div>
+                  <div>
                     <p className="connector-item__reason">
-                      Off by default. Turning this on registers Headroom as a macOS login item,
-                      so it's running when you start coding.
+                      Turn this on to launch Headroom automatically whenever you restart your computer.
                     </p>
                   </div>
                   <div className="connector-item__controls">
@@ -4326,11 +4327,13 @@ export default function App() {
                 <h3>Uninstall Headroom?</h3>
                 <p>This will:</p>
                 <ul className="api-key-guide">
-                  <li>Restore <code>~/.claude/settings.json</code> (remove Headroom's hook and env)</li>
+                  <li>Strip Headroom's hook and env from <code>~/.claude/settings.json</code> and <code>settings.local.json</code></li>
                   <li>Delete <code>~/.claude/hooks/headroom-rtk-rewrite.sh</code></li>
-                  <li>Delete <code>~/Library/Application Support/Headroom</code> (Python runtime, logs, caches)</li>
-                  <li>Delete <code>~/.headroom</code> if present</li>
-                  <li>Disable the Headroom login item</li>
+                  <li>Delete <code>~/Library/Application Support/Headroom</code> (logs, caches, setup state)</li>
+                  <li>Delete <code>~/.headroom</code> (Python runtime)</li>
+                  <li>Remove the LaunchAgent plist from <code>~/Library/LaunchAgents/</code> and disable the login item</li>
+                  <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
+                  <li>Delete Headroom's keychain entries (session token and any API keys you entered)</li>
                 </ul>
                 <p>You can reinstall at any time by launching Headroom again.</p>
                 {uninstallError ? (

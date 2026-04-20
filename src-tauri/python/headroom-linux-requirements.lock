@@ -2,19 +2,20 @@
 # This intentionally excludes optional memory/ML extras from headroom-ai[all]
 # because packages such as hnswlib do not ship broadly compatible Linux wheels
 # and cause bootstrap to fail on fresh machines.
-click==8.3.1
-fastapi==0.135.3
+click==8.3.2
+fastapi==0.136.0
 httpx[http2]==0.28.1
 litellm==1.82.3
 magika==1.0.2
 mcp==1.27.0
 onnxruntime==1.24.4
-openai==2.30.0
-pydantic==2.12.5
-rich==14.3.3
+openai==2.32.0
+pydantic==2.13.2
+rich==15.0.0
 sqlite-vec==0.1.9
 tiktoken==0.12.0
-transformers==5.5.0
-uvicorn==0.42.0
+transformers==5.5.4
+uvicorn==0.44.0
+watchdog==6.0.0
 websockets==16.0
 zstandard==0.25.0

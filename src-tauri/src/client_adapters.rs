@@ -313,8 +313,21 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         "claude_code" => {
             let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
             remove_shell_block(&shell_targets, "claude_code")?;
+            // Also drop the managed_rtk PATH block so `rtk` isn't exported from
+            // shell profiles after quit — otherwise the user's next shell still
+            // has Headroom binaries shadowing whatever's on PATH.
+            remove_shell_block(&shell_targets, "managed_rtk")?;
             remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
             let _ = remove_legacy_vscode_base_url_keys()?;
+            // Strip the PreToolUse hook entry and delete the hook script so CC
+            // behaves exactly as it did before Headroom was launched.
+            for settings_path in claude_settings_candidates() {
+                let _ = strip_headroom_hook_from_settings(&settings_path);
+            }
+            let hook_path = headroom_rtk_hook_path();
+            if hook_path.exists() {
+                let _ = std::fs::remove_file(&hook_path);
+            }
         }
         "vscode" => remove_vscode_connector_keys()?,
         other => {
@@ -376,18 +389,35 @@ pub fn clear_client_setups() -> Result<()> {
 }
 
 /// Fully uninstalls Headroom's on-disk footprint on a best-effort basis:
-/// reverses every client setup, removes the managed RTK hook script, and
-/// deletes the Headroom application-support directory along with the
-/// `~/.headroom` directory used by the Python runtime.
+/// reverses every client setup, strips Headroom's hook entry from Claude Code
+/// settings (both `settings.json` and `settings.local.json`), deletes the
+/// managed hook script, the Headroom application-support directory, the
+/// `~/.headroom` Python runtime, the macOS LaunchAgent plist, Preferences,
+/// Caches, and keychain entries.
 ///
 /// Returns the list of paths that were successfully removed (useful for
-/// surfacing to the user) alongside any per-step errors that were ignored.
+/// surfacing to the user). Per-step failures are logged and skipped.
 pub fn perform_full_cleanup() -> Vec<String> {
     let mut removed: Vec<String> = Vec::new();
 
     // Reverse settings.json mutations and shell blocks for every known client.
     if let Err(err) = clear_client_setups() {
         eprintln!("cleanup: clear_client_setups failed: {err}");
+    }
+
+    // Strip the Headroom hook entry from both ~/.claude/settings.json and
+    // ~/.claude/settings.local.json. `clear_client_setups` doesn't do this —
+    // it only removes env keys — so without this step the hook entry remains,
+    // points to a deleted script, and Claude Code logs errors on every call.
+    for settings_path in claude_settings_candidates() {
+        match strip_headroom_hook_from_settings(&settings_path) {
+            Ok(true) => removed.push(settings_path.display().to_string()),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "cleanup: stripping hook from {} failed: {err}",
+                settings_path.display()
+            ),
+        }
     }
 
     let hook_path = headroom_rtk_hook_path();
@@ -423,7 +453,172 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        removed.extend(remove_macos_launch_agents());
+        removed.extend(remove_macos_preferences());
+        removed.extend(remove_macos_caches());
+    }
+
+    remove_known_keychain_entries();
+
     removed
+}
+
+fn claude_settings_candidates() -> Vec<PathBuf> {
+    let claude_dir = home_dir().join(".claude");
+    vec![
+        claude_dir.join("settings.json"),
+        claude_dir.join("settings.local.json"),
+    ]
+}
+
+/// Remove the PreToolUse entry pointing at `headroom-rtk-rewrite.sh`. Drops
+/// the `PreToolUse` array if it becomes empty, and the `hooks` object if it
+/// has no remaining event arrays. Returns true if the file was modified.
+fn strip_headroom_hook_from_settings(settings_path: &Path) -> Result<bool> {
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+
+    let raw = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut root = parse_json_object(&raw, settings_path)?;
+
+    let Some(hooks_val) = root.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let Some(hooks_obj) = hooks_val.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+
+    if let Some(pre_tool_use) = hooks_obj
+        .get_mut("PreToolUse")
+        .and_then(|value| value.as_array_mut())
+    {
+        let before = pre_tool_use.len();
+        pre_tool_use.retain(|entry| !entry_contains_hook(entry, "headroom-rtk-rewrite.sh"));
+        if pre_tool_use.len() != before {
+            changed = true;
+        }
+        if pre_tool_use.is_empty() {
+            hooks_obj.remove("PreToolUse");
+        }
+    }
+
+    if hooks_obj.is_empty() {
+        root.remove("hooks");
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let _ = backup_if_exists(settings_path)?;
+    std::fs::write(
+        settings_path,
+        serde_json::to_vec_pretty(&Value::Object(root))
+            .context("serializing Claude settings for hook cleanup")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))?;
+
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_launch_agents() -> Vec<String> {
+    let mut removed = Vec::new();
+    let launch_agents_dir = home_dir().join("Library").join("LaunchAgents");
+
+    // Bundle-id-style plist (tauri-plugin-autostart default) and the
+    // "Headroom.plist" name some older builds shipped. Either can exist.
+    let candidates = [
+        "com.extraheadroom.headroom.plist",
+        "Headroom.plist",
+    ];
+
+    for name in candidates {
+        let path = launch_agents_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        // Best-effort unload before deletion so launchd forgets the job.
+        let _ = Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&path)
+            .output();
+        match std::fs::remove_file(&path) {
+            Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+        }
+    }
+
+    removed
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_preferences() -> Vec<String> {
+    let mut removed = Vec::new();
+    let prefs_dir = home_dir().join("Library").join("Preferences");
+    let Ok(entries) = std::fs::read_dir(&prefs_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("com.extraheadroom.headroom") {
+            continue;
+        }
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+        }
+    }
+    removed
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_caches() -> Vec<String> {
+    let mut removed = Vec::new();
+    let caches_dir = home_dir()
+        .join("Library")
+        .join("Caches")
+        .join("com.extraheadroom.headroom");
+    if caches_dir.exists() {
+        match std::fs::remove_dir_all(&caches_dir) {
+            Ok(_) => removed.push(caches_dir.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", caches_dir.display()),
+        }
+    }
+    removed
+}
+
+/// Delete every keychain entry Headroom is known to write. Accounts are
+/// captured alongside services because macOS keychain queries require both.
+fn remove_known_keychain_entries() {
+    const ENTRIES: &[(&str, &str)] = &[
+        ("com.extraheadroom.headroom.account", "session-token"),
+        ("com.extraheadroom.headroom.headroom-learn", "openai"),
+        ("com.extraheadroom.headroom.headroom-learn", "anthropic"),
+        ("com.extraheadroom.headroom.headroom-learn", "gemini"),
+    ];
+    for (service, account) in ENTRIES {
+        if let Err(err) = crate::keychain::delete_secret(service, account) {
+            eprintln!("cleanup: deleting keychain {service}/{account} failed: {err}");
+        }
+    }
 }
 
 /// Re-applies setup for all clients that were active at the last pause or quit.
@@ -1488,6 +1683,20 @@ if [ -z "$REWRITTEN" ] || [ "$CMD" = "$REWRITTEN" ]; then
   exit 0
 fi
 
+# Defense-in-depth: if the rewritten command's first token isn't resolvable
+# (e.g. a partial uninstall left `rtk` missing from PATH), fall through to the
+# original command instead of handing Claude Code a command that will fail with
+# "command not found".
+FIRST_TOKEN="${{REWRITTEN%% *}}"
+case "$FIRST_TOKEN" in
+  /*)
+    [ -x "$FIRST_TOKEN" ] || exit 0
+    ;;
+  *)
+    command -v "$FIRST_TOKEN" >/dev/null 2>&1 || exit 0
+    ;;
+esac
+
 HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
 if not isinstance(tool_input, dict):
     sys.exit(0)
@@ -1722,8 +1931,9 @@ mod tests {
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
         remove_managed_block, serialize_paths, shell_block_contains_in_files,
-        shell_block_contains_text_in_files, shell_double_quote, upsert_managed_block,
-        write_file_if_changed, ClientSetupState, ShellFamily,
+        shell_block_contains_text_in_files, shell_double_quote,
+        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
+        ClientSetupState, ShellFamily,
     };
 
     #[test]
@@ -2145,5 +2355,279 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn strip_hook_returns_false_when_file_missing() {
+        let root = unique_temp_dir("headroom-strip-missing");
+        let settings = root.join("does-not-exist.json");
+        let changed = strip_headroom_hook_from_settings(&settings).expect("strip should succeed");
+        assert!(!changed, "missing file should report no change");
+        assert!(!settings.exists(), "should not create the file");
+    }
+
+    #[test]
+    fn strip_hook_removes_headroom_entry_and_leaves_other_entries() {
+        let root = unique_temp_dir("headroom-strip-mixed");
+        fs::create_dir_all(&root).expect("create root");
+        let settings = root.join("settings.json");
+        let content = json!({
+            "env": { "SOME_KEY": "keep-me" },
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            { "type": "command", "command": "/other/tool/script.sh" }
+                        ]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "/Users/test/.claude/hooks/headroom-rtk-rewrite.sh"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(&settings, serde_json::to_string_pretty(&content).unwrap())
+            .expect("write settings");
+
+        let changed = strip_headroom_hook_from_settings(&settings).expect("strip should succeed");
+        assert!(changed, "should report change");
+
+        let raw = fs::read_to_string(&settings).expect("read settings");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse settings");
+        let entries = parsed
+            .get("hooks")
+            .and_then(|v| v.get("PreToolUse"))
+            .and_then(|v| v.as_array())
+            .expect("PreToolUse preserved");
+        assert_eq!(entries.len(), 1, "only the non-headroom entry remains");
+        assert!(
+            entry_contains_hook(&entries[0], "other/tool/script.sh"),
+            "unrelated entry preserved"
+        );
+        assert_eq!(
+            parsed.get("env").and_then(|v| v.get("SOME_KEY")),
+            Some(&json!("keep-me")),
+            "unrelated top-level keys untouched"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strip_hook_drops_empty_pre_tool_use_and_hooks_keys() {
+        let root = unique_temp_dir("headroom-strip-empty");
+        fs::create_dir_all(&root).expect("create root");
+        let settings = root.join("settings.json");
+        let content = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "/path/to/headroom-rtk-rewrite.sh"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(&settings, serde_json::to_string_pretty(&content).unwrap())
+            .expect("write settings");
+
+        let changed = strip_headroom_hook_from_settings(&settings).expect("strip should succeed");
+        assert!(changed);
+
+        let raw = fs::read_to_string(&settings).expect("read settings");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse settings");
+        assert!(
+            parsed.get("hooks").is_none(),
+            "empty hooks object should be removed, got {parsed}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strip_hook_leaves_file_untouched_when_no_headroom_entry_present() {
+        let root = unique_temp_dir("headroom-strip-noop");
+        fs::create_dir_all(&root).expect("create root");
+        let settings = root.join("settings.json");
+        let original = serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            { "type": "command", "command": "/unrelated.sh" }
+                        ]
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        fs::write(&settings, &original).expect("write settings");
+
+        let changed = strip_headroom_hook_from_settings(&settings).expect("strip should succeed");
+        assert!(!changed, "should report no change");
+
+        let after = fs::read_to_string(&settings).expect("read settings");
+        assert_eq!(after, original, "file should be byte-identical");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strip_hook_tolerates_empty_file() {
+        let root = unique_temp_dir("headroom-strip-empty-file");
+        fs::create_dir_all(&root).expect("create root");
+        let settings = root.join("settings.json");
+        fs::write(&settings, "").expect("write empty file");
+
+        let changed = strip_headroom_hook_from_settings(&settings).expect("strip should succeed");
+        assert!(!changed, "empty file should report no change");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_script_falls_through_when_rewritten_first_token_missing_from_path() {
+        // The hook has an OR guard that exits 0 when the binaries are missing,
+        // so we give it real paths and verify the PATH-resolution check kicks in
+        // when `rtk rewrite` produces a command whose first token can't be
+        // resolved. That's the regression-prone slice added this session.
+        let root = unique_temp_dir("headroom-hook-bash");
+        fs::create_dir_all(&root).expect("create root");
+
+        // Fake rtk that always prepends a made-up binary name that won't be on PATH.
+        let fake_rtk = root.join("fake-rtk");
+        fs::write(
+            &fake_rtk,
+            "#!/usr/bin/env bash\nshift  # drop the 'rewrite' arg\necho \"__headroom_nonexistent_binary_xyzzy__ $*\"\n",
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        // Use the real system python3 so the embedded Python snippets run.
+        let system_python = PathBuf::from("/usr/bin/python3");
+        assert!(system_python.exists(), "this test assumes /usr/bin/python3");
+
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        // Hook expects a JSON object on stdin with tool_input.command.
+        let stdin = r#"{"tool_input":{"command":"git status"}}"#;
+        let output = std::process::Command::new("bash")
+            .arg(&hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .expect("run hook");
+
+        assert!(output.status.success(), "hook should exit 0");
+        assert!(
+            output.stdout.is_empty(),
+            "hook should emit no rewrite when first token isn't resolvable, got: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
+        let root = unique_temp_dir("headroom-hook-bash-ok");
+        fs::create_dir_all(&root).expect("create root");
+
+        // Pick a binary that definitely exists on macOS/Linux test hosts.
+        let real_binary = "/bin/echo";
+        assert!(Path::new(real_binary).exists());
+
+        // Fake rtk rewrites to use an absolute path that *does* exist.
+        let fake_rtk = root.join("fake-rtk");
+        fs::write(
+            &fake_rtk,
+            format!(
+                "#!/usr/bin/env bash\nshift\necho \"{real_binary} $*\"\n"
+            ),
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        let stdin = r#"{"tool_input":{"command":"git status"}}"#;
+        let output = std::process::Command::new("bash")
+            .arg(&hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .expect("run hook");
+
+        assert!(output.status.success(), "hook should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(real_binary),
+            "rewrite should be emitted when first token is a valid absolute path, got stdout: {stdout:?}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("Headroom RTK auto-rewrite"),
+            "should be a rewrite hookSpecificOutput payload"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -263,6 +263,25 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     });
   });
 
+  it("prefers the resolution hint over the raw startup error", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentRuntimeNotification(
+      makeRuntime({
+        running: false,
+        startupError: "never opened port 6768 within 60000ms",
+        startupErrorHint: "Wait a moment and click Retry.",
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Headroom stopped running",
+      body: "Headroom isn't running. Wait a moment and click Retry.",
+      action: "runtime",
+    });
+  });
+
   it("does not fire while the runtime is starting", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();

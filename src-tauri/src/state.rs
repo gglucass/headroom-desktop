@@ -776,6 +776,9 @@ impl AppState {
         let effective_running = installed && !paused && proxy_reachable;
 
         let startup_error = self.last_startup_error.lock().clone();
+        let startup_error_hint = startup_error
+            .as_deref()
+            .and_then(classify_startup_error);
 
         RuntimeStatus {
             platform: platform.into(),
@@ -793,6 +796,7 @@ impl AppState {
             headroom_learn_supported: headroom_learn_disabled_reason.is_none(),
             headroom_learn_disabled_reason,
             startup_error,
+            startup_error_hint,
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
                 version: rtk_version,
@@ -2724,6 +2728,45 @@ pub(crate) fn headroom_proxy_reachable() -> bool {
     is_headroom_proxy_reachable()
 }
 
+/// Turn a raw `last_startup_error` string (the anyhow chain from
+/// `start_headroom_background`) into a short user-friendly explanation plus a
+/// suggested next step. Returns `None` for shapes we don't recognize, in which
+/// case the UI falls back to a generic "open logs" prompt.
+pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
+    if raw.contains("is occupied by a non-headroom process") {
+        return Some(
+            "Port 6768 is in use by another app on your machine. \
+             Run `lsof -iTCP:6768 -sTCP:LISTEN` in a terminal to find it, \
+             quit that process, then click Retry."
+                .into(),
+        );
+    }
+    if raw.contains("headroom proxy already running on port") {
+        return Some(
+            "A previous Headroom proxy is still running in the background. \
+             Quit and relaunch Headroom to reset it."
+                .into(),
+        );
+    }
+    if raw.contains("never opened port") {
+        return Some(
+            "The Headroom runtime took too long to start. \
+             On first launch, macOS Gatekeeper can scan the bundled Python runtime for up to a minute. \
+             Wait a moment and click Retry. If it keeps failing, open Headroom logs from Settings."
+                .into(),
+        );
+    }
+    if raw.contains("exited with status") && raw.contains("before opening port") {
+        return Some(
+            "The Headroom Python runtime crashed at startup. \
+             Open Headroom logs from Settings to see the traceback, \
+             or reinstall the runtime from Settings > Advanced."
+                .into(),
+        );
+    }
+    None
+}
+
 fn is_headroom_proxy_reachable() -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -2904,12 +2947,51 @@ mod tests {
 
     use super::{
         apply_bootstrap_step, begin_bootstrap_transition, bootstrap_complete_state,
-        bootstrap_failed_state, lifetime_token_milestones_crossed, merge_daily_savings,
-        merge_hourly_savings, parse_headroom_stats_from_json,
+        bootstrap_failed_state, classify_startup_error, lifetime_token_milestones_crossed,
+        merge_daily_savings, merge_hourly_savings, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, AppState,
         ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
+
+    #[test]
+    fn classify_startup_error_port_timeout() {
+        let raw = "unable to keep headroom running in background (prior attempts: \
+            /Users/x/venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms): \
+            /Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 never opened port 6768 within 60000ms";
+        let hint = classify_startup_error(raw).expect("timeout should classify");
+        assert!(hint.contains("Gatekeeper"), "got: {hint}");
+        assert!(hint.contains("Retry"));
+    }
+
+    #[test]
+    fn classify_startup_error_python_crash() {
+        let raw = "unable to keep headroom running in background (prior attempts: \
+            /home/h/venv/bin/headroom proxy --port 6768 exited with status exit status: 1 before opening port 6768): \
+            /home/h/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 exited with status exit status: 1 before opening port 6768";
+        let hint = classify_startup_error(raw).expect("crash should classify");
+        assert!(hint.contains("crashed at startup"), "got: {hint}");
+        assert!(hint.contains("logs"));
+    }
+
+    #[test]
+    fn classify_startup_error_foreign_port() {
+        let raw = "port 6768 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
+        let hint = classify_startup_error(raw).expect("foreign port should classify");
+        assert!(hint.contains("lsof -iTCP:6768"), "got: {hint}");
+    }
+
+    #[test]
+    fn classify_startup_error_stale_headroom() {
+        let raw = "headroom proxy already running on port 6768 (likely a stale process from a prior session).";
+        let hint = classify_startup_error(raw).expect("stale should classify");
+        assert!(hint.contains("relaunch"), "got: {hint}");
+    }
+
+    #[test]
+    fn classify_startup_error_unknown_returns_none() {
+        assert!(classify_startup_error("some other error").is_none());
+    }
 
     fn make_tracker() -> SavingsTracker {
         let id = uuid::Uuid::new_v4();

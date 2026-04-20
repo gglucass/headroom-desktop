@@ -22,9 +22,9 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.5.24";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/1a/0f/0cd0c1c238b750443396e35b423b492226a3f7831c5b43b4c99971d2430f/headroom_ai-0.5.24-py3-none-any.whl";
-const HEADROOM_PINNED_SHA256: &str = "0cde90f6b7c8a9900759066957fd80a2bad4a0379946cf62096791a4b514699f";
+const HEADROOM_PINNED_VERSION: &str = "0.6.5";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/bb/a7/5f734e2436f9458da501484f5cc41c0838f1169618e09c009f62f732305e/headroom_ai-0.6.5-py3-none-any.whl";
+const HEADROOM_PINNED_SHA256: &str = "6154db6fa0c5614560bf801401b991180cf414537d694305cd9e9439b1cf41f8";
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
@@ -33,7 +33,7 @@ const VENDOR_WHEELS_INDEX_URL: &str =
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
-const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 60_000;
+const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
@@ -357,6 +357,8 @@ impl ToolManager {
                 .current_dir(&self.runtime.root_dir)
                 .process_group(0)
                 .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONUNBUFFERED", "1")
+                .env("PYTHONFAULTHANDLER", "1")
                 .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
                 .env("PIP_NO_INPUT", "1")
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
@@ -408,6 +410,17 @@ impl ToolManager {
                 return Ok(child);
             }
 
+            // Timeout path (process still alive, port never opened): send SIGABRT
+            // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
+            // before the process dies. Skip if the process already exited on its own.
+            if reason.is_none() {
+                let _ = Command::new("/bin/kill")
+                    .arg("-ABRT")
+                    .arg(child.id().to_string())
+                    .status();
+                thread::sleep(Duration::from_millis(500));
+            }
+
             let _ = child.kill();
             let _ = child.wait();
 
@@ -421,7 +434,7 @@ impl ToolManager {
                 program: executable.display().to_string(),
                 args: args.iter().map(|s| s.to_string()).collect(),
                 log_path: log_path.display().to_string(),
-                log_tail: tail_log_file(&log_path, 20),
+                log_tail: tail_log_file(&log_path, 80),
                 reason,
             });
         }

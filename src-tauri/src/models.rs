@@ -233,6 +233,7 @@ pub struct RuntimeStatus {
     pub headroom_learn_supported: bool,
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
+    pub startup_error_hint: Option<String>,
     pub rtk: RtkRuntimeStatus,
 }
 

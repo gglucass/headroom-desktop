@@ -1193,6 +1193,7 @@ pub fn run() {
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
+            spawn_proxy_watchdog(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::track_event(
@@ -1902,6 +1903,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
         .icon_as_template(false)
+        .tooltip("Headroom")
         .show_menu_on_left_click(false)
         .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click {
@@ -1967,11 +1969,14 @@ enum TrayRuntimeVisual {
     Off,
     Booting,
     Running,
+    Paused,
+    Unhealthy,
     Disconnected,
 }
 
 struct TrayRuntimeIcons {
     off: tauri::image::Image<'static>,
+    paused: tauri::image::Image<'static>,
     running_rgba: Vec<u8>,
     running_dims: (u32, u32),
     booting_frames: Vec<tauri::image::Image<'static>>,
@@ -1990,6 +1995,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
+        let mut last_tooltip: Option<String> = None;
         let mut connector_check_counter: u32 = 0;
         let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled();
 
@@ -2011,17 +2017,39 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                 } else if runtime.starting {
                     TrayRuntimeVisual::Booting
+                } else if runtime.paused {
+                    TrayRuntimeVisual::Paused
+                } else if runtime.installed && !runtime.proxy_reachable {
+                    // Runtime should be up (installed, not paused, not booting)
+                    // but the proxy isn't answering. Treat as unhealthy so the
+                    // user has a visible signal the watchdog is working on it.
+                    TrayRuntimeVisual::Unhealthy
                 } else {
                     TrayRuntimeVisual::Off
                 }
             };
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
+                let tooltip = match visual {
+                    TrayRuntimeVisual::Booting => "Headroom — starting",
+                    TrayRuntimeVisual::Running => "Headroom — active",
+                    TrayRuntimeVisual::Paused => {
+                        "Headroom — paused (Claude Code running normally)"
+                    }
+                    TrayRuntimeVisual::Unhealthy => {
+                        "Headroom — proxy unreachable, attempting restart"
+                    }
+                    TrayRuntimeVisual::Disconnected => "Headroom — Claude Code not connected",
+                    TrayRuntimeVisual::Off => "Headroom — off",
+                };
+
+                let mut icon_changed = false;
                 match visual {
                     TrayRuntimeVisual::Booting => {
                         let icon =
                             icons.booting_frames[frame_index % icons.booting_frames.len()].clone();
                         let _ = tray.set_icon(Some(icon));
+                        icon_changed = true;
                         frame_index = (frame_index + 1) % icons.booting_frames.len();
                         last_non_booting = Some(TrayRuntimeVisual::Booting);
                     }
@@ -2040,6 +2068,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             let (bw, bh) = icons.running_dims;
                             let (new_rgba, new_w, new_h) = build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
                             let _ = tray.set_icon(Some(tauri::image::Image::new_owned(new_rgba, new_w, new_h)));
+                            icon_changed = true;
                             last_non_booting = Some(TrayRuntimeVisual::Running);
                             last_displayed_dollars = Some(dollars);
                         }
@@ -2047,12 +2076,30 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Off => {
                         if last_non_booting != Some(TrayRuntimeVisual::Off) {
                             let _ = tray.set_icon(Some(icons.off.clone()));
+                            icon_changed = true;
                             last_non_booting = Some(TrayRuntimeVisual::Off);
+                        }
+                    }
+                    TrayRuntimeVisual::Paused => {
+                        if last_non_booting != Some(TrayRuntimeVisual::Paused) {
+                            let _ = tray.set_icon(Some(icons.paused.clone()));
+                            icon_changed = true;
+                            last_non_booting = Some(TrayRuntimeVisual::Paused);
+                            last_displayed_dollars = None;
+                        }
+                    }
+                    TrayRuntimeVisual::Unhealthy => {
+                        if last_non_booting != Some(TrayRuntimeVisual::Unhealthy) {
+                            let _ = tray.set_icon(Some(icons.off.clone()));
+                            icon_changed = true;
+                            last_non_booting = Some(TrayRuntimeVisual::Unhealthy);
+                            last_displayed_dollars = None;
                         }
                     }
                     TrayRuntimeVisual::Disconnected => {
                         if last_non_booting != Some(TrayRuntimeVisual::Disconnected) {
                             let _ = tray.set_icon(Some(icons.off.clone()));
+                            icon_changed = true;
                             // Only notify when transitioning from a healthy running
                             // state — not on first boot or from other non-running states.
                             if last_non_booting == Some(TrayRuntimeVisual::Running) {
@@ -2068,11 +2115,88 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         }
                     }
                 }
+
+                // set_icon clobbers the tooltip on macOS, so re-apply whenever
+                // we just swapped the icon — not only on tooltip text change.
+                let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
+                if icon_changed || tooltip_changed {
+                    if let Err(err) = tray.set_tooltip(Some(tooltip)) {
+                        eprintln!("tray: set_tooltip failed: {err}");
+                    }
+                    last_tooltip = Some(tooltip.to_string());
+                }
             } else {
                 break;
             }
 
             std::thread::sleep(std::time::Duration::from_millis(260));
+        }
+    });
+}
+
+/// Every 5s, check whether the Python proxy is actually reachable while the
+/// app thinks the runtime should be up. If it isn't, try to restart via
+/// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
+/// give up: pause the runtime, strip Headroom's interception (BASE_URL,
+/// hooks, shell blocks) so Claude Code falls back to its normal behavior,
+/// and notify the user. The user can re-enable from the menu when ready —
+/// `start_headroom` re-applies everything via `restore_client_setups`.
+fn spawn_proxy_watchdog(app: AppHandle) {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(5);
+    const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+    std::thread::spawn(move || {
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            std::thread::sleep(POLL);
+
+            let state: tauri::State<'_, AppState> = app.state();
+            let runtime = state.runtime_status();
+
+            // Only care when the runtime is supposed to be up: installed,
+            // not paused by the user, and not mid-boot. Anything else and we
+            // reset the counter and keep watching.
+            let should_be_up = runtime.installed && !runtime.paused && !runtime.starting;
+            if !should_be_up {
+                consecutive_failures = 0;
+                continue;
+            }
+
+            if runtime.proxy_reachable {
+                consecutive_failures = 0;
+                continue;
+            }
+
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            eprintln!(
+                "watchdog: proxy unreachable (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}), attempting restart"
+            );
+
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                eprintln!(
+                    "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; disabling interception"
+                );
+                state.set_runtime_paused(true);
+                state.stop_headroom();
+                if let Err(err) = client_adapters::clear_client_setups() {
+                    eprintln!("watchdog: clear_client_setups failed: {err}");
+                }
+                analytics::track_event(&app, "runtime_auto_paused", None);
+                let _ = show_notification_impl(
+                    &app,
+                    "Headroom paused",
+                    "Headroom couldn't restart its proxy — interception disabled so Claude Code keeps working. Open Headroom to try again.",
+                    Some("connectors".into()),
+                );
+                consecutive_failures = 0;
+                continue;
+            }
+
+            // Otherwise try to bring it back.
+            if let Err(err) = state.ensure_headroom_running() {
+                eprintln!("watchdog: ensure_headroom_running failed: {err:#}");
+            }
         }
     });
 }
@@ -2108,6 +2232,9 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
     let rgba = decoded.into_vec();
 
     let off_rgba = add_red_badge_dot(to_grayscale_strength(&rgba, 1.0), width, height);
+    // Paused intentionally has no badge — distinguishes "user chose off" from
+    // "broken and needs attention" at a glance.
+    let paused_rgba = to_grayscale_strength(&rgba, 1.0);
     let booting_base = to_grayscale_strength(&rgba, 0.5);
     let booting_90 = rotate_90_cw(&booting_base, width, height);
     let booting_180 = rotate_90_cw(&booting_90, width, height);
@@ -2115,6 +2242,7 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
 
     Ok(TrayRuntimeIcons {
         off: tauri::image::Image::new_owned(off_rgba, width, height),
+        paused: tauri::image::Image::new_owned(paused_rgba, width, height),
         running_rgba: rgba,
         running_dims: (width, height),
         booting_frames: vec![

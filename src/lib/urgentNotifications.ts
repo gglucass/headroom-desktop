@@ -42,12 +42,16 @@ export async function maybeFireUrgentRuntimeNotification(
     runtime.installed && !runtime.running && !runtime.starting && !runtime.paused;
   if (!runtimeDown) return;
 
+  const body = runtime.startupErrorHint
+    ? `Headroom isn't running. ${runtime.startupErrorHint}`
+    : runtime.startupError
+    ? `Headroom isn't running: ${runtime.startupError}`
+    : "Headroom isn't running. Open the tray to restart it.";
+
   await fireOncePerDay(
     RUNTIME_DOWN_KEY,
     "Headroom stopped running",
-    runtime.startupError
-      ? `Headroom isn't running: ${runtime.startupError}`
-      : "Headroom isn't running. Open the tray to restart it.",
+    body,
     "runtime"
   );
 }

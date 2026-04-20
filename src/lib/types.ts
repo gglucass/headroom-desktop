@@ -160,6 +160,7 @@ export interface RuntimeStatus {
   headroomLearnSupported: boolean;
   headroomLearnDisabledReason?: string | null;
   startupError?: string | null;
+  startupErrorHint?: string | null;
   rtk: {
     installed: boolean;
     version?: string | null;
