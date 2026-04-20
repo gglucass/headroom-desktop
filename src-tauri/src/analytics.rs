@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use std::thread::{self, JoinHandle};
@@ -185,8 +186,15 @@ pub fn resolve_app_key() -> Option<String> {
 pub fn track_event(app: &AppHandle, name: &str, properties: Option<Value>) {
     let client = app.state::<AnalyticsClient>();
     if let Err(err) = client.track_event(name, properties) {
-        eprintln!("failed to track analytics event {}: {err}", name.trim());
+        log_stderr(format_args!(
+            "failed to track analytics event {}: {err}",
+            name.trim()
+        ));
     }
+}
+
+fn log_stderr(args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr(), "{args}");
 }
 
 pub fn shutdown(app: &AppHandle) {
@@ -256,22 +264,25 @@ fn flush_queue(client: &Client, config: &AnalyticsConfig, queue: &mut VecDeque<V
         match response {
             Ok(response) if response.status().is_success() => {}
             Ok(response) if response.status().is_server_error() => {
-                eprintln!(
+                log_stderr(format_args!(
                     "aptabase server error {} while sending {} event(s)",
                     response.status(),
                     events.len()
-                );
+                ));
                 failed.extend(events);
             }
             Ok(response) => {
-                eprintln!(
+                log_stderr(format_args!(
                     "aptabase rejected {} event(s) with status {}",
                     events.len(),
                     response.status()
-                );
+                ));
             }
             Err(err) => {
-                eprintln!("aptabase send failed for {} event(s): {err}", events.len());
+                log_stderr(format_args!(
+                    "aptabase send failed for {} event(s): {err}",
+                    events.len()
+                ));
                 failed.extend(events);
             }
         }

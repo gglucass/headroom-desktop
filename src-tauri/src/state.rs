@@ -366,13 +366,12 @@ impl AppState {
             if let Some(saved_tokens) = history.lifetime_estimated_tokens_saved {
                 snapshot.lifetime_estimated_tokens_saved = saved_tokens;
             }
+            let cutoff_date = savings_history_cutoff_date();
+            let cutoff_hour = format!("{cutoff_date}T00:00");
             daily_savings =
-                merge_daily_savings(daily_savings, history.daily_savings(), "2026-04-20");
-            hourly_savings = merge_hourly_savings(
-                hourly_savings,
-                history.hourly_savings(),
-                "2026-04-20T00:00",
-            );
+                merge_daily_savings(daily_savings, history.daily_savings(), &cutoff_date);
+            hourly_savings =
+                merge_hourly_savings(hourly_savings, history.hourly_savings(), &cutoff_hour);
         }
 
         (
@@ -2325,6 +2324,18 @@ fn local_day_key(timestamp: chrono::DateTime<Local>) -> String {
     timestamp.format("%Y-%m-%d").to_string()
 }
 
+// Boundary between local tracker (pre-cutoff, authoritative) and /stats-history
+// (cutoff and later, authoritative). Release builds pin to the date the schema
+// stabilized; debug builds track "today" so dev sessions never fall behind the
+// history source while iterating.
+fn savings_history_cutoff_date() -> String {
+    if cfg!(debug_assertions) {
+        local_day_key(Local::now())
+    } else {
+        "2026-06-02".to_string()
+    }
+}
+
 fn local_hour_key(timestamp: chrono::DateTime<Local>) -> String {
     timestamp.format("%Y-%m-%dT%H:00").to_string()
 }
@@ -2842,12 +2853,13 @@ fn merge_daily_savings(
 ) -> Vec<DailySavingsPoint> {
     use std::collections::BTreeMap;
     let mut by_date: BTreeMap<String, DailySavingsPoint> = BTreeMap::new();
-    // Insert history first so tracker can overwrite pre-cutoff days
+    // Post-cutoff: history wins, tracker fills gaps so today's local activity still shows.
+    // Pre-cutoff: tracker-only; history is ignored to avoid pulling in pre-v6 schema drift.
     for p in history {
-        by_date.insert(p.date.clone(), p);
+        if p.date.as_str() >= cutoff_date {
+            by_date.insert(p.date.clone(), p);
+        }
     }
-    // Tracker overwrites all pre-cutoff entries; post-cutoff entries are only inserted
-    // if history didn't already have them (i.e. they remain from above).
     for p in tracker {
         if p.date.as_str() < cutoff_date {
             by_date.insert(p.date.clone(), p);
@@ -2867,7 +2879,9 @@ fn merge_hourly_savings(
     use std::collections::BTreeMap;
     let mut by_hour: BTreeMap<String, HourlySavingsPoint> = BTreeMap::new();
     for p in history {
-        by_hour.insert(p.hour.clone(), p);
+        if p.hour.as_str() >= cutoff_hour {
+            by_hour.insert(p.hour.clone(), p);
+        }
     }
     for p in tracker {
         if p.hour.as_str() < cutoff_hour {
@@ -4051,11 +4065,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_daily_fallback_when_only_history_has_pre_cutoff_day() {
+    fn merge_daily_drops_history_pre_cutoff() {
+        // Pre-cutoff is tracker-only: empty tracker + pre-cutoff history => no entry.
+        // This protects against pre-v6 schema drift leaking into the graph.
         let history = vec![daily("2026-04-10", 400, 1.5)];
         let result = merge_daily_savings(vec![], history, "2026-04-20");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].estimated_tokens_saved, 400);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -4090,20 +4105,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_hourly_empty_tracker_does_not_overwrite_history_for_today() {
-        // Regression: before the fix, when native history was present the tracker was
-        // never updated, so it was empty. Pre-cutoff hours should then fall back to
-        // native history rather than producing empty bars.
+    fn merge_hourly_drops_history_pre_cutoff() {
+        // Pre-cutoff is tracker-only: empty tracker + pre-cutoff history => no entries.
         let tracker: Vec<HourlySavingsPoint> = vec![];
         let history = vec![
             hourly("2026-04-13T09:00", 400),
             hourly("2026-04-13T10:00", 600),
         ];
-        let mut result = merge_hourly_savings(tracker, history, "2026-04-20T00:00");
-        result.sort_by(|a, b| a.hour.cmp(&b.hour));
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].estimated_tokens_saved, 400);
-        assert_eq!(result[1].estimated_tokens_saved, 600);
+        let result = merge_hourly_savings(tracker, history, "2026-04-20T00:00");
+        assert!(result.is_empty());
     }
 
     #[test]

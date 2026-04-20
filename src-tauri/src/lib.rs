@@ -134,6 +134,11 @@ struct AvailableAppUpdate {
 
 static ZERO_SPEND_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
 
+// Spend fields (actual_cost_usd, total_tokens_sent) were added to SavingsRecord in
+// schema v6, shipped in 0.2.40 on 2026-04-13. Records written before that date
+// deserialize those fields as 0 via #[serde(default)], producing false positives.
+const SPEND_SCHEMA_CUTOFF_DATE: &str = "2026-04-13";
+
 fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
         return;
@@ -141,7 +146,12 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     let affected_days: Vec<&str> = dashboard
         .daily_savings
         .iter()
-        .filter(|p| p.estimated_tokens_saved > 0 && p.actual_cost_usd == 0.0 && p.total_tokens_sent == 0)
+        .filter(|p| {
+            p.date.as_str() >= SPEND_SCHEMA_CUTOFF_DATE
+                && p.estimated_tokens_saved > 0
+                && p.actual_cost_usd == 0.0
+                && p.total_tokens_sent == 0
+        })
         .map(|p| p.date.as_str())
         .collect();
     if affected_days.is_empty() {
@@ -547,9 +557,16 @@ fn capture_bootstrap_failure(err: &anyhow::Error) {
             },
         );
     } else {
-        sentry::capture_message(
-            &format!("bootstrap_failed (install_runtime): {technical_err}"),
-            sentry::Level::Error,
+        sentry::with_scope(
+            |scope| {
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(
+                    &format!("bootstrap_failed (install_runtime): {technical_err}"),
+                    sentry::Level::Error,
+                );
+            },
         );
     }
 }
@@ -1158,6 +1175,7 @@ pub fn run() {
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
             release: sentry::release_name!(),
+            attach_stacktrace: true,
             ..Default::default()
         },
     ));

@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -819,7 +819,7 @@ impl ToolManager {
                 eta_seconds: 75,
                 percent: 18,
             });
-            self.install_python_distribution()?;
+            self.install_python_distribution(|update| progress(update))?;
         } else {
             progress(BootstrapStepUpdate {
                 step: "Python runtime",
@@ -879,10 +879,58 @@ impl ToolManager {
         Ok(self.runtime.clone())
     }
 
-    fn install_python_distribution(&self) -> Result<()> {
+    fn install_python_distribution<F>(&self, mut emit_step: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
         let archive_path = self.runtime.downloads_dir.join("python-standalone.tar.gz");
         let artifact = python_distribution_artifact()?;
-        download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
+        // Sub-progress maps the download to bootstrap percents 18..=34 (next
+        // step starts at 35). Keeps the progress bar moving on slow networks
+        // so users don't assume the app has frozen.
+        let started_at = Instant::now();
+        download_to_path_with_progress(
+            &artifact.url,
+            &archive_path,
+            artifact.sha256,
+            |downloaded, total| {
+                let downloaded_mb = downloaded as f64 / 1_048_576.0;
+                let (message, percent, eta_seconds) = match total {
+                    Some(total) if total > 0 => {
+                        let total_mb = total as f64 / 1_048_576.0;
+                        let frac = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
+                        let percent = (18.0 + frac * 16.0).round().clamp(18.0, 34.0) as u8;
+                        let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
+                        let rate = downloaded as f64 / elapsed;
+                        let remaining = (total.saturating_sub(downloaded)) as f64;
+                        let eta = if rate > 1.0 {
+                            (remaining / rate).ceil() as u64
+                        } else {
+                            75
+                        };
+                        (
+                            format!(
+                                "Downloading Python runtime: {:.1} / {:.1} MB",
+                                downloaded_mb, total_mb
+                            ),
+                            percent,
+                            eta,
+                        )
+                    }
+                    _ => (
+                        format!("Downloading Python runtime: {:.1} MB", downloaded_mb),
+                        18,
+                        75,
+                    ),
+                };
+                emit_step(BootstrapStepUpdate {
+                    step: "Downloading Python",
+                    message,
+                    eta_seconds,
+                    percent,
+                });
+            },
+        )?;
 
         let file = std::fs::File::open(&archive_path)
             .with_context(|| format!("opening {}", archive_path.display()))?;
@@ -1393,6 +1441,23 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
 }
 
 fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>) -> Result<()> {
+    download_to_path_with_progress(url, destination, expected_sha256, |_, _| {})
+}
+
+/// Download `url` to `destination` with an optional progress callback.
+///
+/// The callback receives `(downloaded_bytes, total_bytes)` and is called at
+/// most every 250ms during a streaming download. `total_bytes` is `None` when
+/// the server does not provide a Content-Length header.
+fn download_to_path_with_progress<F>(
+    url: &str,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
     if destination.exists() {
         if let Some(expected_sha256) = expected_sha256 {
             match verify_sha256_file(destination, expected_sha256) {
@@ -1407,19 +1472,64 @@ fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>
         }
     }
 
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("headroom-desktop/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .context("building download client")?;
+
+    let tmp_path = destination.with_extension("partial");
+    const MAX_ATTEMPTS: u32 = 5;
     let mut last_err = anyhow::anyhow!("no attempts made");
-    for attempt in 0..3u32 {
+
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+            // 2s, 4s, 8s, 16s between attempts.
+            std::thread::sleep(Duration::from_secs(1u64 << attempt));
         }
+        let _ = std::fs::remove_file(&tmp_path);
+
         let result = (|| -> Result<()> {
-            let response = reqwest::blocking::get(url)
+            let mut response = client
+                .get(url)
+                .send()
                 .with_context(|| format!("downloading {}", url))?
                 .error_for_status()
                 .with_context(|| format!("downloading {}", url))?;
-            let bytes = response.bytes().context("reading download body")?;
+
+            let total_bytes = response.content_length();
+            let mut file = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("creating {}", tmp_path.display()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut downloaded: u64 = 0;
+            on_progress(0, total_bytes);
+            let mut last_emit = Instant::now();
+
+            loop {
+                let n = response
+                    .read(&mut buf)
+                    .context("reading download body")?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .with_context(|| format!("writing {}", tmp_path.display()))?;
+                hasher.update(&buf[..n]);
+                downloaded += n as u64;
+                if last_emit.elapsed() >= Duration::from_millis(250) {
+                    on_progress(downloaded, total_bytes);
+                    last_emit = Instant::now();
+                }
+            }
+            file.flush().context("flushing download")?;
+            drop(file);
+            on_progress(downloaded, total_bytes);
+
             if let Some(expected_sha256) = expected_sha256 {
-                let actual_checksum = sha256_bytes(&bytes);
+                let actual_checksum = format!("{:x}", hasher.finalize());
                 if actual_checksum != expected_sha256 {
                     bail!(
                         "checksum mismatch for {}: expected {}, got {}",
@@ -1429,15 +1539,24 @@ fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>
                     );
                 }
             }
-            std::fs::write(destination, &bytes)
-                .with_context(|| format!("writing {}", destination.display()))?;
+
+            std::fs::rename(&tmp_path, destination).with_context(|| {
+                format!(
+                    "renaming {} to {}",
+                    tmp_path.display(),
+                    destination.display()
+                )
+            })?;
             Ok(())
         })();
+
         match result {
             Ok(()) => return Ok(()),
             Err(e) => last_err = e,
         }
     }
+
+    let _ = std::fs::remove_file(&tmp_path);
     Err(last_err)
 }
 
