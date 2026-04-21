@@ -111,6 +111,18 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
         _ => return,
     }
 
+    // Reject requests that didn't target the loopback listener or that carry
+    // a browser Origin. This blocks DNS-rebinding attacks where an attacker
+    // page resolves its hostname to 127.0.0.1 and drives the intercept from
+    // a user's browser; CLI clients never set Origin and always send a
+    // loopback Host.
+    if !request_is_loopback_safe(&buf) {
+        let _ = client
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
     // Scan headers for a Bearer token and capture it.
     if let Some(token) = extract_bearer(&buf) {
         *token_slot.lock() = Some(BearerToken::new(token));
@@ -190,6 +202,42 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Return true if the request's Host header targets the loopback listener
+/// and no browser Origin header is present. Protects against DNS-rebinding
+/// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
+fn request_is_loopback_safe(buf: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(buf) else {
+        return false;
+    };
+    let mut host: Option<&str> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("origin:") {
+            return false;
+        }
+        if host.is_none() && lower.starts_with("host:") {
+            host = Some(line["host:".len()..].trim());
+        }
+    }
+    match host {
+        Some(value) => host_is_loopback(value),
+        None => false,
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let name = host
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Extract the bearer token value from raw HTTP request bytes, if present.
 fn extract_bearer(buf: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(buf).ok()?;
@@ -210,7 +258,7 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_bearer, find_header_end, read_http_headers};
+    use super::{extract_bearer, find_header_end, read_http_headers, request_is_loopback_safe};
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
 
@@ -224,6 +272,36 @@ mod tests {
     fn extracts_bearer_token_case_insensitively() {
         let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn loopback_host_without_origin_is_accepted() {
+        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n";
+        assert!(request_is_loopback_safe(req));
+        let req = b"POST / HTTP/1.1\r\nHost: localhost:6767\r\n\r\n";
+        assert!(request_is_loopback_safe(req));
+        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        assert!(request_is_loopback_safe(req));
+    }
+
+    #[test]
+    fn non_loopback_host_is_rejected() {
+        let req = b"POST / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n";
+        assert!(!request_is_loopback_safe(req));
+        let req = b"POST / HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n";
+        assert!(!request_is_loopback_safe(req));
+    }
+
+    #[test]
+    fn origin_header_causes_rejection_even_on_loopback() {
+        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n";
+        assert!(!request_is_loopback_safe(req));
+    }
+
+    #[test]
+    fn missing_host_header_is_rejected() {
+        let req = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        assert!(!request_is_loopback_safe(req));
     }
 
     #[tokio::test]

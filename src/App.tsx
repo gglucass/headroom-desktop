@@ -469,11 +469,14 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-total">
               {chartMode === "usd"
                 ? currency(
-                    view === "day" && visibleDay >= today && savingsTodayUsd !== null
-                      ? savingsTodayUsd
-                      : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
+                    Math.max(
+                      0,
+                      view === "day" && visibleDay >= today && savingsTodayUsd !== null
+                        ? savingsTodayUsd
+                        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd, 0)
+                    )
                   )
-                : compactNumber(chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0))}
+                : compactNumber(Math.max(0, chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0)))}
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
@@ -790,12 +793,6 @@ export default function App() {
     }
     rtkActivityRef.current.scrollTop = rtkActivityRef.current.scrollHeight;
   }, [showRtkDetails, rtkActivityLines]);
-
-  useEffect(() => {
-    if (!authEmail && pricingStatus?.claude.email) {
-      setAuthEmail(pricingStatus.claude.email);
-    }
-  }, [authEmail, pricingStatus?.claude.email]);
 
   useEffect(() => {
     const unlistenPromise = listen<{ action: string | null }>(
@@ -2496,7 +2493,7 @@ export default function App() {
           <>
             {runtimeStatus?.running !== true ? (
               <>
-                <p className="launcher-install-notice">Starting Headroom for the first time (this can take up to a minute)…</p>
+                <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
                 <button
                   className="primary-button primary-button--large primary-button--install launcher-step1-continue"
                   disabled
@@ -3215,7 +3212,7 @@ export default function App() {
                     setAuthEmail(event.target.value);
                     setAuthFlowError(null);
                   }}
-                  placeholder={pricingStatus?.claude.email ?? "you@example.com"}
+                  placeholder="you@example.com"
                   type="email"
                   value={authEmail}
                 />

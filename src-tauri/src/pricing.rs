@@ -626,7 +626,7 @@ fn evaluate_pricing_status(
                             optimization_allowed = false;
                             gate_reason = Some(PricingGateReason::WeeklyUsageLimitReached);
                             gate_message = format!(
-                                "Headroom is paused because you've reached {:.1}% of weekly Claude usage. Upgrade or earn invite bonuses to raise your limit.",
+                                "Headroom is paused because you've reached {:.1}% of weekly Claude usage. Upgrade to raise your limit.",
                                 weekly_usage
                             );
                         } else if weekly_usage >= nudge {
@@ -1151,8 +1151,16 @@ fn http_client() -> Result<Client, String> {
 }
 
 fn api_url(path: &str) -> String {
+    // Runtime override is only honored in debug builds. In release builds an
+    // attacker with persistence on the user's machine (e.g. a launchd plist)
+    // could otherwise redirect every billing/auth call to a rogue host.
+    #[cfg(debug_assertions)]
+    let runtime_env = std::env::var("HEADROOM_ACCOUNT_API_BASE_URL").ok();
+    #[cfg(not(debug_assertions))]
+    let runtime_env: Option<String> = None;
+
     let base = resolve_account_api_base_url(
-        std::env::var("HEADROOM_ACCOUNT_API_BASE_URL").ok(),
+        runtime_env,
         option_env!("HEADROOM_ACCOUNT_API_BASE_URL"),
     );
     format!(
@@ -1199,14 +1207,14 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
             monthly_price_usd: 2.5,
         }),
         ClaudePlanTier::Max5x => Some(PricingPolicy {
-            nudge_threshold_percent: 5.0,
-            disable_threshold_percent: 10.0,
+            nudge_threshold_percent: 10.0,
+            disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max5x,
             monthly_price_usd: 12.5,
         }),
         ClaudePlanTier::Max20x => Some(PricingPolicy {
-            nudge_threshold_percent: 2.5,
-            disable_threshold_percent: 5.0,
+            nudge_threshold_percent: 10.0,
+            disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
             monthly_price_usd: 25.0,
         }),

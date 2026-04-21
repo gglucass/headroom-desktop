@@ -660,7 +660,7 @@ impl AppState {
             complete: false,
             failed: false,
             current_step: "Starting Headroom".into(),
-            message: "Starting Headroom for the first time (this can take up to a minute)…".into(),
+            message: "Starting Headroom for the first time (this can take ~1-2 minutes)…".into(),
             current_step_eta_seconds: 45,
             overall_percent: 95,
         };
@@ -2782,7 +2782,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     if raw.contains("never opened port") {
         return Some(
             "The Headroom runtime took too long to start. \
-             On first launch, macOS Gatekeeper can scan the bundled Python runtime for up to a minute. \
+             On first launch, macOS Gatekeeper can scan the bundled Python runtime for ~1-2 minutes. \
              Wait a moment and click Retry. If it keeps failing, open Headroom logs from Settings."
                 .into(),
         );

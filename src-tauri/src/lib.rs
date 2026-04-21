@@ -912,11 +912,15 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
         return Err("Enter a valid email address.".to_string());
     }
 
+    let target = validate_contact_request_url(&url)
+        .ok_or_else(|| "Could not reach the contact form.".to_string())?;
+
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| err.to_string())?;
     let response = client
-        .post(url)
+        .post(target)
         .form(&[("contact_request[email]", trimmed)])
         .send()
         .await
@@ -928,6 +932,23 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
         503 => Err("Email delivery still needs to be configured.".to_string()),
         status => Err(format!("Contact request failed with status {status}.")),
     }
+}
+
+// Scheme + host allowlist for the contact form endpoint. The URL reaches this
+// Tauri command from the webview, so we must not assume it is trustworthy —
+// an SSRF primitive here would let a compromised frame POST to arbitrary
+// hosts, including loopback services.
+fn validate_contact_request_url(raw: &str) -> Option<reqwest::Url> {
+    const ALLOWED_HOSTS: &[&str] = &["extraheadroom.com", "www.extraheadroom.com"];
+    let parsed = reqwest::Url::parse(raw).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if !ALLOWED_HOSTS.contains(&host) {
+        return None;
+    }
+    Some(parsed)
 }
 
 #[tauri::command]
