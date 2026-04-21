@@ -4108,7 +4108,7 @@ export default function App() {
                     </span>
                   </div>
                   <div className="runtime-status__grid runtime-status__grid--4">
-                    {[
+                    {([
                       {
                         name: "Runtime",
                         ok: runtimeStatus?.running === true,
@@ -4121,25 +4121,45 @@ export default function App() {
                       },
                       {
                         name: "MCP",
-                        ok: runtimeStatus?.mcpConfigured === true,
+                        ok:
+                          runtimeStatus?.mcpConfigured === true
+                            ? true
+                            : runtimeStatus?.mcpConfigured === false
+                              ? false
+                              : null,
                       },
                       {
                         name: "Kompress",
-                        ok: runtimeStatus?.kompressEnabled === true,
+                        ok:
+                          runtimeStatus?.kompressEnabled === true
+                            ? true
+                            : runtimeStatus?.kompressEnabled === false
+                              ? false
+                              : null,
                       },
-                    ].map((s) => (
-                      <span
-                        key={s.name}
-                        className={`runtime-status__item${s.onClick ? " runtime-status__item--clickable" : ""}`}
-                        onClick={s.onClick}
-                      >
-                        <span className="runtime-status__label">{s.name}:</span>
-                        <span className={`runtime-status__indicator ${s.ok ? "runtime-status__indicator--ok" : "runtime-status__indicator--off"}`}>
-                          {s.ok ? "✔" : "✖"}
+                    ] as { name: string; ok: boolean | null; suffix?: string; onClick?: () => void }[]).map((s) => {
+                      const indicatorClass =
+                        s.ok === true
+                          ? "runtime-status__indicator--ok"
+                          : s.ok === false
+                            ? "runtime-status__indicator--off"
+                            : "runtime-status__indicator--unknown";
+                      const indicatorSymbol = s.ok === true ? "✔" : s.ok === false ? "✖" : "–";
+                      return (
+                        <span
+                          key={s.name}
+                          className={`runtime-status__item${s.onClick ? " runtime-status__item--clickable" : ""}`}
+                          onClick={s.onClick}
+                          title={s.ok === null ? `${s.name} status unknown` : undefined}
+                        >
+                          <span className="runtime-status__label">{s.name}:</span>
+                          <span className={`runtime-status__indicator ${indicatorClass}`}>
+                            {indicatorSymbol}
+                          </span>
+                          {s.suffix && <span className="runtime-status__suffix">({s.suffix})</span>}
                         </span>
-                        {s.suffix && <span className="runtime-status__suffix">({s.suffix})</span>}
-                      </span>
-                    ))}
+                      );
+                    })}
                   </div>
                   <button
                     className="link-button runtime-status__section-action"

@@ -21,6 +21,7 @@ pub const HEADROOM_BACKEND_PORT: u16 = 6768;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
@@ -38,12 +39,38 @@ pub fn spawn(token_slot: SharedToken) {
                 .build()
                 .expect("proxy intercept runtime");
             rt.block_on(async move {
-                if let Err(e) = run(token_slot).await {
-                    eprintln!("[proxy_intercept] fatal: {e}");
-                    sentry::capture_message(
-                        &format!("proxy_intercept fatal error: {e}"),
-                        sentry::Level::Fatal,
-                    );
+                match run(token_slot).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        // Port is already bound. If /health responds over HTTP, an
+                        // existing Headroom proxy owns the port (single-instance
+                        // plugin should normally prevent this, but a crashed or
+                        // still-exiting prior process can leave it held). Treat
+                        // that as benign. Otherwise the port is foreign and we
+                        // escalate to Sentry.
+                        if probe_existing_intercept().await {
+                            eprintln!(
+                                "[proxy_intercept] port {INTERCEPT_PORT} already owned by existing Headroom proxy; exiting thread"
+                            );
+                        } else {
+                            eprintln!(
+                                "[proxy_intercept] fatal: {e} (port {INTERCEPT_PORT} held by foreign process)"
+                            );
+                            sentry::capture_message(
+                                &format!(
+                                    "proxy_intercept fatal error: {e} (port {INTERCEPT_PORT} held by foreign process)"
+                                ),
+                                sentry::Level::Fatal,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[proxy_intercept] fatal: {e}");
+                        sentry::capture_message(
+                            &format!("proxy_intercept fatal error: {e}"),
+                            sentry::Level::Fatal,
+                        );
+                    }
                 }
             });
         })
@@ -103,6 +130,26 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
     }
 
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+/// Return true if something at 127.0.0.1:INTERCEPT_PORT answers /health with a
+/// response that begins with `HTTP/` — that matches both our intercept (which
+/// forwards to the python backend and may return 200 or 502) and no realistic
+/// foreign process we expect to encounter on this port.
+async fn probe_existing_intercept() -> bool {
+    let connect = TcpStream::connect(("127.0.0.1", INTERCEPT_PORT));
+    let Ok(Ok(mut stream)) = tokio::time::timeout(PROBE_TIMEOUT, connect).await else {
+        return false;
+    };
+    let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    let Ok(Ok(n)) = tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut buf)).await else {
+        return false;
+    };
+    buf.get(..n).is_some_and(|b| b.starts_with(b"HTTP/"))
 }
 
 /// Read through the end of the HTTP headers from `stream` into `buf`.

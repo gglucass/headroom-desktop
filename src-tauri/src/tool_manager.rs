@@ -539,69 +539,52 @@ impl ToolManager {
         disabled_markers: &[&str],
     ) -> Option<bool> {
         let path = self.latest_tool_log_path(tool_id)?;
-        let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+        self.scan_file_for_marker_state_cached(tool_id, &path, enabled_marker, disabled_markers)
+    }
+
+    fn scan_file_for_marker_state_cached(
+        &self,
+        cache_key: &str,
+        path: &Path,
+        enabled_marker: &str,
+        disabled_markers: &[&str],
+    ) -> Option<bool> {
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
 
         {
-            let cache = self
-                .log_marker_cache
-                .lock()
-                ;
+            let cache = self.log_marker_cache.lock();
             if let Some(cached) = cache.as_ref() {
-                if cached.tool_id == tool_id && cached.path == path && cached.modified == modified {
+                if cached.tool_id == cache_key && cached.path == path && cached.modified == modified
+                {
                     return cached.result;
                 }
             }
         }
 
-        let content = std::fs::read_to_string(&path).ok()?;
+        let content = std::fs::read_to_string(path).ok()?;
 
+        let mut result: Option<bool> = None;
         for line in content.lines().rev() {
             let lowered = line.to_ascii_lowercase();
             if lowered.contains(enabled_marker) {
-                let result = Some(true);
-                let mut cache = self
-                    .log_marker_cache
-                    .lock()
-                    ;
-                *cache = Some(ToolLogMarkerCache {
-                    tool_id: tool_id.to_string(),
-                    path,
-                    modified,
-                    result,
-                });
-                return result;
+                result = Some(true);
+                break;
             }
-            if disabled_markers
-                .iter()
-                .any(|marker| lowered.contains(marker))
-            {
-                let result = Some(false);
-                let mut cache = self
-                    .log_marker_cache
-                    .lock()
-                    ;
-                *cache = Some(ToolLogMarkerCache {
-                    tool_id: tool_id.to_string(),
-                    path,
-                    modified,
-                    result,
-                });
-                return result;
+            if disabled_markers.iter().any(|marker| lowered.contains(marker)) {
+                result = Some(false);
+                break;
             }
         }
 
-        let mut cache = self
-            .log_marker_cache
-            .lock()
-            ;
+        let mut cache = self.log_marker_cache.lock();
         *cache = Some(ToolLogMarkerCache {
-            tool_id: tool_id.to_string(),
-            path,
+            tool_id: cache_key.to_string(),
+            path: path.to_path_buf(),
             modified,
-            result: None,
+            result,
         });
 
-        None
+        result
     }
 
     pub fn headroom_mcp_configured(&self) -> Option<bool> {
@@ -627,6 +610,25 @@ impl ToolManager {
     }
 
     pub fn headroom_kompress_enabled(&self) -> Option<bool> {
+        // The `headroom` Python package attaches a RotatingFileHandler to its
+        // `headroom` root logger with `propagate = False` (see helpers.py:
+        // `_setup_file_logging`). Proxy-logger INFO lines — including the
+        // `Kompress: ENABLED/not installed/disabled` startup markers — go to
+        // `~/.headroom/logs/proxy.log` only, never to the stderr stream that
+        // our Tauri-spawned log captures. Probe that file first; fall back to
+        // the spawn-time tool log (covers older headroom versions that do
+        // propagate to stderr).
+        if let Some(path) = headroom_propagated_proxy_log_path() {
+            if let Some(state) = self.scan_file_for_marker_state_cached(
+                "headroom-proxy-log",
+                &path,
+                "kompress: enabled",
+                &["kompress: not installed", "kompress: disabled"],
+            ) {
+                return Some(state);
+            }
+        }
+
         self.latest_tool_log_marker_state(
             "headroom",
             "kompress: enabled",
@@ -739,14 +741,14 @@ impl ToolManager {
     pub fn repair_stale_requirements(&self) -> Result<()> {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
-        run_python_command(
+        run_pip_install_with_retries(
             &self.runtime.managed_python(),
             &[
                 "-m",
                 "pip",
                 "install",
                 "--timeout",
-                "60",
+                "180",
                 "--retries",
                 "10",
                 "--extra-index-url",
@@ -1031,14 +1033,14 @@ impl ToolManager {
             }
         };
 
-        run_python_command(
+        run_pip_install_with_retries(
             &self.runtime.managed_python(),
             &[
                 "-m",
                 "pip",
                 "install",
                 "--timeout",
-                "60",
+                "180",
                 "--retries",
                 "10",
                 "--find-links",
@@ -1059,14 +1061,14 @@ impl ToolManager {
         } else {
             headroom_spec.clone()
         };
-        run_python_command(
+        run_pip_install_with_retries(
             &self.runtime.managed_python(),
             &[
                 "-m",
                 "pip",
                 "install",
                 "--timeout",
-                "60",
+                "180",
                 "--retries",
                 "10",
                 "--extra-index-url",
@@ -1386,6 +1388,16 @@ fn headroom_entrypoint_startup_args() -> Vec<&'static str> {
     vec!["proxy", "--port", HEADROOM_PROXY_PORT]
 }
 
+fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let path = PathBuf::from(home).join(".headroom").join("logs").join("proxy.log");
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 struct DownloadArtifact {
     url: String,
     sha256: Option<&'static str>,
@@ -1701,6 +1713,36 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
 
 fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
+}
+
+/// Runs a pip install invocation with retries on transient failures.
+///
+/// pip's own `--retries` flag only covers connection establishment, not
+/// mid-stream read timeouts, so a single TCP stall during a wheel download
+/// can fail the whole bootstrap (see Sentry bootstrap_failed reports). We
+/// retry the full invocation; pip's cachecontrol layer persists partial
+/// responses so retries resume cheaply instead of redownloading from zero.
+fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFFS_SECS: &[u64] = &[2, 5];
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match run_python_command(python, args, cwd) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                eprintln!(
+                    "pip install attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, err
+                );
+                last_err = Some(err);
+                if attempt < MAX_ATTEMPTS {
+                    let idx = (attempt as usize - 1).min(BACKOFFS_SECS.len() - 1);
+                    std::thread::sleep(std::time::Duration::from_secs(BACKOFFS_SECS[idx]));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt was made"))
 }
 
 fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {

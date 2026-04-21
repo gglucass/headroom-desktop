@@ -2705,6 +2705,11 @@ details[open] .optimize-minimal__details summary::after {
   color: #c4b8ae;
 }
 
+.runtime-status__indicator--unknown {
+  color: #a89f95;
+  opacity: 0.7;
+}
+
 .runtime-status__summary {
   margin: 2px 0 0;
   font-size: var(--text-xs);
@@ -3429,6 +3434,10 @@ html.window-hiding {
 
   .runtime-status__indicator--off {
     color: rgba(242, 237, 232, 0.3);
+  }
+
+  .runtime-status__indicator--unknown {
+    color: rgba(242, 237, 232, 0.4);
   }
 
   /* Chart */
