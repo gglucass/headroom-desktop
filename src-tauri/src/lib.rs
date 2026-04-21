@@ -1191,6 +1191,10 @@ pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Second launch: focus the existing window and exit the new process.
+            let _ = show_launcher_window(app);
+        }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .args([AUTOSTART_LAUNCH_ARG])
