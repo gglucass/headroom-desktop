@@ -198,7 +198,7 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 
 Three constants in [`src-tauri/src/tool_manager.rs`](src-tauri/src/tool_manager.rs) control the pin:
 
-- `HEADROOM_PINNED_VERSION` — the version string (e.g. `"0.6.5"`). Must match the wheel URL.
+- `HEADROOM_PINNED_VERSION` — the version string (e.g. `"0.8.2"`). Must match the wheel URL.
 - `HEADROOM_PINNED_WHEEL_URL` — the exact PyPI wheel URL to download.
 - `HEADROOM_PINNED_SHA256` — the wheel's SHA-256, verified after download.
 

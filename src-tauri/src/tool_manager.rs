@@ -22,9 +22,9 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.6.5";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/bb/a7/5f734e2436f9458da501484f5cc41c0838f1169618e09c009f62f732305e/headroom_ai-0.6.5-py3-none-any.whl";
-const HEADROOM_PINNED_SHA256: &str = "6154db6fa0c5614560bf801401b991180cf414537d694305cd9e9439b1cf41f8";
+const HEADROOM_PINNED_VERSION: &str = "0.8.2";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/de/93/9f96df0c50416ef9c7bbfbee7bf2f55342d075801e2db16d728043cf2cd4/headroom_ai-0.8.2-py3-none-any.whl";
+const HEADROOM_PINNED_SHA256: &str = "629ee9eb302a69fea99c64b57fde4f54b24108509113e1c3d0f63aee4dbc0ed9";
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
@@ -1911,7 +1911,9 @@ mod tests {
     fn linux_bootstrap_requirements_skip_optional_memory_and_ml_packages() {
         let linux_requirements = bootstrap_requirements_lock_for_target("linux");
 
+        assert!(linux_requirements.contains("ast-grep-cli=="));
         assert!(!linux_requirements.contains("hnswlib=="));
+        assert!(linux_requirements.contains("opentelemetry-api=="));
         assert!(!linux_requirements.contains("torch=="));
         assert!(!linux_requirements.contains("sentence-transformers=="));
         assert!(linux_requirements.contains("mcp=="));

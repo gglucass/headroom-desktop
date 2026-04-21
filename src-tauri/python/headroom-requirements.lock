@@ -1,5 +1,5 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: Headroom managed runtime freeze captured on 2026-04-20 for headroom-ai[all]==0.6.5.
+# Source: Headroom managed runtime freeze captured on 2026-04-21 for headroom-ai[all]==0.8.2.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
@@ -8,6 +8,7 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anthropic==0.96.0
 anyio==4.13.0
+ast-grep-cli==0.42.1
 attrs==26.1.0
 babel==2.18.0
 certifi==2026.2.25
@@ -43,7 +44,7 @@ httpx==0.28.1
 httpx-sse==0.4.3
 huggingface_hub==1.11.0
 hyperframe==6.1.0
-idna==3.11
+idna==3.12
 importlib_metadata==8.7.1
 Jinja2==3.1.6
 jiter==0.14.0
@@ -78,19 +79,19 @@ opentelemetry-exporter-otlp-proto-http==1.41.0
 opentelemetry-proto==1.41.0
 opentelemetry-sdk==1.41.0
 opentelemetry-semantic-conventions==0.62b0
-packaging==26.1
+packaging==24.2
 pandas==3.0.2
 pathvalidate==3.3.1
 pillow==12.2.0
 portalocker==3.2.0
 propcache==0.4.1
 protobuf==6.33.6
-pyarrow==23.0.1
+pyarrow==24.0.0
 pyclipper==1.4.0
 pycparser==3.0
-pydantic==2.13.2
-pydantic-settings==2.13.1
-pydantic_core==2.46.2
+pydantic==2.13.3
+pydantic-settings==2.14.0
+pydantic_core==2.46.3
 Pygments==2.20.0
 PyJWT==2.12.1
 pytablewriter==1.2.1
@@ -141,9 +142,10 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzlocal==5.3.1
 urllib3==2.6.3
-uvicorn==0.44.0
+uvicorn==0.45.0
 watchdog==6.0.0
 websockets==16.0
+wheel==0.46.3
 word2number==1.1
 xxhash==3.6.0
 yarl==1.23.0
