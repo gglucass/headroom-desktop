@@ -703,6 +703,11 @@ export default function App() {
     proxyReachable: false,
     memoryAvailable: false
   });
+  // Flipped true after the first activity feed fetch attempt resolves (success
+  // OR failure). Before this the feed holds a placeholder value whose
+  // `proxyReachable: false` would falsely render the "proxy unreachable"
+  // empty state and make the tab feel like it's already in an error state.
+  const [activityFeedLoaded, setActivityFeedLoaded] = useState(false);
   // Tray window focus proxies for visibility: the window auto-hides on blur
   // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
   const [trayWindowFocused, setTrayWindowFocused] = useState(true);
@@ -1437,6 +1442,31 @@ export default function App() {
     return () => unlisten?.();
   }, [windowLabel]);
 
+  // Pre-warm Optimize + Activity data the moment the tray gains focus, so
+  // switching tabs reveals already-populated content instead of triggering
+  // a fresh ~500ms Python subprocess spawn and layout flash. The tab-scoped
+  // effects below still run and keep data fresh — they just hit the Rust
+  // cache now instead of spawning a cold Python process.
+  useEffect(() => {
+    if (windowLabel !== "main" || !trayWindowFocused) {
+      return;
+    }
+    void refreshClaudeProjects();
+    void refreshHeadroomLearnPrereq();
+    invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
+      .then((next) => {
+        setActivityFeed(next);
+        setActivityFeedError(null);
+      })
+      .catch(() => {
+        // Swallow: the tab-active poll will surface any real error once the
+        // user opens Activity. Pre-warm failures shouldn't flash a banner.
+      })
+      .finally(() => {
+        setActivityFeedLoaded(true);
+      });
+  }, [windowLabel, trayWindowFocused]);
+
   useEffect(() => {
     if (activeView !== "notifications" || !trayWindowFocused) {
       return;
@@ -1454,6 +1484,10 @@ export default function App() {
           setActivityFeedError(
             err instanceof Error ? err.message : "Could not load activity feed."
           );
+        })
+        .finally(() => {
+          if (!active) return;
+          setActivityFeedLoaded(true);
         });
     };
     refreshFeed();
@@ -3718,7 +3752,7 @@ export default function App() {
                       Claude Code routing, and RTK activity tracking.
                     </p>
                   </div>
-                ) : claudeProjectsBusy ? (
+                ) : claudeProjectsBusy && claudeProjects.length === 0 ? (
                   <p className="loading-copy">Loading projects…</p>
                 ) : claudeProjects.length === 0 ? (
                   <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
@@ -3810,14 +3844,12 @@ export default function App() {
                           project.activeDaysSinceLastLearn >= 2;
                         const learnMeta = (() => {
                           const base = formatLearnStatus(project);
-                          const patterns =
-                            project.lastLearnPatternCount != null
-                              ? `${project.lastLearnPatternCount} learning${project.lastLearnPatternCount === 1 ? "" : "s"} added`
-                              : null;
+                          // Pattern count is already shown by the "X learnings applied"
+                          // pill; repeating it here is redundant.
                           const stalePart = suggestRerun
                             ? `${project.activeDaysSinceLastLearn} active day${project.activeDaysSinceLastLearn === 1 ? "" : "s"} since · consider rerunning`
                             : null;
-                          return [base, patterns, stalePart].filter(Boolean).join(" · ");
+                          return [base, stalePart].filter(Boolean).join(" · ");
                         })();
                         const projectResultTone = headroomLearnStatus.success === true
                           ? "success"
@@ -3937,6 +3969,8 @@ export default function App() {
             key={activeView === "notifications" ? "notifications" : "hidden"}
             feed={activityFeed}
             error={activityFeedError}
+            loaded={activityFeedLoaded}
+            projectPaths={claudeProjects.map((p) => p.projectPath)}
           />
         </div>
 

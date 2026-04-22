@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppliedPatterns,
@@ -277,31 +283,46 @@ function LiveRow({
   onDelete: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const canExpand = row.content.length > 140 || row.content.includes("\n");
+  const canExpand = row.content.length > 80 || row.content.includes("\n");
+  const toggle = () => {
+    if (canExpand) setExpanded((prev) => !prev);
+  };
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
+    if (!canExpand) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggle();
+    }
+  };
+  const onDeleteClick = (e: ReactMouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    onDelete();
+  };
   return (
-    <li className="optimize-panel__row">
+    <li
+      className={
+        "optimize-panel__row" +
+        (canExpand ? " optimize-panel__row--clickable" : "") +
+        (expanded ? " is-expanded" : "")
+      }
+      role={canExpand ? "button" : undefined}
+      tabIndex={canExpand ? 0 : undefined}
+      aria-expanded={canExpand ? expanded : undefined}
+      onClick={toggle}
+      onKeyDown={onKeyDown}
+    >
       <div className="optimize-panel__row-main">
         <p
           className={
             expanded
               ? "activity-feed__content"
-              : "activity-feed__content activity-feed__content--clamped"
+              : "activity-feed__content activity-feed__content--clamped-one"
           }
           title={canExpand && !expanded ? row.content : undefined}
         >
           {row.content}
         </p>
-        {canExpand ? (
-          <button
-            type="button"
-            className="activity-feed__expand"
-            onClick={() => setExpanded((prev) => !prev)}
-          >
-            {expanded ? "Show less" : "Show more"}
-          </button>
-        ) : null}
         <div className="optimize-panel__row-meta">
-          <span>importance {row.importance.toFixed(2)}</span>
           <span>evidence ×{row.evidenceCount}</span>
         </div>
       </div>
@@ -309,7 +330,7 @@ function LiveRow({
         type="button"
         className="optimize-panel__delete"
         disabled={busy}
-        onClick={onDelete}
+        onClick={onDeleteClick}
       >
         {busy ? "…" : "Delete"}
       </button>

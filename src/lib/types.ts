@@ -270,6 +270,7 @@ export interface MemoryFeedEvent {
   scope: string;
   content: string;
   importance: number;
+  evidenceCount: number;
 }
 
 export interface LiveLearning {

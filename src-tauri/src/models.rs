@@ -352,6 +352,7 @@ pub struct MemoryFeedEvent {
     pub scope: String,
     pub content: String,
     pub importance: f64,
+    pub evidence_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

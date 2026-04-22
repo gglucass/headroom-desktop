@@ -50,6 +50,7 @@ function memory(event: Partial<MemoryFeedEvent> = {}): ActivityEvent {
       scope: "user",
       content: "user prefers tabs over spaces",
       importance: 0.85,
+      evidenceCount: 2,
       ...event
     }
   };
@@ -136,13 +137,35 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("something:new:format");
   });
 
-  it("renders a memory row with scope, importance, and content", () => {
+  it("renders a memory row with content", () => {
     const feed: ActivityFeedResponse = { ...baseFeed, events: [memory()] };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Learning");
     expect(markup).toContain("user prefers tabs over spaces");
-    expect(markup).toContain("importance 0.85");
-    expect(markup).toContain(">user<");
+  });
+
+  it("hides learnings below the evidence threshold", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [memory({ id: "weak", content: "noisy one-off", evidenceCount: 1 })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).not.toContain("noisy one-off");
+    expect(markup).toContain("No requests yet");
+  });
+
+  it("coalesces consecutive transformations into a grouped summary row", () => {
+    const events: ActivityEvent[] = [
+      transformation({ requestId: "a", timestamp: "2026-04-21T10:02:00Z", tokensSaved: 100, savingsPercent: 10 }),
+      transformation({ requestId: "b", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 200, savingsPercent: 20 }),
+      transformation({ requestId: "c", timestamp: "2026-04-21T10:00:00Z", tokensSaved: 300, savingsPercent: 30 })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Compression × 3");
+    expect(markup).toContain("Saved 600 tokens (20.0% avg)");
+    const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+    expect(rowCount).toBe(1);
   });
 
   it("renders both kinds in the order they appear in the feed", () => {
@@ -348,14 +371,63 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__scope");
   });
 
-  it("falls back to scope display when scope is not project-prefixed", () => {
+  it("omits the scope chip when scope is not project-prefixed", () => {
+    // Memory scope/entity_refs are absent from the Python export today, so the
+    // fallback chip was always literal "unknown" noise. We drop it entirely and
+    // only render a project chip when there's actually a project path.
     const feed: ActivityFeedResponse = {
       ...baseFeed,
       events: [memory({ scope: "user" })]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("activity-feed__scope");
+    expect(markup).not.toContain("activity-feed__scope");
     expect(markup).not.toContain("activity-feed__project");
+  });
+
+  it("attributes a memory to a known project by substring-matching content", () => {
+    // Mirrors `pattern_matches_project` in the Rust backend: memories carry no
+    // formal project link, so the project chip is inferred from a path match
+    // on the memory's content.
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        memory({
+          scope: "user",
+          content:
+            "File `/Users/u/Code/demo-repo/src/main.rs` does not exist. The correct path is ..."
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed
+        feed={feed}
+        error={null}
+        projectPaths={["/Users/u/Code/other", "/Users/u/Code/demo-repo"]}
+      />
+    );
+    expect(markup).toContain("activity-feed__project");
+    expect(markup).toContain(">demo-repo<");
+  });
+
+  it("picks the longest matching project path when multiple match", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        memory({
+          scope: "user",
+          content: "Error in `/Users/u/Code/demo/packages/web/src/index.ts`"
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed
+        feed={feed}
+        error={null}
+        projectPaths={["/Users/u/Code/demo", "/Users/u/Code/demo/packages/web"]}
+      />
+    );
+    expect(markup).toContain(">web<");
+    expect(markup).not.toContain(">demo<");
   });
 
   it("renders a workspace badge on a transformation when workspace is set", () => {
@@ -402,12 +474,13 @@ describe("ActivityFeed", () => {
   });
 
   it("paginates at 10 events per page and shows navigation when there are more", () => {
+    // Memory rows don't coalesce (each has distinct content), so they're the
+    // right fixture for exercising pagination behavior.
     const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) =>
-      transformation({ requestId: `req-${i}`, timestamp: `2026-04-21T10:${String(i).padStart(2, "0")}:00Z` })
+      memory({ id: `mem-${i}`, createdAt: `2026-04-21T10:${String(i).padStart(2, "0")}:00Z` })
     );
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    // First page: 10 rows.
     const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
     expect(rowCount).toBe(10);
     expect(markup).toContain("Page 1 of 3");
@@ -418,7 +491,7 @@ describe("ActivityFeed", () => {
 
   it("hides pagination when there are 10 or fewer events", () => {
     const events: ActivityEvent[] = Array.from({ length: 7 }, (_, i) =>
-      transformation({ requestId: `req-${i}`, timestamp: `2026-04-21T10:0${i}:00Z` })
+      memory({ id: `mem-${i}`, createdAt: `2026-04-21T10:0${i}:00Z` })
     );
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);

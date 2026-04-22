@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import { formatDateTime } from "../lib/dashboardHelpers";
 import type {
@@ -19,28 +19,51 @@ import type {
 interface ActivityFeedProps {
   feed: ActivityFeedResponse;
   error: string | null;
+  // True after the first fetch attempt resolves. Before that the `feed`
+  // prop is a default placeholder whose `proxyReachable: false` would
+  // otherwise render the "proxy unreachable" state on initial load.
+  loaded?: boolean;
+  // Paths of known Claude projects, used to heuristically associate a memory
+  // row with a project by substring match on the memory's content. Mirrors
+  // the logic in `pattern_matches_project` in the Rust backend. Memories do
+  // not carry an explicit project link today (scope/entity_refs are absent
+  // from the Python export), so content-matching is the only signal.
+  projectPaths?: string[];
 }
 
 const PAGE_SIZE = 10;
+const MIN_MEMORY_EVIDENCE = 2;
 
-export function ActivityFeed({ feed, error }: ActivityFeedProps) {
+export function ActivityFeed({
+  feed,
+  error,
+  loaded = true,
+  projectPaths = []
+}: ActivityFeedProps) {
   const [page, setPage] = useState(0);
-  const totalPages = Math.max(1, Math.ceil(feed.events.length / PAGE_SIZE));
+  const visibleEvents = coalesceFeed(filterLowSignal(feed.events));
+  const totalPages = Math.max(1, Math.ceil(visibleEvents.length / PAGE_SIZE));
   const clampedPage = Math.min(page, totalPages - 1);
   const start = clampedPage * PAGE_SIZE;
-  const pageEvents = feed.events.slice(start, start + PAGE_SIZE);
+  const pageEvents = visibleEvents.slice(start, start + PAGE_SIZE);
 
   return (
     <>
       <header className="activity-feed__header">
-        <h2>Live activity</h2>
+        <h2>Activity</h2>
         <p className="activity-feed__subtitle">
           Compressions, learnings, RTK saves, milestones, and records — everything Headroom is
-          doing, as it happens.
+          doing.
         </p>
       </header>
       {error ? (
         <p className="loading-copy">{error}</p>
+      ) : !loaded ? (
+        <div className="activity-feed__skeleton" aria-hidden="true">
+          <div className="activity-feed__skeleton-row" />
+          <div className="activity-feed__skeleton-row" />
+          <div className="activity-feed__skeleton-row" />
+        </div>
       ) : !feed.proxyReachable ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
@@ -51,7 +74,7 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
             Headroom will reconnect as soon as the proxy is back online.
           </p>
         </div>
-      ) : feed.events.length === 0 ? (
+      ) : visibleEvents.length === 0 ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon" aria-hidden="true">
             <Bell weight="duotone" />
@@ -65,8 +88,12 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
       ) : (
         <>
           <ul className="activity-feed__list">
-            {pageEvents.map((event, index) => (
-              <ActivityRow key={activityKey(event, start + index)} event={event} />
+            {pageEvents.map((row, index) => (
+              <FeedRowItem
+                key={feedRowKey(row, start + index)}
+                row={row}
+                projectPaths={projectPaths}
+              />
             ))}
           </ul>
           {totalPages > 1 ? (
@@ -80,7 +107,7 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
                 ← Prev
               </button>
               <span className="activity-feed__page-indicator">
-                Page {clampedPage + 1} of {totalPages} · {feed.events.length} total
+                Page {clampedPage + 1} of {totalPages} · {visibleEvents.length} total
               </span>
               <button
                 type="button"
@@ -98,7 +125,76 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
   );
 }
 
-function activityKey(event: ActivityEvent, index: number): string {
+type FeedRow =
+  | { type: "single"; event: ActivityEvent }
+  | { type: "transformationGroup"; events: TransformationFeedEvent[] }
+  | { type: "rtkGroup"; events: RtkBatchEvent[] };
+
+// Memory is intentionally NOT coalesced — each entry has distinct content
+// worth seeing individually (and is clamped to one line with click-to-expand).
+// Celebratory/summary events (milestones, records, streaks, recaps) are rare
+// enough that coalescing them isn't worth the lost specificity.
+const COALESCE_KINDS: ReadonlySet<ActivityEvent["kind"]> = new Set([
+  "transformation",
+  "rtkBatch"
+]);
+
+function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
+  return events.filter((event) => {
+    if (event.kind === "memory") {
+      return event.data.evidenceCount >= MIN_MEMORY_EVIDENCE;
+    }
+    return true;
+  });
+}
+
+function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
+  const out: FeedRow[] = [];
+  let i = 0;
+  while (i < events.length) {
+    const event = events[i];
+    if (!COALESCE_KINDS.has(event.kind)) {
+      out.push({ type: "single", event });
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    while (j < events.length && events[j].kind === event.kind) {
+      j++;
+    }
+    const runLength = j - i;
+    if (runLength === 1) {
+      out.push({ type: "single", event });
+    } else if (event.kind === "transformation") {
+      out.push({
+        type: "transformationGroup",
+        events: events.slice(i, j).map((e) => (e as Extract<ActivityEvent, { kind: "transformation" }>).data)
+      });
+    } else if (event.kind === "rtkBatch") {
+      out.push({
+        type: "rtkGroup",
+        events: events.slice(i, j).map((e) => (e as Extract<ActivityEvent, { kind: "rtkBatch" }>).data)
+      });
+    } else {
+      out.push({ type: "single", event });
+    }
+    i = j;
+  }
+  return out;
+}
+
+function feedRowKey(row: FeedRow, index: number): string {
+  if (row.type === "single") {
+    return singleKey(row.event, index);
+  }
+  if (row.type === "transformationGroup") {
+    const first = row.events[0];
+    return `tg-${first.requestId ?? first.timestamp ?? index}-${row.events.length}`;
+  }
+  return `rg-${row.events[0].observedAt}-${row.events.length}`;
+}
+
+function singleKey(event: ActivityEvent, index: number): string {
   switch (event.kind) {
     case "transformation":
       return `t-${event.data.requestId ?? event.data.timestamp ?? index}`;
@@ -125,12 +221,19 @@ function activityKey(event: ActivityEvent, index: number): string {
   }
 }
 
-function ActivityRow({ event }: { event: ActivityEvent }) {
+function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string[] }) {
+  if (row.type === "transformationGroup") {
+    return <TransformationGroupRow events={row.events} />;
+  }
+  if (row.type === "rtkGroup") {
+    return <RtkGroupRow events={row.events} />;
+  }
+  const event = row.event;
   switch (event.kind) {
     case "transformation":
       return <TransformationRow event={event.data} />;
     case "memory":
-      return <MemoryRow event={event.data} />;
+      return <MemoryRow event={event.data} projectPaths={projectPaths} />;
     case "rtkBatch":
       return <RtkBatchRow event={event.data} />;
     case "milestone":
@@ -152,6 +255,50 @@ function ActivityRow({ event }: { event: ActivityEvent }) {
   }
 }
 
+function TransformationGroupRow({ events }: { events: TransformationFeedEvent[] }) {
+  const totalSaved = events.reduce((sum, e) => sum + (e.tokensSaved ?? 0), 0);
+  const avgPct =
+    events.reduce((sum, e) => sum + (e.savingsPercent ?? 0), 0) / events.length;
+  const latest = events[0];
+  return (
+    <li className="activity-feed__item activity-feed__item--transformation">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--transformation">
+          Compression × {events.length}
+        </span>
+        <span className="activity-feed__time">{formatDateTime(latest.timestamp)}</span>
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          Saved {totalSaved.toLocaleString()} tokens ({avgPct.toFixed(1)}% avg)
+        </strong>
+      </div>
+    </li>
+  );
+}
+
+function RtkGroupRow({ events }: { events: RtkBatchEvent[] }) {
+  const commandsDelta = events.reduce((sum, e) => sum + e.commandsDelta, 0);
+  const tokensDelta = events.reduce((sum, e) => sum + e.tokensSavedDelta, 0);
+  const latest = events[0];
+  return (
+    <li className="activity-feed__item activity-feed__item--rtk">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--rtk">
+          RTK × {events.length}
+        </span>
+        <span className="activity-feed__time">{formatDateTime(latest.observedAt)}</span>
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          +{commandsDelta.toLocaleString()} command{commandsDelta === 1 ? "" : "s"}, saved{" "}
+          {tokensDelta.toLocaleString()} tokens
+        </strong>
+      </div>
+    </li>
+  );
+}
+
 function projectBasename(scope: string): string | null {
   if (!scope.startsWith("project:")) return null;
   const path = scope.slice("project:".length);
@@ -163,6 +310,29 @@ function workspaceBasename(path: string | null | undefined): string | null {
   if (!path) return null;
   const segments = path.split("/").filter(Boolean);
   return segments.length > 0 ? segments[segments.length - 1] : null;
+}
+
+const basenameOf = workspaceBasename;
+
+// Heuristic project attribution for memories without explicit scope/entity_refs.
+// Mirrors `pattern_matches_project` in src-tauri/src/lib.rs: a memory "belongs
+// to" a project if its content contains the project's root path followed by a
+// boundary character (/, ", or `). Longest match wins so `/foo/bar` beats `/foo`
+// when both are candidates.
+function matchProjectPath(content: string, projectPaths: string[]): string | null {
+  let best: string | null = null;
+  for (const path of projectPaths) {
+    const root = path.replace(/\/+$/, "");
+    if (!root) continue;
+    if (
+      content.includes(root + "/") ||
+      content.includes(root + "\"") ||
+      content.includes(root + "`")
+    ) {
+      if (!best || root.length > best.length) best = root;
+    }
+  }
+  return best;
 }
 
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
@@ -308,45 +478,63 @@ function formatTransform(raw: string): { label: string; title: string } {
   return { label: raw, title: raw };
 }
 
-function MemoryRow({ event }: { event: MemoryFeedEvent }) {
+function MemoryRow({
+  event,
+  projectPaths
+}: {
+  event: MemoryFeedEvent;
+  projectPaths: string[];
+}) {
   const [expanded, setExpanded] = useState(false);
-  // Heuristic: show the toggle if the content is long enough to plausibly
-  // wrap beyond two lines at typical widths.
-  const canExpand = event.content.length > 140 || event.content.includes("\n");
-  const project = projectBasename(event.scope);
+  // Prefer an explicit project scope (`project:/path`) if the backend ever
+  // emits one; fall back to a substring match against known project paths.
+  // Mirrors `pattern_matches_project` in the Rust backend — memories today
+  // carry no formal project link, so this content-based heuristic is the
+  // only signal available.
+  const scopeProject = projectBasename(event.scope);
+  const matchedPath = scopeProject ? null : matchProjectPath(event.content, projectPaths);
+  const project = scopeProject ?? (matchedPath ? basenameOf(matchedPath) : null);
+  const canExpand = event.content.length > 60 || event.content.includes("\n");
+  const toggle = () => {
+    if (canExpand) setExpanded((prev) => !prev);
+  };
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
+    if (!canExpand) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggle();
+    }
+  };
   return (
-    <li className="activity-feed__item activity-feed__item--memory">
+    <li
+      className={
+        "activity-feed__item activity-feed__item--memory" +
+        (canExpand ? " activity-feed__item--clickable" : "") +
+        (expanded ? " is-expanded" : "")
+      }
+      role={canExpand ? "button" : undefined}
+      tabIndex={canExpand ? 0 : undefined}
+      aria-expanded={canExpand ? expanded : undefined}
+      onClick={toggle}
+      onKeyDown={onKeyDown}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--memory">Learning</span>
         <span className="activity-feed__time">{formatDateTime(event.createdAt)}</span>
         {project ? (
           <span className="activity-feed__project">{project}</span>
-        ) : (
-          <span className="activity-feed__scope">{event.scope}</span>
-        )}
-        <span className="activity-feed__importance">
-          importance {event.importance.toFixed(2)}
-        </span>
+        ) : null}
       </div>
       <p
         className={
           expanded
             ? "activity-feed__content"
-            : "activity-feed__content activity-feed__content--clamped"
+            : "activity-feed__content activity-feed__content--clamped-one"
         }
         title={canExpand && !expanded ? event.content : undefined}
       >
         {event.content}
       </p>
-      {canExpand ? (
-        <button
-          type="button"
-          className="activity-feed__expand"
-          onClick={() => setExpanded((prev) => !prev)}
-        >
-          {expanded ? "Show less" : "Show more"}
-        </button>
-      ) : null}
     </li>
   );
 }

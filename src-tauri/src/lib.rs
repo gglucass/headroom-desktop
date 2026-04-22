@@ -2042,18 +2042,26 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
         created_at: Option<String>,
         #[serde(default)]
         importance: Option<f64>,
+        #[serde(default)]
+        metadata: serde_json::Value,
     }
     let raw: Vec<RawMemory> =
         serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
     let mut events: Vec<MemoryFeedEvent> = raw
         .into_iter()
         .filter_map(|m| {
+            let evidence_count = m
+                .metadata
+                .get("evidence_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
             Some(MemoryFeedEvent {
                 id: m.id,
                 created_at: normalize_utc_timestamp(&m.created_at?)?,
                 scope: m.scope.unwrap_or_else(|| "unknown".into()),
                 content: m.content,
                 importance: m.importance.unwrap_or(0.0),
+                evidence_count,
             })
         })
         .collect();
@@ -3767,6 +3775,7 @@ mod tests {
             scope: "user".into(),
             content: format!("memory {id}"),
             importance: 0.5,
+            evidence_count: 1,
         }
     }
 

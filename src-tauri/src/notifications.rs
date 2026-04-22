@@ -344,6 +344,7 @@ mod tests {
                 scope: "user".into(),
                 content: "x".into(),
                 importance: 0.5,
+                evidence_count: 1,
             }),
         ];
         for ev in candidates.iter() {

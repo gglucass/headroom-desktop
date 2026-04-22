@@ -1170,7 +1170,11 @@ impl AppState {
     }
 
     pub fn dashboard(&self) -> DashboardState {
-        self.dashboard_with_pending_milestones().0
+        // Callers that take this read-only path (tray updater, bootstrap
+        // finalize, account activation) must NOT drain pending milestones —
+        // doing so silently consumes crossings before `get_dashboard_state`
+        // can fire the aptabase event and the in-app notification.
+        self.build_dashboard(false).0
     }
 
     /// Observe a batch of transformations into ActivityFacts (for feed
@@ -1261,6 +1265,10 @@ impl AppState {
     }
 
     pub fn dashboard_with_pending_milestones(&self) -> (DashboardState, PendingMilestones) {
+        self.build_dashboard(true)
+    }
+
+    fn build_dashboard(&self, drain_pending_milestones: bool) -> (DashboardState, PendingMilestones) {
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
         let recent_usage = self
@@ -1288,7 +1296,7 @@ impl AppState {
 
         if let Some(stats) = stats.as_ref() {
             if let Some((updated, updated_daily, updated_hourly, milestones)) =
-                self.record_savings_snapshot(stats)
+                self.record_savings_snapshot(stats, drain_pending_milestones)
             {
                 snapshot = updated;
                 daily_savings = updated_daily;
@@ -1554,6 +1562,7 @@ impl AppState {
     fn record_savings_snapshot(
         &self,
         stats: &HeadroomDashboardStats,
+        drain_pending_milestones: bool,
     ) -> Option<(
         SavingsTotalsSnapshot,
         Vec<DailySavingsPoint>,
@@ -1564,9 +1573,13 @@ impl AppState {
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
         let hourly_savings = tracker.hourly_savings();
-        let milestones = PendingMilestones {
-            token: tracker.take_pending_lifetime_token_milestones(),
-            usd: tracker.take_pending_lifetime_usd_milestones(),
+        let milestones = if drain_pending_milestones {
+            PendingMilestones {
+                token: tracker.take_pending_lifetime_token_milestones(),
+                usd: tracker.take_pending_lifetime_usd_milestones(),
+            }
+        } else {
+            PendingMilestones::default()
         };
         Some((snapshot, daily_savings, hourly_savings, milestones))
     }
@@ -4475,6 +4488,57 @@ mod tests {
             tracker.take_pending_lifetime_token_milestones(),
             vec![20_000_000]
         );
+    }
+
+    #[test]
+    fn dashboard_read_path_preserves_pending_milestones_for_analytics() {
+        // Regression guard: `state.dashboard()` (tray updater, bootstrap
+        // finalize, account activation) must not drain pending milestones.
+        // Only `dashboard_with_pending_milestones()` — the path that actually
+        // fires the aptabase event, pricing report, and in-app notification —
+        // may consume them. A prior refactor drained on every call, so the
+        // tray updater's 5s heartbeat silently ate ~50-100% of crossings.
+        let base_dir = temp_test_dir("headroom-milestone-preservation");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(1),
+            session_estimated_savings_usd: Some(1.0),
+            session_estimated_tokens_saved: Some(1_500_000),
+            session_savings_pct: Some(50.0),
+            session_actual_cost_usd: Some(0.5),
+            session_total_tokens_sent: Some(1_500_000),
+            savings_history: Vec::new(),
+        };
+
+        let (_, _, _, read_only) = state
+            .record_savings_snapshot(&stats, false)
+            .expect("snapshot");
+        assert!(
+            read_only.token.is_empty(),
+            "read-only path must not surface milestones"
+        );
+        assert!(read_only.usd.is_empty());
+
+        let (_, _, _, drained) = state
+            .record_savings_snapshot(&stats, true)
+            .expect("snapshot");
+        assert_eq!(
+            drained.token,
+            vec![100_000, 1_000_000],
+            "drain=true must surface milestones queued by the earlier read-only observe"
+        );
+
+        let (_, _, _, drained_again) = state
+            .record_savings_snapshot(&stats, true)
+            .expect("snapshot");
+        assert!(
+            drained_again.token.is_empty(),
+            "second drain finds nothing: milestones fire exactly once"
+        );
+        assert!(drained_again.usd.is_empty());
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 
     #[test]
