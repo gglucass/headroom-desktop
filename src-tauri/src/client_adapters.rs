@@ -446,10 +446,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     if dot_headroom.exists() {
         match std::fs::remove_dir_all(&dot_headroom) {
             Ok(_) => removed.push(dot_headroom.display().to_string()),
-            Err(err) => eprintln!(
-                "cleanup: removing {} failed: {err}",
-                dot_headroom.display()
-            ),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", dot_headroom.display()),
         }
     }
 
@@ -537,10 +534,7 @@ fn remove_macos_launch_agents() -> Vec<String> {
 
     // Bundle-id-style plist (tauri-plugin-autostart default) and the
     // "Headroom.plist" name some older builds shipped. Either can exist.
-    let candidates = [
-        "com.extraheadroom.headroom.plist",
-        "Headroom.plist",
-    ];
+    let candidates = ["com.extraheadroom.headroom.plist", "Headroom.plist"];
 
     for name in candidates {
         let path = launch_agents_dir.join(name);
@@ -1931,9 +1925,8 @@ mod tests {
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
         remove_managed_block, serialize_paths, shell_block_contains_in_files,
-        shell_block_contains_text_in_files, shell_double_quote,
-        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily,
+        shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
+        upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
     };
 
     #[test]
@@ -2139,8 +2132,12 @@ mod tests {
         let path = root.join(".zshrc");
         fs::write(&path, "export PATH=/usr/bin\n").expect("write shell file");
 
-        let first = upsert_managed_block(&path, "claude_code", "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767")
-            .expect("insert managed block");
+        let first = upsert_managed_block(
+            &path,
+            "claude_code",
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:6767",
+        )
+        .expect("insert managed block");
         assert!(first.0);
         assert!(first.1.is_some());
 
@@ -2192,32 +2189,24 @@ mod tests {
         )
         .expect("write shell file");
 
+        assert!(shell_block_contains_in_files(
+            &[path.clone()],
+            "claude_code",
+            "ANTHROPIC_BASE_URL",
+            "http://127.0.0.1:6767",
+        )
+        .expect("detect managed export"));
         assert!(
-            shell_block_contains_in_files(
-                &[path.clone()],
-                "claude_code",
-                "ANTHROPIC_BASE_URL",
-                "http://127.0.0.1:6767",
-            )
-            .expect("detect managed export")
+            shell_block_contains_text_in_files(&[path.clone()], "claude_code", "export PATH=",)
+                .expect("detect managed text")
         );
-        assert!(
-            shell_block_contains_text_in_files(
-                &[path.clone()],
-                "claude_code",
-                "export PATH=",
-            )
-            .expect("detect managed text")
-        );
-        assert!(
-            !shell_block_contains_in_files(
-                &[path],
-                "managed_rtk",
-                "ANTHROPIC_BASE_URL",
-                "http://127.0.0.1:6767",
-            )
-            .expect("ignore other block ids")
-        );
+        assert!(!shell_block_contains_in_files(
+            &[path],
+            "managed_rtk",
+            "ANTHROPIC_BASE_URL",
+            "http://127.0.0.1:6767",
+        )
+        .expect("ignore other block ids"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2576,9 +2565,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let fake_rtk = root.join("fake-rtk");
         fs::write(
             &fake_rtk,
-            format!(
-                "#!/usr/bin/env bash\nshift\necho \"{real_binary} $*\"\n"
-            ),
+            format!("#!/usr/bin/env bash\nshift\necho \"{real_binary} $*\"\n"),
         )
         .expect("write fake rtk");
         fs::set_permissions(
@@ -2626,6 +2613,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             stdout.contains("Headroom RTK auto-rewrite"),
             "should be a rewrite hookSpecificOutput payload"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_script_emits_rewrite_even_when_rtk_rewrite_exits_nonzero() {
+        let root = unique_temp_dir("headroom-hook-bash-nonzero");
+        fs::create_dir_all(&root).expect("create root");
+
+        let real_binary = "/bin/echo";
+        assert!(Path::new(real_binary).exists());
+
+        // Match the real v0.37.2 behavior we observed during smoke testing:
+        // emit a rewrite, then exit non-zero. The hook's `|| true` should
+        // still preserve the rewritten command.
+        let fake_rtk = root.join("fake-rtk");
+        fs::write(
+            &fake_rtk,
+            format!("#!/usr/bin/env bash\nshift\necho \"{real_binary} $*\"\nexit 3\n"),
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        let stdin = r#"{"tool_input":{"command":"git status"}}"#;
+        let output = std::process::Command::new("bash")
+            .arg(&hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            })
+            .expect("run hook");
+
+        assert!(output.status.success(), "hook should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(real_binary),
+            "rewrite output should survive non-zero RTK exit, got stdout: {stdout:?}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("Headroom RTK auto-rewrite"),
+            "should still emit a rewrite hookSpecificOutput payload"
         );
 
         let _ = fs::remove_dir_all(root);

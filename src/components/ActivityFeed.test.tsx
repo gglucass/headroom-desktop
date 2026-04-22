@@ -5,7 +5,14 @@ import type {
   ActivityEvent,
   ActivityFeedResponse,
   MemoryFeedEvent,
-  TransformationFeedEvent
+  MilestoneEvent,
+  NewModelEvent,
+  RecordEvent,
+  RtkBatchEvent,
+  SavingsMilestoneEvent,
+  StreakEvent,
+  TransformationFeedEvent,
+  WeeklyRecapEvent
 } from "../lib/types";
 
 const baseFeed: ActivityFeedResponse = {
@@ -102,6 +109,167 @@ describe("ActivityFeed", () => {
     expect(memoryIdx).toBeGreaterThan(-1);
     expect(transformationIdx).toBeGreaterThan(-1);
     expect(memoryIdx).toBeLessThan(transformationIdx);
+  });
+
+  it("renders an RTK batch row with deltas and cumulative totals", () => {
+    const data: RtkBatchEvent = {
+      observedAt: "2026-04-21T14:00:00Z",
+      commandsDelta: 3,
+      tokensSavedDelta: 1234,
+      totalCommands: 2888,
+      totalSaved: 12_805_724
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "rtkBatch", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain(">RTK<");
+    expect(markup).toContain("+3 commands");
+    expect(markup).toContain("1,234 tokens");
+    expect(markup).toContain("2,888");
+    expect(markup).toContain("12,805,724");
+  });
+
+  it("renders a milestone row with the formatted token count", () => {
+    const data: MilestoneEvent = {
+      observedAt: "2026-04-21T14:30:00Z",
+      milestoneTokensSaved: 5_000_000,
+      kind: "first_5m"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "milestone", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Milestone");
+    expect(markup).toContain("5M");
+  });
+
+  it("renders a daily record row with model and savings percent", () => {
+    const data: RecordEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      tokensSaved: 7500,
+      savingsPercent: 82.5,
+      model: "claude-opus-4-7",
+      provider: "anthropic",
+      requestId: "r-9",
+      previousRecord: null,
+      day: "2026-04-21"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "dailyRecord", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Daily record");
+    expect(markup).toContain("claude-opus-4-7");
+    expect(markup).toContain("Saved 7,500 tokens (82.5%)");
+  });
+
+  it("renders an all-time record row with the previous record delta", () => {
+    const data: RecordEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      tokensSaved: 12000,
+      savingsPercent: 91,
+      model: "claude-opus-4-7",
+      provider: "anthropic",
+      requestId: "r-42",
+      previousRecord: 9500,
+      day: null
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "allTimeRecord", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("All-time record");
+    expect(markup).toContain("Saved 12,000 tokens (91.0%)");
+    expect(markup).toContain("previous record 9,500");
+  });
+
+  it("renders a new model row with model and provider", () => {
+    const data: NewModelEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      model: "claude-haiku-4-7",
+      provider: "anthropic"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "newModel", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("New model");
+    expect(markup).toContain("First compression on claude-haiku-4-7");
+    expect(markup).toContain(">anthropic<");
+  });
+
+  it("renders a streak row without the new-record tag on a threshold event", () => {
+    const data: StreakEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      days: 7,
+      kind: "threshold"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "streak", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain(">Streak<");
+    expect(markup).toContain("7-day active streak");
+    expect(markup).not.toContain("new longest");
+  });
+
+  it("renders a streak row with the new-record tag on a new_record event", () => {
+    const data: StreakEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      days: 12,
+      kind: "new_record"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "streak", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("new longest");
+    expect(markup).toContain("new personal best");
+  });
+
+  it("renders a savings milestone row with the dollar amount", () => {
+    const data: SavingsMilestoneEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      milestoneUsd: 100,
+      kind: "first_100"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "savingsMilestone", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Savings milestone");
+    expect(markup).toContain("$100");
+  });
+
+  it("renders a weekly recap row with the week range and totals", () => {
+    const data: WeeklyRecapEvent = {
+      observedAt: "2026-04-27T09:00:00Z",
+      weekStart: "2026-04-20",
+      weekEnd: "2026-04-26",
+      totalTokensSaved: 12500,
+      totalSavingsUsd: 4.25,
+      activeDays: 5
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "weeklyRecap", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Weekly recap");
+    expect(markup).toContain("2026-04-20");
+    expect(markup).toContain("2026-04-26");
+    expect(markup).toContain("12,500 tokens saved");
+    expect(markup).toContain("$4.25");
+    expect(markup).toContain("5 active days");
   });
 
   it("falls back to 'unknown' provider and 0 savings when transformation fields are null", () => {

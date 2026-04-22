@@ -7,21 +7,22 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::activity_facts::{ActivityFacts, WeeklyTotals};
 use crate::analytics;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integration_status};
 use crate::insights::generate_daily_insights;
 use crate::models::{
-    BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus, DailyInsight,
-    DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
-    RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
-    UpgradeFailurePhase, UsageEvent,
+    ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
+    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint,
+    LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
+    RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
@@ -52,6 +53,18 @@ pub const RUNTIME_UPGRADE_STALL_SILENCE_SECS: u64 = 45;
 enum RuntimeMaintenancePlan {
     Upgrade(HeadroomRelease),
     RequirementsRepair,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PendingMilestones {
+    pub token: Vec<u64>,
+    pub usd: Vec<u64>,
+}
+
+impl PendingMilestones {
+    pub fn is_empty(&self) -> bool {
+        self.token.is_empty() && self.usd.is_empty()
+    }
 }
 
 /// Emit the runtime upgrade progress event on the given AppHandle.
@@ -213,6 +226,7 @@ pub struct AppState {
     launch_profile: Mutex<LaunchProfile>,
     launch_profile_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
+    activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
     cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant)>>,
@@ -244,6 +258,7 @@ impl AppState {
         let tool_manager = ToolManager::new(runtime);
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
+        let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
 
         let state = Self {
             tool_manager,
@@ -288,6 +303,7 @@ impl AppState {
             launch_profile: Mutex::new(launch_profile),
             launch_profile_path,
             savings_tracker: Mutex::new(savings_tracker),
+            activity_facts: Mutex::new(activity_facts),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
             cached_headroom_history: Mutex::new(None),
@@ -1125,16 +1141,95 @@ impl AppState {
     }
 
     pub fn dashboard(&self) -> DashboardState {
-        self.dashboard_with_lifetime_token_milestones().0
+        self.dashboard_with_pending_milestones().0
     }
 
-    pub fn dashboard_with_lifetime_token_milestones(&self) -> (DashboardState, Vec<u64>) {
+    /// Observe a batch of transformations into ActivityFacts (for feed
+    /// synthetic-event detection: new-model / daily-record / all-time-record),
+    /// persist any changes, and return the emitted synthetic events plus the
+    /// current bounded history of recent synthetic events.
+    pub fn observe_activity_from_transformations(
+        &self,
+        transformations: &[TransformationFeedEvent],
+    ) -> Vec<ActivityEvent> {
+        let mut facts = self.activity_facts.lock();
+        let mut ordered: Vec<&TransformationFeedEvent> = transformations.iter().collect();
+        // Feed arrives newest-first; observe oldest-first so records update in order.
+        ordered.sort_by(|a, b| {
+            a.timestamp
+                .clone()
+                .unwrap_or_default()
+                .cmp(&b.timestamp.clone().unwrap_or_default())
+        });
+        for transformation in ordered {
+            let observed_at = transformation
+                .timestamp
+                .as_deref()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            facts.observe_transformation(transformation, observed_at);
+        }
+
+        if let Some(summary) = self.cached_rtk_gain_summary() {
+            facts.observe_rtk(&summary, Utc::now());
+        }
+
+        let _ = facts.save_if_dirty();
+        facts.recent_events()
+    }
+
+    /// Record milestone crossings into ActivityFacts so they appear in the
+    /// next activity feed poll. Called alongside the existing telemetry path.
+    pub fn record_activity_milestones(&self, milestones: &PendingMilestones) {
+        if milestones.is_empty() {
+            return;
+        }
+        let mut facts = self.activity_facts.lock();
+        let observed_at = Utc::now();
+        if !milestones.token.is_empty() {
+            facts.record_milestones(&milestones.token, observed_at);
+        }
+        if !milestones.usd.is_empty() {
+            facts.record_savings_milestones(&milestones.usd, observed_at);
+        }
+        let _ = facts.save_if_dirty();
+    }
+
+    /// On Monday, emit a weekly recap rolling up the previous 7 days of
+    /// savings. Idempotent per-week: only fires once per Monday even if the
+    /// activity feed polls many times that day.
+    pub fn maybe_emit_weekly_recap(&self) {
+        let today = Local::now().date_naive();
+        if today.weekday() != chrono::Weekday::Mon {
+            return;
+        }
+        let start = match today.checked_sub_days(chrono::Days::new(7)) {
+            Some(d) => d,
+            None => return,
+        };
+        let end = match today.pred_opt() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let totals = {
+            let tracker = self.savings_tracker.lock();
+            aggregate_weekly_totals(&tracker.daily_savings, start, end)
+        };
+
+        let mut facts = self.activity_facts.lock();
+        facts.maybe_record_weekly_recap(today, totals, Utc::now());
+        let _ = facts.save_if_dirty();
+    }
+
+    pub fn dashboard_with_pending_milestones(&self) -> (DashboardState, PendingMilestones) {
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
         let recent_usage = self
             .recent_usage
             .lock()
-            
+
             .clone();
         let insights = build_insights(
             &recent_usage,
@@ -1149,7 +1244,7 @@ impl AppState {
                 tracker.hourly_savings(),
             )
             };
-        let mut lifetime_token_milestones = Vec::new();
+        let mut pending_milestones = PendingMilestones::default();
 
         let stats = self.cached_headroom_stats();
         let history = self.cached_headroom_history();
@@ -1161,7 +1256,7 @@ impl AppState {
                 snapshot = updated;
                 daily_savings = updated_daily;
                 hourly_savings = updated_hourly;
-                lifetime_token_milestones = milestones;
+                pending_milestones = milestones;
             }
         }
 
@@ -1215,7 +1310,7 @@ impl AppState {
                 recent_usage,
                 insights,
             },
-            lifetime_token_milestones,
+            pending_milestones,
         )
     }
 
@@ -1426,19 +1521,17 @@ impl AppState {
         SavingsTotalsSnapshot,
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
-        Vec<u64>,
+        PendingMilestones,
     )> {
         let mut tracker = self.savings_tracker.lock();
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
         let hourly_savings = tracker.hourly_savings();
-        let lifetime_token_milestones = tracker.take_pending_lifetime_token_milestones();
-        Some((
-            snapshot,
-            daily_savings,
-            hourly_savings,
-            lifetime_token_milestones,
-        ))
+        let milestones = PendingMilestones {
+            token: tracker.take_pending_lifetime_token_milestones(),
+            usd: tracker.take_pending_lifetime_usd_milestones(),
+        };
+        Some((snapshot, daily_savings, hourly_savings, milestones))
     }
 
     pub fn should_present_on_launch(&self) -> bool {
@@ -2035,6 +2128,9 @@ struct SavingsTotalsSnapshot {
 const FIRST_LIFETIME_TOKEN_MILESTONES: [u64; 2] = [1_000_000, 5_000_000];
 const REPEATING_LIFETIME_TOKEN_MILESTONE_STEP: u64 = 10_000_000;
 
+const FIRST_LIFETIME_USD_MILESTONES: [u64; 3] = [10, 50, 100];
+const REPEATING_LIFETIME_USD_MILESTONE_STEP: u64 = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct SavingsRecord {
@@ -2125,6 +2221,7 @@ struct SavingsTracker {
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
     pending_lifetime_token_milestones: Vec<u64>,
+    pending_lifetime_usd_milestones: Vec<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -2178,6 +2275,7 @@ impl SavingsTracker {
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
             pending_lifetime_token_milestones: Vec::new(),
+            pending_lifetime_usd_milestones: Vec::new(),
             last_written_at: None,
         };
         tracker.persist_state()?;
@@ -2256,6 +2354,10 @@ impl SavingsTracker {
 
     fn take_pending_lifetime_token_milestones(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.pending_lifetime_token_milestones)
+    }
+
+    fn take_pending_lifetime_usd_milestones(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_lifetime_usd_milestones)
     }
 
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
@@ -2370,6 +2472,7 @@ impl SavingsTracker {
             || delta_actual_cost_usd > 0.000_001
             || session_buckets_changed;
         let previous_lifetime_tokens_saved = self.lifetime_estimated_tokens_saved;
+        let previous_lifetime_estimated_savings_usd = self.lifetime_estimated_savings_usd;
         if delta_requests > 0 || delta_tokens > 0 || delta_usd > 0.0 {
             self.lifetime_requests = self.lifetime_requests.saturating_add(delta_requests);
             self.lifetime_estimated_savings_usd += delta_usd;
@@ -2381,6 +2484,11 @@ impl SavingsTracker {
             .extend(lifetime_token_milestones_crossed(
                 previous_lifetime_tokens_saved,
                 self.lifetime_estimated_tokens_saved,
+            ));
+        self.pending_lifetime_usd_milestones
+            .extend(lifetime_usd_milestones_crossed(
+                previous_lifetime_estimated_savings_usd,
+                self.lifetime_estimated_savings_usd,
             ));
 
         let baseline_hourly_buckets = if (first_observation || reset_detected)
@@ -2674,6 +2782,57 @@ impl SavingsTracker {
             .with_context(|| format!("writing {}", self.state_path.display()))?;
         Ok(())
     }
+}
+
+fn aggregate_weekly_totals(
+    daily_savings: &BTreeMap<String, DailySavingsBucket>,
+    start: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> WeeklyTotals {
+    let start_key = start.format("%Y-%m-%d").to_string();
+    let end_key = end.format("%Y-%m-%d").to_string();
+    let mut total_tokens_saved: u64 = 0;
+    let mut total_savings_usd: f64 = 0.0;
+    let mut active_days: u32 = 0;
+    for (day_key, bucket) in daily_savings.range(start_key..=end_key) {
+        let has_activity =
+            bucket.estimated_tokens_saved > 0 || bucket.estimated_savings_usd > 0.0;
+        if has_activity {
+            active_days += 1;
+        }
+        total_tokens_saved = total_tokens_saved.saturating_add(bucket.estimated_tokens_saved);
+        total_savings_usd += bucket.estimated_savings_usd;
+        let _ = day_key;
+    }
+    WeeklyTotals {
+        total_tokens_saved,
+        total_savings_usd,
+        active_days,
+    }
+}
+
+fn lifetime_usd_milestones_crossed(previous_usd: f64, current_usd: f64) -> Vec<u64> {
+    let previous = previous_usd.max(0.0).floor() as u64;
+    let current = current_usd.max(0.0).floor() as u64;
+    if current <= previous {
+        return Vec::new();
+    }
+
+    let mut milestones = FIRST_LIFETIME_USD_MILESTONES
+        .into_iter()
+        .filter(|threshold| previous < *threshold && current >= *threshold)
+        .collect::<Vec<_>>();
+
+    let first_repeating_index = previous / REPEATING_LIFETIME_USD_MILESTONE_STEP + 1;
+    let last_repeating_index = current / REPEATING_LIFETIME_USD_MILESTONE_STEP;
+    for index in first_repeating_index..=last_repeating_index {
+        let dollars = index.saturating_mul(REPEATING_LIFETIME_USD_MILESTONE_STEP);
+        if !milestones.contains(&dollars) {
+            milestones.push(dollars);
+        }
+    }
+
+    milestones
 }
 
 fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) -> Vec<u64> {
@@ -3832,12 +3991,13 @@ mod tests {
     use crate::tool_manager::BootstrapStepUpdate;
 
     use super::{
-        apply_bootstrap_step, begin_bootstrap_transition, bootstrap_complete_state,
-        bootstrap_failed_state, classify_startup_error, lifetime_token_milestones_crossed,
-        merge_daily_savings, merge_hourly_savings, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, AppState,
-        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
-        PersistedSavingsState, SavingsObservation, SavingsTracker,
+        aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
+        bootstrap_complete_state, bootstrap_failed_state, classify_startup_error,
+        lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, merge_daily_savings,
+        merge_hourly_savings, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, AppState, ClaudeProjectScan, DailySavingsBucket,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
+        SavingsObservation, SavingsTracker,
     };
 
     #[test]
@@ -3964,6 +4124,7 @@ mod tests {
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
             pending_lifetime_token_milestones: Vec::new(),
+            pending_lifetime_usd_milestones: Vec::new(),
             last_written_at: None,
         }
     }
@@ -4002,6 +4163,96 @@ mod tests {
             ),
         )
         .expect("write receipt");
+    }
+
+    #[test]
+    fn lifetime_usd_milestones_first_and_repeating() {
+        assert_eq!(lifetime_usd_milestones_crossed(0.0, 5.0), Vec::<u64>::new());
+        assert_eq!(lifetime_usd_milestones_crossed(9.99, 10.01), vec![10]);
+        assert_eq!(
+            lifetime_usd_milestones_crossed(5.0, 120.0),
+            vec![10, 50, 100]
+        );
+        assert_eq!(lifetime_usd_milestones_crossed(200.0, 205.0), Vec::<u64>::new());
+        assert_eq!(
+            lifetime_usd_milestones_crossed(199.5, 301.0),
+            vec![200, 300]
+        );
+    }
+
+    #[test]
+    fn savings_tracker_queues_pending_usd_milestones_on_observe() {
+        let mut tracker = make_tracker();
+        tracker.lifetime_estimated_savings_usd = 7.5;
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(1),
+            session_estimated_savings_usd: Some(60.0),
+            session_estimated_tokens_saved: Some(1),
+            session_savings_pct: Some(1.0),
+            session_actual_cost_usd: Some(0.0),
+            session_total_tokens_sent: Some(0),
+            savings_history: Vec::new(),
+        };
+        tracker.observe(&stats);
+        let milestones = tracker.take_pending_lifetime_usd_milestones();
+        assert_eq!(milestones, vec![10, 50]);
+    }
+
+    #[test]
+    fn aggregate_weekly_totals_sums_active_days_in_window() {
+        use std::collections::BTreeMap;
+        let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
+        daily.insert(
+            "2026-04-19".into(), // outside window (Sunday of week before)
+            DailySavingsBucket {
+                estimated_savings_usd: 1.0,
+                estimated_tokens_saved: 50,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            },
+        );
+        daily.insert(
+            "2026-04-20".into(),
+            DailySavingsBucket {
+                estimated_savings_usd: 2.5,
+                estimated_tokens_saved: 200,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            },
+        );
+        daily.insert(
+            "2026-04-23".into(),
+            DailySavingsBucket {
+                estimated_savings_usd: 1.0,
+                estimated_tokens_saved: 100,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            },
+        );
+        daily.insert(
+            "2026-04-26".into(),
+            DailySavingsBucket {
+                estimated_savings_usd: 0.0,
+                estimated_tokens_saved: 0, // zero activity day — not counted
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            },
+        );
+        daily.insert(
+            "2026-04-27".into(), // outside window (today Monday)
+            DailySavingsBucket {
+                estimated_savings_usd: 99.0,
+                estimated_tokens_saved: 9999,
+                actual_cost_usd: 0.0,
+                total_tokens_sent: 0,
+            },
+        );
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
+        let totals = aggregate_weekly_totals(&daily, start, end);
+        assert_eq!(totals.active_days, 2);
+        assert_eq!(totals.total_tokens_saved, 300);
+        assert!((totals.total_savings_usd - 3.5).abs() < 1e-9);
     }
 
     #[test]

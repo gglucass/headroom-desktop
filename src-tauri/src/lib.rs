@@ -1,3 +1,4 @@
+mod activity_facts;
 mod analytics;
 mod bearer;
 mod claude_cli;
@@ -170,24 +171,39 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
 async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        let (dashboard, lifetime_token_milestones) =
-            state.dashboard_with_lifetime_token_milestones();
+        let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
 
-        for milestone_tokens_saved in lifetime_token_milestones {
+        state.record_activity_milestones(&pending_milestones);
+
+        for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
                 &app,
                 "lifetime_tokens_saved_milestone_reached",
                 Some(json!({
-                    "milestone_tokens_saved": milestone_tokens_saved,
+                    "milestone_tokens_saved": *milestone_tokens_saved,
                     "milestone_millions": milestone_tokens_saved / 1_000_000,
-                    "milestone_kind": lifetime_token_milestone_kind(milestone_tokens_saved),
+                    "milestone_kind": lifetime_token_milestone_kind(*milestone_tokens_saved),
                     "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
                     "lifetime_requests": dashboard.lifetime_requests,
                     "launch_count": state.launch_count(),
                     "launch_experience": state.launch_experience_label()
                 })),
             );
-            pricing::report_milestone(milestone_tokens_saved);
+            pricing::report_milestone(*milestone_tokens_saved);
+        }
+
+        for milestone_usd in &pending_milestones.usd {
+            analytics::track_event(
+                &app,
+                "lifetime_usd_savings_milestone_reached",
+                Some(json!({
+                    "milestone_usd": *milestone_usd,
+                    "lifetime_estimated_savings_usd": dashboard.lifetime_estimated_savings_usd,
+                    "lifetime_requests": dashboard.lifetime_requests,
+                    "launch_count": state.launch_count(),
+                    "launch_experience": state.launch_experience_label()
+                })),
+            );
         }
 
         check_zero_spend_anomaly(&dashboard);
@@ -867,16 +883,30 @@ fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> Activity
         Vec::new()
     };
 
+    state.maybe_emit_weekly_recap();
+
+    let synthetic_events = match transformations.as_ref() {
+        Some(feed) => state.observe_activity_from_transformations(&feed.transformations),
+        None => Vec::new(),
+    };
+
     let memory_available = memory_path.exists();
-    build_activity_feed_response(transformations, memories, memory_available, limit as usize)
+    build_activity_feed_response(
+        transformations,
+        memories,
+        synthetic_events,
+        memory_available,
+        limit as usize,
+    )
 }
 
-/// Pure merge/sort core of `get_activity_feed`. Combines transformations and
-/// memories into a single chronological stream sorted DESC by timestamp,
-/// capped at `limit` events.
+/// Pure merge/sort core of `get_activity_feed`. Combines transformations,
+/// memories, and synthesized activity events into a single chronological
+/// stream sorted DESC by timestamp, capped at `limit` events.
 fn build_activity_feed_response(
     transformations: Option<TransformationFeedResponse>,
     memories: Vec<MemoryFeedEvent>,
+    synthetic_events: Vec<ActivityEvent>,
     memory_available: bool,
     limit: usize,
 ) -> ActivityFeedResponse {
@@ -893,6 +923,9 @@ fn build_activity_feed_response(
     for m in memories {
         events.push(ActivityEvent::Memory(m));
     }
+    for e in synthetic_events {
+        events.push(e);
+    }
 
     events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
     events.truncate(limit);
@@ -905,10 +938,215 @@ fn build_activity_feed_response(
     }
 }
 
+#[tauri::command]
+fn list_live_learnings(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<Vec<crate::models::LiveLearning>, String> {
+    let memory_path = headroom_memory_db_path();
+    if !memory_path.exists() {
+        return Ok(Vec::new());
+    }
+    let entrypoint = state.tool_manager.headroom_entrypoint();
+    let stdout = run_memory_export(&entrypoint, &memory_path)?;
+    parse_live_learnings(&stdout, &project_path)
+}
+
+#[tauri::command]
+fn delete_live_learning(
+    state: State<'_, AppState>,
+    memory_id: String,
+) -> Result<(), String> {
+    let memory_path = headroom_memory_db_path();
+    if !memory_path.exists() {
+        return Err("Memory database does not exist.".into());
+    }
+    let entrypoint = state.tool_manager.headroom_entrypoint();
+    let output = Command::new(&entrypoint)
+        .arg("memory")
+        .arg("delete")
+        .arg(&memory_id)
+        .arg("--force")
+        .arg("--db-path")
+        .arg(&memory_path)
+        .env("PYTHONNOUSERSITE", "1")
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "headroom memory delete failed ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_applied_patterns(
+    project_path: String,
+) -> Result<crate::models::AppliedPatterns, String> {
+    let claude_md = std::path::PathBuf::from(&project_path).join("CLAUDE.md");
+    let memory_md = crate::tool_manager::claude_project_memory_file(&project_path);
+
+    let claude_sections = read_applied_block(&claude_md);
+    let memory_sections = read_applied_block(&memory_md);
+
+    Ok(crate::models::AppliedPatterns {
+        claude_md: claude_sections,
+        memory_md: memory_sections,
+    })
+}
+
+#[tauri::command]
+fn delete_applied_pattern(
+    project_path: String,
+    file_kind: String,
+    section_title: String,
+    bullet_text: String,
+) -> Result<(), String> {
+    let path = match file_kind.as_str() {
+        "claude" => std::path::PathBuf::from(&project_path).join("CLAUDE.md"),
+        "memory" => crate::tool_manager::claude_project_memory_file(&project_path),
+        other => return Err(format!("Unknown file_kind: {other}")),
+    };
+    if !path.exists() {
+        return Err(format!("{} does not exist.", path.display()));
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let updated = crate::tool_manager::delete_applied_bullet(
+        &content,
+        &section_title,
+        &bullet_text,
+    );
+    if updated == content {
+        return Ok(()); // no-op; nothing to write
+    }
+    std::fs::write(&path, updated).map_err(|err| format!("write {}: {err}", path.display()))?;
+    Ok(())
+}
+
+fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSection> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => crate::tool_manager::parse_headroom_learn_block(&content),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Shells `headroom memory export --db-path <db>` and returns raw JSON stdout.
+fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String> {
+    let output = Command::new(entrypoint)
+        .arg("memory")
+        .arg("export")
+        .arg("--db-path")
+        .arg(db_path)
+        .env("PYTHONNOUSERSITE", "1")
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "headroom memory export exited {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_live_learnings(
+    json: &str,
+    project_path: &str,
+) -> Result<Vec<crate::models::LiveLearning>, String> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        id: String,
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        importance: Option<f64>,
+        #[serde(default)]
+        metadata: serde_json::Value,
+        #[serde(default)]
+        entity_refs: Vec<String>,
+    }
+
+    let raws: Vec<Raw> = serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    let mut out: Vec<crate::models::LiveLearning> = Vec::new();
+    for r in raws {
+        let source = r
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if source != "traffic_learner" {
+            continue;
+        }
+        if !pattern_matches_project(&r.content, &r.entity_refs, project_path) {
+            continue;
+        }
+        let category = r
+            .metadata
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let evidence_count = r
+            .metadata
+            .get("evidence_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        out.push(crate::models::LiveLearning {
+            id: r.id,
+            content: r.content,
+            category,
+            importance: r.importance.unwrap_or(0.5),
+            evidence_count,
+            created_at: r.created_at.unwrap_or_default(),
+        });
+    }
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(out)
+}
+
+/// True if any absolute path in `content` or `entity_refs` is under `project_path`.
+fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: &str) -> bool {
+    let root = project_path.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    let needle_slash = format!("{root}/");
+    if content.contains(root) {
+        // Guard against /x/ab matching /x/a — require either exact or followed by /
+        if content.contains(&needle_slash)
+            || content.contains(&format!("{root}\""))
+            || content.contains(&format!("{root}`"))
+        {
+            return true;
+        }
+    }
+    for r in entity_refs {
+        if r == root || r.starts_with(&needle_slash) {
+            return true;
+        }
+    }
+    false
+}
+
 fn activity_event_timestamp(event: &ActivityEvent) -> String {
     match event {
         ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
         ActivityEvent::Memory(m) => m.created_at.clone(),
+        ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
     }
 }
 
@@ -1424,6 +1662,10 @@ pub fn run() {
             create_headroom_checkout_session,
             get_headroom_billing_portal_url,
             get_activity_feed,
+            list_live_learnings,
+            delete_live_learning,
+            list_applied_patterns,
+            delete_applied_pattern,
             get_headroom_learn_status,
             get_headroom_learn_prereq_status,
             get_transformations_feed,
@@ -2646,14 +2888,17 @@ mod tests {
         build_release_updater_config, check_headroom_learn_prereqs, compute_tray_window_position,
         debounced_tray_runtime_visual, fetch_memory_feed, fetch_transformations_feed_from,
         install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
-        parse_memory_export, parse_updater_endpoint_list, physical_rect_from_rect,
-        store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        parse_live_learnings, parse_memory_export, parse_updater_endpoint_list,
+        pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
-        ActivityEvent, MemoryFeedEvent, TransformationFeedEvent, TransformationFeedResponse,
+        ActivityEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
+        RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
     use parking_lot::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
@@ -3159,6 +3404,68 @@ mod tests {
     }
 
     #[test]
+    fn pattern_matches_project_requires_path_boundary() {
+        assert!(pattern_matches_project(
+            "File `/x/a/b/foo.py` missing",
+            &[],
+            "/x/a/b",
+        ));
+        // /x/ab must not match when root is /x/a
+        assert!(!pattern_matches_project(
+            "File `/x/ab/foo.py` missing",
+            &[],
+            "/x/a",
+        ));
+    }
+
+    #[test]
+    fn pattern_matches_project_via_entity_refs() {
+        assert!(pattern_matches_project(
+            "Command failed",
+            &["/x/a/tool.py".to_string()],
+            "/x/a",
+        ));
+    }
+
+    #[test]
+    fn parse_live_learnings_filters_and_parses() {
+        let json = serde_json::to_string(&json!([
+            {
+                "id": "1",
+                "content": "Pattern mentioning /x/a/foo.py",
+                "created_at": "2026-04-22T10:00:00Z",
+                "importance": 0.8,
+                "metadata": {
+                    "source": "traffic_learner",
+                    "category": "environment",
+                    "evidence_count": 3
+                },
+                "entity_refs": []
+            },
+            {
+                "id": "2",
+                "content": "Unrelated project /y/z",
+                "metadata": {"source": "traffic_learner", "category": "environment"},
+                "entity_refs": []
+            },
+            {
+                "id": "3",
+                "content": "/x/a/bar.py",
+                "metadata": {"source": "other"},
+                "entity_refs": []
+            }
+        ]))
+        .unwrap();
+
+        let learnings = parse_live_learnings(&json, "/x/a").unwrap();
+        assert_eq!(learnings.len(), 1);
+        assert_eq!(learnings[0].id, "1");
+        assert_eq!(learnings[0].category, "environment");
+        assert_eq!(learnings[0].evidence_count, 3);
+        assert_eq!(learnings[0].importance, 0.8);
+    }
+
+    #[test]
     fn fetch_transformations_feed_returns_error_when_proxy_unreachable() {
         // Bind and immediately drop a listener so we know the port is free.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3194,16 +3501,24 @@ mod tests {
         }
     }
 
-    fn timestamp_of(event: &ActivityEvent) -> &str {
+    fn timestamp_of(event: &ActivityEvent) -> String {
         match event {
-            ActivityEvent::Transformation(t) => t.timestamp.as_deref().unwrap_or(""),
-            ActivityEvent::Memory(m) => &m.created_at,
+            ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
+            ActivityEvent::Memory(m) => m.created_at.clone(),
+            ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
         }
     }
 
     #[test]
     fn build_activity_feed_response_returns_empty_when_no_inputs() {
-        let resp = build_activity_feed_response(None, vec![], false, 50);
+        let resp = build_activity_feed_response(None, vec![], vec![], false, 50);
         assert!(resp.events.is_empty());
         assert!(!resp.proxy_reachable);
         assert!(!resp.log_full_messages);
@@ -3217,7 +3532,7 @@ mod tests {
             proxy_reachable: true,
             transformations: vec![],
         };
-        let resp = build_activity_feed_response(Some(transformations), vec![], true, 50);
+        let resp = build_activity_feed_response(Some(transformations), vec![], vec![], true, 50);
         assert!(resp.proxy_reachable);
         assert!(resp.log_full_messages);
         assert!(resp.memory_available);
@@ -3238,16 +3553,16 @@ mod tests {
             make_memory("b", "2026-04-21T13:00:00Z"),
         ];
 
-        let resp = build_activity_feed_response(Some(transformations), memories, true, 50);
+        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 50);
 
-        let timestamps: Vec<&str> = resp.events.iter().map(timestamp_of).collect();
+        let timestamps: Vec<String> = resp.events.iter().map(timestamp_of).collect();
         assert_eq!(
             timestamps,
             vec![
-                "2026-04-21T13:00:00Z",
-                "2026-04-21T12:00:00Z",
-                "2026-04-21T11:00:00Z",
-                "2026-04-21T10:00:00Z",
+                "2026-04-21T13:00:00Z".to_string(),
+                "2026-04-21T12:00:00Z".to_string(),
+                "2026-04-21T11:00:00Z".to_string(),
+                "2026-04-21T10:00:00Z".to_string(),
             ]
         );
     }
@@ -3267,13 +3582,16 @@ mod tests {
             make_memory("b", "2026-04-21T13:00:00Z"),
         ];
 
-        let resp = build_activity_feed_response(Some(transformations), memories, true, 2);
+        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 2);
 
         assert_eq!(resp.events.len(), 2);
-        let timestamps: Vec<&str> = resp.events.iter().map(timestamp_of).collect();
+        let timestamps: Vec<String> = resp.events.iter().map(timestamp_of).collect();
         assert_eq!(
             timestamps,
-            vec!["2026-04-21T13:00:00Z", "2026-04-21T12:00:00Z"]
+            vec![
+                "2026-04-21T13:00:00Z".to_string(),
+                "2026-04-21T12:00:00Z".to_string(),
+            ]
         );
     }
 
@@ -3290,7 +3608,7 @@ mod tests {
         };
         let memories = vec![make_memory("m", "2026-04-21T11:00:00Z")];
 
-        let resp = build_activity_feed_response(Some(transformations), memories, true, 50);
+        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 50);
 
         let last = resp.events.last().unwrap();
         match last {
@@ -3306,7 +3624,7 @@ mod tests {
             make_memory("b", "2026-04-21T12:00:00Z"),
             make_memory("c", "2026-04-21T11:00:00Z"),
         ];
-        let resp = build_activity_feed_response(None, memories, true, 50);
+        let resp = build_activity_feed_response(None, memories, vec![], true, 50);
         assert_eq!(resp.events.len(), 3);
         let ids: Vec<&str> = resp
             .events
@@ -3317,6 +3635,77 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn build_activity_feed_response_merges_synthetic_events_into_sorted_stream() {
+        let transformations = TransformationFeedResponse {
+            log_full_messages: false,
+            proxy_reachable: true,
+            transformations: vec![make_transformation("2026-04-21T10:00:00Z")],
+        };
+        let memories = vec![make_memory("m", "2026-04-21T12:30:00Z")];
+        let synthetic = vec![
+            ActivityEvent::Milestone(MilestoneEvent {
+                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 14, 0, 0).unwrap(),
+                milestone_tokens_saved: 1_000_000,
+                kind: "first_1m".into(),
+            }),
+            ActivityEvent::NewModel(NewModelEvent {
+                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 9, 0, 0).unwrap(),
+                model: "claude-opus-4-7".into(),
+                provider: Some("anthropic".into()),
+            }),
+            ActivityEvent::RtkBatch(RtkBatchEvent {
+                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 13, 0, 0).unwrap(),
+                commands_delta: 5,
+                tokens_saved_delta: 1234,
+                total_commands: 100,
+                total_saved: 50_000,
+            }),
+            ActivityEvent::AllTimeRecord(RecordEvent {
+                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 0, 0).unwrap(),
+                tokens_saved: 9_999,
+                savings_percent: Some(88.0),
+                model: Some("claude-opus-4-7".into()),
+                provider: Some("anthropic".into()),
+                request_id: Some("r".into()),
+                previous_record: Some(500),
+                day: None,
+            }),
+        ];
+
+        let resp =
+            build_activity_feed_response(Some(transformations), memories, synthetic, true, 50);
+
+        assert_eq!(resp.events.len(), 6);
+        let kinds: Vec<&str> = resp
+            .events
+            .iter()
+            .map(|e| match e {
+                ActivityEvent::Transformation(_) => "transformation",
+                ActivityEvent::Memory(_) => "memory",
+                ActivityEvent::RtkBatch(_) => "rtkBatch",
+                ActivityEvent::Milestone(_) => "milestone",
+                ActivityEvent::DailyRecord(_) => "dailyRecord",
+                ActivityEvent::AllTimeRecord(_) => "allTimeRecord",
+                ActivityEvent::NewModel(_) => "newModel",
+                ActivityEvent::Streak(_) => "streak",
+                ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
+                ActivityEvent::WeeklyRecap(_) => "weeklyRecap",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "milestone",
+                "rtkBatch",
+                "memory",
+                "allTimeRecord",
+                "transformation",
+                "newModel",
+            ]
+        );
     }
 
     #[test]

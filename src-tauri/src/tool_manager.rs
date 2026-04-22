@@ -1,8 +1,8 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
@@ -24,7 +24,8 @@ use crate::models::{ManagedTool, ToolStatus};
 /// will be installed if the currently-installed version differs.
 const HEADROOM_PINNED_VERSION: &str = "0.8.2";
 const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/de/93/9f96df0c50416ef9c7bbfbee7bf2f55342d075801e2db16d728043cf2cd4/headroom_ai-0.8.2-py3-none-any.whl";
-const HEADROOM_PINNED_SHA256: &str = "629ee9eb302a69fea99c64b57fde4f54b24108509113e1c3d0f63aee4dbc0ed9";
+const HEADROOM_PINNED_SHA256: &str =
+    "629ee9eb302a69fea99c64b57fde4f54b24108509113e1c3d0f63aee4dbc0ed9";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -39,7 +40,15 @@ const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
     include_str!("../python/headroom-linux-requirements.lock");
-const RTK_VERSION: &str = "0.33.1";
+const RTK_VERSION: &str = "0.37.2";
+const RTK_SHA256_MACOS_AARCH64: &str =
+    "99e20a59847dedbb64032a3f7985f2fe959fcb9674d8eaf940fc58a189e27eca";
+const RTK_SHA256_MACOS_X86_64: &str =
+    "4052e7740a87e121f671a2de269b3f015dcc58b6171d6bedb300da7599cb4d94";
+const RTK_SHA256_LINUX_AARCH64: &str =
+    "1d8d7fcca6cb05e1867c08bb4e5aa5f107c037c607131e511b726ae33ac35a47";
+const RTK_SHA256_LINUX_X86_64: &str =
+    "3dfb7a05636a68687ba1c5aa696fa8d5fcb494447ded86d9eb8b88b7100a37c6";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -172,6 +181,9 @@ struct HeadroomLearnMetadata {
 
 impl ToolManager {
     pub fn new(runtime: ManagedRuntime) -> Self {
+        let rtk_checksum = rtk_distribution_artifact()
+            .ok()
+            .and_then(|artifact| artifact.sha256.map(str::to_owned));
         let manifests = vec![
             ManagedToolManifest {
                 id: "headroom".into(),
@@ -191,7 +203,7 @@ impl ToolManager {
                 runtime: "binary".into(),
                 source_url: "https://github.com/rtk-ai/rtk".into(),
                 version: RTK_VERSION.into(),
-                checksum: None,
+                checksum: rtk_checksum,
                 required: true,
             },
         ];
@@ -444,7 +456,9 @@ impl ToolManager {
             });
         }
 
-        let last = failures.pop().expect("at least one startup variant attempted");
+        let last = failures
+            .pop()
+            .expect("at least one startup variant attempted");
         let prior_summary = if failures.is_empty() {
             String::new()
         } else {
@@ -575,7 +589,10 @@ impl ToolManager {
                 result = Some(true);
                 break;
             }
-            if disabled_markers.iter().any(|marker| lowered.contains(marker)) {
+            if disabled_markers
+                .iter()
+                .any(|marker| lowered.contains(marker))
+            {
                 result = Some(false);
                 break;
             }
@@ -735,8 +752,9 @@ impl ToolManager {
     /// Returns true if the compiled requirements lock differs from what was
     /// used during the last headroom install.
     pub fn requirements_are_stale(&self) -> bool {
-        self.installed_requirements_lock_sha()
-            .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()))
+        self.installed_requirements_lock_sha().map_or(true, |sha| {
+            sha != sha256_bytes(bootstrap_requirements_lock().as_bytes())
+        })
     }
 
     pub fn repair_stale_requirements_with_progress<F>(&self, mut progress: F) -> Result<()>
@@ -776,13 +794,9 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| {
-                if let Some(update) = pip_line_to_progress(
-                    line,
-                    deps_start.elapsed(),
-                    &mut dep_counter,
-                    40,
-                    82,
-                ) {
+                if let Some(update) =
+                    pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 40, 82)
+                {
                     if let Ok(mut cb) = progress_ref.try_borrow_mut() {
                         (cb)(BootstrapStepUpdate {
                             step: "Repairing dependencies",
@@ -825,7 +839,6 @@ impl ToolManager {
 
         Ok(())
     }
-
 
     pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
         self.bootstrap_all_with_progress(|_| {})
@@ -1032,11 +1045,14 @@ impl ToolManager {
 
     /// Bootstrap path: installs the pinned headroom release.
     fn install_headroom(&self) -> Result<()> {
-        self.install_headroom_release(&HeadroomRelease {
-            version: HEADROOM_PINNED_VERSION.into(),
-            wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
-            sha256: HEADROOM_PINNED_SHA256.into(),
-        }, |_| {})
+        self.install_headroom_release(
+            &HeadroomRelease {
+                version: HEADROOM_PINNED_VERSION.into(),
+                wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
+                sha256: HEADROOM_PINNED_SHA256.into(),
+            },
+            |_| {},
+        )
     }
 
     fn install_headroom_release<F>(&self, release: &HeadroomRelease, mut progress: F) -> Result<()>
@@ -1058,15 +1074,16 @@ impl ToolManager {
         });
 
         // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
-        let use_wheel = match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
-            Ok(()) => true,
-            Err(download_err) => {
-                eprintln!(
+        let use_wheel =
+            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+                Ok(()) => true,
+                Err(download_err) => {
+                    eprintln!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
                 );
-                false
-            }
-        };
+                    false
+                }
+            };
 
         progress(BootstrapStepUpdate {
             step: "Updating dependencies",
@@ -1102,13 +1119,9 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| {
-                if let Some(update) = pip_line_to_progress(
-                    line,
-                    deps_start.elapsed(),
-                    &mut dep_counter,
-                    55,
-                    80,
-                ) {
+                if let Some(update) =
+                    pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 55, 80)
+                {
                     if let Ok(mut cb) = deps_progress_ref.try_borrow_mut() {
                         (cb)(update);
                     }
@@ -1211,7 +1224,8 @@ impl ToolManager {
         let receipt_path = self.runtime.tools_dir.join("headroom.json");
         if let Ok(bytes) = std::fs::read(&receipt_path) {
             if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
+                if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut())
+                {
                     artifact.insert(
                         "requirementsLockSha256".into(),
                         json!(requirements_lock_sha256),
@@ -1273,9 +1287,7 @@ impl ToolManager {
         let mut dir = self.runtime.venv_dir.clone();
         let file_name = format!(
             "{}.backup",
-            dir.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("venv")
+            dir.file_name().and_then(|n| n.to_str()).unwrap_or("venv")
         );
         dir.set_file_name(file_name);
         dir
@@ -1449,10 +1461,7 @@ impl ToolManager {
                 self.clear_upgrade_marker();
                 return UpgradeOutcome::InstallFailed {
                     restored: false,
-                    error: anyhow!(
-                        "failed to move {} aside: {err}",
-                        venv_dir.display()
-                    ),
+                    error: anyhow!("failed to move {} aside: {err}", venv_dir.display()),
                 };
             }
         }
@@ -1462,10 +1471,7 @@ impl ToolManager {
                 let restored = self.restore_venv_from_backup(had_live_venv);
                 return UpgradeOutcome::InstallFailed {
                     restored,
-                    error: anyhow!(
-                        "failed to snapshot {}: {err}",
-                        receipt_path.display()
-                    ),
+                    error: anyhow!("failed to snapshot {}: {err}", receipt_path.display()),
                 };
             }
         }
@@ -1719,7 +1725,7 @@ impl ToolManager {
                 "version": RTK_VERSION,
                 "artifact": {
                     "url": artifact.url,
-                    "sha256": Value::Null
+                    "sha256": artifact.sha256
                 }
             }),
         )
@@ -1789,7 +1795,6 @@ impl ToolManager {
             ToolStatus::NotInstalled
         }
     }
-
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -2038,7 +2043,10 @@ fn headroom_learn_startup_args() -> Vec<String> {
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".headroom").join("logs").join("proxy.log");
+    let path = PathBuf::from(home)
+        .join(".headroom")
+        .join("logs")
+        .join("proxy.log");
     if path.exists() {
         Some(path)
     } else {
@@ -2098,8 +2106,6 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-
-
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok(DownloadArtifact {
@@ -2135,11 +2141,11 @@ fn python_distribution_artifact() -> Result<DownloadArtifact> {
 }
 
 fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
-    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+    let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("aarch64-apple-darwin", RTK_SHA256_MACOS_AARCH64),
+        ("macos", "x86_64") => ("x86_64-apple-darwin", RTK_SHA256_MACOS_X86_64),
+        ("linux", "aarch64") => ("aarch64-unknown-linux-gnu", RTK_SHA256_LINUX_AARCH64),
+        ("linux", "x86_64") => ("x86_64-unknown-linux-musl", RTK_SHA256_LINUX_X86_64),
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
 
@@ -2148,7 +2154,7 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
             "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.tar.gz",
             RTK_VERSION, target
         ),
-        sha256: None,
+        sha256: Some(sha256),
     })
 }
 
@@ -2221,9 +2227,7 @@ where
             let mut last_emit = Instant::now();
 
             loop {
-                let n = response
-                    .read(&mut buf)
-                    .context("reading download body")?;
+                let n = response.read(&mut buf).context("reading download body")?;
                 if n == 0 {
                     break;
                 }
@@ -2358,7 +2362,150 @@ fn parse_headroom_learn_timestamp(block: &str) -> Option<DateTime<Utc>> {
     })
 }
 
-fn claude_project_memory_file(project_path: &str) -> PathBuf {
+/// Parse sections and bullets inside the managed `<!-- headroom:learn -->`
+/// block. Returns an empty Vec if no block is present.
+pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::AppliedSection> {
+    use crate::models::AppliedSection;
+    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+        return Vec::new();
+    };
+    let Some(end_rel) = file_content[start..].find("<!-- headroom:learn:end -->") else {
+        return Vec::new();
+    };
+    let block = &file_content[start..start + end_rel];
+
+    let mut sections: Vec<AppliedSection> = Vec::new();
+    let mut current: Option<AppliedSection> = None;
+
+    for line in block.lines() {
+        let trimmed = line.trim_start();
+        if let Some(title) = trimmed.strip_prefix("### ") {
+            if let Some(sec) = current.take() {
+                sections.push(sec);
+            }
+            current = Some(AppliedSection {
+                title: title.trim().to_string(),
+                bullets: Vec::new(),
+            });
+        } else if let Some(sec) = current.as_mut() {
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                let bullet = rest.trim();
+                if !bullet.is_empty() {
+                    sec.bullets.push(bullet.to_string());
+                }
+            }
+        }
+    }
+    if let Some(sec) = current {
+        sections.push(sec);
+    }
+    sections
+}
+
+/// Delete one bullet from the managed block and return the updated file
+/// contents. No-op (returns the original) when section or bullet is missing.
+///
+/// If a section's bullets are all removed, the whole `### <section>` block is
+/// dropped. If the entire managed block becomes empty, the whole block
+/// including its markers is removed.
+pub fn delete_applied_bullet(
+    file_content: &str,
+    section_title: &str,
+    bullet_text: &str,
+) -> String {
+    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+        return file_content.to_string();
+    };
+    let end_marker = "<!-- headroom:learn:end -->";
+    let Some(end_rel) = file_content[start..].find(end_marker) else {
+        return file_content.to_string();
+    };
+    let end = start + end_rel + end_marker.len();
+
+    let before = &file_content[..start];
+    let block = &file_content[start..end];
+    let after = &file_content[end..];
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut current_section_start: Option<usize> = None;
+    let mut current_section_has_bullets = false;
+    let mut in_target_section = false;
+    let mut bullet_removed = false;
+
+    fn flush(
+        out_lines: &mut Vec<String>,
+        section_start: &mut Option<usize>,
+        has_bullets: &mut bool,
+    ) {
+        if let Some(idx) = section_start.take() {
+            if !*has_bullets {
+                out_lines.truncate(idx);
+            }
+        }
+        *has_bullets = false;
+    }
+
+    for line in block.lines() {
+        let trimmed = line.trim_start();
+        if let Some(title) = trimmed.strip_prefix("### ") {
+            flush(
+                &mut out_lines,
+                &mut current_section_start,
+                &mut current_section_has_bullets,
+            );
+            current_section_start = Some(out_lines.len());
+            in_target_section = title.trim() == section_title;
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        if current_section_start.is_some() {
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                let bullet = rest.trim();
+                if in_target_section && !bullet_removed && bullet == bullet_text {
+                    bullet_removed = true;
+                    continue;
+                }
+                if !bullet.is_empty() {
+                    current_section_has_bullets = true;
+                }
+            }
+        }
+
+        out_lines.push(line.to_string());
+    }
+    flush(
+        &mut out_lines,
+        &mut current_section_start,
+        &mut current_section_has_bullets,
+    );
+
+    if !bullet_removed {
+        return file_content.to_string();
+    }
+
+    let any_sections = out_lines
+        .iter()
+        .any(|l| l.trim_start().starts_with("### "));
+    if !any_sections {
+        let mut rewritten = String::with_capacity(before.len() + after.len());
+        rewritten.push_str(before.trim_end_matches('\n'));
+        let after_trimmed = after.trim_start_matches('\n');
+        if !rewritten.is_empty() && !after_trimmed.is_empty() {
+            rewritten.push_str("\n\n");
+        }
+        rewritten.push_str(after_trimmed);
+        return rewritten;
+    }
+
+    let mut rewritten = String::with_capacity(file_content.len());
+    rewritten.push_str(before);
+    rewritten.push_str(&out_lines.join("\n"));
+    rewritten.push_str(after);
+    rewritten
+}
+
+pub fn claude_project_memory_file(project_path: &str) -> PathBuf {
     let home = dirs::home_dir()
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(std::env::temp_dir);
@@ -2522,12 +2669,7 @@ where
 /// Like `run_command` but streams stdout + stderr line-by-line through
 /// `on_line` in real time. Captures everything for the structured failure
 /// payload so error reporting is unchanged.
-fn run_command_streaming<F>(
-    binary: &Path,
-    args: &[&str],
-    cwd: &Path,
-    on_line: &mut F,
-) -> Result<()>
+fn run_command_streaming<F>(binary: &Path, args: &[&str], cwd: &Path, on_line: &mut F) -> Result<()>
 where
     F: FnMut(&str),
 {
@@ -2551,12 +2693,18 @@ where
 
     let stdout_handle = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = tx_stdout.send(StreamedLine { line, is_stderr: false });
+            let _ = tx_stdout.send(StreamedLine {
+                line,
+                is_stderr: false,
+            });
         }
     });
     let stderr_handle = std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let _ = tx_stderr.send(StreamedLine { line, is_stderr: true });
+            let _ = tx_stderr.send(StreamedLine {
+                line,
+                is_stderr: true,
+            });
         }
     });
 
@@ -2599,7 +2747,12 @@ struct StreamedLine {
     is_stderr: bool,
 }
 
-fn run_command_with_timeout(binary: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Result<()> {
+fn run_command_with_timeout(
+    binary: &Path,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<()> {
     use std::io::Read;
     use std::sync::mpsc;
 
@@ -2645,8 +2798,9 @@ fn run_command_with_timeout(binary: &Path, args: &[&str], cwd: &Path, timeout: D
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(err)
-                    .with_context(|| format!("waiting for {} {}", binary.display(), args.join(" ")));
+                return Err(err).with_context(|| {
+                    format!("waiting for {} {}", binary.display(), args.join(" "))
+                });
             }
         }
     };
@@ -2660,7 +2814,10 @@ fn run_command_with_timeout(binary: &Path, args: &[&str], cwd: &Path, timeout: D
         if !stderr.is_empty() && !stderr.ends_with('\n') {
             stderr.push('\n');
         }
-        stderr.push_str(&format!("command timed out after {}ms", timeout.as_millis()));
+        stderr.push_str(&format!(
+            "command timed out after {}ms",
+            timeout.as_millis()
+        ));
         return Err(anyhow::Error::new(CommandFailure {
             program: binary.display().to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -2770,9 +2927,9 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, run_command, sanitize_log_variant, sha256_bytes,
-        verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime, ToolManager,
-        UpgradeOutcome, HEADROOM_PROXY_PORT,
+        read_headroom_learn_metadata_from_path, rtk_distribution_artifact, run_command,
+        sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease,
+        ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT, RTK_VERSION,
     };
 
     #[test]
@@ -2791,8 +2948,16 @@ mod tests {
             .expect("CommandFailure should be in the error chain");
 
         assert_eq!(failure.exit_code, Some(7));
-        assert!(failure.stdout.contains("hi-out"), "stdout: {}", failure.stdout);
-        assert!(failure.stderr.contains("hi-err"), "stderr: {}", failure.stderr);
+        assert!(
+            failure.stdout.contains("hi-out"),
+            "stdout: {}",
+            failure.stdout
+        );
+        assert!(
+            failure.stderr.contains("hi-err"),
+            "stderr: {}",
+            failure.stderr
+        );
         assert_eq!(failure.program, "/bin/sh");
     }
 
@@ -2805,6 +2970,175 @@ mod tests {
         assert!(runtime.standalone_python().starts_with(&runtime.root_dir));
         assert!(runtime.managed_pip().starts_with(&runtime.root_dir));
         assert!(runtime.bin_dir.starts_with(&runtime.root_dir));
+    }
+
+    #[test]
+    fn rtk_distribution_artifact_is_pinned_to_current_release_with_checksum() {
+        let artifact = rtk_distribution_artifact().expect("supported RTK target");
+
+        assert!(artifact.url.contains(&format!("/v{RTK_VERSION}/")));
+        assert!(
+            artifact.sha256.is_some(),
+            "RTK artifact checksum should be pinned"
+        );
+    }
+
+    #[test]
+    fn tool_manifest_exposes_platform_rtk_checksum() {
+        let root = std::env::temp_dir().join("headroom-tool-manager-manifest-test");
+        let runtime = ManagedRuntime::bootstrap_root(&root);
+        let manager = ToolManager::new(runtime);
+
+        let rtk = manager
+            .list_tools()
+            .into_iter()
+            .find(|tool| tool.id == "rtk")
+            .expect("rtk manifest should exist");
+        assert_eq!(rtk.version, RTK_VERSION);
+        assert!(rtk.checksum.is_some(), "RTK checksum should be exposed");
+    }
+
+    #[test]
+    fn rtk_installed_requires_binary_and_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-installed");
+
+        assert!(!manager.rtk_installed(), "no binary or receipt yet");
+
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        assert!(
+            !manager.rtk_installed(),
+            "binary alone should not count as installed"
+        );
+
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+        assert!(manager.rtk_installed(), "binary + receipt should count");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_rtk_version_reads_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-version");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": "0.37.2-test" }))
+            .expect("rtk receipt");
+
+        assert_eq!(
+            manager.installed_rtk_version().as_deref(),
+            Some("0.37.2-test")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_rtk_activity_reports_not_installed_when_missing() {
+        let (root, _runtime, manager) = seed_test_runtime("rtk-not-installed");
+
+        let lines = manager
+            .read_rtk_activity(10)
+            .expect("not-installed fallback");
+        assert_eq!(lines, vec!["RTK is not installed yet.".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_rtk_activity_returns_last_lines_from_session_output() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-activity");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  printf 'line-1\\nline-2\\nline-3\\nline-4\\n';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        let lines = manager.read_rtk_activity(2).expect("session output");
+        assert_eq!(lines, vec!["line-3".to_string(), "line-4".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_rtk_activity_surfaces_session_failures() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-activity-fail");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"session\" ]; then\n  echo 'session stdout';\n  echo 'session stderr' 1>&2;\n  exit 7\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        let err = manager
+            .read_rtk_activity(10)
+            .expect_err("failing session should surface an error");
+        let msg = err.to_string();
+        assert!(msg.contains("session stdout"), "stdout preserved: {msg}");
+        assert!(msg.contains("session stderr"), "stderr preserved: {msg}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rtk_gain_summary_parses_json_output() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  cat <<'EOF'\n{\"summary\":{\"total_commands\":12,\"total_saved\":3456,\"avg_savings_pct\":67.5}}\nEOF\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        let summary = manager.rtk_gain_summary().expect("gain summary");
+        assert_eq!(summary.total_commands, 12);
+        assert_eq!(summary.total_saved, 3456);
+        assert_eq!(summary.avg_savings_pct, 67.5);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rtk_gain_summary_returns_none_on_command_failure() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-fail");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'boom' 1>&2;\n  exit 4\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        assert!(manager.rtk_gain_summary().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rtk_gain_summary_returns_none_on_invalid_json() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-gain-invalid-json");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'not-json';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        assert!(manager.rtk_gain_summary().is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2867,7 +3201,10 @@ mod tests {
     fn sanitize_log_variant_replaces_path_separators() {
         let raw = "proxy---memory-db-path-/Users/x/Library/Application Support/Headroom/memory.db";
         let cleaned = sanitize_log_variant(raw);
-        assert!(!cleaned.contains('/'), "expected no slashes, got: {cleaned}");
+        assert!(
+            !cleaned.contains('/'),
+            "expected no slashes, got: {cleaned}"
+        );
         assert!(!cleaned.contains('\\'));
         assert!(cleaned.contains("memory-db-path"));
     }
@@ -3004,6 +3341,93 @@ Plain text without a dash
     }
 
     #[test]
+    fn parse_block_extracts_sections_and_bullets() {
+        let content = r#"# Prior heading
+
+<!-- headroom:learn:start -->
+## Headroom Learned Patterns
+*Auto-generated by `headroom learn` on 2026-04-22 — do not edit manually*
+
+### Large Files
+*~15,000 tokens/session saved*
+- `src/App.tsx` is very large
+- Also `lib.rs`
+
+### Learned: environment
+- Use uv run python
+<!-- headroom:learn:end -->
+"#;
+
+        let sections = super::parse_headroom_learn_block(content);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "Large Files");
+        assert_eq!(
+            sections[0].bullets,
+            vec!["`src/App.tsx` is very large", "Also `lib.rs`"]
+        );
+        assert_eq!(sections[1].title, "Learned: environment");
+        assert_eq!(sections[1].bullets, vec!["Use uv run python"]);
+    }
+
+    #[test]
+    fn parse_block_returns_empty_when_no_block_present() {
+        let content = "Just some CLAUDE.md content without markers.\n- a bullet";
+        assert!(super::parse_headroom_learn_block(content).is_empty());
+    }
+
+    #[test]
+    fn delete_applied_bullet_removes_one_bullet() {
+        let content = "\
+before
+<!-- headroom:learn:start -->
+### Foo
+- alpha
+- beta
+- gamma
+<!-- headroom:learn:end -->
+after
+";
+        let out = super::delete_applied_bullet(content, "Foo", "beta");
+        assert!(out.contains("- alpha"));
+        assert!(!out.contains("- beta"));
+        assert!(out.contains("- gamma"));
+        assert!(out.contains("### Foo"));
+    }
+
+    #[test]
+    fn delete_applied_bullet_drops_section_when_last_bullet_removed() {
+        let content = "\
+<!-- headroom:learn:start -->
+### Foo
+- only
+### Bar
+- keep
+<!-- headroom:learn:end -->
+";
+        let out = super::delete_applied_bullet(content, "Foo", "only");
+        assert!(!out.contains("### Foo"));
+        assert!(out.contains("### Bar"));
+        assert!(out.contains("- keep"));
+    }
+
+    #[test]
+    fn delete_applied_bullet_removes_whole_block_when_empty() {
+        let content = "prefix\n\n<!-- headroom:learn:start -->\n### Foo\n- only\n<!-- headroom:learn:end -->\n\nsuffix\n";
+        let out = super::delete_applied_bullet(content, "Foo", "only");
+        assert!(!out.contains("headroom:learn:start"));
+        assert!(!out.contains("headroom:learn:end"));
+        assert!(out.contains("prefix"));
+        assert!(out.contains("suffix"));
+    }
+
+    #[test]
+    fn delete_applied_bullet_is_noop_when_bullet_missing() {
+        let content = "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
+        let out = super::delete_applied_bullet(content, "Foo", "not-there");
+        assert_eq!(out, content);
+    }
+
+    #[test]
     fn parse_headroom_learn_timestamp_returns_none_for_malformed_date() {
         let block = r#"
 <!-- headroom:learn:start -->
@@ -3025,10 +3449,7 @@ Plain text without a dash
 
     #[test]
     fn encode_claude_project_folder_name_handles_root_slash() {
-        assert_eq!(
-            super::encode_claude_project_folder_name("/foo"),
-            "-foo"
-        );
+        assert_eq!(super::encode_claude_project_folder_name("/foo"), "-foo");
     }
 
     #[test]
@@ -3122,7 +3543,10 @@ Plain text without a dash
 
         assert!(!backup.exists(), "backup should be removed");
         assert!(!manager.headroom_receipt_backup_path().exists());
-        assert!(runtime.venv_dir.join("marker").exists(), "live venv untouched");
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "live venv untouched"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3161,7 +3585,10 @@ Plain text without a dash
             .expect("rollback succeeds");
 
         // The live venv should now be the original (contains "marker", not "new-marker").
-        assert!(runtime.venv_dir.join("marker").exists(), "restored marker present");
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "restored marker present"
+        );
         assert!(
             !runtime.venv_dir.join("new-marker").exists(),
             "new venv wiped"
@@ -3212,7 +3639,10 @@ Plain text without a dash
         assert!(recovered, "recovery should fire");
 
         // The live venv should be the restored original.
-        assert!(runtime.venv_dir.join("marker").exists(), "original restored");
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "original restored"
+        );
         assert!(
             !runtime.venv_dir.join("partial-marker").exists(),
             "partial new venv discarded"

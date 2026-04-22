@@ -353,12 +353,119 @@ pub struct MemoryFeedEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveLearning {
+    pub id: String,
+    pub content: String,
+    pub category: String,
+    pub importance: f64,
+    pub evidence_count: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedSection {
+    pub title: String,
+    pub bullets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedPatterns {
+    pub claude_md: Vec<AppliedSection>,
+    pub memory_md: Vec<AppliedSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtkBatchEvent {
+    pub observed_at: DateTime<Utc>,
+    pub commands_delta: u64,
+    pub tokens_saved_delta: u64,
+    pub total_commands: u64,
+    pub total_saved: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MilestoneEvent {
+    pub observed_at: DateTime<Utc>,
+    pub milestone_tokens_saved: u64,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordEvent {
+    pub observed_at: DateTime<Utc>,
+    pub tokens_saved: u64,
+    pub savings_percent: Option<f64>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub request_id: Option<String>,
+    pub previous_record: Option<u64>,
+    pub day: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewModelEvent {
+    pub observed_at: DateTime<Utc>,
+    pub model: String,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreakEvent {
+    pub observed_at: DateTime<Utc>,
+    pub days: u32,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavingsMilestoneEvent {
+    pub observed_at: DateTime<Utc>,
+    pub milestone_usd: u64,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyRecapEvent {
+    pub observed_at: DateTime<Utc>,
+    pub week_start: String,
+    pub week_end: String,
+    pub total_tokens_saved: u64,
+    pub total_savings_usd: f64,
+    pub active_days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ActivityEvent {
     #[serde(rename = "transformation")]
     Transformation(TransformationFeedEvent),
     #[serde(rename = "memory")]
     Memory(MemoryFeedEvent),
+    #[serde(rename = "rtkBatch")]
+    RtkBatch(RtkBatchEvent),
+    #[serde(rename = "milestone")]
+    Milestone(MilestoneEvent),
+    #[serde(rename = "dailyRecord")]
+    DailyRecord(RecordEvent),
+    #[serde(rename = "allTimeRecord")]
+    AllTimeRecord(RecordEvent),
+    #[serde(rename = "newModel")]
+    NewModel(NewModelEvent),
+    #[serde(rename = "streak")]
+    Streak(StreakEvent),
+    #[serde(rename = "savingsMilestone")]
+    SavingsMilestone(SavingsMilestoneEvent),
+    #[serde(rename = "weeklyRecap")]
+    WeeklyRecap(WeeklyRecapEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

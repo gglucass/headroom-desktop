@@ -1,24 +1,41 @@
+import { useState } from "react";
 import { formatDateTime } from "../lib/dashboardHelpers";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
   MemoryFeedEvent,
-  TransformationFeedEvent
+  MilestoneEvent,
+  NewModelEvent,
+  RecordEvent,
+  RtkBatchEvent,
+  SavingsMilestoneEvent,
+  StreakEvent,
+  TransformationFeedEvent,
+  WeeklyRecapEvent
 } from "../lib/types";
 
 interface ActivityFeedProps {
   feed: ActivityFeedResponse;
   error: string | null;
+  limit?: number;
+  onLoadMore?: () => void;
 }
 
-export function ActivityFeed({ feed, error }: ActivityFeedProps) {
+const ACTIVITY_FEED_MAX_LIMIT = 500;
+
+export function ActivityFeed({ feed, error, limit, onLoadMore }: ActivityFeedProps) {
+  const hasMore =
+    onLoadMore !== undefined &&
+    limit !== undefined &&
+    feed.events.length >= limit &&
+    limit < ACTIVITY_FEED_MAX_LIMIT;
   return (
     <>
       <header className="activity-feed__header">
         <h2>Live activity</h2>
         <p className="activity-feed__subtitle">
-          Compressions Headroom applied to recent requests, plus learnings extracted from live
-          traffic.
+          Compressions, learnings, RTK saves, milestones, and records — everything Headroom is
+          doing, as it happens.
         </p>
       </header>
       {error ? (
@@ -31,28 +48,75 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
           stream in.
         </p>
       ) : (
-        <ul className="activity-feed__list">
-          {feed.events.map((event, index) => (
-            <ActivityRow key={activityKey(event, index)} event={event} />
-          ))}
-        </ul>
+        <>
+          <ul className="activity-feed__list">
+            {feed.events.map((event, index) => (
+              <ActivityRow key={activityKey(event, index)} event={event} />
+            ))}
+          </ul>
+          {hasMore ? (
+            <button
+              type="button"
+              className="activity-feed__load-more"
+              onClick={onLoadMore}
+            >
+              Load more
+            </button>
+          ) : null}
+        </>
       )}
     </>
   );
 }
 
 function activityKey(event: ActivityEvent, index: number): string {
-  if (event.kind === "transformation") {
-    return `t-${event.data.requestId ?? event.data.timestamp ?? index}`;
+  switch (event.kind) {
+    case "transformation":
+      return `t-${event.data.requestId ?? event.data.timestamp ?? index}`;
+    case "memory":
+      return `m-${event.data.id}`;
+    case "rtkBatch":
+      return `rtk-${event.data.observedAt}`;
+    case "milestone":
+      return `ms-${event.data.milestoneTokensSaved}-${event.data.observedAt}`;
+    case "dailyRecord":
+      return `dr-${event.data.day ?? ""}-${event.data.observedAt}`;
+    case "allTimeRecord":
+      return `atr-${event.data.tokensSaved}-${event.data.observedAt}`;
+    case "newModel":
+      return `nm-${event.data.model}-${event.data.observedAt}`;
+    case "streak":
+      return `streak-${event.data.days}-${event.data.kind}-${event.data.observedAt}`;
+    case "savingsMilestone":
+      return `smile-${event.data.milestoneUsd}-${event.data.observedAt}`;
+    case "weeklyRecap":
+      return `wr-${event.data.weekStart}`;
   }
-  return `m-${event.data.id}`;
 }
 
 function ActivityRow({ event }: { event: ActivityEvent }) {
-  if (event.kind === "transformation") {
-    return <TransformationRow event={event.data} />;
+  switch (event.kind) {
+    case "transformation":
+      return <TransformationRow event={event.data} />;
+    case "memory":
+      return <MemoryRow event={event.data} />;
+    case "rtkBatch":
+      return <RtkBatchRow event={event.data} />;
+    case "milestone":
+      return <MilestoneRow event={event.data} />;
+    case "dailyRecord":
+      return <RecordRow event={event.data} kind="daily" />;
+    case "allTimeRecord":
+      return <RecordRow event={event.data} kind="allTime" />;
+    case "newModel":
+      return <NewModelRow event={event.data} />;
+    case "streak":
+      return <StreakRow event={event.data} />;
+    case "savingsMilestone":
+      return <SavingsMilestoneRow event={event.data} />;
+    case "weeklyRecap":
+      return <WeeklyRecapRow event={event.data} />;
   }
-  return <MemoryRow event={event.data} />;
 }
 
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
@@ -93,6 +157,10 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
 }
 
 function MemoryRow({ event }: { event: MemoryFeedEvent }) {
+  const [expanded, setExpanded] = useState(false);
+  // Heuristic: show the toggle if the content is long enough to plausibly
+  // wrap beyond two lines at typical widths.
+  const canExpand = event.content.length > 140 || event.content.includes("\n");
   return (
     <li className="activity-feed__item activity-feed__item--memory">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -103,7 +171,188 @@ function MemoryRow({ event }: { event: MemoryFeedEvent }) {
           importance {event.importance.toFixed(2)}
         </span>
       </div>
-      <p className="activity-feed__content">{event.content}</p>
+      <p
+        className={
+          expanded
+            ? "activity-feed__content"
+            : "activity-feed__content activity-feed__content--clamped"
+        }
+        title={canExpand && !expanded ? event.content : undefined}
+      >
+        {event.content}
+      </p>
+      {canExpand ? (
+        <button
+          type="button"
+          className="activity-feed__expand"
+          onClick={() => setExpanded((prev) => !prev)}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      ) : null}
     </li>
   );
+}
+
+function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--rtk">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--rtk">RTK</span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          +{event.commandsDelta.toLocaleString()} command
+          {event.commandsDelta === 1 ? "" : "s"}, saved{" "}
+          {event.tokensSavedDelta.toLocaleString()} tokens
+        </strong>
+        <span className="activity-feed__delta">
+          lifetime {event.totalCommands.toLocaleString()} ·{" "}
+          {event.totalSaved.toLocaleString()} tokens
+        </span>
+      </div>
+    </li>
+  );
+}
+
+function MilestoneRow({ event }: { event: MilestoneEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--milestone">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--milestone">Milestone</span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+      </div>
+      <p className="activity-feed__content">
+        Crossed {formatTokensShort(event.milestoneTokensSaved)} lifetime tokens saved.
+      </p>
+    </li>
+  );
+}
+
+function RecordRow({
+  event,
+  kind
+}: {
+  event: RecordEvent;
+  kind: "daily" | "allTime";
+}) {
+  const badgeLabel = kind === "daily" ? "Daily record" : "All-time record";
+  const badgeClass =
+    kind === "daily"
+      ? "activity-feed__badge--daily-record"
+      : "activity-feed__badge--all-time-record";
+  const itemClass =
+    kind === "daily"
+      ? "activity-feed__item--daily-record"
+      : "activity-feed__item--all-time-record";
+  const pct = event.savingsPercent;
+  return (
+    <li className={`activity-feed__item ${itemClass}`}>
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className={`activity-feed__badge ${badgeClass}`}>{badgeLabel}</span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          Saved {event.tokensSaved.toLocaleString()} tokens
+          {pct != null ? ` (${pct.toFixed(1)}%)` : ""}
+        </strong>
+        {kind === "allTime" && event.previousRecord != null ? (
+          <span className="activity-feed__delta">
+            previous record {event.previousRecord.toLocaleString()}
+          </span>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function NewModelRow({ event }: { event: NewModelEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--new-model">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--new-model">New model</span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        {event.provider ? (
+          <span className="activity-feed__provider">{event.provider}</span>
+        ) : null}
+      </div>
+      <p className="activity-feed__content">First compression on {event.model}.</p>
+    </li>
+  );
+}
+
+function StreakRow({ event }: { event: StreakEvent }) {
+  const isRecord = event.kind === "new_record";
+  return (
+    <li className="activity-feed__item activity-feed__item--streak">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--streak">Streak</span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        {isRecord ? (
+          <span className="activity-feed__streak-record">new longest</span>
+        ) : null}
+      </div>
+      <p className="activity-feed__content">
+        {event.days}-day active streak
+        {isRecord ? " — new personal best!" : "!"}
+      </p>
+    </li>
+  );
+}
+
+function SavingsMilestoneRow({ event }: { event: SavingsMilestoneEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--savings-milestone">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--savings-milestone">
+          Savings milestone
+        </span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+      </div>
+      <p className="activity-feed__content">
+        Lifetime savings crossed ${event.milestoneUsd.toLocaleString()}.
+      </p>
+    </li>
+  );
+}
+
+function WeeklyRecapRow({ event }: { event: WeeklyRecapEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--weekly-recap">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--weekly-recap">
+          Weekly recap
+        </span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <span className="activity-feed__week-range">
+          {event.weekStart} – {event.weekEnd}
+        </span>
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          {event.totalTokensSaved.toLocaleString()} tokens saved, $
+          {event.totalSavingsUsd.toFixed(2)}
+        </strong>
+        <span className="activity-feed__delta">
+          {event.activeDays} active day{event.activeDays === 1 ? "" : "s"}
+        </span>
+      </div>
+    </li>
+  );
+}
+
+function formatTokensShort(tokens: number): string {
+  if (tokens >= 1_000_000_000) {
+    return `${(tokens / 1_000_000_000).toFixed(tokens % 1_000_000_000 === 0 ? 0 : 1)}B`;
+  }
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(tokens % 1_000_000 === 0 ? 0 : 1)}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${(tokens / 1_000).toFixed(0)}K`;
+  }
+  return tokens.toLocaleString();
 }

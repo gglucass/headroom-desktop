@@ -271,9 +271,88 @@ export interface MemoryFeedEvent {
   importance: number;
 }
 
+export interface LiveLearning {
+  id: string;
+  content: string;
+  category: string;
+  importance: number;
+  evidenceCount: number;
+  createdAt: string;
+}
+
+export interface AppliedSection {
+  title: string;
+  bullets: string[];
+}
+
+export interface AppliedPatterns {
+  claudeMd: AppliedSection[];
+  memoryMd: AppliedSection[];
+}
+
+export interface RtkBatchEvent {
+  observedAt: string;
+  commandsDelta: number;
+  tokensSavedDelta: number;
+  totalCommands: number;
+  totalSaved: number;
+}
+
+export interface MilestoneEvent {
+  observedAt: string;
+  milestoneTokensSaved: number;
+  kind: string;
+}
+
+export interface RecordEvent {
+  observedAt: string;
+  tokensSaved: number;
+  savingsPercent: number | null;
+  model: string | null;
+  provider: string | null;
+  requestId: string | null;
+  previousRecord: number | null;
+  day: string | null;
+}
+
+export interface NewModelEvent {
+  observedAt: string;
+  model: string;
+  provider: string | null;
+}
+
+export interface StreakEvent {
+  observedAt: string;
+  days: number;
+  kind: string;
+}
+
+export interface SavingsMilestoneEvent {
+  observedAt: string;
+  milestoneUsd: number;
+  kind: string;
+}
+
+export interface WeeklyRecapEvent {
+  observedAt: string;
+  weekStart: string;
+  weekEnd: string;
+  totalTokensSaved: number;
+  totalSavingsUsd: number;
+  activeDays: number;
+}
+
 export type ActivityEvent =
   | { kind: "transformation"; data: TransformationFeedEvent }
-  | { kind: "memory"; data: MemoryFeedEvent };
+  | { kind: "memory"; data: MemoryFeedEvent }
+  | { kind: "rtkBatch"; data: RtkBatchEvent }
+  | { kind: "milestone"; data: MilestoneEvent }
+  | { kind: "dailyRecord"; data: RecordEvent }
+  | { kind: "allTimeRecord"; data: RecordEvent }
+  | { kind: "newModel"; data: NewModelEvent }
+  | { kind: "streak"; data: StreakEvent }
+  | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }
+  | { kind: "weeklyRecap"; data: WeeklyRecapEvent };
 
 export interface ActivityFeedResponse {
   events: ActivityEvent[];

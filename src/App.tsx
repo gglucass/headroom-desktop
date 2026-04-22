@@ -115,6 +115,7 @@ import {
 } from "./lib/pricing";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { OptimizePanel } from "./components/OptimizePanel";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -697,6 +698,7 @@ export default function App() {
     memoryAvailable: false
   });
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
+  const [activityFeedLimit, setActivityFeedLimit] = useState(50);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -1417,7 +1419,7 @@ export default function App() {
     }
     let active = true;
     const refreshFeed = () => {
-      invoke<ActivityFeedResponse>("get_activity_feed", { limit: 50 })
+      invoke<ActivityFeedResponse>("get_activity_feed", { limit: activityFeedLimit })
         .then((next) => {
           if (!active) return;
           setActivityFeed(next);
@@ -1436,7 +1438,14 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView]);
+  }, [activeView, activityFeedLimit]);
+
+  // Reset pagination when leaving the Activity tab so revisits start fresh.
+  useEffect(() => {
+    if (activeView !== "notifications" && activityFeedLimit !== 50) {
+      setActivityFeedLimit(50);
+    }
+  }, [activeView, activityFeedLimit]);
 
   useEffect(() => {
     if (activeView !== "home" || !startupReady) {
@@ -3807,21 +3816,21 @@ export default function App() {
                                 ) : null}
                               </div>
                             </div>
-                            {showInlineResult && headroomLearnStatus.outputTail.length > 0 ? (
-                              <div className="optimize-project-row__details">
-                                <details className="optimize-minimal__details">
-                                  <summary>Recent output</summary>
-                                  <pre className="optimize-minimal__mono optimize-minimal__output">
-                                    {headroomLearnStatus.outputTail.join("\n")}
-                                  </pre>
-                                </details>
-                              </div>
-                            ) : null}
                             {showInlineResult && headroomLearnStatus.error ? (
                               <div className="optimize-project-row__result">
                                 <p className="install-progress__error">{headroomLearnStatus.error}</p>
                               </div>
                             ) : null}
+                            <div className="optimize-project-row__details">
+                              <OptimizePanel
+                                projectPath={project.projectPath}
+                                refreshSignal={
+                                  isLatestLearnProject && !headroomLearnStatus.running
+                                    ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
+                                    : 0
+                                }
+                              />
+                            </div>
                           </div>
                         );
                       })}
@@ -3854,7 +3863,12 @@ export default function App() {
         </div>
 
         <div className="tray-content" hidden={activeView !== "notifications"}>
-          <ActivityFeed feed={activityFeed} error={activityFeedError} />
+          <ActivityFeed
+            feed={activityFeed}
+            error={activityFeedError}
+            limit={activityFeedLimit}
+            onLoadMore={() => setActivityFeedLimit((prev) => Math.min(prev + 50, 500))}
+          />
         </div>
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
