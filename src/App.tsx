@@ -701,6 +701,9 @@ export default function App() {
     proxyReachable: false,
     memoryAvailable: false
   });
+  // Tray window focus proxies for visibility: the window auto-hides on blur
+  // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
+  const [trayWindowFocused, setTrayWindowFocused] = useState(true);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const ACTIVITY_FEED_WINDOW = 500;
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
@@ -1418,7 +1421,22 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
-    if (activeView !== "notifications") {
+    if (windowLabel !== "main") {
+      return;
+    }
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        setTrayWindowFocused(focused);
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => unlisten?.();
+  }, [windowLabel]);
+
+  useEffect(() => {
+    if (activeView !== "notifications" || !trayWindowFocused) {
       return;
     }
     let active = true;
@@ -1437,12 +1455,12 @@ export default function App() {
         });
     };
     refreshFeed();
-    const interval = window.setInterval(refreshFeed, 2000);
+    const interval = window.setInterval(refreshFeed, 4000);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView]);
+  }, [activeView, trayWindowFocused]);
 
   useEffect(() => {
     if (activeView !== "home" || !startupReady) {

@@ -941,8 +941,10 @@ fn get_activity_feed(
     let transformations = fetch_transformations_feed(limit).ok();
     let memory_path = headroom_memory_db_path();
     let memories = if memory_path.exists() {
-        let entrypoint = state.tool_manager.headroom_entrypoint();
-        fetch_memory_feed(&entrypoint, &memory_path, limit as usize).unwrap_or_default()
+        match memory_export_cached(&state, &memory_path) {
+            Ok(stdout) => parse_memory_export(&stdout, limit as usize).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     } else {
         Vec::new()
     };
@@ -2027,34 +2029,6 @@ fn check_headroom_learn_prereqs(
     Ok(())
 }
 
-/// Reads recent memories from the SQLite store via `headroom memory export`.
-/// Returns at most `limit` events, sorted by `created_at` DESC.
-///
-/// Note: this exports the entire memory DB on each call, so cost grows with
-/// the total number of memories. Acceptable while the store is small (<1000
-/// rows). If memory grows, switch to a direct SQLite read with `WHERE created_at > ?`.
-fn fetch_memory_feed(
-    headroom_entrypoint: &Path,
-    db_path: &Path,
-    limit: usize,
-) -> Result<Vec<MemoryFeedEvent>, String> {
-    let output = Command::new(headroom_entrypoint)
-        .arg("memory")
-        .arg("export")
-        .arg("--db-path")
-        .arg(db_path)
-        .env("PYTHONNOUSERSITE", "1")
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "headroom memory export exited {}",
-            output.status
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_memory_export(&stdout, limit)
-}
 
 fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>, String> {
     #[derive(serde::Deserialize)]
@@ -3085,7 +3059,7 @@ mod tests {
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
         coalesce_rtk_batches, compute_tray_window_position, debounced_tray_runtime_visual,
-        empty_live_learnings_for_projects, fetch_memory_feed, fetch_transformations_feed_from,
+        empty_live_learnings_for_projects, fetch_transformations_feed_from,
         install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
         normalize_utc_timestamp, parse_live_learnings, parse_memory_export,
         parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
@@ -4070,11 +4044,4 @@ mod tests {
         assert_eq!(one.len(), 1);
     }
 
-    #[test]
-    fn fetch_memory_feed_returns_error_when_entrypoint_missing() {
-        let bogus_entrypoint = std::path::PathBuf::from("/definitely/does/not/exist/headroom");
-        let bogus_db = std::path::PathBuf::from("/tmp/nonexistent-memory.db");
-        let result = fetch_memory_feed(&bogus_entrypoint, &bogus_db, 10);
-        assert!(result.is_err(), "expected spawn failure to surface as Err");
-    }
 }
