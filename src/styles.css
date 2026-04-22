@@ -4257,3 +4257,237 @@ html.window-hiding {
   font-size: var(--text-sm);
   color: rgba(36, 31, 29, 0.7);
 }
+
+/* ---------- Install prompt (Claude CLI missing) ---------- */
+
+.install-prompt {
+  border: 1px solid rgba(176, 130, 54, 0.22);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #fbf1dc 0%, #f8ebcf 100%);
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.install-prompt__head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.install-prompt__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: rgba(176, 130, 54, 0.16);
+  color: #8a5a1f;
+  flex-shrink: 0;
+}
+
+.install-prompt__icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.install-prompt__head-text {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.install-prompt__title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: #3a2c16;
+  line-height: 1.25;
+}
+
+.install-prompt__body {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: #655346;
+  line-height: 1.45;
+}
+
+.install-prompt__body code {
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 0.72rem;
+  background: rgba(58, 44, 22, 0.08);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: #3a2c16;
+}
+
+.install-prompt__cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(58, 44, 22, 0.12);
+  border-radius: 8px;
+}
+
+.install-prompt__cmd-text {
+  flex: 1;
+  min-width: 0;
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 0.72rem;
+  color: #3a2c16;
+  overflow-x: auto;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.install-prompt__cmd-copy {
+  flex-shrink: 0;
+  border: 1px solid rgba(58, 44, 22, 0.16);
+  background: #fbf6ec;
+  color: #3a2c16;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.install-prompt__cmd-copy:hover {
+  background: #fff;
+  border-color: rgba(58, 44, 22, 0.28);
+}
+
+.install-prompt__alt {
+  margin: 0;
+}
+
+.install-prompt__alt summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: #7a6340;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.install-prompt__alt summary::-webkit-details-marker {
+  display: none;
+}
+
+.install-prompt__alt summary::before {
+  content: "▸";
+  font-size: 0.65rem;
+  transition: transform 0.12s ease;
+  display: inline-block;
+}
+
+.install-prompt__alt[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.install-prompt__alt summary:hover {
+  color: #3a2c16;
+}
+
+.install-prompt__alt > .install-prompt__cmd {
+  margin-top: 8px;
+}
+
+.install-prompt__foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+}
+
+.install-prompt__link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: #2a8d63;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.install-prompt__link:hover {
+  color: #1a6b4a;
+}
+
+.install-prompt__link--recheck {
+  text-decoration: none;
+}
+
+.install-prompt__link--recheck:hover {
+  text-decoration: underline;
+}
+
+.install-prompt__foot-sep {
+  color: #b09b6e;
+}
+
+.install-prompt__notice {
+  margin-left: 4px;
+  color: #1a7a52;
+  font-weight: 500;
+}
+
+/* ---------- Activity feed empty state ---------- */
+
+.activity-feed__empty {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  padding: 48px 20px 40px;
+  text-align: center;
+}
+
+.activity-feed__empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: rgba(79, 158, 145, 0.12);
+  color: #3d776b;
+  margin-bottom: 2px;
+}
+
+.activity-feed__empty-icon svg {
+  width: 28px;
+  height: 28px;
+}
+
+.activity-feed__empty-icon--waiting {
+  background: rgba(176, 130, 54, 0.14);
+  color: #8a5a1f;
+}
+
+.activity-feed__empty-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 500;
+  color: #2b2521;
+}
+
+.activity-feed__empty-body {
+  margin: 0;
+  max-width: 320px;
+  font-size: var(--text-sm);
+  color: #7c7168;
+  line-height: 1.45;
+}

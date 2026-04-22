@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Bell, WifiSlash } from "@phosphor-icons/react";
 import { formatDateTime } from "../lib/dashboardHelpers";
 import type {
   ActivityEvent,
@@ -41,12 +42,26 @@ export function ActivityFeed({ feed, error }: ActivityFeedProps) {
       {error ? (
         <p className="loading-copy">{error}</p>
       ) : !feed.proxyReachable ? (
-        <p className="loading-copy">Waiting for the Headroom proxy…</p>
+        <div className="activity-feed__empty">
+          <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
+            <WifiSlash weight="duotone" />
+          </div>
+          <p className="activity-feed__empty-title">Waiting for the Headroom proxy</p>
+          <p className="activity-feed__empty-body">
+            Headroom will reconnect as soon as the proxy is back online.
+          </p>
+        </div>
       ) : feed.events.length === 0 ? (
-        <p className="loading-copy">
-          No requests yet. Send a message through Claude Code to see compressions and learnings
-          stream in.
-        </p>
+        <div className="activity-feed__empty">
+          <div className="activity-feed__empty-icon" aria-hidden="true">
+            <Bell weight="duotone" />
+          </div>
+          <p className="activity-feed__empty-title">No requests yet</p>
+          <p className="activity-feed__empty-body">
+            Send a message through Claude Code and you'll see compressions and learnings
+            stream in here.
+          </p>
+        </div>
       ) : (
         <>
           <ul className="activity-feed__list">

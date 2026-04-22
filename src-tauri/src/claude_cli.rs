@@ -1,6 +1,8 @@
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -36,36 +38,44 @@ fn probe_via_login_shell() -> Option<PathBuf> {
         _ => "-ilc",
     };
 
-    let mut child = Command::new(&shell)
-        .arg(flags)
-        .arg("command -v claude")
+    let mut command = Command::new(&shell);
+    command.arg(flags).arg("command -v claude");
+    read_path_from_shell(command, SHELL_LOOKUP_TIMEOUT)
+}
+
+/// Spawns `command`, reads the first non-empty line from its stdout, kills
+/// the child, and returns the line as a validated `PathBuf`. The timeout
+/// bounds how long we wait for that first line — NOT how long we wait for
+/// the child to exit. Interactive shells (`-ilc`) print the `command -v`
+/// result immediately but then run through `.zshrc`, so waiting for exit
+/// before reading stdout was dropping valid paths on the floor.
+fn read_path_from_shell(mut command: Command, timeout: Duration) -> Option<PathBuf> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
 
-    let deadline = Instant::now() + SHELL_LOOKUP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
             }
-            Err(_) => return None,
+            let _ = tx.send(trimmed);
+            return;
         }
-    }
+    });
 
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_line = stdout.lines().next()?.trim();
+    let first_line = rx.recv_timeout(timeout).ok();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let first_line = first_line?;
     if first_line.is_empty() {
         return None;
     }
@@ -100,6 +110,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     struct ScopedTempDir(PathBuf);
     impl ScopedTempDir {
@@ -158,5 +169,46 @@ mod tests {
     fn is_executable_rejects_directories() {
         let tmp = ScopedTempDir::new("is_exec_dir");
         assert!(!is_executable(tmp.path()));
+    }
+
+    #[test]
+    fn read_path_from_shell_returns_path_before_shell_exits() {
+        // Regression: interactive shells print the `command -v claude` output
+        // immediately but keep running through `.zshrc`. Previously we waited
+        // for the child to exit before reading stdout, so a slow shell init
+        // would cause a timeout even when the path was already on the pipe.
+        let tmp = ScopedTempDir::new("probe_slow_shell");
+        let fake_claude = tmp.path().join("claude");
+        make_executable(&fake_claude);
+        let claude_str = fake_claude.display().to_string();
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("echo {claude_str}; sleep 30"));
+
+        let start = Instant::now();
+        let got = read_path_from_shell(cmd, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+
+        assert_eq!(got.as_deref(), Some(fake_claude.as_path()));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should return as soon as the first line arrives, not wait for the sleep; took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn read_path_from_shell_times_out_when_no_output() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30");
+
+        let start = Instant::now();
+        let got = read_path_from_shell(cmd, Duration::from_millis(200));
+        let elapsed = start.elapsed();
+
+        assert!(got.is_none());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout should bound the wait; took {elapsed:?}",
+        );
     }
 }

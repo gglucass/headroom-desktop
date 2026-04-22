@@ -10,6 +10,7 @@ import {
   type ReactNode
 } from "react";
 import {
+  ArrowClockwise,
   Bell,
   Brain,
   CaretLeft,
@@ -25,6 +26,7 @@ import {
   SignOut,
   Sliders,
   Sparkle,
+  Terminal,
 } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -3699,10 +3701,10 @@ export default function App() {
                   <span className="optimize-card__title-icon" aria-hidden="true">
                     <Brain weight="duotone" />
                   </span>
-                  <h1>Session learnings</h1>
+                  <h1>Project learnings</h1>
                 </div>
                 <p className="optimize-card__blurb">
-                  Helps Claude Code learn from experience. Scans your recent coding sessions for mistakes and corrections, then writes those learnings to the project's memory so you spend fewer tokens on mistakes.
+                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom writes them to the project's memory so they don't happen again.
                 </p>
               </header>
               <div className="optimize-card__body">
@@ -3723,57 +3725,71 @@ export default function App() {
                 ) : (
                   <div className="optimize-minimal">
                     {!headroomLearnPrereq.claudeCliAvailable ? (
-                      <div className="optimize-minimal__install-guide">
-                        <p className="optimize-minimal__meta">
-                          Headroom Learn uses the <code>claude</code> CLI to analyze your sessions.
-                          Install it to enable learning.
-                        </p>
-                        <div className="optimize-minimal__install-cmd">
-                          <code>{CLAUDE_CODE_INSTALL_NPM_CMD}</code>
+                      <div className="install-prompt" role="status">
+                        <header className="install-prompt__head">
+                          <span className="install-prompt__icon" aria-hidden="true">
+                            <Terminal weight="duotone" />
+                          </span>
+                          <div className="install-prompt__head-text">
+                            <h2 className="install-prompt__title">
+                              Install the Claude Code CLI
+                            </h2>
+                            <p className="install-prompt__body">
+                              Headroom Learn uses the <code>claude</code> CLI to analyze
+                              your sessions.
+                            </p>
+                          </div>
+                        </header>
+                        <div className="install-prompt__cmd">
+                          <code className="install-prompt__cmd-text">
+                            {CLAUDE_CODE_INSTALL_NPM_CMD}
+                          </code>
                           <button
-                            className="optimize-minimal__inline-action"
+                            className="install-prompt__cmd-copy"
                             type="button"
                             onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_NPM_CMD)}
                           >
                             Copy
                           </button>
                         </div>
-                        <details className="optimize-minimal__install-alt">
+                        <details className="install-prompt__alt">
                           <summary>Other install methods</summary>
-                          <div className="optimize-minimal__install-cmd">
-                            <code>{CLAUDE_CODE_INSTALL_CURL_CMD}</code>
+                          <div className="install-prompt__cmd">
+                            <code className="install-prompt__cmd-text">
+                              {CLAUDE_CODE_INSTALL_CURL_CMD}
+                            </code>
                             <button
-                              className="optimize-minimal__inline-action"
+                              className="install-prompt__cmd-copy"
                               type="button"
                               onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
                             >
                               Copy
                             </button>
                           </div>
-                          <p className="optimize-minimal__meta">
-                            <button
-                              className="optimize-minimal__inline-action"
-                              type="button"
-                              onClick={() => void openLearnInstallDocsLink()}
-                            >
-                              Open Claude Code install docs
-                            </button>
-                          </p>
                         </details>
-                        <p className="optimize-minimal__meta">
+                        <div className="install-prompt__foot">
                           <button
-                            className="optimize-minimal__inline-action"
+                            className="install-prompt__link"
+                            type="button"
+                            onClick={() => void openLearnInstallDocsLink()}
+                          >
+                            Open install docs
+                          </button>
+                          <span className="install-prompt__foot-sep" aria-hidden="true">·</span>
+                          <button
+                            className="install-prompt__link install-prompt__link--recheck"
                             type="button"
                             onClick={() => void refreshHeadroomLearnPrereq()}
                           >
+                            <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
                             Re-check
                           </button>
                           {learnInstallCopyNotice ? (
-                            <span className="optimize-minimal__install-notice">
-                              {" "}{learnInstallCopyNotice}
+                            <span className="install-prompt__notice">
+                              {learnInstallCopyNotice}
                             </span>
                           ) : null}
-                        </p>
+                        </div>
                       </div>
                     ) : null}
                     <div className="optimize-projects">
