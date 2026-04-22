@@ -25,6 +25,7 @@ use crate::models::{ManagedTool, ToolStatus};
 const HEADROOM_PINNED_VERSION: &str = "0.8.2";
 const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/de/93/9f96df0c50416ef9c7bbfbee7bf2f55342d075801e2db16d728043cf2cd4/headroom_ai-0.8.2-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str = "629ee9eb302a69fea99c64b57fde4f54b24108509113e1c3d0f63aee4dbc0ed9";
+const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
@@ -738,6 +739,93 @@ impl ToolManager {
             .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()))
     }
 
+    pub fn repair_stale_requirements_with_progress<F>(&self, mut progress: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
+        let requirements_lock = bootstrap_requirements_lock();
+        let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
+
+        progress(BootstrapStepUpdate {
+            step: "Repairing dependencies",
+            message: "Repairing Headroom's bundled dependencies.".into(),
+            eta_seconds: 60,
+            percent: 40,
+        });
+
+        let deps_start = Instant::now();
+        let progress_ref = std::cell::RefCell::new(&mut progress);
+        let mut dep_counter: u32 = 0;
+        run_pip_install_with_retries_streaming(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--find-links",
+                VENDOR_WHEELS_INDEX_URL,
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--upgrade",
+                "--requirement",
+                lock_path.to_string_lossy().as_ref(),
+            ],
+            &self.runtime.root_dir,
+            |line| {
+                if let Some(update) = pip_line_to_progress(
+                    line,
+                    deps_start.elapsed(),
+                    &mut dep_counter,
+                    40,
+                    82,
+                ) {
+                    if let Ok(mut cb) = progress_ref.try_borrow_mut() {
+                        (cb)(BootstrapStepUpdate {
+                            step: "Repairing dependencies",
+                            message: update.message,
+                            eta_seconds: update.eta_seconds,
+                            percent: update.percent,
+                        });
+                    }
+                }
+            },
+        )
+        .context("repairing stale headroom requirements")?;
+
+        progress(BootstrapStepUpdate {
+            step: "Configuring integrations",
+            message: "Setting up Headroom MCP integration.".into(),
+            eta_seconds: 5,
+            percent: 88,
+        });
+
+        let mcp_install = match self.install_headroom_mcp() {
+            Ok(()) => json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL }),
+            Err(err) => {
+                eprintln!("headroom MCP setup skipped during repair: {err}");
+                json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
+            }
+        };
+
+        self.update_headroom_receipt_after_requirements_repair(
+            sha256_bytes(requirements_lock.as_bytes()),
+            mcp_install,
+        )?;
+
+        progress(BootstrapStepUpdate {
+            step: "Repair complete",
+            message: "Headroom dependency repair finished.".into(),
+            eta_seconds: 0,
+            percent: 95,
+        });
+
+        Ok(())
+    }
+
 
     pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
         self.bootstrap_all_with_progress(|_| {})
@@ -1115,37 +1203,66 @@ impl ToolManager {
         )
     }
 
+    fn update_headroom_receipt_after_requirements_repair(
+        &self,
+        requirements_lock_sha256: String,
+        mcp_install: Value,
+    ) -> Result<()> {
+        let receipt_path = self.runtime.tools_dir.join("headroom.json");
+        if let Ok(bytes) = std::fs::read(&receipt_path) {
+            if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
+                    artifact.insert(
+                        "requirementsLockSha256".into(),
+                        json!(requirements_lock_sha256),
+                    );
+                }
+                receipt["mcp"] = mcp_install;
+                std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+                    .with_context(|| format!("writing {}", receipt_path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Cheap post-install sanity check: can the new venv import the top-level
     /// headroom package and its proxy entrypoint? Catches import errors, syntax
     /// errors, and missing transitive dependencies introduced by a new version
-    /// before we try to actually boot the proxy. Runs with a 15s timeout.
+    /// before we try to actually boot the proxy.
     pub fn smoke_test_headroom(&self) -> Result<()> {
+        self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
+    }
+
+    fn smoke_test_headroom_with_timeout(&self, timeout: Duration) -> Result<()> {
         let python = self.runtime.managed_python();
-        let output = Command::new(&python)
-            .args([
-                "-c",
-                "import headroom; import headroom.proxy.server",
-            ])
-            .current_dir(&self.runtime.root_dir)
-            .env_remove("PYTHONHOME")
-            .env_remove("PYTHONPATH")
-            .env_remove("PYTHONSTARTUP")
-            .env("PYTHONNOUSERSITE", "1")
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("LC_ALL", "C.UTF-8")
-            .env("LANG", "C.UTF-8")
-            .output()
-            .with_context(|| format!("running smoke test with {}", python.display()))?;
-        if !output.status.success() {
+        if let Err(err) = run_command_with_timeout(
+            &python,
+            &["-c", "import headroom; import headroom.proxy.server"],
+            &self.runtime.root_dir,
+            timeout,
+        )
+        .with_context(|| format!("running smoke test with {}", python.display()))
+        {
             return Err(anyhow::Error::new(CommandFailure {
                 program: python.display().to_string(),
                 args: vec![
                     "-c".into(),
                     "import headroom; import headroom.proxy.server".into(),
                 ],
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                exit_code: output.status.code(),
+                stdout: err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+                    .map(|failure| failure.stdout.clone())
+                    .unwrap_or_default(),
+                stderr: err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+                    .map(|failure| failure.stderr.clone())
+                    .unwrap_or_else(|| format!("{err:#}")),
+                exit_code: err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+                    .and_then(|failure| failure.exit_code),
             }))
             .context("Headroom smoke test failed — the new version cannot be imported");
         }
@@ -1825,6 +1942,12 @@ impl HeadroomRelease {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeMaintenanceKind {
+    Upgrade,
+    RequirementsRepair,
+}
+
 /// Outcome of [`ToolManager::atomic_upgrade_headroom`].
 ///
 /// `InstalledPendingValidation` means install + smoke test succeeded but the
@@ -2158,6 +2281,23 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_command(python, args, cwd)
 }
 
+fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONSTARTUP")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("LANG", "C.UTF-8")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .env("PIP_NO_INPUT", "1");
+    command
+}
+
 /// Runs a pip install invocation with retries on transient failures.
 ///
 /// pip's own `--retries` flag only covers connection establishment, not
@@ -2272,20 +2412,8 @@ where
     use std::io::{BufRead, BufReader};
     use std::sync::mpsc;
 
-    let mut cmd = Command::new(binary);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env_remove("PYTHONHOME")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONSTARTUP")
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("LC_ALL", "C.UTF-8")
-        .env("LANG", "C.UTF-8")
-        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = build_command(binary, args, cwd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -2349,19 +2477,92 @@ struct StreamedLine {
     is_stderr: bool,
 }
 
+fn run_command_with_timeout(binary: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Result<()> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let mut cmd = build_command(binary, args, cwd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        let _ = stdout_tx.send(buf);
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        let _ = stderr_tx.send(buf);
+    });
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait().with_context(|| {
+                        format!("waiting for {} {}", binary.display(), args.join(" "))
+                    })?;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err)
+                    .with_context(|| format!("waiting for {} {}", binary.display(), args.join(" ")));
+            }
+        }
+    };
+
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+    let stdout = String::from_utf8_lossy(&stdout_rx.recv().unwrap_or_default()).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_rx.recv().unwrap_or_default()).into_owned();
+
+    if timed_out {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!("command timed out after {}ms", timeout.as_millis()));
+        return Err(anyhow::Error::new(CommandFailure {
+            program: binary.display().to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdout,
+            stderr,
+            exit_code: None,
+        }));
+    }
+
+    if !status.success() {
+        return Err(anyhow::Error::new(CommandFailure {
+            program: binary.display().to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdout,
+            stderr,
+            exit_code: status.code(),
+        }));
+    }
+
+    Ok(())
+}
+
 fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
-    let output = Command::new(binary)
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("PYTHONHOME")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONSTARTUP")
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("LC_ALL", "C.UTF-8")
-        .env("LANG", "C.UTF-8")
-        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1")
+    let output = build_command(binary, args, cwd)
         .output()
         .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
 
@@ -2440,8 +2641,9 @@ impl std::error::Error for HeadroomStartupFailure {}
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
@@ -2680,6 +2882,16 @@ Plain text without a dash
         std::env::temp_dir().join(format!("{prefix}-{nanos}"))
     }
 
+    fn write_executable(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, body).expect("write script");
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod");
+    }
+
     fn seed_test_runtime(prefix: &str) -> (PathBuf, ManagedRuntime, ToolManager) {
         let root = unique_temp_dir(prefix);
         let runtime = ManagedRuntime::bootstrap_root(&root);
@@ -2860,6 +3072,93 @@ Plain text without a dash
         );
         // Stale backup purged (either consumed during restore or cleaned at start).
         assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_stale_requirements_updates_receipt_and_emits_progress() {
+        let (root, runtime, manager) = seed_test_runtime("repair-requirements");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{
+                "version":"0.8.2",
+                "artifact":{"requirementsLockSha256":"stale"},
+                "mcp":{"configured":false}
+            }"#,
+        )
+        .expect("seed receipt");
+
+        let mut steps = Vec::new();
+        manager
+            .repair_stale_requirements_with_progress(|step| steps.push(step.step.to_string()))
+            .expect("repair succeeds");
+
+        assert!(steps.iter().any(|step| step == "Repairing dependencies"));
+        assert!(steps.iter().any(|step| step == "Configuring integrations"));
+        assert!(steps.iter().any(|step| step == "Repair complete"));
+
+        let receipt = fs::read(runtime.tools_dir.join("headroom.json")).expect("receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt).expect("receipt json");
+        assert_eq!(
+            receipt["artifact"]["requirementsLockSha256"],
+            sha256_bytes(super::bootstrap_requirements_lock().as_bytes())
+        );
+        assert_eq!(receipt["mcp"]["configured"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_headroom_succeeds_with_executable_python() {
+        let (root, runtime, manager) = seed_test_runtime("smoke-ok");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+
+        manager
+            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            .expect("smoke test succeeds");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_headroom_returns_command_failure_output_on_nonzero_exit() {
+        let (root, runtime, manager) = seed_test_runtime("smoke-fail");
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\necho failure-stdout\necho failure-stderr >&2\nexit 7\n",
+        );
+
+        let err = manager
+            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            .expect_err("smoke test should fail");
+        let failure = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+            .expect("command failure");
+        assert_eq!(failure.exit_code, Some(7));
+        assert!(failure.stdout.contains("failure-stdout"));
+        assert!(failure.stderr.contains("failure-stderr"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_headroom_times_out() {
+        let (root, runtime, manager) = seed_test_runtime("smoke-timeout");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nsleep 1\n");
+
+        let err = manager
+            .smoke_test_headroom_with_timeout(Duration::from_millis(100))
+            .expect_err("smoke test should time out");
+        let failure = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+            .expect("command failure");
+        assert_eq!(failure.exit_code, None);
+        assert!(failure.stderr.contains("command timed out after 100ms"));
+
         let _ = fs::remove_dir_all(root);
     }
 }

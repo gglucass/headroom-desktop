@@ -2483,7 +2483,7 @@ export default function App() {
                 className="secondary-button secondary-button--small"
                 onClick={() =>
                   void invoke("open_external_link", {
-                    url: "https://extraheadroom.com/support",
+                    url: "mailto:support@extraheadroom.com?subject=Headroom Update Issue",
                   }).catch(() => {})
                 }
               >
@@ -2593,7 +2593,7 @@ export default function App() {
                   className="secondary-button secondary-button--small"
                   onClick={() =>
                     void invoke("open_external_link", {
-                      url: "https://extraheadroom.com/support",
+                      url: "mailto:support@extraheadroom.com?subject=Headroom Update Issue",
                     }).catch(() => {})
                   }
                 >

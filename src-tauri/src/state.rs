@@ -25,7 +25,10 @@ use crate::models::{
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
-use crate::tool_manager::{BootstrapStepUpdate, ManagedRuntime, RtkGainSummary, ToolManager};
+use crate::tool_manager::{
+    BootstrapStepUpdate, HeadroomRelease, ManagedRuntime, RtkGainSummary,
+    RuntimeMaintenanceKind, ToolManager,
+};
 
 /// After this many consecutive failed auto-attempts at the same app version,
 /// we stop auto-retrying and surface a persistent banner with a Retry button.
@@ -45,6 +48,11 @@ pub const RUNTIME_UPGRADE_STALL_GRACE_SECS: u64 = 60;
 /// If the proxy log hasn't been written to in this long (AND we're past
 /// the grace period), the proxy is considered stalled and we roll back.
 pub const RUNTIME_UPGRADE_STALL_SILENCE_SECS: u64 = 45;
+
+enum RuntimeMaintenancePlan {
+    Upgrade(HeadroomRelease),
+    RequirementsRepair,
+}
 
 /// Emit the runtime upgrade progress event on the given AppHandle.
 pub fn emit_runtime_upgrade_progress(app: &tauri::AppHandle, state: &AppState) {
@@ -343,36 +351,49 @@ impl AppState {
         self.set_runtime_starting(false);
     }
 
+    fn runtime_maintenance_plan_for_app_version(
+        &self,
+        current_app_version: &str,
+    ) -> Option<RuntimeMaintenancePlan> {
+        if runtime_upgrade_disabled_by_env() {
+            eprintln!(
+                "HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check."
+            );
+            return None;
+        }
+        let profile = self.launch_profile.lock();
+        let version_matches = profile
+            .last_launched_app_version
+            .as_deref()
+            .map(|v| v == current_app_version)
+            .unwrap_or(false);
+        if version_matches {
+            return None;
+        }
+        if let Some(failure) = profile.last_runtime_upgrade_failure.as_ref() {
+            if failure.app_version == current_app_version
+                && failure.attempts >= MAX_UPGRADE_AUTO_RETRIES
+            {
+                return None;
+            }
+        }
+        drop(profile);
+        if let Some(release) = self.tool_manager.check_headroom_upgrade() {
+            return Some(RuntimeMaintenancePlan::Upgrade(release));
+        }
+        if self.tool_manager.requirements_are_stale() {
+            return Some(RuntimeMaintenancePlan::RequirementsRepair);
+        }
+        None
+    }
+
     /// Returns true if the app version changed since the last successful
     /// launch AND an actual upgrade is needed (either headroom-ai version
     /// mismatch or requirements lock drift). Also gates on the retry budget
     /// from any prior upgrade failure, and on `HEADROOM_SKIP_RUNTIME_UPGRADE`.
     pub fn should_run_runtime_upgrade(&self, app: &tauri::AppHandle) -> bool {
-        if runtime_upgrade_disabled_by_env() {
-            eprintln!(
-                "HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check."
-            );
-            return false;
-        }
-        let current_version = app.package_info().version.to_string();
-        let profile = self.launch_profile.lock();
-        let version_matches = profile
-            .last_launched_app_version
-            .as_deref()
-            .map(|v| v == current_version.as_str())
-            .unwrap_or(false);
-        if version_matches {
-            return false;
-        }
-        if let Some(failure) = profile.last_runtime_upgrade_failure.as_ref() {
-            if failure.app_version == current_version && failure.attempts >= MAX_UPGRADE_AUTO_RETRIES
-            {
-                return false;
-            }
-        }
-        drop(profile);
-        self.tool_manager.check_headroom_upgrade().is_some()
-            || self.tool_manager.requirements_are_stale()
+        self.runtime_maintenance_plan_for_app_version(&app.package_info().version.to_string())
+            .is_some()
     }
 
     /// Run a full atomic runtime upgrade with UI progress + boot validation.
@@ -392,16 +413,27 @@ impl AppState {
         };
 
         let current_app_version = app.package_info().version.to_string();
-        let release = match self.tool_manager.check_headroom_upgrade() {
-            Some(r) => r,
+        let maintenance_plan = match self.runtime_maintenance_plan_for_app_version(&current_app_version)
+        {
+            Some(plan) => plan,
             None => {
-                // App version changed but no headroom upgrade is actually
+                // App version changed but no runtime maintenance is actually
                 // needed — just stamp the version.
                 self.stamp_app_version(&current_app_version);
                 return;
             }
         };
-        let target_version = release.version().to_string();
+        let maintenance_kind = match &maintenance_plan {
+            RuntimeMaintenancePlan::Upgrade(_) => RuntimeMaintenanceKind::Upgrade,
+            RuntimeMaintenancePlan::RequirementsRepair => RuntimeMaintenanceKind::RequirementsRepair,
+        };
+        let target_version = match &maintenance_plan {
+            RuntimeMaintenancePlan::Upgrade(release) => release.version().to_string(),
+            RuntimeMaintenancePlan::RequirementsRepair => self
+                .tool_manager
+                .installed_headroom_version()
+                .unwrap_or_else(|| "unknown".into()),
+        };
         let installed_version = self.tool_manager.installed_headroom_version();
 
         // User-facing from/to are the app versions — headroom-ai versions are
@@ -433,6 +465,10 @@ impl AppState {
             app,
             "runtime_upgrade_started",
             Some(serde_json::json!({
+                "maintenance_kind": match maintenance_kind {
+                    RuntimeMaintenanceKind::Upgrade => "upgrade",
+                    RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
+                },
                 "from_version": installed_version,
                 "to_version": target_version,
                 "app_version": current_app_version,
@@ -444,27 +480,55 @@ impl AppState {
         // SAFETY: self has a stable address for the duration of this call; the
         // closure runs inline and does not outlive this scope.
         let self_ptr: *const AppState = self as *const AppState;
-        let outcome = self.tool_manager.atomic_upgrade_headroom(
-            &release,
-            move |step| {
-                let state_ref = unsafe { &*self_ptr };
-                state_ref.set_upgrade_progress(|p| {
-                    p.current_step = step.step.to_string();
-                    p.message = step.message.clone();
-                    p.overall_percent = step.percent;
-                });
-                emit_runtime_upgrade_progress(&app_for_progress, state_ref);
-            },
-        );
+        let progress = move |step: BootstrapStepUpdate| {
+            let state_ref = unsafe { &*self_ptr };
+            state_ref.set_upgrade_progress(|p| {
+                p.current_step = step.step.to_string();
+                p.message = step.message.clone();
+                p.overall_percent = step.percent;
+            });
+            emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+        };
 
         use crate::tool_manager::UpgradeOutcome;
-        match outcome {
-            UpgradeOutcome::InstallFailed { restored, error } => {
+        let needs_commit_or_rollback = matches!(maintenance_kind, RuntimeMaintenanceKind::Upgrade);
+        let install_result = match maintenance_plan {
+            RuntimeMaintenancePlan::Upgrade(release) => {
+                match self.tool_manager.atomic_upgrade_headroom(&release, progress) {
+                    UpgradeOutcome::InstalledPendingValidation => Ok(()),
+                    UpgradeOutcome::InstallFailed { restored, error } => Err((restored, error)),
+                }
+            }
+            RuntimeMaintenancePlan::RequirementsRepair => self
+                .tool_manager
+                .repair_stale_requirements_with_progress(progress)
+                .map_err(|error| (false, error)),
+        };
+        match install_result {
+            Err((restored, error)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 eprintln!(
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
+                let restarted = self.ensure_headroom_running().is_ok();
                 let hint = crate::classify_upgrade_error(&error);
+                let fallback_hint = match maintenance_kind {
+                    RuntimeMaintenanceKind::Upgrade if restored && restarted => {
+                        Some("Restarted Headroom with the previous runtime.".into())
+                    }
+                    RuntimeMaintenanceKind::Upgrade if restored => {
+                        Some("Restored the previous runtime, but Headroom still needs a manual restart.".into())
+                    }
+                    RuntimeMaintenanceKind::Upgrade => {
+                        Some("Headroom update failed and the previous runtime could not be restored automatically.".into())
+                    }
+                    RuntimeMaintenanceKind::RequirementsRepair if restarted => {
+                        Some("Restarted Headroom with the existing runtime.".into())
+                    }
+                    RuntimeMaintenanceKind::RequirementsRepair => {
+                        Some("Dependency repair failed and Headroom could not be restarted automatically.".into())
+                    }
+                };
                 self.record_upgrade_failure(RuntimeUpgradeFailure {
                     app_version: current_app_version.clone(),
                     target_headroom_version: target_version.clone(),
@@ -474,8 +538,8 @@ impl AppState {
                     first_attempt_at: Utc::now(),
                     last_attempt_at: Utc::now(),
                     error_message: format!("{error:#}"),
-                    error_hint: hint,
-                    rollback_restored: restored,
+                    error_hint: hint.or(fallback_hint),
+                    rollback_restored: restored || restarted,
                 });
                 crate::capture_upgrade_failure(&error, restored, "install");
                 analytics::track_event(
@@ -483,9 +547,14 @@ impl AppState {
                     "runtime_upgrade_failed",
                     Some(serde_json::json!({
                         "phase": "install",
+                        "maintenance_kind": match maintenance_kind {
+                            RuntimeMaintenanceKind::Upgrade => "upgrade",
+                            RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
+                        },
                         "attempt": self.upgrade_failure_attempts(&current_app_version),
                         "app_version": current_app_version,
                         "restored": restored,
+                        "restarted": restarted,
                         "duration_ms": duration_ms,
                     })),
                 );
@@ -494,18 +563,30 @@ impl AppState {
                     p.complete = false;
                     p.failed = true;
                     p.current_step = "Install failed".into();
-                    p.message =
-                        "Headroom update couldn't install. Previous version is still running."
-                            .into();
+                    p.message = match maintenance_kind {
+                        RuntimeMaintenanceKind::Upgrade if restored && restarted => {
+                            "Headroom update couldn't install. The previous runtime was restored and restarted.".into()
+                        }
+                        RuntimeMaintenanceKind::Upgrade if restored => {
+                            "Headroom update couldn't install. The previous runtime was restored, but it still needs a restart.".into()
+                        }
+                        RuntimeMaintenanceKind::Upgrade => {
+                            "Headroom update couldn't install, and the previous runtime could not be restored automatically.".into()
+                        }
+                        RuntimeMaintenanceKind::RequirementsRepair if restarted => {
+                            "Headroom dependency repair failed. Restarted Headroom with the existing runtime.".into()
+                        }
+                        RuntimeMaintenanceKind::RequirementsRepair => {
+                            "Headroom dependency repair failed, and Headroom could not be restarted automatically.".into()
+                        }
+                    };
                     p.overall_percent = 100;
                 });
                 emit_runtime_upgrade_progress(app, self);
                 *self.runtime_upgrade_in_progress.lock() = false;
                 return;
             }
-            UpgradeOutcome::InstalledPendingValidation => {
-                // Fall through to boot validation.
-            }
+            Ok(()) => {}
         }
 
         // Boot validation: start the proxy and wait for reachability.
@@ -559,8 +640,10 @@ impl AppState {
         );
 
         if boot_ok {
-            if let Err(err) = self.tool_manager.commit_headroom_upgrade() {
-                eprintln!("commit_headroom_upgrade: non-fatal: {err:#}");
+            if needs_commit_or_rollback {
+                if let Err(err) = self.tool_manager.commit_headroom_upgrade() {
+                    eprintln!("commit_headroom_upgrade: non-fatal: {err:#}");
+                }
             }
             self.stamp_app_version(&current_app_version);
             self.clear_upgrade_failure();
@@ -569,10 +652,14 @@ impl AppState {
                 p.complete = true;
                 p.failed = false;
                 p.current_step = "Done".into();
-                p.message = format!(
-                    "Headroom updated to {}.",
-                    current_app_version
-                );
+                p.message = match maintenance_kind {
+                    RuntimeMaintenanceKind::Upgrade => {
+                        format!("Headroom updated to {}.", current_app_version)
+                    }
+                    RuntimeMaintenanceKind::RequirementsRepair => {
+                        "Headroom runtime repair completed.".into()
+                    }
+                };
                 p.overall_percent = 100;
             });
             emit_runtime_upgrade_progress(app, self);
@@ -580,6 +667,10 @@ impl AppState {
                 app,
                 "runtime_upgrade_completed",
                 Some(serde_json::json!({
+                    "maintenance_kind": match maintenance_kind {
+                        RuntimeMaintenanceKind::Upgrade => "upgrade",
+                        RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
+                    },
                     "from_version": installed_version,
                     "to_version": target_version,
                     "duration_ms": duration_ms,
@@ -589,7 +680,9 @@ impl AppState {
             return;
         }
 
-        // Boot validation failed — roll back to the previous venv.
+        // Boot validation failed — roll back to the previous venv when we have
+        // one, otherwise leave the repaired runtime in place and surface the
+        // failure so the next launch can retry.
         eprintln!(
             "run_upgrade_with_ui: boot validation failed ({}); rolling back to {:?}",
             outcome_label, installed_version
@@ -601,22 +694,20 @@ impl AppState {
             .map(|path| crate::tool_manager::tail_log_file(&path, 30))
             .filter(|s| !s.is_empty());
         self.stop_headroom();
-        let rollback_result = self.tool_manager.rollback_headroom_upgrade();
-        let rollback_restored = rollback_result.is_ok();
+        let rollback_result = if needs_commit_or_rollback {
+            self.tool_manager.rollback_headroom_upgrade()
+        } else {
+            Ok(())
+        };
+        let rollback_restored = needs_commit_or_rollback && rollback_result.is_ok();
         if let Err(err) = rollback_result {
             eprintln!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
-        // Bring the (hopefully restored) old proxy back up so the user lands
-        // on a working state.
-        if let Err(err) = self.ensure_headroom_running() {
-            eprintln!(
-                "run_upgrade_with_ui: failed to restart old proxy after rollback: {err:#}"
-            );
-        }
+        let restarted = self.ensure_headroom_running().is_ok();
 
         let err_msg = match log_tail.as_deref() {
             Some(tail) => format!(
-                "Headroom update to {} installed but boot validation failed ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n--- last proxy log lines ---\n{}",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n--- last proxy log lines ---\n{}",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -625,7 +716,7 @@ impl AppState {
                 tail
             ),
             None => format!(
-                "Headroom update to {} installed but boot validation failed ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -638,30 +729,57 @@ impl AppState {
         let previous_app_label = previous_app_version
             .clone()
             .unwrap_or_else(|| "the previous version".into());
+        let error_hint = match maintenance_kind {
+            RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => {
+                Some(format!("Reverted to Headroom {} and restarted it.", previous_app_label))
+            }
+            RuntimeMaintenanceKind::Upgrade if rollback_restored => {
+                Some(format!("Reverted to Headroom {}.", previous_app_label))
+            }
+            RuntimeMaintenanceKind::RequirementsRepair if restarted => {
+                Some("Headroom restarted with the repaired runtime, but validation still failed.".into())
+            }
+            RuntimeMaintenanceKind::RequirementsRepair => None,
+            _ => None,
+        };
         self.record_upgrade_failure(RuntimeUpgradeFailure {
             app_version: current_app_version.clone(),
             target_headroom_version: target_version.clone(),
             fallback_headroom_version: installed_version.clone(),
-            failure_phase: UpgradeFailurePhase::BootValidation,
+            failure_phase: if maintenance_kind == RuntimeMaintenanceKind::Upgrade {
+                UpgradeFailurePhase::BootValidation
+            } else {
+                UpgradeFailurePhase::Install
+            },
             attempts: 0,
             first_attempt_at: Utc::now(),
             last_attempt_at: Utc::now(),
             error_message: err_msg.clone(),
-            error_hint: Some(format!(
-                "Reverted to Headroom {}.",
-                previous_app_label
-            )),
-            rollback_restored,
+            error_hint,
+            rollback_restored: rollback_restored || restarted,
         });
-        crate::capture_upgrade_failure(&err, rollback_restored, "boot_validation");
+        crate::capture_upgrade_failure(
+            &err,
+            rollback_restored || restarted,
+            if maintenance_kind == RuntimeMaintenanceKind::Upgrade {
+                "boot_validation"
+            } else {
+                "requirements_repair_boot_validation"
+            },
+        );
         analytics::track_event(
             app,
             "runtime_upgrade_failed",
             Some(serde_json::json!({
                 "phase": "boot_validation",
+                "maintenance_kind": match maintenance_kind {
+                    RuntimeMaintenanceKind::Upgrade => "upgrade",
+                    RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
+                },
                 "attempt": self.upgrade_failure_attempts(&current_app_version),
                 "app_version": current_app_version,
                 "restored": rollback_restored,
+                "restarted": restarted,
                 "duration_ms": duration_ms,
             })),
         );
@@ -674,16 +792,29 @@ impl AppState {
             p.complete = false;
             p.failed = true;
             p.current_step = "Update didn't start".into();
-            p.message = if rollback_restored {
-                format!(
-                    "Headroom {} installed but didn't start. Reverted to {}.",
-                    current_app_label, fallback_app_label
-                )
-            } else {
-                format!(
+            p.message = match maintenance_kind {
+                RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => {
+                    format!(
+                        "Headroom {} installed but didn't start. Reverted to {} and restarted it.",
+                        current_app_label, fallback_app_label
+                    )
+                }
+                RuntimeMaintenanceKind::Upgrade if rollback_restored => {
+                    format!(
+                        "Headroom {} installed but didn't start. Reverted to {}.",
+                        current_app_label, fallback_app_label
+                    )
+                }
+                RuntimeMaintenanceKind::Upgrade => format!(
                     "Headroom {} installed but didn't start, and rollback failed. Reinstall from the Dashboard.",
                     current_app_label
-                )
+                ),
+                RuntimeMaintenanceKind::RequirementsRepair if restarted => {
+                    "Headroom runtime repair finished, but startup validation still failed after restart.".into()
+                }
+                RuntimeMaintenanceKind::RequirementsRepair => {
+                    "Headroom runtime repair finished, but startup validation failed. Reinstall from the Dashboard.".into()
+                }
             };
             p.overall_percent = 100;
         });
@@ -3679,7 +3810,10 @@ mod tests {
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
-    use crate::models::{BootstrapProgress, DailySavingsPoint, HourlySavingsPoint};
+    use crate::models::{
+        BootstrapProgress, DailySavingsPoint, HourlySavingsPoint, RuntimeUpgradeFailure,
+        UpgradeFailurePhase,
+    };
     use crate::tool_manager::BootstrapStepUpdate;
 
     use super::{
@@ -3839,6 +3973,22 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
     }
 
+    fn write_headroom_receipt(base_dir: &PathBuf, version: &str, requirements_lock_sha256: &str) {
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(base_dir);
+        fs::create_dir_all(&runtime.tools_dir).expect("create tools dir");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            format!(
+                r#"{{
+                    "version":"{}",
+                    "artifact":{{"requirementsLockSha256":"{}"}}
+                }}"#,
+                version, requirements_lock_sha256
+            ),
+        )
+        .expect("write receipt");
+    }
+
     #[test]
     fn dashboard_includes_managed_tools() {
         let base_dir = temp_test_dir("headroom-app-state");
@@ -3851,6 +4001,75 @@ mod tests {
             .insights
             .iter()
             .any(|insight| !insight.title.is_empty()));
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_maintenance_plan_prefers_requirements_repair_when_only_lock_is_stale() {
+        let base_dir = temp_test_dir("headroom-maintenance-repair");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        write_headroom_receipt(&base_dir, "0.8.2", "stale");
+
+        let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
+        assert!(matches!(plan, Some(super::RuntimeMaintenancePlan::RequirementsRepair)));
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_maintenance_plan_prefers_upgrade_over_requirements_repair() {
+        let base_dir = temp_test_dir("headroom-maintenance-upgrade");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        write_headroom_receipt(&base_dir, "0.6.5", "stale");
+
+        let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
+        match plan {
+            Some(super::RuntimeMaintenancePlan::Upgrade(release)) => {
+                assert_eq!(release.version(), "0.8.2");
+            }
+            _ => panic!("expected version upgrade plan"),
+        }
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_maintenance_plan_skips_when_current_app_version_already_succeeded() {
+        let base_dir = temp_test_dir("headroom-maintenance-stamped");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        write_headroom_receipt(&base_dir, "0.8.2", "stale");
+        state.stamp_app_version(env!("CARGO_PKG_VERSION"));
+
+        let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
+        assert!(plan.is_none());
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_maintenance_plan_skips_when_retry_budget_is_exhausted() {
+        let base_dir = temp_test_dir("headroom-maintenance-budget");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        write_headroom_receipt(&base_dir, "0.6.5", "stale");
+
+        for _ in 0..super::MAX_UPGRADE_AUTO_RETRIES {
+            state.record_upgrade_failure(RuntimeUpgradeFailure {
+                app_version: env!("CARGO_PKG_VERSION").into(),
+                target_headroom_version: "0.8.2".into(),
+                fallback_headroom_version: Some("0.6.5".into()),
+                failure_phase: UpgradeFailurePhase::Install,
+                attempts: 0,
+                first_attempt_at: Utc::now(),
+                last_attempt_at: Utc::now(),
+                error_message: "failed".into(),
+                error_hint: None,
+                rollback_restored: true,
+            });
+        }
+
+        let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
+        assert!(plan.is_none());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

@@ -453,7 +453,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 state.mark_bootstrap_failed(
                     "Installation failed: Headroom couldn't download a required file. \
                     Please check your internet connection and try restarting the app. \
-                    If this keeps happening, contact support at headroom.ai/support."
+                    If this keeps happening, contact support at support@extraheadroom.com."
                 );
                 emit_bootstrap_progress(&app_handle, &state);
                 analytics::track_event(
