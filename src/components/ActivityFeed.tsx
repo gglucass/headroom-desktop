@@ -1,4 +1,4 @@
-import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
@@ -43,8 +43,12 @@ export function ActivityFeed({
   projectPaths = []
 }: ActivityFeedProps) {
   const [page, setPage] = useState(0);
-  const filteredEvents = filterLowSignal(feed.events);
-  const visibleEvents = coalesceFeed(filteredEvents);
+  // Memoize the derived feed shapes so page changes (or any re-render that
+  // doesn't actually change `feed.events`) skip the O(N) filter + coalesce
+  // pass. Combined with the signature-based bail in App.tsx's poll, identical
+  // polls become cheap: same `feed.events` reference → memo hits → no work.
+  const filteredEvents = useMemo(() => filterLowSignal(feed.events), [feed.events]);
+  const visibleEvents = useMemo(() => coalesceFeed(filteredEvents), [filteredEvents]);
   const totalPages = Math.max(1, Math.ceil(visibleEvents.length / PAGE_SIZE));
   const clampedPage = Math.min(page, totalPages - 1);
   const start = clampedPage * PAGE_SIZE;

@@ -129,6 +129,7 @@ import type {
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
+  ActivityEvent,
   DashboardState,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
@@ -326,6 +327,47 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+/**
+ * O(1) structural fingerprint of an activity feed response. Used by the
+ * polling effects to skip `setActivityFeed` when the proxy's sliding window
+ * returns the same events two polls in a row — which is the common case
+ * between compressions. Skipping the state update avoids a top-level
+ * re-render and re-coalescing of ~150 events every 4s.
+ *
+ * The fingerprint is length + proxyReachable + first-event-id + last-event-id.
+ * If the head/tail of a 150-event window are the same, the window is the same.
+ */
+function activityFeedSignature(feed: ActivityFeedResponse): string {
+  const { events } = feed;
+  const sigOf = (event: ActivityEvent | undefined): string => {
+    if (!event) return "";
+    switch (event.kind) {
+      case "transformation":
+        return `t:${event.data.requestId ?? event.data.timestamp ?? ""}`;
+      case "memory":
+        return `m:${event.data.id}`;
+      case "weeklyRecap":
+        return `wr:${event.data.weekStart}`;
+      case "rtkBatch":
+      case "milestone":
+      case "dailyRecord":
+      case "allTimeRecord":
+      case "newModel":
+      case "streak":
+      case "savingsMilestone":
+      case "learningsMilestone":
+      case "promptAllTimeRecord":
+        return `${event.kind[0]}:${event.data.observedAt}`;
+    }
+  };
+  return [
+    events.length,
+    feed.proxyReachable ? 1 : 0,
+    sigOf(events[0]),
+    sigOf(events[events.length - 1])
+  ].join("|");
 }
 
 const PRICING_CACHE_KEY = "headroom.cachedPricing";
@@ -712,7 +754,11 @@ export default function App() {
   // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
   const [trayWindowFocused, setTrayWindowFocused] = useState(true);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
-  const ACTIVITY_FEED_WINDOW = 500;
+  // 150 rows ≈ 15 pages at 10/row. Bigger windows make each poll transfer
+  // more data across the Tauri IPC boundary, parse more JSON, and do more
+  // coalescing/render work — with no user-visible benefit since nobody
+  // paginates that deep. Cut from 500.
+  const ACTIVITY_FEED_WINDOW = 150;
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -1455,7 +1501,9 @@ export default function App() {
     void refreshHeadroomLearnPrereq();
     invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
       .then((next) => {
-        setActivityFeed(next);
+        setActivityFeed((prev) =>
+          activityFeedSignature(prev) === activityFeedSignature(next) ? prev : next
+        );
         setActivityFeedError(null);
       })
       .catch(() => {
@@ -1476,7 +1524,9 @@ export default function App() {
       invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
         .then((next) => {
           if (!active) return;
-          setActivityFeed(next);
+          setActivityFeed((prev) =>
+            activityFeedSignature(prev) === activityFeedSignature(next) ? prev : next
+          );
           setActivityFeedError(null);
         })
         .catch((err) => {
