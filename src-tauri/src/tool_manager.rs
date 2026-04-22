@@ -342,7 +342,7 @@ impl ToolManager {
             let variant = if args.is_empty() {
                 "default".to_string()
             } else {
-                args.join("-")
+                sanitize_log_variant(&args.join("-"))
             };
             let log_path = logs_dir.join(format!("headroom-{variant}.log"));
             let log_file = OpenOptions::new()
@@ -1932,6 +1932,26 @@ fn headroom_entrypoint_startup_args() -> Vec<String> {
     args
 }
 
+/// Make a string safe to use as part of a filename: replace path separators
+/// (`/`, `\`) and other characters that have meaning to the filesystem with
+/// `_`, then truncate so absurdly long argv strings don't blow past
+/// per-component name limits (255 bytes on most filesystems).
+fn sanitize_log_variant(raw: &str) -> String {
+    const MAX_LEN: usize = 80;
+    let mut out: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' | '\n' | '\r' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if out.len() > MAX_LEN {
+        out.truncate(MAX_LEN);
+    }
+    out
+}
+
 /// Args that enable passive learning: the proxy extracts patterns from live
 /// traffic into the memory store, but does not inject memory tools or context
 /// into requests (so the model's view of the conversation is unchanged).
@@ -2679,8 +2699,8 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, read_headroom_learn_metadata_from_path,
-        run_command, sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease,
-        ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
+        run_command, sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure,
+        HeadroomRelease, ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -2730,6 +2750,29 @@ mod tests {
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
         assert!(runtime.bin_dir.join("rtk").exists());
+    }
+
+    #[test]
+    fn sanitize_log_variant_replaces_path_separators() {
+        let raw = "proxy---memory-db-path-/Users/x/Library/Application Support/Headroom/memory.db";
+        let cleaned = sanitize_log_variant(raw);
+        assert!(!cleaned.contains('/'), "expected no slashes, got: {cleaned}");
+        assert!(!cleaned.contains('\\'));
+        assert!(cleaned.contains("memory-db-path"));
+    }
+
+    #[test]
+    fn sanitize_log_variant_truncates_long_input() {
+        let raw = "a".repeat(500);
+        let cleaned = sanitize_log_variant(&raw);
+        assert_eq!(cleaned.len(), 80);
+    }
+
+    #[test]
+    fn sanitize_log_variant_keeps_short_safe_input_unchanged() {
+        let raw = "proxy---port-6768---log-messages---learn";
+        let cleaned = sanitize_log_variant(raw);
+        assert_eq!(cleaned, raw);
     }
 
     #[test]
