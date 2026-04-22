@@ -83,7 +83,56 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Saved 750 tokens (75.0%)");
     expect(markup).toContain("1,000");
     expect(markup).toContain("250");
-    expect(markup).toContain("interceptor:ast-grep");
+    expect(markup).toContain("ast-grep");
+    expect(markup).not.toContain("interceptor:ast-grep");
+  });
+
+  it("renders friendly labels for read_lifecycle transforms", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          transformsApplied: ["read_lifecycle:stale", "read_lifecycle:superseded"]
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Stale Read");
+    expect(markup).toContain("Superseded Read");
+    expect(markup).not.toContain("read_lifecycle:stale");
+    expect(markup).not.toContain("read_lifecycle:superseded");
+  });
+
+  it("renders friendly labels for parametric transforms", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          transformsApplied: [
+            "tool_crush:7",
+            "router:tool_result:ast",
+            "kompress:user:0.45",
+            "inserted_3_cache_breakpoints",
+            "cache_align"
+          ]
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Crushed 7 tools");
+    expect(markup).toContain("Tool result: ast");
+    expect(markup).toContain("Kompress user (0.45x)");
+    expect(markup).toContain("Inserted 3 cache breakpoints");
+    expect(markup).toContain("Cache aligned");
+  });
+
+  it("falls back to the raw transform string when unknown", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [transformation({ transformsApplied: ["something:new:format"] })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("something:new:format");
   });
 
   it("renders a memory row with scope, importance, and content", () => {

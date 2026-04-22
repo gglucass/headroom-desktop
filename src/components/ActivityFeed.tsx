@@ -145,15 +145,117 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       </div>
       {event.transformsApplied.length > 0 ? (
         <ul className="activity-feed__transforms">
-          {event.transformsApplied.map((t) => (
-            <li key={t} className="activity-feed__transform">
-              {t}
-            </li>
-          ))}
+          {event.transformsApplied.map((t) => {
+            const { label, title } = formatTransform(t);
+            return (
+              <li key={t} className="activity-feed__transform" title={title}>
+                {label}
+              </li>
+            );
+          })}
         </ul>
       ) : null}
     </li>
   );
+}
+
+function formatTransform(raw: string): { label: string; title: string } {
+  // Exact-match table for known labels.
+  const exact: Record<string, { label: string; title: string }> = {
+    "read_lifecycle:stale": {
+      label: "Stale Read",
+      title: "Read output replaced — file was edited after this Read"
+    },
+    "read_lifecycle:superseded": {
+      label: "Superseded Read",
+      title: "Read output replaced — file was re-Read later in the conversation"
+    },
+    "interceptor:ast-grep": {
+      label: "ast-grep",
+      title: "Tool-result interceptor applied semantic code search"
+    },
+    "router:excluded:tool": {
+      label: "Tool result excluded",
+      title: "Content router excluded a tool result from the prompt"
+    },
+    "router:protected:user_message": {
+      label: "Protected: user message",
+      title: "Content router preserved a user message from compression"
+    },
+    "router:protected:system_message": {
+      label: "Protected: system message",
+      title: "Content router preserved a system message from compression"
+    },
+    "router:protected:recent_code": {
+      label: "Protected: recent code",
+      title: "Content router preserved recent code from compression"
+    },
+    "router:protected:analysis_context": {
+      label: "Protected: analysis context",
+      title: "Content router preserved analysis context from compression"
+    },
+    cache_align: {
+      label: "Cache aligned",
+      title: "Conversation aligned to a stable cache boundary"
+    }
+  };
+
+  const hit = exact[raw];
+  if (hit) return hit;
+
+  // Prefix patterns with variable tails.
+  const crush = /^tool_crush:(\d+)$/.exec(raw);
+  if (crush) {
+    const n = Number(crush[1]);
+    return {
+      label: `Crushed ${n} tool${n === 1 ? "" : "s"}`,
+      title: "Compacted tool-use blocks into a shorter form"
+    };
+  }
+
+  const breakpoints = /^inserted_(\d+)_cache_breakpoints$/.exec(raw);
+  if (breakpoints) {
+    const n = Number(breakpoints[1]);
+    return {
+      label: `Inserted ${n} cache breakpoint${n === 1 ? "" : "s"}`,
+      title: "Added cache breakpoints to improve prompt-cache hit rate"
+    };
+  }
+
+  const routerTool = /^router:tool_result:(.+)$/.exec(raw);
+  if (routerTool) {
+    return {
+      label: `Tool result: ${routerTool[1]}`,
+      title: `Content router compressed a tool result with strategy ${routerTool[1]}`
+    };
+  }
+
+  const routerRatio = /^router:([^:]+):([\d.]+)$/.exec(raw);
+  if (routerRatio) {
+    return {
+      label: `Compressed: ${routerRatio[1]} (${routerRatio[2]}x)`,
+      title: `Content router used ${routerRatio[1]} at ${routerRatio[2]}x compression`
+    };
+  }
+
+  const kompress = /^kompress:([^:]+):([\d.]+)$/.exec(raw);
+  if (kompress) {
+    return {
+      label: `Kompress ${kompress[1]} (${kompress[2]}x)`,
+      title: `Kompress compressed ${kompress[1]} messages at ${kompress[2]}x`
+    };
+  }
+
+  const cacheOpt = /^cache_optimizer:(.+)$/.exec(raw);
+  if (cacheOpt) {
+    return {
+      label: `Cache optimizer: ${cacheOpt[1]}`,
+      title: "Cache optimizer adjusted prompt for better caching"
+    };
+  }
+
+  // Unknown transform — render verbatim, tooltip shows the raw id.
+  return { label: raw, title: raw };
 }
 
 function MemoryRow({ event }: { event: MemoryFeedEvent }) {
