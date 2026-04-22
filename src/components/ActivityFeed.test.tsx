@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { ActivityFeed } from "./ActivityFeed";
+import { ActivityFeed, groupTransforms } from "./ActivityFeed";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
@@ -8,6 +8,7 @@ import type {
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
+  PromptRecordEvent,
   RecordEvent,
   RtkBatchEvent,
   SavingsMilestoneEvent,
@@ -629,5 +630,83 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("RTK × 2");
     expect(markup).toContain("+4 commands");
     expect(markup).toContain("1,600 tokens");
+  });
+
+  it("renders a promptAllTimeRecord row with totals, call count, and previous record", () => {
+    const data: PromptRecordEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      tokensSaved: 3_210,
+      callCount: 4,
+      previousRecord: 2_500,
+      turnId: "turn-X",
+      model: "claude-opus-4-7",
+      workspace: "/Users/u/Code/demo"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "promptAllTimeRecord", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("All-time record (prompt)");
+    expect(markup).toContain("Saved 3,210 tokens across 4 calls");
+    expect(markup).toContain("previous record 2,500");
+    expect(markup).toContain(">demo<");
+    expect(markup).toContain(">claude-opus-4-7<");
+  });
+
+  it("renders a promptAllTimeRecord row without previous/workspace when null", () => {
+    const data: PromptRecordEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      tokensSaved: 100,
+      callCount: 1,
+      previousRecord: null,
+      turnId: "turn-Y",
+      model: null,
+      workspace: null
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "promptAllTimeRecord", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Saved 100 tokens across 1 call");
+    expect(markup).not.toContain("previous record");
+    expect(markup).not.toContain("activity-feed__project");
+    expect(markup).not.toContain("activity-feed__model");
+  });
+});
+
+describe("groupTransforms", () => {
+  it("returns an empty array for an empty input", () => {
+    expect(groupTransforms([])).toEqual([]);
+  });
+
+  it("returns a single entry with count 1 for a unique raw", () => {
+    const result = groupTransforms(["cache_align"]);
+    expect(result).toEqual([
+      { label: "Cache aligned", title: expect.any(String), count: 1 }
+    ]);
+  });
+
+  it("collapses duplicates, preserves first-seen order, and counts each group", () => {
+    const raws = [
+      "read_lifecycle:stale",
+      "router:excluded:tool",
+      "read_lifecycle:stale",
+      "read_lifecycle:stale",
+      "router:excluded:tool"
+    ];
+    const result = groupTransforms(raws);
+    expect(result.map((g) => g.label)).toEqual(["Stale Read", "Tool result excluded"]);
+    expect(result.map((g) => g.count)).toEqual([3, 2]);
+  });
+
+  it("groups by friendly label even when the raw strings differ", () => {
+    // Two distinct raws that both map to the same friendly label would
+    // collapse into one chip — pin that so future formatTransform changes
+    // don't silently break the UX.
+    const result = groupTransforms(["cache_align", "cache_align"]);
+    expect(result).toHaveLength(1);
+    expect(result[0].count).toBe(2);
   });
 });

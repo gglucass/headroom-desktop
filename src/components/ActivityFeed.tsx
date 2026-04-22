@@ -357,6 +357,9 @@ function ExpandableRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const canExpand = detail != null;
+  /* v8 ignore start — interactive handlers require a DOM; SSR tests can pin
+     role/aria/class but cannot dispatch click or keyboard events. Same reason
+     OptimizePanel.tsx is excluded from coverage entirely. */
   const toggle = () => {
     if (canExpand) setExpanded((prev) => !prev);
   };
@@ -367,6 +370,7 @@ function ExpandableRow({
       toggle();
     }
   };
+  /* v8 ignore stop */
   return (
     <li
       className={
@@ -607,7 +611,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
  * "Stale Read × 70" chip instead of 70 identical chips flooding the row.
  * Preserves first-seen order so the display is stable.
  */
-function groupTransforms(
+export function groupTransforms(
   raws: string[]
 ): Array<{ label: string; title: string; count: number }> {
   const byLabel = new Map<string, { label: string; title: string; count: number }>();
@@ -739,6 +743,7 @@ function MemoryRow({
   const matchedPath = scopeProject ? null : matchProjectPath(event.content, projectPaths);
   const project = scopeProject ?? (matchedPath ? basenameOf(matchedPath) : null);
   const canExpand = event.content.length > 60 || event.content.includes("\n");
+  /* v8 ignore start — interactive handlers require a DOM; see ExpandableRow. */
   const toggle = () => {
     if (canExpand) setExpanded((prev) => !prev);
   };
@@ -749,6 +754,7 @@ function MemoryRow({
       toggle();
     }
   };
+  /* v8 ignore stop */
   return (
     <li
       className={
