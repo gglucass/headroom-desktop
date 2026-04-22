@@ -80,6 +80,16 @@ pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPaylo
             ),
             action: Some("activity".into()),
         }),
+        ActivityEvent::PromptAllTimeRecord(r) => Some(NotificationPayload {
+            title: "New record prompt".into(),
+            body: format!(
+                "Saved {} tokens across {} call{} on a single prompt. Your biggest one yet.",
+                format_with_commas(r.tokens_saved),
+                r.call_count,
+                if r.call_count == 1 { "" } else { "s" }
+            ),
+            action: Some("activity".into()),
+        }),
         ActivityEvent::Streak(s) if s.kind == "new_record" => Some(NotificationPayload {
             title: "New longest streak".into(),
             body: format!("You're on a {}-day run with Headroom. Keep it up.", s.days),
@@ -337,6 +347,7 @@ mod tests {
                 savings_percent: None,
                 transforms_applied: vec![],
                 workspace: None,
+                turn_id: None,
             }),
             ActivityEvent::Memory(MemoryFeedEvent {
                 id: "m".into(),

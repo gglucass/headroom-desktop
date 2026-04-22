@@ -1,6 +1,7 @@
 import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
-import { formatDateTime } from "../lib/dashboardHelpers";
+import type { ReactNode } from "react";
+import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
@@ -8,6 +9,7 @@ import type {
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
+  PromptRecordEvent,
   RecordEvent,
   RtkBatchEvent,
   SavingsMilestoneEvent,
@@ -41,7 +43,8 @@ export function ActivityFeed({
   projectPaths = []
 }: ActivityFeedProps) {
   const [page, setPage] = useState(0);
-  const visibleEvents = coalesceFeed(filterLowSignal(feed.events));
+  const filteredEvents = filterLowSignal(feed.events);
+  const visibleEvents = coalesceFeed(filteredEvents);
   const totalPages = Math.max(1, Math.ceil(visibleEvents.length / PAGE_SIZE));
   const clampedPage = Math.min(page, totalPages - 1);
   const start = clampedPage * PAGE_SIZE;
@@ -107,7 +110,7 @@ export function ActivityFeed({
                 ← Prev
               </button>
               <span className="activity-feed__page-indicator">
-                Page {clampedPage + 1} of {totalPages} · {visibleEvents.length} total
+                Page {clampedPage + 1} of {totalPages} · {filteredEvents.length} total
               </span>
               <button
                 type="button"
@@ -128,7 +131,8 @@ export function ActivityFeed({
 type FeedRow =
   | { type: "single"; event: ActivityEvent }
   | { type: "transformationGroup"; events: TransformationFeedEvent[] }
-  | { type: "rtkGroup"; events: RtkBatchEvent[] };
+  | { type: "rtkGroup"; events: RtkBatchEvent[] }
+  | { type: "dayHeader"; dayKey: string; label: string };
 
 // Memory is intentionally NOT coalesced — each entry has distinct content
 // worth seeing individually (and is clamped to one line with click-to-expand).
@@ -139,6 +143,11 @@ const COALESCE_KINDS: ReadonlySet<ActivityEvent["kind"]> = new Set([
   "rtkBatch"
 ]);
 
+// Break a coalesced run when consecutive same-kind events are further apart
+// than this. Picks a natural "work session" boundary — a morning burst and
+// an afternoon burst become two groups instead of one blob.
+const COALESCE_GAP_MS = 30 * 60 * 1000;
+
 function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
   return events.filter((event) => {
     if (event.kind === "memory") {
@@ -148,18 +157,81 @@ function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
   });
 }
 
+function eventTimestampMs(event: ActivityEvent): number {
+  switch (event.kind) {
+    case "transformation":
+      return Date.parse(event.data.timestamp ?? "") || 0;
+    case "memory":
+      return Date.parse(event.data.createdAt) || 0;
+    case "rtkBatch":
+    case "milestone":
+    case "dailyRecord":
+    case "allTimeRecord":
+    case "promptAllTimeRecord":
+    case "newModel":
+    case "streak":
+    case "savingsMilestone":
+    case "learningsMilestone":
+      return Date.parse(event.data.observedAt) || 0;
+    case "weeklyRecap":
+      return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
+  }
+}
+
+function localDayKey(ms: number): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function dayHeaderLabel(dayKey: string, now: Date = new Date()): string {
+  if (!dayKey) return "";
+  const today = localDayKey(now.getTime());
+  const yesterday = localDayKey(now.getTime() - 86_400_000);
+  if (dayKey === today) return "Today";
+  if (dayKey === yesterday) return "Yesterday";
+  const [y, m, d] = dayKey.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const sameYear = dt.getFullYear() === now.getFullYear();
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric"
+  }).format(dt);
+}
+
 function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
   const out: FeedRow[] = [];
   let i = 0;
+  let lastDayKey: string | null = null;
   while (i < events.length) {
     const event = events[i];
+    const ts = eventTimestampMs(event);
+    const dayKey = localDayKey(ts);
+    if (dayKey && dayKey !== lastDayKey) {
+      out.push({ type: "dayHeader", dayKey, label: dayHeaderLabel(dayKey) });
+      lastDayKey = dayKey;
+    }
     if (!COALESCE_KINDS.has(event.kind)) {
       out.push({ type: "single", event });
       i++;
       continue;
     }
+    // Extend the run while: same kind, same calendar day, AND consecutive
+    // timestamps within COALESCE_GAP_MS. A break on any dimension ends the
+    // run so the next row starts fresh (under its own header if the day
+    // changed, or as a distinct group if just the gap did).
     let j = i + 1;
+    let prevTs = ts;
     while (j < events.length && events[j].kind === event.kind) {
+      const nextTs = eventTimestampMs(events[j]);
+      if (localDayKey(nextTs) !== dayKey) break;
+      if (Math.abs(prevTs - nextTs) > COALESCE_GAP_MS) break;
+      prevTs = nextTs;
       j++;
     }
     const runLength = j - i;
@@ -184,6 +256,9 @@ function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
 }
 
 function feedRowKey(row: FeedRow, index: number): string {
+  if (row.type === "dayHeader") {
+    return `day-${row.dayKey}`;
+  }
   if (row.type === "single") {
     return singleKey(row.event, index);
   }
@@ -208,6 +283,8 @@ function singleKey(event: ActivityEvent, index: number): string {
       return `dr-${event.data.day ?? ""}-${event.data.observedAt}`;
     case "allTimeRecord":
       return `atr-${event.data.tokensSaved}-${event.data.observedAt}`;
+    case "promptAllTimeRecord":
+      return `patr-${event.data.turnId}-${event.data.observedAt}`;
     case "newModel":
       return `nm-${event.data.model}-${event.data.observedAt}`;
     case "streak":
@@ -222,6 +299,13 @@ function singleKey(event: ActivityEvent, index: number): string {
 }
 
 function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string[] }) {
+  if (row.type === "dayHeader") {
+    return (
+      <li className="activity-feed__day-header" aria-label={`Events from ${row.label}`}>
+        <span>{row.label}</span>
+      </li>
+    );
+  }
   if (row.type === "transformationGroup") {
     return <TransformationGroupRow events={row.events} />;
   }
@@ -242,6 +326,8 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
       return <RecordRow event={event.data} kind="daily" />;
     case "allTimeRecord":
       return <RecordRow event={event.data} kind="allTime" />;
+    case "promptAllTimeRecord":
+      return <PromptRecordRow event={event.data} />;
     case "newModel":
       return <NewModelRow event={event.data} />;
     case "streak":
@@ -255,25 +341,102 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
   }
 }
 
+/**
+ * Wraps a feed row and toggles an expanded detail block below the main
+ * content when clicked. No-op when `detail` is null — the row renders
+ * non-clickable and the caller just gets a plain `<li>` wrapper.
+ */
+function ExpandableRow({
+  className,
+  detail,
+  children
+}: {
+  className: string;
+  detail: ReactNode | null;
+  children: ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = detail != null;
+  const toggle = () => {
+    if (canExpand) setExpanded((prev) => !prev);
+  };
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
+    if (!canExpand) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggle();
+    }
+  };
+  return (
+    <li
+      className={
+        className +
+        (canExpand ? " activity-feed__item--clickable" : "") +
+        (expanded ? " is-expanded" : "")
+      }
+      role={canExpand ? "button" : undefined}
+      tabIndex={canExpand ? 0 : undefined}
+      aria-expanded={canExpand ? expanded : undefined}
+      onClick={toggle}
+      onKeyDown={onKeyDown}
+    >
+      {children}
+      {expanded && detail ? (
+        <div className="activity-feed__detail">{detail}</div>
+      ) : null}
+    </li>
+  );
+}
+
+function TimeChip({ iso }: { iso: string | null | undefined }) {
+  return (
+    <span className="activity-feed__time" title={formatDateTime(iso)}>
+      {formatRelativeTime(iso)}
+    </span>
+  );
+}
+
 function TransformationGroupRow({ events }: { events: TransformationFeedEvent[] }) {
   const totalSaved = events.reduce((sum, e) => sum + (e.tokensSaved ?? 0), 0);
   const avgPct =
     events.reduce((sum, e) => sum + (e.savingsPercent ?? 0), 0) / events.length;
   const latest = events[0];
+  const detail = (
+    <ul className="activity-feed__detail-list">
+      {events.map((ev, i) => (
+        <li
+          key={`tg-sub-${ev.requestId ?? ev.timestamp ?? i}`}
+          className="activity-feed__detail-item"
+        >
+          <TimeChip iso={ev.timestamp} />
+          <span className="activity-feed__detail-primary">
+            Saved {(ev.tokensSaved ?? 0).toLocaleString()} tokens
+            {ev.savingsPercent != null ? ` (${ev.savingsPercent.toFixed(1)}%)` : ""}
+          </span>
+          {ev.model ? (
+            <span className="activity-feed__model">{ev.model}</span>
+          ) : null}
+        </li>
+      ))}
+    </ul>
+  );
   return (
-    <li className="activity-feed__item activity-feed__item--transformation">
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--transformation"
+      detail={detail}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--transformation">
           Compression × {events.length}
         </span>
-        <span className="activity-feed__time">{formatDateTime(latest.timestamp)}</span>
+        <TimeChip iso={latest.timestamp} />
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
           Saved {totalSaved.toLocaleString()} tokens ({avgPct.toFixed(1)}% avg)
         </strong>
       </div>
-    </li>
+    </ExpandableRow>
   );
 }
 
@@ -281,13 +444,30 @@ function RtkGroupRow({ events }: { events: RtkBatchEvent[] }) {
   const commandsDelta = events.reduce((sum, e) => sum + e.commandsDelta, 0);
   const tokensDelta = events.reduce((sum, e) => sum + e.tokensSavedDelta, 0);
   const latest = events[0];
+  const detail = (
+    <ul className="activity-feed__detail-list">
+      {events.map((ev, i) => (
+        <li key={`rg-sub-${ev.observedAt}-${i}`} className="activity-feed__detail-item">
+          <TimeChip iso={ev.observedAt} />
+          <span className="activity-feed__detail-primary">
+            +{ev.commandsDelta.toLocaleString()} command
+            {ev.commandsDelta === 1 ? "" : "s"}, saved{" "}
+            {ev.tokensSavedDelta.toLocaleString()} tokens
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
   return (
-    <li className="activity-feed__item activity-feed__item--rtk">
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--rtk"
+      detail={detail}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--rtk">
           RTK × {events.length}
         </span>
-        <span className="activity-feed__time">{formatDateTime(latest.observedAt)}</span>
+        <TimeChip iso={latest.observedAt} />
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
@@ -295,7 +475,7 @@ function RtkGroupRow({ events }: { events: RtkBatchEvent[] }) {
           {tokensDelta.toLocaleString()} tokens
         </strong>
       </div>
-    </li>
+    </ExpandableRow>
   );
 }
 
@@ -339,13 +519,54 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
   const workspace = workspaceBasename(event.workspace);
+  const hasExactTokens =
+    event.inputTokensOriginal != null && event.inputTokensOptimized != null;
+  const hasRequestId = !!event.requestId;
+  const hasRawTransforms = event.transformsApplied.length > 0;
+  const hasExtra = hasRequestId || hasRawTransforms || event.workspace != null;
+  const detail = hasExtra ? (
+    <dl className="activity-feed__detail-grid">
+      {hasRequestId ? (
+        <>
+          <dt>Request ID</dt>
+          <dd className="activity-feed__detail-mono">{event.requestId}</dd>
+        </>
+      ) : null}
+      {event.workspace ? (
+        <>
+          <dt>Workspace</dt>
+          <dd className="activity-feed__detail-mono">{event.workspace}</dd>
+        </>
+      ) : null}
+      {hasExactTokens ? (
+        <>
+          <dt>Tokens in → out</dt>
+          <dd>
+            {event.inputTokensOriginal!.toLocaleString()} →{" "}
+            {event.inputTokensOptimized!.toLocaleString()}
+          </dd>
+        </>
+      ) : null}
+      {hasRawTransforms ? (
+        <>
+          <dt>Raw transforms</dt>
+          <dd className="activity-feed__detail-mono">
+            {event.transformsApplied.join(", ")}
+          </dd>
+        </>
+      ) : null}
+    </dl>
+  ) : null;
   return (
-    <li className="activity-feed__item activity-feed__item--transformation">
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--transformation"
+      detail={detail}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--transformation">
           Compression
         </span>
-        <span className="activity-feed__time">{formatDateTime(event.timestamp)}</span>
+        <TimeChip iso={event.timestamp} />
         <span className="activity-feed__provider">{event.provider ?? "unknown"}</span>
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
         {workspace ? (
@@ -356,27 +577,50 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <strong className="activity-feed__savings">
           Saved {saved.toLocaleString()} tokens ({pct.toFixed(1)}%)
         </strong>
-        {event.inputTokensOriginal != null && event.inputTokensOptimized != null ? (
+        {hasExactTokens ? (
           <span className="activity-feed__delta">
-            {event.inputTokensOriginal.toLocaleString()} →{" "}
-            {event.inputTokensOptimized.toLocaleString()}
+            {event.inputTokensOriginal!.toLocaleString()} →{" "}
+            {event.inputTokensOptimized!.toLocaleString()}
           </span>
         ) : null}
       </div>
-      {event.transformsApplied.length > 0 ? (
+      {hasRawTransforms ? (
         <ul className="activity-feed__transforms">
-          {event.transformsApplied.map((t) => {
-            const { label, title } = formatTransform(t);
-            return (
-              <li key={t} className="activity-feed__transform" title={title}>
-                {label}
-              </li>
-            );
-          })}
+          {groupTransforms(event.transformsApplied).map((grp) => (
+            <li
+              key={grp.label}
+              className="activity-feed__transform"
+              title={grp.count > 1 ? `${grp.title} (${grp.count} times)` : grp.title}
+            >
+              {grp.count > 1 ? `${grp.label} × ${grp.count}` : grp.label}
+            </li>
+          ))}
         </ul>
       ) : null}
-    </li>
+    </ExpandableRow>
   );
+}
+
+/**
+ * Collapses a transformsApplied list into one entry per friendly label with a
+ * count. A single compression that fires 70 "Stale Read"s renders as one
+ * "Stale Read × 70" chip instead of 70 identical chips flooding the row.
+ * Preserves first-seen order so the display is stable.
+ */
+function groupTransforms(
+  raws: string[]
+): Array<{ label: string; title: string; count: number }> {
+  const byLabel = new Map<string, { label: string; title: string; count: number }>();
+  for (const raw of raws) {
+    const { label, title } = formatTransform(raw);
+    const existing = byLabel.get(label);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      byLabel.set(label, { label, title, count: 1 });
+    }
+  }
+  return Array.from(byLabel.values());
 }
 
 function formatTransform(raw: string): { label: string; title: string } {
@@ -520,7 +764,7 @@ function MemoryRow({
     >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--memory">Learning</span>
-        <span className="activity-feed__time">{formatDateTime(event.createdAt)}</span>
+        <TimeChip iso={event.createdAt} />
         {project ? (
           <span className="activity-feed__project">{project}</span>
         ) : null}
@@ -540,11 +784,24 @@ function MemoryRow({
 }
 
 function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
+  const detail = (
+    <dl className="activity-feed__detail-grid">
+      <dt>Observed</dt>
+      <dd>{formatDateTime(event.observedAt)}</dd>
+      <dt>Lifetime commands</dt>
+      <dd>{event.totalCommands.toLocaleString()}</dd>
+      <dt>Lifetime tokens saved</dt>
+      <dd>{event.totalSaved.toLocaleString()}</dd>
+    </dl>
+  );
   return (
-    <li className="activity-feed__item activity-feed__item--rtk">
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--rtk"
+      detail={detail}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--rtk">RTK</span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
@@ -557,7 +814,7 @@ function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
           {event.totalSaved.toLocaleString()} tokens
         </span>
       </div>
-    </li>
+    </ExpandableRow>
   );
 }
 
@@ -566,7 +823,7 @@ function MilestoneRow({ event }: { event: MilestoneEvent }) {
     <li className="activity-feed__item activity-feed__item--milestone">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--milestone">Milestone</span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
       </div>
       <p className="activity-feed__content">
         Crossed {formatTokensShort(event.milestoneTokensSaved)} lifetime tokens saved.
@@ -597,7 +854,7 @@ function RecordRow({
     <li className={`activity-feed__item ${itemClass}`}>
       <div className="activity-feed__row activity-feed__row--meta">
         <span className={`activity-feed__badge ${badgeClass}`}>{badgeLabel}</span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
         {workspace ? (
           <span className="activity-feed__project">{workspace}</span>
@@ -618,13 +875,40 @@ function RecordRow({
   );
 }
 
+function PromptRecordRow({ event }: { event: PromptRecordEvent }) {
+  const workspace = workspaceBasename(event.workspace);
+  return (
+    <li className="activity-feed__item activity-feed__item--all-time-record">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--all-time-record">
+          All-time record (prompt)
+        </span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
+        {workspace ? <span className="activity-feed__project">{workspace}</span> : null}
+      </div>
+      <div className="activity-feed__row activity-feed__row--savings">
+        <strong className="activity-feed__savings">
+          Saved {event.tokensSaved.toLocaleString()} tokens across {event.callCount}{" "}
+          call{event.callCount === 1 ? "" : "s"}
+        </strong>
+        {event.previousRecord != null ? (
+          <span className="activity-feed__delta">
+            previous record {event.previousRecord.toLocaleString()}
+          </span>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
 function NewModelRow({ event }: { event: NewModelEvent }) {
   const workspace = workspaceBasename(event.workspace);
   return (
     <li className="activity-feed__item activity-feed__item--new-model">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--new-model">New model</span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
         {event.provider ? (
           <span className="activity-feed__provider">{event.provider}</span>
         ) : null}
@@ -644,7 +928,7 @@ function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
         <span className="activity-feed__badge activity-feed__badge--learnings-milestone">
           Learning milestone
         </span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
       </div>
       <p className="activity-feed__content">
         {event.count} patterns extracted from your work so far.
@@ -659,7 +943,7 @@ function StreakRow({ event }: { event: StreakEvent }) {
     <li className="activity-feed__item activity-feed__item--streak">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--streak">Streak</span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
         {isRecord ? (
           <span className="activity-feed__streak-record">new longest</span>
         ) : null}
@@ -679,7 +963,7 @@ function SavingsMilestoneRow({ event }: { event: SavingsMilestoneEvent }) {
         <span className="activity-feed__badge activity-feed__badge--savings-milestone">
           Savings milestone
         </span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
       </div>
       <p className="activity-feed__content">
         Lifetime savings crossed ${event.milestoneUsd.toLocaleString()}.
@@ -695,7 +979,7 @@ function WeeklyRecapRow({ event }: { event: WeeklyRecapEvent }) {
         <span className="activity-feed__badge activity-feed__badge--weekly-recap">
           Weekly recap
         </span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <TimeChip iso={event.observedAt} />
         <span className="activity-feed__week-range">
           {event.weekStart} – {event.weekEnd}
         </span>

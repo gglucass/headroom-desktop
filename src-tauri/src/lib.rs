@@ -1296,6 +1296,7 @@ fn activity_event_timestamp(event: &ActivityEvent) -> String {
         ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::PromptAllTimeRecord(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
@@ -3765,6 +3766,7 @@ mod tests {
             savings_percent: Some(75.0),
             transforms_applied: vec!["interceptor:ast-grep".into()],
             workspace: None,
+            turn_id: None,
         }
     }
 
@@ -3787,6 +3789,7 @@ mod tests {
             ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::PromptAllTimeRecord(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
@@ -3970,6 +3973,7 @@ mod tests {
                 ActivityEvent::Milestone(_) => "milestone",
                 ActivityEvent::DailyRecord(_) => "dailyRecord",
                 ActivityEvent::AllTimeRecord(_) => "allTimeRecord",
+                ActivityEvent::PromptAllTimeRecord(_) => "promptAllTimeRecord",
                 ActivityEvent::NewModel(_) => "newModel",
                 ActivityEvent::Streak(_) => "streak",
                 ActivityEvent::SavingsMilestone(_) => "savingsMilestone",

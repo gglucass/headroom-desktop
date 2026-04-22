@@ -273,6 +273,37 @@ export function formatDateTime(timestamp?: string | null) {
   }).format(parsed);
 }
 
+/**
+ * Relative time for high-frequency events in the activity feed. Recent events
+ * read as "just now" / "10m ago" / "6h ago" / "3 days ago"; anything older
+ * than a week falls back to an absolute date. `now` is injectable so callers
+ * with a mocked clock (tests) can get deterministic output.
+ */
+export function formatRelativeTime(
+  timestamp?: string | null,
+  now: Date = new Date()
+): string {
+  if (!timestamp) return "Never";
+  const ms = new Date(timestamp).getTime();
+  if (Number.isNaN(ms)) return "Unknown";
+  const diff = now.getTime() - ms;
+  if (diff < 45_000) return "just now";
+  if (diff < 60 * 60_000) return `${Math.max(1, Math.floor(diff / 60_000))}m ago`;
+  if (diff < 24 * 60 * 60_000) return `${Math.floor(diff / (60 * 60_000))}h ago`;
+  if (diff < 7 * 24 * 60 * 60_000) {
+    const days = Math.floor(diff / (24 * 60 * 60_000));
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+  }
+  // Older than a week: absolute date.
+  const d = new Date(ms);
+  const sameYear = d.getFullYear() === now.getFullYear();
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric"
+  }).format(d);
+}
+
 export function formatLearnStatus(project: {
   lastLearnRanAt: string | null;
   hasPersistedLearnings?: boolean;

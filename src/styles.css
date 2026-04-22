@@ -4204,6 +4204,31 @@ html.window-hiding {
   gap: 10px;
 }
 
+.activity-feed__day-header {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 -2px;
+  padding: 0 2px;
+  font-size: var(--text-xxs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.activity-feed__day-header:first-child {
+  margin-top: 0;
+}
+
+.activity-feed__day-header::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
 .activity-feed__item {
   background: rgba(248, 246, 242, 0.7);
   border: 1px solid rgba(124, 113, 104, 0.12);
@@ -4460,6 +4485,60 @@ html.window-hiding {
   background: rgba(250, 247, 240, 0.95);
 }
 
+.activity-feed__detail {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-subtle);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.activity-feed__detail-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 12px;
+}
+
+.activity-feed__detail-grid dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.activity-feed__detail-grid dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-feed__detail-mono {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.activity-feed__detail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.activity-feed__detail-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.activity-feed__detail-primary {
+  color: var(--text-secondary);
+}
+
 .activity-feed__expand {
   margin-top: 4px;
   padding: 0;
@@ -4485,16 +4564,16 @@ html.window-hiding {
 
 .activity-feed__page-button {
   padding: 6px 14px;
-  background: rgba(108, 90, 165, 0.08);
-  border: 1px solid rgba(108, 90, 165, 0.25);
+  background: var(--fill-hover);
+  border: 1px solid var(--border-default);
   border-radius: 6px;
-  color: #5a4990;
+  color: var(--text-primary);
   font-size: var(--text-sm);
   cursor: pointer;
 }
 
 .activity-feed__page-button:hover:not(:disabled) {
-  background: rgba(108, 90, 165, 0.15);
+  background: var(--fill-active);
 }
 
 .activity-feed__page-button:disabled {
@@ -4504,7 +4583,7 @@ html.window-hiding {
 
 .activity-feed__page-indicator {
   font-size: var(--text-sm);
-  color: rgba(36, 31, 29, 0.7);
+  color: var(--text-muted);
 }
 
 /* ---------- Install prompt (Claude CLI missing) ---------- */

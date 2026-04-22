@@ -256,6 +256,7 @@ export interface TransformationFeedEvent {
   savingsPercent?: number | null;
   transformsApplied: string[];
   workspace?: string | null;
+  turnId?: string | null;
 }
 
 export interface TransformationFeedResponse {
@@ -318,6 +319,16 @@ export interface RecordEvent {
   workspace?: string | null;
 }
 
+export interface PromptRecordEvent {
+  observedAt: string;
+  tokensSaved: number;
+  callCount: number;
+  previousRecord: number | null;
+  turnId: string;
+  model: string | null;
+  workspace?: string | null;
+}
+
 export interface NewModelEvent {
   observedAt: string;
   model: string;
@@ -359,6 +370,7 @@ export type ActivityEvent =
   | { kind: "milestone"; data: MilestoneEvent }
   | { kind: "dailyRecord"; data: RecordEvent }
   | { kind: "allTimeRecord"; data: RecordEvent }
+  | { kind: "promptAllTimeRecord"; data: PromptRecordEvent }
   | { kind: "newModel"; data: NewModelEvent }
   | { kind: "streak"; data: StreakEvent }
   | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }

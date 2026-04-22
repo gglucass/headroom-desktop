@@ -334,6 +334,8 @@ pub struct TransformationFeedEvent {
     pub transforms_applied: Vec<String>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default, alias = "turn_id")]
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +417,19 @@ pub struct RecordEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PromptRecordEvent {
+    pub observed_at: DateTime<Utc>,
+    pub tokens_saved: u64,
+    pub call_count: u32,
+    pub previous_record: Option<u64>,
+    pub turn_id: String,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewModelEvent {
     pub observed_at: DateTime<Utc>,
     pub model: String,
@@ -473,6 +488,8 @@ pub enum ActivityEvent {
     DailyRecord(RecordEvent),
     #[serde(rename = "allTimeRecord")]
     AllTimeRecord(RecordEvent),
+    #[serde(rename = "promptAllTimeRecord")]
+    PromptAllTimeRecord(PromptRecordEvent),
     #[serde(rename = "newModel")]
     NewModel(NewModelEvent),
     #[serde(rename = "streak")]

@@ -4322,6 +4322,7 @@ mod tests {
             savings_percent: Some(80.0),
             transforms_applied: vec!["kompress".into()],
             workspace: Some("/Users/u/Code/demo".into()),
+            turn_id: None,
         };
 
         let first = state.observe_activity_from_transformations(&[transformation.clone()]);

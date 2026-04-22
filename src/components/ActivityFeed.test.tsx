@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ActivityFeed } from "./ActivityFeed";
 import type {
   ActivityEvent,
@@ -137,6 +137,29 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("something:new:format");
   });
 
+  it("collapses repeated transforms into a single count chip", () => {
+    // Before: 70 identical stale-read transforms rendered 70 separate chips
+    // and flooded the row. Now: one chip "Stale Read × 70".
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          transformsApplied: [
+            ...Array(70).fill("read_lifecycle:stale"),
+            ...Array(42).fill("router:excluded:tool"),
+            "cache_align"
+          ]
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    const chipCount = (markup.match(/<li class="activity-feed__transform"/g) ?? []).length;
+    expect(chipCount).toBe(3);
+    expect(markup).toContain("Stale Read × 70");
+    expect(markup).toContain("Tool result excluded × 42");
+    expect(markup).toContain(">Cache aligned<");
+  });
+
   it("renders a memory row with content", () => {
     const feed: ActivityFeedResponse = { ...baseFeed, events: [memory()] };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
@@ -166,6 +189,80 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Saved 600 tokens (20.0% avg)");
     const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
     expect(rowCount).toBe(1);
+  });
+
+  it("breaks a coalesced run when consecutive events are more than 30 minutes apart", () => {
+    // Two clusters on the same day, 40 minutes apart — should render as two
+    // separate grouped rows, not one merged "Compression × 4".
+    const events: ActivityEvent[] = [
+      transformation({ requestId: "a1", timestamp: "2026-04-21T15:01:00Z", tokensSaved: 100, savingsPercent: 10 }),
+      transformation({ requestId: "a2", timestamp: "2026-04-21T15:00:00Z", tokensSaved: 100, savingsPercent: 10 }),
+      transformation({ requestId: "b1", timestamp: "2026-04-21T14:20:00Z", tokensSaved: 200, savingsPercent: 20 }),
+      transformation({ requestId: "b2", timestamp: "2026-04-21T14:19:00Z", tokensSaved: 200, savingsPercent: 20 })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    const groupCount = (markup.match(/Compression × 2/g) ?? []).length;
+    expect(groupCount).toBe(2);
+    expect(markup).not.toContain("Compression × 4");
+  });
+
+  it("renders time chips using relative time with an absolute-date tooltip", () => {
+    const now = new Date("2026-04-21T10:00:00Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const feed: ActivityFeedResponse = {
+        ...baseFeed,
+        events: [
+          transformation({
+            requestId: "relnow",
+            timestamp: "2026-04-21T09:50:00Z"
+          })
+        ]
+      };
+      const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+      expect(markup).toContain("10m ago");
+      expect(markup).toMatch(/title="[^"]*2026[^"]*"/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("exposes transformation detail (request ID + raw transforms) in an expandable row", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          requestId: "req-abc-123",
+          transformsApplied: ["interceptor:ast-grep", "cache_align"],
+          workspace: "/Users/u/Code/demo"
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    // Row is marked clickable and carries the detail block so client render
+    // can toggle it. SSR renders it with expanded=false, so the detail text
+    // isn't visible, but the button role + aria wiring are pinned here.
+    expect(markup).toContain("activity-feed__item--clickable");
+    expect(markup).toContain('role="button"');
+    expect(markup).toContain('aria-expanded="false"');
+  });
+
+  it("breaks a coalesced run and inserts a header when the day changes", () => {
+    // Pick timestamps ~24h apart so they land on different local days in any
+    // reasonable timezone the test host might run in.
+    const events: ActivityEvent[] = [
+      transformation({ requestId: "later", timestamp: "2026-04-22T12:00:00Z", tokensSaved: 100, savingsPercent: 10 }),
+      transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 200, savingsPercent: 20 })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    // Two distinct days ⇒ two day-header rows and no group (each day has one
+    // event, so each stays a single row).
+    const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
+    expect(headerCount).toBe(2);
+    expect(markup).not.toContain("Compression × 2");
   });
 
   it("renders both kinds in the order they appear in the feed", () => {
@@ -473,16 +570,20 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__transforms");
   });
 
-  it("paginates at 10 events per page and shows navigation when there are more", () => {
+  it("paginates at 10 rows per page and shows navigation when there are more", () => {
     // Memory rows don't coalesce (each has distinct content), so they're the
-    // right fixture for exercising pagination behavior.
+    // right fixture for exercising pagination behavior. All 23 entries share
+    // the same local day, so one day header is inserted at the top of page 1
+    // and page 1 ends up with 9 item rows + 1 header = 10 rows total.
     const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) =>
       memory({ id: `mem-${i}`, createdAt: `2026-04-21T10:${String(i).padStart(2, "0")}:00Z` })
     );
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    expect(rowCount).toBe(10);
+    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+    const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
+    expect(itemCount + headerCount).toBe(10);
+    expect(headerCount).toBe(1);
     expect(markup).toContain("Page 1 of 3");
     expect(markup).toContain("23 total");
     expect(markup).toContain("← Prev");
