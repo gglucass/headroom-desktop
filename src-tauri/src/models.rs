@@ -312,6 +312,65 @@ pub struct HeadroomLearnPrereqStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformationFeedEvent {
+    #[serde(default, alias = "request_id")]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default, alias = "input_tokens_original")]
+    pub input_tokens_original: Option<u64>,
+    #[serde(default, alias = "input_tokens_optimized")]
+    pub input_tokens_optimized: Option<u64>,
+    #[serde(default, alias = "tokens_saved")]
+    pub tokens_saved: Option<i64>,
+    #[serde(default, alias = "savings_percent")]
+    pub savings_percent: Option<f64>,
+    #[serde(default, alias = "transforms_applied")]
+    pub transforms_applied: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformationFeedResponse {
+    pub log_full_messages: bool,
+    pub transformations: Vec<TransformationFeedEvent>,
+    pub proxy_reachable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryFeedEvent {
+    pub id: String,
+    pub created_at: String,
+    pub scope: String,
+    pub content: String,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
+pub enum ActivityEvent {
+    #[serde(rename = "transformation")]
+    Transformation(TransformationFeedEvent),
+    #[serde(rename = "memory")]
+    Memory(MemoryFeedEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityFeedResponse {
+    pub events: Vec<ActivityEvent>,
+    pub log_full_messages: bool,
+    pub proxy_reachable: bool,
+    pub memory_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateDecision {
     Include,

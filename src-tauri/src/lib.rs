@@ -35,10 +35,11 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    BillingPeriod, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage,
-    ClientConnectorStatus, ClientSetupResult, ClientSetupVerification, DashboardState,
-    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress,
+    ActivityEvent, ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
+    ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
+    ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
+    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, MemoryFeedEvent,
+    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -837,16 +838,66 @@ fn get_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
 }
 
 #[tauri::command]
-fn start_headroom_learn(app: AppHandle, project_path: String) -> Result<(), String> {
-    if let Some(reason) = crate::state::headroom_learn_platform_message() {
-        return Err(reason);
+fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
+    let limit = limit.unwrap_or(50).min(100);
+    fetch_transformations_feed(limit).unwrap_or_else(|_| TransformationFeedResponse {
+        log_full_messages: false,
+        transformations: Vec::new(),
+        proxy_reachable: false,
+    })
+}
+
+#[tauri::command]
+fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> ActivityFeedResponse {
+    let limit = limit.unwrap_or(50).min(100);
+    let transformations = fetch_transformations_feed(limit).ok();
+    let memory_path = headroom_memory_db_path();
+    let memories = if memory_path.exists() {
+        let entrypoint = state.tool_manager.headroom_entrypoint();
+        fetch_memory_feed(&entrypoint, &memory_path, limit as usize).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut events: Vec<ActivityEvent> = Vec::new();
+    let (proxy_reachable, log_full_messages) = match transformations {
+        Some(t) => {
+            for ev in t.transformations {
+                events.push(ActivityEvent::Transformation(ev));
+            }
+            (t.proxy_reachable, t.log_full_messages)
+        }
+        None => (false, false),
+    };
+    let memory_available = memory_path.exists();
+    for m in memories {
+        events.push(ActivityEvent::Memory(m));
     }
 
-    if !detect_headroom_learn_prereq_status().claude_cli_available {
-        return Err(
-            "Install the Claude Code CLI (`claude`) to enable Headroom Learn.".into(),
-        );
+    events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
+    events.truncate(limit as usize);
+
+    ActivityFeedResponse {
+        events,
+        log_full_messages,
+        proxy_reachable,
+        memory_available,
     }
+}
+
+fn activity_event_timestamp(event: &ActivityEvent) -> String {
+    match event {
+        ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
+        ActivityEvent::Memory(m) => m.created_at.clone(),
+    }
+}
+
+#[tauri::command]
+fn start_headroom_learn(app: AppHandle, project_path: String) -> Result<(), String> {
+    check_headroom_learn_prereqs(
+        crate::state::headroom_learn_platform_message().as_deref(),
+        &detect_headroom_learn_prereq_status(),
+    )?;
 
     {
         let state: tauri::State<'_, AppState> = app.state();
@@ -1352,8 +1403,10 @@ pub fn run() {
             activate_headroom_account,
             create_headroom_checkout_session,
             get_headroom_billing_portal_url,
+            get_activity_feed,
             get_headroom_learn_status,
             get_headroom_learn_prereq_status,
+            get_transformations_feed,
             start_headroom_learn,
             apply_client_setup,
             verify_client_setup,
@@ -1496,12 +1549,122 @@ fn parse_updater_endpoint_list(raw: &str) -> Result<Vec<reqwest::Url>, String> {
         .collect()
 }
 
+pub fn headroom_memory_db_path() -> std::path::PathBuf {
+    crate::storage::memory_db_path(&crate::storage::app_data_dir())
+}
+
 fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
     let path = claude_cli::detect_claude_cli();
     HeadroomLearnPrereqStatus {
         claude_cli_available: path.is_some(),
         claude_cli_path: path.map(|p| p.display().to_string()),
     }
+}
+
+fn check_headroom_learn_prereqs(
+    platform_disabled_reason: Option<&str>,
+    prereq: &HeadroomLearnPrereqStatus,
+) -> Result<(), String> {
+    if let Some(reason) = platform_disabled_reason {
+        return Err(reason.to_string());
+    }
+    if !prereq.claude_cli_available {
+        return Err("Install the Claude Code CLI (`claude`) to enable Headroom Learn.".into());
+    }
+    Ok(())
+}
+
+/// Reads recent memories from the SQLite store via `headroom memory export`.
+/// Returns at most `limit` events, sorted by `created_at` DESC.
+///
+/// Note: this exports the entire memory DB on each call, so cost grows with
+/// the total number of memories. Acceptable while the store is small (<1000
+/// rows). If memory grows, switch to a direct SQLite read with `WHERE created_at > ?`.
+fn fetch_memory_feed(
+    headroom_entrypoint: &Path,
+    db_path: &Path,
+    limit: usize,
+) -> Result<Vec<MemoryFeedEvent>, String> {
+    let output = Command::new(headroom_entrypoint)
+        .arg("memory")
+        .arg("export")
+        .arg("--db-path")
+        .arg(db_path)
+        .env("PYTHONNOUSERSITE", "1")
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "headroom memory export exited {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_memory_export(&stdout, limit)
+}
+
+fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>, String> {
+    #[derive(serde::Deserialize)]
+    struct RawMemory {
+        id: String,
+        #[serde(default)]
+        content: String,
+        #[serde(default, alias = "scope_level")]
+        scope: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        importance: Option<f64>,
+    }
+    let raw: Vec<RawMemory> =
+        serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    let mut events: Vec<MemoryFeedEvent> = raw
+        .into_iter()
+        .filter_map(|m| {
+            Some(MemoryFeedEvent {
+                id: m.id,
+                created_at: m.created_at?,
+                scope: m.scope.unwrap_or_else(|| "unknown".into()),
+                content: m.content,
+                importance: m.importance.unwrap_or(0.0),
+            })
+        })
+        .collect();
+    events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    events.truncate(limit);
+    Ok(events)
+}
+
+fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
+    fetch_transformations_feed_from("http://127.0.0.1:6767", limit)
+}
+
+#[derive(serde::Deserialize)]
+struct RawTransformationsFeedResponse {
+    log_full_messages: bool,
+    transformations: Vec<crate::models::TransformationFeedEvent>,
+}
+
+fn fetch_transformations_feed_from(
+    base_url: &str,
+    limit: u32,
+) -> Result<TransformationFeedResponse, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(2000))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let url = format!("{base_url}/transformations/feed?limit={limit}");
+    let response = client.get(url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("proxy returned HTTP {}", response.status()));
+    }
+    let raw: RawTransformationsFeedResponse =
+        response.json().map_err(|err| err.to_string())?;
+    Ok(TransformationFeedResponse {
+        log_full_messages: raw.log_full_messages,
+        transformations: raw.transformations,
+        proxy_reachable: true,
+    })
 }
 
 struct HeadroomLearnRunResult {
@@ -2451,11 +2614,12 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
-        compute_tray_window_position, debounced_tray_runtime_visual, install_pending_update,
-        is_prerelease_version, lifetime_token_milestone_kind,
-        parse_updater_endpoint_list, physical_rect_from_rect, store_checked_update,
-        AvailableAppUpdate, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
-        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        check_headroom_learn_prereqs, compute_tray_window_position, debounced_tray_runtime_visual,
+        fetch_transformations_feed_from, install_pending_update, is_prerelease_version,
+        lifetime_token_milestone_kind, parse_memory_export, parse_updater_endpoint_list,
+        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
         DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use serde_json::json;
@@ -2804,5 +2968,173 @@ mod tests {
         assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
         assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
         assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_passes_when_cli_available() {
+        let prereq = HeadroomLearnPrereqStatus {
+            claude_cli_available: true,
+            claude_cli_path: Some("/usr/bin/claude".into()),
+        };
+        assert!(check_headroom_learn_prereqs(None, &prereq).is_ok());
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_returns_install_message_when_cli_missing() {
+        let prereq = HeadroomLearnPrereqStatus {
+            claude_cli_available: false,
+            claude_cli_path: None,
+        };
+        let err = check_headroom_learn_prereqs(None, &prereq).unwrap_err();
+        assert!(
+            err.contains("Install the Claude Code CLI"),
+            "expected install hint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_prefers_platform_message_over_cli_check() {
+        let prereq = HeadroomLearnPrereqStatus {
+            claude_cli_available: false,
+            claude_cli_path: None,
+        };
+        let err = check_headroom_learn_prereqs(Some("Linux not supported"), &prereq).unwrap_err();
+        assert_eq!(err, "Linux not supported");
+    }
+
+    #[test]
+    fn fetch_transformations_feed_decodes_proxy_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = serde_json::json!({
+                "log_full_messages": true,
+                "transformations": [{
+                    "request_id": "req-1",
+                    "timestamp": "2026-04-21T10:00:00Z",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens_original": 1000,
+                    "input_tokens_optimized": 250,
+                    "tokens_saved": 750,
+                    "savings_percent": 75.0,
+                    "transforms_applied": ["interceptor:ast-grep"]
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let result =
+            fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50).unwrap();
+        server.join().unwrap();
+
+        assert!(result.proxy_reachable);
+        assert!(result.log_full_messages);
+        assert_eq!(result.transformations.len(), 1);
+        let event = &result.transformations[0];
+        assert_eq!(event.request_id.as_deref(), Some("req-1"));
+        assert_eq!(event.provider.as_deref(), Some("anthropic"));
+        assert_eq!(event.tokens_saved, Some(750));
+        assert_eq!(event.transforms_applied, vec!["interceptor:ast-grep"]);
+    }
+
+    #[test]
+    fn fetch_transformations_feed_returns_error_on_non_2xx_status() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response =
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("503"), "expected status code in error, got: {err}");
+    }
+
+    #[test]
+    fn parse_memory_export_decodes_recent_entries_sorted_descending() {
+        let json = r#"[
+            {"id":"a","content":"oldest","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.5},
+            {"id":"b","content":"newest","scope_level":"session","created_at":"2026-04-21T12:00:00","importance":0.9},
+            {"id":"c","content":"middle","scope_level":"agent","created_at":"2026-04-21T11:00:00","importance":0.3}
+        ]"#;
+        let events = parse_memory_export(json, 10).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].id, "b");
+        assert_eq!(events[0].content, "newest");
+        assert_eq!(events[0].scope, "session");
+        assert_eq!(events[1].id, "c");
+        assert_eq!(events[2].id, "a");
+    }
+
+    #[test]
+    fn parse_memory_export_caps_to_limit() {
+        let json = r#"[
+            {"id":"1","content":"a","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.1},
+            {"id":"2","content":"b","scope_level":"user","created_at":"2026-04-21T11:00:00","importance":0.1},
+            {"id":"3","content":"c","scope_level":"user","created_at":"2026-04-21T12:00:00","importance":0.1}
+        ]"#;
+        let events = parse_memory_export(json, 2).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "3");
+        assert_eq!(events[1].id, "2");
+    }
+
+    #[test]
+    fn parse_memory_export_handles_empty_array() {
+        let events = parse_memory_export("[]", 10).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_memory_export_skips_entries_without_created_at() {
+        let json = r#"[
+            {"id":"1","content":"valid","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.5},
+            {"id":"2","content":"missing","scope_level":"user","importance":0.1}
+        ]"#;
+        let events = parse_memory_export(json, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "1");
+    }
+
+    #[test]
+    fn parse_memory_export_returns_error_on_malformed_json() {
+        let err = parse_memory_export("not json", 10).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn fetch_transformations_feed_returns_error_when_proxy_unreachable() {
+        // Bind and immediately drop a listener so we know the port is free.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
+            .unwrap_err();
+        assert!(!err.is_empty(), "expected a non-empty error message");
     }
 }

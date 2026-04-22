@@ -245,6 +245,43 @@ export interface HeadroomLearnPrereqStatus {
   claudeCliPath?: string | null;
 }
 
+export interface TransformationFeedEvent {
+  requestId?: string | null;
+  timestamp?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  inputTokensOriginal?: number | null;
+  inputTokensOptimized?: number | null;
+  tokensSaved?: number | null;
+  savingsPercent?: number | null;
+  transformsApplied: string[];
+}
+
+export interface TransformationFeedResponse {
+  logFullMessages: boolean;
+  proxyReachable: boolean;
+  transformations: TransformationFeedEvent[];
+}
+
+export interface MemoryFeedEvent {
+  id: string;
+  createdAt: string;
+  scope: string;
+  content: string;
+  importance: number;
+}
+
+export type ActivityEvent =
+  | { kind: "transformation"; data: TransformationFeedEvent }
+  | { kind: "memory"; data: MemoryFeedEvent };
+
+export interface ActivityFeedResponse {
+  events: ActivityEvent[];
+  logFullMessages: boolean;
+  proxyReachable: boolean;
+  memoryAvailable: boolean;
+}
+
 export type ClaudeAuthMethod = "claude_ai_oauth" | "api_key" | "unknown";
 
 export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "unknown";

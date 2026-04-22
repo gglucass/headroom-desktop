@@ -114,6 +114,7 @@ import {
   subscriptionTierLabel
 } from "./lib/pricing";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
+import { ActivityFeed } from "./components/ActivityFeed";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -128,6 +129,7 @@ import type {
   DashboardState,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
+  ActivityFeedResponse,
   HourlySavingsPoint,
   RuntimeStatus,
   RuntimeUpgradeProgress,
@@ -688,6 +690,13 @@ export default function App() {
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
   const [headroomLearnPrereq, setHeadroomLearnPrereq] =
     useState<HeadroomLearnPrereqStatus>(idleHeadroomLearnPrereqStatus);
+  const [activityFeed, setActivityFeed] = useState<ActivityFeedResponse>({
+    events: [],
+    logFullMessages: false,
+    proxyReachable: false,
+    memoryAvailable: false
+  });
+  const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -1396,6 +1405,33 @@ export default function App() {
 
     refreshDashboard();
     const interval = window.setInterval(refreshDashboard, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [activeView]);
+
+  useEffect(() => {
+    if (activeView !== "notifications") {
+      return;
+    }
+    let active = true;
+    const refreshFeed = () => {
+      invoke<ActivityFeedResponse>("get_activity_feed", { limit: 50 })
+        .then((next) => {
+          if (!active) return;
+          setActivityFeed(next);
+          setActivityFeedError(null);
+        })
+        .catch((err) => {
+          if (!active) return;
+          setActivityFeedError(
+            err instanceof Error ? err.message : "Could not load activity feed."
+          );
+        });
+    };
+    refreshFeed();
+    const interval = window.setInterval(refreshFeed, 2000);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -3817,8 +3853,8 @@ export default function App() {
           <p className="loading-copy">Coming soon</p>
         </div>
 
-        <div className="tray-content tray-content--centered" hidden={activeView !== "notifications"}>
-          <p className="loading-copy">Coming soon</p>
+        <div className="tray-content" hidden={activeView !== "notifications"}>
+          <ActivityFeed feed={activityFeed} error={activityFeedError} />
         </div>
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
@@ -4464,7 +4500,7 @@ export default function App() {
                   <li>Delete <code>~/.headroom</code> (Python runtime)</li>
                   <li>Remove the LaunchAgent plist from <code>~/Library/LaunchAgents/</code> and disable the login item</li>
                   <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
-                  <li>Delete Headroom's keychain entries (session token and any API keys you entered)</li>
+                  <li>Delete Headroom's keychain entries (session token plus any API keys saved by older builds)</li>
                 </ul>
                 <p>You can reinstall at any time by launching Headroom again.</p>
                 {uninstallError ? (

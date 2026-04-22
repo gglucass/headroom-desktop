@@ -299,7 +299,7 @@ impl ToolManager {
         // Use the console_scripts entrypoint when available to avoid the Python
         // -m double-import RuntimeWarning. Fall back to -m if missing.
         let entrypoint = self.headroom_entrypoint();
-        let startup_variants: Vec<(PathBuf, Vec<&'static str>)> = if entrypoint.exists() {
+        let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
             vec![
                 (entrypoint, headroom_entrypoint_startup_args()),
                 (python.clone(), headroom_python_startup_args()),
@@ -1904,14 +1904,45 @@ pub(crate) fn newest_proxy_log_path(logs_dir: &Path) -> Option<PathBuf> {
     newest.map(|(_, p)| p)
 }
 
-fn headroom_python_startup_args() -> Vec<&'static str> {
-    vec!["-m", "headroom.proxy.server", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
+fn headroom_python_startup_args() -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        "headroom.proxy.server".to_string(),
+        "--port".to_string(),
+        HEADROOM_PROXY_PORT.to_string(),
+        "--no-http2".to_string(),
+        "--log-messages".to_string(),
+    ];
+    args.extend(headroom_learn_startup_args());
+    args
 }
 
-fn headroom_entrypoint_startup_args() -> Vec<&'static str> {
+fn headroom_entrypoint_startup_args() -> Vec<String> {
     // The CLI `proxy` command does not expose --no-http2; HTTP/2 is controlled
     // via the HEADROOM_HTTP2 env var when using the entrypoint.
-    vec!["proxy", "--port", HEADROOM_PROXY_PORT]
+    // --log-messages stores full request/response bodies so the desktop's
+    // Activity tab can render the live transformations feed.
+    let mut args = vec![
+        "proxy".to_string(),
+        "--port".to_string(),
+        HEADROOM_PROXY_PORT.to_string(),
+        "--log-messages".to_string(),
+    ];
+    args.extend(headroom_learn_startup_args());
+    args
+}
+
+/// Args that enable passive learning: the proxy extracts patterns from live
+/// traffic into the memory store, but does not inject memory tools or context
+/// into requests (so the model's view of the conversation is unchanged).
+fn headroom_learn_startup_args() -> Vec<String> {
+    vec![
+        "--learn".to_string(),
+        "--no-memory-tools".to_string(),
+        "--no-memory-context".to_string(),
+        "--memory-db-path".to_string(),
+        crate::headroom_memory_db_path().display().to_string(),
+    ]
 }
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
@@ -2703,14 +2734,28 @@ mod tests {
 
     #[test]
     fn managed_headroom_startup_uses_supported_proxy_args() {
-        assert_eq!(
-            headroom_entrypoint_startup_args(),
-            vec!["proxy", "--port", HEADROOM_PROXY_PORT]
-        );
-        assert_eq!(
-            headroom_python_startup_args(),
-            vec!["-m", "headroom.proxy.server", "--port", HEADROOM_PROXY_PORT, "--no-http2"]
-        );
+        let entrypoint_args = headroom_entrypoint_startup_args();
+        assert!(entrypoint_args.starts_with(&[
+            "proxy".to_string(),
+            "--port".to_string(),
+            HEADROOM_PROXY_PORT.to_string(),
+            "--log-messages".to_string(),
+        ]));
+        assert!(entrypoint_args.contains(&"--learn".to_string()));
+        assert!(entrypoint_args.contains(&"--no-memory-tools".to_string()));
+        assert!(entrypoint_args.contains(&"--no-memory-context".to_string()));
+        assert!(entrypoint_args.contains(&"--memory-db-path".to_string()));
+
+        let python_args = headroom_python_startup_args();
+        assert!(python_args.starts_with(&[
+            "-m".to_string(),
+            "headroom.proxy.server".to_string(),
+            "--port".to_string(),
+            HEADROOM_PROXY_PORT.to_string(),
+            "--no-http2".to_string(),
+            "--log-messages".to_string(),
+        ]));
+        assert!(python_args.contains(&"--learn".to_string()));
     }
 
     #[test]

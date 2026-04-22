@@ -3643,7 +3643,7 @@ fn is_headroom_proxy_reachable() -> bool {
 
     ["127.0.0.1", "localhost"].iter().any(|host| {
         client
-            .get(format!("http://{host}:6767/health"))
+            .get(format!("http://{host}:6767/readyz"))
             .send()
             .map(|response| response.status().is_success())
             .unwrap_or(false)

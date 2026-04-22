@@ -3775,3 +3775,134 @@ html.window-hiding {
   min-width: 200px;
   justify-content: center;
 }
+
+.activity-feed__header {
+  margin: 0 0 12px;
+}
+
+.activity-feed__header h2 {
+  margin: 0 0 4px;
+  font-size: var(--text-lg);
+}
+
+.activity-feed__subtitle {
+  margin: 0;
+  color: #7c7168;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+.activity-feed__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.activity-feed__item {
+  background: rgba(248, 246, 242, 0.7);
+  border: 1px solid rgba(124, 113, 104, 0.12);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.activity-feed__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.activity-feed__row--meta {
+  font-size: var(--text-xs);
+  color: #7c7168;
+}
+
+.activity-feed__provider {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.activity-feed__model {
+  font-family: ui-monospace, "SF Mono", monospace;
+}
+
+.activity-feed__row--savings {
+  font-size: var(--text-sm);
+}
+
+.activity-feed__savings {
+  color: #4a6b3f;
+}
+
+.activity-feed__delta {
+  color: #7c7168;
+  font-family: ui-monospace, "SF Mono", monospace;
+}
+
+.activity-feed__transforms {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.activity-feed__transform {
+  font-size: var(--text-xxs);
+  background: rgba(124, 113, 104, 0.1);
+  color: #5d544c;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-family: ui-monospace, "SF Mono", monospace;
+}
+
+
+.activity-feed__badge {
+  font-size: var(--text-xxs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.activity-feed__badge--transformation {
+  background: rgba(74, 107, 63, 0.15);
+  color: #4a6b3f;
+}
+
+.activity-feed__badge--memory {
+  background: rgba(108, 90, 165, 0.15);
+  color: #5a4990;
+}
+
+.activity-feed__item--memory {
+  background: rgba(247, 244, 250, 0.7);
+  border-color: rgba(108, 90, 165, 0.18);
+}
+
+.activity-feed__scope {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.activity-feed__importance {
+  font-family: ui-monospace, "SF Mono", monospace;
+  color: #7c7168;
+}
+
+.activity-feed__content {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  color: #3a342e;
+}

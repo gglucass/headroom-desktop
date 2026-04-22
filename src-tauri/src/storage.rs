@@ -26,6 +26,10 @@ pub fn config_file(base_dir: &Path, name: &str) -> PathBuf {
     base_dir.join("config").join(name)
 }
 
+pub fn memory_db_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("memory.db")
+}
+
 pub fn telemetry_file(base_dir: &Path, name: &str) -> PathBuf {
     base_dir.join("telemetry").join(name)
 }
