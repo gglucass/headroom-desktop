@@ -11,6 +11,13 @@ interface OptimizePanelProps {
   // Bump this to force a refetch after an external event (e.g. a Learn run
   // finishes). The value itself is ignored; only changes matter.
   refreshSignal?: number;
+  // When provided, the panel uses this slice of live learnings rather than
+  // invoking `list_live_learnings` itself. Lets the parent batch one Python
+  // subprocess spawn across every panel instead of N.
+  preloadedLive?: LiveLearning[] | null;
+  // Called after the panel mutates live learnings (e.g. delete) so the parent
+  // can refetch the shared aggregate. Only used when preloadedLive is set.
+  onLiveMutated?: () => void;
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -20,21 +27,42 @@ const CATEGORY_LABELS: Record<string, string> = {
   error_recovery: "Error recovery",
 };
 
-export function OptimizePanel({ projectPath, refreshSignal }: OptimizePanelProps) {
-  const [live, setLive] = useState<LiveLearning[] | null>(null);
+type ModalKind = null | "pending" | "applied";
+
+export function OptimizePanel({
+  projectPath,
+  refreshSignal,
+  preloadedLive,
+  onLiveMutated,
+}: OptimizePanelProps) {
+  const hasPreloadedLive = preloadedLive !== undefined;
+  const [live, setLive] = useState<LiveLearning[] | null>(
+    hasPreloadedLive ? preloadedLive ?? null : null,
+  );
   const [applied, setApplied] = useState<AppliedPatterns | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
+  const [modal, setModal] = useState<ModalKind>(null);
+
+  // Sync preloaded slice into local state whenever the parent updates it.
+  useEffect(() => {
+    if (hasPreloadedLive) {
+      setLive(preloadedLive ?? null);
+    }
+  }, [hasPreloadedLive, preloadedLive]);
 
   const refetch = useCallback(() => {
     let active = true;
-    Promise.all([
-      invoke<LiveLearning[]>("list_live_learnings", { projectPath }),
-      invoke<AppliedPatterns>("list_applied_patterns", { projectPath }),
-    ])
+    const appliedPromise = invoke<AppliedPatterns>("list_applied_patterns", { projectPath });
+    const livePromise = hasPreloadedLive
+      ? Promise.resolve<LiveLearning[] | null>(null)
+      : invoke<LiveLearning[]>("list_live_learnings", { projectPath });
+    Promise.all([livePromise, appliedPromise])
       .then(([l, a]) => {
         if (!active) return;
-        setLive(l);
+        if (!hasPreloadedLive) {
+          setLive(l);
+        }
         setApplied(a);
         setLoadError(null);
       })
@@ -45,20 +73,22 @@ export function OptimizePanel({ projectPath, refreshSignal }: OptimizePanelProps
     return () => {
       active = false;
     };
-  }, [projectPath]);
+  }, [projectPath, hasPreloadedLive]);
 
   useEffect(() => {
     const cancel = refetch();
     return cancel;
   }, [refetch, refreshSignal]);
 
-  const liveByCategory = groupBy(live ?? [], (l) => l.category);
-
   const handleDeleteLive = async (id: string) => {
     setBusyIds((prev) => new Set(prev).add(id));
     try {
       await invoke("delete_live_learning", { memoryId: id });
-      refetch();
+      if (hasPreloadedLive) {
+        onLiveMutated?.();
+      } else {
+        refetch();
+      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Delete failed.");
     } finally {
@@ -101,21 +131,44 @@ export function OptimizePanel({ projectPath, refreshSignal }: OptimizePanelProps
     (applied?.claudeMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0) +
     (applied?.memoryMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0);
 
-  return (
-    <div className="optimize-panel">
-      {loadError ? <p className="install-progress__error">{loadError}</p> : null}
+  const liveByCategory = groupBy(live ?? [], (l) => l.category);
+  const pendingDisabled = live === null || liveCount === 0;
+  const appliedDisabled = applied === null || appliedCount === 0;
 
-      <details className="optimize-panel__collapsible" open>
-        <summary className="optimize-panel__summary">
-          Live learnings ({liveCount})
-        </summary>
-        <div className="optimize-panel__body">
+  return (
+    <>
+      <span className="optimize-panel__pills">
+        <button
+          type="button"
+          className={`optimize-panel__pill${pendingDisabled ? " optimize-panel__pill--empty" : ""}`}
+          onClick={() => setModal("pending")}
+          disabled={pendingDisabled}
+        >
+          {liveCount} pending learning{liveCount === 1 ? "" : "s"}
+        </button>
+        <button
+          type="button"
+          className={`optimize-panel__pill${appliedDisabled ? " optimize-panel__pill--empty" : ""}`}
+          onClick={() => setModal("applied")}
+          disabled={appliedDisabled}
+        >
+          {appliedCount} learning{appliedCount === 1 ? "" : "s"} applied
+        </button>
+      </span>
+
+      {modal === "pending" ? (
+        <Modal title="Pending learnings" onClose={() => setModal(null)}>
+          <p className="optimize-panel__info">
+            Patterns observed in recent sessions. Each must be observed at least
+            twice before being written to your project's memory.
+          </p>
+          {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {live === null ? (
             <p className="optimize-panel__empty">Loading…</p>
           ) : live.length === 0 ? (
             <p className="optimize-panel__empty">
-              No live learnings yet for this project — use Claude Code and they'll
-              appear here.
+              No pending learnings yet for this project — use Claude Code and
+              they'll appear here.
             </p>
           ) : (
             Array.from(liveByCategory.entries()).map(([category, items]) => (
@@ -136,23 +189,22 @@ export function OptimizePanel({ projectPath, refreshSignal }: OptimizePanelProps
               </div>
             ))
           )}
-        </div>
-      </details>
+        </Modal>
+      ) : null}
 
-      <details className="optimize-panel__collapsible">
-        <summary className="optimize-panel__summary">
-          Applied patterns ({appliedCount})
-        </summary>
-        <div className="optimize-panel__body">
+      {modal === "applied" ? (
+        <Modal title="Applied learnings" onClose={() => setModal(null)}>
           <p className="optimize-panel__info">
-            Patterns still present in live learnings may be re-applied on the next
-            flush (~10s).
+            Patterns still present in pending learnings may be re-applied on the
+            next flush (~10s).
           </p>
+          {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">Loading…</p>
           ) : appliedCount === 0 ? (
             <p className="optimize-panel__empty">
-              No applied patterns yet — run Learn or let live traffic accumulate.
+              No applied learnings yet — run Learn or let live traffic
+              accumulate.
             </p>
           ) : (
             <>
@@ -172,8 +224,45 @@ export function OptimizePanel({ projectPath, refreshSignal }: OptimizePanelProps
               />
             </>
           )}
+        </Modal>
+      ) : null}
+    </>
+  );
+}
+
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+    >
+      <div
+        className="modal-card optimize-panel__modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="optimize-panel__modal-header">
+          <h3>{title}</h3>
+          <button
+            type="button"
+            className="optimize-panel__modal-close"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            ×
+          </button>
         </div>
-      </details>
+        <div className="optimize-panel__modal-body">{children}</div>
+      </div>
     </div>
   );
 }

@@ -132,6 +132,7 @@ import type {
   HeadroomLearnStatus,
   ActivityFeedResponse,
   HourlySavingsPoint,
+  LiveLearning,
   RuntimeStatus,
   RuntimeUpgradeProgress,
 } from "./lib/types";
@@ -687,6 +688,9 @@ export default function App() {
   const [selectedClaudeProjectPath, setSelectedClaudeProjectPath] = useState<string | null>(null);
   const [headroomLearnStatus, setHeadroomLearnStatus] =
     useState<HeadroomLearnStatus>(idleHeadroomLearnStatus);
+  const [optimizeLiveByProject, setOptimizeLiveByProject] =
+    useState<Record<string, LiveLearning[]> | null>(null);
+  const [optimizeLiveRefreshTick, setOptimizeLiveRefreshTick] = useState(0);
   const previousHeadroomLearnRunningRef = useRef(false);
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
   const [headroomLearnPrereq, setHeadroomLearnPrereq] =
@@ -1545,6 +1549,39 @@ export default function App() {
     headroomLearnStatus.projectPath,
     headroomLearnStatus.running,
     headroomLearnStatus.success
+  ]);
+
+  const claudeProjectPathsKey = claudeProjects
+    .map((project) => project.projectPath)
+    .sort()
+    .join("\t");
+  useEffect(() => {
+    const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
+    if (paths.length === 0) {
+      setOptimizeLiveByProject({});
+      return;
+    }
+    let active = true;
+    invoke<Record<string, LiveLearning[]>>("list_live_learnings_for_projects", {
+      projectPaths: paths,
+    })
+      .then((result) => {
+        if (!active) return;
+        setOptimizeLiveByProject(result);
+      })
+      .catch(() => {
+        if (!active) return;
+        // Panels fall back to their own fetch on error (Rust cache still keeps
+        // that cheap if this call just failed for a transient reason).
+        setOptimizeLiveByProject(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    claudeProjectPathsKey,
+    headroomLearnStatus.finishedAt,
+    optimizeLiveRefreshTick,
   ]);
 
   // Keep connectorPhase in sync with the connector enabled state from the backend
@@ -3776,6 +3813,22 @@ export default function App() {
                                 <strong>{project.displayName}</strong>
                                 <small className={suggestRerun ? "optimize-project-row__stale" : undefined}>
                                   {learnMeta}
+                                  <OptimizePanel
+                                    projectPath={project.projectPath}
+                                    refreshSignal={
+                                      isLatestLearnProject && !headroomLearnStatus.running
+                                        ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
+                                        : 0
+                                    }
+                                    preloadedLive={
+                                      optimizeLiveByProject
+                                        ? optimizeLiveByProject[project.projectPath] ?? []
+                                        : undefined
+                                    }
+                                    onLiveMutated={() =>
+                                      setOptimizeLiveRefreshTick((tick) => tick + 1)
+                                    }
+                                  />
                                 </small>
                               </span>
                               <div className="optimize-project-row__actions">
@@ -3814,16 +3867,6 @@ export default function App() {
                                 <p className="install-progress__error">{headroomLearnStatus.error}</p>
                               </div>
                             ) : null}
-                            <div className="optimize-project-row__details">
-                              <OptimizePanel
-                                projectPath={project.projectPath}
-                                refreshSignal={
-                                  isLatestLearnProject && !headroomLearnStatus.running
-                                    ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
-                                    : 0
-                                }
-                              />
-                            </div>
                           </div>
                         );
                       })}

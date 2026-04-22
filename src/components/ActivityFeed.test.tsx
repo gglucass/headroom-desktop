@@ -400,4 +400,29 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__delta");
     expect(markup).not.toContain("activity-feed__transforms");
   });
+
+  it("paginates at 10 events per page and shows navigation when there are more", () => {
+    const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) =>
+      transformation({ requestId: `req-${i}`, timestamp: `2026-04-21T10:${String(i).padStart(2, "0")}:00Z` })
+    );
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    // First page: 10 rows.
+    const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+    expect(rowCount).toBe(10);
+    expect(markup).toContain("Page 1 of 3");
+    expect(markup).toContain("23 total");
+    expect(markup).toContain("← Prev");
+    expect(markup).toContain("Next →");
+  });
+
+  it("hides pagination when there are 10 or fewer events", () => {
+    const events: ActivityEvent[] = Array.from({ length: 7 }, (_, i) =>
+      transformation({ requestId: `req-${i}`, timestamp: `2026-04-21T10:0${i}:00Z` })
+    );
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).not.toContain("activity-feed__pagination");
+    expect(markup).not.toContain("Page 1 of");
+  });
 });

@@ -238,6 +238,9 @@ pub struct AppState {
     cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
+    /// Cached stdout of `headroom memory export`. Shared by every OptimizePanel
+    /// that mounts at once — without it, N panels = N Python cold-starts.
+    cached_memory_export: Mutex<Option<(String, Instant)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +318,7 @@ impl AppState {
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
+            cached_memory_export: Mutex::new(None),
         };
 
         Ok(state)
@@ -1059,6 +1063,25 @@ impl AppState {
         let clients = detect_clients();
         *cache = Some((clients.clone(), Instant::now()));
         clients
+    }
+
+    pub fn cached_memory_export(&self) -> Option<String> {
+        const TTL: Duration = Duration::from_secs(5);
+        let cache = self.cached_memory_export.lock();
+        if let Some((ref s, at)) = *cache {
+            if at.elapsed() < TTL {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+
+    pub fn store_memory_export(&self, stdout: String) {
+        *self.cached_memory_export.lock() = Some((stdout, Instant::now()));
+    }
+
+    pub fn invalidate_memory_export_cache(&self) {
+        *self.cached_memory_export.lock() = None;
     }
 
     /// Returns the captured Claude bearer token if it is still within its TTL.

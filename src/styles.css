@@ -813,7 +813,7 @@ select {
 .tray-content {
   display: grid;
   gap: 10px;
-  min-height: 0;
+  flex-shrink: 0;
   overflow-x: hidden;
   overflow-y: visible;
 }
@@ -2295,48 +2295,83 @@ select {
 
 /* ---------- OptimizePanel ---------- */
 
-.optimize-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 100%;
-  margin-top: 8px;
+.optimize-panel__pills {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: 8px;
+  vertical-align: middle;
 }
 
-.optimize-panel__collapsible {
-  border: 1px solid rgba(108, 90, 165, 0.18);
-  border-radius: 8px;
-  background: rgba(247, 244, 250, 0.5);
-}
-
-.optimize-panel__summary {
-  padding: 8px 12px;
-  cursor: pointer;
+.optimize-panel__pill {
+  padding: 2px 10px;
+  font-size: var(--text-xs);
   font-weight: 500;
-  color: #3a342e;
-  user-select: none;
-  list-style: none;
+  line-height: 1.6;
+  background: rgba(108, 90, 165, 0.1);
+  border: 1px solid rgba(108, 90, 165, 0.25);
+  border-radius: 999px;
+  color: #5a4990;
+  cursor: pointer;
+  transition: background 0.1s ease;
 }
 
-.optimize-panel__summary::-webkit-details-marker {
-  display: none;
+.optimize-panel__pill:hover:not(:disabled) {
+  background: rgba(108, 90, 165, 0.18);
 }
 
-.optimize-panel__summary::before {
-  content: "▸";
-  display: inline-block;
-  margin-right: 6px;
-  transition: transform 0.1s ease;
-  font-size: 10px;
+.optimize-panel__pill--empty {
+  background: rgba(124, 113, 104, 0.08);
+  border-color: rgba(124, 113, 104, 0.2);
   color: #7c7168;
 }
 
-.optimize-panel__collapsible[open] > .optimize-panel__summary::before {
-  transform: rotate(90deg);
+.optimize-panel__pill:disabled {
+  cursor: default;
 }
 
-.optimize-panel__body {
-  padding: 8px 12px 12px;
+.modal-card.optimize-panel__modal {
+  width: min(560px, calc(100vw - 32px));
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+}
+
+.optimize-panel__modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px 10px;
+  border-bottom: 1px solid rgba(36, 31, 29, 0.08);
+}
+
+.optimize-panel__modal-header h3 {
+  margin: 0;
+}
+
+.optimize-panel__modal-close {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  color: #7c7168;
+  cursor: pointer;
+}
+
+.optimize-panel__modal-close:hover {
+  background: rgba(36, 31, 29, 0.06);
+  color: #3a342e;
+}
+
+.optimize-panel__modal-body {
+  padding: 14px 18px 18px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;

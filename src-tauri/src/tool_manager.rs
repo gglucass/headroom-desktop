@@ -34,6 +34,23 @@ const VENDOR_WHEELS_INDEX_URL: &str =
 // headroom binds on 6768; the intercept layer on 6767 forwards to it.
 const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
+const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
+const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum McpInstallMethod {
+    ClaudeCli,
+    FallbackJson,
+}
+
+impl McpInstallMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            McpInstallMethod::ClaudeCli => MCP_METHOD_CLAUDE_CLI,
+            McpInstallMethod::FallbackJson => MCP_METHOD_FALLBACK_JSON,
+        }
+    }
+}
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 
@@ -624,6 +641,14 @@ impl ToolManager {
             .map(|value| value.to_string())
     }
 
+    pub fn headroom_mcp_install_method(&self) -> Option<String> {
+        self.read_headroom_receipt()?
+            .get("mcp")?
+            .get("installMethod")?
+            .as_str()
+            .map(|value| value.to_string())
+    }
+
     pub fn headroom_ml_installed(&self) -> Option<bool> {
         self.read_headroom_receipt()?
             .get("ml")?
@@ -818,7 +843,11 @@ impl ToolManager {
         });
 
         let mcp_install = match self.install_headroom_mcp() {
-            Ok(()) => json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL }),
+            Ok(method) => json!({
+                "configured": true,
+                "proxyUrl": HEADROOM_PROXY_URL,
+                "installMethod": method.as_str(),
+            }),
             Err(err) => {
                 eprintln!("headroom MCP setup skipped during repair: {err}");
                 json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
@@ -1176,9 +1205,10 @@ impl ToolManager {
         });
 
         let mcp_install = match self.install_headroom_mcp() {
-            Ok(()) => json!({
+            Ok(method) => json!({
                 "configured": true,
-                "proxyUrl": HEADROOM_PROXY_URL
+                "proxyUrl": HEADROOM_PROXY_URL,
+                "installMethod": method.as_str(),
             }),
             Err(err) => {
                 eprintln!("headroom MCP setup skipped: {err}");
@@ -1636,31 +1666,108 @@ impl ToolManager {
         }
     }
 
-    /// Runs MCP install if the receipt shows it is not configured, then updates
-    /// the receipt. Safe to call at every launch — no-ops when already configured.
+    /// Runs MCP install if the receipt shows it is not configured, or was
+    /// configured via the legacy `~/.claude/mcp.json` fallback (which Claude
+    /// Code ≥2.x ignores). Safe to call at every launch — no-ops when the
+    /// server is already registered via `claude mcp add`.
     pub fn ensure_mcp_configured(&self) -> Result<()> {
-        if self.headroom_mcp_configured() == Some(true) {
+        if self.headroom_mcp_configured() == Some(true)
+            && self.headroom_mcp_install_method().as_deref() == Some(MCP_METHOD_CLAUDE_CLI)
+        {
             return Ok(());
         }
-        self.install_headroom_mcp()?;
+        let method = self.install_headroom_mcp()?;
         let receipt_path = self.runtime.tools_dir.join("headroom.json");
         if let Ok(bytes) = std::fs::read(&receipt_path) {
             if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
-                receipt["mcp"] = json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL });
+                receipt["mcp"] = json!({
+                    "configured": true,
+                    "proxyUrl": HEADROOM_PROXY_URL,
+                    "installMethod": method.as_str(),
+                });
                 let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
             }
         }
         Ok(())
     }
 
-    fn install_headroom_mcp(&self) -> Result<()> {
+    fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
         let entrypoint = self.headroom_entrypoint();
-        run_command(
-            &entrypoint,
-            &["mcp", "install", "--proxy-url", HEADROOM_PROXY_URL],
-            &self.runtime.root_dir,
-        )
-        .context("configuring Headroom MCP integration")
+        let args = ["mcp", "install", "--proxy-url", HEADROOM_PROXY_URL];
+        let mut cmd = build_command(&entrypoint, &args, &self.runtime.root_dir);
+
+        // GUI apps launched from Finder/Dock inherit a minimal PATH that
+        // excludes /opt/homebrew/bin, /usr/local/bin, ~/.claude/local/bin,
+        // etc. Without augmentation, `shutil.which("claude")` inside the
+        // Python CLI returns None and it falls back to writing
+        // ~/.claude/mcp.json — a legacy path Claude Code ≥2.x does not read.
+        let detected_claude = crate::claude_cli::detect_claude_cli();
+        if let Some(claude_path) = detected_claude.as_ref() {
+            if let Some(dir) = claude_path.parent() {
+                let existing = std::env::var("PATH").unwrap_or_default();
+                let augmented = if existing.is_empty() {
+                    dir.display().to_string()
+                } else {
+                    format!("{}:{}", dir.display(), existing)
+                };
+                cmd.env("PATH", augmented);
+            }
+        }
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("starting {} {}", entrypoint.display(), args.join(" ")))
+            .context("configuring Headroom MCP integration")?;
+
+        if !output.status.success() {
+            return Err(anyhow::Error::new(CommandFailure {
+                program: entrypoint.display().to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code: output.status.code(),
+            }))
+            .context("configuring Headroom MCP integration");
+        }
+
+        // Ground truth: did Claude Code actually see the server? The Python
+        // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
+        // Claude Code ≥2.x) and exits 0, so the subprocess succeeding is not
+        // a reliable proxy for "integration works". Read the file Claude Code
+        // actually reads and confirm the registration landed there.
+        let method = if claude_code_has_headroom_mcp_server() {
+            McpInstallMethod::ClaudeCli
+        } else {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detected = detected_claude
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<not detected>".into());
+            sentry::with_scope(
+                |scope| {
+                    scope.set_extra("claude_cli_detected", detected.clone().into());
+                    scope.set_extra(
+                        "stdout_tail",
+                        stdout.chars().rev().take(512).collect::<String>().into(),
+                    );
+                    scope.set_extra(
+                        "stderr_tail",
+                        stderr.chars().rev().take(512).collect::<String>().into(),
+                    );
+                },
+                || {
+                    sentry::capture_message(
+                        "Headroom MCP install exited 0 but Claude Code does not see the server \
+                         (fell back to ~/.claude/mcp.json which Claude Code ≥2.x ignores).",
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            McpInstallMethod::FallbackJson
+        };
+
+        Ok(method)
     }
 
     fn install_rtk(&self) -> Result<()> {
@@ -1795,6 +1902,28 @@ impl ToolManager {
             ToolStatus::NotInstalled
         }
     }
+}
+
+/// Claude Code ≥2.x stores user-scope MCP servers in `~/.claude.json` under
+/// `mcpServers.<name>`. The legacy `~/.claude/mcp.json` path written by our
+/// Python CLI's fallback branch is ignored. Reading the file Claude Code
+/// actually reads is the only reliable way to confirm the registration
+/// landed where `/mcp` and `claude mcp list` will see it.
+fn claude_code_has_headroom_mcp_server() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let path = home.join(".claude.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("mcpServers")
+        .and_then(|v| v.get("headroom"))
+        .is_some()
 }
 
 fn is_local_proxy_reachable() -> bool {

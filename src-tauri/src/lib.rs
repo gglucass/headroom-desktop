@@ -1050,9 +1050,56 @@ fn list_live_learnings(
     if !memory_path.exists() {
         return Ok(Vec::new());
     }
-    let entrypoint = state.tool_manager.headroom_entrypoint();
-    let stdout = run_memory_export(&entrypoint, &memory_path)?;
+    let stdout = memory_export_cached(&state, &memory_path)?;
     parse_live_learnings(&stdout, &project_path)
+}
+
+#[tauri::command]
+fn list_live_learnings_for_projects(
+    state: State<'_, AppState>,
+    project_paths: Vec<String>,
+) -> Result<std::collections::HashMap<String, Vec<crate::models::LiveLearning>>, String> {
+    let memory_path = headroom_memory_db_path();
+    if !memory_path.exists() {
+        return Ok(empty_live_learnings_for_projects(&project_paths));
+    }
+    let stdout = memory_export_cached(&state, &memory_path)?;
+    aggregate_live_learnings(&stdout, &project_paths)
+}
+
+fn empty_live_learnings_for_projects(
+    project_paths: &[String],
+) -> std::collections::HashMap<String, Vec<crate::models::LiveLearning>> {
+    let mut out = std::collections::HashMap::with_capacity(project_paths.len());
+    for p in project_paths {
+        out.insert(p.clone(), Vec::new());
+    }
+    out
+}
+
+fn aggregate_live_learnings(
+    stdout: &str,
+    project_paths: &[String],
+) -> Result<std::collections::HashMap<String, Vec<crate::models::LiveLearning>>, String> {
+    let mut out = std::collections::HashMap::with_capacity(project_paths.len());
+    for p in project_paths {
+        let learnings = parse_live_learnings(stdout, p)?;
+        out.insert(p.clone(), learnings);
+    }
+    Ok(out)
+}
+
+fn memory_export_cached(
+    state: &State<'_, AppState>,
+    memory_path: &Path,
+) -> Result<String, String> {
+    if let Some(cached) = state.cached_memory_export() {
+        return Ok(cached);
+    }
+    let entrypoint = state.tool_manager.headroom_entrypoint();
+    let stdout = run_memory_export(&entrypoint, memory_path)?;
+    state.store_memory_export(stdout.clone());
+    Ok(stdout)
 }
 
 #[tauri::command]
@@ -1083,6 +1130,7 @@ fn delete_live_learning(
             stderr.trim()
         ));
     }
+    state.invalidate_memory_export_cache();
     Ok(())
 }
 
@@ -1424,6 +1472,35 @@ fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupRe
                     "proxy_reachable": result.verification.proxy_reachable
                 })),
             );
+            // Setup returned Ok, but the post-write verification read the
+            // files back and found the expected side effect missing. That's
+            // the same class of bug as the MCP fallback silent-success —
+            // subprocess/file-write succeeded yet the integration is not
+            // actually in place. Capture to Sentry so we see it.
+            if !result.verification.verified {
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_extra(
+                            "proxy_reachable",
+                            result.verification.proxy_reachable.into(),
+                        );
+                        scope.set_extra("checks", json!(result.verification.checks).into());
+                        scope.set_extra("failures", json!(result.verification.failures).into());
+                        scope.set_extra(
+                            "already_configured",
+                            result.already_configured.into(),
+                        );
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!(
+                                "client setup for {client_id} completed but verification failed",
+                            ),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+            }
             Ok(result)
         }
         Err(err) => {
@@ -1767,6 +1844,7 @@ pub fn run() {
             get_headroom_billing_portal_url,
             get_activity_feed,
             list_live_learnings,
+            list_live_learnings_for_projects,
             delete_live_learning,
             list_applied_patterns,
             delete_applied_pattern,
@@ -3004,21 +3082,22 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_quit_requested_properties, app_update_notification_body, build_activity_feed_response,
-        build_release_updater_config, check_headroom_learn_prereqs, compute_tray_window_position,
-        debounced_tray_runtime_visual, fetch_memory_feed, fetch_transformations_feed_from,
+        aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
+        build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
+        coalesce_rtk_batches, compute_tray_window_position, debounced_tray_runtime_visual,
+        empty_live_learnings_for_projects, fetch_memory_feed, fetch_transformations_feed_from,
         install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
-        parse_live_learnings, parse_memory_export, parse_updater_endpoint_list,
-        pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        normalize_utc_timestamp, parse_live_learnings, parse_memory_export,
+        parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
+        store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
         ActivityEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
         RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Timelike, Utc};
     use serde_json::json;
     use parking_lot::Mutex;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
@@ -3524,6 +3603,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_memory_export_normalizes_naive_created_at_to_utc_rfc3339() {
+        let json = r#"[
+            {"id":"a","content":"x","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.1}
+        ]"#;
+        let events = parse_memory_export(json, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        // Naive timestamp must be treated as UTC and emitted with an offset so
+        // JS `new Date(...)` parses it as UTC rather than local.
+        assert!(
+            events[0].created_at.ends_with("+00:00") || events[0].created_at.ends_with("Z"),
+            "expected UTC offset suffix, got {}",
+            events[0].created_at
+        );
+    }
+
+    #[test]
+    fn parse_memory_export_preserves_existing_offset() {
+        let json = r#"[
+            {"id":"a","content":"x","scope_level":"user","created_at":"2026-04-21T10:00:00-07:00","importance":0.1}
+        ]"#;
+        let events = parse_memory_export(json, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        // -07:00 wall-clock 10:00 == UTC 17:00.
+        let dt = DateTime::parse_from_rfc3339(&events[0].created_at).unwrap();
+        assert_eq!(dt.with_timezone(&Utc).hour(), 17);
+    }
+
+    #[test]
+    fn normalize_utc_timestamp_handles_naive_and_rfc3339() {
+        let naive = normalize_utc_timestamp("2026-04-21T10:00:00").unwrap();
+        let parsed = DateTime::parse_from_rfc3339(&naive).unwrap();
+        assert_eq!(parsed.with_timezone(&Utc).to_rfc3339(),
+                   "2026-04-21T10:00:00+00:00");
+
+        let fractional = normalize_utc_timestamp("2026-04-21T10:00:00.123").unwrap();
+        assert!(DateTime::parse_from_rfc3339(&fractional).is_ok());
+
+        let with_z = normalize_utc_timestamp("2026-04-21T10:00:00Z").unwrap();
+        assert_eq!(
+            DateTime::parse_from_rfc3339(&with_z).unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2026-04-21T10:00:00+00:00").unwrap().with_timezone(&Utc)
+        );
+
+        assert!(normalize_utc_timestamp("not a date").is_none());
+    }
+
+    #[test]
     fn pattern_matches_project_requires_path_boundary() {
         assert!(pattern_matches_project(
             "File `/x/a/b/foo.py` missing",
@@ -3583,6 +3709,54 @@ mod tests {
         assert_eq!(learnings[0].category, "environment");
         assert_eq!(learnings[0].evidence_count, 3);
         assert_eq!(learnings[0].importance, 0.8);
+    }
+
+    #[test]
+    fn aggregate_live_learnings_returns_entry_per_path_including_empty() {
+        let json = serde_json::to_string(&json!([
+            {
+                "id": "a1",
+                "content": "Pattern in /x/a/foo.py",
+                "metadata": {"source": "traffic_learner", "category": "environment"},
+                "entity_refs": []
+            },
+            {
+                "id": "b1",
+                "content": "Pattern in /x/b/bar.py",
+                "metadata": {"source": "traffic_learner", "category": "environment"},
+                "entity_refs": []
+            }
+        ]))
+        .unwrap();
+
+        let paths = vec!["/x/a".to_string(), "/x/b".to_string(), "/x/empty".to_string()];
+        let map = aggregate_live_learnings(&json, &paths).unwrap();
+
+        assert_eq!(map.len(), 3, "one entry per requested path");
+        assert_eq!(map.get("/x/a").unwrap().len(), 1);
+        assert_eq!(map.get("/x/a").unwrap()[0].id, "a1");
+        assert_eq!(map.get("/x/b").unwrap().len(), 1);
+        assert_eq!(map.get("/x/b").unwrap()[0].id, "b1");
+        assert!(
+            map.get("/x/empty").unwrap().is_empty(),
+            "paths with no matches get an empty Vec, not a missing key",
+        );
+    }
+
+    #[test]
+    fn aggregate_live_learnings_bubbles_json_errors() {
+        let paths = vec!["/x/a".to_string()];
+        let err = aggregate_live_learnings("not json", &paths).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn empty_live_learnings_for_projects_fills_each_path_with_empty_vec() {
+        let paths = vec!["/x/a".to_string(), "/x/b".to_string()];
+        let map = empty_live_learnings_for_projects(&paths);
+        assert_eq!(map.len(), 2);
+        assert!(map.get("/x/a").unwrap().is_empty());
+        assert!(map.get("/x/b").unwrap().is_empty());
     }
 
     #[test]
@@ -3831,6 +4005,69 @@ mod tests {
                 "newModel",
             ]
         );
+    }
+
+    fn rtk(hour: u32, minute: u32, commands: u64, tokens: u64, total: u64) -> ActivityEvent {
+        ActivityEvent::RtkBatch(RtkBatchEvent {
+            observed_at: Utc
+                .with_ymd_and_hms(2026, 4, 21, hour, minute, 0)
+                .unwrap(),
+            commands_delta: commands,
+            tokens_saved_delta: tokens,
+            total_commands: total,
+            total_saved: total * 500,
+        })
+    }
+
+    #[test]
+    fn coalesce_rtk_batches_merges_events_within_10_minutes() {
+        // Sorted DESC by timestamp (newer first).
+        let events = vec![
+            rtk(12, 0, 5, 1000, 100),
+            rtk(11, 55, 3, 600, 95),
+            rtk(11, 51, 2, 400, 92),
+        ];
+        let merged = coalesce_rtk_batches(events);
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            ActivityEvent::RtkBatch(b) => {
+                assert_eq!(b.commands_delta, 10);
+                assert_eq!(b.tokens_saved_delta, 2000);
+                // Totals remain from the newest (first) entry.
+                assert_eq!(b.total_commands, 100);
+                assert_eq!(b.observed_at.hour(), 12);
+            }
+            _ => panic!("expected RtkBatch"),
+        }
+    }
+
+    #[test]
+    fn coalesce_rtk_batches_keeps_events_outside_window_separate() {
+        let events = vec![rtk(12, 0, 5, 1000, 100), rtk(11, 45, 3, 600, 95)];
+        let merged = coalesce_rtk_batches(events);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_rtk_batches_does_not_merge_across_non_rtk_event() {
+        let events = vec![
+            rtk(12, 0, 5, 1000, 100),
+            ActivityEvent::Milestone(MilestoneEvent {
+                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 55, 0).unwrap(),
+                milestone_tokens_saved: 1_000_000,
+                kind: "first_1m".into(),
+            }),
+            rtk(11, 51, 2, 400, 92),
+        ];
+        let merged = coalesce_rtk_batches(events);
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn coalesce_rtk_batches_is_noop_on_empty_and_single() {
+        assert!(coalesce_rtk_batches(vec![]).is_empty());
+        let one = coalesce_rtk_batches(vec![rtk(12, 0, 5, 1000, 100)]);
+        assert_eq!(one.len(), 1);
     }
 
     #[test]
