@@ -4087,12 +4087,6 @@ export default function App() {
         </div>
 
         <div className="tray-content" hidden={activeView !== "settings"}>
-            <section className="content-header">
-              <div>
-                <p>Manage how Headroom works with Claude Code.</p>
-              </div>
-            </section>
-
             <section className="panel-stack">
               <article className="soft-card panel-card settings-account-card">
                 <div className="settings-account-row">

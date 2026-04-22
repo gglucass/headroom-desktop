@@ -1517,6 +1517,20 @@ impl AppState {
             return Ok(());
         }
 
+        // Tear down any orphan proxy from an older desktop build BEFORE taking
+        // the lifecycle lock, since `stop_headroom` acquires the same lock.
+        // The orphan check: a proxy is reachable, but its argv is missing flags
+        // this build relies on (e.g. --log-messages, --learn). Without this we
+        // would happily reuse a v0.2.x proxy that pre-dates the Activity feed.
+        if is_headroom_proxy_reachable()
+            && !crate::tool_manager::running_proxy_matches_expected_args()
+        {
+            eprintln!(
+                "headroom proxy is reachable but its argv predates this build; restarting it"
+            );
+            self.stop_headroom();
+        }
+
         // Serialize lifecycle transitions so launch warm-up, tray open, and the
         // watchdog cannot race into concurrent proxy spawns before port 6768 is
         // reachable and `headroom_process` has been recorded.
@@ -1534,8 +1548,9 @@ impl AppState {
             return Ok(());
         }
 
-        // If the proxy is already live (e.g. started externally or detached),
-        // treat runtime as healthy without forcing a second launcher.
+        // If the proxy is already live (e.g. started externally, or by us under
+        // the lifecycle lock just above), treat runtime as healthy without
+        // forcing another launcher.
         if is_headroom_proxy_reachable() {
             *self.last_startup_error.lock() = None;
             return Ok(());

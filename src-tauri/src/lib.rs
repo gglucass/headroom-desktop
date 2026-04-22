@@ -296,6 +296,14 @@ where
 
 #[tauri::command]
 fn restart_app(app: AppHandle) {
+    // Stop the proxy before relaunching so the new build starts a fresh proxy
+    // with current args (otherwise the orphan keeps serving traffic and the
+    // new desktop reuses it via the reachability check). Without this, any
+    // proxy-arg change shipped by an upgrade silently never takes effect.
+    {
+        let state: tauri::State<'_, AppState> = app.state();
+        state.stop_headroom();
+    }
     analytics::shutdown(&app);
     app.request_restart();
 }
@@ -859,6 +867,19 @@ fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> Activity
         Vec::new()
     };
 
+    let memory_available = memory_path.exists();
+    build_activity_feed_response(transformations, memories, memory_available, limit as usize)
+}
+
+/// Pure merge/sort core of `get_activity_feed`. Combines transformations and
+/// memories into a single chronological stream sorted DESC by timestamp,
+/// capped at `limit` events.
+fn build_activity_feed_response(
+    transformations: Option<TransformationFeedResponse>,
+    memories: Vec<MemoryFeedEvent>,
+    memory_available: bool,
+    limit: usize,
+) -> ActivityFeedResponse {
     let mut events: Vec<ActivityEvent> = Vec::new();
     let (proxy_reachable, log_full_messages) = match transformations {
         Some(t) => {
@@ -869,13 +890,12 @@ fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> Activity
         }
         None => (false, false),
     };
-    let memory_available = memory_path.exists();
     for m in memories {
         events.push(ActivityEvent::Memory(m));
     }
 
     events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
-    events.truncate(limit as usize);
+    events.truncate(limit);
 
     ActivityFeedResponse {
         events,
@@ -1427,8 +1447,17 @@ pub fn run() {
             uninstall_and_quit,
             quit_headroom
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
+            // or our explicit quit/restart commands). Without this, the proxy
+            // outlives the desktop and the next launch reuses an orphan.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                let state: tauri::State<'_, AppState> = app.state();
+                state.stop_headroom();
+            }
+        });
 }
 
 fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
@@ -2613,14 +2642,17 @@ fn compute_tray_window_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_quit_requested_properties, app_update_notification_body, build_release_updater_config,
-        check_headroom_learn_prereqs, compute_tray_window_position, debounced_tray_runtime_visual,
-        fetch_transformations_feed_from, install_pending_update, is_prerelease_version,
-        lifetime_token_milestone_kind, parse_memory_export, parse_updater_endpoint_list,
-        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        app_quit_requested_properties, app_update_notification_body, build_activity_feed_response,
+        build_release_updater_config, check_headroom_learn_prereqs, compute_tray_window_position,
+        debounced_tray_runtime_visual, fetch_memory_feed, fetch_transformations_feed_from,
+        install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
+        parse_memory_export, parse_updater_endpoint_list, physical_rect_from_rect,
+        store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+    };
+    use crate::models::{
+        ActivityEvent, MemoryFeedEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use serde_json::json;
     use parking_lot::Mutex;
@@ -3136,5 +3168,162 @@ mod tests {
         let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
             .unwrap_err();
         assert!(!err.is_empty(), "expected a non-empty error message");
+    }
+
+    fn make_transformation(timestamp: &str) -> TransformationFeedEvent {
+        TransformationFeedEvent {
+            request_id: Some(format!("req-{timestamp}")),
+            timestamp: Some(timestamp.to_string()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            input_tokens_original: Some(1000),
+            input_tokens_optimized: Some(250),
+            tokens_saved: Some(750),
+            savings_percent: Some(75.0),
+            transforms_applied: vec!["interceptor:ast-grep".into()],
+        }
+    }
+
+    fn make_memory(id: &str, created_at: &str) -> MemoryFeedEvent {
+        MemoryFeedEvent {
+            id: id.into(),
+            created_at: created_at.into(),
+            scope: "user".into(),
+            content: format!("memory {id}"),
+            importance: 0.5,
+        }
+    }
+
+    fn timestamp_of(event: &ActivityEvent) -> &str {
+        match event {
+            ActivityEvent::Transformation(t) => t.timestamp.as_deref().unwrap_or(""),
+            ActivityEvent::Memory(m) => &m.created_at,
+        }
+    }
+
+    #[test]
+    fn build_activity_feed_response_returns_empty_when_no_inputs() {
+        let resp = build_activity_feed_response(None, vec![], false, 50);
+        assert!(resp.events.is_empty());
+        assert!(!resp.proxy_reachable);
+        assert!(!resp.log_full_messages);
+        assert!(!resp.memory_available);
+    }
+
+    #[test]
+    fn build_activity_feed_response_propagates_proxy_metadata() {
+        let transformations = TransformationFeedResponse {
+            log_full_messages: true,
+            proxy_reachable: true,
+            transformations: vec![],
+        };
+        let resp = build_activity_feed_response(Some(transformations), vec![], true, 50);
+        assert!(resp.proxy_reachable);
+        assert!(resp.log_full_messages);
+        assert!(resp.memory_available);
+    }
+
+    #[test]
+    fn build_activity_feed_response_sorts_mixed_events_descending_by_timestamp() {
+        let transformations = TransformationFeedResponse {
+            log_full_messages: true,
+            proxy_reachable: true,
+            transformations: vec![
+                make_transformation("2026-04-21T10:00:00Z"),
+                make_transformation("2026-04-21T12:00:00Z"),
+            ],
+        };
+        let memories = vec![
+            make_memory("a", "2026-04-21T11:00:00Z"),
+            make_memory("b", "2026-04-21T13:00:00Z"),
+        ];
+
+        let resp = build_activity_feed_response(Some(transformations), memories, true, 50);
+
+        let timestamps: Vec<&str> = resp.events.iter().map(timestamp_of).collect();
+        assert_eq!(
+            timestamps,
+            vec![
+                "2026-04-21T13:00:00Z",
+                "2026-04-21T12:00:00Z",
+                "2026-04-21T11:00:00Z",
+                "2026-04-21T10:00:00Z",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_activity_feed_response_caps_to_limit_after_sorting() {
+        let transformations = TransformationFeedResponse {
+            log_full_messages: false,
+            proxy_reachable: true,
+            transformations: vec![
+                make_transformation("2026-04-21T10:00:00Z"),
+                make_transformation("2026-04-21T12:00:00Z"),
+            ],
+        };
+        let memories = vec![
+            make_memory("a", "2026-04-21T11:00:00Z"),
+            make_memory("b", "2026-04-21T13:00:00Z"),
+        ];
+
+        let resp = build_activity_feed_response(Some(transformations), memories, true, 2);
+
+        assert_eq!(resp.events.len(), 2);
+        let timestamps: Vec<&str> = resp.events.iter().map(timestamp_of).collect();
+        assert_eq!(
+            timestamps,
+            vec!["2026-04-21T13:00:00Z", "2026-04-21T12:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn build_activity_feed_response_treats_transformation_with_no_timestamp_as_oldest() {
+        // Transformations from the proxy may have null timestamps; they
+        // shouldn't shove themselves to the top of the feed.
+        let mut t_no_ts = make_transformation("ignored");
+        t_no_ts.timestamp = None;
+        let transformations = TransformationFeedResponse {
+            log_full_messages: false,
+            proxy_reachable: true,
+            transformations: vec![t_no_ts, make_transformation("2026-04-21T12:00:00Z")],
+        };
+        let memories = vec![make_memory("m", "2026-04-21T11:00:00Z")];
+
+        let resp = build_activity_feed_response(Some(transformations), memories, true, 50);
+
+        let last = resp.events.last().unwrap();
+        match last {
+            ActivityEvent::Transformation(t) => assert!(t.timestamp.is_none()),
+            _ => panic!("expected the no-timestamp transformation to sort last"),
+        }
+    }
+
+    #[test]
+    fn build_activity_feed_response_with_only_memories_still_sorts_them() {
+        let memories = vec![
+            make_memory("a", "2026-04-21T10:00:00Z"),
+            make_memory("b", "2026-04-21T12:00:00Z"),
+            make_memory("c", "2026-04-21T11:00:00Z"),
+        ];
+        let resp = build_activity_feed_response(None, memories, true, 50);
+        assert_eq!(resp.events.len(), 3);
+        let ids: Vec<&str> = resp
+            .events
+            .iter()
+            .map(|e| match e {
+                ActivityEvent::Memory(m) => m.id.as_str(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn fetch_memory_feed_returns_error_when_entrypoint_missing() {
+        let bogus_entrypoint = std::path::PathBuf::from("/definitely/does/not/exist/headroom");
+        let bogus_db = std::path::PathBuf::from("/tmp/nonexistent-memory.db");
+        let result = fetch_memory_feed(&bogus_entrypoint, &bogus_db, 10);
+        assert!(result.is_err(), "expected spawn failure to surface as Err");
     }
 }

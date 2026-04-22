@@ -1932,6 +1932,77 @@ fn headroom_entrypoint_startup_args() -> Vec<String> {
     args
 }
 
+/// Flags whose presence in the running proxy's argv we treat as proof that it
+/// was started by this build. If any of these are missing, the proxy was
+/// spawned by an older desktop (or by something else) and we restart it.
+fn expected_proxy_arg_signature() -> Vec<&'static str> {
+    vec![
+        "--port",
+        "--log-messages",
+        "--learn",
+        "--no-memory-tools",
+        "--no-memory-context",
+        "--memory-db-path",
+    ]
+}
+
+/// Returns the full command line of whatever process is currently listening on
+/// the proxy port, or `None` if we couldn't determine it.
+pub fn running_proxy_argv() -> Option<String> {
+    let pid = lsof_listener_pid(HEADROOM_PROXY_PORT.parse().ok()?)?;
+    ps_command(pid)
+}
+
+/// True if the running proxy's argv contains every flag we expect this build
+/// to pass. Used to detect proxies left over from an older desktop version.
+pub fn running_proxy_matches_expected_args() -> bool {
+    let Some(argv) = running_proxy_argv() else {
+        return false;
+    };
+    proxy_argv_contains_expected_flags(&argv)
+}
+
+fn proxy_argv_contains_expected_flags(argv: &str) -> bool {
+    expected_proxy_arg_signature()
+        .iter()
+        .all(|flag| argv_contains_flag(argv, flag))
+}
+
+/// Whitespace-aware containment check so `--port` doesn't match `--port-foo`
+/// and `--learn` doesn't match `--no-learn`.
+fn argv_contains_flag(argv: &str, flag: &str) -> bool {
+    argv.split_whitespace().any(|tok| tok == flag)
+}
+
+fn lsof_listener_pid(port: u16) -> Option<u32> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix('p').and_then(|n| n.trim().parse().ok()))
+}
+
+fn ps_command(pid: u32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Make a string safe to use as part of a filename: replace path separators
 /// (`/`, `\`) and other characters that have meaning to the filesystem with
 /// `_`, then truncate so absurdly long argv strings don't blow past
@@ -2698,9 +2769,10 @@ mod tests {
 
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
-        headroom_python_startup_args, read_headroom_learn_metadata_from_path,
-        run_command, sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure,
-        HeadroomRelease, ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
+        headroom_python_startup_args, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, run_command, sanitize_log_variant, sha256_bytes,
+        verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime, ToolManager,
+        UpgradeOutcome, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -2750,6 +2822,45 @@ mod tests {
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
         assert!(runtime.bin_dir.join("rtk").exists());
+    }
+
+    #[test]
+    fn proxy_argv_matches_when_all_expected_flags_present() {
+        let argv = "/usr/bin/nice -n 5 /Users/x/headroom proxy --port 6768 --log-messages \
+                    --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
+        assert!(proxy_argv_contains_expected_flags(argv));
+    }
+
+    #[test]
+    fn proxy_argv_mismatch_when_log_messages_missing() {
+        // The exact orphan-from-old-build case: a v0.2.x proxy still running
+        // with just `proxy --port 6768`.
+        let argv = "/Users/x/headroom proxy --port 6768";
+        assert!(!proxy_argv_contains_expected_flags(argv));
+    }
+
+    #[test]
+    fn proxy_argv_mismatch_when_learn_missing() {
+        let argv = "headroom proxy --port 6768 --log-messages --no-memory-tools \
+                    --no-memory-context --memory-db-path /tmp/m.db";
+        assert!(!proxy_argv_contains_expected_flags(argv));
+    }
+
+    #[test]
+    fn proxy_argv_match_does_not_get_fooled_by_negated_flag_substring() {
+        // `--no-learn` contains `--learn` as a substring; whitespace tokenizing
+        // ensures we don't false-positive on it.
+        let argv = "headroom proxy --port 6768 --log-messages --no-learn \
+                    --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
+        assert!(!proxy_argv_contains_expected_flags(argv));
+    }
+
+    #[test]
+    fn proxy_argv_match_works_for_python_module_invocation() {
+        let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
+                    --no-http2 --log-messages --learn --no-memory-tools --no-memory-context \
+                    --memory-db-path /tmp/m.db";
+        assert!(proxy_argv_contains_expected_flags(argv));
     }
 
     #[test]
