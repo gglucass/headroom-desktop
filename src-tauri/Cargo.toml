@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.2.50-rc.1"
+version = "0.2.50-rc.2"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -20,6 +20,7 @@ dirs = "5.0"
 flate2 = "1.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 json5 = "=0.4.1"
+libc = "0.2"
 os_info = "3.10"
 parking_lot = "0.12"
 rand = "0.9"

@@ -4,8 +4,6 @@ import type {
   HourlySavingsPoint
 } from "./types";
 
-export type ApiProvider = "openai" | "anthropic" | "gemini";
-
 export interface SavingsChartDatum {
   bucketKey: string;
   bucketLabel: string;
@@ -26,13 +24,6 @@ const GENERIC_PROXY_TELEMETRY_PATTERNS = [
 const CONNECTOR_LOG_MARKERS: Record<string, RegExp[]> = {
   claude_code: [/\bclaude\b/i, /\banthropic\b/i, /\/v1\/messages/i]
 };
-
-export function resolveApiProvider(provider?: string | null): ApiProvider {
-  if (provider === "openai" || provider === "anthropic" || provider === "gemini") {
-    return provider;
-  }
-  return "anthropic";
-}
 
 export function currencyExact(value: number) {
   return new Intl.NumberFormat("en-US", {
@@ -298,19 +289,6 @@ export function formatLearnStatus(project: {
   if (diffDays === 0) return "analyzed today";
   if (diffDays === 1) return "analyzed yesterday";
   return `analyzed ${diffDays} days ago`;
-}
-
-export function apiProviderLabel(provider?: string | null) {
-  switch (provider) {
-    case "openai":
-      return "OpenAI";
-    case "anthropic":
-      return "Claude";
-    case "gemini":
-      return "Gemini";
-    default:
-      return "API";
-  }
 }
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {

@@ -1,5 +1,6 @@
 mod analytics;
 mod bearer;
+mod claude_cli;
 mod client_adapters;
 mod device;
 mod insights;
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
 use chrono::{Local, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
@@ -36,8 +37,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::models::{
     BillingPeriod, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage,
     ClientConnectorStatus, ClientSetupResult, ClientSetupVerification, DashboardState,
-    HeadroomAuthCodeRequest, HeadroomLearnApiKeyStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus,
+    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress,
 };
 use crate::state::AppState;
 
@@ -50,10 +51,6 @@ const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
-const HEADROOM_LEARN_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.headroom-learn";
-const HEADROOM_LEARN_OPENAI_ACCOUNT: &str = "openai";
-const HEADROOM_LEARN_ANTHROPIC_ACCOUNT: &str = "anthropic";
-const HEADROOM_LEARN_GEMINI_ACCOUNT: &str = "gemini";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
@@ -610,9 +607,85 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     }
 }
 
+/// Report a runtime upgrade failure to Sentry. `phase` is "install" for
+/// pip/smoke-test failures, "boot_validation" for "installed but didn't boot".
+pub(crate) fn capture_upgrade_failure(err: &anyhow::Error, restored: bool, phase: &str) {
+    let technical_err = format!("{err:#}");
+    let cmd_failure = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>());
+
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "runtime_upgrade");
+            scope.set_tag("upgrade_phase", phase);
+            scope.set_extra("rollback_restored", restored.into());
+            scope.set_extra("error_chain", technical_err.clone().into());
+            if let Some(failure) = cmd_failure {
+                scope.set_extra("program", failure.program.clone().into());
+                scope.set_extra("args", failure.args.join(" ").into());
+                scope.set_extra(
+                    "exit_code",
+                    failure
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into())
+                        .into(),
+                );
+                scope.set_extra("stdout", failure.stdout.clone().into());
+                scope.set_extra("stderr", failure.stderr.clone().into());
+            }
+        },
+        || {
+            sentry::capture_message(
+                &format!("runtime_upgrade_failed ({phase})"),
+                sentry::Level::Error,
+            );
+        },
+    );
+}
+
+/// Map common runtime-upgrade failure modes to a short user-facing hint.
+pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
+    let chain = format!("{err:#}").to_ascii_lowercase();
+    if chain.contains("network") || chain.contains("timed out") || chain.contains("dns")
+        || chain.contains("connection refused") || chain.contains("could not resolve")
+    {
+        return Some("Couldn't reach PyPI. Check your network and retry.".into());
+    }
+    if chain.contains("no space") || chain.contains("disk full") || chain.contains("enospc") {
+        return Some("Not enough disk space to install the update. Free up space and retry.".into());
+    }
+    if chain.contains("sha256") || chain.contains("checksum") || chain.contains("digest") {
+        return Some("The downloaded wheel's checksum didn't match. Retry to redownload.".into());
+    }
+    if chain.contains("import") && chain.contains("smoke test") {
+        return Some("The new Headroom version couldn't be imported. Try retrying or reinstalling.".into());
+    }
+    if chain.contains("resolution") || chain.contains("no matching distribution") {
+        return Some("Pip couldn't resolve dependencies for the new version. Please report this.".into());
+    }
+    None
+}
+
 #[tauri::command]
 fn get_bootstrap_progress(state: State<'_, AppState>) -> BootstrapProgress {
     state.bootstrap_progress()
+}
+
+#[tauri::command]
+fn get_runtime_upgrade_progress(state: State<'_, AppState>) -> RuntimeUpgradeProgress {
+    state.runtime_upgrade_progress()
+}
+
+#[tauri::command]
+fn retry_runtime_upgrade(app: AppHandle) -> Result<(), String> {
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app_clone.state();
+        state.retry_runtime_upgrade(&app_clone);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -759,37 +832,8 @@ fn get_headroom_learn_status(
 }
 
 #[tauri::command]
-fn get_headroom_learn_api_key_status() -> HeadroomLearnApiKeyStatus {
-    detect_headroom_learn_api_key_status()
-}
-
-#[tauri::command]
-fn set_headroom_learn_api_key(
-    provider: String,
-    api_key: String,
-) -> Result<HeadroomLearnApiKeyStatus, String> {
-    if let Some(reason) = crate::state::headroom_learn_platform_message() {
-        return Err(reason);
-    }
-
-    let normalized_provider = provider.trim().to_ascii_lowercase();
-    let trimmed_key = api_key.trim().to_string();
-    if trimmed_key.is_empty() {
-        return Err("API key cannot be empty.".into());
-    }
-
-    let mut keys = load_headroom_learn_api_keys_strict()?;
-    match normalized_provider.as_str() {
-        "openai" => keys.openai_api_key = Some(trimmed_key),
-        "anthropic" => keys.anthropic_api_key = Some(trimmed_key),
-        "gemini" => keys.gemini_api_key = Some(trimmed_key),
-        _ => {
-            return Err("Unsupported provider. Use openai, anthropic, or gemini.".into());
-        }
-    }
-
-    write_headroom_learn_api_keys(&keys)?;
-    Ok(detect_headroom_learn_api_key_status())
+fn get_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
+    detect_headroom_learn_prereq_status()
 }
 
 #[tauri::command]
@@ -798,8 +842,10 @@ fn start_headroom_learn(app: AppHandle, project_path: String) -> Result<(), Stri
         return Err(reason);
     }
 
-    if !detect_headroom_learn_api_key_status().has_api_key {
-        return Err("Add an API key before running headroom learn.".into());
+    if !detect_headroom_learn_prereq_status().claude_cli_available {
+        return Err(
+            "Install the Claude Code CLI (`claude`) to enable Headroom Learn.".into(),
+        );
     }
 
     {
@@ -1267,7 +1313,7 @@ pub fn run() {
             }
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppState> = app_handle.state();
-                state.warm_runtime_on_launch();
+                state.warm_runtime_on_launch(&app_handle);
             });
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
@@ -1290,6 +1336,8 @@ pub fn run() {
             bootstrap_runtime,
             start_bootstrap,
             get_bootstrap_progress,
+            get_runtime_upgrade_progress,
+            retry_runtime_upgrade,
             get_runtime_status,
             get_headroom_logs,
             get_rtk_activity,
@@ -1305,8 +1353,7 @@ pub fn run() {
             create_headroom_checkout_session,
             get_headroom_billing_portal_url,
             get_headroom_learn_status,
-            get_headroom_learn_api_key_status,
-            set_headroom_learn_api_key,
+            get_headroom_learn_prereq_status,
             start_headroom_learn,
             apply_client_setup,
             verify_client_setup,
@@ -1449,349 +1496,12 @@ fn parse_updater_endpoint_list(raw: &str) -> Result<Vec<reqwest::Url>, String> {
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct HeadroomLearnApiKeys {
-    openai_api_key: Option<String>,
-    anthropic_api_key: Option<String>,
-    gemini_api_key: Option<String>,
-}
-
-fn legacy_headroom_learn_api_keys_path() -> std::path::PathBuf {
-    crate::storage::config_file(
-        &crate::storage::app_data_dir(),
-        "headroom-learn-api-keys.json",
-    )
-}
-
-fn load_headroom_learn_api_keys() -> HeadroomLearnApiKeys {
-    load_headroom_learn_api_keys_strict().unwrap_or_else(|err| {
-        eprintln!("headroom learn API key load failed: {err}");
-        HeadroomLearnApiKeys::default()
-    })
-}
-
-fn load_headroom_learn_api_keys_strict() -> Result<HeadroomLearnApiKeys, String> {
-    migrate_legacy_headroom_learn_api_keys_to_keychain()?;
-    Ok(HeadroomLearnApiKeys {
-        openai_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_OPENAI_ACCOUNT)?,
-        anthropic_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_ANTHROPIC_ACCOUNT)?,
-        gemini_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_GEMINI_ACCOUNT)?,
-    })
-}
-
-fn write_headroom_learn_api_keys(keys: &HeadroomLearnApiKeys) -> Result<(), String> {
-    write_headroom_learn_keychain_secret(
-        HEADROOM_LEARN_OPENAI_ACCOUNT,
-        keys.openai_api_key.as_deref(),
-    )?;
-    write_headroom_learn_keychain_secret(
-        HEADROOM_LEARN_ANTHROPIC_ACCOUNT,
-        keys.anthropic_api_key.as_deref(),
-    )?;
-    write_headroom_learn_keychain_secret(
-        HEADROOM_LEARN_GEMINI_ACCOUNT,
-        keys.gemini_api_key.as_deref(),
-    )?;
-
-    let path = legacy_headroom_learn_api_keys_path();
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|err| {
-            format!(
-                "Failed to remove legacy API key file {}: {err}",
-                path.display()
-            )
-        })?;
+fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
+    let path = claude_cli::detect_claude_cli();
+    HeadroomLearnPrereqStatus {
+        claude_cli_available: path.is_some(),
+        claude_cli_path: path.map(|p| p.display().to_string()),
     }
-
-    Ok(())
-}
-
-fn read_headroom_learn_keychain_secret(account: &str) -> Result<Option<String>, String> {
-    Ok(non_empty_string(keychain::read_secret(
-        HEADROOM_LEARN_KEYCHAIN_SERVICE,
-        account,
-    )?))
-}
-
-fn has_headroom_learn_keychain_secret(account: &str) -> Result<bool, String> {
-    keychain::has_secret(HEADROOM_LEARN_KEYCHAIN_SERVICE, account)
-}
-
-fn write_headroom_learn_keychain_secret(account: &str, value: Option<&str>) -> Result<(), String> {
-    let normalized = value.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(secret) = normalized {
-        keychain::write_secret(HEADROOM_LEARN_KEYCHAIN_SERVICE, account, secret)
-    } else {
-        keychain::delete_secret(HEADROOM_LEARN_KEYCHAIN_SERVICE, account)
-    }
-}
-
-fn migrate_legacy_headroom_learn_api_keys_to_keychain() -> Result<(), String> {
-    let path = legacy_headroom_learn_api_keys_path();
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let bytes = std::fs::read(&path).map_err(|err| {
-        format!(
-            "Failed to read legacy API key file {}: {err}",
-            path.display()
-        )
-    })?;
-    let legacy = serde_json::from_slice::<HeadroomLearnApiKeys>(&bytes).map_err(|err| {
-        format!(
-            "Failed to parse legacy API key file {}: {err}",
-            path.display()
-        )
-    })?;
-
-    let existing = HeadroomLearnApiKeys {
-        openai_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_OPENAI_ACCOUNT)?,
-        anthropic_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_ANTHROPIC_ACCOUNT)?,
-        gemini_api_key: read_headroom_learn_keychain_secret(HEADROOM_LEARN_GEMINI_ACCOUNT)?,
-    };
-
-    let merged = HeadroomLearnApiKeys {
-        openai_api_key: existing
-            .openai_api_key
-            .or_else(|| non_empty_string(legacy.openai_api_key)),
-        anthropic_api_key: existing
-            .anthropic_api_key
-            .or_else(|| non_empty_string(legacy.anthropic_api_key)),
-        gemini_api_key: existing
-            .gemini_api_key
-            .or_else(|| non_empty_string(legacy.gemini_api_key)),
-    };
-
-    write_headroom_learn_api_keys(&merged)
-}
-
-fn read_legacy_headroom_learn_api_keys() -> Result<HeadroomLearnApiKeys, String> {
-    let path = legacy_headroom_learn_api_keys_path();
-    if !path.exists() {
-        return Ok(HeadroomLearnApiKeys::default());
-    }
-
-    let bytes = std::fs::read(&path).map_err(|err| {
-        format!(
-            "Failed to read legacy API key file {}: {err}",
-            path.display()
-        )
-    })?;
-    serde_json::from_slice::<HeadroomLearnApiKeys>(&bytes).map_err(|err| {
-        format!(
-            "Failed to parse legacy API key file {}: {err}",
-            path.display()
-        )
-    })
-}
-
-fn detect_headroom_learn_api_key_status() -> HeadroomLearnApiKeyStatus {
-    if let Some(status) = headroom_learn_keychain_api_key_status() {
-        return status;
-    }
-
-    if non_empty_string(std::env::var("OPENAI_API_KEY").ok()).is_some() {
-        return HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("openai".into()),
-            source: Some("environment".into()),
-        };
-    }
-    if non_empty_string(std::env::var("ANTHROPIC_API_KEY").ok()).is_some() {
-        return HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("anthropic".into()),
-            source: Some("environment".into()),
-        };
-    }
-    if non_empty_string(std::env::var("GEMINI_API_KEY").ok())
-        .or_else(|| non_empty_string(std::env::var("GOOGLE_API_KEY").ok()))
-        .is_some()
-    {
-        return HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("gemini".into()),
-            source: Some("environment".into()),
-        };
-    }
-
-    if let Ok(legacy) = read_legacy_headroom_learn_api_keys() {
-        if non_empty_string(legacy.openai_api_key).is_some() {
-            return HeadroomLearnApiKeyStatus {
-                has_api_key: true,
-                provider: Some("openai".into()),
-                source: Some("legacy_file".into()),
-            };
-        }
-        if non_empty_string(legacy.anthropic_api_key).is_some() {
-            return HeadroomLearnApiKeyStatus {
-                has_api_key: true,
-                provider: Some("anthropic".into()),
-                source: Some("legacy_file".into()),
-            };
-        }
-        if non_empty_string(legacy.gemini_api_key).is_some() {
-            return HeadroomLearnApiKeyStatus {
-                has_api_key: true,
-                provider: Some("gemini".into()),
-                source: Some("legacy_file".into()),
-            };
-        }
-    }
-
-    HeadroomLearnApiKeyStatus {
-        has_api_key: false,
-        provider: None,
-        source: None,
-    }
-}
-
-fn headroom_learn_keychain_api_key_status() -> Option<HeadroomLearnApiKeyStatus> {
-    if keychain_secret_exists_for_status(HEADROOM_LEARN_OPENAI_ACCOUNT, "openai") {
-        return Some(HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("openai".into()),
-            source: Some("keychain".into()),
-        });
-    }
-    if keychain_secret_exists_for_status(HEADROOM_LEARN_ANTHROPIC_ACCOUNT, "anthropic") {
-        return Some(HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("anthropic".into()),
-            source: Some("keychain".into()),
-        });
-    }
-    if keychain_secret_exists_for_status(HEADROOM_LEARN_GEMINI_ACCOUNT, "gemini") {
-        return Some(HeadroomLearnApiKeyStatus {
-            has_api_key: true,
-            provider: Some("gemini".into()),
-            source: Some("keychain".into()),
-        });
-    }
-
-    None
-}
-
-fn keychain_secret_exists_for_status(account: &str, provider: &str) -> bool {
-    match has_headroom_learn_keychain_secret(account) {
-        Ok(found) => found,
-        Err(err) => {
-            eprintln!("headroom learn keychain status failed for {provider}: {err}");
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct ResolvedHeadroomLearnApiKeys {
-    openai: Option<(String, String)>,
-    anthropic: Option<(String, String)>,
-    gemini: Option<(String, String)>,
-}
-
-fn non_empty_string(value: Option<String>) -> Option<String> {
-    value.and_then(|raw| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn home_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-fn read_json_value(path: &std::path::Path) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-}
-
-fn resolve_headroom_learn_api_keys() -> ResolvedHeadroomLearnApiKeys {
-    let mut resolved = ResolvedHeadroomLearnApiKeys::default();
-    let saved = load_headroom_learn_api_keys();
-
-    resolved.openai = non_empty_string(saved.openai_api_key).map(|key| (key, "keychain".into()));
-    resolved.anthropic =
-        non_empty_string(saved.anthropic_api_key).map(|key| (key, "keychain".into()));
-    resolved.gemini = non_empty_string(saved.gemini_api_key).map(|key| (key, "keychain".into()));
-
-    if resolved.openai.is_none() {
-        resolved.openai = non_empty_string(std::env::var("OPENAI_API_KEY").ok())
-            .map(|key| (key, "environment".into()));
-    }
-    if resolved.anthropic.is_none() {
-        resolved.anthropic = non_empty_string(std::env::var("ANTHROPIC_API_KEY").ok())
-            .map(|key| (key, "environment".into()));
-    }
-    if resolved.gemini.is_none() {
-        resolved.gemini = non_empty_string(std::env::var("GEMINI_API_KEY").ok())
-            .or_else(|| non_empty_string(std::env::var("GOOGLE_API_KEY").ok()))
-            .map(|key| (key, "environment".into()));
-    }
-
-    let codex_auth = read_json_value(&home_dir().join(".codex").join("auth.json"));
-    if resolved.openai.is_none() {
-        resolved.openai = codex_auth
-            .as_ref()
-            .and_then(|root| {
-                root.get("OPENAI_API_KEY")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-                    .or_else(|| {
-                        root.get("openai_api_key")
-                            .and_then(|value| value.as_str())
-                            .map(|value| value.to_string())
-                    })
-            })
-            .and_then(|value| non_empty_string(Some(value)))
-            .map(|key| (key, "codex".into()));
-    }
-
-    let claude_settings = read_json_value(&home_dir().join(".claude").join("settings.json"));
-    if resolved.anthropic.is_none() {
-        resolved.anthropic = claude_settings
-            .as_ref()
-            .and_then(|root| root.get("env"))
-            .and_then(|env| env.get("ANTHROPIC_API_KEY"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .and_then(|value| non_empty_string(Some(value)))
-            .map(|key| (key, "claude".into()));
-    }
-    if resolved.openai.is_none() {
-        resolved.openai = claude_settings
-            .as_ref()
-            .and_then(|root| root.get("env"))
-            .and_then(|env| env.get("OPENAI_API_KEY"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .and_then(|value| non_empty_string(Some(value)))
-            .map(|key| (key, "claude".into()));
-    }
-
-    let gemini_settings = read_json_value(&home_dir().join(".gemini").join("settings.json"));
-    if resolved.gemini.is_none() {
-        resolved.gemini = gemini_settings
-            .as_ref()
-            .and_then(|root| root.get("env"))
-            .and_then(|env| {
-                env.get("GEMINI_API_KEY")
-                    .or_else(|| env.get("GOOGLE_API_KEY"))
-            })
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .and_then(|value| non_empty_string(Some(value)))
-            .map(|key| (key, "gemini".into()));
-    }
-
-    resolved
 }
 
 struct HeadroomLearnRunResult {
@@ -1819,7 +1529,6 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         };
     }
 
-    let keys = resolve_headroom_learn_api_keys();
     let mut command = Command::new(&entrypoint);
     command
         .arg("learn")
@@ -1829,16 +1538,18 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         .current_dir(project_path)
         .env("PYTHONNOUSERSITE", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1");
-    if let Some((key, _)) = keys.openai.as_ref() {
-        command.env("OPENAI_API_KEY", key);
-    }
-    if let Some((key, _)) = keys.anthropic.as_ref() {
-        command.env("ANTHROPIC_API_KEY", key);
-    }
-    if let Some((key, _)) = keys.gemini.as_ref() {
-        command.env("GEMINI_API_KEY", key);
-        command.env("GOOGLE_API_KEY", key);
+        .env("PIP_NO_INPUT", "1")
+        .env("HEADROOM_LEARN_CLI", "claude");
+    if let Some(claude_path) = claude_cli::detect_claude_cli() {
+        if let Some(dir) = claude_path.parent() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let augmented = if existing.is_empty() {
+                dir.display().to_string()
+            } else {
+                format!("{}:{}", dir.display(), existing)
+            };
+            command.env("PATH", augmented);
+        }
     }
     let output = command.output();
 
@@ -2236,9 +1947,12 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             let runtime = state.runtime_status();
 
             // Only care when the runtime is supposed to be up: installed,
-            // not paused by the user, and not mid-boot. Anything else and we
-            // reset the counter and keep watching.
-            let should_be_up = runtime.installed && !runtime.paused && !runtime.starting;
+            // not paused by the user, not mid-boot, and not mid-upgrade.
+            // Anything else and we reset the counter and keep watching.
+            let should_be_up = runtime.installed
+                && !runtime.paused
+                && !runtime.starting
+                && !state.runtime_upgrade_in_progress();
             if !should_be_up {
                 consecutive_failures = 0;
                 continue;

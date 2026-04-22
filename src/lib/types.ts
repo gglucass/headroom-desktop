@@ -161,6 +161,7 @@ export interface RuntimeStatus {
   headroomLearnDisabledReason?: string | null;
   startupError?: string | null;
   startupErrorHint?: string | null;
+  runtimeUpgradeFailure?: RuntimeUpgradeFailure | null;
   rtk: {
     installed: boolean;
     version?: string | null;
@@ -170,6 +171,32 @@ export interface RuntimeStatus {
     totalSaved?: number | null;
     avgSavingsPct?: number | null;
   };
+}
+
+export interface RuntimeUpgradeProgress {
+  running: boolean;
+  complete: boolean;
+  failed: boolean;
+  currentStep: string;
+  message: string;
+  overallPercent: number;
+  fromVersion?: string | null;
+  toVersion?: string | null;
+}
+
+export type UpgradeFailurePhase = "install" | "boot_validation";
+
+export interface RuntimeUpgradeFailure {
+  appVersion: string;
+  targetHeadroomVersion: string;
+  fallbackHeadroomVersion?: string | null;
+  failurePhase: UpgradeFailurePhase;
+  attempts: number;
+  firstAttemptAt: string;
+  lastAttemptAt: string;
+  errorMessage: string;
+  errorHint?: string | null;
+  rollbackRestored: boolean;
 }
 
 export interface AppUpdateConfiguration {
@@ -213,10 +240,9 @@ export interface HeadroomLearnStatus {
   outputTail: string[];
 }
 
-export interface HeadroomLearnApiKeyStatus {
-  hasApiKey: boolean;
-  provider?: string | null;
-  source?: string | null;
+export interface HeadroomLearnPrereqStatus {
+  claudeCliAvailable: boolean;
+  claudeCliPath?: string | null;
 }
 
 export type ClaudeAuthMethod = "claude_ai_oauth" | "api_key" | "unknown";

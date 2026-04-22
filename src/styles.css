@@ -3668,3 +3668,110 @@ html.window-hiding {
     color: #e08080;
   }
 }
+
+/* Runtime upgrade modal + banner (renders in tray shell as overlay). */
+
+.runtime-upgrade-backdrop {
+  /* Inherits .modal-backdrop positioning; higher stack than install modals. */
+  z-index: 60;
+}
+
+.runtime-upgrade-modal {
+  width: min(440px, calc(100vw - 32px));
+  padding: 18px 18px 16px;
+  gap: 10px;
+}
+
+.runtime-upgrade-modal__sub {
+  font-size: var(--text-xs);
+  color: #8a7f77;
+}
+
+.runtime-upgrade-modal__step {
+  font-size: var(--text-xs);
+  color: #655c56;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+
+.runtime-upgrade-modal__message {
+  font-size: var(--text-sm);
+  color: #4a4441;
+  line-height: 1.4;
+}
+
+.runtime-upgrade-banner {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  z-index: 50;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  background: #3a2f2b;
+  color: #f7f5f3;
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  font-size: var(--text-sm);
+  line-height: 1.35;
+}
+
+.runtime-upgrade-banner--boot_validation {
+  background: #4b2d2a;
+}
+
+.runtime-upgrade-banner__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.runtime-upgrade-banner__body strong {
+  font-size: var(--text-sm);
+}
+
+.runtime-upgrade-banner__body span {
+  color: #d7cec6;
+  font-size: var(--text-xs);
+}
+
+.runtime-upgrade-banner__note {
+  color: #e0b9a9 !important;
+  font-style: italic;
+}
+
+.runtime-upgrade-banner__actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: nowrap;
+  align-items: center;
+}
+
+.runtime-upgrade-banner__actions .button,
+.runtime-upgrade-banner__actions .secondary-button {
+  white-space: nowrap;
+}
+
+/* Launcher-mode upgrade action row (used when the launcher window renders
+   the dedicated upgrade-failure state instead of the install wizard). */
+.launcher-install-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+  align-items: center;
+}
+
+.launcher-install-buttons .primary-button--large,
+.launcher-install-buttons .secondary-button {
+  min-width: 200px;
+  justify-content: center;
+}

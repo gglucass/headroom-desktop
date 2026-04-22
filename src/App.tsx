@@ -75,7 +75,6 @@ import {
   aggregateClientConnectors,
   addDays,
   addMonths,
-  apiProviderLabel,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
@@ -94,11 +93,9 @@ import {
   formatSelectedDayLabel,
   hourOfDayTickFormatter,
   percent1,
-  resolveApiProvider,
   sortClientConnectors,
   startOfDay,
   startOfMonth,
-  type ApiProvider,
   type SavingsChartDatum
 } from "./lib/dashboardHelpers";
 import {
@@ -129,10 +126,11 @@ import type {
   ClientSetupResult,
   DailySavingsPoint,
   DashboardState,
-  HeadroomLearnApiKeyStatus,
+  HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
   HourlySavingsPoint,
   RuntimeStatus,
+  RuntimeUpgradeProgress,
 } from "./lib/types";
 
 type TrayView =
@@ -189,6 +187,19 @@ const idleBootstrapProgress: BootstrapProgress = {
   overallPercent: 0
 };
 
+const idleRuntimeUpgradeProgress: RuntimeUpgradeProgress = {
+  running: false,
+  complete: false,
+  failed: false,
+  currentStep: "Idle",
+  message: "",
+  overallPercent: 0,
+  fromVersion: null,
+  toVersion: null
+};
+
+const MAX_UPGRADE_AUTO_RETRIES = 2;
+
 const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   running: false,
   progressPercent: 0,
@@ -196,34 +207,14 @@ const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   outputTail: []
 };
 
-const idleHeadroomLearnApiKeyStatus: HeadroomLearnApiKeyStatus = {
-  hasApiKey: false,
-  provider: null
+const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
+  claudeCliAvailable: false,
+  claudeCliPath: null
 };
 
-interface ApiKeyGuide {
-  providerLabel: string;
-  keyUrl: string;
-  billingUrl: string;
-}
-
-const apiKeyGuides: Record<ApiProvider, ApiKeyGuide> = {
-  openai: {
-    providerLabel: "OpenAI",
-    keyUrl: "https://platform.openai.com/api-keys",
-    billingUrl: "https://platform.openai.com/settings/organization/billing/overview"
-  },
-  anthropic: {
-    providerLabel: "Claude",
-    keyUrl: "https://console.anthropic.com/settings/keys",
-    billingUrl: "https://console.anthropic.com/settings/billing"
-  },
-  gemini: {
-    providerLabel: "Gemini (Google AI Studio)",
-    keyUrl: "https://aistudio.google.com/app/apikey",
-    billingUrl: "https://ai.google.dev/gemini-api/docs/billing"
-  }
-};
+const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
+const CLAUDE_CODE_INSTALL_NPM_CMD = "npm install -g @anthropic-ai/claude-code";
+const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
 
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
@@ -645,6 +636,8 @@ export default function App() {
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootstrapProgress, setBootstrapProgress] =
     useState<BootstrapProgress>(idleBootstrapProgress);
+  const [runtimeUpgradeProgress, setRuntimeUpgradeProgress] =
+    useState<RuntimeUpgradeProgress>(idleRuntimeUpgradeProgress);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [windowLabel, setWindowLabel] = useState<"main" | "launcher" | null>(null);
   const [startupPhase, setStartupPhase] = useState<StartupPhase>("window");
@@ -693,8 +686,8 @@ export default function App() {
     useState<HeadroomLearnStatus>(idleHeadroomLearnStatus);
   const previousHeadroomLearnRunningRef = useRef(false);
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
-  const [headroomApiKeyStatus, setHeadroomApiKeyStatus] =
-    useState<HeadroomLearnApiKeyStatus>(idleHeadroomLearnApiKeyStatus);
+  const [headroomLearnPrereq, setHeadroomLearnPrereq] =
+    useState<HeadroomLearnPrereqStatus>(idleHeadroomLearnPrereqStatus);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -711,14 +704,7 @@ export default function App() {
   const [pendingUpgradePlanId, setPendingUpgradePlanId] = useState<UpgradePlanId | null>(null);
   const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
   const desktopActivationSentRef = useRef(false);
-  const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
-  const [apiKeyProvider, setApiKeyProvider] = useState<ApiProvider>("anthropic");
-  const [apiKeyDraft, setApiKeyDraft] = useState("");
-  const [apiKeySaving, setApiKeySaving] = useState(false);
-  const [apiKeyPasting, setApiKeyPasting] = useState(false);
-  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
-  const [pendingLearnProjectPath, setPendingLearnProjectPath] = useState<string | null>(null);
-  const apiKeyInputRef = useRef<HTMLInputElement | null>(null);
+  const [learnInstallCopyNotice, setLearnInstallCopyNotice] = useState<string | null>(null);
 
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
@@ -746,14 +732,6 @@ export default function App() {
   const appUpdateReadyToRestartRef = useRef(false);
   const appUpdateBusyRef = useRef(false);
   const appUpdateInstallBusyRef = useRef(false);
-  const hasShownLearnKeyReadNoticeRef = useRef(false);
-  const apiKeyGuide = apiKeyGuides[apiKeyProvider];
-  const apiKeyDialogStorageCopy =
-    runtimeStatus?.headroomLearnSupported === false
-      ? "Headroom Learn is disabled on this platform preview, so API key storage is unavailable here."
-      : pendingLearnProjectPath
-        ? "Saving stores this key in macOS Keychain, then Headroom reads it immediately to start Learn for the selected project."
-        : "Saving stores this key in macOS Keychain. Headroom reads it later only when you start Learn or update the saved key.";
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
@@ -1061,6 +1039,57 @@ export default function App() {
       unlisten?.();
     };
   }, [bootstrapping]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void listen<RuntimeUpgradeProgress>("runtime_upgrade_progress", (event) => {
+      if (!active) return;
+      setRuntimeUpgradeProgress(event.payload);
+    }).then((fn) => {
+      if (!active) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+
+    void invoke<RuntimeUpgradeProgress>("get_runtime_upgrade_progress")
+      .then((progress) => {
+        if (active) setRuntimeUpgradeProgress(progress);
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  // Hand off cleanly once the runtime upgrade finishes: show the success
+  // state briefly, then drop the progress object back to idle so the
+  // launcher stops rendering the upgrade UI and falls through to whichever
+  // window content the user should see next. We also nudge the launcher
+  // stage to post_install since bootstrapComplete only gets checked at
+  // startup otherwise.
+  useEffect(() => {
+    if (!runtimeUpgradeProgress.complete || runtimeUpgradeProgress.failed) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setRuntimeUpgradeProgress(idleRuntimeUpgradeProgress);
+      if (windowLabel === "launcher") {
+        setLauncherStage("post_install");
+      }
+      // Refresh runtime status so the rest of the app picks up the
+      // freshly-installed version immediately.
+      void invoke<RuntimeStatus>("get_runtime_status")
+        .then((status) => setRuntimeStatus(status))
+        .catch(() => {});
+    }, 2500);
+    return () => window.clearTimeout(timeout);
+  }, [runtimeUpgradeProgress.complete, runtimeUpgradeProgress.failed, windowLabel]);
 
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "client_setup") {
@@ -1398,19 +1427,8 @@ export default function App() {
     if (activeView !== "optimization") {
       return;
     }
-    void Promise.all([refreshClaudeProjects(), refreshHeadroomLearnApiKeyStatus()]);
+    void Promise.all([refreshClaudeProjects(), refreshHeadroomLearnPrereq()]);
   }, [activeView]);
-
-  useEffect(() => {
-    if (!showApiKeyDialog) {
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      apiKeyInputRef.current?.focus();
-      apiKeyInputRef.current?.select();
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [showApiKeyDialog]);
 
   useEffect(() => {
     if (activeView !== "optimization") {
@@ -1867,27 +1885,27 @@ export default function App() {
     }
   }
 
-  async function refreshHeadroomLearnApiKeyStatus() {
+  async function refreshHeadroomLearnPrereq() {
     try {
-      const status = await invoke<HeadroomLearnApiKeyStatus>("get_headroom_learn_api_key_status");
-      setHeadroomApiKeyStatus(status);
-      setApiKeyProvider(resolveApiProvider(status.provider));
+      const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status");
+      setHeadroomLearnPrereq(status);
     } catch {
-      setHeadroomApiKeyStatus(idleHeadroomLearnApiKeyStatus);
+      setHeadroomLearnPrereq(idleHeadroomLearnPrereqStatus);
     }
   }
 
-  function openApiKeyDialog() {
-    if (runtimeStatus?.headroomLearnSupported === false) {
-      setApiKeyError(
-        runtimeStatus.headroomLearnDisabledReason ??
-          "Headroom Learn is unavailable on this platform."
-      );
-      return;
+  async function copyLearnInstallCommand(command: string) {
+    try {
+      if (!navigator.clipboard) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(command);
+      setLearnInstallCopyNotice("Copied install command.");
+      window.setTimeout(() => setLearnInstallCopyNotice(null), 2000);
+    } catch {
+      setLearnInstallCopyNotice("Copy failed. Select the command and copy manually.");
+      window.setTimeout(() => setLearnInstallCopyNotice(null), 3000);
     }
-
-    setApiKeyProvider(resolveApiProvider(headroomApiKeyStatus.provider));
-    setShowApiKeyDialog(true);
   }
 
   async function autoConfigureClaudeCodeForLauncher() {
@@ -1952,15 +1970,7 @@ export default function App() {
     const selectedProject =
       claudeProjects.find((project) => project.projectPath === projectPath) ?? null;
     const displayName = selectedProject?.displayName ?? projectPath;
-    const shouldExplainKeychainRead =
-      (headroomApiKeyStatus.source === "keychain" || headroomApiKeyStatus.source === "legacy_file") &&
-      !hasShownLearnKeyReadNoticeRef.current;
-    const startupSummary = shouldExplainKeychainRead && headroomApiKeyStatus.provider
-      ? `Reading your saved ${apiProviderLabel(headroomApiKeyStatus.provider)} key from macOS Keychain to start Learn for ${displayName}.`
-      : `Running headroom learn for ${displayName}.`;
-    if (shouldExplainKeychainRead) {
-      hasShownLearnKeyReadNoticeRef.current = true;
-    }
+    const startupSummary = `Running headroom learn for ${displayName}.`;
     setHeadroomLearnBusy(true);
     setHeadroomLearnStatus((current) => ({
       ...current,
@@ -2000,10 +2010,14 @@ export default function App() {
 
   async function handleRunHeadroomLearn(projectPath: string) {
     setSelectedClaudeProjectPath(projectPath);
-    if (!headroomApiKeyStatus.hasApiKey) {
-      setPendingLearnProjectPath(projectPath);
-      setApiKeyError(null);
-      openApiKeyDialog();
+    try {
+      const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status");
+      setHeadroomLearnPrereq(status);
+      if (!status.claudeCliAvailable) {
+        return;
+      }
+    } catch {
+      setHeadroomLearnPrereq(idleHeadroomLearnPrereqStatus);
       return;
     }
     await runHeadroomLearn(projectPath);
@@ -2098,14 +2112,14 @@ export default function App() {
     }
   }
 
-  async function openApiKeyGuideLink(url: string, label: string) {
-    setApiKeyError(null);
+  async function openLearnInstallDocsLink() {
     try {
-      await openExternalLink(url);
+      await openExternalLink(CLAUDE_CODE_INSTALL_DOCS_URL);
     } catch (error) {
-      setApiKeyError(
-        error instanceof Error ? error.message : `Could not open the ${label} link.`
+      setLearnInstallCopyNotice(
+        error instanceof Error ? error.message : "Could not open the install guide."
       );
+      window.setTimeout(() => setLearnInstallCopyNotice(null), 3000);
     }
   }
 
@@ -2257,63 +2271,6 @@ export default function App() {
     }
   }
 
-  async function pasteApiKeyFromClipboard() {
-    if (!navigator.clipboard?.readText) {
-      setApiKeyError("Clipboard access is unavailable in this window. Paste manually.");
-      return;
-    }
-    setApiKeyPasting(true);
-    try {
-      const text = (await navigator.clipboard.readText()).trim();
-      if (!text) {
-        setApiKeyError("Clipboard is empty.");
-        return;
-      }
-      setApiKeyDraft(text);
-      setApiKeyError(null);
-    } catch {
-      setApiKeyError("Could not read from clipboard. Try right-click paste.");
-    } finally {
-      setApiKeyPasting(false);
-    }
-  }
-
-  async function saveApiKeyAndRunPending() {
-    if (runtimeStatus?.headroomLearnSupported === false) {
-      setApiKeyError(
-        runtimeStatus.headroomLearnDisabledReason ??
-          "Headroom Learn is unavailable on this platform."
-      );
-      return;
-    }
-
-    const trimmed = apiKeyDraft.trim();
-    if (!trimmed) {
-      setApiKeyError("Enter an API key first.");
-      return;
-    }
-    setApiKeySaving(true);
-    setApiKeyError(null);
-    try {
-      const status = await invoke<HeadroomLearnApiKeyStatus>("set_headroom_learn_api_key", {
-        provider: apiKeyProvider,
-        apiKey: trimmed
-      });
-      setHeadroomApiKeyStatus(status);
-      setApiKeyDraft("");
-      setShowApiKeyDialog(false);
-
-      if (pendingLearnProjectPath) {
-        await runHeadroomLearn(pendingLearnProjectPath);
-      }
-      setPendingLearnProjectPath(null);
-    } catch (error) {
-      setApiKeyError(error instanceof Error ? error.message : "Could not save API key.");
-    } finally {
-      setApiKeySaving(false);
-    }
-  }
-
   async function beginProxyVerificationStep() {
     let fresh = connectors;
     try {
@@ -2437,6 +2394,217 @@ export default function App() {
 
   if (!startupReady || windowLabel === null) {
     return null;
+  }
+
+  const upgradeFailure = runtimeStatus?.runtimeUpgradeFailure ?? null;
+  const showUpgradeModal =
+    runtimeUpgradeProgress.running &&
+    !runtimeUpgradeProgress.complete &&
+    !runtimeUpgradeProgress.failed;
+  const showUpgradeSuccess =
+    !runtimeUpgradeProgress.running &&
+    runtimeUpgradeProgress.complete &&
+    !runtimeUpgradeProgress.failed;
+  const showUpgradeBanner =
+    !runtimeUpgradeProgress.running && upgradeFailure !== null;
+  const upgradeExhausted =
+    upgradeFailure !== null && upgradeFailure.attempts >= MAX_UPGRADE_AUTO_RETRIES;
+
+  const upgradeOverlay = (
+    <>
+      {showUpgradeModal && (
+        <div
+          className="modal-backdrop runtime-upgrade-backdrop"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="modal-card runtime-upgrade-modal">
+            <h3>
+              {runtimeUpgradeProgress.toVersion
+                ? `Finishing Headroom update to ${runtimeUpgradeProgress.toVersion}…`
+                : "Finishing Headroom update…"}
+            </h3>
+            <p className="runtime-upgrade-modal__sub">
+              {runtimeUpgradeProgress.fromVersion
+                ? `From ${runtimeUpgradeProgress.fromVersion}`
+                : ""}
+            </p>
+            <div className="install-progress__bar-track">
+              <div
+                className="install-progress__bar-fill"
+                style={{ width: `${runtimeUpgradeProgress.overallPercent}%` }}
+              />
+            </div>
+            <p className="runtime-upgrade-modal__step">
+              {runtimeUpgradeProgress.currentStep}
+            </p>
+            <p className="runtime-upgrade-modal__message">
+              {runtimeUpgradeProgress.message}
+            </p>
+          </div>
+        </div>
+      )}
+      {showUpgradeBanner && upgradeFailure && (
+        <div
+          className={`runtime-upgrade-banner runtime-upgrade-banner--${upgradeFailure.failurePhase}`}
+          role="alert"
+        >
+          <div className="runtime-upgrade-banner__body">
+            <strong>
+              {upgradeFailure.failurePhase === "boot_validation"
+                ? `Headroom ${upgradeFailure.targetHeadroomVersion} installed but didn't start.`
+                : "Headroom update didn't finish."}
+            </strong>
+            <span>
+              {upgradeFailure.errorHint ??
+                (upgradeFailure.failurePhase === "boot_validation" &&
+                upgradeFailure.fallbackHeadroomVersion
+                  ? `Reverted to Headroom ${upgradeFailure.fallbackHeadroomVersion}.`
+                  : "Running the previous Headroom version.")}
+            </span>
+            {upgradeExhausted && (
+              <span className="runtime-upgrade-banner__note">
+                We won't auto-retry on launch. Click Retry to try again.
+              </span>
+            )}
+          </div>
+          <div className="runtime-upgrade-banner__actions">
+            <button
+              type="button"
+              className="button button--primary"
+              onClick={() => void invoke("retry_runtime_upgrade")}
+              disabled={runtimeUpgradeProgress.running}
+            >
+              Retry now
+            </button>
+            {upgradeFailure.failurePhase === "boot_validation" && (
+              <button
+                type="button"
+                className="secondary-button secondary-button--small"
+                onClick={() =>
+                  void invoke("open_external_link", {
+                    url: "https://extraheadroom.com/support",
+                  }).catch(() => {})
+                }
+              >
+                Report issue
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  // While a runtime upgrade is in flight, the venv is in the middle of being
+  // swapped so `bootstrapComplete` may return false. Don't render the first-
+  // run install wizard in that case — render a dedicated update screen in the
+  // launcher instead.
+  if (
+    windowLabel === "launcher" &&
+    (showUpgradeModal || showUpgradeSuccess || (showUpgradeBanner && upgradeFailure))
+  ) {
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--post-install"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+        showSpinner={showUpgradeModal}
+      >
+        {showUpgradeSuccess ? (
+          <>
+            <h1>
+              {`Headroom ${runtimeUpgradeProgress.toVersion ?? ""} is ready`}
+            </h1>
+            <p className="launcher-install-notice">
+              {runtimeUpgradeProgress.message}
+            </p>
+            <div className="install-progress-shell">
+              <div className="install-progress" aria-live="polite">
+                <div className="install-progress__bar-track">
+                  <div
+                    className="install-progress__bar-fill"
+                    style={{ width: "100%" }}
+                  />
+                </div>
+              </div>
+            </div>
+          </>
+        ) : showUpgradeModal ? (
+          <>
+            <h1>
+              {runtimeUpgradeProgress.toVersion
+                ? `Finishing Headroom ${runtimeUpgradeProgress.toVersion} update…`
+                : "Finishing Headroom update…"}
+            </h1>
+            <p className="launcher-install-notice">
+              {runtimeUpgradeProgress.message ||
+                "Wrapping up the Headroom update."}
+            </p>
+            <div className="install-progress-shell">
+              <div className="install-progress" aria-live="polite">
+                <div className="install-progress__bar-track">
+                  <div
+                    className="install-progress__bar-fill"
+                    style={{ width: `${runtimeUpgradeProgress.overallPercent}%` }}
+                  />
+                </div>
+                <div className="install-progress__meta">
+                  <p>{runtimeUpgradeProgress.currentStep}</p>
+                </div>
+              </div>
+            </div>
+          </>
+        ) : upgradeFailure ? (
+          <>
+            <h1>
+              {`Headroom ${upgradeFailure.appVersion} couldn't finish updating`}
+            </h1>
+            <p className="launcher-install-notice">
+              {upgradeFailure.errorHint ??
+                (upgradeFailure.fallbackHeadroomVersion
+                  ? "Running the previous version while we wait for you to retry."
+                  : "Running the previous version.")}
+              {upgradeExhausted
+                ? " We won't auto-retry on launch — click Retry to try again."
+                : ""}
+            </p>
+            <div className="launcher-install-buttons">
+              <button
+                type="button"
+                className="primary-button primary-button--large"
+                onClick={() => void invoke("retry_runtime_upgrade")}
+                disabled={runtimeUpgradeProgress.running}
+              >
+                Retry update
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void handleFirstLaunchContinue()}
+              >
+                Continue with previous version
+              </button>
+              {upgradeFailure.failurePhase === "boot_validation" && (
+                <button
+                  type="button"
+                  className="secondary-button secondary-button--small"
+                  onClick={() =>
+                    void invoke("open_external_link", {
+                      url: "https://extraheadroom.com/support",
+                    }).catch(() => {})
+                  }
+                >
+                  Report issue
+                </button>
+              )}
+            </div>
+          </>
+        ) : null}
+      </LauncherShell>
+    );
   }
 
   if (
@@ -3307,6 +3475,7 @@ export default function App() {
 
   return (
     <main className="tray-shell">
+      {upgradeOverlay}
       <aside className="tray-sidebar">
         <div className="tray-sidebar__logo">
           <img src={headroomLogo} alt="Headroom" />
@@ -3460,17 +3629,59 @@ export default function App() {
                   <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
                 ) : (
                   <div className="optimize-minimal">
-                    {!headroomApiKeyStatus.hasApiKey ? (
-                      <p className="optimize-minimal__meta">
-                        <button
-                          className="optimize-minimal__inline-action"
-                          onClick={openApiKeyDialog}
-                          type="button"
-                        >
-                          Add an API key
-                        </button>
-                        {" "}to enable learning.
-                      </p>
+                    {!headroomLearnPrereq.claudeCliAvailable ? (
+                      <div className="optimize-minimal__install-guide">
+                        <p className="optimize-minimal__meta">
+                          Headroom Learn uses the <code>claude</code> CLI to analyze your sessions.
+                          Install it to enable learning.
+                        </p>
+                        <div className="optimize-minimal__install-cmd">
+                          <code>{CLAUDE_CODE_INSTALL_NPM_CMD}</code>
+                          <button
+                            className="optimize-minimal__inline-action"
+                            type="button"
+                            onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_NPM_CMD)}
+                          >
+                            Copy
+                          </button>
+                        </div>
+                        <details className="optimize-minimal__install-alt">
+                          <summary>Other install methods</summary>
+                          <div className="optimize-minimal__install-cmd">
+                            <code>{CLAUDE_CODE_INSTALL_CURL_CMD}</code>
+                            <button
+                              className="optimize-minimal__inline-action"
+                              type="button"
+                              onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
+                            >
+                              Copy
+                            </button>
+                          </div>
+                          <p className="optimize-minimal__meta">
+                            <button
+                              className="optimize-minimal__inline-action"
+                              type="button"
+                              onClick={() => void openLearnInstallDocsLink()}
+                            >
+                              Open Claude Code install docs
+                            </button>
+                          </p>
+                        </details>
+                        <p className="optimize-minimal__meta">
+                          <button
+                            className="optimize-minimal__inline-action"
+                            type="button"
+                            onClick={() => void refreshHeadroomLearnPrereq()}
+                          >
+                            Re-check
+                          </button>
+                          {learnInstallCopyNotice ? (
+                            <span className="optimize-minimal__install-notice">
+                              {" "}{learnInstallCopyNotice}
+                            </span>
+                          ) : null}
+                        </p>
+                      </div>
                     ) : null}
                     <div className="optimize-projects">
                       {visibleClaudeProjects.map((project) => {
@@ -3480,7 +3691,7 @@ export default function App() {
                         const isLatestLearnProject =
                           headroomLearnStatus.projectPath === project.projectPath;
                         const disableLearn =
-                          !headroomApiKeyStatus.hasApiKey ||
+                          !headroomLearnPrereq.claudeCliAvailable ||
                           headroomLearnBusy ||
                           claudeProjectsBusy ||
                           (headroomLearnStatus.running && !isRunning);
@@ -3599,108 +3810,6 @@ export default function App() {
                 ) : null}
               </div>
             </article>
-
-            {showApiKeyDialog && headroomLearnSupported ? (
-              <div className="modal-backdrop" role="dialog" aria-modal="true">
-                <div className="modal-card">
-                  <h3>Add API key</h3>
-                  <p>Headroom Learn uses an LLM to extract insights from past sessions and write them to your project memory.</p>
-                  <p className="optimize-minimal__meta optimize-minimal__meta--notice">
-                    {apiKeyDialogStorageCopy}
-                  </p>
-                  <label htmlFor="learn-api-provider">Provider</label>
-                  <select
-                    id="learn-api-provider"
-                    value={apiKeyProvider}
-                    onChange={(event) =>
-                      setApiKeyProvider(event.target.value as ApiProvider)
-                    }
-                  >
-                    <option value="openai">OpenAI</option>
-                    <option value="anthropic">Claude (Anthropic)</option>
-                    <option value="gemini">Gemini</option>
-                  </select>
-                  <ul className="api-key-guide">
-                    <li>
-                      Create key:{" "}
-                      <a
-                        href={apiKeyGuide.keyUrl}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          void openApiKeyGuideLink(apiKeyGuide.keyUrl, "create key");
-                        }}
-                      >
-                        {apiKeyGuide.providerLabel}
-                      </a>
-                    </li>
-                    <li>
-                      Billing:{" "}
-                      <a
-                        href={apiKeyGuide.billingUrl}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          void openApiKeyGuideLink(apiKeyGuide.billingUrl, "billing");
-                        }}
-                      >
-                        {apiKeyGuide.providerLabel} API billing
-                      </a>
-                    </li>
-                    <li>API usage is billed separately from chat app subscriptions.</li>
-                  </ul>
-                  <label htmlFor="learn-api-key">API key</label>
-                  <div className="api-key-input-row">
-                    <input
-                      id="learn-api-key"
-                      ref={apiKeyInputRef}
-                      type="password"
-                      autoComplete="off"
-                      placeholder="Paste API key"
-                      value={apiKeyDraft}
-                      onChange={(event) => setApiKeyDraft(event.target.value)}
-                      onPaste={(event) => {
-                        const pasted = event.clipboardData?.getData("text") ?? "";
-                        if (!pasted) {
-                          return;
-                        }
-                        event.preventDefault();
-                        setApiKeyDraft(pasted.trim());
-                        setApiKeyError(null);
-                      }}
-                    />
-                    <button
-                      className="secondary-button secondary-button--small"
-                      disabled={apiKeySaving || apiKeyPasting}
-                      onClick={() => void pasteApiKeyFromClipboard()}
-                      type="button"
-                    >
-                      {apiKeyPasting ? "Pasting…" : "Paste"}
-                    </button>
-                  </div>
-                  {apiKeyError ? <p className="install-progress__error">{apiKeyError}</p> : null}
-                  <div className="modal-actions">
-                    <button
-                      className="secondary-button"
-                      disabled={apiKeySaving}
-                      onClick={() => {
-                        setShowApiKeyDialog(false);
-                        setPendingLearnProjectPath(null);
-                      }}
-                      type="button"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      className="primary-button"
-                      disabled={apiKeySaving}
-                      onClick={() => void saveApiKeyAndRunPending()}
-                      type="button"
-                    >
-                      {apiKeySaving ? "Saving…" : "Save and run"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : null}
 
           </div>
 

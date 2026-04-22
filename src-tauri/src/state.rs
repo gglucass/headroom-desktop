@@ -13,25 +13,188 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::analytics;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integration_status};
 use crate::insights::generate_daily_insights;
 use crate::models::{
     BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus, DailyInsight,
     DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
-    RtkRuntimeStatus, RuntimeStatus, UsageEvent,
+    RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
+    UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
 use crate::tool_manager::{BootstrapStepUpdate, ManagedRuntime, RtkGainSummary, ToolManager};
+
+/// After this many consecutive failed auto-attempts at the same app version,
+/// we stop auto-retrying and surface a persistent banner with a Retry button.
+pub const MAX_UPGRADE_AUTO_RETRIES: u32 = 2;
+
+/// Absolute maximum time we'll wait for the new proxy to come up during
+/// boot validation, regardless of observed activity. Bounded so an
+/// indefinitely-hung process is still detected eventually. Adaptive stall
+/// detection (below) normally fires long before this.
+pub const RUNTIME_UPGRADE_BOOT_MAX_SECS: u64 = 600;
+
+/// Once this much wall-time has elapsed without /livez success, start
+/// checking the proxy log's mtime for progress. Before this, we stay quiet
+/// — most fast boots finish well under this threshold.
+pub const RUNTIME_UPGRADE_STALL_GRACE_SECS: u64 = 60;
+
+/// If the proxy log hasn't been written to in this long (AND we're past
+/// the grace period), the proxy is considered stalled and we roll back.
+pub const RUNTIME_UPGRADE_STALL_SILENCE_SECS: u64 = 45;
+
+/// Emit the runtime upgrade progress event on the given AppHandle.
+pub fn emit_runtime_upgrade_progress(app: &tauri::AppHandle, state: &AppState) {
+    use tauri::Emitter;
+    let _ = app.emit("runtime_upgrade_progress", state.runtime_upgrade_progress());
+}
+
+/// Escape hatch: set `HEADROOM_SKIP_RUNTIME_UPGRADE=1` to boot past a
+/// persistently-failing upgrade without editing disk state.
+pub fn runtime_upgrade_disabled_by_env() -> bool {
+    matches!(
+        std::env::var("HEADROOM_SKIP_RUNTIME_UPGRADE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// One-shot probe of the new proxy. Hits `/livez` on port 6768 directly
+/// first (bypasses the intercept layer on 6767). Falls back to `/health`
+/// for older headroom-ai versions that don't expose `/livez`, then through
+/// the intercept layer on 6767 as a last resort — which also succeeds if
+/// the proxy is alive but too CPU-saturated to answer a direct probe
+/// quickly, since the intercept has its own retry + longer timeout path.
+fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
+    let urls = [
+        "http://127.0.0.1:6768/livez",
+        "http://127.0.0.1:6768/health",
+        "http://127.0.0.1:6767/livez",
+        "http://127.0.0.1:6767/health",
+    ];
+    for url in urls {
+        if client
+            .get(url)
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Newest mtime of any `headroom-proxy*.log` file in the logs directory, as
+/// a "is the proxy doing anything" signal. Returns None if no logs yet.
+fn newest_proxy_log_mtime(logs_dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("headroom-proxy") || !name_str.ends_with(".log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                newest = Some(match newest {
+                    Some(prev) if prev > mtime => prev,
+                    _ => mtime,
+                });
+            }
+        }
+    }
+    newest
+}
+
+/// User-facing message shown during boot validation. Evolves with elapsed
+/// time and whether the proxy log is actively being written to. Cycles
+/// through a rotating set of sub-messages per phase so the UI never looks
+/// frozen even when all phases last a while.
+fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
+    let prefix = if elapsed_secs < 10 {
+        "Launching Headroom".to_string()
+    } else if elapsed_secs < 30 {
+        if active {
+            "Warming up Headroom's runtime".to_string()
+        } else {
+            "Launching Headroom".to_string()
+        }
+    } else if elapsed_secs < 90 {
+        // Rotate across a few descriptive phrasings so the line changes
+        // every ~10 seconds instead of repeating identically.
+        let rotation = (elapsed_secs / 10) % 3;
+        match rotation {
+            0 => "Preparing Headroom's ML subsystems".to_string(),
+            1 => "Loading optimization pipeline".to_string(),
+            _ => "Initializing caches and request handlers".to_string(),
+        }
+    } else if elapsed_secs < 240 {
+        let rotation = (elapsed_secs / 15) % 3;
+        match rotation {
+            0 => "Downloading Headroom's ML models (first-run only)".to_string(),
+            1 => "Fetching model weights from Hugging Face".to_string(),
+            _ => "Preparing model caches for first-time use".to_string(),
+        }
+    } else {
+        "Finishing up the first-run download — slower connections may take several more minutes".to_string()
+    };
+
+    let hint = if active {
+        " · activity detected"
+    } else if elapsed_secs > 60 {
+        " · this is normal for a first-time upgrade"
+    } else {
+        ""
+    };
+
+    format!("{prefix}… ({}s elapsed{})", elapsed_secs, hint)
+}
+
+/// Outcome of the boot-validation loop.
+#[derive(Debug)]
+pub enum BootValidationOutcome {
+    /// Proxy reachable via /livez within the max timeout.
+    Reachable,
+    /// Proxy process exited before becoming reachable.
+    ProcessExited,
+    /// No log activity for long enough that we consider the proxy stalled.
+    Stalled,
+    /// Hit the absolute max without reachability or obvious failure.
+    TimedOut,
+}
+
+impl BootValidationOutcome {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, BootValidationOutcome::Reachable)
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            BootValidationOutcome::Reachable => "reachable",
+            BootValidationOutcome::ProcessExited => "process_exited",
+            BootValidationOutcome::Stalled => "stalled",
+            BootValidationOutcome::TimedOut => "timed_out",
+        }
+    }
+}
 
 pub struct AppState {
     pub tool_manager: ToolManager,
     pub recent_usage: Mutex<Vec<UsageEvent>>,
     pub headroom_process: Mutex<Option<Child>>,
     lifecycle_lock: Mutex<()>,
+    /// Held for the full duration of a runtime upgrade. A second call to
+    /// `run_upgrade_with_ui` tries `try_lock` and bails if already held.
+    upgrade_lock: Mutex<()>,
     pub runtime_paused: Mutex<bool>,
     pub runtime_starting: Mutex<bool>,
+    /// True while an atomic runtime upgrade is running (install + boot validation).
+    /// Gates the watchdog from auto-pausing during the ~minutes-long upgrade.
+    pub runtime_upgrade_in_progress: Mutex<bool>,
+    pub runtime_upgrade_progress: Mutex<RuntimeUpgradeProgress>,
     pub last_startup_error: Mutex<Option<String>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
@@ -79,8 +242,20 @@ impl AppState {
             recent_usage: Mutex::new(Vec::new()),
             headroom_process: Mutex::new(None),
             lifecycle_lock: Mutex::new(()),
+            upgrade_lock: Mutex::new(()),
             runtime_paused: Mutex::new(false),
             runtime_starting: Mutex::new(false),
+            runtime_upgrade_in_progress: Mutex::new(false),
+            runtime_upgrade_progress: Mutex::new(RuntimeUpgradeProgress {
+                running: false,
+                complete: false,
+                failed: false,
+                current_step: "Idle".into(),
+                message: String::new(),
+                overall_percent: 0,
+                from_version: None,
+                to_version: None,
+            }),
             last_startup_error: Mutex::new(None),
             bootstrap_progress: Mutex::new(BootstrapProgress {
                 running: false,
@@ -115,67 +290,584 @@ impl AppState {
         Ok(state)
     }
 
-    pub fn warm_runtime_on_launch(&self) {
-        if self.tool_manager.python_runtime_installed() {
-            self.set_runtime_starting(true);
-            self.enforce_pricing_gate();
+    pub fn warm_runtime_on_launch(&self, app: &tauri::AppHandle) {
+        // Always check for a mid-upgrade interrupt first. If the last app
+        // run was killed between move-aside and commit, the venv.backup/
+        // dir holds the real working environment and the live venv is a
+        // partial install. Restore before doing anything else.
+        let _ = self.tool_manager.recover_from_interrupted_upgrade();
 
-            if let Err(err) = ensure_rtk_integrations(
-                &self.tool_manager.rtk_entrypoint(),
-                &self.tool_manager.managed_python(),
-            ) {
-                eprintln!("failed to ensure RTK integrations during app launch: {err}");
-                sentry::capture_message(
-                    &format!("RTK integrations failed during warm_runtime_on_launch: {err}"),
-                    sentry::Level::Warning,
-                );
-            }
-
-            // If a newer eligible 0.5.X release exists on PyPI, or the
-            // installed version is explicitly blocked, silently sync it before
-            // starting the proxy.
-            if let Some(release) = self.tool_manager.check_headroom_upgrade() {
-                if let Err(err) = self.tool_manager.upgrade_headroom(&release) {
-                    eprintln!("failed to sync headroom release: {err}");
-                    sentry::capture_message(
-                        &format!("headroom release sync failed: {err}"),
-                        sentry::Level::Error,
-                    );
-                }
-            } else if self.tool_manager.requirements_are_stale() {
-                // No version change, but the compiled requirements lock has
-                // changed (e.g. a new dep was added). Repair deps in place
-                // without reinstalling the wheel.
-                if let Err(err) = self.tool_manager.repair_stale_requirements() {
-                    eprintln!("failed to repair stale headroom requirements: {err}");
-                    sentry::capture_message(
-                        &format!("headroom requirements repair failed: {err}"),
-                        sentry::Level::Error,
-                    );
-                }
-            }
-
-            // Independent of version upgrades or requirements repairs: if MCP
-            // is not configured (e.g. it failed during a prior install when deps
-            // were missing), retry it now.
-            if let Err(err) = self.tool_manager.ensure_mcp_configured() {
-                eprintln!("failed to configure headroom MCP: {err}");
-                sentry::capture_message(
-                    &format!("headroom MCP configuration failed: {err}"),
-                    sentry::Level::Warning,
-                );
-            }
-
-            if let Err(err) = self.ensure_headroom_running() {
-                eprintln!("failed to auto-start headroom during app launch: {err}");
-                crate::capture_headroom_start_failure(
-                    "headroom auto-start failed during launch",
-                    &err,
-                );
-            }
-
-            self.set_runtime_starting(false);
+        if !self.tool_manager.python_runtime_installed() {
+            // First-run; start_bootstrap (wizard) handles install.
+            return;
         }
+
+        self.set_runtime_starting(true);
+        self.enforce_pricing_gate();
+
+        if let Err(err) = ensure_rtk_integrations(
+            &self.tool_manager.rtk_entrypoint(),
+            &self.tool_manager.managed_python(),
+        ) {
+            eprintln!("failed to ensure RTK integrations during app launch: {err}");
+            sentry::capture_message(
+                &format!("RTK integrations failed during warm_runtime_on_launch: {err}"),
+                sentry::Level::Warning,
+            );
+        }
+
+        // App-version-triggered atomic runtime upgrade. Replaces the old
+        // receipt-vs-pinned drift path.
+        if self.should_run_runtime_upgrade(app) {
+            self.run_upgrade_with_ui(app);
+        }
+
+        // Independent of the upgrade: if MCP is not configured (e.g. it failed
+        // during a prior install), retry it now.
+        if let Err(err) = self.tool_manager.ensure_mcp_configured() {
+            eprintln!("failed to configure headroom MCP: {err}");
+            sentry::capture_message(
+                &format!("headroom MCP configuration failed: {err}"),
+                sentry::Level::Warning,
+            );
+        }
+
+        if let Err(err) = self.ensure_headroom_running() {
+            eprintln!("failed to auto-start headroom during app launch: {err}");
+            crate::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &err,
+            );
+        }
+
+        self.set_runtime_starting(false);
+    }
+
+    /// Returns true if the app version changed since the last successful
+    /// launch AND an actual upgrade is needed (either headroom-ai version
+    /// mismatch or requirements lock drift). Also gates on the retry budget
+    /// from any prior upgrade failure, and on `HEADROOM_SKIP_RUNTIME_UPGRADE`.
+    pub fn should_run_runtime_upgrade(&self, app: &tauri::AppHandle) -> bool {
+        if runtime_upgrade_disabled_by_env() {
+            eprintln!(
+                "HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check."
+            );
+            return false;
+        }
+        let current_version = app.package_info().version.to_string();
+        let profile = self.launch_profile.lock();
+        let version_matches = profile
+            .last_launched_app_version
+            .as_deref()
+            .map(|v| v == current_version.as_str())
+            .unwrap_or(false);
+        if version_matches {
+            return false;
+        }
+        if let Some(failure) = profile.last_runtime_upgrade_failure.as_ref() {
+            if failure.app_version == current_version && failure.attempts >= MAX_UPGRADE_AUTO_RETRIES
+            {
+                return false;
+            }
+        }
+        drop(profile);
+        self.tool_manager.check_headroom_upgrade().is_some()
+            || self.tool_manager.requirements_are_stale()
+    }
+
+    /// Run a full atomic runtime upgrade with UI progress + boot validation.
+    ///
+    /// Acquires `upgrade_lock` to guard against concurrent launches. Stops
+    /// the proxy, runs `atomic_upgrade_headroom`, then validates the new
+    /// runtime by waiting for proxy reachability. On boot-validation failure,
+    /// rolls back to the previous venv and records a failure so the UI can
+    /// render a retry banner.
+    pub fn run_upgrade_with_ui(&self, app: &tauri::AppHandle) {
+        let _guard = match self.upgrade_lock.try_lock() {
+            Some(g) => g,
+            None => {
+                eprintln!("run_upgrade_with_ui: upgrade already running; skipping");
+                return;
+            }
+        };
+
+        let current_app_version = app.package_info().version.to_string();
+        let release = match self.tool_manager.check_headroom_upgrade() {
+            Some(r) => r,
+            None => {
+                // App version changed but no headroom upgrade is actually
+                // needed — just stamp the version.
+                self.stamp_app_version(&current_app_version);
+                return;
+            }
+        };
+        let target_version = release.version().to_string();
+        let installed_version = self.tool_manager.installed_headroom_version();
+
+        // User-facing from/to are the app versions — headroom-ai versions are
+        // an implementation detail tracked in the failure record only.
+        let previous_app_version = self
+            .launch_profile
+            .lock()
+            .last_launched_app_version
+            .clone();
+
+        *self.runtime_upgrade_in_progress.lock() = true;
+
+        // Set up progress state + emit initial event.
+        self.set_upgrade_progress(|p| {
+            p.running = true;
+            p.complete = false;
+            p.failed = false;
+            p.current_step = "Preparing update".into();
+            p.message = "Wrapping up the Headroom update.".into();
+            p.overall_percent = 0;
+            p.from_version = previous_app_version.clone();
+            p.to_version = Some(current_app_version.clone());
+        });
+        emit_runtime_upgrade_progress(app, self);
+
+        self.stop_headroom();
+
+        analytics::track_event(
+            app,
+            "runtime_upgrade_started",
+            Some(serde_json::json!({
+                "from_version": installed_version,
+                "to_version": target_version,
+                "app_version": current_app_version,
+            })),
+        );
+
+        let start = std::time::Instant::now();
+        let app_for_progress = app.clone();
+        // SAFETY: self has a stable address for the duration of this call; the
+        // closure runs inline and does not outlive this scope.
+        let self_ptr: *const AppState = self as *const AppState;
+        let outcome = self.tool_manager.atomic_upgrade_headroom(
+            &release,
+            move |step| {
+                let state_ref = unsafe { &*self_ptr };
+                state_ref.set_upgrade_progress(|p| {
+                    p.current_step = step.step.to_string();
+                    p.message = step.message.clone();
+                    p.overall_percent = step.percent;
+                });
+                emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+            },
+        );
+
+        use crate::tool_manager::UpgradeOutcome;
+        match outcome {
+            UpgradeOutcome::InstallFailed { restored, error } => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                eprintln!(
+                    "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
+                );
+                let hint = crate::classify_upgrade_error(&error);
+                self.record_upgrade_failure(RuntimeUpgradeFailure {
+                    app_version: current_app_version.clone(),
+                    target_headroom_version: target_version.clone(),
+                    fallback_headroom_version: installed_version.clone(),
+                    failure_phase: UpgradeFailurePhase::Install,
+                    attempts: 0, // filled in by record_upgrade_failure
+                    first_attempt_at: Utc::now(),
+                    last_attempt_at: Utc::now(),
+                    error_message: format!("{error:#}"),
+                    error_hint: hint,
+                    rollback_restored: restored,
+                });
+                crate::capture_upgrade_failure(&error, restored, "install");
+                analytics::track_event(
+                    app,
+                    "runtime_upgrade_failed",
+                    Some(serde_json::json!({
+                        "phase": "install",
+                        "attempt": self.upgrade_failure_attempts(&current_app_version),
+                        "app_version": current_app_version,
+                        "restored": restored,
+                        "duration_ms": duration_ms,
+                    })),
+                );
+                self.set_upgrade_progress(|p| {
+                    p.running = false;
+                    p.complete = false;
+                    p.failed = true;
+                    p.current_step = "Install failed".into();
+                    p.message =
+                        "Headroom update couldn't install. Previous version is still running."
+                            .into();
+                    p.overall_percent = 100;
+                });
+                emit_runtime_upgrade_progress(app, self);
+                *self.runtime_upgrade_in_progress.lock() = false;
+                return;
+            }
+            UpgradeOutcome::InstalledPendingValidation => {
+                // Fall through to boot validation.
+            }
+        }
+
+        // Boot validation: start the proxy and wait for reachability.
+        self.set_upgrade_progress(|p| {
+            p.current_step = "Verifying update".into();
+            p.message =
+                "Launching Headroom and waiting for it to respond. This can take a minute on first run — Headroom may need to download its ML models.".into();
+            p.overall_percent = 97;
+        });
+        emit_runtime_upgrade_progress(app, self);
+
+        if let Err(err) = self.ensure_headroom_running() {
+            eprintln!("run_upgrade_with_ui: new proxy failed to spawn: {err:#}");
+        }
+        // Diagnostic: confirm we actually have a tracked child. If this is
+        // false, something about ensure_headroom_running short-circuited
+        // (e.g., python_runtime_installed returned false because READY flag
+        // was missing, pricing gate fired, runtime paused).
+        {
+            let has_tracked = self.headroom_process.lock().is_some();
+            eprintln!(
+                "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={}",
+                has_tracked,
+                self.tool_manager.python_runtime_installed()
+            );
+        }
+
+        let app_for_progress = app.clone();
+        let self_ptr_progress: *const AppState = self as *const AppState;
+        let outcome = self.wait_for_boot_validation(move |elapsed, active| {
+            let state_ref = unsafe { &*self_ptr_progress };
+            let elapsed_secs = elapsed.as_secs();
+            let message = boot_validation_message(elapsed_secs, active);
+            // Gently creep 97 → 99.5 over the max budget so the bar keeps
+            // moving — the user sees *something* happen during long waits.
+            let percent = 97
+                + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128)
+                    .min(250) as u8) / 100;
+            state_ref.set_upgrade_progress(|p| {
+                p.message = message;
+                p.overall_percent = percent.min(99);
+            });
+            emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+        });
+        let boot_ok = outcome.is_ok();
+        let outcome_label = outcome.label();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        eprintln!(
+            "run_upgrade_with_ui: boot validation {outcome_label} after {}s",
+            duration_ms / 1000
+        );
+
+        if boot_ok {
+            if let Err(err) = self.tool_manager.commit_headroom_upgrade() {
+                eprintln!("commit_headroom_upgrade: non-fatal: {err:#}");
+            }
+            self.stamp_app_version(&current_app_version);
+            self.clear_upgrade_failure();
+            self.set_upgrade_progress(|p| {
+                p.running = false;
+                p.complete = true;
+                p.failed = false;
+                p.current_step = "Done".into();
+                p.message = format!(
+                    "Headroom updated to {}.",
+                    current_app_version
+                );
+                p.overall_percent = 100;
+            });
+            emit_runtime_upgrade_progress(app, self);
+            analytics::track_event(
+                app,
+                "runtime_upgrade_completed",
+                Some(serde_json::json!({
+                    "from_version": installed_version,
+                    "to_version": target_version,
+                    "duration_ms": duration_ms,
+                })),
+            );
+            *self.runtime_upgrade_in_progress.lock() = false;
+            return;
+        }
+
+        // Boot validation failed — roll back to the previous venv.
+        eprintln!(
+            "run_upgrade_with_ui: boot validation failed ({}); rolling back to {:?}",
+            outcome_label, installed_version
+        );
+        // Capture the tail of the proxy log BEFORE stop_headroom runs — for
+        // a process that crashed on its own, we want what was written right
+        // before the exit.
+        let log_tail = crate::tool_manager::newest_proxy_log_path(&self.tool_manager.logs_dir())
+            .map(|path| crate::tool_manager::tail_log_file(&path, 30))
+            .filter(|s| !s.is_empty());
+        self.stop_headroom();
+        let rollback_result = self.tool_manager.rollback_headroom_upgrade();
+        let rollback_restored = rollback_result.is_ok();
+        if let Err(err) = rollback_result {
+            eprintln!("run_upgrade_with_ui: rollback failed: {err:#}");
+        }
+        // Bring the (hopefully restored) old proxy back up so the user lands
+        // on a working state.
+        if let Err(err) = self.ensure_headroom_running() {
+            eprintln!(
+                "run_upgrade_with_ui: failed to restart old proxy after rollback: {err:#}"
+            );
+        }
+
+        let err_msg = match log_tail.as_deref() {
+            Some(tail) => format!(
+                "Headroom update to {} installed but boot validation failed ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n--- last proxy log lines ---\n{}",
+                current_app_version,
+                outcome_label,
+                duration_ms,
+                target_version,
+                installed_version,
+                tail
+            ),
+            None => format!(
+                "Headroom update to {} installed but boot validation failed ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).",
+                current_app_version,
+                outcome_label,
+                duration_ms,
+                target_version,
+                installed_version
+            ),
+        };
+        eprintln!("run_upgrade_with_ui: {err_msg}");
+        let err = anyhow::anyhow!("{}", err_msg);
+        let previous_app_label = previous_app_version
+            .clone()
+            .unwrap_or_else(|| "the previous version".into());
+        self.record_upgrade_failure(RuntimeUpgradeFailure {
+            app_version: current_app_version.clone(),
+            target_headroom_version: target_version.clone(),
+            fallback_headroom_version: installed_version.clone(),
+            failure_phase: UpgradeFailurePhase::BootValidation,
+            attempts: 0,
+            first_attempt_at: Utc::now(),
+            last_attempt_at: Utc::now(),
+            error_message: err_msg.clone(),
+            error_hint: Some(format!(
+                "Reverted to Headroom {}.",
+                previous_app_label
+            )),
+            rollback_restored,
+        });
+        crate::capture_upgrade_failure(&err, rollback_restored, "boot_validation");
+        analytics::track_event(
+            app,
+            "runtime_upgrade_failed",
+            Some(serde_json::json!({
+                "phase": "boot_validation",
+                "attempt": self.upgrade_failure_attempts(&current_app_version),
+                "app_version": current_app_version,
+                "restored": rollback_restored,
+                "duration_ms": duration_ms,
+            })),
+        );
+        let current_app_label = current_app_version.clone();
+        let fallback_app_label = previous_app_version
+            .clone()
+            .unwrap_or_else(|| "the previous version".into());
+        self.set_upgrade_progress(|p| {
+            p.running = false;
+            p.complete = false;
+            p.failed = true;
+            p.current_step = "Update didn't start".into();
+            p.message = if rollback_restored {
+                format!(
+                    "Headroom {} installed but didn't start. Reverted to {}.",
+                    current_app_label, fallback_app_label
+                )
+            } else {
+                format!(
+                    "Headroom {} installed but didn't start, and rollback failed. Reinstall from the Dashboard.",
+                    current_app_label
+                )
+            };
+            p.overall_percent = 100;
+        });
+        emit_runtime_upgrade_progress(app, self);
+        *self.runtime_upgrade_in_progress.lock() = false;
+    }
+
+    /// User-initiated retry of a previously-failed runtime upgrade. Resets
+    /// the attempts counter so `should_run_runtime_upgrade` lets it through,
+    /// then invokes `run_upgrade_with_ui` directly.
+    pub fn retry_runtime_upgrade(&self, app: &tauri::AppHandle) {
+        {
+            let mut profile = self.launch_profile.lock();
+            if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
+                failure.attempts = 0;
+            }
+            persist_launch_profile(&self.launch_profile_path, &profile);
+        }
+        self.run_upgrade_with_ui(app);
+    }
+
+    pub fn runtime_upgrade_in_progress(&self) -> bool {
+        *self.runtime_upgrade_in_progress.lock()
+    }
+
+    /// Returns true if the tracked Headroom process has DEFINITIVELY exited.
+    ///
+    /// Only reports exited on `Ok(Some(status))` — i.e., the OS told us the
+    /// child reaped. `None` (no tracked child) is NOT treated as exited,
+    /// because `ensure_headroom_running` intentionally skips spawning when
+    /// the intercept layer already reports the proxy reachable; in that
+    /// case there's a live proxy we just don't own the Child handle for.
+    /// `Err` (child was reaped by someone else) is also not treated as
+    /// exited — the OS-level process may well still be serving traffic.
+    fn headroom_process_exited(&self) -> Option<String> {
+        let mut guard = self.headroom_process.lock();
+        match guard.as_mut() {
+            None => None,
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(format!("{status}")),
+                Ok(None) => None,
+                Err(err) => {
+                    eprintln!(
+                        "headroom_process_exited: try_wait returned Err (treating as still alive): {err}"
+                    );
+                    None
+                }
+            },
+        }
+    }
+
+    /// Adaptive boot validation loop. Probes `/livez` on port 6768 until the
+    /// proxy responds, the proxy process exits, the log goes silent past the
+    /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
+    /// pass through the loop, emits a progress update via `on_progress`.
+    fn wait_for_boot_validation<F>(
+        &self,
+        mut on_progress: F,
+    ) -> BootValidationOutcome
+    where
+        F: FnMut(std::time::Duration, bool),
+    {
+        use std::time::{Duration, Instant};
+
+        // 5s is generous: /livez is a cheap endpoint, but the proxy event
+        // loop can be held by the GIL while the pipeline chews through a
+        // large Claude request (tokenization, ONNX inference, etc). The
+        // previous 1.5s timeout false-fired during those bursts.
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return BootValidationOutcome::TimedOut,
+        };
+
+        let logs_dir = self.tool_manager.logs_dir();
+        let start = Instant::now();
+        let mut last_log_activity = start;
+        let mut last_seen_mtime = newest_proxy_log_mtime(&logs_dir);
+        let mut last_progress = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .unwrap_or_else(Instant::now);
+
+        let max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_MAX_SECS);
+        let grace = Duration::from_secs(RUNTIME_UPGRADE_STALL_GRACE_SECS);
+        let silence = Duration::from_secs(RUNTIME_UPGRADE_STALL_SILENCE_SECS);
+        let progress_interval = Duration::from_secs(2);
+
+        loop {
+            if probe_proxy_livez(&client) {
+                return BootValidationOutcome::Reachable;
+            }
+
+            if let Some(exit_status) = self.headroom_process_exited() {
+                eprintln!(
+                    "wait_for_boot_validation: tracked proxy child exited with status {exit_status}"
+                );
+                return BootValidationOutcome::ProcessExited;
+            }
+
+            let elapsed = start.elapsed();
+            if elapsed >= max {
+                return BootValidationOutcome::TimedOut;
+            }
+
+            // Refresh log activity observation.
+            let current_mtime = newest_proxy_log_mtime(&logs_dir);
+            if current_mtime.is_some() && current_mtime != last_seen_mtime {
+                last_seen_mtime = current_mtime;
+                last_log_activity = Instant::now();
+            }
+            let activity_age = last_log_activity.elapsed();
+            let has_recent_activity = current_mtime.is_some() && activity_age < silence;
+
+            // Past grace period and no recent log writes → treat as stalled.
+            if elapsed > grace && activity_age > silence {
+                return BootValidationOutcome::Stalled;
+            }
+
+            if last_progress.elapsed() >= progress_interval {
+                on_progress(elapsed, has_recent_activity);
+                last_progress = Instant::now();
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    pub fn runtime_upgrade_progress(&self) -> RuntimeUpgradeProgress {
+        self.runtime_upgrade_progress.lock().clone()
+    }
+
+    pub fn runtime_upgrade_failure(&self) -> Option<RuntimeUpgradeFailure> {
+        self.launch_profile
+            .lock()
+            .last_runtime_upgrade_failure
+            .clone()
+    }
+
+    fn set_upgrade_progress<F>(&self, mutate: F)
+    where
+        F: FnOnce(&mut RuntimeUpgradeProgress),
+    {
+        let mut p = self.runtime_upgrade_progress.lock();
+        mutate(&mut p);
+    }
+
+    fn stamp_app_version(&self, version: &str) {
+        let mut profile = self.launch_profile.lock();
+        profile.last_launched_app_version = Some(version.to_string());
+        persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
+    fn clear_upgrade_failure(&self) {
+        let mut profile = self.launch_profile.lock();
+        profile.last_runtime_upgrade_failure = None;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
+    fn record_upgrade_failure(&self, mut failure: RuntimeUpgradeFailure) {
+        let mut profile = self.launch_profile.lock();
+        let attempts = match profile.last_runtime_upgrade_failure.as_ref() {
+            Some(prev) if prev.app_version == failure.app_version => prev.attempts.saturating_add(1),
+            _ => 1,
+        };
+        failure.attempts = attempts;
+        if let Some(prev) = profile.last_runtime_upgrade_failure.as_ref() {
+            if prev.app_version == failure.app_version {
+                failure.first_attempt_at = prev.first_attempt_at;
+            }
+        }
+        profile.last_runtime_upgrade_failure = Some(failure);
+        persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
+    fn upgrade_failure_attempts(&self, app_version: &str) -> u32 {
+        self.launch_profile
+            .lock()
+            .last_runtime_upgrade_failure
+            .as_ref()
+            .filter(|f| f.app_version == app_version)
+            .map(|f| f.attempts)
+            .unwrap_or(0)
     }
 
     pub fn launch_count(&self) -> u64 {
@@ -200,9 +892,7 @@ impl AppState {
             return;
         }
         profile.setup_wizard_complete = true;
-        if let Ok(bytes) = serde_json::to_vec_pretty(&*profile) {
-            let _ = std::fs::write(&self.launch_profile_path, bytes);
-        }
+        persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
@@ -815,6 +1505,7 @@ impl AppState {
             headroom_learn_disabled_reason,
             startup_error,
             startup_error_hint,
+            runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
                 version: rtk_version,
@@ -1121,6 +1812,16 @@ struct LaunchProfile {
     lifetime_estimated_tokens_saved: u64,
     #[serde(default)]
     setup_wizard_complete: bool,
+    #[serde(default)]
+    last_launched_app_version: Option<String>,
+    #[serde(default)]
+    last_runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
+}
+
+fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
+        let _ = std::fs::write(path, bytes);
+    }
 }
 
 impl LaunchProfile {
@@ -1140,6 +1841,8 @@ impl LaunchProfile {
                 lifetime_estimated_savings_usd: 0.0,
                 lifetime_estimated_tokens_saved: 0,
                 setup_wizard_complete: false,
+                last_launched_app_version: None,
+                last_runtime_upgrade_failure: None,
             }
         };
 
@@ -3025,6 +3728,70 @@ mod tests {
     #[test]
     fn classify_startup_error_unknown_returns_none() {
         assert!(classify_startup_error("some other error").is_none());
+    }
+
+    #[test]
+    fn launch_profile_missing_new_fields_deserialize_as_none() {
+        // Legacy profile JSON from before we added last_launched_app_version
+        // and last_runtime_upgrade_failure. Must still parse.
+        let legacy = br#"{
+            "launch_count": 3,
+            "launch_experience": "resume",
+            "lifetime_requests": 0,
+            "lifetime_estimated_savings_usd": 0.0,
+            "lifetime_estimated_tokens_saved": 0
+        }"#;
+        let profile: super::LaunchProfile =
+            serde_json::from_slice(legacy).expect("legacy profile parses");
+        assert!(profile.last_launched_app_version.is_none());
+        assert!(profile.last_runtime_upgrade_failure.is_none());
+        assert!(!profile.setup_wizard_complete);
+    }
+
+    #[test]
+    fn persist_launch_profile_round_trips_new_fields() {
+        let id = uuid::Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("headroom-launch-profile-test-{}.json", id));
+        let profile = super::LaunchProfile {
+            launch_count: 1,
+            launch_experience: crate::models::LaunchExperience::Resume,
+            lifetime_requests: 0,
+            lifetime_estimated_savings_usd: 0.0,
+            lifetime_estimated_tokens_saved: 0,
+            setup_wizard_complete: true,
+            last_launched_app_version: Some("0.2.50".into()),
+            last_runtime_upgrade_failure: Some(crate::models::RuntimeUpgradeFailure {
+                app_version: "0.2.50".into(),
+                target_headroom_version: "0.8.2".into(),
+                fallback_headroom_version: Some("0.6.5".into()),
+                failure_phase: crate::models::UpgradeFailurePhase::BootValidation,
+                attempts: 2,
+                first_attempt_at: Utc::now(),
+                last_attempt_at: Utc::now(),
+                error_message: "timed out".into(),
+                error_hint: Some("Reverted to 0.6.5".into()),
+                rollback_restored: true,
+            }),
+        };
+        super::persist_launch_profile(&path, &profile);
+
+        let bytes = std::fs::read(&path).expect("persisted");
+        let round_tripped: super::LaunchProfile =
+            serde_json::from_slice(&bytes).expect("re-parses");
+        assert_eq!(
+            round_tripped.last_launched_app_version.as_deref(),
+            Some("0.2.50")
+        );
+        let failure = round_tripped
+            .last_runtime_upgrade_failure
+            .expect("failure present");
+        assert_eq!(failure.attempts, 2);
+        assert_eq!(failure.target_headroom_version, "0.8.2");
+        assert_eq!(
+            failure.failure_phase,
+            crate::models::UpgradeFailurePhase::BootValidation
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn make_tracker() -> SavingsTracker {

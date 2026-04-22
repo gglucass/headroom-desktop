@@ -229,6 +229,10 @@ impl ToolManager {
         self.runtime.ready_flag().exists() && self.runtime.managed_python().exists()
     }
 
+    pub fn logs_dir(&self) -> PathBuf {
+        self.runtime.logs_dir()
+    }
+
     pub fn headroom_entrypoint(&self) -> PathBuf {
         self.runtime.venv_dir.join("bin").join("headroom")
     }
@@ -734,73 +738,6 @@ impl ToolManager {
             .map_or(true, |sha| sha != sha256_bytes(bootstrap_requirements_lock().as_bytes()))
     }
 
-    /// Re-runs the requirements lock install when the compiled lock has changed
-    /// since the last install. This repairs missing or outdated deps without
-    /// requiring a headroom version bump. Also re-runs MCP install (which may
-    /// have failed previously if deps were missing) and updates the receipt.
-    pub fn repair_stale_requirements(&self) -> Result<()> {
-        let requirements_lock = bootstrap_requirements_lock();
-        let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
-        run_pip_install_with_retries(
-            &self.runtime.managed_python(),
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--timeout",
-                "180",
-                "--retries",
-                "10",
-                "--extra-index-url",
-                "https://pypi.org/simple",
-                "--upgrade",
-                "--requirement",
-                lock_path.to_string_lossy().as_ref(),
-            ],
-            &self.runtime.root_dir,
-        )
-        .context("repairing stale headroom requirements")?;
-
-        let mcp_install = match self.install_headroom_mcp() {
-            Ok(()) => json!({ "configured": true, "proxyUrl": HEADROOM_PROXY_URL }),
-            Err(err) => {
-                eprintln!("headroom MCP setup skipped during repair: {err}");
-                json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
-            }
-        };
-
-        // Update the lock sha and MCP state in the receipt so neither re-runs
-        // unnecessarily on the next launch.
-        let receipt_path = self.runtime.tools_dir.join("headroom.json");
-        if let Ok(bytes) = std::fs::read(&receipt_path) {
-            if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
-                    artifact.insert(
-                        "requirementsLockSha256".into(),
-                        json!(sha256_bytes(requirements_lock.as_bytes())),
-                    );
-                }
-                receipt["mcp"] = mcp_install;
-                let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies a previously-fetched release, upgrading or downgrading
-    /// Headroom in place.
-    pub fn upgrade_headroom(&self, release: &HeadroomRelease) -> Result<()> {
-        let old = self
-            .installed_headroom_version()
-            .unwrap_or("unknown".into());
-        eprintln!(
-            "headroom: syncing from {} to {}",
-            old, release.version
-        );
-        self.install_headroom_release(release)
-            .context("syncing headroom release")
-    }
 
     pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
         self.bootstrap_all_with_progress(|_| {})
@@ -1011,16 +948,26 @@ impl ToolManager {
             version: HEADROOM_PINNED_VERSION.into(),
             wheel_url: HEADROOM_PINNED_WHEEL_URL.into(),
             sha256: HEADROOM_PINNED_SHA256.into(),
-        })
+        }, |_| {})
     }
 
-    fn install_headroom_release(&self, release: &HeadroomRelease) -> Result<()> {
+    fn install_headroom_release<F>(&self, release: &HeadroomRelease, mut progress: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
         let wheel_path = self
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
+
+        progress(BootstrapStepUpdate {
+            step: "Downloading update",
+            message: "Fetching Headroom update bundle.".into(),
+            eta_seconds: 15,
+            percent: 40,
+        });
 
         // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
         let use_wheel = match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
@@ -1033,7 +980,21 @@ impl ToolManager {
             }
         };
 
-        run_pip_install_with_retries(
+        progress(BootstrapStepUpdate {
+            step: "Updating dependencies",
+            message: "Updating Headroom's bundled dependencies.".into(),
+            eta_seconds: 90,
+            percent: 55,
+        });
+
+        // Stream pip's stdout/stderr and translate noteworthy lines into
+        // user-facing step updates so the progress UI actually changes
+        // during the ~60-90s dependency install instead of staring at a
+        // single "Updating dependencies" frame.
+        let deps_start = std::time::Instant::now();
+        let deps_progress_ref = std::cell::RefCell::new(&mut progress);
+        let mut dep_counter: u32 = 0;
+        run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -1052,8 +1013,28 @@ impl ToolManager {
                 lock_path.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
+            |line| {
+                if let Some(update) = pip_line_to_progress(
+                    line,
+                    deps_start.elapsed(),
+                    &mut dep_counter,
+                    55,
+                    80,
+                ) {
+                    if let Ok(mut cb) = deps_progress_ref.try_borrow_mut() {
+                        (cb)(update);
+                    }
+                }
+            },
         )
         .context("installing locked Headroom dependencies into Headroom-managed virtualenv")?;
+
+        progress(BootstrapStepUpdate {
+            step: "Applying update",
+            message: "Applying the Headroom update.".into(),
+            eta_seconds: 15,
+            percent: 80,
+        });
 
         let headroom_spec = format!("headroom-ai=={}", release.version);
         let headroom_arg = if use_wheel {
@@ -1085,6 +1066,13 @@ impl ToolManager {
                 format!("installing {headroom_spec} from PyPI into Headroom-managed virtualenv")
             }
         })?;
+
+        progress(BootstrapStepUpdate {
+            step: "Configuring integrations",
+            message: "Setting up Headroom MCP integration.".into(),
+            eta_seconds: 5,
+            percent: 90,
+        });
 
         let mcp_install = match self.install_headroom_mcp() {
             Ok(()) => json!({
@@ -1125,6 +1113,404 @@ impl ToolManager {
                 }
             }),
         )
+    }
+
+    /// Cheap post-install sanity check: can the new venv import the top-level
+    /// headroom package and its proxy entrypoint? Catches import errors, syntax
+    /// errors, and missing transitive dependencies introduced by a new version
+    /// before we try to actually boot the proxy. Runs with a 15s timeout.
+    pub fn smoke_test_headroom(&self) -> Result<()> {
+        let python = self.runtime.managed_python();
+        let output = Command::new(&python)
+            .args([
+                "-c",
+                "import headroom; import headroom.proxy.server",
+            ])
+            .current_dir(&self.runtime.root_dir)
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
+            .env_remove("PYTHONSTARTUP")
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("LANG", "C.UTF-8")
+            .output()
+            .with_context(|| format!("running smoke test with {}", python.display()))?;
+        if !output.status.success() {
+            return Err(anyhow::Error::new(CommandFailure {
+                program: python.display().to_string(),
+                args: vec![
+                    "-c".into(),
+                    "import headroom; import headroom.proxy.server".into(),
+                ],
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code: output.status.code(),
+            }))
+            .context("Headroom smoke test failed — the new version cannot be imported");
+        }
+        Ok(())
+    }
+
+    fn venv_backup_dir(&self) -> PathBuf {
+        let mut dir = self.runtime.venv_dir.clone();
+        let file_name = format!(
+            "{}.backup",
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("venv")
+        );
+        dir.set_file_name(file_name);
+        dir
+    }
+
+    fn headroom_receipt_path(&self) -> PathBuf {
+        self.runtime.tools_dir.join("headroom.json")
+    }
+
+    fn headroom_receipt_backup_path(&self) -> PathBuf {
+        self.runtime.tools_dir.join("headroom.json.backup")
+    }
+
+    fn upgrade_marker_path(&self) -> PathBuf {
+        self.runtime.runtime_dir.join("upgrade.in_progress.json")
+    }
+
+    fn write_upgrade_marker(&self, target_version: &str) -> Result<()> {
+        let marker = self.upgrade_marker_path();
+        let body = json!({
+            "target_version": target_version,
+            "started_at": Utc::now().to_rfc3339(),
+        });
+        std::fs::write(&marker, serde_json::to_vec_pretty(&body)?)
+            .with_context(|| format!("writing {}", marker.display()))?;
+        Ok(())
+    }
+
+    fn clear_upgrade_marker(&self) {
+        let _ = std::fs::remove_file(self.upgrade_marker_path());
+    }
+
+    /// Inspect disk state for the signature of an interrupted previous upgrade
+    /// and restore the backup venv as the live venv if so.
+    ///
+    /// Interrupted = upgrade marker file present. The backup venv is treated
+    /// as the canonical "old, working" one; the live venv (if any) is whatever
+    /// partial state was left behind. Safe to call at every upgrade entry.
+    ///
+    /// Returns true if recovery was performed.
+    pub fn recover_from_interrupted_upgrade(&self) -> bool {
+        let marker = self.upgrade_marker_path();
+        if !marker.exists() {
+            return false;
+        }
+        let backup_dir = self.venv_backup_dir();
+        let venv_dir = &self.runtime.venv_dir;
+        let receipt_backup = self.headroom_receipt_backup_path();
+        let receipt_path = self.headroom_receipt_path();
+
+        eprintln!(
+            "recover_from_interrupted_upgrade: found stale marker at {}; restoring backup",
+            marker.display()
+        );
+
+        if backup_dir.exists() {
+            // The live venv (if present) is a partial/unknown new install.
+            // Blow it away and put the backup back in its place.
+            if venv_dir.exists() {
+                if let Err(err) = std::fs::remove_dir_all(venv_dir) {
+                    eprintln!(
+                        "recover_from_interrupted_upgrade: failed to remove partial venv at {}: {err}",
+                        venv_dir.display()
+                    );
+                    // Leave everything in place; clearing the marker would be
+                    // worse than leaving it for a later manual intervention.
+                    return false;
+                }
+            }
+            if let Err(err) = std::fs::rename(&backup_dir, venv_dir) {
+                eprintln!(
+                    "recover_from_interrupted_upgrade: failed to restore venv from {}: {err}",
+                    backup_dir.display()
+                );
+                return false;
+            }
+            if receipt_backup.exists() {
+                let _ = std::fs::copy(&receipt_backup, &receipt_path);
+                let _ = std::fs::remove_file(&receipt_backup);
+            }
+        } else {
+            // No backup to restore from. Rare — the user (or a script) deleted
+            // the backup dir while the marker was still live. Best we can do
+            // is clear the marker so we don't loop on this state.
+            eprintln!(
+                "recover_from_interrupted_upgrade: no backup at {}; clearing marker",
+                backup_dir.display()
+            );
+        }
+        self.clear_upgrade_marker();
+        true
+    }
+
+    /// Atomic runtime upgrade. Moves the current venv aside, creates a fresh
+    /// venv at the original path, installs the new release, runs a smoke test.
+    ///
+    /// On success: returns `InstalledPendingValidation` — the backup is **still
+    /// on disk** and the caller must call either [`commit_headroom_upgrade`] (if
+    /// the new proxy boots) or [`rollback_headroom_upgrade`] (if it doesn't).
+    ///
+    /// On failure in any install step: rolls back internally, restoring the
+    /// previous venv + receipt byte-for-byte, and returns `InstallFailed`.
+    pub fn atomic_upgrade_headroom<F>(
+        &self,
+        release: &HeadroomRelease,
+        mut progress: F,
+    ) -> UpgradeOutcome
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
+        progress(BootstrapStepUpdate {
+            step: "Preparing update",
+            message: "Checking for previous upgrade state.".into(),
+            eta_seconds: 2,
+            percent: 5,
+        });
+
+        // If a prior upgrade was interrupted (process killed between
+        // move-aside and success-commit), the backup is the REAL venv.
+        // Restore it before doing anything destructive.
+        let _recovered = self.recover_from_interrupted_upgrade();
+
+        let venv_dir = self.runtime.venv_dir.clone();
+        let backup_dir = self.venv_backup_dir();
+        let receipt_path = self.headroom_receipt_path();
+        let receipt_backup = self.headroom_receipt_backup_path();
+
+        // Best-effort: purge any leftover backup from a cleanly-completed
+        // previous upgrade. recover_from_interrupted_upgrade above has
+        // already handled any backup that belongs to an in-flight upgrade.
+        if backup_dir.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
+                return UpgradeOutcome::InstallFailed {
+                    restored: false,
+                    error: anyhow!(
+                        "failed to remove stale venv backup at {}: {err}",
+                        backup_dir.display()
+                    ),
+                };
+            }
+        }
+        let _ = std::fs::remove_file(&receipt_backup);
+
+        // Disk-space pre-check: building a fresh venv doubles space usage
+        // momentarily. Refuse if less than 1 GB is free on the root volume.
+        if let Some(avail) = available_disk_bytes(&self.runtime.root_dir) {
+            const ONE_GB: u64 = 1_024 * 1_024 * 1_024;
+            if avail < ONE_GB {
+                return UpgradeOutcome::InstallFailed {
+                    restored: false,
+                    error: anyhow!(
+                        "insufficient disk space for runtime upgrade: {} MB free, 1024 MB required",
+                        avail / (1024 * 1024)
+                    ),
+                };
+            }
+        }
+
+        // Move current venv + receipt aside. Write the in-progress marker
+        // FIRST so that if we're killed between the rename and
+        // commit/rollback, the next launch can recognize and recover.
+        let had_live_venv = venv_dir.exists();
+        if had_live_venv {
+            if let Err(err) = self.write_upgrade_marker(&release.version) {
+                return UpgradeOutcome::InstallFailed {
+                    restored: false,
+                    error: err.context("writing upgrade-in-progress marker"),
+                };
+            }
+            if let Err(err) = std::fs::rename(&venv_dir, &backup_dir) {
+                self.clear_upgrade_marker();
+                return UpgradeOutcome::InstallFailed {
+                    restored: false,
+                    error: anyhow!(
+                        "failed to move {} aside: {err}",
+                        venv_dir.display()
+                    ),
+                };
+            }
+        }
+        let had_receipt = receipt_path.exists();
+        if had_receipt {
+            if let Err(err) = std::fs::copy(&receipt_path, &receipt_backup) {
+                let restored = self.restore_venv_from_backup(had_live_venv);
+                return UpgradeOutcome::InstallFailed {
+                    restored,
+                    error: anyhow!(
+                        "failed to snapshot {}: {err}",
+                        receipt_path.display()
+                    ),
+                };
+            }
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Creating environment",
+            message: "Creating isolated Headroom virtual environment.".into(),
+            eta_seconds: 20,
+            percent: 15,
+        });
+
+        if let Err(err) = self.create_managed_venv() {
+            let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err.context("creating replacement Headroom virtualenv"),
+            };
+        }
+
+        // install_headroom_release emits its own granular progress from ~40-90%.
+        if let Err(err) = self.install_headroom_release(release, &mut progress) {
+            let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err,
+            };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Verifying install",
+            message: "Running Headroom import smoke test.".into(),
+            eta_seconds: 3,
+            percent: 95,
+        });
+
+        if let Err(err) = self.smoke_test_headroom() {
+            let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err,
+            };
+        }
+
+        // Re-stamp the READY flag on the fresh venv. Without this,
+        // `python_runtime_installed()` returns false (the flag lives inside
+        // venv_dir, which was replaced during the swap), which would make
+        // `ensure_headroom_running()` early-return without spawning the
+        // new proxy — silently breaking boot validation.
+        if let Err(err) = self.write_ready_flag() {
+            let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err.context("writing READY flag on upgraded venv"),
+            };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Install complete",
+            message: "Install finished. Verifying Headroom boot…".into(),
+            eta_seconds: 0,
+            percent: 97,
+        });
+
+        UpgradeOutcome::InstalledPendingValidation
+    }
+
+    /// Tear down the new venv and restore the previous one. Called by the
+    /// `state.rs` upgrade coordinator when boot validation fails.
+    /// Idempotent — no-op if no backup exists.
+    pub fn rollback_headroom_upgrade(&self) -> Result<()> {
+        let backup_dir = self.venv_backup_dir();
+        if !backup_dir.exists() {
+            return Ok(());
+        }
+        let had_live_venv = true; // by definition, if we have a backup
+        let had_receipt = self.headroom_receipt_backup_path().exists();
+        let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
+        if !restored {
+            bail!(
+                "rollback failed — venv.backup is present but could not be restored to {}",
+                self.runtime.venv_dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Finalize a successful atomic upgrade. Deletes the backup venv and
+    /// receipt snapshot. Non-fatal if cleanup fails — a future upgrade's
+    /// "purge stale backup" step will clean up whatever we left behind.
+    pub fn commit_headroom_upgrade(&self) -> Result<()> {
+        let backup_dir = self.venv_backup_dir();
+        if backup_dir.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
+                eprintln!(
+                    "commit_headroom_upgrade: non-fatal: failed to remove {}: {err}",
+                    backup_dir.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_file(self.headroom_receipt_backup_path());
+        // Clear the in-progress marker last, so a mid-commit crash (e.g.,
+        // between the remove_dir_all of the backup and the marker cleanup)
+        // still looks like an interrupted upgrade on the next launch and
+        // triggers recovery rather than a potentially-unsafe purge.
+        self.clear_upgrade_marker();
+        Ok(())
+    }
+
+    /// Restore both venv + receipt from their backups. Used from the atomic
+    /// upgrade failure path and from the post-boot-validation rollback path.
+    /// Returns true if the restore succeeded.
+    fn rollback_partial_upgrade(&self, had_live_venv: bool, had_receipt: bool) -> bool {
+        // Remove any partial new venv.
+        if self.runtime.venv_dir.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&self.runtime.venv_dir) {
+                eprintln!(
+                    "rollback: failed to remove partial venv at {}: {err}",
+                    self.runtime.venv_dir.display()
+                );
+                return false;
+            }
+        }
+        let venv_restored = self.restore_venv_from_backup(had_live_venv);
+        if !venv_restored {
+            return false;
+        }
+        if had_receipt {
+            let receipt_path = self.headroom_receipt_path();
+            let receipt_backup = self.headroom_receipt_backup_path();
+            if let Err(err) = std::fs::copy(&receipt_backup, &receipt_path) {
+                eprintln!(
+                    "rollback: failed to restore {}: {err}",
+                    receipt_path.display()
+                );
+                return false;
+            }
+            let _ = std::fs::remove_file(&receipt_backup);
+        }
+        // Rollback complete — clear the marker so we don't trigger recovery
+        // on the next launch.
+        self.clear_upgrade_marker();
+        true
+    }
+
+    fn restore_venv_from_backup(&self, had_live_venv: bool) -> bool {
+        if !had_live_venv {
+            return true;
+        }
+        let backup_dir = self.venv_backup_dir();
+        if !backup_dir.exists() {
+            return true;
+        }
+        match std::fs::rename(&backup_dir, &self.runtime.venv_dir) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "rollback: failed to restore venv from {}: {err}",
+                    backup_dir.display()
+                );
+                false
+            }
+        }
     }
 
     /// Runs MCP install if the receipt shows it is not configured, then updates
@@ -1363,7 +1749,7 @@ fn lsof_listener(port: u16) -> Option<String> {
     Some(format!("{cmd} pid {pid}"))
 }
 
-fn tail_log_file(path: &Path, max_lines: usize) -> String {
+pub(crate) fn tail_log_file(path: &Path, max_lines: usize) -> String {
     let Ok(file) = std::fs::File::open(path) else {
         return String::new();
     };
@@ -1376,6 +1762,29 @@ fn tail_log_file(path: &Path, max_lines: usize) -> String {
         lines.push_back(line);
     }
     lines.into_iter().collect::<Vec<_>>().join("\n")
+}
+
+/// Newest `headroom-proxy*.log` in the logs directory, if any.
+pub(crate) fn newest_proxy_log_path(logs_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("headroom-proxy") || !name_str.ends_with(".log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                let path = entry.path();
+                newest = Some(match newest {
+                    Some((prev_time, prev_path)) if prev_time > mtime => (prev_time, prev_path),
+                    _ => (mtime, path),
+                });
+            }
+        }
+    }
+    newest.map(|(_, p)| p)
 }
 
 fn headroom_python_startup_args() -> Vec<&'static str> {
@@ -1408,6 +1817,40 @@ pub(crate) struct HeadroomRelease {
     version: String,
     wheel_url: String,
     sha256: String,
+}
+
+impl HeadroomRelease {
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// Outcome of [`ToolManager::atomic_upgrade_headroom`].
+///
+/// `InstalledPendingValidation` means install + smoke test succeeded but the
+/// backup is still on disk. The caller must either commit or rollback.
+pub enum UpgradeOutcome {
+    InstalledPendingValidation,
+    InstallFailed {
+        /// True if we successfully restored the old venv + receipt.
+        restored: bool,
+        error: anyhow::Error,
+    },
+}
+
+/// Best-effort free-bytes query for the volume backing `path`. Returns None
+/// on error — callers should treat that as "don't block on disk space".
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 
@@ -1723,11 +2166,80 @@ fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 /// retry the full invocation; pip's cachecontrol layer persists partial
 /// responses so retries resume cheaply instead of redownloading from zero.
 fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
+    run_pip_install_with_retries_streaming(python, args, cwd, |_| {})
+}
+
+/// Translate a pip stdout/stderr line into a progress update, or None for
+/// noise. Counter-based monotonic advance inside `[base_percent, max_percent-1]`:
+/// we don't know the final dep count up-front, so each interesting line nudges
+/// the bar forward and it saturates just below the parent step's ceiling.
+fn pip_line_to_progress(
+    line: &str,
+    elapsed: Duration,
+    counter: &mut u32,
+    base_percent: u8,
+    max_percent: u8,
+) -> Option<BootstrapStepUpdate> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let message = if let Some(rest) = trimmed.strip_prefix("Collecting ") {
+        let spec = rest.split_whitespace().next().unwrap_or(rest);
+        let pkg = spec
+            .split(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | ';' | '['))
+            .next()
+            .unwrap_or(spec);
+        format!("Fetching {}...", pkg)
+    } else if let Some(rest) = trimmed.strip_prefix("Downloading ") {
+        let file = rest.split_whitespace().next().unwrap_or(rest);
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let pkg = name.split('-').next().unwrap_or(name);
+        format!("Downloading {}...", pkg)
+    } else if trimmed.starts_with("Installing collected packages") {
+        "Installing packages...".to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("Successfully installed ") {
+        let count = rest.split_whitespace().count();
+        format!("Installed {} packages.", count)
+    } else {
+        return None;
+    };
+
+    *counter = counter.saturating_add(1);
+    let span = max_percent.saturating_sub(base_percent).max(1) as u32;
+    let advance = (*counter).min(span.saturating_sub(1));
+    let percent = (base_percent as u32 + advance).min(max_percent as u32 - 1) as u8;
+
+    let remaining = 90_u64.saturating_sub(elapsed.as_secs()).max(5);
+    Some(BootstrapStepUpdate {
+        step: "Updating dependencies",
+        message,
+        eta_seconds: remaining,
+        percent,
+    })
+}
+
+/// Streaming variant of `run_pip_install_with_retries`. Each line emitted by
+/// pip on stdout/stderr is piped through `on_line` as it arrives, so callers
+/// can translate noteworthy pip events ("Collecting X", "Downloading Y",
+/// "Installing collected packages", "Successfully installed") into
+/// user-facing progress updates instead of staring at a static message for
+/// the 60–90 seconds a large pip install takes.
+fn run_pip_install_with_retries_streaming<F>(
+    python: &Path,
+    args: &[&str],
+    cwd: &Path,
+    mut on_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
     const MAX_ATTEMPTS: u32 = 3;
     const BACKOFFS_SECS: &[u64] = &[2, 5];
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_python_command(python, args, cwd) {
+        match run_command_streaming(python, args, cwd, &mut on_line) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!(
@@ -1743,6 +2255,98 @@ fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Res
         }
     }
     Err(last_err.expect("at least one attempt was made"))
+}
+
+/// Like `run_command` but streams stdout + stderr line-by-line through
+/// `on_line` in real time. Captures everything for the structured failure
+/// payload so error reporting is unchanged.
+fn run_command_streaming<F>(
+    binary: &Path,
+    args: &[&str],
+    cwd: &Path,
+    on_line: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let mut cmd = Command::new(binary);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONSTARTUP")
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("LANG", "C.UTF-8")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .env("PIP_NO_INPUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let (tx, rx) = mpsc::channel::<StreamedLine>();
+    let tx_stdout = tx.clone();
+    let tx_stderr = tx.clone();
+    drop(tx);
+
+    let stdout_handle = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx_stdout.send(StreamedLine { line, is_stderr: false });
+        }
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx_stderr.send(StreamedLine { line, is_stderr: true });
+        }
+    });
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+
+    while let Ok(streamed) = rx.recv() {
+        on_line(&streamed.line);
+        let sink = if streamed.is_stderr {
+            &mut stderr_buf
+        } else {
+            &mut stdout_buf
+        };
+        sink.push_str(&streamed.line);
+        sink.push('\n');
+    }
+
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {} {}", binary.display(), args.join(" ")))?;
+
+    if !status.success() {
+        return Err(anyhow::Error::new(CommandFailure {
+            program: binary.display().to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+            exit_code: status.code(),
+        }));
+    }
+
+    Ok(())
+}
+
+struct StreamedLine {
+    line: String,
+    is_stderr: bool,
 }
 
 fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
@@ -1842,8 +2446,8 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, read_headroom_learn_metadata_from_path,
-        run_command, sha256_bytes, verify_sha256_file, CommandFailure, ManagedRuntime,
-        ToolManager, HEADROOM_PROXY_PORT,
+        run_command, sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease,
+        ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
     };
 
     #[test]
@@ -2074,5 +2678,188 @@ Plain text without a dash
             .expect("time went backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    fn seed_test_runtime(prefix: &str) -> (PathBuf, ManagedRuntime, ToolManager) {
+        let root = unique_temp_dir(prefix);
+        let runtime = ManagedRuntime::bootstrap_root(&root);
+        runtime.ensure_layout().expect("layout");
+        fs::create_dir_all(&runtime.venv_dir).expect("venv dir");
+        fs::write(runtime.venv_dir.join("marker"), b"live-v1").expect("marker");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.0.1"}"#,
+        )
+        .expect("receipt");
+        let manager = ToolManager::new(runtime.clone());
+        (root, runtime, manager)
+    }
+
+    #[test]
+    fn commit_headroom_upgrade_removes_backup() {
+        let (root, runtime, manager) = seed_test_runtime("commit-backup");
+        let backup = manager.venv_backup_dir();
+        fs::create_dir_all(&backup).expect("backup dir");
+        fs::write(backup.join("old-marker"), b"old").expect("old marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.0.0"}"#,
+        )
+        .expect("receipt backup");
+
+        manager.commit_headroom_upgrade().expect("commit ok");
+
+        assert!(!backup.exists(), "backup should be removed");
+        assert!(!manager.headroom_receipt_backup_path().exists());
+        assert!(runtime.venv_dir.join("marker").exists(), "live venv untouched");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_headroom_upgrade_is_noop_without_backup() {
+        let (root, _runtime, manager) = seed_test_runtime("commit-noop");
+        manager.commit_headroom_upgrade().expect("noop ok");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_headroom_upgrade_restores_from_backup() {
+        // Simulate state after a boot-validation failure: a NEW venv is live
+        // at venv_dir, the previous one is at venv_dir.backup, and the old
+        // receipt is snapshotted.
+        let (root, runtime, manager) = seed_test_runtime("rollback");
+        let backup = manager.venv_backup_dir();
+
+        // "Move" the current live venv to backup and create a fake "new" venv.
+        fs::rename(&runtime.venv_dir, &backup).expect("move aside");
+        fs::create_dir_all(&runtime.venv_dir).expect("new venv dir");
+        fs::write(runtime.venv_dir.join("new-marker"), b"new").expect("new marker");
+        fs::copy(
+            runtime.tools_dir.join("headroom.json"),
+            manager.headroom_receipt_backup_path(),
+        )
+        .expect("snapshot receipt");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"9.9.9"}"#,
+        )
+        .expect("new receipt");
+
+        manager
+            .rollback_headroom_upgrade()
+            .expect("rollback succeeds");
+
+        // The live venv should now be the original (contains "marker", not "new-marker").
+        assert!(runtime.venv_dir.join("marker").exists(), "restored marker present");
+        assert!(
+            !runtime.venv_dir.join("new-marker").exists(),
+            "new venv wiped"
+        );
+        assert!(!backup.exists(), "backup consumed");
+        let receipt = fs::read(runtime.tools_dir.join("headroom.json")).expect("receipt");
+        assert!(
+            String::from_utf8_lossy(&receipt).contains("0.0.1"),
+            "receipt restored to previous: {}",
+            String::from_utf8_lossy(&receipt)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_headroom_upgrade_is_noop_without_backup() {
+        let (root, _runtime, manager) = seed_test_runtime("rollback-noop");
+        manager.rollback_headroom_upgrade().expect("noop ok");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_from_interrupted_upgrade_restores_backup_as_live() {
+        // Simulate an interrupted upgrade: marker present, venv.backup has
+        // the real old venv, venv has some partial new content.
+        let (root, runtime, manager) = seed_test_runtime("interrupted");
+        let backup = manager.venv_backup_dir();
+
+        // Move original venv aside (as atomic_upgrade would).
+        fs::rename(&runtime.venv_dir, &backup).expect("move aside");
+        // Simulate a partial new venv left by an interrupted pip install.
+        fs::create_dir_all(&runtime.venv_dir).expect("partial venv");
+        fs::write(runtime.venv_dir.join("partial-marker"), b"interrupted").expect("partial");
+        // Marker file and receipt backup (written by atomic_upgrade).
+        manager.write_upgrade_marker("0.8.2").expect("marker");
+        fs::copy(
+            runtime.tools_dir.join("headroom.json"),
+            manager.headroom_receipt_backup_path(),
+        )
+        .expect("receipt snapshot");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"9.9.9-partial"}"#,
+        )
+        .expect("new receipt");
+
+        let recovered = manager.recover_from_interrupted_upgrade();
+        assert!(recovered, "recovery should fire");
+
+        // The live venv should be the restored original.
+        assert!(runtime.venv_dir.join("marker").exists(), "original restored");
+        assert!(
+            !runtime.venv_dir.join("partial-marker").exists(),
+            "partial new venv discarded"
+        );
+        assert!(!backup.exists(), "backup consumed");
+        assert!(
+            !manager.upgrade_marker_path().exists(),
+            "marker cleared after recovery"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_from_interrupted_upgrade_is_noop_without_marker() {
+        let (root, _runtime, manager) = seed_test_runtime("interrupted-noop");
+        assert!(!manager.recover_from_interrupted_upgrade());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_upgrade_purges_stale_backup_and_reports_failure_without_python() {
+        // Without a real standalone python available, create_managed_venv()
+        // will fail. We still want to verify that a stale backup from a
+        // previous aborted upgrade is removed before the attempt, and that
+        // the live venv is restored byte-for-byte after the failure.
+        let (root, runtime, manager) = seed_test_runtime("atomic-stale");
+
+        // Pre-seed a stale backup (simulating a previous aborted upgrade).
+        let stale_backup = manager.venv_backup_dir();
+        fs::create_dir_all(&stale_backup).expect("stale backup");
+        fs::write(stale_backup.join("stale-marker"), b"stale").expect("stale marker");
+
+        // Fake release — bogus URL ensures download/install would fail even
+        // if we somehow reached that step.
+        let release = HeadroomRelease {
+            version: "0.0.0-test".into(),
+            wheel_url: "https://example.invalid/headroom.whl".into(),
+            sha256: "deadbeef".into(),
+        };
+
+        let outcome = manager.atomic_upgrade_headroom(&release, |_| {});
+
+        match outcome {
+            UpgradeOutcome::InstallFailed { restored, .. } => {
+                assert!(restored, "old venv should be restored after failure");
+            }
+            UpgradeOutcome::InstalledPendingValidation => {
+                panic!("unexpected success without python");
+            }
+        }
+
+        // Live venv is back with its original content.
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "original marker restored"
+        );
+        // Stale backup purged (either consumed during restore or cleaned at start).
+        assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
     }
 }

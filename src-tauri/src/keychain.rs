@@ -27,10 +27,6 @@ mod platform {
             .map_err(|err| format!("Failed to read dev secret {}: {err}", path.display()))
     }
 
-    pub fn has_secret(service: &str, account: &str) -> Result<bool, String> {
-        Ok(secret_path(service, account).exists())
-    }
-
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
         let path = secret_path(service, account);
         if let Some(parent) = path.parent() {
@@ -245,10 +241,6 @@ mod platform {
         }
     }
 
-    pub fn has_secret(service: &str, account: &str) -> Result<bool, String> {
-        read_secret(service, account).map(|opt| opt.is_some())
-    }
-
     pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
         unsafe {
             let query = base_query(service, account);
@@ -280,10 +272,6 @@ mod platform {
         Ok(None)
     }
 
-    pub fn has_secret(_service: &str, _account: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-
     pub fn write_secret(_service: &str, _account: &str, _secret: &str) -> Result<(), String> {
         Err("Secure key storage is currently only implemented for macOS builds.".into())
     }
@@ -297,10 +285,6 @@ mod platform {
 
 pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
     platform::read_secret(service, account)
-}
-
-pub fn has_secret(service: &str, account: &str) -> Result<bool, String> {
-    platform::has_secret(service, account)
 }
 
 pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {

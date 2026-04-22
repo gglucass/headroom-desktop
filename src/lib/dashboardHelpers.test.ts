@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   aggregateClientConnectors,
-  apiProviderLabel,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
@@ -18,7 +17,6 @@ import {
   formatLearnStatus,
   hourOfDayTickFormatter,
   percent1,
-  resolveApiProvider,
   sortClientConnectors
 } from "./dashboardHelpers";
 import type {
@@ -141,17 +139,13 @@ describe("dashboard helpers", () => {
     expect(hourOfDayTickFormatter("2024-02-01T23:00")).toBe("23");
   });
 
-  it("normalizes provider labels and connector filtering", () => {
+  it("filters and sorts client connectors", () => {
     const connectors: ClientConnectorStatus[] = [
       { clientId: "zed", name: "Zed", installed: false, enabled: false, verified: false },
       { clientId: "claude_code", name: "Claude Code", installed: true, enabled: true, verified: true },
       { clientId: "cursor", name: "Cursor", installed: true, enabled: false, verified: false }
     ];
 
-    expect(resolveApiProvider("openai")).toBe("openai");
-    expect(resolveApiProvider("mystery")).toBe("anthropic");
-    expect(apiProviderLabel("anthropic")).toBe("Claude");
-    expect(apiProviderLabel("unknown")).toBe("API");
     expect(aggregateClientConnectors(connectors)).toEqual([connectors[1]]);
     expect(sortClientConnectors(connectors).map((connector) => connector.clientId)).toEqual([
       "claude_code",

@@ -234,7 +234,43 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeUpgradeProgress {
+    pub running: bool,
+    pub complete: bool,
+    pub failed: bool,
+    pub current_step: String,
+    pub message: String,
+    pub overall_percent: u8,
+    pub from_version: Option<String>,
+    pub to_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeFailurePhase {
+    Install,
+    BootValidation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeUpgradeFailure {
+    pub app_version: String,
+    pub target_headroom_version: String,
+    pub fallback_headroom_version: Option<String>,
+    pub failure_phase: UpgradeFailurePhase,
+    pub attempts: u32,
+    pub first_attempt_at: DateTime<Utc>,
+    pub last_attempt_at: DateTime<Utc>,
+    pub error_message: String,
+    pub error_hint: Option<String>,
+    pub rollback_restored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,10 +306,9 @@ pub struct HeadroomLearnStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HeadroomLearnApiKeyStatus {
-    pub has_api_key: bool,
-    pub provider: Option<String>,
-    pub source: Option<String>,
+pub struct HeadroomLearnPrereqStatus {
+    pub claude_cli_available: bool,
+    pub claude_cli_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

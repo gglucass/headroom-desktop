@@ -19,7 +19,7 @@
 
 Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings.
 
-Linux preview artifacts are published on the same release page. Today they are best treated as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. `Headroom Learn` and secure API-key storage are not supported yet on Linux preview builds.
+Linux preview artifacts are published on the same release page. Today they are best treated as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. `Headroom Learn` is not supported yet on Linux preview builds.
 
 ---
 
@@ -50,7 +50,7 @@ Full disclosure of every location Headroom writes to, so you can decide before i
 - Downloads a self-contained Python runtime (~2 GB) to `~/.headroom`. Your system Python is untouched.
 - Adds a `PreToolUse` hook to `~/.claude/settings.json` and a script at `~/.claude/hooks/headroom-rtk-rewrite.sh` so Claude Code routes through Headroom. A timestamped backup of `settings.json` is written before any edit.
 - Creates `~/Library/Application Support/Headroom` for logs, caches, and per-client setup state.
-- Stores your Headroom session token (and any API keys you enter) in the macOS Keychain under services prefixed `com.extraheadroom.headroom`.
+- Stores your Headroom session token in the macOS Keychain under services prefixed `com.extraheadroom.headroom`.
 - If you opt into "launch at login," installs a LaunchAgent plist at `~/Library/LaunchAgents/`. Never added otherwise.
 - Adds a managed block to your shell profile (`.zshrc`, `.zprofile`, etc.) that prepends `~/.headroom/bin` to `PATH` so `rtk` is available in your terminals. Every managed block is fenced with `# >>> headroom:... >>>` markers and can be removed by hand if you prefer.
 
