@@ -255,6 +255,7 @@ export interface TransformationFeedEvent {
   tokensSaved?: number | null;
   savingsPercent?: number | null;
   transformsApplied: string[];
+  workspace?: string | null;
 }
 
 export interface TransformationFeedResponse {
@@ -313,12 +314,14 @@ export interface RecordEvent {
   requestId: string | null;
   previousRecord: number | null;
   day: string | null;
+  workspace?: string | null;
 }
 
 export interface NewModelEvent {
   observedAt: string;
   model: string;
   provider: string | null;
+  workspace?: string | null;
 }
 
 export interface StreakEvent {
@@ -342,6 +345,12 @@ export interface WeeklyRecapEvent {
   activeDays: number;
 }
 
+export interface LearningsMilestoneEvent {
+  observedAt: string;
+  count: number;
+  kind: string;
+}
+
 export type ActivityEvent =
   | { kind: "transformation"; data: TransformationFeedEvent }
   | { kind: "memory"; data: MemoryFeedEvent }
@@ -352,7 +361,8 @@ export type ActivityEvent =
   | { kind: "newModel"; data: NewModelEvent }
   | { kind: "streak"; data: StreakEvent }
   | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }
-  | { kind: "weeklyRecap"; data: WeeklyRecapEvent };
+  | { kind: "weeklyRecap"; data: WeeklyRecapEvent }
+  | { kind: "learningsMilestone"; data: LearningsMilestoneEvent };
 
 export interface ActivityFeedResponse {
   events: ActivityEvent[];

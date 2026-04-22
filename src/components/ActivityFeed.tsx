@@ -3,6 +3,7 @@ import { formatDateTime } from "../lib/dashboardHelpers";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
+  LearningsMilestoneEvent,
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
@@ -17,18 +18,17 @@ import type {
 interface ActivityFeedProps {
   feed: ActivityFeedResponse;
   error: string | null;
-  limit?: number;
-  onLoadMore?: () => void;
 }
 
-const ACTIVITY_FEED_MAX_LIMIT = 500;
+const PAGE_SIZE = 10;
 
-export function ActivityFeed({ feed, error, limit, onLoadMore }: ActivityFeedProps) {
-  const hasMore =
-    onLoadMore !== undefined &&
-    limit !== undefined &&
-    feed.events.length >= limit &&
-    limit < ACTIVITY_FEED_MAX_LIMIT;
+export function ActivityFeed({ feed, error }: ActivityFeedProps) {
+  const [page, setPage] = useState(0);
+  const totalPages = Math.max(1, Math.ceil(feed.events.length / PAGE_SIZE));
+  const clampedPage = Math.min(page, totalPages - 1);
+  const start = clampedPage * PAGE_SIZE;
+  const pageEvents = feed.events.slice(start, start + PAGE_SIZE);
+
   return (
     <>
       <header className="activity-feed__header">
@@ -50,18 +50,32 @@ export function ActivityFeed({ feed, error, limit, onLoadMore }: ActivityFeedPro
       ) : (
         <>
           <ul className="activity-feed__list">
-            {feed.events.map((event, index) => (
-              <ActivityRow key={activityKey(event, index)} event={event} />
+            {pageEvents.map((event, index) => (
+              <ActivityRow key={activityKey(event, start + index)} event={event} />
             ))}
           </ul>
-          {hasMore ? (
-            <button
-              type="button"
-              className="activity-feed__load-more"
-              onClick={onLoadMore}
-            >
-              Load more
-            </button>
+          {totalPages > 1 ? (
+            <nav className="activity-feed__pagination" aria-label="Activity pagination">
+              <button
+                type="button"
+                className="activity-feed__page-button"
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={clampedPage === 0}
+              >
+                ← Prev
+              </button>
+              <span className="activity-feed__page-indicator">
+                Page {clampedPage + 1} of {totalPages} · {feed.events.length} total
+              </span>
+              <button
+                type="button"
+                className="activity-feed__page-button"
+                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                disabled={clampedPage >= totalPages - 1}
+              >
+                Next →
+              </button>
+            </nav>
           ) : null}
         </>
       )}
@@ -91,6 +105,8 @@ function activityKey(event: ActivityEvent, index: number): string {
       return `smile-${event.data.milestoneUsd}-${event.data.observedAt}`;
     case "weeklyRecap":
       return `wr-${event.data.weekStart}`;
+    case "learningsMilestone":
+      return `lm-${event.data.count}-${event.data.observedAt}`;
   }
 }
 
@@ -116,12 +132,28 @@ function ActivityRow({ event }: { event: ActivityEvent }) {
       return <SavingsMilestoneRow event={event.data} />;
     case "weeklyRecap":
       return <WeeklyRecapRow event={event.data} />;
+    case "learningsMilestone":
+      return <LearningsMilestoneRow event={event.data} />;
   }
+}
+
+function projectBasename(scope: string): string | null {
+  if (!scope.startsWith("project:")) return null;
+  const path = scope.slice("project:".length);
+  const segments = path.split("/").filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : null;
+}
+
+function workspaceBasename(path: string | null | undefined): string | null {
+  if (!path) return null;
+  const segments = path.split("/").filter(Boolean);
+  return segments.length > 0 ? segments[segments.length - 1] : null;
 }
 
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
+  const workspace = workspaceBasename(event.workspace);
   return (
     <li className="activity-feed__item activity-feed__item--transformation">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -131,6 +163,9 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <span className="activity-feed__time">{formatDateTime(event.timestamp)}</span>
         <span className="activity-feed__provider">{event.provider ?? "unknown"}</span>
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
+        {workspace ? (
+          <span className="activity-feed__project">{workspace}</span>
+        ) : null}
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
@@ -263,12 +298,17 @@ function MemoryRow({ event }: { event: MemoryFeedEvent }) {
   // Heuristic: show the toggle if the content is long enough to plausibly
   // wrap beyond two lines at typical widths.
   const canExpand = event.content.length > 140 || event.content.includes("\n");
+  const project = projectBasename(event.scope);
   return (
     <li className="activity-feed__item activity-feed__item--memory">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--memory">Learning</span>
         <span className="activity-feed__time">{formatDateTime(event.createdAt)}</span>
-        <span className="activity-feed__scope">{event.scope}</span>
+        {project ? (
+          <span className="activity-feed__project">{project}</span>
+        ) : (
+          <span className="activity-feed__scope">{event.scope}</span>
+        )}
         <span className="activity-feed__importance">
           importance {event.importance.toFixed(2)}
         </span>
@@ -349,12 +389,16 @@ function RecordRow({
       ? "activity-feed__item--daily-record"
       : "activity-feed__item--all-time-record";
   const pct = event.savingsPercent;
+  const workspace = workspaceBasename(event.workspace);
   return (
     <li className={`activity-feed__item ${itemClass}`}>
       <div className="activity-feed__row activity-feed__row--meta">
         <span className={`activity-feed__badge ${badgeClass}`}>{badgeLabel}</span>
         <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
+        {workspace ? (
+          <span className="activity-feed__project">{workspace}</span>
+        ) : null}
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
@@ -372,6 +416,7 @@ function RecordRow({
 }
 
 function NewModelRow({ event }: { event: NewModelEvent }) {
+  const workspace = workspaceBasename(event.workspace);
   return (
     <li className="activity-feed__item activity-feed__item--new-model">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -380,8 +425,27 @@ function NewModelRow({ event }: { event: NewModelEvent }) {
         {event.provider ? (
           <span className="activity-feed__provider">{event.provider}</span>
         ) : null}
+        {workspace ? (
+          <span className="activity-feed__project">{workspace}</span>
+        ) : null}
       </div>
       <p className="activity-feed__content">First compression on {event.model}.</p>
+    </li>
+  );
+}
+
+function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
+  return (
+    <li className="activity-feed__item activity-feed__item--learnings-milestone">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--learnings-milestone">
+          Learning milestone
+        </span>
+        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+      </div>
+      <p className="activity-feed__content">
+        {event.count} patterns extracted from your work so far.
+      </p>
     </li>
   );
 }

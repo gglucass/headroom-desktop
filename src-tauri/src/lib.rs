@@ -7,6 +7,7 @@ mod device;
 mod insights;
 mod keychain;
 mod models;
+mod notifications;
 mod pricing;
 mod proxy_intercept;
 mod research;
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -190,6 +191,11 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
                 })),
             );
             pricing::report_milestone(*milestone_tokens_saved);
+            if let Some(payload) =
+                notifications::notification_for_token_milestone(*milestone_tokens_saved)
+            {
+                let _ = show_notification_impl(&app, &payload.title, &payload.body, payload.action);
+            }
         }
 
         for milestone_usd in &pending_milestones.usd {
@@ -474,17 +480,14 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 emit_bootstrap_progress(&app_handle, &state);
             });
             if let Err(err) = result {
-                capture_bootstrap_failure(&err);
-                state.mark_bootstrap_failed(
-                    "Installation failed: Headroom couldn't download a required file. \
-                    Please check your internet connection and try restarting the app. \
-                    If this keeps happening, contact support at support@extraheadroom.com."
-                );
+                let kind = classify_bootstrap_failure(&err);
+                capture_bootstrap_failure(&err, kind);
+                state.mark_bootstrap_failed(user_message_for(kind));
                 emit_bootstrap_progress(&app_handle, &state);
                 analytics::track_event(
                     &app_handle,
                     "bootstrap_failed",
-                    Some(json!({ "phase": "install_runtime" })),
+                    Some(json!({ "phase": "install_runtime", "kind": kind.as_str() })),
                 );
                 return;
             }
@@ -551,11 +554,66 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug)]
+enum BootstrapFailureKind {
+    /// Corporate proxy / AV / VPN injecting a self-signed root, so pip can't
+    /// verify pypi.org or github.com. Not our bug, but users here are stuck
+    /// until they configure `REQUESTS_CA_BUNDLE` or disable TLS inspection.
+    SslInterception,
+    Other,
+}
+
+impl BootstrapFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            BootstrapFailureKind::SslInterception => "ssl_interception",
+            BootstrapFailureKind::Other => "other",
+        }
+    }
+}
+
+fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
+    let Some(failure) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>())
+    else {
+        return BootstrapFailureKind::Other;
+    };
+    let haystack = format!("{}\n{}", failure.stdout, failure.stderr);
+    if haystack.contains("CERTIFICATE_VERIFY_FAILED")
+        || haystack.contains("self-signed certificate in certificate chain")
+        || haystack.contains("self signed certificate in certificate chain")
+    {
+        BootstrapFailureKind::SslInterception
+    } else {
+        BootstrapFailureKind::Other
+    }
+}
+
+fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
+    match kind {
+        BootstrapFailureKind::SslInterception => {
+            "Installation failed: your network is intercepting secure connections \
+             (self-signed certificate in the TLS chain), so Headroom can't verify \
+             pypi.org or github.com. This usually means a corporate proxy, VPN, or \
+             antivirus is inspecting HTTPS traffic. Set the REQUESTS_CA_BUNDLE \
+             environment variable to your organization's CA bundle, or disable TLS \
+             inspection for pypi.org, files.pythonhosted.org, and github.com, then \
+             restart the app. Contact support@extraheadroom.com if you need help."
+        }
+        BootstrapFailureKind::Other => {
+            "Installation failed: Headroom couldn't download a required file. \
+             Please check your internet connection and try restarting the app. \
+             If this keeps happening, contact support at support@extraheadroom.com."
+        }
+    }
+}
+
 /// Report a bootstrap failure to Sentry. If the error chain contains a
 /// `CommandFailure`, its full stdout/stderr/exit_code are sent as structured
 /// `extra` fields (which Sentry does NOT truncate at the 8KB message cap),
 /// so we can actually see why pip/venv failed on the user's machine.
-fn capture_bootstrap_failure(err: &anyhow::Error) {
+fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     let technical_err = format!("{err:#}");
     let cmd_failure = err
         .chain()
@@ -564,6 +622,7 @@ fn capture_bootstrap_failure(err: &anyhow::Error) {
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
+                scope.set_tag("failure_kind", kind.as_str());
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
                 scope.set_extra(
@@ -588,6 +647,7 @@ fn capture_bootstrap_failure(err: &anyhow::Error) {
     } else {
         sentry::with_scope(
             |scope| {
+                scope.set_tag("failure_kind", kind.as_str());
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
             || {
@@ -872,8 +932,12 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
 }
 
 #[tauri::command]
-fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> ActivityFeedResponse {
-    let limit = limit.unwrap_or(50).min(100);
+fn get_activity_feed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> ActivityFeedResponse {
+    let limit = limit.unwrap_or(50).min(500);
     let transformations = fetch_transformations_feed(limit).ok();
     let memory_path = headroom_memory_db_path();
     let memories = if memory_path.exists() {
@@ -883,18 +947,31 @@ fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> Activity
         Vec::new()
     };
 
-    state.maybe_emit_weekly_recap();
+    let mut fresh_events: Vec<ActivityEvent> = Vec::new();
 
-    let synthetic_events = match transformations.as_ref() {
+    if let Some(event) = state.maybe_emit_weekly_recap() {
+        fresh_events.push(event);
+    }
+
+    let observation = match transformations.as_ref() {
         Some(feed) => state.observe_activity_from_transformations(&feed.transformations),
-        None => Vec::new(),
+        None => crate::state::ActivityObservation::default(),
     };
+    fresh_events.extend(observation.fresh.iter().cloned());
+
+    if let Some(event) = state.observe_learnings_count(memories.len()) {
+        fresh_events.push(event);
+    }
+
+    for payload in notifications::collect_notification_payloads(&fresh_events) {
+        let _ = show_notification_impl(&app, &payload.title, &payload.body, payload.action);
+    }
 
     let memory_available = memory_path.exists();
     build_activity_feed_response(
         transformations,
         memories,
-        synthetic_events,
+        observation.recent,
         memory_available,
         limit as usize,
     )
@@ -928,6 +1005,7 @@ fn build_activity_feed_response(
     }
 
     events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
+    let mut events = coalesce_rtk_batches(events);
     events.truncate(limit);
 
     ActivityFeedResponse {
@@ -936,6 +1014,31 @@ fn build_activity_feed_response(
         proxy_reachable,
         memory_available,
     }
+}
+
+/// Merge adjacent `RtkBatch` events within a 10-minute window into a single
+/// aggregated row. The feed polls every 2s, so an active RTK session produces
+/// many small batches; coalescing keeps the feed readable without touching the
+/// persistent fact store. Expects `events` sorted DESC by timestamp.
+fn coalesce_rtk_batches(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
+    let window = chrono::Duration::minutes(10);
+    let mut out: Vec<ActivityEvent> = Vec::with_capacity(events.len());
+    for ev in events {
+        if let ActivityEvent::RtkBatch(curr) = &ev {
+            if let Some(ActivityEvent::RtkBatch(prev)) = out.last_mut() {
+                if prev.observed_at.signed_duration_since(curr.observed_at) <= window {
+                    prev.commands_delta =
+                        prev.commands_delta.saturating_add(curr.commands_delta);
+                    prev.tokens_saved_delta = prev
+                        .tokens_saved_delta
+                        .saturating_add(curr.tokens_saved_delta);
+                    continue;
+                }
+            }
+        }
+        out.push(ev);
+    }
+    out
 }
 
 #[tauri::command]
@@ -1147,6 +1250,7 @@ fn activity_event_timestamp(event: &ActivityEvent) -> String {
         ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
     }
 }
 
@@ -1894,7 +1998,7 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
         .filter_map(|m| {
             Some(MemoryFeedEvent {
                 id: m.id,
-                created_at: m.created_at?,
+                created_at: normalize_utc_timestamp(&m.created_at?)?,
                 scope: m.scope.unwrap_or_else(|| "unknown".into()),
                 content: m.content,
                 importance: m.importance.unwrap_or(0.0),
@@ -1904,6 +2008,22 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
     events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     events.truncate(limit);
     Ok(events)
+}
+
+/// Normalize an ISO-8601 timestamp string to RFC3339 UTC (`...Z`).
+///
+/// Headroom's memory DB stores naive ISO strings (no offset). JS `Date` parses
+/// those as local time, so downstream display would be off by the local tz
+/// offset. Treat naive strings as UTC and emit `Z`-suffixed output so both the
+/// feed sort and the frontend render match system time.
+fn normalize_utc_timestamp(raw: &str) -> Option<String> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc).to_rfc3339());
+    }
+    NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S"))
+        .ok()
+        .map(|naive| naive.and_utc().to_rfc3339())
 }
 
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
@@ -3488,6 +3608,7 @@ mod tests {
             tokens_saved: Some(750),
             savings_percent: Some(75.0),
             transforms_applied: vec!["interceptor:ast-grep".into()],
+            workspace: None,
         }
     }
 
@@ -3513,6 +3634,7 @@ mod tests {
             ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
         }
     }
 
@@ -3655,6 +3777,7 @@ mod tests {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 9, 0, 0).unwrap(),
                 model: "claude-opus-4-7".into(),
                 provider: Some("anthropic".into()),
+                workspace: None,
             }),
             ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 13, 0, 0).unwrap(),
@@ -3672,6 +3795,7 @@ mod tests {
                 request_id: Some("r".into()),
                 previous_record: Some(500),
                 day: None,
+                workspace: None,
             }),
         ];
 
@@ -3693,6 +3817,7 @@ mod tests {
                 ActivityEvent::Streak(_) => "streak",
                 ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
                 ActivityEvent::WeeklyRecap(_) => "weeklyRecap",
+                ActivityEvent::LearningsMilestone(_) => "learningsMilestone",
             })
             .collect();
         assert_eq!(

@@ -4,6 +4,7 @@ import { ActivityFeed } from "./ActivityFeed";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
+  LearningsMilestoneEvent,
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
@@ -319,6 +320,61 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("12,500 tokens saved");
     expect(markup).toContain("$4.25");
     expect(markup).toContain("5 active days");
+  });
+
+  it("renders a learnings milestone row with the extracted-count copy", () => {
+    const data: LearningsMilestoneEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      count: 3,
+      kind: "first_3"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "learningsMilestone", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Learning milestone");
+    expect(markup).toContain("3 patterns extracted");
+  });
+
+  it("renders a project badge on learnings with a project-scoped memory", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [memory({ scope: "project:/Users/u/Code/headroom-desktop" })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__project");
+    expect(markup).toContain(">headroom-desktop<");
+    expect(markup).not.toContain("activity-feed__scope");
+  });
+
+  it("falls back to scope display when scope is not project-prefixed", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [memory({ scope: "user" })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__scope");
+    expect(markup).not.toContain("activity-feed__project");
+  });
+
+  it("renders a workspace badge on a transformation when workspace is set", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [transformation({ workspace: "/Users/u/Code/demo-repo" })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__project");
+    expect(markup).toContain(">demo-repo<");
+  });
+
+  it("omits the workspace badge when workspace is missing", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [transformation()]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).not.toContain("activity-feed__project");
   });
 
   it("falls back to 'unknown' provider and 0 savings when transformation fields are null", () => {

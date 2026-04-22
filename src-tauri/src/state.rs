@@ -61,6 +61,12 @@ pub struct PendingMilestones {
     pub usd: Vec<u64>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ActivityObservation {
+    pub fresh: Vec<ActivityEvent>,
+    pub recent: Vec<ActivityEvent>,
+}
+
 impl PendingMilestones {
     pub fn is_empty(&self) -> bool {
         self.token.is_empty() && self.usd.is_empty()
@@ -1151,8 +1157,9 @@ impl AppState {
     pub fn observe_activity_from_transformations(
         &self,
         transformations: &[TransformationFeedEvent],
-    ) -> Vec<ActivityEvent> {
+    ) -> ActivityObservation {
         let mut facts = self.activity_facts.lock();
+        let mut fresh: Vec<ActivityEvent> = Vec::new();
         let mut ordered: Vec<&TransformationFeedEvent> = transformations.iter().collect();
         // Feed arrives newest-first; observe oldest-first so records update in order.
         ordered.sort_by(|a, b| {
@@ -1168,15 +1175,27 @@ impl AppState {
                 .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now);
-            facts.observe_transformation(transformation, observed_at);
+            fresh.extend(facts.observe_transformation(transformation, observed_at));
         }
 
         if let Some(summary) = self.cached_rtk_gain_summary() {
-            facts.observe_rtk(&summary, Utc::now());
+            if let Some(event) = facts.observe_rtk(&summary, Utc::now()) {
+                fresh.push(event);
+            }
         }
 
         let _ = facts.save_if_dirty();
-        facts.recent_events()
+        ActivityObservation {
+            fresh,
+            recent: facts.recent_events(),
+        }
+    }
+
+    pub fn observe_learnings_count(&self, count: usize) -> Option<ActivityEvent> {
+        let mut facts = self.activity_facts.lock();
+        let event = facts.observe_learnings_count(count, Utc::now());
+        let _ = facts.save_if_dirty();
+        event
     }
 
     /// Record milestone crossings into ActivityFacts so they appear in the
@@ -1199,19 +1218,13 @@ impl AppState {
     /// On Monday, emit a weekly recap rolling up the previous 7 days of
     /// savings. Idempotent per-week: only fires once per Monday even if the
     /// activity feed polls many times that day.
-    pub fn maybe_emit_weekly_recap(&self) {
+    pub fn maybe_emit_weekly_recap(&self) -> Option<ActivityEvent> {
         let today = Local::now().date_naive();
         if today.weekday() != chrono::Weekday::Mon {
-            return;
+            return None;
         }
-        let start = match today.checked_sub_days(chrono::Days::new(7)) {
-            Some(d) => d,
-            None => return,
-        };
-        let end = match today.pred_opt() {
-            Some(d) => d,
-            None => return,
-        };
+        let start = today.checked_sub_days(chrono::Days::new(7))?;
+        let end = today.pred_opt()?;
 
         let totals = {
             let tracker = self.savings_tracker.lock();
@@ -1219,8 +1232,9 @@ impl AppState {
         };
 
         let mut facts = self.activity_facts.lock();
-        facts.maybe_record_weekly_recap(today, totals, Utc::now());
+        let event = facts.maybe_record_weekly_recap(today, totals, Utc::now());
         let _ = facts.save_if_dirty();
+        event
     }
 
     pub fn dashboard_with_pending_milestones(&self) -> (DashboardState, PendingMilestones) {
@@ -2125,7 +2139,7 @@ struct SavingsTotalsSnapshot {
     lifetime_estimated_tokens_saved: u64,
 }
 
-const FIRST_LIFETIME_TOKEN_MILESTONES: [u64; 2] = [1_000_000, 5_000_000];
+const FIRST_LIFETIME_TOKEN_MILESTONES: [u64; 3] = [100_000, 1_000_000, 5_000_000];
 const REPEATING_LIFETIME_TOKEN_MILESTONE_STEP: u64 = 10_000_000;
 
 const FIRST_LIFETIME_USD_MILESTONES: [u64; 3] = [10, 50, 100];
@@ -3985,8 +3999,8 @@ mod tests {
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
     use crate::models::{
-        BootstrapProgress, DailySavingsPoint, HourlySavingsPoint, RuntimeUpgradeFailure,
-        UpgradeFailurePhase,
+        ActivityEvent, BootstrapProgress, DailySavingsPoint, HourlySavingsPoint,
+        RuntimeUpgradeFailure, UpgradeFailurePhase,
     };
     use crate::tool_manager::BootstrapStepUpdate;
 
@@ -4256,6 +4270,50 @@ mod tests {
     }
 
     #[test]
+    fn observe_activity_separates_fresh_from_recent_across_calls() {
+        use crate::models::TransformationFeedEvent;
+        let base_dir = temp_test_dir("headroom-activity-observation");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        let transformation = TransformationFeedEvent {
+            request_id: Some("r1".into()),
+            timestamp: Some("2026-04-22T10:00:00Z".into()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-4-7".into()),
+            input_tokens_original: Some(1000),
+            input_tokens_optimized: Some(200),
+            tokens_saved: Some(800),
+            savings_percent: Some(80.0),
+            transforms_applied: vec!["kompress".into()],
+            workspace: Some("/Users/u/Code/demo".into()),
+        };
+
+        let first = state.observe_activity_from_transformations(&[transformation.clone()]);
+        assert!(!first.fresh.is_empty(), "first observation should emit fresh events");
+        assert!(
+            first
+                .fresh
+                .iter()
+                .any(|e| matches!(e, ActivityEvent::NewModel(_))),
+            "first seen model should fire"
+        );
+        assert_eq!(first.fresh.len(), first.recent.len());
+
+        let second = state.observe_activity_from_transformations(&[transformation]);
+        assert!(
+            second.fresh.is_empty(),
+            "second observation of same transformation should emit no fresh events"
+        );
+        assert_eq!(
+            second.recent.len(),
+            first.recent.len(),
+            "recent history persists across calls"
+        );
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn dashboard_includes_managed_tools() {
         let base_dir = temp_test_dir("headroom-app-state");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
@@ -4344,11 +4402,15 @@ mod tests {
     fn lifetime_token_milestones_include_firsts_and_repeating_tens() {
         assert_eq!(
             lifetime_token_milestones_crossed(0, 5_000_000),
-            vec![1_000_000, 5_000_000]
+            vec![100_000, 1_000_000, 5_000_000]
         );
         assert_eq!(
             lifetime_token_milestones_crossed(9_500_000, 21_000_000),
             vec![10_000_000, 20_000_000]
+        );
+        assert_eq!(
+            lifetime_token_milestones_crossed(0, 150_000),
+            vec![100_000]
         );
     }
 
@@ -4370,7 +4432,7 @@ mod tests {
 
         assert_eq!(
             tracker.take_pending_lifetime_token_milestones(),
-            vec![1_000_000, 5_000_000, 10_000_000]
+            vec![100_000, 1_000_000, 5_000_000, 10_000_000]
         );
         assert!(tracker.take_pending_lifetime_token_milestones().is_empty());
 

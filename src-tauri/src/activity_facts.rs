@@ -6,8 +6,8 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, MilestoneEvent, NewModelEvent, RecordEvent, RtkBatchEvent,
-    SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent, WeeklyRecapEvent,
+    ActivityEvent, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent, RecordEvent,
+    RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
@@ -20,6 +20,7 @@ const REPEATING_STREAK_STEP: u32 = 30;
 
 fn milestone_kind(milestone_tokens_saved: u64) -> &'static str {
     match milestone_tokens_saved {
+        100_000 => "first_100k",
         1_000_000 => "first_1m",
         5_000_000 => "first_5m",
         10_000_000 => "first_10m",
@@ -97,6 +98,8 @@ struct PersistedActivityFacts {
     last_active_day: Option<String>,
     #[serde(default)]
     last_weekly_recap_week_key: Option<String>,
+    #[serde(default)]
+    learnings_milestones_fired: BTreeSet<u32>,
 }
 
 pub struct ActivityFacts {
@@ -111,6 +114,7 @@ pub struct ActivityFacts {
     longest_streak: u32,
     last_active_day: Option<String>,
     last_weekly_recap_week_key: Option<String>,
+    learnings_milestones_fired: BTreeSet<u32>,
     rtk_initialized: bool,
     dirty: bool,
 }
@@ -142,6 +146,7 @@ impl ActivityFacts {
             longest_streak: persisted.longest_streak,
             last_active_day: persisted.last_active_day,
             last_weekly_recap_week_key: persisted.last_weekly_recap_week_key,
+            learnings_milestones_fired: persisted.learnings_milestones_fired,
             rtk_initialized: true,
             dirty: false,
         })
@@ -160,6 +165,7 @@ impl ActivityFacts {
             longest_streak: 0,
             last_active_day: None,
             last_weekly_recap_week_key: None,
+            learnings_milestones_fired: BTreeSet::new(),
             rtk_initialized: false,
             dirty: false,
         }
@@ -182,6 +188,7 @@ impl ActivityFacts {
                     observed_at,
                     model: model.clone(),
                     provider: event.provider.clone(),
+                    workspace: event.workspace.clone(),
                 }));
             }
         }
@@ -215,6 +222,7 @@ impl ActivityFacts {
                     request_id: event.request_id.clone(),
                     previous_record: None,
                     day: Some(day),
+                    workspace: event.workspace.clone(),
                 }));
             }
 
@@ -234,6 +242,7 @@ impl ActivityFacts {
                     request_id: event.request_id.clone(),
                     previous_record: previous,
                     day: None,
+                    workspace: event.workspace.clone(),
                 }));
             }
         }
@@ -403,6 +412,29 @@ impl ActivityFacts {
         events
     }
 
+    pub fn observe_learnings_count(
+        &mut self,
+        count: usize,
+        observed_at: DateTime<Utc>,
+    ) -> Option<ActivityEvent> {
+        const THRESHOLD: u32 = 3;
+        if count < THRESHOLD as usize {
+            return None;
+        }
+        if self.learnings_milestones_fired.contains(&THRESHOLD) {
+            return None;
+        }
+        self.learnings_milestones_fired.insert(THRESHOLD);
+        let event = ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
+            observed_at,
+            count: THRESHOLD,
+            kind: "first_3".into(),
+        });
+        self.push_recent(vec![event.clone()]);
+        self.dirty = true;
+        Some(event)
+    }
+
     pub fn maybe_record_weekly_recap(
         &mut self,
         today_local: NaiveDate,
@@ -465,6 +497,7 @@ impl ActivityFacts {
             longest_streak: self.longest_streak,
             last_active_day: self.last_active_day.clone(),
             last_weekly_recap_week_key: self.last_weekly_recap_week_key.clone(),
+            learnings_milestones_fired: self.learnings_milestones_fired.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted)
             .context("serializing activity facts")?;
@@ -496,6 +529,7 @@ mod tests {
             tokens_saved,
             savings_percent,
             transforms_applied: vec!["kompress".into()],
+            workspace: None,
         }
     }
 
@@ -865,6 +899,76 @@ mod tests {
             Utc::now(),
         );
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn workspace_threads_through_to_new_model_and_record_events() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let mut transformation =
+            mk_transformation(Some("claude-x"), Some(1_000), Some(50.0));
+        transformation.workspace = Some("/Users/u/Code/demo-repo".into());
+        let events = facts.observe_transformation(&transformation, at(10, 0));
+        let new_model = events
+            .iter()
+            .find_map(|e| match e {
+                ActivityEvent::NewModel(m) => Some(m),
+                _ => None,
+            })
+            .expect("new model");
+        assert_eq!(new_model.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
+        let daily = events
+            .iter()
+            .find_map(|e| match e {
+                ActivityEvent::DailyRecord(r) => Some(r),
+                _ => None,
+            })
+            .expect("daily record");
+        assert_eq!(daily.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
+        let all_time = events
+            .iter()
+            .find_map(|e| match e {
+                ActivityEvent::AllTimeRecord(r) => Some(r),
+                _ => None,
+            })
+            .expect("all-time record");
+        assert_eq!(all_time.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
+    }
+
+    #[test]
+    fn milestone_kind_includes_first_100k() {
+        assert_eq!(milestone_kind(100_000), "first_100k");
+        assert_eq!(milestone_kind(1_000_000), "first_1m");
+        assert_eq!(milestone_kind(20_000_000), "repeating_10m");
+    }
+
+    #[test]
+    fn learnings_milestone_fires_once_at_three() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        assert!(facts.observe_learnings_count(2, at(10, 0)).is_none());
+        let event = facts
+            .observe_learnings_count(3, at(10, 1))
+            .expect("should fire at 3");
+        match event {
+            ActivityEvent::LearningsMilestone(e) => {
+                assert_eq!(e.count, 3);
+                assert_eq!(e.kind, "first_3");
+            }
+            _ => panic!("expected learnings milestone"),
+        }
+        assert!(facts.observe_learnings_count(5, at(10, 2)).is_none());
+    }
+
+    #[test]
+    fn learnings_milestone_idempotent_across_reload() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        facts.observe_learnings_count(10, at(10, 0));
+        facts.save_if_dirty().unwrap();
+
+        let mut reloaded = ActivityFacts::load_or_create(&base).unwrap();
+        assert!(reloaded.observe_learnings_count(20, at(11, 0)).is_none());
     }
 
     #[test]

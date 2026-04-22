@@ -332,6 +332,8 @@ pub struct TransformationFeedEvent {
     pub savings_percent: Option<f64>,
     #[serde(default, alias = "transforms_applied")]
     pub transforms_applied: Vec<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +408,8 @@ pub struct RecordEvent {
     pub request_id: Option<String>,
     pub previous_record: Option<u64>,
     pub day: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +418,8 @@ pub struct NewModelEvent {
     pub observed_at: DateTime<Utc>,
     pub model: String,
     pub provider: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +450,14 @@ pub struct WeeklyRecapEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningsMilestoneEvent {
+    pub observed_at: DateTime<Utc>,
+    pub count: u32,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ActivityEvent {
     #[serde(rename = "transformation")]
@@ -466,6 +480,8 @@ pub enum ActivityEvent {
     SavingsMilestone(SavingsMilestoneEvent),
     #[serde(rename = "weeklyRecap")]
     WeeklyRecap(WeeklyRecapEvent),
+    #[serde(rename = "learningsMilestone")]
+    LearningsMilestone(LearningsMilestoneEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

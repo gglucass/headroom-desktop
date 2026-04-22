@@ -668,10 +668,10 @@ select {
 .tray-shell {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   background: transparent;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .tray-sidebar {
@@ -804,6 +804,7 @@ select {
 .tray-panel {
   display: flex;
   flex-direction: column;
+  min-height: 0;
   padding: 10px 12px;
   overflow-x: hidden;
   overflow-y: auto;
@@ -4128,6 +4129,26 @@ html.window-hiding {
   color: var(--muted);
 }
 
+.activity-feed__project {
+  font-size: var(--text-xxs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.04);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.activity-feed__badge--learnings-milestone {
+  background: rgba(108, 90, 165, 0.2);
+  color: #4a3a82;
+}
+
+.activity-feed__item--learnings-milestone {
+  background: rgba(247, 244, 252, 0.7);
+  border-color: rgba(108, 90, 165, 0.22);
+}
+
 .activity-feed__scope {
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -4170,10 +4191,16 @@ html.window-hiding {
   text-decoration: underline;
 }
 
-.activity-feed__load-more {
-  display: block;
-  margin: 12px auto 4px;
-  padding: 6px 16px;
+.activity-feed__pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 14px 0 4px;
+}
+
+.activity-feed__page-button {
+  padding: 6px 14px;
   background: rgba(108, 90, 165, 0.08);
   border: 1px solid rgba(108, 90, 165, 0.25);
   border-radius: 6px;
@@ -4182,6 +4209,16 @@ html.window-hiding {
   cursor: pointer;
 }
 
-.activity-feed__load-more:hover {
+.activity-feed__page-button:hover:not(:disabled) {
   background: rgba(108, 90, 165, 0.15);
+}
+
+.activity-feed__page-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.activity-feed__page-indicator {
+  font-size: var(--text-sm);
+  color: rgba(36, 31, 29, 0.7);
 }

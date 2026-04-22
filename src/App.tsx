@@ -698,7 +698,7 @@ export default function App() {
     memoryAvailable: false
   });
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
-  const [activityFeedLimit, setActivityFeedLimit] = useState(50);
+  const ACTIVITY_FEED_WINDOW = 500;
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -1419,7 +1419,7 @@ export default function App() {
     }
     let active = true;
     const refreshFeed = () => {
-      invoke<ActivityFeedResponse>("get_activity_feed", { limit: activityFeedLimit })
+      invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
         .then((next) => {
           if (!active) return;
           setActivityFeed(next);
@@ -1438,14 +1438,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView, activityFeedLimit]);
-
-  // Reset pagination when leaving the Activity tab so revisits start fresh.
-  useEffect(() => {
-    if (activeView !== "notifications" && activityFeedLimit !== 50) {
-      setActivityFeedLimit(50);
-    }
-  }, [activeView, activityFeedLimit]);
+  }, [activeView]);
 
   useEffect(() => {
     if (activeView !== "home" || !startupReady) {
@@ -3864,10 +3857,9 @@ export default function App() {
 
         <div className="tray-content" hidden={activeView !== "notifications"}>
           <ActivityFeed
+            key={activeView === "notifications" ? "notifications" : "hidden"}
             feed={activityFeed}
             error={activityFeedError}
-            limit={activityFeedLimit}
-            onLoadMore={() => setActivityFeedLimit((prev) => Math.min(prev + 50, 500))}
           />
         </div>
 
