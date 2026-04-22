@@ -4504,7 +4504,7 @@ export default function App() {
                     <h3>Open on login</h3>
                   </div>
                   <div>
-                    <p className="connector-item__reason">
+                    <p>
                       Automatically launch Headroom whenever you login or restart.
                     </p>
                   </div>
@@ -4530,7 +4530,7 @@ export default function App() {
                     <h3>Uninstall</h3>
                   </div>
                 </div>
-                <p className="connector-item__reason">
+                <p>
                   Reverses every change Headroom made: removes the managed Python runtime, the Claude Code
                   hook, and restores <code>~/.claude/settings.json</code> changes. Headroom will quit when done.
                 </p>

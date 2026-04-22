@@ -39,6 +39,7 @@
 - If a needed color does not exist as a token, add it to both the `:root` block and the `@media (prefers-color-scheme: dark)` override — do not inline a hex/rgba in a component rule.
 - Exceptions: pure `#fff`/`#000`, brand gradients, and launcher/splash-only one-offs that are intentionally theme-invariant. Comment the exception inline.
 - When adding or modifying a component, visually verify both light and dark mode before declaring done. If dark mode cannot be tested, say so explicitly.
+- Run `npm run check:colors` (or `./scripts/check-colors.sh`) on any CSS you touch. It flags raw hex/rgba in component rules. Migrate any new offenders to tokens before committing. Existing offenders are the Stage 4 migration backlog — don't add to them.
 
 <!-- headroom:learn:start -->
 ## Headroom Learned Patterns

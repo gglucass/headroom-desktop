@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.3.0-rc.10",
+  "version": "0.3.0-rc.11",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +14,8 @@
     "test:coverage": "vitest run --coverage.enabled --coverage.provider=v8",
     "test:desktop": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:all": "npm run test:frontend && npm run test:desktop",
-    "release:check": "./scripts/verify-release.sh"
+    "release:check": "./scripts/verify-release.sh",
+    "check:colors": "./scripts/check-colors.sh"
   },
   "dependencies": {
     "@microsoft/clarity": "^1.0.2",

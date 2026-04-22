@@ -498,4 +498,35 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__pagination");
     expect(markup).not.toContain("Page 1 of");
   });
+
+  it("coalesces consecutive rtkBatch events into a single RTK group row", () => {
+    const batches: ActivityEvent[] = [
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:05:00Z",
+          commandsDelta: 3,
+          tokensSavedDelta: 1200,
+          totalCommands: 10,
+          totalSaved: 5000
+        }
+      },
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:04:00Z",
+          commandsDelta: 1,
+          tokensSavedDelta: 400,
+          totalCommands: 7,
+          totalSaved: 3800
+        }
+      }
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events: batches };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__item--rtk");
+    expect(markup).toContain("RTK × 2");
+    expect(markup).toContain("+4 commands");
+    expect(markup).toContain("1,600 tokens");
+  });
 });
