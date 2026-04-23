@@ -1349,7 +1349,7 @@ mod tests {
         let mut transformation =
             mk_transformation(Some("claude-x"), Some(1_000), Some(50.0));
         transformation.workspace = Some("/Users/u/Code/demo-repo".into());
-        let events = facts.observe_transformation(&transformation, at(10, 0));
+        let events = facts.observe_transformation_at(&transformation, at(10, 0), at(10, 0));
         let new_model = events
             .iter()
             .find_map(|e| match e {

@@ -4370,7 +4370,7 @@ mod tests {
     fn runtime_maintenance_plan_prefers_requirements_repair_when_only_lock_is_stale() {
         let base_dir = temp_test_dir("headroom-maintenance-repair");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        write_headroom_receipt(&base_dir, "0.9.7", "stale");
+        write_headroom_receipt(&base_dir, "0.10.4", "stale");
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(matches!(plan, Some(super::RuntimeMaintenancePlan::RequirementsRepair)));
@@ -4387,7 +4387,7 @@ mod tests {
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         match plan {
             Some(super::RuntimeMaintenancePlan::Upgrade(release)) => {
-                assert_eq!(release.version(), "0.9.7");
+                assert_eq!(release.version(), "0.10.4");
             }
             _ => panic!("expected version upgrade plan"),
         }

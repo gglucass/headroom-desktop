@@ -1046,6 +1046,11 @@ export default function App() {
     let active = true;
     let completionHandled = false;
     let unlisten: (() => void) | undefined;
+    const detach = () => {
+      const fn = unlisten;
+      unlisten = undefined;
+      fn?.();
+    };
 
     const handleProgress = async (progress: BootstrapProgress) => {
       if (!active) {
@@ -1064,13 +1069,13 @@ export default function App() {
         setBootstrapError(progress.message);
         setBootstrapping(false);
         completionHandled = true;
-        unlisten?.();
+        detach();
         return;
       }
 
       if (progress.complete && !completionHandled) {
         completionHandled = true;
-        unlisten?.();
+        detach();
         setBootstrapping(false);
         const latestDashboard = await loadDashboard();
         if (!active) {
@@ -1092,7 +1097,7 @@ export default function App() {
     void listen<BootstrapProgress>("bootstrap_progress", (event) => {
       void handleProgress(event.payload);
     }).then((fn) => {
-      if (!active) {
+      if (!active || completionHandled) {
         fn();
         return;
       }
@@ -1107,7 +1112,7 @@ export default function App() {
 
     return () => {
       active = false;
-      unlisten?.();
+      detach();
     };
   }, [bootstrapping]);
 
