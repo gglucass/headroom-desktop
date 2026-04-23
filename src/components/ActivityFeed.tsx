@@ -136,21 +136,31 @@ type FeedRow =
   | { type: "single"; event: ActivityEvent }
   | { type: "transformationGroup"; events: TransformationFeedEvent[] }
   | { type: "rtkGroup"; events: RtkBatchEvent[] }
+  | { type: "memoryGroup"; events: MemoryFeedEvent[] }
   | { type: "dayHeader"; dayKey: string; label: string };
 
-// Memory is intentionally NOT coalesced — each entry has distinct content
-// worth seeing individually (and is clamped to one line with click-to-expand).
-// Celebratory/summary events (milestones, records, streaks, recaps) are rare
-// enough that coalescing them isn't worth the lost specificity.
-const COALESCE_KINDS: ReadonlySet<ActivityEvent["kind"]> = new Set([
-  "transformation",
-  "rtkBatch"
-]);
+// Minimum same-kind run length required to emit a group row. Kinds absent
+// from this map never coalesce (milestones/records/streaks are rare enough
+// that each deserves its own row). Transformation/RTK coalesce in pairs;
+// memory needs a burst of 3+ because a single learning has distinct content
+// worth seeing but a spammy burst (the common case when `headroom learn`
+// extracts a batch of similar patterns) should fold into one group.
+const COALESCE_MIN_LENGTH: Partial<Record<ActivityEvent["kind"], number>> = {
+  transformation: 2,
+  rtkBatch: 2,
+  memory: 3
+};
 
 // Break a coalesced run when consecutive same-kind events are further apart
 // than this. Picks a natural "work session" boundary — a morning burst and
 // an afternoon burst become two groups instead of one blob.
 const COALESCE_GAP_MS = 30 * 60 * 1000;
+
+// Max different-kind events allowed to sit between two same-kind events
+// without breaking the run. Handles the common case of 3 RTK batches in a
+// minute with 1 learning interleaved — the RTKs still coalesce. Absorbed
+// interlopers still render (as their own single row) right after the group.
+const MAX_INTERLOPERS = 1;
 
 function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
   return events.filter((event) => {
@@ -210,9 +220,10 @@ function dayHeaderLabel(dayKey: string, now: Date = new Date()): string {
 
 function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
   const out: FeedRow[] = [];
-  let i = 0;
+  const consumed = new Set<number>();
   let lastDayKey: string | null = null;
-  while (i < events.length) {
+  for (let i = 0; i < events.length; i++) {
+    if (consumed.has(i)) continue;
     const event = events[i];
     const ts = eventTimestampMs(event);
     const dayKey = localDayKey(ts);
@@ -220,41 +231,67 @@ function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
       out.push({ type: "dayHeader", dayKey, label: dayHeaderLabel(dayKey) });
       lastDayKey = dayKey;
     }
-    if (!COALESCE_KINDS.has(event.kind)) {
+    const minRun = COALESCE_MIN_LENGTH[event.kind];
+    if (!minRun) {
       out.push({ type: "single", event });
-      i++;
       continue;
     }
-    // Extend the run while: same kind, same calendar day, AND consecutive
-    // timestamps within COALESCE_GAP_MS. A break on any dimension ends the
-    // run so the next row starts fresh (under its own header if the day
-    // changed, or as a distinct group if just the gap did).
-    let j = i + 1;
+    // Walk forward collecting same-kind events into a group, allowing up to
+    // MAX_INTERLOPERS different-kind events to pass through without ending
+    // the run. Bail on a calendar-day flip or a gap larger than
+    // COALESCE_GAP_MS. Interlopers still render (as their own single rows)
+    // right after the group so nothing disappears.
+    const groupIndices: number[] = [i];
+    const interloperIndices: number[] = [];
     let prevTs = ts;
-    while (j < events.length && events[j].kind === event.kind) {
-      const nextTs = eventTimestampMs(events[j]);
-      if (localDayKey(nextTs) !== dayKey) break;
-      if (Math.abs(prevTs - nextTs) > COALESCE_GAP_MS) break;
-      prevTs = nextTs;
-      j++;
+    let interlopersUsed = 0;
+    for (let j = i + 1; j < events.length; j++) {
+      if (consumed.has(j)) break;
+      const candidate = events[j];
+      const candidateTs = eventTimestampMs(candidate);
+      if (localDayKey(candidateTs) !== dayKey) break;
+      if (Math.abs(prevTs - candidateTs) > COALESCE_GAP_MS) break;
+      if (candidate.kind === event.kind) {
+        groupIndices.push(j);
+        prevTs = candidateTs;
+      } else if (interlopersUsed < MAX_INTERLOPERS) {
+        interloperIndices.push(j);
+        interlopersUsed++;
+      } else {
+        break;
+      }
     }
-    const runLength = j - i;
-    if (runLength === 1) {
+    if (groupIndices.length < minRun) {
       out.push({ type: "single", event });
-    } else if (event.kind === "transformation") {
+      continue;
+    }
+    if (event.kind === "transformation") {
       out.push({
         type: "transformationGroup",
-        events: events.slice(i, j).map((e) => (e as Extract<ActivityEvent, { kind: "transformation" }>).data)
+        events: groupIndices.map(
+          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "transformation" }>).data
+        )
       });
     } else if (event.kind === "rtkBatch") {
       out.push({
         type: "rtkGroup",
-        events: events.slice(i, j).map((e) => (e as Extract<ActivityEvent, { kind: "rtkBatch" }>).data)
+        events: groupIndices.map(
+          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "rtkBatch" }>).data
+        )
       });
-    } else {
-      out.push({ type: "single", event });
+    } else if (event.kind === "memory") {
+      out.push({
+        type: "memoryGroup",
+        events: groupIndices.map(
+          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "memory" }>).data
+        )
+      });
     }
-    i = j;
+    for (const idx of groupIndices) consumed.add(idx);
+    for (const idx of interloperIndices) {
+      out.push({ type: "single", event: events[idx] });
+      consumed.add(idx);
+    }
   }
   return out;
 }
@@ -270,6 +307,9 @@ function feedRowKey(row: FeedRow, index: number): string {
     const first = row.events[0];
     return `tg-${first.requestId ?? first.timestamp ?? index}-${row.events.length}`;
   }
+  if (row.type === "memoryGroup") {
+    return `mg-${row.events[0].id}-${row.events.length}`;
+  }
   return `rg-${row.events[0].observedAt}-${row.events.length}`;
 }
 
@@ -278,7 +318,9 @@ function singleKey(event: ActivityEvent, index: number): string {
     case "transformation":
       return `t-${event.data.requestId ?? event.data.timestamp ?? index}`;
     case "memory":
-      return `m-${event.data.id}`;
+      // Include createdAt so the React key survives a theoretical ID
+      // collision without bleeding state between sibling MemoryRows.
+      return `m-${event.data.id}-${event.data.createdAt}`;
     case "rtkBatch":
       return `rtk-${event.data.observedAt}`;
     case "milestone":
@@ -315,6 +357,9 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
   }
   if (row.type === "rtkGroup") {
     return <RtkGroupRow events={row.events} />;
+  }
+  if (row.type === "memoryGroup") {
+    return <MemoryGroupRow events={row.events} projectPaths={projectPaths} />;
   }
   const event = row.event;
   switch (event.kind) {
@@ -483,6 +528,61 @@ function RtkGroupRow({ events }: { events: RtkBatchEvent[] }) {
           {tokensDelta.toLocaleString()} tokens
         </strong>
       </div>
+    </ExpandableRow>
+  );
+}
+
+function MemoryGroupRow({
+  events,
+  projectPaths
+}: {
+  events: MemoryFeedEvent[];
+  projectPaths: string[];
+}) {
+  const latest = events[0];
+  // Resolve each learning's project and keep the value only if every learning
+  // in the group agrees. Mixed groups drop the badge — otherwise the label
+  // would misrepresent learnings from other projects.
+  const perEventProject = events.map((ev) => {
+    const scopeProject = projectBasename(ev.scope);
+    if (scopeProject) return scopeProject;
+    const matched = matchProjectPath(ev.content, projectPaths);
+    return matched ? basenameOf(matched) : null;
+  });
+  const sharedProject =
+    perEventProject[0] && perEventProject.every((p) => p === perEventProject[0])
+      ? perEventProject[0]
+      : null;
+  const detail = (
+    <ul className="activity-feed__detail-list">
+      {events.map((ev) => (
+        <li
+          key={`mg-sub-${ev.id}-${ev.createdAt}`}
+          className="activity-feed__detail-item"
+        >
+          <TimeChip iso={ev.createdAt} />
+          <p className="activity-feed__content">{ev.content}</p>
+        </li>
+      ))}
+    </ul>
+  );
+  return (
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--memory"
+      detail={detail}
+    >
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--memory">
+          Learning × {events.length}
+        </span>
+        <TimeChip iso={latest.createdAt} />
+        {sharedProject ? (
+          <span className="activity-feed__project">{sharedProject}</span>
+        ) : null}
+      </div>
+      <p className="activity-feed__content activity-feed__content--clamped-one">
+        {latest.content}
+      </p>
     </ExpandableRow>
   );
 }

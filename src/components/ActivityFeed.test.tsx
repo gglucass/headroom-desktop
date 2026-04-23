@@ -572,13 +572,17 @@ describe("ActivityFeed", () => {
   });
 
   it("paginates at 10 rows per page and shows navigation when there are more", () => {
-    // Memory rows don't coalesce (each has distinct content), so they're the
-    // right fixture for exercising pagination behavior. All 23 entries share
-    // the same local day, so one day header is inserted at the top of page 1
-    // and page 1 ends up with 9 item rows + 1 header = 10 rows total.
-    const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) =>
-      memory({ id: `mem-${i}`, createdAt: `2026-04-21T10:${String(i).padStart(2, "0")}:00Z` })
-    );
+    // Memory rows coalesce into groups when 3+ land within COALESCE_GAP_MS of
+    // each other, so this fixture spaces them 45 minutes apart to keep every
+    // entry as its own row. All 23 entries share the same local day, so one
+    // day header is inserted at the top of page 1 and page 1 ends up with 9
+    // item rows + 1 header = 10 rows total.
+    const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) => {
+      const minutes = i * 35;
+      const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
+      const mm = String(minutes % 60).padStart(2, "0");
+      return memory({ id: `mem-${i}`, createdAt: `2026-04-21T${hh}:${mm}:00Z` });
+    });
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
@@ -593,7 +597,7 @@ describe("ActivityFeed", () => {
 
   it("hides pagination when there are 10 or fewer events", () => {
     const events: ActivityEvent[] = Array.from({ length: 7 }, (_, i) =>
-      memory({ id: `mem-${i}`, createdAt: `2026-04-21T10:0${i}:00Z` })
+      memory({ id: `mem-${i}`, createdAt: `2026-04-21T${10 + i}:00:00Z` })
     );
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
@@ -630,6 +634,131 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("RTK × 2");
     expect(markup).toContain("+4 commands");
     expect(markup).toContain("1,600 tokens");
+  });
+
+  it("coalesces RTK events across a single non-RTK interloper", () => {
+    const events: ActivityEvent[] = [
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:05:00Z",
+          commandsDelta: 4,
+          tokensSavedDelta: 2000,
+          totalCommands: 20,
+          totalSaved: 10000
+        }
+      },
+      memory({
+        id: "mem-between",
+        createdAt: "2026-04-21T10:04:30Z",
+        content: "a learning dropped in between the RTK batches"
+      }),
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:04:00Z",
+          commandsDelta: 3,
+          tokensSavedDelta: 1000,
+          totalCommands: 17,
+          totalSaved: 8000
+        }
+      }
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("RTK × 2");
+    expect(markup).toContain("+7 commands");
+    // The interloper still renders — absorbed events are never dropped.
+    expect(markup).toContain("a learning dropped in between");
+    // Group row precedes the absorbed interloper in the rendered order.
+    const groupIdx = markup.indexOf("RTK × 2");
+    const interIdx = markup.indexOf("a learning dropped in between");
+    expect(groupIdx).toBeLessThan(interIdx);
+  });
+
+  it("does not coalesce two RTK events split by two interlopers", () => {
+    const events: ActivityEvent[] = [
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:05:00Z",
+          commandsDelta: 2,
+          tokensSavedDelta: 500,
+          totalCommands: 12,
+          totalSaved: 6000
+        }
+      },
+      memory({
+        id: "mem-a",
+        createdAt: "2026-04-21T10:04:40Z",
+        content: "first interloper learning"
+      }),
+      memory({
+        id: "mem-b",
+        createdAt: "2026-04-21T10:04:20Z",
+        content: "second interloper learning"
+      }),
+      {
+        kind: "rtkBatch",
+        data: {
+          observedAt: "2026-04-21T10:04:00Z",
+          commandsDelta: 1,
+          tokensSavedDelta: 300,
+          totalCommands: 10,
+          totalSaved: 5500
+        }
+      }
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    // MAX_INTERLOPERS = 1, so two interlopers force both RTKs to stand alone.
+    expect(markup).not.toContain("RTK × 2");
+  });
+
+  it("coalesces a burst of 3+ memories into a Learning group", () => {
+    const events: ActivityEvent[] = [
+      memory({ id: "m1", createdAt: "2026-04-21T10:03:00Z", content: "first learning" }),
+      memory({ id: "m2", createdAt: "2026-04-21T10:02:00Z", content: "second learning" }),
+      memory({ id: "m3", createdAt: "2026-04-21T10:01:00Z", content: "third learning" })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("Learning × 3");
+    // The group collapses the three memory rows into one — no individual row
+    // should render. Preview line shows the latest learning's content.
+    expect(markup).toContain("first learning");
+    expect(markup).toContain("activity-feed__item--clickable");
+    expect(markup).toContain('aria-expanded="false"');
+    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+    expect(itemCount).toBe(1);
+  });
+
+  it("does not coalesce a pair of memories (threshold is 3)", () => {
+    const events: ActivityEvent[] = [
+      memory({ id: "m1", createdAt: "2026-04-21T10:02:00Z", content: "alpha learning" }),
+      memory({ id: "m2", createdAt: "2026-04-21T10:01:00Z", content: "beta learning" })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).not.toContain("Learning × 2");
+    expect(markup).toContain("alpha learning");
+    expect(markup).toContain("beta learning");
+  });
+
+  it("shows a shared project badge on a memory group when all learnings match", () => {
+    const projectPaths = ["/Users/u/Code/demo"];
+    const content = "touched /Users/u/Code/demo/file.ts in this run";
+    const events: ActivityEvent[] = [
+      memory({ id: "m1", createdAt: "2026-04-21T10:03:00Z", content }),
+      memory({ id: "m2", createdAt: "2026-04-21T10:02:00Z", content }),
+      memory({ id: "m3", createdAt: "2026-04-21T10:01:00Z", content })
+    ];
+    const feed: ActivityFeedResponse = { ...baseFeed, events };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={feed} error={null} projectPaths={projectPaths} />
+    );
+    expect(markup).toContain("Learning × 3");
+    expect(markup).toContain(">demo<");
   });
 
   it("renders a promptAllTimeRecord row with totals, call count, and previous record", () => {
