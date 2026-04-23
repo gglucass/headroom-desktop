@@ -95,7 +95,7 @@ describe("ActivityFeed", () => {
   it("renders a transformation row with provider, model, savings, delta, and transforms", () => {
     const feed: ActivityFeedResponse = { ...baseFeed, events: [transformation()] };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Compression");
+    expect(markup).toContain("Recent large compression");
     expect(markup).toContain("anthropic");
     expect(markup).toContain("claude-sonnet-4-6");
     expect(markup).toContain("Saved 750 tokens (75.0%)");
@@ -193,34 +193,23 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("No requests yet");
   });
 
-  it("coalesces consecutive transformations into a grouped summary row", () => {
+  it("keeps only the single largest compression and drops the rest", () => {
+    // Presence of compression is already conveyed by the savings graph and
+    // totals; a chronological list of every compression drowns out rarer
+    // events. The feed surfaces one "Recent large compression" row sourced
+    // from the biggest compression (by tokens saved) in the window.
     const events: ActivityEvent[] = [
       transformation({ requestId: "a", timestamp: "2026-04-21T10:02:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "b", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 200, savingsPercent: 20 }),
+      transformation({ requestId: "biggest", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 9_999, savingsPercent: 90 }),
       transformation({ requestId: "c", timestamp: "2026-04-21T10:00:00Z", tokensSaved: 300, savingsPercent: 30 })
     ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Compression × 3");
-    expect(markup).toContain("Saved 600 tokens (20.0% avg)");
     const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
     expect(rowCount).toBe(1);
-  });
-
-  it("breaks a coalesced run when consecutive events are more than 30 minutes apart", () => {
-    // Two clusters on the same day, 40 minutes apart — should render as two
-    // separate grouped rows, not one merged "Compression × 4".
-    const events: ActivityEvent[] = [
-      transformation({ requestId: "a1", timestamp: "2026-04-21T15:01:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "a2", timestamp: "2026-04-21T15:00:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "b1", timestamp: "2026-04-21T14:20:00Z", tokensSaved: 200, savingsPercent: 20 }),
-      transformation({ requestId: "b2", timestamp: "2026-04-21T14:19:00Z", tokensSaved: 200, savingsPercent: 20 })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const groupCount = (markup.match(/Compression × 2/g) ?? []).length;
-    expect(groupCount).toBe(2);
-    expect(markup).not.toContain("Compression × 4");
+    expect(markup).toContain("Recent large compression");
+    expect(markup).toContain("Saved 9,999 tokens (90.0%)");
+    expect(markup).not.toContain("Compression × ");
   });
 
   it("renders time chips using relative time with an absolute-date tooltip", () => {
@@ -265,20 +254,21 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("breaks a coalesced run and inserts a header when the day changes", () => {
-    // Pick timestamps ~24h apart so they land on different local days in any
-    // reasonable timezone the test host might run in.
+  it("inserts a day-header row when a single compression on an earlier day survives the filter", () => {
+    // Only the largest compression across all days survives filterLowSignal;
+    // here that's the one from 2026-04-21. A memory on 2026-04-22 provides a
+    // second day so the renderer emits two day-headers, confirming the
+    // header logic still fires even though transformations no longer group.
     const events: ActivityEvent[] = [
-      transformation({ requestId: "later", timestamp: "2026-04-22T12:00:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 200, savingsPercent: 20 })
+      memory({ id: "mem-late", createdAt: "2026-04-22T12:00:00Z" }),
+      transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 9_999, savingsPercent: 90 })
     ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    // Two distinct days ⇒ two day-header rows and no group (each day has one
-    // event, so each stays a single row).
     const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
     expect(headerCount).toBe(2);
-    expect(markup).not.toContain("Compression × 2");
+    expect(markup).toContain("Recent large compression");
+    expect(markup).not.toContain("Compression × ");
   });
 
   it("renders both kinds in the order they appear in the feed", () => {

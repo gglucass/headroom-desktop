@@ -21,7 +21,7 @@ const RECENT_EVENTS_CAP: usize = 300;
 // bursts of compressions / rtk batches / memories, which can push 150+
 // events through the buffer in a single session and otherwise drown them
 // out before the UI ever sees them.
-fn is_high_signal(event: &ActivityEvent) -> bool {
+pub(crate) fn is_high_signal(event: &ActivityEvent) -> bool {
     match event {
         ActivityEvent::Transformation(_)
         | ActivityEvent::Memory(_)
@@ -399,16 +399,18 @@ impl ActivityFacts {
                 } else {
                     Some(previous_tokens)
                 };
-                // Debounce celebratory AllTimeRecord events: if we beat the
-                // previous record less than an hour ago by less than 1%, still
-                // update the counter but don't emit a row in the feed. Stops
-                // a rapid-fire burst of near-identical "new record" cards.
+                // Debounce celebratory AllTimeRecord events: once we've
+                // emitted a card, the bar is already raised — a heavy session
+                // that keeps nudging the record up shouldn't spam the feed.
+                // Suppress follow-ups within 24h unless the new record beats
+                // the previous by a meaningful margin (>=25%). The counter
+                // still updates silently so the underlying number stays true.
                 let suppress = match (previous, self.all_time_record_emitted_at) {
                     (Some(prev), Some(prev_at)) => {
-                        let within_one_hour =
-                            now.signed_duration_since(prev_at) < Duration::hours(1);
+                        let within_24h =
+                            now.signed_duration_since(prev_at) < Duration::hours(24);
                         let delta_pct = (tokens as f64 - prev as f64) / prev as f64 * 100.0;
-                        within_one_hour && delta_pct < 1.0
+                        within_24h && delta_pct < 25.0
                     }
                     _ => false,
                 };
@@ -1103,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn all_time_record_debounces_tiny_beats_within_an_hour() {
+    fn all_time_record_debounces_tiny_beats_within_a_day() {
         // First record sets the bar and emits. A beat that's 0.5% higher just
         // 10 minutes later still updates the counter but MUST NOT emit another
         // feed row — otherwise a burst of similar compressions spams the feed
@@ -1131,7 +1133,7 @@ mod tests {
             !second
                 .iter()
                 .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))),
-            "0.5% beat within an hour should be suppressed",
+            "0.5% beat within 24h should be suppressed",
         );
         assert_eq!(
             facts.all_time_record_tokens, 1_005,
@@ -1151,10 +1153,10 @@ mod tests {
             t0,
         );
 
-        // Delta >= 1% inside the hour → emits.
+        // Delta >= 25% inside 24h → emits.
         let t_delta = t0 + Duration::minutes(5);
         let big = facts.observe_transformation_at(
-            &mk_transformation(Some("a"), Some(1_020), Some(50.0)),
+            &mk_transformation(Some("a"), Some(1_300), Some(50.0)),
             t_delta,
             t_delta,
         );
@@ -1162,10 +1164,10 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))));
 
-        // Tiny beat but > 1 hour later → emits.
-        let t_late = t_delta + Duration::hours(1) + Duration::minutes(1);
+        // Tiny beat but > 24 hours later → emits.
+        let t_late = t_delta + Duration::hours(24) + Duration::minutes(1);
         let late = facts.observe_transformation_at(
-            &mk_transformation(Some("a"), Some(1_022), Some(50.0)),
+            &mk_transformation(Some("a"), Some(1_305), Some(50.0)),
             t_late,
             t_late,
         );

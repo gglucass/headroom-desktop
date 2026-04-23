@@ -134,19 +134,21 @@ export function ActivityFeed({
 
 type FeedRow =
   | { type: "single"; event: ActivityEvent }
-  | { type: "transformationGroup"; events: TransformationFeedEvent[] }
   | { type: "rtkGroup"; events: RtkBatchEvent[] }
   | { type: "memoryGroup"; events: MemoryFeedEvent[] }
   | { type: "dayHeader"; dayKey: string; label: string };
 
 // Minimum same-kind run length required to emit a group row. Kinds absent
 // from this map never coalesce (milestones/records/streaks are rare enough
-// that each deserves its own row). Transformation/RTK coalesce in pairs;
-// memory needs a burst of 3+ because a single learning has distinct content
-// worth seeing but a spammy burst (the common case when `headroom learn`
-// extracts a batch of similar patterns) should fold into one group.
+// that each deserves its own row). RTK coalesces in pairs; memory needs a
+// burst of 3+ because a single learning has distinct content worth seeing
+// but a spammy burst (the common case when `headroom learn` extracts a
+// batch of similar patterns) should fold into one group. Transformations
+// are not coalesced because `filterLowSignal` keeps only the single largest
+// one in the window — presence of compression is already conveyed by the
+// savings graph and the big number, so one "Recent large compression" row
+// is all we need.
 const COALESCE_MIN_LENGTH: Partial<Record<ActivityEvent["kind"], number>> = {
-  transformation: 2,
   rtkBatch: 2,
   memory: 3
 };
@@ -163,7 +165,26 @@ const COALESCE_GAP_MS = 30 * 60 * 1000;
 const MAX_INTERLOPERS = 1;
 
 function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
+  // Of all compressions in the window, keep only the single largest (by
+  // tokens saved). The stream of individual compression events is already
+  // summarised by the savings graph and the big totals number, so a long
+  // chronological list of them drowns out more interesting activity. One
+  // "recent large compression" card captures the only compression detail
+  // worth surfacing in this view.
+  let largestTransformation: ActivityEvent | null = null;
+  let largestTokens = -1;
+  for (const event of events) {
+    if (event.kind !== "transformation") continue;
+    const tokens = event.data.tokensSaved ?? 0;
+    if (tokens > largestTokens) {
+      largestTokens = tokens;
+      largestTransformation = event;
+    }
+  }
   return events.filter((event) => {
+    if (event.kind === "transformation") {
+      return event === largestTransformation;
+    }
     if (event.kind === "memory") {
       return event.data.evidenceCount >= MIN_MEMORY_EVIDENCE;
     }
@@ -265,14 +286,7 @@ function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
       out.push({ type: "single", event });
       continue;
     }
-    if (event.kind === "transformation") {
-      out.push({
-        type: "transformationGroup",
-        events: groupIndices.map(
-          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "transformation" }>).data
-        )
-      });
-    } else if (event.kind === "rtkBatch") {
+    if (event.kind === "rtkBatch") {
       out.push({
         type: "rtkGroup",
         events: groupIndices.map(
@@ -302,10 +316,6 @@ function feedRowKey(row: FeedRow, index: number): string {
   }
   if (row.type === "single") {
     return singleKey(row.event, index);
-  }
-  if (row.type === "transformationGroup") {
-    const first = row.events[0];
-    return `tg-${first.requestId ?? first.timestamp ?? index}-${row.events.length}`;
   }
   if (row.type === "memoryGroup") {
     return `mg-${row.events[0].id}-${row.events.length}`;
@@ -351,9 +361,6 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
         <span>{row.label}</span>
       </li>
     );
-  }
-  if (row.type === "transformationGroup") {
-    return <TransformationGroupRow events={row.events} />;
   }
   if (row.type === "rtkGroup") {
     return <RtkGroupRow events={row.events} />;
@@ -446,50 +453,6 @@ function TimeChip({ iso }: { iso: string | null | undefined }) {
     <span className="activity-feed__time" title={formatDateTime(iso)}>
       {formatRelativeTime(iso)}
     </span>
-  );
-}
-
-function TransformationGroupRow({ events }: { events: TransformationFeedEvent[] }) {
-  const totalSaved = events.reduce((sum, e) => sum + (e.tokensSaved ?? 0), 0);
-  const avgPct =
-    events.reduce((sum, e) => sum + (e.savingsPercent ?? 0), 0) / events.length;
-  const latest = events[0];
-  const detail = (
-    <ul className="activity-feed__detail-list">
-      {events.map((ev, i) => (
-        <li
-          key={`tg-sub-${ev.requestId ?? ev.timestamp ?? i}`}
-          className="activity-feed__detail-item"
-        >
-          <TimeChip iso={ev.timestamp} />
-          <span className="activity-feed__detail-primary">
-            Saved {(ev.tokensSaved ?? 0).toLocaleString()} tokens
-            {ev.savingsPercent != null ? ` (${ev.savingsPercent.toFixed(1)}%)` : ""}
-          </span>
-          {ev.model ? (
-            <span className="activity-feed__model">{ev.model}</span>
-          ) : null}
-        </li>
-      ))}
-    </ul>
-  );
-  return (
-    <ExpandableRow
-      className="activity-feed__item activity-feed__item--transformation"
-      detail={detail}
-    >
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--transformation">
-          Compression × {events.length}
-        </span>
-        <TimeChip iso={latest.timestamp} />
-      </div>
-      <div className="activity-feed__row activity-feed__row--savings">
-        <strong className="activity-feed__savings">
-          Saved {totalSaved.toLocaleString()} tokens ({avgPct.toFixed(1)}% avg)
-        </strong>
-      </div>
-    </ExpandableRow>
   );
 }
 
@@ -672,7 +635,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
     >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--transformation">
-          Compression
+          Recent large compression
         </span>
         <TimeChip iso={event.timestamp} />
         <span className="activity-feed__provider">{event.provider ?? "unknown"}</span>

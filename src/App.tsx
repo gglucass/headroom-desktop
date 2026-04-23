@@ -3894,7 +3894,7 @@ export default function App() {
                   <h1>Project learnings</h1>
                 </div>
                 <p className="optimize-card__blurb">
-                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom updates the project's MEMORY.md so they don't happen again. It can also train on session history and write token savings learnings to CLAUDE.md.
+                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.
                 </p>
               </header>
               <div className="optimize-card__body">

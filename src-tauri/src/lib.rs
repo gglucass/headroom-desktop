@@ -1126,8 +1126,8 @@ fn build_activity_feed_response(
     }
 
     events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
-    let mut events = coalesce_rtk_batches(events);
-    events.truncate(limit);
+    let events = coalesce_rtk_batches(events);
+    let events = truncate_preserving_variety(events, limit);
 
     ActivityFeedResponse {
         events,
@@ -1160,6 +1160,39 @@ fn coalesce_rtk_batches(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
         out.push(ev);
     }
     out
+}
+
+/// Truncate the feed to `limit` events while preserving all high-signal
+/// events (records, milestones, streaks, etc.). A burst of 150+ compressions
+/// in a single session would otherwise monopolize a timestamp-ordered
+/// truncation and push rare, interesting events off the response — even
+/// when they're still within the persisted ring buffer. We keep every
+/// high-signal event (they're rare by nature) and fill the rest with the
+/// newest low-signal events, then restore chronological order.
+///
+/// Expects `events` sorted DESC by timestamp. Output is also DESC.
+fn truncate_preserving_variety(
+    events: Vec<ActivityEvent>,
+    limit: usize,
+) -> Vec<ActivityEvent> {
+    if events.len() <= limit {
+        return events;
+    }
+    let (high, low): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(crate::activity_facts::is_high_signal);
+    let low_budget = limit.saturating_sub(high.len());
+    let mut low = low;
+    low.truncate(low_budget);
+    let mut merged: Vec<ActivityEvent> = Vec::with_capacity(high.len() + low.len());
+    merged.extend(high);
+    merged.extend(low);
+    merged.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
+    // Safety valve: if high-signal alone exceeds the cap (extremely unlikely
+    // given their rarity), still enforce `limit` so callers never see more
+    // than requested.
+    merged.truncate(limit);
+    merged
 }
 
 #[tauri::command]
@@ -2216,6 +2249,7 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
         .env("HEADROOM_LEARN_CLI", "claude")
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
         // Force the claude CLI backend: the analyzer picks LiteLLM over
         // HEADROOM_LEARN_CLI when any of these keys is set in the parent env.
         .env_remove("ANTHROPIC_API_KEY")
@@ -3176,8 +3210,8 @@ mod tests {
         TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
-        ActivityEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
-        RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
+        ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent,
+        RecordEvent, RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use chrono::{DateTime, TimeZone, Timelike, Utc};
     use serde_json::json;
@@ -3991,6 +4025,52 @@ mod tests {
                 "2026-04-21T10:00:00Z".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_activity_feed_response_preserves_high_signal_under_compression_flood() {
+        // Regression: a burst of 150 compressions sorted DESC by timestamp
+        // would otherwise monopolize a timestamp-ordered truncation and push
+        // the older-but-high-signal LearningsMilestone off the response.
+        let flood: Vec<TransformationFeedEvent> = (0..150)
+            .map(|i| {
+                // All compressions newer than the milestone below.
+                make_transformation(&format!(
+                    "2026-04-22T12:{:02}:{:02}Z",
+                    i / 60,
+                    i % 60
+                ))
+            })
+            .collect();
+        let transformations = TransformationFeedResponse {
+            log_full_messages: false,
+            proxy_reachable: true,
+            transformations: flood,
+        };
+        let milestone = ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
+            observed_at: chrono::Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap(),
+            count: 100,
+            kind: "first_100".into(),
+        });
+
+        let resp = build_activity_feed_response(
+            Some(transformations),
+            vec![],
+            vec![milestone],
+            false,
+            150,
+        );
+
+        let milestone_count = resp
+            .events
+            .iter()
+            .filter(|e| matches!(e, ActivityEvent::LearningsMilestone(_)))
+            .count();
+        assert_eq!(
+            milestone_count, 1,
+            "high-signal event must survive a compression flood at the limit boundary"
+        );
+        assert!(resp.events.len() <= 150, "limit must still be honored");
     }
 
     #[test]
