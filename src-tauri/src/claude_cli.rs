@@ -24,7 +24,9 @@ fn probe_known_paths() -> Option<PathBuf> {
         home.join(".bun").join("bin").join("claude"),
         PathBuf::from("/usr/bin/claude"),
     ];
-    candidates.into_iter().find(|candidate| is_executable(candidate))
+    candidates
+        .into_iter()
+        .find(|candidate| is_executable(candidate))
 }
 
 fn probe_via_login_shell() -> Option<PathBuf> {

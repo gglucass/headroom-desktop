@@ -294,7 +294,8 @@ mod tests {
 
     #[test]
     fn origin_header_causes_rejection_even_on_loopback() {
-        let req = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n";
+        let req =
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n";
         assert!(!request_is_loopback_safe(req));
     }
 

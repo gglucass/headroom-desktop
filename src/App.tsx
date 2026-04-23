@@ -385,6 +385,10 @@ function writeCachedPricing(pricing: CachedPricing) {
   } catch {}
 }
 
+function serializeState(value: unknown): string {
+  return JSON.stringify(value);
+}
+
 type SavingsChartView = "month" | "day";
 type SavingsChartMode = "usd" | "tokens";
 
@@ -811,6 +815,12 @@ export default function App() {
   const appUpdateReadyToRestartRef = useRef(false);
   const appUpdateBusyRef = useRef(false);
   const appUpdateInstallBusyRef = useRef(false);
+  const launcherHideAnimationMs = 320;
+  const trayFocusPrewarmDelayMs = 250;
+  const dashboardSignatureRef = useRef(serializeState(mockDashboard));
+  const connectorsSignatureRef = useRef(serializeState([] as ClientConnectorStatus[]));
+  const runtimeStatusSignatureRef = useRef(serializeState(null as RuntimeStatus | null));
+  const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
@@ -850,6 +860,58 @@ export default function App() {
     }
     rtkActivityRef.current.scrollTop = rtkActivityRef.current.scrollHeight;
   }, [showRtkDetails, rtkActivityLines]);
+
+  useEffect(() => {
+    dashboardSignatureRef.current = serializeState(dashboard);
+  }, [dashboard]);
+
+  useEffect(() => {
+    connectorsSignatureRef.current = serializeState(connectors);
+  }, [connectors]);
+
+  useEffect(() => {
+    runtimeStatusSignatureRef.current = serializeState(runtimeStatus);
+  }, [runtimeStatus]);
+
+  useEffect(() => {
+    claudeProjectsSignatureRef.current = serializeState(claudeProjects);
+  }, [claudeProjects]);
+
+  function applyDashboardIfChanged(next: DashboardState) {
+    const nextSignature = serializeState(next);
+    if (dashboardSignatureRef.current === nextSignature) {
+      return;
+    }
+    dashboardSignatureRef.current = nextSignature;
+    setDashboard(next);
+  }
+
+  function applyConnectorsIfChanged(next: ClientConnectorStatus[]) {
+    const nextSignature = serializeState(next);
+    if (connectorsSignatureRef.current === nextSignature) {
+      return;
+    }
+    connectorsSignatureRef.current = nextSignature;
+    setConnectors(next);
+  }
+
+  function applyRuntimeStatusIfChanged(next: RuntimeStatus | null) {
+    const nextSignature = serializeState(next);
+    if (runtimeStatusSignatureRef.current === nextSignature) {
+      return;
+    }
+    runtimeStatusSignatureRef.current = nextSignature;
+    setRuntimeStatus(next);
+  }
+
+  function applyClaudeProjectsIfChanged(next: ClaudeCodeProject[]) {
+    const nextSignature = serializeState(next);
+    if (claudeProjectsSignatureRef.current === nextSignature) {
+      return;
+    }
+    claudeProjectsSignatureRef.current = nextSignature;
+    setClaudeProjects(next);
+  }
 
   useEffect(() => {
     const unlistenPromise = listen<{ action: string | null }>(
@@ -959,7 +1021,7 @@ export default function App() {
       if (!active) {
         return;
       }
-      setDashboard(dashboardResult);
+      applyDashboardIfChanged(dashboardResult);
 
       updateStartup("bootstrap", 58, "Checking runtime install state…");
       const bootstrapResult = await invoke<BootstrapProgress>("get_bootstrap_progress").catch(
@@ -990,7 +1052,7 @@ export default function App() {
         return;
       }
       if (runtimeResult) {
-        setRuntimeStatus(runtimeResult);
+        applyRuntimeStatusIfChanged(runtimeResult);
       }
       if (pricingResult) {
         setPricingStatus(pricingResult);
@@ -1089,7 +1151,7 @@ export default function App() {
         if (!active) {
           return;
         }
-        setDashboard(latestDashboard);
+        applyDashboardIfChanged(latestDashboard);
         // Always land on the install step after a bootstrap completes during
         // this session, regardless of launchExperience. The install step's
         // Continue button is gated on runtime.running, so it handles both the
@@ -1169,7 +1231,7 @@ export default function App() {
       // Refresh runtime status so the rest of the app picks up the
       // freshly-installed version immediately.
       void invoke<RuntimeStatus>("get_runtime_status")
-        .then((status) => setRuntimeStatus(status))
+        .then((status) => applyRuntimeStatusIfChanged(status))
         .catch(() => {});
     }, 2500);
     return () => window.clearTimeout(timeout);
@@ -1290,7 +1352,7 @@ export default function App() {
   }, [isLastScreen]);
 
   useEffect(() => {
-    if (windowLabel !== "main") {
+    if (windowLabel !== "main" || !trayWindowFocused) {
       return;
     }
 
@@ -1300,7 +1362,7 @@ export default function App() {
     }, 3000);
 
     return () => window.clearInterval(interval);
-  }, [windowLabel]);
+  }, [windowLabel, trayWindowFocused]);
 
   // Poll runtime status while the install step is visible so the Continue
   // button unlocks as soon as headroom is fully running (same signal the
@@ -1332,6 +1394,7 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
+        setTrayWindowFocused(focused);
         const now = new Date();
         const nowDayKey = formatDayKey(now);
 
@@ -1459,7 +1522,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (activeView !== "home") {
+    if (activeView !== "home" || !trayWindowFocused) {
       return;
     }
 
@@ -1467,11 +1530,8 @@ export default function App() {
     const refreshDashboard = () => {
       void loadDashboard()
         .then((next) => {
-          if (active) {
-            setDashboard((prev) =>
-              JSON.stringify(prev) === JSON.stringify(next) ? prev : next
-            );
-          }
+          if (!active) return;
+          applyDashboardIfChanged(next);
         })
         .catch(() => {
           // keep last known state
@@ -1484,22 +1544,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView]);
-
-  useEffect(() => {
-    if (windowLabel !== "main") {
-      return;
-    }
-    let unlisten: (() => void) | undefined;
-    void getCurrentWindow()
-      .onFocusChanged(({ payload: focused }) => {
-        setTrayWindowFocused(focused);
-      })
-      .then((fn) => {
-        unlisten = fn;
-      });
-    return () => unlisten?.();
-  }, [windowLabel]);
+  }, [activeView, trayWindowFocused]);
 
   // Track whether the user has ever visited a heavy-data tab this session.
   // Once true, stays true until app restart — the pre-warm below is gated
@@ -1517,26 +1562,46 @@ export default function App() {
   // cache now instead of spawning a cold Python process. Gated on
   // `heavyTabEverOpened` so users who only use Home never trigger it.
   useEffect(() => {
-    if (windowLabel !== "main" || !trayWindowFocused || !heavyTabEverOpened) {
+    if (
+      windowLabel !== "main" ||
+      !trayWindowFocused ||
+      !heavyTabEverOpened ||
+      activeView === "notifications" ||
+      activeView === "optimization"
+    ) {
       return;
     }
-    void refreshClaudeProjects();
-    void refreshHeadroomLearnPrereq();
-    invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
-      .then((next) => {
-        setActivityFeed((prev) =>
-          activityFeedSignature(prev) === activityFeedSignature(next) ? prev : next
-        );
-        setActivityFeedError(null);
-      })
-      .catch(() => {
-        // Swallow: the tab-active poll will surface any real error once the
-        // user opens Activity. Pre-warm failures shouldn't flash a banner.
-      })
-      .finally(() => {
-        setActivityFeedLoaded(true);
-      });
-  }, [windowLabel, trayWindowFocused, heavyTabEverOpened]);
+
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      if (!active) {
+        return;
+      }
+      void refreshClaudeProjects();
+      void refreshHeadroomLearnPrereq();
+      invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
+        .then((next) => {
+          if (!active) return;
+          setActivityFeed((prev) =>
+            activityFeedSignature(prev) === activityFeedSignature(next) ? prev : next
+          );
+          setActivityFeedError(null);
+        })
+        .catch(() => {
+          // Swallow: the tab-active poll will surface any real error once the
+          // user opens Activity. Pre-warm failures shouldn't flash a banner.
+        })
+        .finally(() => {
+          if (!active) return;
+          setActivityFeedLoaded(true);
+        });
+    }, trayFocusPrewarmDelayMs);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [windowLabel, trayWindowFocused, heavyTabEverOpened, activeView]);
 
   useEffect(() => {
     if (activeView !== "notifications" || !trayWindowFocused) {
@@ -1683,6 +1748,9 @@ export default function App() {
     .sort()
     .join("\t");
   useEffect(() => {
+    if (activeView !== "optimization") {
+      return;
+    }
     const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
     if (paths.length === 0) {
       setOptimizeLiveByProject({});
@@ -1706,6 +1774,7 @@ export default function App() {
       active = false;
     };
   }, [
+    activeView,
     claudeProjectPathsKey,
     headroomLearnStatus.finishedAt,
     optimizeLiveRefreshTick,
@@ -1715,6 +1784,9 @@ export default function App() {
   // Mirrors the live-learnings aggregate above so both halves of each panel
   // come from a single parent-owned source of truth.
   useEffect(() => {
+    if (activeView !== "optimization") {
+      return;
+    }
     const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
     if (paths.length === 0) {
       setOptimizeAppliedByProject({});
@@ -1736,6 +1808,7 @@ export default function App() {
       active = false;
     };
   }, [
+    activeView,
     claudeProjectPathsKey,
     headroomLearnStatus.finishedAt,
     optimizeAppliedRefreshTick,
@@ -2060,7 +2133,7 @@ export default function App() {
     try {
       setConnectorsError(null);
       const items = await invoke<ClientConnectorStatus[]>("get_client_connectors");
-      setConnectors(items);
+      applyConnectorsIfChanged(items);
     } catch (error) {
       setConnectorsError(
         error instanceof Error ? error.message : "Could not load connector status."
@@ -2071,7 +2144,7 @@ export default function App() {
   async function refreshRuntimeStatus() {
     try {
       const runtime = await invoke<RuntimeStatus>("get_runtime_status");
-      setRuntimeStatus(runtime);
+      applyRuntimeStatusIfChanged(runtime);
       void maybeFireUrgentRuntimeNotification(runtime);
     } catch (error) {
       setConnectorsError(
@@ -2107,7 +2180,7 @@ export default function App() {
     try {
       setClaudeProjectsError(null);
       const projects = await invoke<ClaudeCodeProject[]>("get_claude_code_projects");
-      setClaudeProjects(projects);
+      applyClaudeProjectsIfChanged(projects);
     } catch (error) {
       setClaudeProjectsError(
         error instanceof Error ? error.message : "Could not load Claude Code projects."
@@ -2148,7 +2221,7 @@ export default function App() {
 
     try {
       let latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
-      setConnectors(latestConnectors);
+      applyConnectorsIfChanged(latestConnectors);
 
       if (getLauncherAutoConfigureDecision(latestConnectors) === "show_client_setup") {
         setLauncherStage("client_setup");
@@ -2165,7 +2238,7 @@ export default function App() {
           clientId: detectedClaudeConnector.clientId
         });
         latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
-        setConnectors(latestConnectors);
+        applyConnectorsIfChanged(latestConnectors);
       }
 
       if (getLauncherAutoConfigureDecision(latestConnectors) !== "begin_proxy_verification") {
@@ -2509,7 +2582,7 @@ export default function App() {
     let fresh = connectors;
     try {
       fresh = await invoke<ClientConnectorStatus[]>("get_client_connectors");
-      setConnectors(fresh);
+      applyConnectorsIfChanged(fresh);
     } catch {
       // fall back to cached state
     }
@@ -2538,7 +2611,7 @@ export default function App() {
       }
 
       const latestDashboard = await loadDashboard();
-      setDashboard(latestDashboard);
+      applyDashboardIfChanged(latestDashboard);
       await refreshConnectors();
     } catch (error) {
       setConnectorsError(
@@ -2573,7 +2646,9 @@ export default function App() {
     if (hidingRef.current) return;
     hidingRef.current = true;
     document.documentElement.classList.add("window-hiding");
-    void invoke("hide_launcher_animated");
+    window.setTimeout(() => {
+      void invoke("hide_launcher_animated");
+    }, launcherHideAnimationMs);
     setTimeout(() => {
       document.documentElement.classList.remove("window-hiding");
       hidingRef.current = false;

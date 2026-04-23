@@ -58,6 +58,7 @@ const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
+const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
 type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
@@ -1028,8 +1029,12 @@ fn merge_live_and_persisted_transformations(
 
 /// Observation cadence: frequent enough that a first-time user sees a
 /// milestone notification shortly after earning it, but slow enough that the
-/// 20s memory-export cache usually absorbs the Python subprocess.
+/// 60s memory-export cache usually absorbs the Python subprocess.
 const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+/// Rescan cadence for the Claude projects cache. Shorter than the 60s TTL
+/// by enough margin that a fresh warm lands before the cached value expires,
+/// so the frontend's IPC path essentially never re-scans the projects dir.
+const CLAUDE_PROJECTS_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
 /// Matches the frontend's `ACTIVITY_FEED_WINDOW` in App.tsx so the observer
 /// sees the same transformations the UI will display.
 const ACTIVITY_OBSERVER_LIMIT: u32 = 150;
@@ -1042,6 +1047,24 @@ fn spawn_activity_observer(app: AppHandle) {
         loop {
             run_activity_observation(&app);
             std::thread::sleep(ACTIVITY_OBSERVER_INTERVAL);
+        }
+    });
+}
+
+/// Keeps `list_claude_code_projects` cache warm on a background thread so the
+/// IPC path never pays the projects-dir scan (hundreds of `stat` calls plus
+/// per-project metadata reads). Pure cache-fill with no side effects —
+/// `list_claude_code_projects` is idempotent and only writes to its own
+/// cache slot.
+fn spawn_claude_projects_warmer(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Stagger from the activity observer so both background threads
+        // don't simultaneously contend on fs / IPC at boot.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        loop {
+            let state: tauri::State<'_, AppState> = app.state();
+            let _ = state.list_claude_code_projects();
+            std::thread::sleep(CLAUDE_PROJECTS_WARM_INTERVAL);
         }
     });
 }
@@ -1679,84 +1702,10 @@ fn start_headroom(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_launcher_animated(app: AppHandle) {
-    let window = match app.get_webview_window("launcher") {
-        Some(w) => w,
-        None => return,
-    };
-
-    let start_pos = match window.outer_position() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = window.hide();
-            return;
-        }
-    };
-    let start_size = match window.outer_size() {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = window.hide();
-            return;
-        }
-    };
-
-    // Resolve the tray icon center as the animation target.
-    let target = app
-        .tray_by_id("headroom-tray")
-        .and_then(|t| t.rect().ok().flatten())
-        .map(|r| {
-            let (tx, ty) = match r.position {
-                Position::Physical(p) => (p.x as f64, p.y as f64),
-                Position::Logical(p) => (p.x, p.y),
-            };
-            let (tw, th) = match r.size {
-                tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                tauri::Size::Logical(s) => (s.width, s.height),
-            };
-            (tx + tw / 2.0, ty + th / 2.0)
-        })
-        .unwrap_or_else(|| {
-            // Fallback: top-right of screen (typical menu bar area).
-            (start_pos.x as f64 + start_size.width as f64, 0.0)
-        });
-
-    let start_cx = start_pos.x as f64 + start_size.width as f64 / 2.0;
-    let start_cy = start_pos.y as f64 + start_size.height as f64 / 2.0;
-    let sw = start_size.width as f64;
-    let sh = start_size.height as f64;
-    let (target_cx, target_cy) = target;
-
-    std::thread::spawn(move || {
-        let frame_ms = 16u64;
-        let frames = 24u32; // ~384ms total
-
-        for i in 1..=frames {
-            let t = i as f64 / frames as f64;
-            let ease = t * t * t; // ease-in cubic — slow start, fast finish
-
-            let scale = 1.0 - ease;
-            let cx = start_cx + (target_cx - start_cx) * ease;
-            let cy = start_cy + (target_cy - start_cy) * ease;
-            let w = (sw * scale).max(1.0) as u32;
-            let h = (sh * scale).max(1.0) as u32;
-            let x = (cx - w as f64 / 2.0).round() as i32;
-            let y = (cy - h as f64 / 2.0).round() as i32;
-
-            let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
-            let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
-
-            if i < frames {
-                std::thread::sleep(std::time::Duration::from_millis(frame_ms));
-            }
-        }
-
-        let _ = window.hide();
-        // Restore original size so the window is ready for next open.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(
-            start_size.width,
-            start_size.height,
-        )));
-    });
+    // The launcher close animation now lives in the webview/CSS layer.
+    // Keep the backend hide on the straightforward window path instead of
+    // mutating window geometry from a background thread.
+    let _ = hide_launcher_window(&app);
 }
 
 #[tauri::command]
@@ -1894,6 +1843,7 @@ pub fn run() {
             spawn_tray_savings_updater(app.handle().clone());
             spawn_proxy_watchdog(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
+            spawn_claude_projects_warmer(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::track_event(
@@ -2509,15 +2459,20 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_displayed_dollars: Option<u32> = None;
         let mut last_tooltip: Option<String> = None;
         let mut unhealthy_streak: u8 = 0;
-        let mut connector_check_counter: u32 = 0;
+        let mut last_connector_check = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now);
         let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled();
 
         loop {
-            // Re-check the Claude connector every ~2s (every 8 ticks at 260ms).
-            if connector_check_counter % 8 == 0 {
+            // Re-check the Claude connector at most every ~2s, regardless of
+            // whether the tick rate is booting-fast (260ms) or idle-slow
+            // (1500ms). Time-based instead of tick-count based so the cadence
+            // stays correct across the adaptive sleep below.
+            if last_connector_check.elapsed() >= std::time::Duration::from_secs(2) {
                 cached_connector_enabled = client_adapters::is_claude_code_enabled();
+                last_connector_check = std::time::Instant::now();
             }
-            connector_check_counter = connector_check_counter.wrapping_add(1);
 
             let raw_visual = {
                 let state: tauri::State<'_, AppState> = app.state();
@@ -2647,7 +2602,17 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 break;
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(260));
+            // Only the booting animation needs frame-rate polling; for every
+            // other steady-state the icon doesn't change visually between
+            // ticks. Slowing the idle cadence to 1.5s cuts `runtime_status()`
+            // calls from ~4/s to <1/s, which in turn drops the background
+            // HTTP ping to the local proxy from ~4/s to <1/s.
+            let sleep = if matches!(visual, TrayRuntimeVisual::Booting) {
+                std::time::Duration::from_millis(260)
+            } else {
+                std::time::Duration::from_millis(1500)
+            };
+            std::thread::sleep(sleep);
         }
     });
 }
@@ -2723,9 +2688,15 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 }
 
 fn spawn_tray_savings_updater(app: AppHandle) {
+    // The tray icon's dollar badge only redraws when the integer value
+    // changes (see `changed_dollars` in `spawn_tray_runtime_icon_updater`),
+    // so polling faster than the number ticks up is wasted work. 20s is
+    // fast enough that the badge feels live during active traffic and slow
+    // enough that `build_dashboard` runs ~3x/min instead of 12x/min.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(INTERVAL);
             let state: tauri::State<'_, AppState> = app.state();
             let dashboard = state.dashboard();
             let today_key = Local::now().format("%Y-%m-%d").to_string();
@@ -2835,7 +2806,18 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
             if window.label() == "main" {
-                let _ = window.hide();
+                let window = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
+                    ));
+
+                    let still_unfocused = matches!(window.is_focused(), Ok(false));
+                    let still_visible = matches!(window.is_visible(), Ok(true));
+                    if still_unfocused && still_visible {
+                        let _ = window.hide();
+                    }
+                });
             }
         }
         WindowEvent::CloseRequested { api, .. } => {

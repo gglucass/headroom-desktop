@@ -50,10 +50,7 @@ fn savings_milestone_kind(milestone_usd: u64) -> &'static str {
 /// is present — such events can't be deduped, so we don't persist them
 /// (the proxy will keep surfacing them while they're in its window).
 fn transformation_fingerprint(event: &TransformationFeedEvent) -> Option<String> {
-    event
-        .request_id
-        .clone()
-        .or_else(|| event.timestamp.clone())
+    event.request_id.clone().or_else(|| event.timestamp.clone())
 }
 
 /// Append `event` to `history` if no entry with the same fingerprint exists.
@@ -210,8 +207,7 @@ impl ActivityFacts {
             return Ok(Self::empty(path));
         }
 
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let persisted = serde_json::from_slice::<PersistedActivityFacts>(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         if persisted.schema_version != SCHEMA_VERSION {
@@ -273,9 +269,10 @@ impl ActivityFacts {
         let mut kept_rev: Vec<ActivityEvent> = Vec::with_capacity(self.recent_events.len());
         for event in self.recent_events.iter().rev() {
             if let ActivityEvent::DailyRecord(rec) = event {
-                let day = rec.day.clone().unwrap_or_else(|| {
-                    rec.observed_at.format("%Y-%m-%d").to_string()
-                });
+                let day = rec
+                    .day
+                    .clone()
+                    .unwrap_or_else(|| rec.observed_at.format("%Y-%m-%d").to_string());
                 if !seen_dr_days.insert(day) {
                     continue;
                 }
@@ -346,9 +343,7 @@ impl ActivityFacts {
             // in `recent_events` and shows the user the same record N times.
             if event_day == today {
                 let beats_day = match &self.daily_record {
-                    Some(existing) if existing.day == today => {
-                        tokens > existing.tokens_saved
-                    }
+                    Some(existing) if existing.day == today => tokens > existing.tokens_saved,
                     _ => true,
                 };
                 if beats_day {
@@ -390,8 +385,7 @@ impl ActivityFacts {
                     (Some(prev), Some(prev_at)) => {
                         let within_one_hour =
                             now.signed_duration_since(prev_at) < Duration::hours(1);
-                        let delta_pct =
-                            (tokens as f64 - prev as f64) / prev as f64 * 100.0;
+                        let delta_pct = (tokens as f64 - prev as f64) / prev as f64 * 100.0;
                         within_one_hour && delta_pct < 1.0
                     }
                     _ => false,
@@ -451,16 +445,14 @@ impl ActivityFacts {
         // sliding window, which re-surfaces the same event on every poll).
         let turn_id = event.turn_id.as_ref()?;
         let request_id = event.request_id.as_ref()?;
-        let tokens_saved = event
-            .tokens_saved
-            .and_then(|n| if n > 0 { Some(n as u64) } else { None })?;
+        let tokens_saved =
+            event
+                .tokens_saved
+                .and_then(|n| if n > 0 { Some(n as u64) } else { None })?;
 
         let previous_record = self.prompt_all_time_record_tokens;
 
-        let acc = self
-            .turn_accumulators
-            .entry(turn_id.clone())
-            .or_default();
+        let acc = self.turn_accumulators.entry(turn_id.clone()).or_default();
 
         if !acc.seen_request_ids.insert(request_id.clone()) {
             // Same transformation re-observed on a later feed poll — already counted.
@@ -714,9 +706,7 @@ impl ActivityFacts {
             .pred_opt()
             .and_then(|d| d.checked_sub_days(chrono::Days::new(6)))
             .unwrap_or(today_local);
-        let week_end = today_local
-            .pred_opt()
-            .unwrap_or(today_local);
+        let week_end = today_local.pred_opt().unwrap_or(today_local);
         let event = ActivityEvent::WeeklyRecap(WeeklyRecapEvent {
             observed_at,
             week_start: week_start.format("%Y-%m-%d").to_string(),
@@ -761,8 +751,7 @@ impl ActivityFacts {
             all_time_record_emitted_at: self.all_time_record_emitted_at,
             transformation_history: self.transformation_history.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&persisted)
-            .context("serializing activity facts")?;
+        let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
         std::fs::write(&self.path, bytes)
             .with_context(|| format!("writing {}", self.path.display()))?;
         self.dirty = false;
@@ -891,11 +880,7 @@ mod tests {
         // Poll 2: SAME feed re-observed. None of the three must emit another
         // DailyRecord — previously all three would fire because the single
         // `daily_record.day` oscillated between 22, 21, 20 and back.
-        for (obs_at, tokens) in [
-            (today, 500i64),
-            (yesterday, 700),
-            (two_days_ago, 800),
-        ] {
+        for (obs_at, tokens) in [(today, 500i64), (yesterday, 700), (two_days_ago, 800)] {
             let events = facts.observe_transformation_at(
                 &mk_transformation(Some("a"), Some(tokens), Some(50.0)),
                 obs_at,
@@ -985,10 +970,17 @@ mod tests {
             ev
         };
         for n in 0..5 {
-            assert!(push_transformation_history_unique(&mut history, &make(n), 3));
+            assert!(push_transformation_history_unique(
+                &mut history,
+                &make(n),
+                3
+            ));
         }
         assert_eq!(history.len(), 3);
-        assert_eq!(history.front().unwrap().request_id.as_deref(), Some("req-2"));
+        assert_eq!(
+            history.front().unwrap().request_id.as_deref(),
+            Some("req-2")
+        );
         assert_eq!(history.back().unwrap().request_id.as_deref(), Some("req-4"));
     }
 
@@ -1059,7 +1051,10 @@ mod tests {
                 .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))),
             "0.5% beat within an hour should be suppressed",
         );
-        assert_eq!(facts.all_time_record_tokens, 1_005, "counter still advances");
+        assert_eq!(
+            facts.all_time_record_tokens, 1_005,
+            "counter still advances"
+        );
     }
 
     #[test]
@@ -1097,11 +1092,7 @@ mod tests {
             .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))));
     }
 
-    fn mk_turn(
-        turn_id: &str,
-        request_id: &str,
-        tokens_saved: i64,
-    ) -> TransformationFeedEvent {
+    fn mk_turn(turn_id: &str, request_id: &str, tokens_saved: i64) -> TransformationFeedEvent {
         let mut e = mk_transformation(Some("a"), Some(tokens_saved), Some(10.0));
         e.turn_id = Some(turn_id.into());
         e.request_id = Some(request_id.into());
@@ -1304,9 +1295,9 @@ mod tests {
             day_at(2026, 4, 22, 10),
         );
         assert_eq!(facts.current_streak, 3);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::Streak(s) if s.days == 3 && s.kind == "threshold")));
+        assert!(events.iter().any(
+            |e| matches!(e, ActivityEvent::Streak(s) if s.days == 3 && s.kind == "threshold")
+        ));
     }
 
     #[test]
@@ -1388,9 +1379,9 @@ mod tests {
         );
         assert_eq!(facts.current_streak, 3);
         assert_eq!(facts.longest_streak, 3);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::Streak(s) if s.kind == "new_record" && s.days == 3)));
+        assert!(events.iter().any(
+            |e| matches!(e, ActivityEvent::Streak(s) if s.kind == "new_record" && s.days == 3)
+        ));
     }
 
     #[test]
@@ -1476,8 +1467,7 @@ mod tests {
     fn workspace_threads_through_to_new_model_and_record_events() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let mut transformation =
-            mk_transformation(Some("claude-x"), Some(1_000), Some(50.0));
+        let mut transformation = mk_transformation(Some("claude-x"), Some(1_000), Some(50.0));
         transformation.workspace = Some("/Users/u/Code/demo-repo".into());
         let events = facts.observe_transformation_at(&transformation, at(10, 0), at(10, 0));
         let new_model = events
@@ -1487,7 +1477,10 @@ mod tests {
                 _ => None,
             })
             .expect("new model");
-        assert_eq!(new_model.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
+        assert_eq!(
+            new_model.workspace.as_deref(),
+            Some("/Users/u/Code/demo-repo")
+        );
         let daily = events
             .iter()
             .find_map(|e| match e {
@@ -1503,7 +1496,10 @@ mod tests {
                 _ => None,
             })
             .expect("all-time record");
-        assert_eq!(all_time.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
+        assert_eq!(
+            all_time.workspace.as_deref(),
+            Some("/Users/u/Code/demo-repo")
+        );
     }
 
     #[test]

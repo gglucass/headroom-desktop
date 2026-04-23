@@ -7,13 +7,8 @@ pub struct NotificationPayload {
     pub action: Option<String>,
 }
 
-const FIRST_NOTIFIABLE_TOKEN_MILESTONES: [u64; 5] = [
-    100_000,
-    1_000_000,
-    5_000_000,
-    10_000_000,
-    50_000_000,
-];
+const FIRST_NOTIFIABLE_TOKEN_MILESTONES: [u64; 5] =
+    [100_000, 1_000_000, 5_000_000, 10_000_000, 50_000_000];
 const REPEATING_NOTIFIABLE_TOKEN_STEP: u64 = 100_000_000;
 
 pub fn token_milestone_is_notifiable(tokens: u64) -> bool {
@@ -52,9 +47,7 @@ pub fn notification_for_token_milestone(tokens: u64) -> Option<NotificationPaylo
     let label = format_tokens_short(tokens);
     Some(NotificationPayload {
         title: format!("{label} tokens saved"),
-        body: format!(
-            "Your lifetime savings with Headroom just crossed {label}."
-        ),
+        body: format!("Your lifetime savings with Headroom just crossed {label}."),
         action: Some("activity".into()),
     })
 }
@@ -63,10 +56,7 @@ pub fn notification_for_token_milestone(tokens: u64) -> Option<NotificationPaylo
 /// should fire for them. Preserves input order and drops events whose kind
 /// (or threshold, for token milestones) isn't notifiable.
 pub fn collect_notification_payloads(events: &[ActivityEvent]) -> Vec<NotificationPayload> {
-    events
-        .iter()
-        .filter_map(notification_for_event)
-        .collect()
+    events.iter().filter_map(notification_for_event).collect()
 }
 
 pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPayload> {
@@ -359,7 +349,11 @@ mod tests {
             }),
         ];
         for ev in candidates.iter() {
-            assert!(notification_for_event(ev).is_none(), "unexpected notify for {:?}", ev);
+            assert!(
+                notification_for_event(ev).is_none(),
+                "unexpected notify for {:?}",
+                ev
+            );
         }
     }
 }

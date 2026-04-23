@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use parking_lot::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -103,10 +103,7 @@ impl AnalyticsClient {
             "props": sanitize_properties(properties)
         });
 
-        let dispatcher = self
-            .dispatcher
-            .lock()
-            ;
+        let dispatcher = self.dispatcher.lock();
         let handle = dispatcher
             .as_ref()
             .ok_or_else(|| "analytics dispatcher unavailable".to_string())?;

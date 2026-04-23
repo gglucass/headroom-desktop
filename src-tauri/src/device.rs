@@ -34,7 +34,9 @@ pub fn current() -> DeviceIdentity {
 }
 
 fn load_or_compute_machine_id_digest() -> String {
-    if let Ok(Some(cached)) = keychain::read_secret(DEVICE_KEYCHAIN_SERVICE, MACHINE_ID_DIGEST_ACCOUNT) {
+    if let Ok(Some(cached)) =
+        keychain::read_secret(DEVICE_KEYCHAIN_SERVICE, MACHINE_ID_DIGEST_ACCOUNT)
+    {
         let trimmed = cached.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -44,7 +46,9 @@ fn load_or_compute_machine_id_digest() -> String {
     let raw = read_hardware_uuid().unwrap_or_else(fallback_identifier);
     let digest = sha256_hex(&raw);
 
-    if let Err(err) = keychain::write_secret(DEVICE_KEYCHAIN_SERVICE, MACHINE_ID_DIGEST_ACCOUNT, &digest) {
+    if let Err(err) =
+        keychain::write_secret(DEVICE_KEYCHAIN_SERVICE, MACHINE_ID_DIGEST_ACCOUNT, &digest)
+    {
         sentry::capture_message(
             &format!("Could not persist machine id digest: {err}"),
             sentry::Level::Warning,
@@ -102,7 +106,12 @@ fn fallback_identifier() -> String {
 
 fn describe_os() -> String {
     let info = os_info::get();
-    format!("{} {} {}", info.os_type(), info.version(), std::env::consts::ARCH)
+    format!(
+        "{} {} {}",
+        info.os_type(),
+        info.version(),
+        std::env::consts::ARCH
+    )
 }
 
 fn read_chopratejas_instance_id() -> Option<String> {

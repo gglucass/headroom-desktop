@@ -20,15 +20,16 @@ use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integr
 use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
-    HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
-    RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
+    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus,
+    HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus,
+    RuntimeUpgradeFailure, RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase,
+    UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
 use crate::tool_manager::{
-    BootstrapStepUpdate, HeadroomRelease, ManagedRuntime, RtkGainSummary,
-    RuntimeMaintenanceKind, ToolManager,
+    BootstrapStepUpdate, HeadroomRelease, ManagedRuntime, RtkGainSummary, RuntimeMaintenanceKind,
+    ToolManager,
 };
 
 /// After this many consecutive failed auto-attempts at the same app version,
@@ -87,7 +88,9 @@ pub fn emit_runtime_upgrade_progress(app: &tauri::AppHandle, state: &AppState) {
 /// persistently-failing upgrade without editing disk state.
 pub fn runtime_upgrade_disabled_by_env() -> bool {
     matches!(
-        std::env::var("HEADROOM_SKIP_RUNTIME_UPGRADE").ok().as_deref(),
+        std::env::var("HEADROOM_SKIP_RUNTIME_UPGRADE")
+            .ok()
+            .as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
 }
@@ -171,7 +174,8 @@ fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
             _ => "Preparing model caches for first-time use".to_string(),
         }
     } else {
-        "Finishing up the first-run download — slower connections may take several more minutes".to_string()
+        "Finishing up the first-run download — slower connections may take several more minutes"
+            .to_string()
     };
 
     let hint = if active {
@@ -256,6 +260,12 @@ pub struct AppState {
     /// fallback shell probe can take up to 2s, so we keep this sticky and
     /// expose an invalidator for the user's "Re-check" button.
     cached_headroom_learn_prereq: Mutex<Option<HeadroomLearnPrereqStatus>>,
+    /// Cached `runtime_status()` output. The tray-icon updater, proxy
+    /// watchdog, and frontend pollers all ask for runtime status on tight
+    /// intervals; each uncached call hits `is_headroom_proxy_reachable`
+    /// (blocking HTTP) plus a handful of file stats. A short TTL dedupes
+    /// the work across all those callers without any visible lag.
+    cached_runtime_status: Mutex<Option<(RuntimeStatus, Instant)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +346,7 @@ impl AppState {
             cached_memory_export: Mutex::new(None),
             cached_claude_code_projects: Mutex::new(None),
             cached_headroom_learn_prereq: Mutex::new(None),
+            cached_runtime_status: Mutex::new(None),
         };
 
         Ok(state)
@@ -385,10 +396,7 @@ impl AppState {
 
         if let Err(err) = self.ensure_headroom_running() {
             eprintln!("failed to auto-start headroom during app launch: {err}");
-            crate::capture_headroom_start_failure(
-                "headroom auto-start failed during launch",
-                &err,
-            );
+            crate::capture_headroom_start_failure("headroom auto-start failed during launch", &err);
         }
 
         // Hold `starting` until the probe `runtime_status()` uses
@@ -414,9 +422,7 @@ impl AppState {
         current_app_version: &str,
     ) -> Option<RuntimeMaintenancePlan> {
         if runtime_upgrade_disabled_by_env() {
-            eprintln!(
-                "HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check."
-            );
+            eprintln!("HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check.");
             return None;
         }
         let profile = self.launch_profile.lock();
@@ -471,19 +477,21 @@ impl AppState {
         };
 
         let current_app_version = app.package_info().version.to_string();
-        let maintenance_plan = match self.runtime_maintenance_plan_for_app_version(&current_app_version)
-        {
-            Some(plan) => plan,
-            None => {
-                // App version changed but no runtime maintenance is actually
-                // needed — just stamp the version.
-                self.stamp_app_version(&current_app_version);
-                return;
-            }
-        };
+        let maintenance_plan =
+            match self.runtime_maintenance_plan_for_app_version(&current_app_version) {
+                Some(plan) => plan,
+                None => {
+                    // App version changed but no runtime maintenance is actually
+                    // needed — just stamp the version.
+                    self.stamp_app_version(&current_app_version);
+                    return;
+                }
+            };
         let maintenance_kind = match &maintenance_plan {
             RuntimeMaintenancePlan::Upgrade(_) => RuntimeMaintenanceKind::Upgrade,
-            RuntimeMaintenancePlan::RequirementsRepair => RuntimeMaintenanceKind::RequirementsRepair,
+            RuntimeMaintenancePlan::RequirementsRepair => {
+                RuntimeMaintenanceKind::RequirementsRepair
+            }
         };
         let target_version = match &maintenance_plan {
             RuntimeMaintenancePlan::Upgrade(release) => release.version().to_string(),
@@ -496,13 +504,10 @@ impl AppState {
 
         // User-facing from/to are the app versions — headroom-ai versions are
         // an implementation detail tracked in the failure record only.
-        let previous_app_version = self
-            .launch_profile
-            .lock()
-            .last_launched_app_version
-            .clone();
+        let previous_app_version = self.launch_profile.lock().last_launched_app_version.clone();
 
         *self.runtime_upgrade_in_progress.lock() = true;
+        self.invalidate_runtime_status_cache();
 
         // Set up progress state + emit initial event.
         self.set_upgrade_progress(|p| {
@@ -552,7 +557,10 @@ impl AppState {
         let needs_commit_or_rollback = matches!(maintenance_kind, RuntimeMaintenanceKind::Upgrade);
         let install_result = match maintenance_plan {
             RuntimeMaintenancePlan::Upgrade(release) => {
-                match self.tool_manager.atomic_upgrade_headroom(&release, progress) {
+                match self
+                    .tool_manager
+                    .atomic_upgrade_headroom(&release, progress)
+                {
                     UpgradeOutcome::InstalledPendingValidation => Ok(()),
                     UpgradeOutcome::InstallFailed { restored, error } => Err((restored, error)),
                 }
@@ -642,6 +650,7 @@ impl AppState {
                 });
                 emit_runtime_upgrade_progress(app, self);
                 *self.runtime_upgrade_in_progress.lock() = false;
+                self.invalidate_runtime_status_cache();
                 return;
             }
             Ok(()) => {}
@@ -681,8 +690,9 @@ impl AppState {
             // Gently creep 97 → 99.5 over the max budget so the bar keeps
             // moving — the user sees *something* happen during long waits.
             let percent = 97
-                + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128)
-                    .min(250) as u8) / 100;
+                + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128).min(250)
+                    as u8)
+                    / 100;
             state_ref.set_upgrade_progress(|p| {
                 p.message = message;
                 p.overall_percent = percent.min(99);
@@ -735,6 +745,7 @@ impl AppState {
                 })),
             );
             *self.runtime_upgrade_in_progress.lock() = false;
+            self.invalidate_runtime_status_cache();
             return;
         }
 
@@ -788,15 +799,16 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| "the previous version".into());
         let error_hint = match maintenance_kind {
-            RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => {
-                Some(format!("Reverted to Headroom {} and restarted it.", previous_app_label))
-            }
+            RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
+                "Reverted to Headroom {} and restarted it.",
+                previous_app_label
+            )),
             RuntimeMaintenanceKind::Upgrade if rollback_restored => {
                 Some(format!("Reverted to Headroom {}.", previous_app_label))
             }
-            RuntimeMaintenanceKind::RequirementsRepair if restarted => {
-                Some("Headroom restarted with the repaired runtime, but validation still failed.".into())
-            }
+            RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
+                "Headroom restarted with the repaired runtime, but validation still failed.".into(),
+            ),
             RuntimeMaintenanceKind::RequirementsRepair => None,
             _ => None,
         };
@@ -878,6 +890,7 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
         *self.runtime_upgrade_in_progress.lock() = false;
+        self.invalidate_runtime_status_cache();
     }
 
     /// User-initiated retry of a previously-failed runtime upgrade. Resets
@@ -928,10 +941,7 @@ impl AppState {
     /// proxy responds, the proxy process exits, the log goes silent past the
     /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
     /// pass through the loop, emits a progress update via `on_progress`.
-    fn wait_for_boot_validation<F>(
-        &self,
-        mut on_progress: F,
-    ) -> BootValidationOutcome
+    fn wait_for_boot_validation<F>(&self, mut on_progress: F) -> BootValidationOutcome
     where
         F: FnMut(std::time::Duration, bool),
     {
@@ -1036,7 +1046,9 @@ impl AppState {
     fn record_upgrade_failure(&self, mut failure: RuntimeUpgradeFailure) {
         let mut profile = self.launch_profile.lock();
         let attempts = match profile.last_runtime_upgrade_failure.as_ref() {
-            Some(prev) if prev.app_version == failure.app_version => prev.attempts.saturating_add(1),
+            Some(prev) if prev.app_version == failure.app_version => {
+                prev.attempts.saturating_add(1)
+            }
             _ => 1,
         };
         failure.attempts = attempts;
@@ -1098,7 +1110,11 @@ impl AppState {
     }
 
     pub fn cached_memory_export(&self) -> Option<String> {
-        const TTL: Duration = Duration::from_secs(20);
+        // Long TTL is safe because:
+        //   - live-learning deletion explicitly calls `invalidate_memory_export_cache`
+        //   - the activity observer background thread keeps the cache warm on an
+        //     independent cadence, so cache misses rarely land on the IPC path
+        const TTL: Duration = Duration::from_secs(60);
         let cache = self.cached_memory_export.lock();
         if let Some((ref s, at)) = *cache {
             if at.elapsed() < TTL {
@@ -1133,10 +1149,7 @@ impl AppState {
         let current_token = self.current_bearer_token();
 
         {
-            let cache = self
-                .cached_claude_profile
-                .lock()
-                ;
+            let cache = self.cached_claude_profile.lock();
             if let Some((cached_token, profile, at)) = &*cache {
                 if *cached_token == current_token && at.elapsed() < TTL {
                     return profile.clone();
@@ -1145,20 +1158,17 @@ impl AppState {
         }
 
         let profile = pricing::detect_claude_profile_uncached(self);
-        let mut cache = self
-            .cached_claude_profile
-            .lock()
-            ;
+        let mut cache = self.cached_claude_profile.lock();
         *cache = Some((current_token, profile.clone(), Instant::now()));
         profile
     }
 
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
-        const TTL: Duration = Duration::from_secs(4);
-        let mut cache = self
-            .cached_headroom_stats
-            .lock()
-            ;
+        // Dashboard polls at 5s; a 4s TTL caused every poll to miss and
+        // re-fetch from the proxy. 12s gives at least one cache hit between
+        // dashboard refreshes while keeping session savings visibly fresh.
+        const TTL: Duration = Duration::from_secs(12);
+        let mut cache = self.cached_headroom_stats.lock();
         if let Some((stats, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return stats.clone();
@@ -1170,11 +1180,12 @@ impl AppState {
     }
 
     fn cached_headroom_history(&self) -> Option<HeadroomSavingsHistoryResponse> {
-        const TTL: Duration = Duration::from_secs(8);
-        let mut cache = self
-            .cached_headroom_history
-            .lock()
-            ;
+        // Lifetime history moves slowly — the daily/hourly buckets that drive
+        // the Home charts only change a handful of times per minute under
+        // active traffic. A 30s TTL absorbs most dashboard polls while still
+        // updating the chart's most-recent bucket within one full refresh.
+        const TTL: Duration = Duration::from_secs(30);
+        let mut cache = self.cached_headroom_history.lock();
         if let Some((history, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return history.clone();
@@ -1187,10 +1198,7 @@ impl AppState {
 
     fn cached_rtk_gain_summary(&self) -> Option<RtkGainSummary> {
         const TTL: Duration = Duration::from_secs(10);
-        let mut cache = self
-            .cached_rtk_gain_summary
-            .lock()
-            ;
+        let mut cache = self.cached_rtk_gain_summary.lock();
         if let Some((stats, at)) = cache.as_ref() {
             if at.elapsed() < TTL {
                 return stats.clone();
@@ -1314,14 +1322,13 @@ impl AppState {
         self.build_dashboard(true)
     }
 
-    fn build_dashboard(&self, drain_pending_milestones: bool) -> (DashboardState, PendingMilestones) {
+    fn build_dashboard(
+        &self,
+        drain_pending_milestones: bool,
+    ) -> (DashboardState, PendingMilestones) {
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
-        let recent_usage = self
-            .recent_usage
-            .lock()
-
-            .clone();
+        let recent_usage = self.recent_usage.lock().clone();
         let insights = build_insights(
             &recent_usage,
             &clients,
@@ -1334,7 +1341,7 @@ impl AppState {
                 tracker.daily_savings(),
                 tracker.hourly_savings(),
             )
-            };
+        };
         let mut pending_milestones = PendingMilestones::default();
 
         let stats = self.cached_headroom_stats();
@@ -1405,11 +1412,15 @@ impl AppState {
         )
     }
 
-    /// Cache TTL for `list_claude_code_projects`. Short enough that a newly
-    /// created Claude project (or a session in an existing one) shows up
-    /// within ~20s; long enough that rapid tab switches and pre-warms hit
-    /// the cache instead of re-scanning the whole projects directory.
-    const CLAUDE_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(20);
+    /// Cache TTL for `list_claude_code_projects`. Long enough that rapid tab
+    /// switches and pre-warms hit the cache instead of re-scanning the
+    /// projects directory. A dedicated background thread
+    /// (`spawn_claude_projects_warmer`) keeps this fresh at ~45s cadence so
+    /// even the first post-expiry call hits a warm cache on the IPC path.
+    /// Completed learn runs explicitly invalidate via
+    /// `invalidate_claude_code_projects_cache`, so staleness isn't a concern
+    /// for learn-driven UI updates.
+    const CLAUDE_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(60);
 
     pub fn list_claude_code_projects(&self) -> Result<Vec<ClaudeCodeProject>> {
         if let Some(cached) = self.cached_claude_code_projects_fresh() {
@@ -1546,10 +1557,7 @@ impl AppState {
             ));
         }
 
-        let mut state = self
-            .headroom_learn_state
-            .lock()
-            ;
+        let mut state = self.headroom_learn_state.lock();
         if state.running {
             return Err("headroom learn is already running.".into());
         }
@@ -1578,10 +1586,7 @@ impl AppState {
         error: Option<String>,
         output_tail: Vec<String>,
     ) {
-        let mut state = self
-            .headroom_learn_state
-            .lock()
-            ;
+        let mut state = self.headroom_learn_state.lock();
         state.running = false;
         state.finished_at = Some(Utc::now());
         state.success = Some(success);
@@ -1599,11 +1604,7 @@ impl AppState {
         &self,
         selected_project_path: Option<&str>,
     ) -> HeadroomLearnStatus {
-        let state = self
-            .headroom_learn_state
-            .lock()
-            
-            .clone();
+        let state = self.headroom_learn_state.lock().clone();
 
         let current_project_path = state.project_path.clone();
         let lookup_project_path = selected_project_path
@@ -1682,36 +1683,24 @@ impl AppState {
     }
 
     pub fn bootstrap_progress(&self) -> BootstrapProgress {
-        self.bootstrap_progress
-            .lock()
-            
-            .clone()
+        self.bootstrap_progress.lock().clone()
     }
 
     pub fn begin_bootstrap(&self) -> Result<(), String> {
         let python_installed = self.tool_manager.python_runtime_installed();
-        let mut progress = self
-            .bootstrap_progress
-            .lock()
-            ;
+        let mut progress = self.bootstrap_progress.lock();
         let (next, result) = begin_bootstrap_transition(&progress, python_installed);
         *progress = next;
         result
     }
 
     pub fn update_bootstrap_step(&self, step: BootstrapStepUpdate) {
-        let mut progress = self
-            .bootstrap_progress
-            .lock()
-            ;
+        let mut progress = self.bootstrap_progress.lock();
         *progress = apply_bootstrap_step(&progress, step);
     }
 
     pub fn mark_bootstrap_proxy_starting(&self) {
-        let mut progress = self
-            .bootstrap_progress
-            .lock()
-            ;
+        let mut progress = self.bootstrap_progress.lock();
         *progress = BootstrapProgress {
             running: true,
             complete: false,
@@ -1724,18 +1713,12 @@ impl AppState {
     }
 
     pub fn mark_bootstrap_complete(&self) {
-        let mut progress = self
-            .bootstrap_progress
-            .lock()
-            ;
+        let mut progress = self.bootstrap_progress.lock();
         *progress = bootstrap_complete_state();
     }
 
     pub fn mark_bootstrap_failed<S: Into<String>>(&self, message: S) {
-        let mut progress = self
-            .bootstrap_progress
-            .lock()
-            ;
+        let mut progress = self.bootstrap_progress.lock();
         *progress = bootstrap_failed_state(&progress, message.into());
     }
 
@@ -1793,10 +1776,7 @@ impl AppState {
         }
 
         {
-            let mut process = self
-                .headroom_process
-                .lock()
-                ;
+            let mut process = self.headroom_process.lock();
 
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
@@ -1826,6 +1806,27 @@ impl AppState {
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
+        // Multiple pollers (tray icon updater at 260ms, proxy watchdog at 5s,
+        // frontend interval at 3s, ad-hoc pre-warms) all land here and each
+        // uncached call does a blocking HTTP `/readyz` plus several file
+        // stats. A short TTL collapses them into one fetch without any
+        // perceptible staleness — the longest-cadence caller is 5s, so 2s
+        // TTL gives each poll a fresh read while deduping within bursts.
+        const TTL: Duration = Duration::from_secs(2);
+        {
+            let cache = self.cached_runtime_status.lock();
+            if let Some((status, at)) = cache.as_ref() {
+                if at.elapsed() < TTL {
+                    return status.clone();
+                }
+            }
+        }
+        let status = self.compute_runtime_status();
+        *self.cached_runtime_status.lock() = Some((status.clone(), Instant::now()));
+        status
+    }
+
+    fn compute_runtime_status(&self) -> RuntimeStatus {
         let installed = self.tool_manager.python_runtime_installed();
         let paused = self.runtime_is_paused();
         let proxy_reachable = is_headroom_proxy_reachable();
@@ -1846,10 +1847,7 @@ impl AppState {
             rtk_integration_status().unwrap_or((false, false));
         let rtk_gain_summary = self.cached_rtk_gain_summary();
         let headroom_pid = {
-            let mut process = self
-                .headroom_process
-                .lock()
-                ;
+            let mut process = self.headroom_process.lock();
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
                     Ok(None) => Some(existing.id()),
@@ -1866,9 +1864,7 @@ impl AppState {
         let effective_running = installed && !paused && proxy_reachable;
 
         let startup_error = self.last_startup_error.lock().clone();
-        let startup_error_hint = startup_error
-            .as_deref()
-            .and_then(classify_startup_error);
+        let startup_error_hint = startup_error.as_deref().and_then(classify_startup_error);
 
         RuntimeStatus {
             platform: platform.into(),
@@ -1901,33 +1897,34 @@ impl AppState {
     }
 
     pub fn set_runtime_paused(&self, paused: bool) {
-        let mut runtime_paused = self
-            .runtime_paused
-            .lock()
-            ;
+        let mut runtime_paused = self.runtime_paused.lock();
         *runtime_paused = paused;
+        drop(runtime_paused);
+        self.invalidate_runtime_status_cache();
     }
 
     pub fn runtime_is_paused(&self) -> bool {
-        *self
-            .runtime_paused
-            .lock()
-            
+        *self.runtime_paused.lock()
     }
 
     pub fn set_runtime_starting(&self, starting: bool) {
-        let mut runtime_starting = self
-            .runtime_starting
-            .lock()
-            ;
+        let mut runtime_starting = self.runtime_starting.lock();
         *runtime_starting = starting;
+        drop(runtime_starting);
+        self.invalidate_runtime_status_cache();
+    }
+
+    /// Drops the cached `RuntimeStatus` so the next call recomputes. Wired
+    /// into every path that mutates visible runtime state (pause, resume,
+    /// starting, upgrade phase) so user-initiated changes show up on the
+    /// tray icon and settings UI within one tray-updater tick instead of
+    /// waiting out the 2s TTL.
+    pub fn invalidate_runtime_status_cache(&self) {
+        *self.cached_runtime_status.lock() = None;
     }
 
     pub fn runtime_is_starting(&self) -> bool {
-        *self
-            .runtime_starting
-            .lock()
-            
+        *self.runtime_starting.lock()
     }
 
     pub fn resume_runtime(&self) -> Result<()> {
@@ -1938,10 +1935,7 @@ impl AppState {
     pub fn stop_headroom(&self) {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         self.set_runtime_starting(false);
-        let mut process = self
-            .headroom_process
-            .lock()
-            ;
+        let mut process = self.headroom_process.lock();
 
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
@@ -2938,8 +2932,7 @@ fn aggregate_weekly_totals(
     let mut total_savings_usd: f64 = 0.0;
     let mut active_days: u32 = 0;
     for (day_key, bucket) in daily_savings.range(start_key..=end_key) {
-        let has_activity =
-            bucket.estimated_tokens_saved > 0 || bucket.estimated_savings_usd > 0.0;
+        let has_activity = bucket.estimated_tokens_saved > 0 || bucket.estimated_savings_usd > 0.0;
         if has_activity {
             active_days += 1;
         }
@@ -4165,7 +4158,8 @@ mod tests {
 
     #[test]
     fn classify_startup_error_foreign_port() {
-        let raw = "port 6768 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
+        let raw =
+            "port 6768 is occupied by a non-headroom process (pid 1234 node); cannot start proxy.";
         let hint = classify_startup_error(raw).expect("foreign port should classify");
         assert!(hint.contains("lsof -iTCP:6768"), "got: {hint}");
     }
@@ -4316,7 +4310,10 @@ mod tests {
             lifetime_usd_milestones_crossed(5.0, 120.0),
             vec![10, 50, 100]
         );
-        assert_eq!(lifetime_usd_milestones_crossed(200.0, 205.0), Vec::<u64>::new());
+        assert_eq!(
+            lifetime_usd_milestones_crossed(200.0, 205.0),
+            Vec::<u64>::new()
+        );
         assert_eq!(
             lifetime_usd_milestones_crossed(199.5, 301.0),
             vec![200, 300]
@@ -4419,7 +4416,10 @@ mod tests {
         };
 
         let first = state.observe_activity_from_transformations(&[transformation.clone()]);
-        assert!(!first.fresh.is_empty(), "first observation should emit fresh events");
+        assert!(
+            !first.fresh.is_empty(),
+            "first observation should emit fresh events"
+        );
         assert!(
             first
                 .fresh
@@ -4466,7 +4466,10 @@ mod tests {
         write_headroom_receipt(&base_dir, "0.10.4", "stale");
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
-        assert!(matches!(plan, Some(super::RuntimeMaintenancePlan::RequirementsRepair)));
+        assert!(matches!(
+            plan,
+            Some(super::RuntimeMaintenancePlan::RequirementsRepair)
+        ));
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
@@ -4538,10 +4541,7 @@ mod tests {
             lifetime_token_milestones_crossed(9_500_000, 21_000_000),
             vec![10_000_000, 20_000_000]
         );
-        assert_eq!(
-            lifetime_token_milestones_crossed(0, 150_000),
-            vec![100_000]
-        );
+        assert_eq!(lifetime_token_milestones_crossed(0, 150_000), vec![100_000]);
     }
 
     #[test]

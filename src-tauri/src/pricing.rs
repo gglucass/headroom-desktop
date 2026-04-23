@@ -65,7 +65,10 @@ impl IdentityPayload {
         }
     }
 
-    fn apply_headers(&self, mut builder: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    fn apply_headers(
+        &self,
+        mut builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
         builder = builder.header("X-Headroom-Device-Id", &self.device_id);
         if let Some(value) = self.chopratejas_instance_id.as_deref() {
             builder = builder.header("X-Headroom-Chopratejas-Id", value);
@@ -281,13 +284,11 @@ pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCo
         return Err(msg);
     }
 
-    let body: RequestCodeResponse = response
-        .json()
-        .map_err(|err| {
-            let msg = format!("Could not parse sign-in response: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
-            msg
-        })?;
+    let body: RequestCodeResponse = response.json().map_err(|err| {
+        let msg = format!("Could not parse sign-in response: {err}");
+        sentry::capture_message(&msg, sentry::Level::Error);
+        msg
+    })?;
 
     Ok(HeadroomAuthCodeRequest {
         email: body.email,
@@ -388,13 +389,11 @@ pub fn activate_account(
         return Err(msg);
     }
 
-    let body: RemoteAccountEnvelope = response
-        .json()
-        .map_err(|err| {
-            let msg = format!("Could not parse Headroom activation response: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
-            msg
-        })?;
+    let body: RemoteAccountEnvelope = response.json().map_err(|err| {
+        let msg = format!("Could not parse Headroom activation response: {err}");
+        sentry::capture_message(&msg, sentry::Level::Error);
+        msg
+    })?;
     let local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
@@ -442,7 +441,10 @@ pub fn create_checkout_session(
     let response = http_client()?
         .post(api_url("desktop/checkout"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&CheckoutSessionPayload { subscription_tier, billing_period })
+        .json(&CheckoutSessionPayload {
+            subscription_tier,
+            billing_period,
+        })
         .send()
         .map_err(|err| format!("Could not create checkout session: {err}"))?;
 
@@ -565,7 +567,11 @@ fn evaluate_pricing_status(
     launch_discount_active: bool,
 ) -> HeadroomPricingStatus {
     #[cfg(debug_assertions)]
-    let local_grace_active = if INDEFINITE_TRIAL { true } else { local_grace_active };
+    let local_grace_active = if INDEFINITE_TRIAL {
+        true
+    } else {
+        local_grace_active
+    };
     let needs_authentication = !authenticated && !local_grace_active;
     let mut optimization_allowed = true;
     let mut should_nudge = false;
@@ -1110,7 +1116,11 @@ struct PublicConfig {
 }
 
 fn fetch_public_config() -> Option<PublicConfig> {
-    let response = http_client().ok()?.get(api_url("desktop/config")).send().ok()?;
+    let response = http_client()
+        .ok()?
+        .get(api_url("desktop/config"))
+        .send()
+        .ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -1159,10 +1169,8 @@ fn api_url(path: &str) -> String {
     #[cfg(not(debug_assertions))]
     let runtime_env: Option<String> = None;
 
-    let base = resolve_account_api_base_url(
-        runtime_env,
-        option_env!("HEADROOM_ACCOUNT_API_BASE_URL"),
-    );
+    let base =
+        resolve_account_api_base_url(runtime_env, option_env!("HEADROOM_ACCOUNT_API_BASE_URL"));
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
@@ -1707,7 +1715,11 @@ mod tests {
 
     #[test]
     fn detect_plan_tier_default_rate_limit_with_claude_max_is_max5x() {
-        let p = oauth_profile(Some("default_claude_ai"), Some("claude_max"), Some(Utc::now()));
+        let p = oauth_profile(
+            Some("default_claude_ai"),
+            Some("claude_max"),
+            Some(Utc::now()),
+        );
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max5x
@@ -1716,7 +1728,11 @@ mod tests {
 
     #[test]
     fn detect_plan_tier_default_rate_limit_with_claude_pro_is_pro() {
-        let p = oauth_profile(Some("default_claude_ai"), Some("claude_pro"), Some(Utc::now()));
+        let p = oauth_profile(
+            Some("default_claude_ai"),
+            Some("claude_pro"),
+            Some(Utc::now()),
+        );
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Pro

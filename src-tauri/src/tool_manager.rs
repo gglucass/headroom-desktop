@@ -335,7 +335,10 @@ impl ToolManager {
     /// Bundled metadata used to populate a `ClaudeCodeProject` row. Reads
     /// CLAUDE.md + MEMORY.md once instead of three times, which collapses
     /// 6 file reads per project down to 2 during the project list scan.
-    pub fn headroom_learn_project_summary(&self, project_path: &str) -> HeadroomLearnProjectSummary {
+    pub fn headroom_learn_project_summary(
+        &self,
+        project_path: &str,
+    ) -> HeadroomLearnProjectSummary {
         let metadata = self.headroom_learn_metadata(project_path);
         let log_last_run_at = std::fs::metadata(self.headroom_learn_log_path(project_path))
             .and_then(|meta| meta.modified())
@@ -2602,11 +2605,7 @@ pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::Appl
 /// If a section's bullets are all removed, the whole `### <section>` block is
 /// dropped. If the entire managed block becomes empty, the whole block
 /// including its markers is removed.
-pub fn delete_applied_bullet(
-    file_content: &str,
-    section_title: &str,
-    bullet_text: &str,
-) -> String {
+pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_text: &str) -> String {
     let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
         return file_content.to_string();
     };
@@ -2678,9 +2677,7 @@ pub fn delete_applied_bullet(
         return file_content.to_string();
     }
 
-    let any_sections = out_lines
-        .iter()
-        .any(|l| l.trim_start().starts_with("### "));
+    let any_sections = out_lines.iter().any(|l| l.trim_start().starts_with("### "));
     if !any_sections {
         let mut rewritten = String::with_capacity(before.len() + after.len());
         rewritten.push_str(before.trim_end_matches('\n'));
@@ -3136,10 +3133,10 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, rtk_distribution_artifact, run_command,
-        requirements_lock_sha, sanitize_log_variant, sha256_bytes, verify_sha256_file,
-        CommandFailure, HeadroomRelease,
-        ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT, RTK_VERSION,
+        read_headroom_learn_metadata_from_path, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure,
+        HeadroomRelease, ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
+        RTK_VERSION,
     };
 
     #[test]
@@ -3154,7 +3151,8 @@ mod tests {
         // A real version bump changes the hash.
         assert_ne!(requirements_lock_sha(a), requirements_lock_sha(c));
         // Adding/removing a comment or blank line must not change the hash.
-        let a_more_comments = "# header one\n# extra note\n\n\nabsl-py==2.4.0\n# inline\naiohttp==3.13.5\n";
+        let a_more_comments =
+            "# header one\n# extra note\n\n\nabsl-py==2.4.0\n# inline\naiohttp==3.13.5\n";
         assert_eq!(
             requirements_lock_sha(a),
             requirements_lock_sha(a_more_comments)
@@ -3651,7 +3649,8 @@ after
 
     #[test]
     fn delete_applied_bullet_is_noop_when_bullet_missing() {
-        let content = "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
+        let content =
+            "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
         let out = super::delete_applied_bullet(content, "Foo", "not-there");
         assert_eq!(out, content);
     }

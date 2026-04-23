@@ -51,7 +51,10 @@ mod tests {
     #[test]
     fn fresh_token_returns_value() {
         let t = BearerToken::new("secret-abc".into());
-        assert_eq!(t.value_if_fresh(Duration::from_secs(60)), Some("secret-abc"));
+        assert_eq!(
+            t.value_if_fresh(Duration::from_secs(60)),
+            Some("secret-abc")
+        );
     }
 
     #[test]
