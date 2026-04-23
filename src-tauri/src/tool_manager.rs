@@ -22,10 +22,10 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.9.7";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/55/9c/807a44f609b0a2fd617c47b4e709a125123ecb9b30afc1339410fc8a745a/headroom_ai-0.9.7-py3-none-any.whl";
+const HEADROOM_PINNED_VERSION: &str = "0.10.4";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/f0/a8/7626d0f8ca0d434d61c854bc417853465a0da06e4334b9f2cdf7c7ddf9c5/headroom_ai-0.10.4-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "146e45d85b0a53f35617862d0a715a9cc1308978870c413f121382a1dc0e379f";
+    "5b2b789303f6424e4ce7671ffe8818da710cb7c315dd95ab928ef27249d56dd6";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.

@@ -619,7 +619,7 @@ impl AppState {
         self.set_upgrade_progress(|p| {
             p.current_step = "Verifying update".into();
             p.message =
-                "Launching Headroom and waiting for it to respond. This can take a minute on first run — Headroom may need to download its ML models.".into();
+                "Launching updated Headroom. This can take a minute — Headroom may need to download new ML models.".into();
             p.overall_percent = 97;
         });
         emit_runtime_upgrade_progress(app, self);
