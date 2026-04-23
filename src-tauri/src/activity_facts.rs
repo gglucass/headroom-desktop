@@ -6,9 +6,8 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent, PromptRecordEvent,
-    RecordEvent, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
-    WeeklyRecapEvent,
+    ActivityEvent, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent, RecordEvent, RecordTag,
+    RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
@@ -27,9 +26,7 @@ pub(crate) fn is_high_signal(event: &ActivityEvent) -> bool {
         | ActivityEvent::Memory(_)
         | ActivityEvent::RtkBatch(_) => false,
         ActivityEvent::Milestone(_)
-        | ActivityEvent::DailyRecord(_)
-        | ActivityEvent::AllTimeRecord(_)
-        | ActivityEvent::PromptAllTimeRecord(_)
+        | ActivityEvent::Record(_)
         | ActivityEvent::NewModel(_)
         | ActivityEvent::Streak(_)
         | ActivityEvent::SavingsMilestone(_)
@@ -282,21 +279,23 @@ impl ActivityFacts {
     }
 
     pub fn recent_events(&self) -> Vec<ActivityEvent> {
-        // Defense against any residual duplication: if multiple DailyRecord
-        // events share the same day, keep only the most recent one (highest
-        // observed_at). Walk newest-first, remember days we've already emitted
-        // a DailyRecord for, and drop subsequent ones. Works even if a new
-        // bug re-introduces duplicates — the UI always sees one row per day.
+        // Defense against any residual duplication: if multiple Record events
+        // tagged Daily share the same day, keep only the most recent one
+        // (highest observed_at). Walk newest-first, remember days we've
+        // already emitted a Daily-tagged Record for, and drop subsequent
+        // ones. Turn-only Records don't carry a day tag and aren't filtered.
         let mut seen_dr_days: BTreeSet<String> = BTreeSet::new();
         let mut kept_rev: Vec<ActivityEvent> = Vec::with_capacity(self.recent_events.len());
         for event in self.recent_events.iter().rev() {
-            if let ActivityEvent::DailyRecord(rec) = event {
-                let day = rec
-                    .day
-                    .clone()
-                    .unwrap_or_else(|| rec.observed_at.format("%Y-%m-%d").to_string());
-                if !seen_dr_days.insert(day) {
-                    continue;
+            if let ActivityEvent::Record(rec) = event {
+                if rec.tags.contains(&RecordTag::Daily) {
+                    let day = rec
+                        .day
+                        .clone()
+                        .unwrap_or_else(|| rec.observed_at.format("%Y-%m-%d").to_string());
+                    if !seen_dr_days.insert(day) {
+                        continue;
+                    }
                 }
             }
             kept_rev.push(event.clone());
@@ -357,12 +356,16 @@ impl ActivityFacts {
         if let Some(tokens) = tokens_saved {
             let today = now.format("%Y-%m-%d").to_string();
             let event_day = observed_at.format("%Y-%m-%d").to_string();
-            // Only track + celebrate DailyRecord for events that happened today.
-            // The proxy's feed is a sliding window that re-returns historical
-            // transformations on every poll. Without this guard, each day
-            // boundary in the feed oscillates `daily_record` and emits a fresh
-            // (duplicate) DailyRecord event on every poll — which stacks up
-            // in `recent_events` and shows the user the same record N times.
+            let mut tags: Vec<RecordTag> = Vec::new();
+            let mut all_time_previous: Option<u64> = None;
+
+            // Only track + celebrate a Daily record for events that happened
+            // today. The proxy's feed is a sliding window that re-returns
+            // historical transformations on every poll. Without this guard,
+            // each day boundary in the feed oscillates `daily_record` and
+            // emits a fresh (duplicate) Daily-tagged Record on every poll —
+            // which stacks up in `recent_events` and shows the user the same
+            // record N times.
             if event_day == today {
                 let beats_day = match &self.daily_record {
                     Some(existing) if existing.day == today => tokens > existing.tokens_saved,
@@ -378,17 +381,7 @@ impl ActivityFacts {
                         request_id: event.request_id.clone(),
                         savings_percent: event.savings_percent,
                     });
-                    emitted.push(ActivityEvent::DailyRecord(RecordEvent {
-                        observed_at,
-                        tokens_saved: tokens,
-                        savings_percent: event.savings_percent,
-                        model: event.model.clone(),
-                        provider: event.provider.clone(),
-                        request_id: event.request_id.clone(),
-                        previous_record: None,
-                        day: Some(today),
-                        workspace: event.workspace.clone(),
-                    }));
+                    tags.push(RecordTag::Daily);
                 }
             }
 
@@ -399,12 +392,14 @@ impl ActivityFacts {
                 } else {
                     Some(previous_tokens)
                 };
-                // Debounce celebratory AllTimeRecord events: once we've
-                // emitted a card, the bar is already raised — a heavy session
-                // that keeps nudging the record up shouldn't spam the feed.
-                // Suppress follow-ups within 24h unless the new record beats
-                // the previous by a meaningful margin (>=25%). The counter
-                // still updates silently so the underlying number stays true.
+                // Debounce celebratory AllTime records: once we've emitted a
+                // card, the bar is already raised — a heavy session that keeps
+                // nudging the record up shouldn't spam the feed. Suppress
+                // follow-ups within 24h unless the new record beats the
+                // previous by a meaningful margin (>=25%). The counter still
+                // updates silently so the underlying number stays true. When
+                // suppressed we omit the AllTime tag but still emit a Record
+                // if Daily also applies.
                 let suppress = match (previous, self.all_time_record_emitted_at) {
                     (Some(prev), Some(prev_at)) => {
                         let within_24h =
@@ -417,18 +412,31 @@ impl ActivityFacts {
                 self.all_time_record_tokens = tokens;
                 if !suppress {
                     self.all_time_record_emitted_at = Some(now);
-                    emitted.push(ActivityEvent::AllTimeRecord(RecordEvent {
-                        observed_at,
-                        tokens_saved: tokens,
-                        savings_percent: event.savings_percent,
-                        model: event.model.clone(),
-                        provider: event.provider.clone(),
-                        request_id: event.request_id.clone(),
-                        previous_record: previous,
-                        day: None,
-                        workspace: event.workspace.clone(),
-                    }));
+                    tags.push(RecordTag::AllTime);
+                    all_time_previous = previous;
                 }
+            }
+
+            if !tags.is_empty() {
+                let day = if tags.contains(&RecordTag::Daily) {
+                    Some(today)
+                } else {
+                    None
+                };
+                emitted.push(ActivityEvent::Record(RecordEvent {
+                    observed_at,
+                    tags,
+                    tokens_saved: tokens,
+                    savings_percent: event.savings_percent,
+                    model: event.model.clone(),
+                    provider: event.provider.clone(),
+                    request_id: event.request_id.clone(),
+                    previous_record: all_time_previous,
+                    day,
+                    workspace: event.workspace.clone(),
+                    turn_id: None,
+                    call_count: None,
+                }));
             }
         }
 
@@ -503,18 +511,23 @@ impl ActivityFacts {
         }
         let emitted = if should_emit {
             acc.record_emitted = true;
-            Some(ActivityEvent::PromptAllTimeRecord(PromptRecordEvent {
+            Some(ActivityEvent::Record(RecordEvent {
                 observed_at,
+                tags: vec![RecordTag::Turn],
                 tokens_saved: acc.tokens_saved,
-                call_count: acc.call_count,
+                savings_percent: None,
+                model: acc.model.clone(),
+                provider: None,
+                request_id: None,
                 previous_record: if previous_record == 0 {
                     None
                 } else {
                     Some(previous_record)
                 },
-                turn_id: turn_id.clone(),
-                model: acc.model.clone(),
+                day: None,
                 workspace: acc.workspace.clone(),
+                turn_id: Some(turn_id.clone()),
+                call_count: Some(acc.call_count),
             }))
         } else {
             None
@@ -852,6 +865,18 @@ mod tests {
             .any(|e| matches!(e, ActivityEvent::NewModel(_))));
     }
 
+    fn is_daily_record(e: &ActivityEvent) -> bool {
+        matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Daily))
+    }
+
+    fn is_all_time_record(e: &ActivityEvent) -> bool {
+        matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::AllTime))
+    }
+
+    fn is_turn_record(e: &ActivityEvent) -> bool {
+        matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn))
+    }
+
     #[test]
     fn daily_record_updates_only_on_beat_and_resets_on_day_change() {
         let (_tmp, base) = base_dir();
@@ -861,26 +886,20 @@ mod tests {
             at(10, 0),
             at(10, 0),
         );
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::DailyRecord(_))));
+        assert!(events.iter().any(is_daily_record));
         let events2 = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(200), Some(20.0)),
             at(10, 1),
             at(10, 1),
         );
-        assert!(!events2
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::DailyRecord(_))));
+        assert!(!events2.iter().any(is_daily_record));
         let next_day = Utc.with_ymd_and_hms(2026, 4, 23, 1, 0, 0).unwrap();
         let events3 = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(100), Some(10.0)),
             next_day,
             next_day,
         );
-        assert!(events3
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::DailyRecord(_))));
+        assert!(events3.iter().any(is_daily_record));
     }
 
     #[test]
@@ -923,9 +942,7 @@ mod tests {
                 today,
             );
             assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, ActivityEvent::DailyRecord(_))),
+                !events.iter().any(is_daily_record),
                 "re-observing same tx (obs_at={obs_at}) must not re-fire DailyRecord",
             );
         }
@@ -942,6 +959,7 @@ mod tests {
         let obs_late = Utc.with_ymd_and_hms(2026, 4, 22, 15, 0, 0).unwrap();
         let mk = |obs: DateTime<Utc>, tokens: u64| RecordEvent {
             observed_at: obs,
+            tags: vec![RecordTag::Daily],
             tokens_saved: tokens,
             savings_percent: Some(10.0),
             model: Some("a".into()),
@@ -950,19 +968,21 @@ mod tests {
             previous_record: None,
             day: Some("2026-04-22".into()),
             workspace: None,
+            turn_id: None,
+            call_count: None,
         };
         facts
             .recent_events
-            .push_back(ActivityEvent::DailyRecord(mk(obs_early, 100)));
+            .push_back(ActivityEvent::Record(mk(obs_early, 100)));
         facts
             .recent_events
-            .push_back(ActivityEvent::DailyRecord(mk(obs_late, 200)));
+            .push_back(ActivityEvent::Record(mk(obs_late, 200)));
 
         let visible = facts.recent_events();
         let drs: Vec<_> = visible
             .iter()
             .filter_map(|e| match e {
-                ActivityEvent::DailyRecord(r) => Some(r),
+                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Daily) => Some(r),
                 _ => None,
             })
             .collect();
@@ -1096,7 +1116,7 @@ mod tests {
         let record = events
             .iter()
             .find_map(|e| match e {
-                ActivityEvent::AllTimeRecord(r) => Some(r),
+                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::AllTime) => Some(r),
                 _ => None,
             })
             .expect("all-time record event");
@@ -1120,9 +1140,7 @@ mod tests {
             t0,
             t0,
         );
-        assert!(first
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))));
+        assert!(first.iter().any(is_all_time_record));
 
         let second = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(1_005), Some(50.0)),
@@ -1130,9 +1148,7 @@ mod tests {
             t1,
         );
         assert!(
-            !second
-                .iter()
-                .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))),
+            !second.iter().any(is_all_time_record),
             "0.5% beat within 24h should be suppressed",
         );
         assert_eq!(
@@ -1160,9 +1176,7 @@ mod tests {
             t_delta,
             t_delta,
         );
-        assert!(big
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))));
+        assert!(big.iter().any(is_all_time_record));
 
         // Tiny beat but > 24 hours later → emits.
         let t_late = t_delta + Duration::hours(24) + Duration::minutes(1);
@@ -1171,9 +1185,7 @@ mod tests {
             t_late,
             t_late,
         );
-        assert!(late
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::AllTimeRecord(_))));
+        assert!(late.iter().any(is_all_time_record));
     }
 
     fn mk_turn(turn_id: &str, request_id: &str, tokens_saved: i64) -> TransformationFeedEvent {
@@ -1194,39 +1206,35 @@ mod tests {
         let first_rec = first
             .iter()
             .find_map(|e| match e {
-                ActivityEvent::PromptAllTimeRecord(r) => Some(r),
+                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn) => Some(r),
                 _ => None,
             })
             .expect("initial record event");
         assert_eq!(first_rec.tokens_saved, 500);
-        assert_eq!(first_rec.call_count, 1);
+        assert_eq!(first_rec.call_count, Some(1));
         assert_eq!(first_rec.previous_record, None);
-        assert_eq!(first_rec.turn_id, "turn-A");
+        assert_eq!(first_rec.turn_id.as_deref(), Some("turn-A"));
 
         // Start a second turn. First call: 300 (under record of 500). Second
         // call same turn: +400 = 700 total, beats the 500 record.
         let second = facts.observe_transformation(&mk_turn("turn-B", "req-2", 300), at(10, 1));
-        assert!(!second
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::PromptAllTimeRecord(_))));
+        assert!(!second.iter().any(is_turn_record));
         let third = facts.observe_transformation(&mk_turn("turn-B", "req-3", 400), at(10, 2));
         let rec = third
             .iter()
             .find_map(|e| match e {
-                ActivityEvent::PromptAllTimeRecord(r) => Some(r),
+                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn) => Some(r),
                 _ => None,
             })
             .expect("prompt record event");
         assert_eq!(rec.tokens_saved, 700);
-        assert_eq!(rec.call_count, 2);
+        assert_eq!(rec.call_count, Some(2));
         assert_eq!(rec.previous_record, Some(500));
-        assert_eq!(rec.turn_id, "turn-B");
+        assert_eq!(rec.turn_id.as_deref(), Some("turn-B"));
 
         // Further growth within the same turn must NOT re-emit.
         let fourth = facts.observe_transformation(&mk_turn("turn-B", "req-4", 100), at(10, 3));
-        assert!(!fourth
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::PromptAllTimeRecord(_))));
+        assert!(!fourth.iter().any(is_turn_record));
         // But the persisted record should reflect the new total.
         assert_eq!(facts.prompt_all_time_record_tokens, 800);
     }
@@ -1255,10 +1263,33 @@ mod tests {
             &mk_transformation(Some("a"), Some(5000), Some(50.0)),
             at(10, 0),
         );
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::PromptAllTimeRecord(_))));
+        assert!(!events.iter().any(is_turn_record));
         assert_eq!(facts.prompt_all_time_record_tokens, 0);
+    }
+
+    #[test]
+    fn single_transformation_beating_daily_and_all_time_emits_one_record_with_both_tags() {
+        // A single transformation that qualifies for Daily and All-time must
+        // produce exactly one Record event carrying both tags — not two.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
+        let events = facts.observe_transformation_at(
+            &mk_transformation(Some("a"), Some(10_000), Some(80.0)),
+            t,
+            t,
+        );
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ActivityEvent::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 1, "must emit exactly one Record");
+        assert_eq!(records[0].tags, vec![RecordTag::Daily, RecordTag::AllTime]);
+        assert_eq!(records[0].tokens_saved, 10_000);
+        assert!(records[0].day.is_some());
     }
 
     #[test]
@@ -1565,25 +1596,16 @@ mod tests {
             new_model.workspace.as_deref(),
             Some("/Users/u/Code/demo-repo")
         );
-        let daily = events
+        let record = events
             .iter()
             .find_map(|e| match e {
-                ActivityEvent::DailyRecord(r) => Some(r),
+                ActivityEvent::Record(r) => Some(r),
                 _ => None,
             })
-            .expect("daily record");
-        assert_eq!(daily.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
-        let all_time = events
-            .iter()
-            .find_map(|e| match e {
-                ActivityEvent::AllTimeRecord(r) => Some(r),
-                _ => None,
-            })
-            .expect("all-time record");
-        assert_eq!(
-            all_time.workspace.as_deref(),
-            Some("/Users/u/Code/demo-repo")
-        );
+            .expect("record event");
+        assert!(record.tags.contains(&RecordTag::Daily));
+        assert!(record.tags.contains(&RecordTag::AllTime));
+        assert_eq!(record.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
     }
 
     #[test]

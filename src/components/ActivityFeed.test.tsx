@@ -8,7 +8,6 @@ import type {
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
-  PromptRecordEvent,
   RecordEvent,
   RtkBatchEvent,
   SavingsMilestoneEvent,
@@ -142,6 +141,44 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Kompress user (0.45x)");
     expect(markup).toContain("Inserted 3 cache breakpoints");
     expect(markup).toContain("Cache aligned");
+  });
+
+  it("shows an estimated dollar savings alongside tokens saved", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          model: "claude-sonnet-4-6",
+          tokensSaved: 750_000,
+          savingsPercent: 75
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    // sonnet: $3/M × 0.75M = $2.25
+    expect(markup).toContain("~$2.25");
+  });
+
+  it("surfaces file paths from enriched read_lifecycle tags in the detail view", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        transformation({
+          transformsApplied: [
+            "read_lifecycle:stale:/src/App.tsx",
+            "read_lifecycle:stale:/src/lib/foo.ts",
+            "tool_crush:2:Bash,Grep"
+          ]
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("/src/App.tsx");
+    expect(markup).toContain("/src/lib/foo.ts");
+    expect(markup).toContain("Bash,Grep");
+    // Chip row still collapses to per-label count regardless of target count.
+    expect(markup).toContain("Stale Read × 2");
+    expect(markup).toContain("Crushed 2 tools");
   });
 
   it("falls back to the raw transform string when unknown", () => {
@@ -325,6 +362,7 @@ describe("ActivityFeed", () => {
   it("renders a daily record row with model and savings percent", () => {
     const data: RecordEvent = {
       observedAt: "2026-04-21T09:00:00Z",
+      tags: ["daily"],
       tokensSaved: 7500,
       savingsPercent: 82.5,
       model: "claude-opus-4-7",
@@ -335,10 +373,12 @@ describe("ActivityFeed", () => {
     };
     const feed: ActivityFeedResponse = {
       ...baseFeed,
-      events: [{ kind: "dailyRecord", data }]
+      events: [{ kind: "record", data }]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Daily record");
+    expect(markup).toContain(">Record<");
+    expect(markup).toContain(">Daily<");
+    expect(markup).not.toContain(">All-time<");
     expect(markup).toContain("claude-opus-4-7");
     expect(markup).toContain("Saved 7,500 tokens (82.5%)");
   });
@@ -346,6 +386,7 @@ describe("ActivityFeed", () => {
   it("renders an all-time record row with the previous record delta", () => {
     const data: RecordEvent = {
       observedAt: "2026-04-21T09:00:00Z",
+      tags: ["allTime"],
       tokensSaved: 12000,
       savingsPercent: 91,
       model: "claude-opus-4-7",
@@ -356,12 +397,37 @@ describe("ActivityFeed", () => {
     };
     const feed: ActivityFeedResponse = {
       ...baseFeed,
-      events: [{ kind: "allTimeRecord", data }]
+      events: [{ kind: "record", data }]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("All-time record");
+    expect(markup).toContain(">Record<");
+    expect(markup).toContain(">All-time<");
     expect(markup).toContain("Saved 12,000 tokens (91.0%)");
     expect(markup).toContain("previous record 9,500");
+  });
+
+  it("renders a record row that qualifies for both daily and all-time with both tags", () => {
+    const data: RecordEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      tags: ["daily", "allTime"],
+      tokensSaved: 15000,
+      savingsPercent: 88.2,
+      model: "claude-opus-4-7",
+      provider: "anthropic",
+      requestId: "r-77",
+      previousRecord: 10000,
+      day: "2026-04-21"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "record", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain(">Record<");
+    expect(markup).toContain(">Daily<");
+    expect(markup).toContain(">All-time<");
+    expect(markup).toContain("Saved 15,000 tokens (88.2%)");
+    expect(markup).toContain("previous record 10,000");
   });
 
   it("renders a new model row with model and provider", () => {
@@ -576,13 +642,13 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__transforms");
   });
 
-  it("paginates at 10 rows per page and shows navigation when there are more", () => {
+  it("paginates at 5 rows per page and shows navigation when there are more", () => {
     // Memory rows coalesce into groups when 3+ land within COALESCE_GAP_MS of
-    // each other, so this fixture spaces them 45 minutes apart to keep every
-    // entry as its own row. All 23 entries share the same local day, so one
-    // day header is inserted at the top of page 1 and page 1 ends up with 9
-    // item rows + 1 header = 10 rows total.
-    const events: ActivityEvent[] = Array.from({ length: 23 }, (_, i) => {
+    // each other, so this fixture spaces them 35 minutes apart to keep every
+    // entry as its own row. All 13 entries share the same local day, so one
+    // day header is inserted at the top of page 1 and page 1 ends up with 4
+    // item rows + 1 header = 5 rows total.
+    const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
       const minutes = i * 35;
       const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
       const mm = String(minutes % 60).padStart(2, "0");
@@ -592,15 +658,15 @@ describe("ActivityFeed", () => {
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
     const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
-    expect(itemCount + headerCount).toBe(10);
+    expect(itemCount + headerCount).toBe(5);
     expect(headerCount).toBe(1);
     expect(markup).toContain("Page 1 of 3");
     expect(markup).toContain("← Prev");
     expect(markup).toContain("Next →");
   });
 
-  it("hides pagination when there are 10 or fewer events", () => {
-    const events: ActivityEvent[] = Array.from({ length: 7 }, (_, i) =>
+  it("hides pagination when there are 5 or fewer events", () => {
+    const events: ActivityEvent[] = Array.from({ length: 4 }, (_, i) =>
       memory({ id: `mem-${i}`, createdAt: `2026-04-21T${10 + i}:00:00Z` })
     );
     const feed: ActivityFeedResponse = { ...baseFeed, events };
@@ -765,41 +831,52 @@ describe("ActivityFeed", () => {
     expect(markup).toContain(">demo<");
   });
 
-  it("renders a promptAllTimeRecord row with totals, call count, and previous record", () => {
-    const data: PromptRecordEvent = {
+  it("renders a turn record row with totals, call count, and previous record", () => {
+    const data: RecordEvent = {
       observedAt: "2026-04-22T10:00:00Z",
+      tags: ["turn"],
       tokensSaved: 3_210,
-      callCount: 4,
-      previousRecord: 2_500,
-      turnId: "turn-X",
+      savingsPercent: null,
       model: "claude-opus-4-7",
+      provider: null,
+      requestId: null,
+      previousRecord: 2_500,
+      day: null,
+      turnId: "turn-X",
+      callCount: 4,
       workspace: "/Users/u/Code/demo"
     };
     const feed: ActivityFeedResponse = {
       ...baseFeed,
-      events: [{ kind: "promptAllTimeRecord", data }]
+      events: [{ kind: "record", data }]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("All-time record (prompt)");
+    expect(markup).toContain(">Record<");
+    expect(markup).toContain(">Turn<");
     expect(markup).toContain("Saved 3,210 tokens across 4 calls");
     expect(markup).toContain("previous record 2,500");
     expect(markup).toContain(">demo<");
     expect(markup).toContain(">claude-opus-4-7<");
   });
 
-  it("renders a promptAllTimeRecord row without previous/workspace when null", () => {
-    const data: PromptRecordEvent = {
+  it("renders a turn record row without previous/workspace when null", () => {
+    const data: RecordEvent = {
       observedAt: "2026-04-22T10:00:00Z",
+      tags: ["turn"],
       tokensSaved: 100,
-      callCount: 1,
-      previousRecord: null,
-      turnId: "turn-Y",
+      savingsPercent: null,
       model: null,
+      provider: null,
+      requestId: null,
+      previousRecord: null,
+      day: null,
+      turnId: "turn-Y",
+      callCount: 1,
       workspace: null
     };
     const feed: ActivityFeedResponse = {
       ...baseFeed,
-      events: [{ kind: "promptAllTimeRecord", data }]
+      events: [{ kind: "record", data }]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Saved 100 tokens across 1 call");
@@ -817,7 +894,7 @@ describe("groupTransforms", () => {
   it("returns a single entry with count 1 for a unique raw", () => {
     const result = groupTransforms(["cache_align"]);
     expect(result).toEqual([
-      { label: "Cache aligned", title: expect.any(String), count: 1 }
+      { label: "Cache aligned", title: expect.any(String), count: 1, targets: [] }
     ]);
   });
 
@@ -841,5 +918,51 @@ describe("groupTransforms", () => {
     const result = groupTransforms(["cache_align", "cache_align"]);
     expect(result).toHaveLength(1);
     expect(result[0].count).toBe(2);
+  });
+
+  it("accumulates unique file paths from enriched read_lifecycle tags", () => {
+    // New proxy format: read_lifecycle:<state>:<file_path>. Two stale reads
+    // on the same file dedupe to one target; different files accumulate.
+    const result = groupTransforms([
+      "read_lifecycle:stale:/src/App.tsx",
+      "read_lifecycle:stale:/src/App.tsx",
+      "read_lifecycle:stale:/src/lib/foo.ts"
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].label).toBe("Stale Read");
+    expect(result[0].count).toBe(3);
+    expect(result[0].targets).toEqual(["/src/App.tsx", "/src/lib/foo.ts"]);
+  });
+
+  it("preserves colons in file paths when parsing read_lifecycle tags", () => {
+    // A 3-part split ensures paths containing ':' aren't truncated.
+    const result = groupTransforms(["read_lifecycle:stale:/tmp/has:colon/x.py"]);
+    expect(result[0].targets).toEqual(["/tmp/has:colon/x.py"]);
+  });
+
+  it("groups legacy and enriched read_lifecycle tags together", () => {
+    // During a rolling proxy upgrade both forms may appear in the same
+    // request — both should land in the same "Stale Read" group.
+    const result = groupTransforms([
+      "read_lifecycle:stale",
+      "read_lifecycle:stale:/src/App.tsx"
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].label).toBe("Stale Read");
+    expect(result[0].count).toBe(2);
+    expect(result[0].targets).toEqual(["/src/App.tsx"]);
+  });
+
+  it("extracts tool names from enriched tool_crush tags", () => {
+    const result = groupTransforms(["tool_crush:3:Bash,Read,Grep"]);
+    expect(result).toHaveLength(1);
+    expect(result[0].label).toBe("Crushed 3 tools");
+    expect(result[0].targets).toEqual(["Bash,Read,Grep"]);
+  });
+
+  it("leaves targets empty for legacy tool_crush tags without names", () => {
+    const result = groupTransforms(["tool_crush:5"]);
+    expect(result[0].label).toBe("Crushed 5 tools");
+    expect(result[0].targets).toEqual([]);
   });
 });

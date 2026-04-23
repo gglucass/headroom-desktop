@@ -400,10 +400,20 @@ pub struct MilestoneEvent {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum RecordTag {
+    Daily,
+    Weekly,
+    AllTime,
+    Turn,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordEvent {
     pub observed_at: DateTime<Utc>,
+    pub tags: Vec<RecordTag>,
     pub tokens_saved: u64,
     pub savings_percent: Option<f64>,
     pub model: Option<String>,
@@ -413,19 +423,10 @@ pub struct RecordEvent {
     pub day: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptRecordEvent {
-    pub observed_at: DateTime<Utc>,
-    pub tokens_saved: u64,
-    pub call_count: u32,
-    pub previous_record: Option<u64>,
-    pub turn_id: String,
-    pub model: Option<String>,
     #[serde(default)]
-    pub workspace: Option<String>,
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub call_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,12 +485,8 @@ pub enum ActivityEvent {
     RtkBatch(RtkBatchEvent),
     #[serde(rename = "milestone")]
     Milestone(MilestoneEvent),
-    #[serde(rename = "dailyRecord")]
-    DailyRecord(RecordEvent),
-    #[serde(rename = "allTimeRecord")]
-    AllTimeRecord(RecordEvent),
-    #[serde(rename = "promptAllTimeRecord")]
-    PromptAllTimeRecord(PromptRecordEvent),
+    #[serde(rename = "record")]
+    Record(RecordEvent),
     #[serde(rename = "newModel")]
     NewModel(NewModelEvent),
     #[serde(rename = "streak")]

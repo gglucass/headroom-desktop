@@ -1459,9 +1459,7 @@ fn activity_event_timestamp(event: &ActivityEvent) -> String {
         ActivityEvent::Memory(m) => m.created_at.clone(),
         ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::PromptAllTimeRecord(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
@@ -3211,7 +3209,7 @@ mod tests {
     };
     use crate::models::{
         ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent,
-        RecordEvent, RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
+        RecordEvent, RecordTag, RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use chrono::{DateTime, TimeZone, Timelike, Utc};
     use serde_json::json;
@@ -3965,9 +3963,7 @@ mod tests {
             ActivityEvent::Memory(m) => m.created_at.clone(),
             ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::DailyRecord(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::AllTimeRecord(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::PromptAllTimeRecord(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
@@ -4170,8 +4166,9 @@ mod tests {
                 total_commands: 100,
                 total_saved: 50_000,
             }),
-            ActivityEvent::AllTimeRecord(RecordEvent {
+            ActivityEvent::Record(RecordEvent {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 0, 0).unwrap(),
+                tags: vec![RecordTag::AllTime],
                 tokens_saved: 9_999,
                 savings_percent: Some(88.0),
                 model: Some("claude-opus-4-7".into()),
@@ -4180,6 +4177,8 @@ mod tests {
                 previous_record: Some(500),
                 day: None,
                 workspace: None,
+                turn_id: None,
+                call_count: None,
             }),
         ];
 
@@ -4195,9 +4194,7 @@ mod tests {
                 ActivityEvent::Memory(_) => "memory",
                 ActivityEvent::RtkBatch(_) => "rtkBatch",
                 ActivityEvent::Milestone(_) => "milestone",
-                ActivityEvent::DailyRecord(_) => "dailyRecord",
-                ActivityEvent::AllTimeRecord(_) => "allTimeRecord",
-                ActivityEvent::PromptAllTimeRecord(_) => "promptAllTimeRecord",
+                ActivityEvent::Record(_) => "record",
                 ActivityEvent::NewModel(_) => "newModel",
                 ActivityEvent::Streak(_) => "streak",
                 ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
@@ -4211,7 +4208,7 @@ mod tests {
                 "milestone",
                 "rtkBatch",
                 "memory",
-                "allTimeRecord",
+                "record",
                 "transformation",
                 "newModel",
             ]

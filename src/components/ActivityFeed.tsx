@@ -2,6 +2,7 @@ import { useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "rea
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
+import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
@@ -9,8 +10,8 @@ import type {
   MemoryFeedEvent,
   MilestoneEvent,
   NewModelEvent,
-  PromptRecordEvent,
   RecordEvent,
+  RecordTag,
   RtkBatchEvent,
   SavingsMilestoneEvent,
   StreakEvent,
@@ -33,7 +34,7 @@ interface ActivityFeedProps {
   projectPaths?: string[];
 }
 
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 5;
 const MIN_MEMORY_EVIDENCE = 2;
 
 export function ActivityFeed({
@@ -200,9 +201,7 @@ function eventTimestampMs(event: ActivityEvent): number {
       return Date.parse(event.data.createdAt) || 0;
     case "rtkBatch":
     case "milestone":
-    case "dailyRecord":
-    case "allTimeRecord":
-    case "promptAllTimeRecord":
+    case "record":
     case "newModel":
     case "streak":
     case "savingsMilestone":
@@ -335,12 +334,11 @@ function singleKey(event: ActivityEvent, index: number): string {
       return `rtk-${event.data.observedAt}`;
     case "milestone":
       return `ms-${event.data.milestoneTokensSaved}-${event.data.observedAt}`;
-    case "dailyRecord":
-      return `dr-${event.data.day ?? ""}-${event.data.observedAt}`;
-    case "allTimeRecord":
-      return `atr-${event.data.tokensSaved}-${event.data.observedAt}`;
-    case "promptAllTimeRecord":
-      return `patr-${event.data.turnId}-${event.data.observedAt}`;
+    case "record": {
+      const id =
+        event.data.requestId ?? event.data.turnId ?? event.data.observedAt;
+      return `rec-${event.data.tags.join(",")}-${id}`;
+    }
     case "newModel":
       return `nm-${event.data.model}-${event.data.observedAt}`;
     case "streak":
@@ -378,12 +376,8 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
       return <RtkBatchRow event={event.data} />;
     case "milestone":
       return <MilestoneRow event={event.data} />;
-    case "dailyRecord":
-      return <RecordRow event={event.data} kind="daily" />;
-    case "allTimeRecord":
-      return <RecordRow event={event.data} kind="allTime" />;
-    case "promptAllTimeRecord":
-      return <PromptRecordRow event={event.data} />;
+    case "record":
+      return <RecordRow event={event.data} />;
     case "newModel":
       return <NewModelRow event={event.data} />;
     case "streak":
@@ -594,19 +588,17 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
     event.inputTokensOriginal != null && event.inputTokensOptimized != null;
   const hasRequestId = !!event.requestId;
   const hasRawTransforms = event.transformsApplied.length > 0;
-  const hasExtra = hasRequestId || hasRawTransforms || event.workspace != null;
+  const groups = hasRawTransforms ? groupTransforms(event.transformsApplied) : [];
+  const groupsWithTargets = groups.filter((g) => g.targets.length > 0);
+  const estimatedUsd = estimateCostSavingsUsd(event.model, saved);
+  const hasExtra =
+    hasRequestId || hasRawTransforms || event.workspace != null || estimatedUsd != null;
   const detail = hasExtra ? (
     <dl className="activity-feed__detail-grid">
-      {hasRequestId ? (
+      {estimatedUsd != null ? (
         <>
-          <dt>Request ID</dt>
-          <dd className="activity-feed__detail-mono">{event.requestId}</dd>
-        </>
-      ) : null}
-      {event.workspace ? (
-        <>
-          <dt>Workspace</dt>
-          <dd className="activity-feed__detail-mono">{event.workspace}</dd>
+          <dt>Estimated cost saved</dt>
+          <dd>{formatEstimatedUsd(estimatedUsd)}</dd>
         </>
       ) : null}
       {hasExactTokens ? (
@@ -618,12 +610,33 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
           </dd>
         </>
       ) : null}
-      {hasRawTransforms ? (
+      {groupsWithTargets.length > 0 ? (
         <>
-          <dt>Raw transforms</dt>
-          <dd className="activity-feed__detail-mono">
-            {event.transformsApplied.join(", ")}
+          <dt>What was touched</dt>
+          <dd>
+            <ul className="activity-feed__targets">
+              {groupsWithTargets.map((grp) => (
+                <li key={grp.label} className="activity-feed__target">
+                  <span className="activity-feed__target-label">{grp.label}</span>
+                  <span className="activity-feed__target-values">
+                    {grp.targets.join(", ")}
+                  </span>
+                </li>
+              ))}
+            </ul>
           </dd>
+        </>
+      ) : null}
+      {event.workspace ? (
+        <>
+          <dt>Workspace</dt>
+          <dd className="activity-feed__detail-mono">{event.workspace}</dd>
+        </>
+      ) : null}
+      {hasRequestId ? (
+        <>
+          <dt>Request ID</dt>
+          <dd className="activity-feed__detail-mono">{event.requestId}</dd>
         </>
       ) : null}
     </dl>
@@ -647,6 +660,12 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
           Saved {saved.toLocaleString()} tokens ({pct.toFixed(1)}%)
+          {estimatedUsd != null ? (
+            <span className="activity-feed__savings-usd">
+              {" "}
+              · {formatEstimatedUsd(estimatedUsd)}
+            </span>
+          ) : null}
         </strong>
         {hasExactTokens ? (
           <span className="activity-feed__delta">
@@ -657,11 +676,11 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
       </div>
       {hasRawTransforms ? (
         <ul className="activity-feed__transforms">
-          {groupTransforms(event.transformsApplied).map((grp) => (
+          {groups.map((grp) => (
             <li
               key={grp.label}
               className="activity-feed__transform"
-              title={grp.count > 1 ? `${grp.title} (${grp.count} times)` : grp.title}
+              title={chipTitle(grp)}
             >
               {grp.count > 1 ? `${grp.label} × ${grp.count}` : grp.label}
             </li>
@@ -672,6 +691,15 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   );
 }
 
+function chipTitle(grp: TransformGroup): string {
+  const base = grp.count > 1 ? `${grp.title} (×${grp.count})` : grp.title;
+  if (grp.targets.length === 0) return base;
+  const preview = grp.targets.slice(0, 3).join(", ");
+  const suffix =
+    grp.targets.length > 3 ? `${preview}, +${grp.targets.length - 3} more` : preview;
+  return `${base} — ${suffix}`;
+}
+
 /**
  * Collapses a transformsApplied list into one entry per friendly label with a
  * count. A single compression that fires 70 "Stale Read"s renders as one
@@ -680,71 +708,103 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
  */
 export function groupTransforms(
   raws: string[]
-): Array<{ label: string; title: string; count: number }> {
-  const byLabel = new Map<string, { label: string; title: string; count: number }>();
+): TransformGroup[] {
+  const byLabel = new Map<string, TransformGroup>();
   for (const raw of raws) {
-    const { label, title } = formatTransform(raw);
+    const { label, title, target } = formatTransform(raw);
     const existing = byLabel.get(label);
     if (existing) {
       existing.count += 1;
+      if (target && !existing.targets.includes(target)) {
+        existing.targets.push(target);
+      }
     } else {
-      byLabel.set(label, { label, title, count: 1 });
+      byLabel.set(label, {
+        label,
+        title,
+        count: 1,
+        targets: target ? [target] : []
+      });
     }
   }
   return Array.from(byLabel.values());
 }
 
-function formatTransform(raw: string): { label: string; title: string } {
-  // Exact-match table for known labels.
+export interface TransformGroup {
+  label: string;
+  title: string;
+  count: number;
+  // Accumulated across all raws that mapped to this label (file paths for
+  // read_lifecycle, tool names for tool_crush, etc.). Empty for transforms
+  // emitted by older proxies that don't carry attribution, and for
+  // transforms that have no meaningful target (e.g. cache_align).
+  targets: string[];
+}
+
+function formatTransform(raw: string): { label: string; title: string; target?: string } {
+  // Exact-match table for known labels (covers older proxies that emit the
+  // un-enriched form, and transforms that have no parameter tail).
   const exact: Record<string, { label: string; title: string }> = {
-    "read_lifecycle:stale": {
-      label: "Stale Read",
-      title: "Read output replaced — file was edited after this Read"
-    },
-    "read_lifecycle:superseded": {
-      label: "Superseded Read",
-      title: "Read output replaced — file was re-Read later in the conversation"
-    },
-    "interceptor:ast-grep": {
-      label: "ast-grep",
-      title: "Tool-result interceptor applied semantic code search"
-    },
-    "router:excluded:tool": {
-      label: "Tool result excluded",
-      title: "Content router excluded a tool result from the prompt"
-    },
+    "read_lifecycle:stale": { label: "Stale Read", title: "file edited after read" },
+    "read_lifecycle:superseded": { label: "Superseded Read", title: "file re-read later" },
+    "interceptor:ast-grep": { label: "ast-grep", title: "semantic code search" },
+    "router:excluded:tool": { label: "Tool result excluded", title: "tool output dropped" },
     "router:protected:user_message": {
       label: "Protected: user message",
-      title: "Content router preserved a user message from compression"
+      title: "user message preserved"
     },
     "router:protected:system_message": {
       label: "Protected: system message",
-      title: "Content router preserved a system message from compression"
+      title: "system message preserved"
     },
     "router:protected:recent_code": {
       label: "Protected: recent code",
-      title: "Content router preserved recent code from compression"
+      title: "recent code preserved"
     },
     "router:protected:analysis_context": {
       label: "Protected: analysis context",
-      title: "Content router preserved analysis context from compression"
+      title: "analysis preserved"
     },
-    cache_align: {
-      label: "Cache aligned",
-      title: "Conversation aligned to a stable cache boundary"
-    }
+    cache_align: { label: "Cache aligned", title: "aligned to cache boundary" }
   };
 
   const hit = exact[raw];
   if (hit) return hit;
 
-  // Prefix patterns with variable tails.
+  // read_lifecycle:<state>:<file_path> — new enriched form from upstream PR.
+  // Bound the split to 3 parts so paths containing `:` survive.
+  if (raw.startsWith("read_lifecycle:")) {
+    const parts = splitColonN(raw, 3);
+    if (parts.length === 3 && parts[2]) {
+      const state = parts[1];
+      const target = parts[2];
+      if (state === "stale") {
+        return { label: "Stale Read", title: "file edited after read", target };
+      }
+      if (state === "superseded") {
+        return { label: "Superseded Read", title: "file re-read later", target };
+      }
+    }
+  }
+
+  // tool_crush:<n>[:<name1,name2,...>]. The tail may be absent when the proxy
+  // couldn't resolve tool names (legacy shape) — fall back to the count-only
+  // label.
+  const crushWithNames = /^tool_crush:(\d+):(.+)$/.exec(raw);
+  if (crushWithNames) {
+    const n = Number(crushWithNames[1]);
+    return {
+      label: `Crushed ${n} tool${n === 1 ? "" : "s"}`,
+      title: "tool outputs compacted",
+      target: crushWithNames[2]
+    };
+  }
   const crush = /^tool_crush:(\d+)$/.exec(raw);
   if (crush) {
     const n = Number(crush[1]);
     return {
       label: `Crushed ${n} tool${n === 1 ? "" : "s"}`,
-      title: "Compacted tool-use blocks into a shorter form"
+      title: "tool outputs compacted"
     };
   }
 
@@ -753,23 +813,20 @@ function formatTransform(raw: string): { label: string; title: string } {
     const n = Number(breakpoints[1]);
     return {
       label: `Inserted ${n} cache breakpoint${n === 1 ? "" : "s"}`,
-      title: "Added cache breakpoints to improve prompt-cache hit rate"
+      title: "cache prefix tuned"
     };
   }
 
   const routerTool = /^router:tool_result:(.+)$/.exec(raw);
   if (routerTool) {
-    return {
-      label: `Tool result: ${routerTool[1]}`,
-      title: `Content router compressed a tool result with strategy ${routerTool[1]}`
-    };
+    return { label: `Tool result: ${routerTool[1]}`, title: "tool result compressed" };
   }
 
   const routerRatio = /^router:([^:]+):([\d.]+)$/.exec(raw);
   if (routerRatio) {
     return {
       label: `Compressed: ${routerRatio[1]} (${routerRatio[2]}x)`,
-      title: `Content router used ${routerRatio[1]} at ${routerRatio[2]}x compression`
+      title: "router compression"
     };
   }
 
@@ -777,20 +834,34 @@ function formatTransform(raw: string): { label: string; title: string } {
   if (kompress) {
     return {
       label: `Kompress ${kompress[1]} (${kompress[2]}x)`,
-      title: `Kompress compressed ${kompress[1]} messages at ${kompress[2]}x`
+      title: "kompress compression"
     };
   }
 
   const cacheOpt = /^cache_optimizer:(.+)$/.exec(raw);
   if (cacheOpt) {
-    return {
-      label: `Cache optimizer: ${cacheOpt[1]}`,
-      title: "Cache optimizer adjusted prompt for better caching"
-    };
+    return { label: `Cache optimizer: ${cacheOpt[1]}`, title: "cache tuning" };
   }
 
   // Unknown transform — render verbatim, tooltip shows the raw id.
   return { label: raw, title: raw };
+}
+
+function splitColonN(s: string, parts: number): string[] {
+  if (parts <= 1) return [s];
+  const result: string[] = [];
+  let cursor = 0;
+  for (let i = 0; i < parts - 1; i++) {
+    const idx = s.indexOf(":", cursor);
+    if (idx === -1) {
+      result.push(s.slice(cursor));
+      return result;
+    }
+    result.push(s.slice(cursor, idx));
+    cursor = idx + 1;
+  }
+  result.push(s.slice(cursor));
+  return result;
 }
 
 function MemoryRow({
@@ -905,65 +976,43 @@ function MilestoneRow({ event }: { event: MilestoneEvent }) {
   );
 }
 
-function RecordRow({
-  event,
-  kind
-}: {
-  event: RecordEvent;
-  kind: "daily" | "allTime";
-}) {
-  const badgeLabel = kind === "daily" ? "Daily record" : "All-time record";
-  const badgeClass =
-    kind === "daily"
-      ? "activity-feed__badge--daily-record"
-      : "activity-feed__badge--all-time-record";
-  const itemClass =
-    kind === "daily"
-      ? "activity-feed__item--daily-record"
-      : "activity-feed__item--all-time-record";
-  const pct = event.savingsPercent;
-  const workspace = workspaceBasename(event.workspace);
-  return (
-    <li className={`activity-feed__item ${itemClass}`}>
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className={`activity-feed__badge ${badgeClass}`}>{badgeLabel}</span>
-        <TimeChip iso={event.observedAt} />
-        {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
-        {workspace ? (
-          <span className="activity-feed__project">{workspace}</span>
-        ) : null}
-      </div>
-      <div className="activity-feed__row activity-feed__row--savings">
-        <strong className="activity-feed__savings">
-          Saved {event.tokensSaved.toLocaleString()} tokens
-          {pct != null ? ` (${pct.toFixed(1)}%)` : ""}
-        </strong>
-        {kind === "allTime" && event.previousRecord != null ? (
-          <span className="activity-feed__delta">
-            previous record {event.previousRecord.toLocaleString()}
-          </span>
-        ) : null}
-      </div>
-    </li>
-  );
-}
+const RECORD_TAG_ORDER: RecordTag[] = ["turn", "daily", "weekly", "allTime"];
 
-function PromptRecordRow({ event }: { event: PromptRecordEvent }) {
+const RECORD_TAG_LABEL: Record<RecordTag, string> = {
+  daily: "Daily",
+  weekly: "Weekly",
+  allTime: "All-time",
+  turn: "Turn"
+};
+
+function RecordRow({ event }: { event: RecordEvent }) {
   const workspace = workspaceBasename(event.workspace);
+  const pct = event.savingsPercent;
+  const callCount = event.callCount ?? null;
+  const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
   return (
-    <li className="activity-feed__item activity-feed__item--all-time-record">
+    <li className="activity-feed__item activity-feed__item--record">
       <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--all-time-record">
-          All-time record (prompt)
-        </span>
-        <span className="activity-feed__time">{formatDateTime(event.observedAt)}</span>
+        <span className="activity-feed__badge activity-feed__badge--record">Record</span>
+        {orderedTags.map((tag) => (
+          <span
+            key={tag}
+            className={`activity-feed__tag activity-feed__tag--${tag}`}
+          >
+            {RECORD_TAG_LABEL[tag]}
+          </span>
+        ))}
+        <TimeChip iso={event.observedAt} />
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
         {workspace ? <span className="activity-feed__project">{workspace}</span> : null}
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          Saved {event.tokensSaved.toLocaleString()} tokens across {event.callCount}{" "}
-          call{event.callCount === 1 ? "" : "s"}
+          Saved {event.tokensSaved.toLocaleString()} tokens
+          {pct != null ? ` (${pct.toFixed(1)}%)` : ""}
+          {callCount != null && callCount > 0
+            ? ` across ${callCount} call${callCount === 1 ? "" : "s"}`
+            : ""}
         </strong>
         {event.previousRecord != null ? (
           <span className="activity-feed__delta">

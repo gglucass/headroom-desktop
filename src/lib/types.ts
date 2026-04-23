@@ -307,8 +307,11 @@ export interface MilestoneEvent {
   kind: string;
 }
 
+export type RecordTag = "daily" | "weekly" | "allTime" | "turn";
+
 export interface RecordEvent {
   observedAt: string;
+  tags: RecordTag[];
   tokensSaved: number;
   savingsPercent: number | null;
   model: string | null;
@@ -317,16 +320,8 @@ export interface RecordEvent {
   previousRecord: number | null;
   day: string | null;
   workspace?: string | null;
-}
-
-export interface PromptRecordEvent {
-  observedAt: string;
-  tokensSaved: number;
-  callCount: number;
-  previousRecord: number | null;
-  turnId: string;
-  model: string | null;
-  workspace?: string | null;
+  turnId?: string | null;
+  callCount?: number | null;
 }
 
 export interface NewModelEvent {
@@ -368,9 +363,7 @@ export type ActivityEvent =
   | { kind: "memory"; data: MemoryFeedEvent }
   | { kind: "rtkBatch"; data: RtkBatchEvent }
   | { kind: "milestone"; data: MilestoneEvent }
-  | { kind: "dailyRecord"; data: RecordEvent }
-  | { kind: "allTimeRecord"; data: RecordEvent }
-  | { kind: "promptAllTimeRecord"; data: PromptRecordEvent }
+  | { kind: "record"; data: RecordEvent }
   | { kind: "newModel"; data: NewModelEvent }
   | { kind: "streak"; data: StreakEvent }
   | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }

@@ -1,4 +1,4 @@
-use crate::models::ActivityEvent;
+use crate::models::{ActivityEvent, RecordTag};
 
 #[derive(Debug, Clone)]
 pub struct NotificationPayload {
@@ -62,24 +62,33 @@ pub fn collect_notification_payloads(events: &[ActivityEvent]) -> Vec<Notificati
 pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPayload> {
     match event {
         ActivityEvent::Milestone(m) => notification_for_token_milestone(m.milestone_tokens_saved),
-        ActivityEvent::AllTimeRecord(r) => Some(NotificationPayload {
-            title: "New record compression".into(),
-            body: format!(
-                "Saved {} tokens on a single request. Your biggest one yet.",
-                format_with_commas(r.tokens_saved)
-            ),
-            action: Some("activity".into()),
-        }),
-        ActivityEvent::PromptAllTimeRecord(r) => Some(NotificationPayload {
-            title: "New record prompt".into(),
-            body: format!(
-                "Saved {} tokens across {} call{} on a single prompt. Your biggest one yet.",
-                format_with_commas(r.tokens_saved),
-                r.call_count,
-                if r.call_count == 1 { "" } else { "s" }
-            ),
-            action: Some("activity".into()),
-        }),
+        ActivityEvent::Record(r) => {
+            if r.tags.contains(&RecordTag::Turn) {
+                let call_count = r.call_count.unwrap_or(0);
+                Some(NotificationPayload {
+                    title: "New record prompt".into(),
+                    body: format!(
+                        "Saved {} tokens across {} call{} on a single prompt. Your biggest one yet.",
+                        format_with_commas(r.tokens_saved),
+                        call_count,
+                        if call_count == 1 { "" } else { "s" }
+                    ),
+                    action: Some("activity".into()),
+                })
+            } else if r.tags.contains(&RecordTag::AllTime) {
+                Some(NotificationPayload {
+                    title: "New record compression".into(),
+                    body: format!(
+                        "Saved {} tokens on a single request. Your biggest one yet.",
+                        format_with_commas(r.tokens_saved)
+                    ),
+                    action: Some("activity".into()),
+                })
+            } else {
+                // Daily-only (and future Weekly-only) records don't notify.
+                None
+            }
+        }
         ActivityEvent::Streak(s) if s.kind == "new_record" => Some(NotificationPayload {
             title: "New longest streak".into(),
             body: format!("You're on a {}-day run with Headroom. Keep it up.", s.days),
@@ -124,7 +133,7 @@ mod tests {
     use super::*;
     use crate::models::{
         LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
-        RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
+        RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
         WeeklyRecapEvent,
     };
     use chrono::{TimeZone, Utc};
@@ -194,8 +203,9 @@ mod tests {
 
     #[test]
     fn notifies_for_all_time_record() {
-        let ev = ActivityEvent::AllTimeRecord(RecordEvent {
+        let ev = ActivityEvent::Record(RecordEvent {
             observed_at: ts(),
+            tags: vec![RecordTag::AllTime],
             tokens_saved: 12_345,
             savings_percent: Some(90.0),
             model: Some("m".into()),
@@ -204,10 +214,53 @@ mod tests {
             previous_record: Some(500),
             day: None,
             workspace: None,
+            turn_id: None,
+            call_count: None,
         });
         let p = notification_for_event(&ev).expect("should notify");
         assert!(p.title.contains("New record"));
         assert!(p.body.contains("12,345"));
+    }
+
+    #[test]
+    fn notifies_for_turn_record() {
+        let ev = ActivityEvent::Record(RecordEvent {
+            observed_at: ts(),
+            tags: vec![RecordTag::Turn],
+            tokens_saved: 30_000,
+            savings_percent: None,
+            model: Some("m".into()),
+            provider: None,
+            request_id: None,
+            previous_record: Some(10_000),
+            day: None,
+            workspace: None,
+            turn_id: Some("t".into()),
+            call_count: Some(3),
+        });
+        let p = notification_for_event(&ev).expect("should notify");
+        assert!(p.title.contains("New record prompt"));
+        assert!(p.body.contains("30,000"));
+        assert!(p.body.contains("3 calls"));
+    }
+
+    #[test]
+    fn does_not_notify_for_daily_only_record() {
+        let ev = ActivityEvent::Record(RecordEvent {
+            observed_at: ts(),
+            tags: vec![RecordTag::Daily],
+            tokens_saved: 100,
+            savings_percent: None,
+            model: None,
+            provider: None,
+            request_id: None,
+            previous_record: None,
+            day: Some("2026-04-22".into()),
+            workspace: None,
+            turn_id: None,
+            call_count: None,
+        });
+        assert!(notification_for_event(&ev).is_none());
     }
 
     #[test]
@@ -297,8 +350,9 @@ mod tests {
     #[test]
     fn does_not_notify_for_excluded_kinds() {
         let candidates = [
-            ActivityEvent::DailyRecord(RecordEvent {
+            ActivityEvent::Record(RecordEvent {
                 observed_at: ts(),
+                tags: vec![RecordTag::Daily],
                 tokens_saved: 100,
                 savings_percent: None,
                 model: None,
@@ -307,6 +361,8 @@ mod tests {
                 previous_record: None,
                 day: Some("2026-04-22".into()),
                 workspace: None,
+                turn_id: None,
+                call_count: None,
             }),
             ActivityEvent::SavingsMilestone(SavingsMilestoneEvent {
                 observed_at: ts(),

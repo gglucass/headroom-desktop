@@ -352,13 +352,11 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
         return `wr:${event.data.weekStart}`;
       case "rtkBatch":
       case "milestone":
-      case "dailyRecord":
-      case "allTimeRecord":
+      case "record":
       case "newModel":
       case "streak":
       case "savingsMilestone":
       case "learningsMilestone":
-      case "promptAllTimeRecord":
         return `${event.kind[0]}:${event.data.observedAt}`;
     }
   };
