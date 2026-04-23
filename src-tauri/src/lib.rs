@@ -41,7 +41,8 @@ use crate::models::{
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
     HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, MemoryFeedEvent,
-    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
+    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedEvent,
+    TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -917,8 +918,14 @@ fn get_headroom_learn_status(
 }
 
 #[tauri::command]
-fn get_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
-    detect_headroom_learn_prereq_status()
+fn get_headroom_learn_prereq_status(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> HeadroomLearnPrereqStatus {
+    if force.unwrap_or(false) {
+        state.invalidate_headroom_learn_prereq_cache();
+    }
+    state.headroom_learn_prereq_status()
 }
 
 #[tauri::command]
@@ -944,7 +951,15 @@ fn get_activity_feed(
     limit: Option<u32>,
 ) -> ActivityFeedResponse {
     let limit = limit.unwrap_or(50).min(500);
-    let transformations = fetch_transformations_feed(limit).ok();
+    let live_transformations = fetch_transformations_feed(limit).ok();
+    let persisted_transformations = state.persisted_transformations();
+    // Merge the proxy's in-memory sliding window with our persisted history
+    // so compressions carry across app/proxy restarts. If the proxy fetch
+    // failed (e.g. transient restart) but we have persisted data, synthesize
+    // a response from the persisted list alone — the frontend shows the
+    // history and will transparently refresh once the proxy is back.
+    let transformations =
+        merge_live_and_persisted_transformations(live_transformations, persisted_transformations);
     let memory_path = headroom_memory_db_path();
     let memories = if memory_path.exists() {
         match memory_export_cached(&state, &memory_path) {
@@ -964,6 +979,51 @@ fn get_activity_feed(
         memory_available,
         limit as usize,
     )
+}
+
+/// Merge the proxy's live transformation feed with our persisted history,
+/// preferring the live copy when the same `request_id` appears in both.
+/// Falls back to persisted-only (with `proxy_reachable: false`) when the
+/// proxy fetch failed but we have history to show.
+fn merge_live_and_persisted_transformations(
+    live: Option<TransformationFeedResponse>,
+    persisted: Vec<TransformationFeedEvent>,
+) -> Option<TransformationFeedResponse> {
+    match live {
+        Some(feed) => {
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut merged: Vec<TransformationFeedEvent> = Vec::with_capacity(
+                feed.transformations.len() + persisted.len(),
+            );
+            for ev in feed.transformations.into_iter().chain(persisted.into_iter()) {
+                let fingerprint = ev
+                    .request_id
+                    .clone()
+                    .or_else(|| ev.timestamp.clone())
+                    .unwrap_or_default();
+                if fingerprint.is_empty() {
+                    // Events without identity can't be deduped; keep them but
+                    // they may appear twice if re-observed.
+                    merged.push(ev);
+                    continue;
+                }
+                if seen.insert(fingerprint) {
+                    merged.push(ev);
+                }
+            }
+            Some(TransformationFeedResponse {
+                transformations: merged,
+                log_full_messages: feed.log_full_messages,
+                proxy_reachable: feed.proxy_reachable,
+            })
+        }
+        None if persisted.is_empty() => None,
+        None => Some(TransformationFeedResponse {
+            transformations: persisted,
+            log_full_messages: false,
+            proxy_reachable: false,
+        }),
+    }
 }
 
 /// Observation cadence: frequent enough that a first-time user sees a
@@ -2060,7 +2120,7 @@ pub fn headroom_memory_db_path() -> std::path::PathBuf {
     crate::storage::memory_db_path(&crate::storage::app_data_dir())
 }
 
-fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
+pub(crate) fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
     let path = claude_cli::detect_claude_cli();
     HeadroomLearnPrereqStatus {
         claude_cli_available: path.is_some(),
@@ -3121,6 +3181,7 @@ mod tests {
         coalesce_rtk_batches, compute_tray_window_position, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from,
         install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
+        merge_live_and_persisted_transformations,
         normalize_utc_timestamp, parse_live_learnings, parse_memory_export,
         parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
         store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
@@ -3803,6 +3864,51 @@ mod tests {
         let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
             .unwrap_err();
         assert!(!err.is_empty(), "expected a non-empty error message");
+    }
+
+    #[test]
+    fn merge_prefers_live_copy_when_request_id_matches() {
+        // Live and persisted both contain the same transformation. The merged
+        // list must keep exactly one copy, preferring the live version (it's
+        // the freshest view).
+        let live = TransformationFeedResponse {
+            transformations: vec![make_transformation("2026-04-22T10:02:00Z")],
+            log_full_messages: true,
+            proxy_reachable: true,
+        };
+        let persisted = vec![
+            make_transformation("2026-04-22T10:02:00Z"),
+            make_transformation("2026-04-22T09:59:00Z"),
+        ];
+        let merged = merge_live_and_persisted_transformations(Some(live), persisted).unwrap();
+        assert_eq!(merged.transformations.len(), 2);
+        assert_eq!(
+            merged.transformations[0].request_id.as_deref(),
+            Some("req-2026-04-22T10:02:00Z"),
+            "live copy kept at the front"
+        );
+        assert_eq!(
+            merged.transformations[1].request_id.as_deref(),
+            Some("req-2026-04-22T09:59:00Z")
+        );
+        assert!(merged.proxy_reachable);
+    }
+
+    #[test]
+    fn merge_falls_back_to_persisted_when_proxy_fetch_failed() {
+        let persisted = vec![
+            make_transformation("2026-04-22T10:00:00Z"),
+            make_transformation("2026-04-22T09:00:00Z"),
+        ];
+        let merged = merge_live_and_persisted_transformations(None, persisted).unwrap();
+        assert_eq!(merged.transformations.len(), 2);
+        assert!(!merged.proxy_reachable, "marked unreachable so UI can surface it");
+    }
+
+    #[test]
+    fn merge_returns_none_when_both_empty_and_proxy_down() {
+        let merged = merge_live_and_persisted_transformations(None, vec![]);
+        assert!(merged.is_none());
     }
 
     fn make_transformation(timestamp: &str) -> TransformationFeedEvent {

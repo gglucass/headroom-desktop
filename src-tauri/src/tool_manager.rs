@@ -211,6 +211,13 @@ struct HeadroomLearnMetadata {
     pattern_count: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HeadroomLearnProjectSummary {
+    pub last_run_at: Option<String>,
+    pub has_persisted_learnings: bool,
+    pub pattern_count: Option<usize>,
+}
+
 impl ToolManager {
     pub fn new(runtime: ManagedRuntime) -> Self {
         let rtk_checksum = rtk_distribution_artifact()
@@ -325,13 +332,24 @@ impl ToolManager {
             .and_then(|metadata| metadata.learned_at)
     }
 
-    pub fn headroom_learn_has_persisted_learnings(&self, project_path: &str) -> bool {
-        self.headroom_learn_metadata(project_path).is_some()
-    }
-
-    pub fn headroom_learn_pattern_count(&self, project_path: &str) -> Option<usize> {
-        self.headroom_learn_metadata(project_path)
-            .and_then(|metadata| metadata.pattern_count)
+    /// Bundled metadata used to populate a `ClaudeCodeProject` row. Reads
+    /// CLAUDE.md + MEMORY.md once instead of three times, which collapses
+    /// 6 file reads per project down to 2 during the project list scan.
+    pub fn headroom_learn_project_summary(&self, project_path: &str) -> HeadroomLearnProjectSummary {
+        let metadata = self.headroom_learn_metadata(project_path);
+        let log_last_run_at = std::fs::metadata(self.headroom_learn_log_path(project_path))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .map(|m| {
+                let t: DateTime<Utc> = m.into();
+                t.to_rfc3339()
+            });
+        HeadroomLearnProjectSummary {
+            last_run_at: log_last_run_at
+                .or_else(|| metadata.as_ref().and_then(|m| m.learned_at.clone())),
+            has_persisted_learnings: metadata.is_some(),
+            pattern_count: metadata.and_then(|m| m.pattern_count),
+        }
     }
 
     pub fn start_headroom_background(&self) -> Result<Child> {

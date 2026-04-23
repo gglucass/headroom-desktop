@@ -71,7 +71,7 @@ export function ActivityFeed({
           <div className="activity-feed__skeleton-row" />
           <div className="activity-feed__skeleton-row" />
         </div>
-      ) : !feed.proxyReachable ? (
+      ) : !feed.proxyReachable && visibleEvents.length === 0 ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
             <WifiSlash weight="duotone" />

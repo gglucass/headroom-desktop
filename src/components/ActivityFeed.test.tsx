@@ -64,12 +64,27 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__list");
   });
 
-  it("shows the waiting state when proxy is not reachable", () => {
+  it("shows the waiting state when proxy is not reachable and no events", () => {
     const markup = renderToStaticMarkup(
       <ActivityFeed feed={{ ...baseFeed, proxyReachable: false }} error={null} />
     );
     expect(markup).toContain("Waiting for the Headroom proxy");
     expect(markup).not.toContain("activity-feed__list");
+  });
+
+  it("surfaces persisted events even when the proxy is unreachable", () => {
+    // Rust merges persisted compression history in when the live proxy fetch
+    // fails, sending them with proxyReachable=false. The feed must render
+    // them instead of the "Waiting" empty state — otherwise restarts look
+    // blank until the proxy re-comes online.
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      proxyReachable: false,
+      events: [transformation({ requestId: "from-history" })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__list");
+    expect(markup).not.toContain("Waiting for the Headroom proxy");
   });
 
   it("shows the empty state when proxy is up but no events", () => {

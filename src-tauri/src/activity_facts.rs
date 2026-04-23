@@ -16,6 +16,11 @@ use crate::tool_manager::RtkGainSummary;
 const SCHEMA_VERSION: u8 = 1;
 const RECENT_EVENTS_CAP: usize = 200;
 
+// Persisted compression history cap. Big enough to cover a few days of
+// moderate traffic but small enough to keep `activity-facts.json` well
+// under a megabyte even with ~500-byte JSON events.
+const TRANSFORMATION_HISTORY_CAP: usize = 500;
+
 const FIRST_STREAKS: [u32; 4] = [3, 7, 14, 30];
 const REPEATING_STREAK_STEP: u32 = 30;
 
@@ -36,6 +41,45 @@ fn savings_milestone_kind(milestone_usd: u64) -> &'static str {
         100 => "first_100",
         _ => "repeating_100",
     }
+}
+
+/// Stable identity for a transformation, used to dedup the persisted
+/// history when the proxy's sliding window re-returns the same events on
+/// subsequent polls. `request_id` is the authoritative key; fall back to
+/// `timestamp` for older payloads without it. Returns `None` when neither
+/// is present — such events can't be deduped, so we don't persist them
+/// (the proxy will keep surfacing them while they're in its window).
+fn transformation_fingerprint(event: &TransformationFeedEvent) -> Option<String> {
+    event
+        .request_id
+        .clone()
+        .or_else(|| event.timestamp.clone())
+}
+
+/// Append `event` to `history` if no entry with the same fingerprint exists.
+/// Enforces the cap by popping the oldest entries from the front. Returns
+/// `true` iff a new entry was actually added (i.e. the caller should mark
+/// state dirty).
+fn push_transformation_history_unique(
+    history: &mut VecDeque<TransformationFeedEvent>,
+    event: &TransformationFeedEvent,
+    cap: usize,
+) -> bool {
+    let Some(fp) = transformation_fingerprint(event) else {
+        return false;
+    };
+    // Walk newest-first; dups are almost always at the tail from the most
+    // recent poll, so this is O(k) in the overlap between polls, not O(n).
+    for existing in history.iter().rev() {
+        if transformation_fingerprint(existing).as_deref() == Some(fp.as_str()) {
+            return false;
+        }
+    }
+    history.push_back(event.clone());
+    while history.len() > cap {
+        history.pop_front();
+    }
+    true
 }
 
 fn streaks_crossed(previous: u32, current: u32) -> Vec<u32> {
@@ -105,6 +149,14 @@ struct PersistedActivityFacts {
     prompt_all_time_record_tokens: u64,
     #[serde(default)]
     all_time_record_emitted_at: Option<DateTime<Utc>>,
+    // Rolling window of compression events, deduped by request_id (fallback
+    // timestamp). The proxy keeps its own sliding window but loses it on
+    // restart; persisting here lets the Activity feed carry history across
+    // app restarts without reading the proxy's state. Cap kept modest —
+    // users don't need a forever archive, just enough context to feel
+    // continuous.
+    #[serde(default)]
+    transformation_history: VecDeque<TransformationFeedEvent>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +197,7 @@ pub struct ActivityFacts {
     // previous by a fraction of a percent would otherwise produce a row of
     // indistinguishable "new record" cards in the Activity feed.
     all_time_record_emitted_at: Option<DateTime<Utc>>,
+    transformation_history: VecDeque<TransformationFeedEvent>,
     turn_accumulators: HashMap<String, TurnAccumulator>,
     rtk_initialized: bool,
     dirty: bool,
@@ -180,6 +233,7 @@ impl ActivityFacts {
             learnings_milestones_fired: persisted.learnings_milestones_fired,
             prompt_all_time_record_tokens: persisted.prompt_all_time_record_tokens,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
+            transformation_history: persisted.transformation_history,
             turn_accumulators: HashMap::new(),
             rtk_initialized: true,
             dirty: false,
@@ -202,6 +256,7 @@ impl ActivityFacts {
             learnings_milestones_fired: BTreeSet::new(),
             prompt_all_time_record_tokens: 0,
             all_time_record_emitted_at: None,
+            transformation_history: VecDeque::new(),
             turn_accumulators: HashMap::new(),
             rtk_initialized: false,
             dirty: false,
@@ -231,6 +286,12 @@ impl ActivityFacts {
         kept_rev
     }
 
+    /// Persisted compression history, oldest-first. Callers typically merge
+    /// this with the proxy's live feed and dedup by request_id.
+    pub fn transformation_history(&self) -> Vec<TransformationFeedEvent> {
+        self.transformation_history.iter().cloned().collect()
+    }
+
     pub fn observe_transformation(
         &mut self,
         event: &TransformationFeedEvent,
@@ -246,6 +307,18 @@ impl ActivityFacts {
         now: DateTime<Utc>,
     ) -> Vec<ActivityEvent> {
         let mut emitted = Vec::new();
+
+        // Persist compression history so it survives across app restarts.
+        // The proxy's /transformations/feed is an in-memory sliding window
+        // and returns nothing on a cold start; without this the Activity
+        // feed would show an empty slate every time the proxy restarts.
+        if push_transformation_history_unique(
+            &mut self.transformation_history,
+            event,
+            TRANSFORMATION_HISTORY_CAP,
+        ) {
+            self.dirty = true;
+        }
 
         if let Some(model) = event.model.as_ref() {
             if !model.is_empty() && self.seen_models.insert(model.clone()) {
@@ -686,6 +759,7 @@ impl ActivityFacts {
             learnings_milestones_fired: self.learnings_milestones_fired.clone(),
             prompt_all_time_record_tokens: self.prompt_all_time_record_tokens,
             all_time_record_emitted_at: self.all_time_record_emitted_at,
+            transformation_history: self.transformation_history.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted)
             .context("serializing activity facts")?;
@@ -873,6 +947,62 @@ mod tests {
             .collect();
         assert_eq!(drs.len(), 1);
         assert_eq!(drs[0].observed_at, obs_late, "newest entry wins");
+    }
+
+    #[test]
+    fn transformation_history_persists_across_observations_and_dedups() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let t = at(10, 0);
+
+        let mut tx_a = mk_transformation(Some("m"), Some(500), Some(50.0));
+        tx_a.request_id = Some("req-A".into());
+        tx_a.timestamp = Some("2026-04-22T10:00:00Z".into());
+        let mut tx_b = mk_transformation(Some("m"), Some(600), Some(55.0));
+        tx_b.request_id = Some("req-B".into());
+        tx_b.timestamp = Some("2026-04-22T10:01:00Z".into());
+
+        facts.observe_transformation_at(&tx_a, t, t);
+        facts.observe_transformation_at(&tx_b, t, t);
+        // Re-observing the same events (what the proxy's sliding window
+        // returns every poll) must not duplicate them in history.
+        facts.observe_transformation_at(&tx_a, t, t);
+        facts.observe_transformation_at(&tx_b, t, t);
+
+        let history = facts.transformation_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].request_id.as_deref(), Some("req-A"));
+        assert_eq!(history[1].request_id.as_deref(), Some("req-B"));
+    }
+
+    #[test]
+    fn push_transformation_history_unique_enforces_cap_by_evicting_oldest() {
+        use std::collections::VecDeque;
+        let mut history: VecDeque<TransformationFeedEvent> = VecDeque::new();
+        let make = |n: u64| {
+            let mut ev = mk_transformation(Some("m"), Some(n as i64), Some(10.0));
+            ev.request_id = Some(format!("req-{n}"));
+            ev
+        };
+        for n in 0..5 {
+            assert!(push_transformation_history_unique(&mut history, &make(n), 3));
+        }
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.front().unwrap().request_id.as_deref(), Some("req-2"));
+        assert_eq!(history.back().unwrap().request_id.as_deref(), Some("req-4"));
+    }
+
+    #[test]
+    fn push_transformation_history_unique_skips_fingerprint_less_events() {
+        // Events with neither request_id nor timestamp can't be deduped, so
+        // we don't persist them — the proxy keeps returning them live.
+        use std::collections::VecDeque;
+        let mut history: VecDeque<TransformationFeedEvent> = VecDeque::new();
+        let mut ev = mk_transformation(Some("m"), Some(100), Some(10.0));
+        ev.request_id = None;
+        ev.timestamp = None;
+        assert!(!push_transformation_history_unique(&mut history, &ev, 10));
+        assert!(history.is_empty());
     }
 
     #[test]

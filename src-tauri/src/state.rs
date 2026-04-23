@@ -20,8 +20,8 @@ use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integr
 use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnStatus, HourlySavingsPoint,
-    LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
+    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
+    HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
     RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
@@ -245,6 +245,17 @@ pub struct AppState {
     /// Cached stdout of `headroom memory export`. Shared by every OptimizePanel
     /// that mounts at once — without it, N panels = N Python cold-starts.
     cached_memory_export: Mutex<Option<(String, Instant)>>,
+    /// Cached result of `list_claude_code_projects`. Scanning the projects dir,
+    /// reading session files, and computing per-project learn metadata is the
+    /// main cost of opening the Optimize tab. TTL is short enough that
+    /// just-finished learn runs appear promptly once their explicit
+    /// invalidation fires.
+    cached_claude_code_projects: Mutex<Option<(Vec<ClaudeCodeProject>, Instant)>>,
+    /// Cached `detect_headroom_learn_prereq_status`. The Claude CLI location
+    /// can't change without explicit user action during a session, and the
+    /// fallback shell probe can take up to 2s, so we keep this sticky and
+    /// expose an invalidator for the user's "Re-check" button.
+    cached_headroom_learn_prereq: Mutex<Option<HeadroomLearnPrereqStatus>>,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +334,8 @@ impl AppState {
             cached_rtk_gain_summary: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
             cached_memory_export: Mutex::new(None),
+            cached_claude_code_projects: Mutex::new(None),
+            cached_headroom_learn_prereq: Mutex::new(None),
         };
 
         Ok(state)
@@ -1251,6 +1264,13 @@ impl AppState {
         self.activity_facts.lock().recent_events()
     }
 
+    /// Persisted compression history. Carried across app restarts so the
+    /// Activity feed isn't blank for the first few seconds after launch
+    /// while the proxy's own in-memory window is still warming up.
+    pub fn persisted_transformations(&self) -> Vec<TransformationFeedEvent> {
+        self.activity_facts.lock().transformation_history()
+    }
+
     /// Record milestone crossings into ActivityFacts so they appear in the
     /// next activity feed poll. Called alongside the existing telemetry path.
     pub fn record_activity_milestones(&self, milestones: &PendingMilestones) {
@@ -1385,7 +1405,49 @@ impl AppState {
         )
     }
 
+    /// Cache TTL for `list_claude_code_projects`. Short enough that a newly
+    /// created Claude project (or a session in an existing one) shows up
+    /// within ~20s; long enough that rapid tab switches and pre-warms hit
+    /// the cache instead of re-scanning the whole projects directory.
+    const CLAUDE_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(20);
+
     pub fn list_claude_code_projects(&self) -> Result<Vec<ClaudeCodeProject>> {
+        if let Some(cached) = self.cached_claude_code_projects_fresh() {
+            return Ok(cached);
+        }
+        let projects = self.list_claude_code_projects_uncached()?;
+        *self.cached_claude_code_projects.lock() = Some((projects.clone(), Instant::now()));
+        Ok(projects)
+    }
+
+    fn cached_claude_code_projects_fresh(&self) -> Option<Vec<ClaudeCodeProject>> {
+        let cache = self.cached_claude_code_projects.lock();
+        if let Some((ref projects, at)) = *cache {
+            if at.elapsed() < Self::CLAUDE_PROJECTS_CACHE_TTL {
+                return Some(projects.clone());
+            }
+        }
+        None
+    }
+
+    pub fn invalidate_claude_code_projects_cache(&self) {
+        *self.cached_claude_code_projects.lock() = None;
+    }
+
+    pub fn headroom_learn_prereq_status(&self) -> HeadroomLearnPrereqStatus {
+        if let Some(cached) = self.cached_headroom_learn_prereq.lock().clone() {
+            return cached;
+        }
+        let status = crate::detect_headroom_learn_prereq_status();
+        *self.cached_headroom_learn_prereq.lock() = Some(status.clone());
+        status
+    }
+
+    pub fn invalidate_headroom_learn_prereq_cache(&self) {
+        *self.cached_headroom_learn_prereq.lock() = None;
+    }
+
+    fn list_claude_code_projects_uncached(&self) -> Result<Vec<ClaudeCodeProject>> {
         let projects_dir = claude_projects_dir();
         if !projects_dir.exists() {
             return Ok(Vec::new());
@@ -1526,6 +1588,11 @@ impl AppState {
         state.summary = summary;
         state.error = error;
         state.output_tail = output_tail;
+        drop(state);
+        // A completed run rewrites CLAUDE.md / MEMORY.md and updates the learn
+        // log's mtime, so the cached project list (which depends on both) is
+        // now stale — force a fresh scan on the next read.
+        self.invalidate_claude_code_projects_cache();
     }
 
     pub fn headroom_learn_status(
@@ -2002,10 +2069,10 @@ fn build_claude_code_project(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| project_path.clone());
 
-    let last_learn_ran_at = tool_manager.headroom_learn_last_run_at(&project_path);
-    let has_persisted_learnings =
-        tool_manager.headroom_learn_has_persisted_learnings(&project_path);
-    let last_learn_pattern_count = tool_manager.headroom_learn_pattern_count(&project_path);
+    let learn_summary = tool_manager.headroom_learn_project_summary(&project_path);
+    let last_learn_ran_at = learn_summary.last_run_at;
+    let has_persisted_learnings = learn_summary.has_persisted_learnings;
+    let last_learn_pattern_count = learn_summary.pattern_count;
     let active_days_since_last_learn = if let Some(ref learn_at_str) = last_learn_ran_at {
         chrono::DateTime::parse_from_rfc3339(learn_at_str)
             .ok()

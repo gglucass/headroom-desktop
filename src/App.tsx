@@ -2117,9 +2117,11 @@ export default function App() {
     }
   }
 
-  async function refreshHeadroomLearnPrereq() {
+  async function refreshHeadroomLearnPrereq(force = false) {
     try {
-      const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status");
+      const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status", {
+        force,
+      });
       setHeadroomLearnPrereq(status);
     } catch {
       setHeadroomLearnPrereq(idleHeadroomLearnPrereqStatus);
@@ -3916,7 +3918,7 @@ export default function App() {
                           <button
                             className="install-prompt__link install-prompt__link--recheck"
                             type="button"
-                            onClick={() => void refreshHeadroomLearnPrereq()}
+                            onClick={() => void refreshHeadroomLearnPrereq(true)}
                           >
                             <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
                             Re-check
