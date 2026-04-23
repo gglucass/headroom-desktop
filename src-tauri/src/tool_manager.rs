@@ -57,6 +57,21 @@ const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
     include_str!("../python/headroom-linux-requirements.lock");
+
+/// Full-file SHA-256 values of historical headroom-requirements.lock shipments
+/// whose pinned versions are byte-for-byte identical to the current lock.
+/// Receipts holding one of these shas are treated as up-to-date; the receipt is
+/// silently migrated to the comment-insensitive sha on next launch so the
+/// entry can be dropped the next time the lock file actually changes.
+///
+/// When modifying the lock, re-evaluate: compare the stripped (comments and
+/// blank lines removed) form of each legacy lock against the stripped current
+/// lock. Drop any entry that no longer matches — those users need a real
+/// reinstall.
+const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
+    // v0.2.50, v0.2.50-rc.1, v0.2.50-rc.2, v0.2.50-rc.3 all shipped this lock.
+    "7f214ecb1cfb305bcc2676ef32379bb7cbd8a522f8274bc19897cc4c04e74bae",
+];
 const RTK_VERSION: &str = "0.37.2";
 const RTK_SHA256_MACOS_AARCH64: &str =
     "99e20a59847dedbb64032a3f7985f2fe959fcb9674d8eaf940fc58a189e27eca";
@@ -776,10 +791,42 @@ impl ToolManager {
 
     /// Returns true if the compiled requirements lock differs from what was
     /// used during the last headroom install.
+    ///
+    /// As a side effect, if the stored sha is a known legacy value whose
+    /// pinned versions are byte-identical to the current lock, rewrites the
+    /// receipt with the new-format sha and returns false. This avoids a
+    /// purely cosmetic reinstall on the 0.2.50 → 0.3.0 jump.
     pub fn requirements_are_stale(&self) -> bool {
-        self.installed_requirements_lock_sha().map_or(true, |sha| {
-            sha != sha256_bytes(bootstrap_requirements_lock().as_bytes())
-        })
+        let Some(stored) = self.installed_requirements_lock_sha() else {
+            return true;
+        };
+        let current = requirements_lock_sha(bootstrap_requirements_lock());
+        if stored == current {
+            return false;
+        }
+        if LEGACY_REQUIREMENTS_LOCK_SHAS.contains(&stored.as_str()) {
+            if let Err(err) = self.write_requirements_lock_sha_to_receipt(&current) {
+                eprintln!("failed to migrate legacy requirementsLockSha256: {err}");
+            }
+            return false;
+        }
+        true
+    }
+
+    fn write_requirements_lock_sha_to_receipt(&self, sha: &str) -> Result<()> {
+        let receipt_path = self.runtime.tools_dir.join("headroom.json");
+        let bytes = std::fs::read(&receipt_path)
+            .with_context(|| format!("reading {}", receipt_path.display()))?;
+        let mut receipt: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", receipt_path.display()))?;
+        if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
+            artifact.insert("requirementsLockSha256".into(), json!(sha));
+        } else {
+            return Ok(());
+        }
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+            .with_context(|| format!("writing {}", receipt_path.display()))?;
+        Ok(())
     }
 
     pub fn repair_stale_requirements_with_progress<F>(&self, mut progress: F) -> Result<()>
@@ -855,7 +902,7 @@ impl ToolManager {
         };
 
         self.update_headroom_receipt_after_requirements_repair(
-            sha256_bytes(requirements_lock.as_bytes()),
+            requirements_lock_sha(requirements_lock),
             mcp_install,
         )?;
 
@@ -1235,7 +1282,7 @@ impl ToolManager {
                 "artifact": {
                     "url": release.wheel_url,
                     "sha256": release.sha256,
-                    "requirementsLockSha256": sha256_bytes(requirements_lock.as_bytes())
+                    "requirementsLockSha256": requirements_lock_sha(requirements_lock)
                 },
                 "mcp": mcp_install,
                 "ml": {
@@ -2661,6 +2708,21 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Hash a requirements lock file ignoring comments and blank lines, so that
+/// header/comment churn does not force a full `pip install` on upgrade.
+fn requirements_lock_sha(lock: &str) -> String {
+    let mut hasher = Sha256::new();
+    for line in lock.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        hasher.update(trimmed.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn bootstrap_requirements_lock() -> &'static str {
     bootstrap_requirements_lock_for_target(std::env::consts::OS)
 }
@@ -3057,9 +3119,29 @@ mod tests {
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, rtk_distribution_artifact, run_command,
-        sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease,
+        requirements_lock_sha, sanitize_log_variant, sha256_bytes, verify_sha256_file,
+        CommandFailure, HeadroomRelease,
         ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT, RTK_VERSION,
     };
+
+    #[test]
+    fn requirements_lock_sha_ignores_comments_and_blank_lines() {
+        let a = "# header one\n\nabsl-py==2.4.0\naiohttp==3.13.5\n";
+        let b = "# header two — different\naiohttp==3.13.5\nabsl-py==2.4.0\n";
+        let c = "absl-py==2.4.0\naiohttp==3.13.6\n";
+        // Same pinned versions, different comments/whitespace → same hash.
+        assert_eq!(requirements_lock_sha(a), requirements_lock_sha(a));
+        // Order still matters (pip resolution order), so (a) and (b) differ.
+        assert_ne!(requirements_lock_sha(a), requirements_lock_sha(b));
+        // A real version bump changes the hash.
+        assert_ne!(requirements_lock_sha(a), requirements_lock_sha(c));
+        // Adding/removing a comment or blank line must not change the hash.
+        let a_more_comments = "# header one\n# extra note\n\n\nabsl-py==2.4.0\n# inline\naiohttp==3.13.5\n";
+        assert_eq!(
+            requirements_lock_sha(a),
+            requirements_lock_sha(a_more_comments)
+        );
+    }
 
     #[test]
     fn run_command_failure_carries_structured_output() {
@@ -3834,6 +3916,57 @@ after
     }
 
     #[test]
+    fn requirements_are_stale_recognizes_legacy_sha_and_migrates_receipt() {
+        let (root, runtime, manager) = seed_test_runtime("legacy-sha-migrate");
+        let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
+        let receipt_path = runtime.tools_dir.join("headroom.json");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.2.50",
+                "artifact": { "requirementsLockSha256": legacy_sha },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+
+        assert!(
+            !manager.requirements_are_stale(),
+            "legacy sha should be treated as current"
+        );
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_path).expect("receipt read")).expect("json");
+        assert_eq!(
+            receipt["artifact"]["requirementsLockSha256"],
+            requirements_lock_sha(super::bootstrap_requirements_lock()),
+            "receipt should be migrated to the new-format sha"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requirements_are_stale_flags_unknown_sha() {
+        let (root, runtime, manager) = seed_test_runtime("unknown-sha");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.2.45",
+                "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+
+        assert!(
+            manager.requirements_are_stale(),
+            "unknown sha must force a reinstall"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn repair_stale_requirements_updates_receipt_and_emits_progress() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
@@ -3861,7 +3994,7 @@ after
         let receipt: serde_json::Value = serde_json::from_slice(&receipt).expect("receipt json");
         assert_eq!(
             receipt["artifact"]["requirementsLockSha256"],
-            sha256_bytes(super::bootstrap_requirements_lock().as_bytes())
+            requirements_lock_sha(super::bootstrap_requirements_lock())
         );
         assert_eq!(receipt["mcp"]["configured"], true);
 

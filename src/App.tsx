@@ -134,6 +134,7 @@ import type {
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
   ActivityFeedResponse,
+  AppliedPatterns,
   HourlySavingsPoint,
   LiveLearning,
   RuntimeStatus,
@@ -734,7 +735,10 @@ export default function App() {
     useState<HeadroomLearnStatus>(idleHeadroomLearnStatus);
   const [optimizeLiveByProject, setOptimizeLiveByProject] =
     useState<Record<string, LiveLearning[]> | null>(null);
+  const [optimizeAppliedByProject, setOptimizeAppliedByProject] =
+    useState<Record<string, AppliedPatterns> | null>(null);
   const [optimizeLiveRefreshTick, setOptimizeLiveRefreshTick] = useState(0);
+  const [optimizeAppliedRefreshTick, setOptimizeAppliedRefreshTick] = useState(0);
   const previousHeadroomLearnRunningRef = useRef(false);
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
   const [headroomLearnPrereq, setHeadroomLearnPrereq] =
@@ -753,6 +757,10 @@ export default function App() {
   // Tray window focus proxies for visibility: the window auto-hides on blur
   // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
   const [trayWindowFocused, setTrayWindowFocused] = useState(true);
+  // Sticky flag: the user has visited a heavy-data tab (Activity or Optimize)
+  // at least once this session. The tray-focus pre-warm is gated on this so
+  // users who stay on Home don't pay its IPC/subprocess cost on every focus.
+  const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   // 150 rows ≈ 15 pages at 10/row. Bigger windows make each poll transfer
   // more data across the Tauri IPC boundary, parse more JSON, and do more
@@ -1493,13 +1501,23 @@ export default function App() {
     return () => unlisten?.();
   }, [windowLabel]);
 
+  // Track whether the user has ever visited a heavy-data tab this session.
+  // Once true, stays true until app restart — the pre-warm below is gated
+  // on it so Home-only users don't pay its cost on every tray focus.
+  useEffect(() => {
+    if (activeView === "notifications" || activeView === "optimization") {
+      setHeavyTabEverOpened(true);
+    }
+  }, [activeView]);
+
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
   // switching tabs reveals already-populated content instead of triggering
   // a fresh ~500ms Python subprocess spawn and layout flash. The tab-scoped
   // effects below still run and keep data fresh — they just hit the Rust
-  // cache now instead of spawning a cold Python process.
+  // cache now instead of spawning a cold Python process. Gated on
+  // `heavyTabEverOpened` so users who only use Home never trigger it.
   useEffect(() => {
-    if (windowLabel !== "main" || !trayWindowFocused) {
+    if (windowLabel !== "main" || !trayWindowFocused || !heavyTabEverOpened) {
       return;
     }
     void refreshClaudeProjects();
@@ -1518,7 +1536,7 @@ export default function App() {
       .finally(() => {
         setActivityFeedLoaded(true);
       });
-  }, [windowLabel, trayWindowFocused]);
+  }, [windowLabel, trayWindowFocused, heavyTabEverOpened]);
 
   useEffect(() => {
     if (activeView !== "notifications" || !trayWindowFocused) {
@@ -1691,6 +1709,36 @@ export default function App() {
     claudeProjectPathsKey,
     headroomLearnStatus.finishedAt,
     optimizeLiveRefreshTick,
+  ]);
+
+  // Batched applied-patterns fetch: one IPC instead of one per OptimizePanel.
+  // Mirrors the live-learnings aggregate above so both halves of each panel
+  // come from a single parent-owned source of truth.
+  useEffect(() => {
+    const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
+    if (paths.length === 0) {
+      setOptimizeAppliedByProject({});
+      return;
+    }
+    let active = true;
+    invoke<Record<string, AppliedPatterns>>("list_applied_patterns_for_projects", {
+      projectPaths: paths,
+    })
+      .then((result) => {
+        if (!active) return;
+        setOptimizeAppliedByProject(result);
+      })
+      .catch(() => {
+        if (!active) return;
+        setOptimizeAppliedByProject(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    claudeProjectPathsKey,
+    headroomLearnStatus.finishedAt,
+    optimizeAppliedRefreshTick,
   ]);
 
   // Keep connectorPhase in sync with the connector enabled state from the backend
@@ -3946,8 +3994,19 @@ export default function App() {
                                         ? optimizeLiveByProject[project.projectPath] ?? []
                                         : undefined
                                     }
+                                    preloadedApplied={
+                                      optimizeAppliedByProject
+                                        ? optimizeAppliedByProject[project.projectPath] ?? {
+                                            claudeMd: [],
+                                            memoryMd: [],
+                                          }
+                                        : undefined
+                                    }
                                     onLiveMutated={() =>
                                       setOptimizeLiveRefreshTick((tick) => tick + 1)
+                                    }
+                                    onAppliedMutated={() =>
+                                      setOptimizeAppliedRefreshTick((tick) => tick + 1)
                                     }
                                   />
                                 </small>
@@ -4021,7 +4080,6 @@ export default function App() {
 
         <div className="tray-content" hidden={activeView !== "notifications"}>
           <ActivityFeed
-            key={activeView === "notifications" ? "notifications" : "hidden"}
             feed={activityFeed}
             error={activityFeedError}
             loaded={activityFeedLoaded}

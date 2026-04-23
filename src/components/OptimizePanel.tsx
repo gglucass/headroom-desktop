@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -21,9 +22,14 @@ interface OptimizePanelProps {
   // invoking `list_live_learnings` itself. Lets the parent batch one Python
   // subprocess spawn across every panel instead of N.
   preloadedLive?: LiveLearning[] | null;
+  // Same pattern as `preloadedLive` but for applied patterns. Collapses one
+  // `list_applied_patterns` IPC per project into a single batched parent call.
+  preloadedApplied?: AppliedPatterns | null;
   // Called after the panel mutates live learnings (e.g. delete) so the parent
   // can refetch the shared aggregate. Only used when preloadedLive is set.
   onLiveMutated?: () => void;
+  // Same as onLiveMutated, but for applied patterns.
+  onAppliedMutated?: () => void;
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -39,37 +45,60 @@ export function OptimizePanel({
   projectPath,
   refreshSignal,
   preloadedLive,
+  preloadedApplied,
   onLiveMutated,
+  onAppliedMutated,
 }: OptimizePanelProps) {
   const hasPreloadedLive = preloadedLive !== undefined;
+  const hasPreloadedApplied = preloadedApplied !== undefined;
   const [live, setLive] = useState<LiveLearning[] | null>(
     hasPreloadedLive ? preloadedLive ?? null : null,
   );
-  const [applied, setApplied] = useState<AppliedPatterns | null>(null);
+  const [applied, setApplied] = useState<AppliedPatterns | null>(
+    hasPreloadedApplied ? preloadedApplied ?? null : null,
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [modal, setModal] = useState<ModalKind>(null);
 
-  // Sync preloaded slice into local state whenever the parent updates it.
+  // Reading `hasPreloaded*` via refs inside `refetch` keeps its identity
+  // stable when the parent flips from "still loading the aggregate" to
+  // "aggregate resolved". Without this, refetch's useCallback dep churn
+  // re-fires the refetch effect and causes a duplicate IPC round per panel.
+  const hasPreloadedLiveRef = useRef(hasPreloadedLive);
+  hasPreloadedLiveRef.current = hasPreloadedLive;
+  const hasPreloadedAppliedRef = useRef(hasPreloadedApplied);
+  hasPreloadedAppliedRef.current = hasPreloadedApplied;
+
+  // Sync preloaded slices into local state whenever the parent updates them.
   useEffect(() => {
     if (hasPreloadedLive) {
       setLive(preloadedLive ?? null);
     }
   }, [hasPreloadedLive, preloadedLive]);
+  useEffect(() => {
+    if (hasPreloadedApplied) {
+      setApplied(preloadedApplied ?? null);
+    }
+  }, [hasPreloadedApplied, preloadedApplied]);
 
   const refetch = useCallback(() => {
     let active = true;
-    const appliedPromise = invoke<AppliedPatterns>("list_applied_patterns", { projectPath });
-    const livePromise = hasPreloadedLive
+    const appliedPromise = hasPreloadedAppliedRef.current
+      ? Promise.resolve<AppliedPatterns | null>(null)
+      : invoke<AppliedPatterns>("list_applied_patterns", { projectPath });
+    const livePromise = hasPreloadedLiveRef.current
       ? Promise.resolve<LiveLearning[] | null>(null)
       : invoke<LiveLearning[]>("list_live_learnings", { projectPath });
     Promise.all([livePromise, appliedPromise])
       .then(([l, a]) => {
         if (!active) return;
-        if (!hasPreloadedLive) {
+        if (!hasPreloadedLiveRef.current) {
           setLive(l);
         }
-        setApplied(a);
+        if (!hasPreloadedAppliedRef.current && a !== null) {
+          setApplied(a);
+        }
         setLoadError(null);
       })
       .catch((err) => {
@@ -79,7 +108,7 @@ export function OptimizePanel({
     return () => {
       active = false;
     };
-  }, [projectPath, hasPreloadedLive]);
+  }, [projectPath]);
 
   useEffect(() => {
     const cancel = refetch();
@@ -120,7 +149,11 @@ export function OptimizePanel({
         sectionTitle,
         bulletText,
       });
-      refetch();
+      if (hasPreloadedApplied) {
+        onAppliedMutated?.();
+      } else {
+        refetch();
+      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Delete failed.");
     } finally {

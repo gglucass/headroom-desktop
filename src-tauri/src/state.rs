@@ -64,6 +64,10 @@ pub struct PendingMilestones {
 #[derive(Debug, Default, Clone)]
 pub struct ActivityObservation {
     pub fresh: Vec<ActivityEvent>,
+    // Only read by tests today — the feed read path now calls
+    // `recent_activity_events()` directly, bypassing ActivityObservation
+    // entirely. Keeping the field lets existing test assertions compile.
+    #[allow(dead_code)]
     pub recent: Vec<ActivityEvent>,
 }
 
@@ -372,6 +376,21 @@ impl AppState {
                 "headroom auto-start failed during launch",
                 &err,
             );
+        }
+
+        // Hold `starting` until the probe `runtime_status()` uses
+        // (`is_headroom_proxy_reachable` → 6767/readyz) actually returns true.
+        // `wait_for_boot_validation` accepts /livez, which can flip green
+        // before /readyz does; clearing `starting` on livez alone opens a
+        // window where the UI poller sees !running && !starting and fires
+        // the "Headroom isn't running" notification while readiness is still
+        // loading.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if is_headroom_proxy_reachable() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
 
         self.set_runtime_starting(false);
@@ -1066,7 +1085,7 @@ impl AppState {
     }
 
     pub fn cached_memory_export(&self) -> Option<String> {
-        const TTL: Duration = Duration::from_secs(5);
+        const TTL: Duration = Duration::from_secs(20);
         let cache = self.cached_memory_export.lock();
         if let Some((ref s, at)) = *cache {
             if at.elapsed() < TTL {
@@ -1223,6 +1242,13 @@ impl AppState {
         let event = facts.observe_learnings_count(count, Utc::now());
         let _ = facts.save_if_dirty();
         event
+    }
+
+    /// Read-only snapshot of the synthetic-event history already persisted to
+    /// ActivityFacts. Used by the feed read path so it never mutates state —
+    /// observation runs on a backend timer and is the sole writer.
+    pub fn recent_activity_events(&self) -> Vec<ActivityEvent> {
+        self.activity_facts.lock().recent_events()
     }
 
     /// Record milestone crossings into ActivityFacts so they appear in the

@@ -931,9 +931,15 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
     })
 }
 
+/// Read-only snapshot of the activity feed. Observation — writing to
+/// ActivityFacts, persisting, emitting OS notifications — happens on a
+/// dedicated background timer (see `spawn_activity_observer`), so this
+/// command never mutates state. That keeps the IPC hot path short (no disk
+/// writes, no notification dispatch) and decouples notification delivery
+/// from frontend polling: users get milestone notifications whether or not
+/// the Activity tab is currently on screen.
 #[tauri::command]
 fn get_activity_feed(
-    app: AppHandle,
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> ActivityFeedResponse {
@@ -949,34 +955,64 @@ fn get_activity_feed(
         Vec::new()
     };
 
+    let recent_synthetic = state.recent_activity_events();
+    let memory_available = memory_path.exists();
+    build_activity_feed_response(
+        transformations,
+        memories,
+        recent_synthetic,
+        memory_available,
+        limit as usize,
+    )
+}
+
+/// Observation cadence: frequent enough that a first-time user sees a
+/// milestone notification shortly after earning it, but slow enough that the
+/// 20s memory-export cache usually absorbs the Python subprocess.
+const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+/// Matches the frontend's `ACTIVITY_FEED_WINDOW` in App.tsx so the observer
+/// sees the same transformations the UI will display.
+const ACTIVITY_OBSERVER_LIMIT: u32 = 150;
+
+fn spawn_activity_observer(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Small warm-up so we don't race with runtime bring-up; the first
+        // proxy fetch lands a few seconds after the proxy is actually up.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        loop {
+            run_activity_observation(&app);
+            std::thread::sleep(ACTIVITY_OBSERVER_INTERVAL);
+        }
+    });
+}
+
+fn run_activity_observation(app: &AppHandle) {
+    let state: tauri::State<'_, AppState> = app.state();
     let mut fresh_events: Vec<ActivityEvent> = Vec::new();
 
     if let Some(event) = state.maybe_emit_weekly_recap() {
         fresh_events.push(event);
     }
 
-    let observation = match transformations.as_ref() {
-        Some(feed) => state.observe_activity_from_transformations(&feed.transformations),
-        None => crate::state::ActivityObservation::default(),
-    };
-    fresh_events.extend(observation.fresh.iter().cloned());
+    if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
+        let observation = state.observe_activity_from_transformations(&feed.transformations);
+        fresh_events.extend(observation.fresh);
+    }
 
-    if let Some(event) = state.observe_learnings_count(memories.len()) {
-        fresh_events.push(event);
+    let memory_path = headroom_memory_db_path();
+    if memory_path.exists() {
+        if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
+            if let Ok(memories) = parse_memory_export(&stdout, ACTIVITY_OBSERVER_LIMIT as usize) {
+                if let Some(event) = state.observe_learnings_count(memories.len()) {
+                    fresh_events.push(event);
+                }
+            }
+        }
     }
 
     for payload in notifications::collect_notification_payloads(&fresh_events) {
-        let _ = show_notification_impl(&app, &payload.title, &payload.body, payload.action);
+        let _ = show_notification_impl(app, &payload.title, &payload.body, payload.action);
     }
-
-    let memory_available = memory_path.exists();
-    build_activity_feed_response(
-        transformations,
-        memories,
-        observation.recent,
-        memory_available,
-        limit as usize,
-    )
 }
 
 /// Pure merge/sort core of `get_activity_feed`. Combines transformations,
@@ -1140,16 +1176,29 @@ fn delete_live_learning(
 fn list_applied_patterns(
     project_path: String,
 ) -> Result<crate::models::AppliedPatterns, String> {
-    let claude_md = std::path::PathBuf::from(&project_path).join("CLAUDE.md");
-    let memory_md = crate::tool_manager::claude_project_memory_file(&project_path);
+    Ok(read_applied_patterns_for_project(&project_path))
+}
 
-    let claude_sections = read_applied_block(&claude_md);
-    let memory_sections = read_applied_block(&memory_md);
+#[tauri::command]
+fn list_applied_patterns_for_projects(
+    project_paths: Vec<String>,
+) -> Result<std::collections::HashMap<String, crate::models::AppliedPatterns>, String> {
+    let mut out = std::collections::HashMap::with_capacity(project_paths.len());
+    for p in project_paths {
+        let patterns = read_applied_patterns_for_project(&p);
+        out.insert(p, patterns);
+    }
+    Ok(out)
+}
 
-    Ok(crate::models::AppliedPatterns {
-        claude_md: claude_sections,
-        memory_md: memory_sections,
-    })
+fn read_applied_patterns_for_project(project_path: &str) -> crate::models::AppliedPatterns {
+    let claude_md = std::path::PathBuf::from(project_path).join("CLAUDE.md");
+    let memory_md = crate::tool_manager::claude_project_memory_file(project_path);
+
+    crate::models::AppliedPatterns {
+        claude_md: read_applied_block(&claude_md),
+        memory_md: read_applied_block(&memory_md),
+    }
 }
 
 #[tauri::command]
@@ -1784,6 +1833,7 @@ pub fn run() {
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
             spawn_proxy_watchdog(app.handle().clone());
+            spawn_activity_observer(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::track_event(
@@ -1850,6 +1900,7 @@ pub fn run() {
             list_live_learnings_for_projects,
             delete_live_learning,
             list_applied_patterns,
+            list_applied_patterns_for_projects,
             delete_applied_pattern,
             get_headroom_learn_status,
             get_headroom_learn_prereq_status,
