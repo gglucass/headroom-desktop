@@ -2151,15 +2151,20 @@ fn extract_cwd_from_session_file(path: &Path) -> Option<String> {
 }
 
 fn decode_project_folder_name(folder_name: &str) -> String {
-    if folder_name.starts_with('-') {
-        let mut normalized = folder_name.replace("--", "__dash__");
-        normalized = normalized.trim_start_matches('-').to_string();
-        let rebuilt = format!("/{}", normalized.replace('-', "/").replace("__dash__", "-"));
-        if !rebuilt.trim().is_empty() {
-            return rebuilt;
-        }
+    // Claude Code's folder-name convention is lossy: it maps '/' to '-' without
+    // escaping existing hyphens, so paths like `/a/b-c` and `/a/b/c` produce the
+    // same folder. We mirror that convention here and accept the ambiguity --
+    // the primary resolver (`extract_cwd_from_session_file`) reads the real cwd
+    // from session JSONL, so this fallback only runs when that fails.
+    if !folder_name.starts_with('-') {
+        return folder_name.to_string();
     }
-    folder_name.to_string()
+    let rebuilt = format!("/{}", folder_name.trim_start_matches('-').replace('-', "/"));
+    if rebuilt.trim().is_empty() {
+        folder_name.to_string()
+    } else {
+        rebuilt
+    }
 }
 
 fn project_display_name(project_path: &str) -> String {

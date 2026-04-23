@@ -309,17 +309,17 @@ export function formatLearnStatus(project: {
   hasPersistedLearnings?: boolean;
 }): string {
   if (!project.lastLearnRanAt) {
-    return project.hasPersistedLearnings ? "existing learnings found" : "never analyzed";
+    return project.hasPersistedLearnings ? "existing training found" : "never trained";
   }
   const parsed = new Date(project.lastLearnRanAt);
   if (Number.isNaN(parsed.getTime())) {
-    return project.hasPersistedLearnings ? "existing learnings found" : "never analyzed";
+    return project.hasPersistedLearnings ? "existing training found" : "never trained";
   }
   const diffMs = Date.now() - parsed.getTime();
   const diffDays = Math.floor(diffMs / 86_400_000);
-  if (diffDays === 0) return "analyzed today";
-  if (diffDays === 1) return "analyzed yesterday";
-  return `analyzed ${diffDays} days ago`;
+  if (diffDays === 0) return "last training: today";
+  if (diffDays === 1) return "last training: yesterday";
+  return `last training: ${diffDays} days ago`;
 }
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {

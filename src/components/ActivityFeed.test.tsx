@@ -605,7 +605,6 @@ describe("ActivityFeed", () => {
     expect(itemCount + headerCount).toBe(10);
     expect(headerCount).toBe(1);
     expect(markup).toContain("Page 1 of 3");
-    expect(markup).toContain("23 total");
     expect(markup).toContain("← Prev");
     expect(markup).toContain("Next →");
   });

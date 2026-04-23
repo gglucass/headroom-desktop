@@ -136,7 +136,6 @@ import type {
   ActivityFeedResponse,
   AppliedPatterns,
   HourlySavingsPoint,
-  LiveLearning,
   RuntimeStatus,
   RuntimeUpgradeProgress,
 } from "./lib/types";
@@ -737,11 +736,8 @@ export default function App() {
   const [selectedClaudeProjectPath, setSelectedClaudeProjectPath] = useState<string | null>(null);
   const [headroomLearnStatus, setHeadroomLearnStatus] =
     useState<HeadroomLearnStatus>(idleHeadroomLearnStatus);
-  const [optimizeLiveByProject, setOptimizeLiveByProject] =
-    useState<Record<string, LiveLearning[]> | null>(null);
   const [optimizeAppliedByProject, setOptimizeAppliedByProject] =
     useState<Record<string, AppliedPatterns> | null>(null);
-  const [optimizeLiveRefreshTick, setOptimizeLiveRefreshTick] = useState(0);
   const [optimizeAppliedRefreshTick, setOptimizeAppliedRefreshTick] = useState(0);
   const previousHeadroomLearnRunningRef = useRef(false);
   const [headroomLearnBusy, setHeadroomLearnBusy] = useState(false);
@@ -1404,13 +1400,21 @@ export default function App() {
           return;
         }
 
-        void refreshConnectors();
-
         const inactiveForMs = mainWindowLastBlurAtRef.current
           ? now.getTime() - mainWindowLastBlurAtRef.current
-          : 0;
+          : null;
+        // Skip `refreshConnectors` for quick alt-tabs: connectors only change
+        // via user action (app enable/disable) or manual edits to
+        // ~/.claude/settings.json — neither happens in the 30s window of a
+        // fast context switch. On initial focus (`inactiveForMs === null`)
+        // or after a real "came back from another app" gap, refresh to pick
+        // up outside changes.
+        if (inactiveForMs === null || inactiveForMs >= 30_000) {
+          void refreshConnectors();
+        }
+
         const dayRolledOver = nowDayKey !== mainWindowLastSeenDayRef.current;
-        if (inactiveForMs >= 3_600_000 || dayRolledOver) {
+        if ((inactiveForMs ?? 0) >= 3_600_000 || dayRolledOver) {
           setChartResetSignal((current) => current + 1);
         }
 
@@ -1665,7 +1669,7 @@ export default function App() {
   }, [activeView]);
 
   useEffect(() => {
-    if (activeView !== "optimization") {
+    if (activeView !== "optimization" || !trayWindowFocused) {
       return;
     }
 
@@ -1699,7 +1703,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView, selectedClaudeProjectPath, headroomLearnStatus.running]);
+  }, [activeView, selectedClaudeProjectPath, headroomLearnStatus.running, trayWindowFocused]);
 
   useEffect(() => {
     if (activeView !== "upgrade") {
@@ -1747,42 +1751,7 @@ export default function App() {
     .map((project) => project.projectPath)
     .sort()
     .join("\t");
-  useEffect(() => {
-    if (activeView !== "optimization") {
-      return;
-    }
-    const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
-    if (paths.length === 0) {
-      setOptimizeLiveByProject({});
-      return;
-    }
-    let active = true;
-    invoke<Record<string, LiveLearning[]>>("list_live_learnings_for_projects", {
-      projectPaths: paths,
-    })
-      .then((result) => {
-        if (!active) return;
-        setOptimizeLiveByProject(result);
-      })
-      .catch(() => {
-        if (!active) return;
-        // Panels fall back to their own fetch on error (Rust cache still keeps
-        // that cheap if this call just failed for a transient reason).
-        setOptimizeLiveByProject(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [
-    activeView,
-    claudeProjectPathsKey,
-    headroomLearnStatus.finishedAt,
-    optimizeLiveRefreshTick,
-  ]);
-
   // Batched applied-patterns fetch: one IPC instead of one per OptimizePanel.
-  // Mirrors the live-learnings aggregate above so both halves of each panel
-  // come from a single parent-owned source of truth.
   useEffect(() => {
     if (activeView !== "optimization") {
       return;
@@ -1825,14 +1794,21 @@ export default function App() {
   }, [claudeConnectorEnabled]);
 
   useEffect(() => {
+    // Pricing status hits the remote Headroom API. When the tray is focused,
+    // poll at 60s so fresh subscription/trial state is visible on demand.
+    // When hidden, slow to 10 min — still fast enough for trial-expiry and
+    // urgent notifications to fire, while cutting hourly API traffic by
+    // ~90%. The launcher window never sets `trayWindowFocused` to false
+    // (its focus listener isn't wired up), so it keeps the 60s cadence.
+    const intervalMs = trayWindowFocused ? 60_000 : 600_000;
     void refreshPricingStatus();
     const interval = window.setInterval(() => {
       void refreshPricingStatus();
-    }, 60_000);
+    }, intervalMs);
     return () => {
       window.clearInterval(interval);
     };
-  }, []);
+  }, [trayWindowFocused]);
 
   useEffect(() => {
     const claudeConnector = getClaudeConnector(connectors);
@@ -3918,7 +3894,7 @@ export default function App() {
                   <h1>Project learnings</h1>
                 </div>
                 <p className="optimize-card__blurb">
-                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom writes them to the project's memory so they don't happen again.
+                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom updates the project's MEMORY.md so they don't happen again. It can also train on session history and write token savings learnings to CLAUDE.md.
                 </p>
               </header>
               <div className="optimize-card__body">
@@ -4024,13 +4000,14 @@ export default function App() {
                           project.activeDaysSinceLastLearn >= 2;
                         const learnMeta = (() => {
                           const base = formatLearnStatus(project);
-                          // Pattern count is already shown by the "X learnings applied"
-                          // pill; repeating it here is redundant.
                           const stalePart = suggestRerun
                             ? `${project.activeDaysSinceLastLearn} active day${project.activeDaysSinceLastLearn === 1 ? "" : "s"} since · consider rerunning`
                             : null;
                           return [base, stalePart].filter(Boolean).join(" · ");
                         })();
+                        const refreshLabel = isRunning
+                          ? "Training…"
+                          : "Train now";
                         const projectResultTone = headroomLearnStatus.success === true
                           ? "success"
                           : (headroomLearnStatus.success === false || headroomLearnStatus.error)
@@ -4058,18 +4035,25 @@ export default function App() {
                               <span className="optimize-project-row__name">
                                 <strong>{project.displayName}</strong>
                                 <small className={suggestRerun ? "optimize-project-row__stale" : undefined}>
-                                  {learnMeta}
+                                  <span className="optimize-project-row__training">
+                                    {learnMeta}
+                                    <button
+                                      type="button"
+                                      className={`optimize-project-row__refresh${isRunning ? " is-spinning" : ""}`}
+                                      onClick={() => void handleRunHeadroomLearn(project.projectPath)}
+                                      disabled={disableLearn}
+                                      aria-label={refreshLabel}
+                                      title={refreshLabel}
+                                    >
+                                      <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
+                                    </button>
+                                  </span>
                                   <OptimizePanel
                                     projectPath={project.projectPath}
                                     refreshSignal={
                                       isLatestLearnProject && !headroomLearnStatus.running
                                         ? Date.parse(headroomLearnStatus.finishedAt ?? "") || 0
                                         : 0
-                                    }
-                                    preloadedLive={
-                                      optimizeLiveByProject
-                                        ? optimizeLiveByProject[project.projectPath] ?? []
-                                        : undefined
                                     }
                                     preloadedApplied={
                                       optimizeAppliedByProject
@@ -4079,9 +4063,6 @@ export default function App() {
                                           }
                                         : undefined
                                     }
-                                    onLiveMutated={() =>
-                                      setOptimizeLiveRefreshTick((tick) => tick + 1)
-                                    }
                                     onAppliedMutated={() =>
                                       setOptimizeAppliedRefreshTick((tick) => tick + 1)
                                     }
@@ -4089,21 +4070,11 @@ export default function App() {
                                 </small>
                               </span>
                               <div className="optimize-project-row__actions">
-                                <div className="optimize-project-row__action-row">
-                                  {showInlineResult ? (
-                                    <span className={`optimize-project-row__status optimize-minimal__result--${projectResultTone}`}>
-                                      {projectResultLabel}
-                                    </span>
-                                  ) : null}
-                                  <button
-                                    className="secondary-button secondary-button--small optimize-project-row__learn"
-                                    disabled={disableLearn}
-                                    onClick={() => void handleRunHeadroomLearn(project.projectPath)}
-                                    type="button"
-                                  >
-                                    {isRunning ? "Learning…" : "Learn"}
-                                  </button>
-                                </div>
+                                {showInlineResult ? (
+                                  <span className={`optimize-project-row__status optimize-minimal__result--${projectResultTone}`}>
+                                    {projectResultLabel}
+                                  </span>
+                                ) : null}
                                 {isRunning ? (
                                   <div className="headroom-learn__progress optimize-project-row__progress" aria-live="polite">
                                     <div className="headroom-learn__progress-track">

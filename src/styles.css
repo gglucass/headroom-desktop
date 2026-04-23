@@ -2298,9 +2298,46 @@ select {
   color: #7a7068;
 }
 
-.optimize-project-row__learn {
-  min-width: 72px;
+.optimize-project-row__training {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.optimize-project-row__refresh {
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: 50%;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  flex-shrink: 0;
+}
+
+.optimize-project-row__refresh:hover:not(:disabled) {
+  background: var(--fill-hover);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.optimize-project-row__refresh:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.optimize-project-row__refresh.is-spinning svg {
+  animation: optimize-refresh-spin 1.1s linear infinite;
+}
+
+@keyframes optimize-refresh-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .optimize-project-row__actions {
@@ -2308,13 +2345,6 @@ select {
   justify-items: end;
   gap: 6px;
   flex-shrink: 0;
-}
-
-.optimize-project-row__action-row {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
 }
 
 .optimize-project-row__status {

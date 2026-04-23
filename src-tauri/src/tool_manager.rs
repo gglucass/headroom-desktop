@@ -2710,10 +2710,7 @@ pub fn claude_project_memory_file(project_path: &str) -> PathBuf {
 fn encode_claude_project_folder_name(project_path: &str) -> String {
     format!(
         "-{}",
-        project_path
-            .trim_start_matches('/')
-            .replace('-', "--")
-            .replace('/', "-")
+        project_path.trim_start_matches('/').replace('/', "-")
     )
 }
 
@@ -3668,10 +3665,13 @@ after
     }
 
     #[test]
-    fn encode_claude_project_folder_name_replaces_slashes_and_escapes_hyphens() {
+    fn encode_claude_project_folder_name_replaces_slashes_preserving_hyphens() {
+        // Claude Code's on-disk encoding only substitutes '/' with '-'; literal
+        // hyphens in the path are preserved verbatim. Verified against real
+        // ~/.claude/projects/ folder names.
         assert_eq!(
             super::encode_claude_project_folder_name("/Users/alice/my-project"),
-            "-Users-alice-my--project"
+            "-Users-alice-my-project"
         );
     }
 

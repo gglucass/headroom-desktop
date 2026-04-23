@@ -14,7 +14,29 @@ use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
 
 const SCHEMA_VERSION: u8 = 1;
-const RECENT_EVENTS_CAP: usize = 200;
+const RECENT_EVENTS_CAP: usize = 300;
+
+// High-signal events (records, milestones, streaks, etc.) are rare and
+// intrinsically interesting. Protect them from FIFO eviction caused by
+// bursts of compressions / rtk batches / memories, which can push 150+
+// events through the buffer in a single session and otherwise drown them
+// out before the UI ever sees them.
+fn is_high_signal(event: &ActivityEvent) -> bool {
+    match event {
+        ActivityEvent::Transformation(_)
+        | ActivityEvent::Memory(_)
+        | ActivityEvent::RtkBatch(_) => false,
+        ActivityEvent::Milestone(_)
+        | ActivityEvent::DailyRecord(_)
+        | ActivityEvent::AllTimeRecord(_)
+        | ActivityEvent::PromptAllTimeRecord(_)
+        | ActivityEvent::NewModel(_)
+        | ActivityEvent::Streak(_)
+        | ActivityEvent::SavingsMilestone(_)
+        | ActivityEvent::LearningsMilestone(_)
+        | ActivityEvent::WeeklyRecap(_) => true,
+    }
+}
 
 // Persisted compression history cap. Big enough to cover a few days of
 // moderate traffic but small enough to keep `activity-facts.json` well
@@ -726,7 +748,19 @@ impl ActivityFacts {
             self.recent_events.push_back(event);
         }
         while self.recent_events.len() > RECENT_EVENTS_CAP {
-            self.recent_events.pop_front();
+            // Prefer evicting the oldest non-high-signal event so a burst
+            // of compressions can't push out a learnings milestone or a
+            // new daily record. Fall back to pop_front only when the entire
+            // buffer is high-signal (rare — these kinds are sparse).
+            if let Some(idx) = self
+                .recent_events
+                .iter()
+                .position(|event| !is_high_signal(event))
+            {
+                self.recent_events.remove(idx);
+            } else {
+                self.recent_events.pop_front();
+            }
         }
     }
 
@@ -932,6 +966,54 @@ mod tests {
             .collect();
         assert_eq!(drs.len(), 1);
         assert_eq!(drs[0].observed_at, obs_late, "newest entry wins");
+    }
+
+    #[test]
+    fn push_recent_preserves_high_signal_events_under_burst() {
+        // A long coding session emits hundreds of compression events. Without
+        // kind-aware eviction, a rare learnings milestone pushed early would
+        // be FIFO'd out before the frontend ever saw it. Confirm it survives.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let milestone_at = Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap();
+        facts.push_recent(vec![ActivityEvent::LearningsMilestone(
+            LearningsMilestoneEvent {
+                observed_at: milestone_at,
+                count: 100,
+                kind: "first_100".into(),
+            },
+        )]);
+
+        // Flood past the cap with transformations.
+        let flood: Vec<ActivityEvent> = (0..RECENT_EVENTS_CAP + 50)
+            .map(|i| {
+                ActivityEvent::Transformation(TransformationFeedEvent {
+                    request_id: Some(format!("req-{i}")),
+                    timestamp: Some("2026-04-22T10:00:00Z".into()),
+                    provider: Some("anthropic".into()),
+                    model: Some("claude".into()),
+                    input_tokens_original: Some(1000),
+                    input_tokens_optimized: Some(300),
+                    tokens_saved: Some(500),
+                    savings_percent: Some(50.0),
+                    transforms_applied: vec!["kompress".into()],
+                    workspace: None,
+                    turn_id: None,
+                })
+            })
+            .collect();
+        facts.push_recent(flood);
+
+        assert!(facts.recent_events.len() <= RECENT_EVENTS_CAP);
+        let milestone_count = facts
+            .recent_events
+            .iter()
+            .filter(|e| matches!(e, ActivityEvent::LearningsMilestone(_)))
+            .count();
+        assert_eq!(
+            milestone_count, 1,
+            "learnings milestone must survive a compression burst"
+        );
     }
 
     #[test]

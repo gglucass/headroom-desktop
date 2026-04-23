@@ -2215,7 +2215,12 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         .env("PYTHONNOUSERSITE", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
-        .env("HEADROOM_LEARN_CLI", "claude");
+        .env("HEADROOM_LEARN_CLI", "claude")
+        // Force the claude CLI backend: the analyzer picks LiteLLM over
+        // HEADROOM_LEARN_CLI when any of these keys is set in the parent env.
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GEMINI_API_KEY");
     if let Some(claude_path) = claude_cli::detect_claude_cli() {
         if let Some(dir) = claude_path.parent() {
             let existing = std::env::var("PATH").unwrap_or_default();

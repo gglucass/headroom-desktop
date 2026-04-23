@@ -3,57 +3,33 @@ import {
   useEffect,
   useRef,
   useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type MouseEvent as ReactMouseEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type {
-  AppliedPatterns,
-  AppliedSection,
-  LiveLearning,
-} from "../lib/types";
+import type { AppliedPatterns, AppliedSection } from "../lib/types";
 
 interface OptimizePanelProps {
   projectPath: string;
   // Bump this to force a refetch after an external event (e.g. a Learn run
   // finishes). The value itself is ignored; only changes matter.
   refreshSignal?: number;
-  // When provided, the panel uses this slice of live learnings rather than
-  // invoking `list_live_learnings` itself. Lets the parent batch one Python
-  // subprocess spawn across every panel instead of N.
-  preloadedLive?: LiveLearning[] | null;
-  // Same pattern as `preloadedLive` but for applied patterns. Collapses one
-  // `list_applied_patterns` IPC per project into a single batched parent call.
+  // When provided, the panel uses this slice of applied patterns rather than
+  // invoking `list_applied_patterns` itself. Lets the parent batch one IPC
+  // across every panel instead of N.
   preloadedApplied?: AppliedPatterns | null;
-  // Called after the panel mutates live learnings (e.g. delete) so the parent
-  // can refetch the shared aggregate. Only used when preloadedLive is set.
-  onLiveMutated?: () => void;
-  // Same as onLiveMutated, but for applied patterns.
+  // Called after the panel mutates applied patterns (delete) so the parent
+  // can refetch the shared aggregate. Only used when preloadedApplied is set.
   onAppliedMutated?: () => void;
 }
 
-const CATEGORY_LABELS: Record<string, string> = {
-  environment: "Environment",
-  architecture: "Architecture",
-  preference: "Preference",
-  error_recovery: "Error recovery",
-};
-
-type ModalKind = null | "pending" | "applied";
+type ModalKind = null | "claude" | "memory";
 
 export function OptimizePanel({
   projectPath,
   refreshSignal,
-  preloadedLive,
   preloadedApplied,
-  onLiveMutated,
   onAppliedMutated,
 }: OptimizePanelProps) {
-  const hasPreloadedLive = preloadedLive !== undefined;
   const hasPreloadedApplied = preloadedApplied !== undefined;
-  const [live, setLive] = useState<LiveLearning[] | null>(
-    hasPreloadedLive ? preloadedLive ?? null : null,
-  );
   const [applied, setApplied] = useState<AppliedPatterns | null>(
     hasPreloadedApplied ? preloadedApplied ?? null : null,
   );
@@ -61,21 +37,13 @@ export function OptimizePanel({
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [modal, setModal] = useState<ModalKind>(null);
 
-  // Reading `hasPreloaded*` via refs inside `refetch` keeps its identity
+  // Reading `hasPreloadedApplied` via a ref inside `refetch` keeps its identity
   // stable when the parent flips from "still loading the aggregate" to
   // "aggregate resolved". Without this, refetch's useCallback dep churn
   // re-fires the refetch effect and causes a duplicate IPC round per panel.
-  const hasPreloadedLiveRef = useRef(hasPreloadedLive);
-  hasPreloadedLiveRef.current = hasPreloadedLive;
   const hasPreloadedAppliedRef = useRef(hasPreloadedApplied);
   hasPreloadedAppliedRef.current = hasPreloadedApplied;
 
-  // Sync preloaded slices into local state whenever the parent updates them.
-  useEffect(() => {
-    if (hasPreloadedLive) {
-      setLive(preloadedLive ?? null);
-    }
-  }, [hasPreloadedLive, preloadedLive]);
   useEffect(() => {
     if (hasPreloadedApplied) {
       setApplied(preloadedApplied ?? null);
@@ -83,22 +51,12 @@ export function OptimizePanel({
   }, [hasPreloadedApplied, preloadedApplied]);
 
   const refetch = useCallback(() => {
+    if (hasPreloadedAppliedRef.current) return () => {};
     let active = true;
-    const appliedPromise = hasPreloadedAppliedRef.current
-      ? Promise.resolve<AppliedPatterns | null>(null)
-      : invoke<AppliedPatterns>("list_applied_patterns", { projectPath });
-    const livePromise = hasPreloadedLiveRef.current
-      ? Promise.resolve<LiveLearning[] | null>(null)
-      : invoke<LiveLearning[]>("list_live_learnings", { projectPath });
-    Promise.all([livePromise, appliedPromise])
-      .then(([l, a]) => {
+    invoke<AppliedPatterns>("list_applied_patterns", { projectPath })
+      .then((a) => {
         if (!active) return;
-        if (!hasPreloadedLiveRef.current) {
-          setLive(l);
-        }
-        if (!hasPreloadedAppliedRef.current && a !== null) {
-          setApplied(a);
-        }
+        setApplied(a);
         setLoadError(null);
       })
       .catch((err) => {
@@ -114,26 +72,6 @@ export function OptimizePanel({
     const cancel = refetch();
     return cancel;
   }, [refetch, refreshSignal]);
-
-  const handleDeleteLive = async (id: string) => {
-    setBusyIds((prev) => new Set(prev).add(id));
-    try {
-      await invoke("delete_live_learning", { memoryId: id });
-      if (hasPreloadedLive) {
-        onLiveMutated?.();
-      } else {
-        refetch();
-      }
-    } catch (err) {
-      setLoadError(err instanceof Error ? err.message : "Delete failed.");
-    } finally {
-      setBusyIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
-  };
 
   const handleDeleteApplied = async (
     fileKind: "claude" | "memory",
@@ -165,103 +103,70 @@ export function OptimizePanel({
     }
   };
 
-  const liveCount = live?.length ?? 0;
-  const appliedCount =
-    (applied?.claudeMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0) +
-    (applied?.memoryMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0);
-
-  const liveByCategory = groupBy(live ?? [], (l) => l.category);
-  const pendingDisabled = live === null || liveCount === 0;
-  const appliedDisabled = applied === null || appliedCount === 0;
+  const claudeCount = applied?.claudeMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0;
+  const memoryCount = applied?.memoryMd.reduce((n, s) => n + s.bullets.length, 0) ?? 0;
+  const claudeDisabled = applied === null || claudeCount === 0;
+  const memoryDisabled = applied === null || memoryCount === 0;
 
   return (
     <>
       <span className="optimize-panel__pills">
         <button
           type="button"
-          className={`optimize-panel__pill${pendingDisabled ? " optimize-panel__pill--empty" : ""}`}
-          onClick={() => setModal("pending")}
-          disabled={pendingDisabled}
+          className={`optimize-panel__pill${claudeDisabled ? " optimize-panel__pill--empty" : ""}`}
+          onClick={() => setModal("claude")}
+          disabled={claudeDisabled}
         >
-          {liveCount} pending learning{liveCount === 1 ? "" : "s"}
+          {claudeCount} learning{claudeCount === 1 ? "" : "s"} in CLAUDE.md
         </button>
         <button
           type="button"
-          className={`optimize-panel__pill${appliedDisabled ? " optimize-panel__pill--empty" : ""}`}
-          onClick={() => setModal("applied")}
-          disabled={appliedDisabled}
+          className={`optimize-panel__pill${memoryDisabled ? " optimize-panel__pill--empty" : ""}`}
+          onClick={() => setModal("memory")}
+          disabled={memoryDisabled}
         >
-          {appliedCount} learning{appliedCount === 1 ? "" : "s"} applied
+          {memoryCount} reminder{memoryCount === 1 ? "" : "s"} in MEMORY.md
         </button>
       </span>
 
-      {modal === "pending" ? (
-        <Modal title="Pending learnings" onClose={() => setModal(null)}>
-          <p className="optimize-panel__info">
-            Patterns observed in recent sessions. Each must be observed at least
-            twice before being written to your project's memory.
-          </p>
+      {modal === "claude" ? (
+        <Modal title="Learnings in CLAUDE.md" onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
-          {live === null ? (
+          {applied === null ? (
             <p className="optimize-panel__empty">Loading…</p>
-          ) : live.length === 0 ? (
+          ) : claudeCount === 0 ? (
             <p className="optimize-panel__empty">
-              No pending learnings yet for this project — use Claude Code and
-              they'll appear here.
+              No learnings in CLAUDE.md yet — run Learn or let live traffic
+              accumulate.
             </p>
           ) : (
-            Array.from(liveByCategory.entries()).map(([category, items]) => (
-              <div className="optimize-panel__subsection" key={category}>
-                <h5 className="optimize-panel__subsection-title">
-                  {CATEGORY_LABELS[category] ?? category}
-                </h5>
-                <ul className="optimize-panel__list">
-                  {items.map((row) => (
-                    <LiveRow
-                      key={row.id}
-                      row={row}
-                      busy={busyIds.has(row.id)}
-                      onDelete={() => void handleDeleteLive(row.id)}
-                    />
-                  ))}
-                </ul>
-              </div>
-            ))
+            <AppliedSections
+              fileKind="claude"
+              sections={applied.claudeMd}
+              busyIds={busyIds}
+              onDelete={handleDeleteApplied}
+            />
           )}
         </Modal>
       ) : null}
 
-      {modal === "applied" ? (
-        <Modal title="Applied learnings" onClose={() => setModal(null)}>
-          <p className="optimize-panel__info">
-            Patterns still present in pending learnings may be re-applied on the
-            next flush (~10s).
-          </p>
+      {modal === "memory" ? (
+        <Modal title="Reminders in MEMORY.md" onClose={() => setModal(null)}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">Loading…</p>
-          ) : appliedCount === 0 ? (
+          ) : memoryCount === 0 ? (
             <p className="optimize-panel__empty">
-              No applied learnings yet — run Learn or let live traffic
+              No reminders in MEMORY.md yet — run Learn or let live traffic
               accumulate.
             </p>
           ) : (
-            <>
-              <AppliedFileView
-                label="CLAUDE.md"
-                fileKind="claude"
-                sections={applied.claudeMd}
-                busyIds={busyIds}
-                onDelete={handleDeleteApplied}
-              />
-              <AppliedFileView
-                label="MEMORY.md"
-                fileKind="memory"
-                sections={applied.memoryMd}
-                busyIds={busyIds}
-                onDelete={handleDeleteApplied}
-              />
-            </>
+            <AppliedSections
+              fileKind="memory"
+              sections={applied.memoryMd}
+              busyIds={busyIds}
+              onDelete={handleDeleteApplied}
+            />
           )}
         </Modal>
       ) : null}
@@ -306,79 +211,12 @@ function Modal({
   );
 }
 
-function LiveRow({
-  row,
-  busy,
-  onDelete,
-}: {
-  row: LiveLearning;
-  busy: boolean;
-  onDelete: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const canExpand = row.content.length > 80 || row.content.includes("\n");
-  const toggle = () => {
-    if (canExpand) setExpanded((prev) => !prev);
-  };
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
-    if (!canExpand) return;
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      toggle();
-    }
-  };
-  const onDeleteClick = (e: ReactMouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    onDelete();
-  };
-  return (
-    <li
-      className={
-        "optimize-panel__row" +
-        (canExpand ? " optimize-panel__row--clickable" : "") +
-        (expanded ? " is-expanded" : "")
-      }
-      role={canExpand ? "button" : undefined}
-      tabIndex={canExpand ? 0 : undefined}
-      aria-expanded={canExpand ? expanded : undefined}
-      onClick={toggle}
-      onKeyDown={onKeyDown}
-    >
-      <div className="optimize-panel__row-main">
-        <p
-          className={
-            expanded
-              ? "activity-feed__content"
-              : "activity-feed__content activity-feed__content--clamped-one"
-          }
-          title={canExpand && !expanded ? row.content : undefined}
-        >
-          {row.content}
-        </p>
-        <div className="optimize-panel__row-meta">
-          <span>evidence ×{row.evidenceCount}</span>
-        </div>
-      </div>
-      <button
-        type="button"
-        className="optimize-panel__delete"
-        disabled={busy}
-        onClick={onDeleteClick}
-      >
-        {busy ? "…" : "Delete"}
-      </button>
-    </li>
-  );
-}
-
-function AppliedFileView({
-  label,
+function AppliedSections({
   fileKind,
   sections,
   busyIds,
   onDelete,
 }: {
-  label: string;
   fileKind: "claude" | "memory";
   sections: AppliedSection[];
   busyIds: Set<string>;
@@ -388,10 +226,8 @@ function AppliedFileView({
     bulletText: string,
   ) => Promise<void> | void;
 }) {
-  if (sections.length === 0) return null;
   return (
-    <div className="optimize-panel__subsection">
-      <h5 className="optimize-panel__subsection-title">{label}</h5>
+    <>
       {sections.map((section) => (
         <div className="optimize-panel__applied-section" key={section.title}>
           <h6 className="optimize-panel__applied-section-title">{section.title}</h6>
@@ -410,7 +246,7 @@ function AppliedFileView({
           </ul>
         </div>
       ))}
-    </div>
+    </>
   );
 }
 
@@ -458,18 +294,4 @@ function AppliedBullet({
       </button>
     </li>
   );
-}
-
-function groupBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {
-  const map = new Map<K, T[]>();
-  for (const item of items) {
-    const k = key(item);
-    const list = map.get(k);
-    if (list) {
-      list.push(item);
-    } else {
-      map.set(k, [item]);
-    }
-  }
-  return map;
 }

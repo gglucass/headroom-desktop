@@ -114,7 +114,7 @@ export function ActivityFeed({
                 ← Prev
               </button>
               <span className="activity-feed__page-indicator">
-                Page {clampedPage + 1} of {totalPages} · {filteredEvents.length} total
+                Page {clampedPage + 1} of {totalPages}
               </span>
               <button
                 type="button"
