@@ -1265,6 +1265,20 @@ impl AppState {
         event
     }
 
+    /// Scan the Claude Code project list for candidates that should be
+    /// prompted to run Train. Delegates the decision logic and bookkeeping
+    /// (fire-once for never-trained, 7-day cooldown for stale) to
+    /// `ActivityFacts::observe_train_suggestions`.
+    pub fn observe_train_suggestions(
+        &self,
+        projects: &[ClaudeCodeProject],
+    ) -> Vec<ActivityEvent> {
+        let mut facts = self.activity_facts.lock();
+        let events = facts.observe_train_suggestions(projects, Utc::now());
+        let _ = facts.save_if_dirty();
+        events
+    }
+
     /// Read-only snapshot of the synthetic-event history already persisted to
     /// ActivityFacts. Used by the feed read path so it never mutates state —
     /// observation runs on a backend timer and is the sole writer.

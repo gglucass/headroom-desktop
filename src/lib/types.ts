@@ -358,6 +358,16 @@ export interface LearningsMilestoneEvent {
   kind: string;
 }
 
+export interface TrainSuggestionEvent {
+  observedAt: string;
+  projectPath: string;
+  projectDisplayName: string;
+  sessionCount: number;
+  activeDaysSinceLastLearn: number;
+  // "never_trained" | "stale"
+  kind: string;
+}
+
 export type ActivityEvent =
   | { kind: "transformation"; data: TransformationFeedEvent }
   | { kind: "memory"; data: MemoryFeedEvent }
@@ -368,7 +378,8 @@ export type ActivityEvent =
   | { kind: "streak"; data: StreakEvent }
   | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }
   | { kind: "weeklyRecap"; data: WeeklyRecapEvent }
-  | { kind: "learningsMilestone"; data: LearningsMilestoneEvent };
+  | { kind: "learningsMilestone"; data: LearningsMilestoneEvent }
+  | { kind: "trainSuggestion"; data: TrainSuggestionEvent };
 
 export interface ActivityFeedResponse {
   events: ActivityEvent[];

@@ -1093,6 +1093,18 @@ fn run_activity_observation(app: &AppHandle) {
         }
     }
 
+    // No point nudging the user to run Train if the claude CLI isn't installed —
+    // they'd just hit an install prompt. The Optimize tab surfaces the install
+    // UI in that case; let them fix prereqs first.
+    if state
+        .headroom_learn_prereq_status()
+        .claude_cli_available
+    {
+        if let Ok(projects) = state.list_claude_code_projects() {
+            fresh_events.extend(state.observe_train_suggestions(&projects));
+        }
+    }
+
     for payload in notifications::collect_notification_payloads(&fresh_events) {
         let _ = show_notification_impl(app, &payload.title, &payload.body, payload.action);
     }
@@ -1465,6 +1477,7 @@ fn activity_event_timestamp(event: &ActivityEvent) -> String {
         ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
+        ActivityEvent::TrainSuggestion(e) => e.observed_at.to_rfc3339(),
     }
 }
 
@@ -3969,6 +3982,7 @@ mod tests {
             ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::TrainSuggestion(e) => e.observed_at.to_rfc3339(),
         }
     }
 
@@ -4200,6 +4214,7 @@ mod tests {
                 ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
                 ActivityEvent::WeeklyRecap(_) => "weeklyRecap",
                 ActivityEvent::LearningsMilestone(_) => "learningsMilestone",
+                ActivityEvent::TrainSuggestion(_) => "trainSuggestion",
             })
             .collect();
         assert_eq!(

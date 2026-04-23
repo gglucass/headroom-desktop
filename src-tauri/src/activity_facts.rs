@@ -6,14 +6,24 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent, RecordEvent, RecordTag,
-    RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent, WeeklyRecapEvent,
+    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent,
+    RecordEvent, RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent,
+    TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
 
 const SCHEMA_VERSION: u8 = 1;
 const RECENT_EVENTS_CAP: usize = 300;
+
+// Minimum Claude Code session count before we nudge a never-trained project.
+// Below this, the user probably hasn't done enough real work on the project
+// for train to find meaningful patterns.
+pub(crate) const NEVER_TRAINED_MIN_SESSIONS: usize = 5;
+// Cooldown between stale re-suggestions per project. Once the user has trained
+// at least once, we only remind them weekly at most so the Activity feed
+// doesn't turn into a nag screen.
+pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 7;
 
 // High-signal events (records, milestones, streaks, etc.) are rare and
 // intrinsically interesting. Protect them from FIFO eviction caused by
@@ -31,7 +41,8 @@ pub(crate) fn is_high_signal(event: &ActivityEvent) -> bool {
         | ActivityEvent::Streak(_)
         | ActivityEvent::SavingsMilestone(_)
         | ActivityEvent::LearningsMilestone(_)
-        | ActivityEvent::WeeklyRecap(_) => true,
+        | ActivityEvent::WeeklyRecap(_)
+        | ActivityEvent::TrainSuggestion(_) => true,
     }
 }
 
@@ -123,6 +134,28 @@ pub struct WeeklyTotals {
     pub active_days: u32,
 }
 
+// Shared debounce for Daily and AllTime record tags. Once we've emitted a
+// tag, the bar is already visible — a burst of beats that each nudge the
+// number up by a fraction of a percent shouldn't repaint the same chip
+// every row. Suppress a follow-up tag only when it lands within 24h of the
+// last emission AND beats the previous by under 25%. First-ever emission
+// (previous=None) or emission after 24h always fires.
+fn debounce_suppress(
+    previous: Option<u64>,
+    last_emitted_at: Option<DateTime<Utc>>,
+    tokens: u64,
+    now: DateTime<Utc>,
+) -> bool {
+    match (previous, last_emitted_at) {
+        (Some(prev), Some(prev_at)) if prev > 0 => {
+            let within_24h = now.signed_duration_since(prev_at) < Duration::hours(24);
+            let delta_pct = (tokens as f64 - prev as f64) / prev as f64 * 100.0;
+            within_24h && delta_pct < 25.0
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyRecordFact {
@@ -165,6 +198,8 @@ struct PersistedActivityFacts {
     prompt_all_time_record_tokens: u64,
     #[serde(default)]
     all_time_record_emitted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    daily_record_emitted_at: Option<DateTime<Utc>>,
     // Rolling window of compression events, deduped by request_id (fallback
     // timestamp). The proxy keeps its own sliding window but loses it on
     // restart; persisting here lets the Activity feed carry history across
@@ -173,6 +208,17 @@ struct PersistedActivityFacts {
     // continuous.
     #[serde(default)]
     transformation_history: VecDeque<TransformationFeedEvent>,
+    // Projects we've already nudged with a "never trained" TrainSuggestion.
+    // Fire-once per project, ever — once it's in the set we never re-emit the
+    // never-trained kind for that project (even after the user trains and
+    // re-resets state). Stale re-suggestions have their own throttle map.
+    #[serde(default)]
+    train_suggestions_fired: BTreeSet<String>,
+    // Last time we emitted a "stale" TrainSuggestion per project. Used to
+    // throttle re-fires to `STALE_TRAIN_REFIRE_DAYS` so a long-neglected
+    // project doesn't churn a new Activity row on every observer tick.
+    #[serde(default)]
+    stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,14 +252,16 @@ pub struct ActivityFacts {
     last_weekly_recap_week_key: Option<String>,
     learnings_milestones_fired: BTreeSet<u32>,
     prompt_all_time_record_tokens: u64,
-    // Timestamp of the last all-time-record event we actually emitted (not
-    // just the last time the tokens counter updated). Used to debounce
-    // celebratory events that arrive in quick succession with near-identical
-    // values — e.g. a few requests within the same minute that each beat the
-    // previous by a fraction of a percent would otherwise produce a row of
-    // indistinguishable "new record" cards in the Activity feed.
+    // Timestamps of the last record-tag emission we actually made for each
+    // scope (not just the last time the underlying counter updated). Used to
+    // debounce near-identical beats: a burst of compressions that each nudge
+    // the record up by a fraction of a percent would otherwise flood the
+    // feed with chips that keep saying the same thing.
     all_time_record_emitted_at: Option<DateTime<Utc>>,
+    daily_record_emitted_at: Option<DateTime<Utc>>,
     transformation_history: VecDeque<TransformationFeedEvent>,
+    train_suggestions_fired: BTreeSet<String>,
+    stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
     turn_accumulators: HashMap<String, TurnAccumulator>,
     rtk_initialized: bool,
     dirty: bool,
@@ -248,7 +296,10 @@ impl ActivityFacts {
             learnings_milestones_fired: persisted.learnings_milestones_fired,
             prompt_all_time_record_tokens: persisted.prompt_all_time_record_tokens,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
+            daily_record_emitted_at: persisted.daily_record_emitted_at,
             transformation_history: persisted.transformation_history,
+            train_suggestions_fired: persisted.train_suggestions_fired,
+            stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
             turn_accumulators: HashMap::new(),
             rtk_initialized: true,
             dirty: false,
@@ -271,7 +322,10 @@ impl ActivityFacts {
             learnings_milestones_fired: BTreeSet::new(),
             prompt_all_time_record_tokens: 0,
             all_time_record_emitted_at: None,
+            daily_record_emitted_at: None,
             transformation_history: VecDeque::new(),
+            train_suggestions_fired: BTreeSet::new(),
+            stale_train_suggestions_fired_at: std::collections::BTreeMap::new(),
             turn_accumulators: HashMap::new(),
             rtk_initialized: false,
             dirty: false,
@@ -367,9 +421,15 @@ impl ActivityFacts {
             // which stacks up in `recent_events` and shows the user the same
             // record N times.
             if event_day == today {
-                let beats_day = match &self.daily_record {
-                    Some(existing) if existing.day == today => tokens > existing.tokens_saved,
-                    _ => true,
+                // `beats_day` plus the previous same-day tokens (None when
+                // this is the first Daily of a new calendar day — so the
+                // 24h/25% debounce can't accidentally suppress today's first
+                // celebration just because yesterday's ran < 24h ago).
+                let (beats_day, previous_same_day) = match &self.daily_record {
+                    Some(existing) if existing.day == today => {
+                        (tokens > existing.tokens_saved, Some(existing.tokens_saved))
+                    }
+                    _ => (true, None),
                 };
                 if beats_day {
                     self.daily_record = Some(DailyRecordFact {
@@ -381,7 +441,10 @@ impl ActivityFacts {
                         request_id: event.request_id.clone(),
                         savings_percent: event.savings_percent,
                     });
-                    tags.push(RecordTag::Daily);
+                    if !debounce_suppress(previous_same_day, self.daily_record_emitted_at, tokens, now) {
+                        self.daily_record_emitted_at = Some(now);
+                        tags.push(RecordTag::Daily);
+                    }
                 }
             }
 
@@ -392,25 +455,8 @@ impl ActivityFacts {
                 } else {
                     Some(previous_tokens)
                 };
-                // Debounce celebratory AllTime records: once we've emitted a
-                // card, the bar is already raised — a heavy session that keeps
-                // nudging the record up shouldn't spam the feed. Suppress
-                // follow-ups within 24h unless the new record beats the
-                // previous by a meaningful margin (>=25%). The counter still
-                // updates silently so the underlying number stays true. When
-                // suppressed we omit the AllTime tag but still emit a Record
-                // if Daily also applies.
-                let suppress = match (previous, self.all_time_record_emitted_at) {
-                    (Some(prev), Some(prev_at)) => {
-                        let within_24h =
-                            now.signed_duration_since(prev_at) < Duration::hours(24);
-                        let delta_pct = (tokens as f64 - prev as f64) / prev as f64 * 100.0;
-                        within_24h && delta_pct < 25.0
-                    }
-                    _ => false,
-                };
                 self.all_time_record_tokens = tokens;
-                if !suppress {
+                if !debounce_suppress(previous, self.all_time_record_emitted_at, tokens, now) {
                     self.all_time_record_emitted_at = Some(now);
                     tags.push(RecordTag::AllTime);
                     all_time_previous = previous;
@@ -723,6 +769,81 @@ impl ActivityFacts {
         Some(event)
     }
 
+    /// Scan project metadata and emit a `TrainSuggestion` for any project that
+    /// matches a trigger. Two kinds:
+    ///
+    /// - `"never_trained"` — user has logged `NEVER_TRAINED_MIN_SESSIONS`+
+    ///   sessions but never run Train on this project. Fires once per project,
+    ///   ever (gated by `train_suggestions_fired`). The caller dispatches a
+    ///   macOS notification for this kind via
+    ///   `notifications::notification_for_event`.
+    /// - `"stale"` — user has trained before but worked on the project 2+
+    ///   active days since. Throttled to at most once per
+    ///   `STALE_TRAIN_REFIRE_DAYS` per project via
+    ///   `stale_train_suggestions_fired_at` so the Activity feed doesn't turn
+    ///   into a nag screen. No notification for this kind — the existing
+    ///   inline "consider rerunning" hint on the Optimize tab covers the
+    ///   signal, this just surfaces it on the Activity tab too.
+    pub fn observe_train_suggestions(
+        &mut self,
+        projects: &[ClaudeCodeProject],
+        observed_at: DateTime<Utc>,
+    ) -> Vec<ActivityEvent> {
+        let mut events: Vec<ActivityEvent> = Vec::new();
+        for project in projects {
+            let (kind, active_days) = if project.last_learn_ran_at.is_none() {
+                if project.session_count < NEVER_TRAINED_MIN_SESSIONS {
+                    continue;
+                }
+                if self.train_suggestions_fired.contains(&project.project_path) {
+                    continue;
+                }
+                ("never_trained", 0u32)
+            } else if project.active_days_since_last_learn >= 2 {
+                let throttled = self
+                    .stale_train_suggestions_fired_at
+                    .get(&project.project_path)
+                    .is_some_and(|last| {
+                        observed_at.signed_duration_since(*last)
+                            < Duration::days(STALE_TRAIN_REFIRE_DAYS)
+                    });
+                if throttled {
+                    continue;
+                }
+                ("stale", project.active_days_since_last_learn as u32)
+            } else {
+                continue;
+            };
+
+            events.push(ActivityEvent::TrainSuggestion(TrainSuggestionEvent {
+                observed_at,
+                project_path: project.project_path.clone(),
+                project_display_name: project.display_name.clone(),
+                session_count: project.session_count as u32,
+                active_days_since_last_learn: active_days,
+                kind: kind.into(),
+            }));
+
+            match kind {
+                "never_trained" => {
+                    self.train_suggestions_fired
+                        .insert(project.project_path.clone());
+                }
+                "stale" => {
+                    self.stale_train_suggestions_fired_at
+                        .insert(project.project_path.clone(), observed_at);
+                }
+                _ => {}
+            }
+        }
+
+        if !events.is_empty() {
+            self.push_recent(events.clone());
+            self.dirty = true;
+        }
+        events
+    }
+
     pub fn maybe_record_weekly_recap(
         &mut self,
         today_local: NaiveDate,
@@ -798,7 +919,10 @@ impl ActivityFacts {
             learnings_milestones_fired: self.learnings_milestones_fired.clone(),
             prompt_all_time_record_tokens: self.prompt_all_time_record_tokens,
             all_time_record_emitted_at: self.all_time_record_emitted_at,
+            daily_record_emitted_at: self.daily_record_emitted_at,
             transformation_history: self.transformation_history.clone(),
+            train_suggestions_fired: self.train_suggestions_fired.clone(),
+            stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
         std::fs::write(&self.path, bytes)
@@ -1126,14 +1250,14 @@ mod tests {
 
     #[test]
     fn all_time_record_debounces_tiny_beats_within_a_day() {
-        // First record sets the bar and emits. A beat that's 0.5% higher just
-        // 10 minutes later still updates the counter but MUST NOT emit another
-        // feed row — otherwise a burst of similar compressions spams the feed
-        // with indistinguishable "new record" cards.
+        // First all-time sets the bar and emits the tag. A 0.5% beat 10 min
+        // later still advances the counter but MUST NOT re-tag — otherwise
+        // consecutive Record cards both claim "All-time" and the chip loses
+        // meaning. A subsequent beat >= 25% re-fires, as does any beat after
+        // 24h have passed.
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
-        let t1 = t0 + Duration::minutes(10);
 
         let first = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(1_000), Some(50.0)),
@@ -1142,50 +1266,80 @@ mod tests {
         );
         assert!(first.iter().any(is_all_time_record));
 
-        let second = facts.observe_transformation_at(
+        let tiny = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(1_005), Some(50.0)),
-            t1,
-            t1,
+            t0 + Duration::minutes(10),
+            t0 + Duration::minutes(10),
         );
         assert!(
-            !second.iter().any(is_all_time_record),
-            "0.5% beat within 24h should be suppressed",
+            !tiny.iter().any(is_all_time_record),
+            "0.5% beat within 24h must be suppressed",
         );
         assert_eq!(
             facts.all_time_record_tokens, 1_005,
-            "counter still advances"
+            "counter still advances even when tag suppressed"
         );
+
+        // >=25% beat inside 24h re-fires.
+        let big = facts.observe_transformation_at(
+            &mk_transformation(Some("a"), Some(1_300), Some(50.0)),
+            t0 + Duration::minutes(20),
+            t0 + Duration::minutes(20),
+        );
+        assert!(big.iter().any(is_all_time_record));
+
+        // Tiny beat but > 24h later re-fires.
+        let late = t0 + Duration::hours(24) + Duration::minutes(30);
+        let late_ev = facts.observe_transformation_at(
+            &mk_transformation(Some("a"), Some(1_305), Some(50.0)),
+            late,
+            late,
+        );
+        assert!(late_ev.iter().any(is_all_time_record));
     }
 
     #[test]
-    fn all_time_record_emits_when_delta_large_or_enough_time_has_passed() {
+    fn daily_record_debounces_tiny_beats_within_the_day() {
+        // Same debounce rules apply to the Daily tag: a tiny beat within 24h
+        // is suppressed, but a >=25% beat re-fires. The first Daily of a new
+        // calendar day always fires regardless of the 24h clock.
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
 
-        facts.observe_transformation_at(
+        let first = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(1_000), Some(50.0)),
             t0,
             t0,
         );
+        assert!(first.iter().any(is_daily_record));
 
-        // Delta >= 25% inside 24h → emits.
-        let t_delta = t0 + Duration::minutes(5);
+        let tiny = facts.observe_transformation_at(
+            &mk_transformation(Some("a"), Some(1_005), Some(50.0)),
+            t0 + Duration::minutes(10),
+            t0 + Duration::minutes(10),
+        );
+        assert!(
+            !tiny.iter().any(is_daily_record),
+            "0.5% daily beat within 24h must be suppressed",
+        );
+
         let big = facts.observe_transformation_at(
             &mk_transformation(Some("a"), Some(1_300), Some(50.0)),
-            t_delta,
-            t_delta,
+            t0 + Duration::minutes(20),
+            t0 + Duration::minutes(20),
         );
-        assert!(big.iter().any(is_all_time_record));
+        assert!(big.iter().any(is_daily_record));
 
-        // Tiny beat but > 24 hours later → emits.
-        let t_late = t_delta + Duration::hours(24) + Duration::minutes(1);
-        let late = facts.observe_transformation_at(
-            &mk_transformation(Some("a"), Some(1_305), Some(50.0)),
-            t_late,
-            t_late,
+        // Next day: first beat always fires even if the previous day's Daily
+        // was < 24h ago — a new calendar day deserves its own celebration.
+        let next = Utc.with_ymd_and_hms(2026, 4, 23, 2, 0, 0).unwrap();
+        let next_ev = facts.observe_transformation_at(
+            &mk_transformation(Some("a"), Some(500), Some(50.0)),
+            next,
+            next,
         );
-        assert!(late.iter().any(is_all_time_record));
+        assert!(next_ev.iter().any(is_daily_record));
     }
 
     fn mk_turn(turn_id: &str, request_id: &str, tokens_saved: i64) -> TransformationFeedEvent {
@@ -1668,5 +1822,121 @@ mod tests {
             }
             _ => panic!("expected weekly recap"),
         }
+    }
+
+    fn mk_project(
+        path: &str,
+        sessions: usize,
+        last_learn: Option<&str>,
+        active_days: usize,
+    ) -> ClaudeCodeProject {
+        ClaudeCodeProject {
+            id: path.chars().take(12).collect(),
+            project_path: path.into(),
+            display_name: path.rsplit('/').next().unwrap_or(path).into(),
+            last_worked_at: "2026-04-22T10:00:00Z".into(),
+            session_count: sessions,
+            last_learn_ran_at: last_learn.map(str::to_string),
+            has_persisted_learnings: last_learn.is_some(),
+            active_days_since_last_learn: active_days,
+            last_learn_pattern_count: None,
+        }
+    }
+
+    #[test]
+    fn train_suggestion_never_trained_fires_once_over_threshold() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
+        let first = facts.observe_train_suggestions(&projects, at(10, 0));
+        assert_eq!(first.len(), 1);
+        match &first[0] {
+            ActivityEvent::TrainSuggestion(e) => {
+                assert_eq!(e.kind, "never_trained");
+                assert_eq!(e.project_path, "/Users/u/Code/demo");
+                assert_eq!(e.session_count, 5);
+            }
+            _ => panic!("expected TrainSuggestion"),
+        }
+        let second = facts.observe_train_suggestions(&projects, at(11, 0));
+        assert!(second.is_empty(), "never-trained must fire once per project");
+    }
+
+    #[test]
+    fn train_suggestion_never_trained_below_threshold_silent() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let projects = vec![mk_project("/Users/u/Code/demo", 4, None, 0)];
+        assert!(facts
+            .observe_train_suggestions(&projects, at(10, 0))
+            .is_empty());
+    }
+
+    #[test]
+    fn train_suggestion_stale_throttled_to_weekly() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let projects = vec![mk_project(
+            "/Users/u/Code/demo",
+            10,
+            Some("2026-04-15T10:00:00Z"),
+            3,
+        )];
+        let day0 = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
+        let first = facts.observe_train_suggestions(&projects, day0);
+        assert_eq!(first.len(), 1);
+        match &first[0] {
+            ActivityEvent::TrainSuggestion(e) => assert_eq!(e.kind, "stale"),
+            _ => panic!("expected stale TrainSuggestion"),
+        }
+        let day3 = day0 + Duration::days(3);
+        assert!(
+            facts.observe_train_suggestions(&projects, day3).is_empty(),
+            "within 7-day cooldown must not re-fire"
+        );
+        let day8 = day0 + Duration::days(8);
+        let third = facts.observe_train_suggestions(&projects, day8);
+        assert_eq!(third.len(), 1, "after cooldown, stale must re-fire");
+    }
+
+    #[test]
+    fn train_suggestion_persists_across_reload() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
+        assert_eq!(
+            facts.observe_train_suggestions(&projects, at(10, 0)).len(),
+            1
+        );
+        facts.save_if_dirty().unwrap();
+        let mut reloaded = ActivityFacts::load_or_create(&base).unwrap();
+        assert!(
+            reloaded
+                .observe_train_suggestions(&projects, at(11, 0))
+                .is_empty(),
+            "fired set must survive reload"
+        );
+    }
+
+    #[test]
+    fn train_suggestion_survives_low_signal_eviction() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
+        facts.observe_train_suggestions(&projects, at(10, 0));
+        for _ in 0..(RECENT_EVENTS_CAP + 10) {
+            facts.push_recent(vec![ActivityEvent::Transformation(mk_transformation(
+                Some("claude-x"),
+                Some(1),
+                Some(1.0),
+            ))]);
+        }
+        let recent = facts.recent_events();
+        assert!(
+            recent
+                .iter()
+                .any(|e| matches!(e, ActivityEvent::TrainSuggestion(_))),
+            "TrainSuggestion must survive FIFO eviction"
+        );
     }
 }

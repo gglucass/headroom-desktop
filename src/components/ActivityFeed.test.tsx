@@ -12,6 +12,7 @@ import type {
   RtkBatchEvent,
   SavingsMilestoneEvent,
   StreakEvent,
+  TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
 } from "../lib/types";
@@ -296,16 +297,23 @@ describe("ActivityFeed", () => {
     // here that's the one from 2026-04-21. A memory on 2026-04-22 provides a
     // second day so the renderer emits two day-headers, confirming the
     // header logic still fires even though transformations no longer group.
-    const events: ActivityEvent[] = [
-      memory({ id: "mem-late", createdAt: "2026-04-22T12:00:00Z" }),
-      transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 9_999, savingsPercent: 90 })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
-    expect(headerCount).toBe(2);
-    expect(markup).toContain("Recent large compression");
-    expect(markup).not.toContain("Compression × ");
+    // Pin "now" so neither fixture date is "today" (today's header is hidden).
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-25T10:00:00Z"));
+    try {
+      const events: ActivityEvent[] = [
+        memory({ id: "mem-late", createdAt: "2026-04-22T12:00:00Z" }),
+        transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 9_999, savingsPercent: 90 })
+      ];
+      const feed: ActivityFeedResponse = { ...baseFeed, events };
+      const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+      const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
+      expect(headerCount).toBe(2);
+      expect(markup).toContain("Recent large compression");
+      expect(markup).not.toContain("Compression × ");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders both kinds in the order they appear in the feed", () => {
@@ -529,6 +537,80 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("3 patterns extracted");
   });
 
+  it("renders a never-trained TrainSuggestion row with project + session count", () => {
+    const data: TrainSuggestionEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      projectPath: "/Users/u/Code/demo-repo",
+      projectDisplayName: "demo-repo",
+      sessionCount: 7,
+      activeDaysSinceLastLearn: 0,
+      kind: "never_trained"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "trainSuggestion", data }]
+    };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed
+        feed={feed}
+        error={null}
+        onNavigateToOptimize={() => {}}
+      />
+    );
+    expect(markup).toContain("activity-feed__item--train");
+    expect(markup).toContain("activity-feed__badge--train");
+    expect(markup).toContain("Try Train");
+    expect(markup).toContain("demo-repo");
+    expect(markup).toContain("7 sessions");
+    // Clickable affordance present when navigation callback was provided.
+    expect(markup).toContain("activity-feed__item--clickable");
+    expect(markup).toContain('role="button"');
+  });
+
+  it("renders a stale TrainSuggestion row with the retrain copy", () => {
+    const data: TrainSuggestionEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      projectPath: "/Users/u/Code/demo-repo",
+      projectDisplayName: "demo-repo",
+      sessionCount: 20,
+      activeDaysSinceLastLearn: 4,
+      kind: "stale"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "trainSuggestion", data }]
+    };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed
+        feed={feed}
+        error={null}
+        onNavigateToOptimize={() => {}}
+      />
+    );
+    expect(markup).toContain("Retrain");
+    expect(markup).toContain("4 active days");
+    expect(markup).toContain("demo-repo");
+  });
+
+  it("omits the clickable affordance when onNavigateToOptimize is not provided", () => {
+    const data: TrainSuggestionEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      projectPath: "/Users/u/Code/demo-repo",
+      projectDisplayName: "demo-repo",
+      sessionCount: 7,
+      activeDaysSinceLastLearn: 0,
+      kind: "never_trained"
+    };
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [{ kind: "trainSuggestion", data }]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("activity-feed__item--train");
+    expect(markup).not.toContain("activity-feed__item--clickable");
+    expect(markup).not.toContain('role="button"');
+  });
+
   it("renders a project badge on learnings with a project-scoped memory", () => {
     const feed: ActivityFeedResponse = {
       ...baseFeed,
@@ -642,27 +724,34 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__transforms");
   });
 
-  it("paginates at 5 rows per page and shows navigation when there are more", () => {
+  it("paginates at 5 activity rows per page and shows navigation when there are more", () => {
     // Memory rows coalesce into groups when 3+ land within COALESCE_GAP_MS of
     // each other, so this fixture spaces them 35 minutes apart to keep every
-    // entry as its own row. All 13 entries share the same local day, so one
-    // day header is inserted at the top of page 1 and page 1 ends up with 4
-    // item rows + 1 header = 5 rows total.
-    const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
-      const minutes = i * 35;
-      const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
-      const mm = String(minutes % 60).padStart(2, "0");
-      return memory({ id: `mem-${i}`, createdAt: `2026-04-21T${hh}:${mm}:00Z` });
-    });
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
-    expect(itemCount + headerCount).toBe(5);
-    expect(headerCount).toBe(1);
-    expect(markup).toContain("Page 1 of 3");
-    expect(markup).toContain("← Prev");
-    expect(markup).toContain("Next →");
+    // entry as its own row. Day headers do not count toward PAGE_SIZE — they
+    // render in addition to the 5 activity rows. All 13 entries share the
+    // same local day (2026-04-21, pinned below as not "today" so the header
+    // emits), so page 1 shows 5 item rows plus 1 day header = 6 rows total.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-25T10:00:00Z"));
+    try {
+      const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
+        const minutes = i * 35;
+        const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
+        const mm = String(minutes % 60).padStart(2, "0");
+        return memory({ id: `mem-${i}`, createdAt: `2026-04-21T${hh}:${mm}:00Z` });
+      });
+      const feed: ActivityFeedResponse = { ...baseFeed, events };
+      const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+      const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+      const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
+      expect(itemCount).toBe(5);
+      expect(headerCount).toBe(1);
+      expect(markup).toContain("Page 1 of 3");
+      expect(markup).toContain("← Prev");
+      expect(markup).toContain("Next →");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hides pagination when there are 5 or fewer events", () => {

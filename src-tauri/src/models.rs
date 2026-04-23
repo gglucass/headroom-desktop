@@ -475,6 +475,18 @@ pub struct LearningsMilestoneEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainSuggestionEvent {
+    pub observed_at: DateTime<Utc>,
+    pub project_path: String,
+    pub project_display_name: String,
+    pub session_count: u32,
+    pub active_days_since_last_learn: u32,
+    // "never_trained" | "stale"
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ActivityEvent {
     #[serde(rename = "transformation")]
@@ -497,6 +509,8 @@ pub enum ActivityEvent {
     WeeklyRecap(WeeklyRecapEvent),
     #[serde(rename = "learningsMilestone")]
     LearningsMilestone(LearningsMilestoneEvent),
+    #[serde(rename = "trainSuggestion")]
+    TrainSuggestion(TrainSuggestionEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

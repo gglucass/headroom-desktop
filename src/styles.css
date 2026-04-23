@@ -4502,6 +4502,16 @@ html.window-hiding {
   border-color: rgba(108, 90, 165, 0.22);
 }
 
+.activity-feed__badge--train {
+  background: var(--accent-tint-strong);
+  color: var(--accent-strong);
+}
+
+.activity-feed__item--train {
+  background: var(--accent-tint);
+  border-color: var(--accent-tint-strong);
+}
+
 .activity-feed__scope {
   text-transform: uppercase;
   letter-spacing: 0.04em;

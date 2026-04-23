@@ -318,6 +318,10 @@ function notificationActionView(action: string | null): TrayView | null {
     case "runtime":
     case "connectors":
       return "settings";
+    case "optimize":
+      return "optimization";
+    case "activity":
+      return "notifications";
     default:
       return null;
   }
@@ -358,6 +362,8 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
       case "savingsMilestone":
       case "learningsMilestone":
         return `${event.kind[0]}:${event.data.observedAt}`;
+      case "trainSuggestion":
+        return `ts:${event.data.projectPath}:${event.data.observedAt}`;
     }
   };
   return [
@@ -4130,6 +4136,7 @@ export default function App() {
             error={activityFeedError}
             loaded={activityFeedLoaded}
             projectPaths={claudeProjects.map((p) => p.projectPath)}
+            onNavigateToOptimize={() => setActiveView("optimization")}
           />
         </div>
 

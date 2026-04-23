@@ -111,6 +111,17 @@ pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPaylo
                 .into(),
             action: Some("optimize".into()),
         }),
+        ActivityEvent::TrainSuggestion(s) if s.kind == "never_trained" => {
+            Some(NotificationPayload {
+                title: format!("Train Headroom on {}", s.project_display_name),
+                body: format!(
+                    "{} session{} tracked without a Train run. Extract learnings into CLAUDE.md and MEMORY.md from the Optimize tab.",
+                    s.session_count,
+                    if s.session_count == 1 { "" } else { "s" }
+                ),
+                action: Some("optimize".into()),
+            })
+        }
         _ => None,
     }
 }
@@ -133,8 +144,8 @@ mod tests {
     use super::*;
     use crate::models::{
         LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
-        RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
-        WeeklyRecapEvent,
+        RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TrainSuggestionEvent,
+        TransformationFeedEvent, WeeklyRecapEvent,
     };
     use chrono::{TimeZone, Utc};
 
@@ -411,5 +422,34 @@ mod tests {
                 ev
             );
         }
+    }
+
+    #[test]
+    fn notifies_for_never_trained_train_suggestion() {
+        let ev = ActivityEvent::TrainSuggestion(TrainSuggestionEvent {
+            observed_at: ts(),
+            project_path: "/Users/u/Code/demo-repo".into(),
+            project_display_name: "demo-repo".into(),
+            session_count: 7,
+            active_days_since_last_learn: 0,
+            kind: "never_trained".into(),
+        });
+        let p = notification_for_event(&ev).expect("should notify");
+        assert!(p.title.contains("demo-repo"));
+        assert!(p.body.contains("7"));
+        assert_eq!(p.action.as_deref(), Some("optimize"));
+    }
+
+    #[test]
+    fn does_not_notify_for_stale_train_suggestion() {
+        let ev = ActivityEvent::TrainSuggestion(TrainSuggestionEvent {
+            observed_at: ts(),
+            project_path: "/Users/u/Code/demo-repo".into(),
+            project_display_name: "demo-repo".into(),
+            session_count: 20,
+            active_days_since_last_learn: 4,
+            kind: "stale".into(),
+        });
+        assert!(notification_for_event(&ev).is_none());
     }
 }

@@ -15,6 +15,7 @@ import type {
   RtkBatchEvent,
   SavingsMilestoneEvent,
   StreakEvent,
+  TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
 } from "../lib/types";
@@ -32,6 +33,10 @@ interface ActivityFeedProps {
   // not carry an explicit project link today (scope/entity_refs are absent
   // from the Python export), so content-matching is the only signal.
   projectPaths?: string[];
+  // Invoked when a TrainSuggestion row is clicked, so the parent can switch
+  // tabs. Left optional so the component keeps rendering in contexts that
+  // can't navigate (tests, embedded previews).
+  onNavigateToOptimize?: () => void;
 }
 
 const PAGE_SIZE = 5;
@@ -41,7 +46,8 @@ export function ActivityFeed({
   feed,
   error,
   loaded = true,
-  projectPaths = []
+  projectPaths = [],
+  onNavigateToOptimize
 }: ActivityFeedProps) {
   const [page, setPage] = useState(0);
   // Memoize the derived feed shapes so page changes (or any re-render that
@@ -96,13 +102,12 @@ export function ActivityFeed({
       ) : (
         <>
           <ul className="activity-feed__list">
-            {pageEvents.map((row, index) => (
-              <FeedRowItem
-                key={feedRowKey(row, start + index)}
-                row={row}
-                projectPaths={projectPaths}
-              />
-            ))}
+            {renderPageWithDayHeaders(
+              pageEvents,
+              start,
+              projectPaths,
+              onNavigateToOptimize
+            )}
           </ul>
           {totalPages > 1 ? (
             <nav className="activity-feed__pagination" aria-label="Activity pagination">
@@ -206,6 +211,7 @@ function eventTimestampMs(event: ActivityEvent): number {
     case "streak":
     case "savingsMilestone":
     case "learningsMilestone":
+    case "trainSuggestion":
       return Date.parse(event.data.observedAt) || 0;
     case "weeklyRecap":
       return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
@@ -241,16 +247,11 @@ function dayHeaderLabel(dayKey: string, now: Date = new Date()): string {
 function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
   const out: FeedRow[] = [];
   const consumed = new Set<number>();
-  let lastDayKey: string | null = null;
   for (let i = 0; i < events.length; i++) {
     if (consumed.has(i)) continue;
     const event = events[i];
     const ts = eventTimestampMs(event);
     const dayKey = localDayKey(ts);
-    if (dayKey && dayKey !== lastDayKey) {
-      out.push({ type: "dayHeader", dayKey, label: dayHeaderLabel(dayKey) });
-      lastDayKey = dayKey;
-    }
     const minRun = COALESCE_MIN_LENGTH[event.kind];
     if (!minRun) {
       out.push({ type: "single", event });
@@ -309,6 +310,49 @@ function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
   return out;
 }
 
+function rowDayKey(row: FeedRow): string {
+  if (row.type === "dayHeader") return row.dayKey;
+  if (row.type === "single") return localDayKey(eventTimestampMs(row.event));
+  if (row.type === "rtkGroup") {
+    return localDayKey(Date.parse(row.events[0]?.observedAt ?? "") || 0);
+  }
+  return localDayKey(Date.parse(row.events[0]?.createdAt ?? "") || 0);
+}
+
+function renderPageWithDayHeaders(
+  rows: FeedRow[],
+  start: number,
+  projectPaths: string[],
+  onNavigateToOptimize: (() => void) | undefined
+): ReactNode[] {
+  const today = localDayKey(Date.now());
+  const nodes: ReactNode[] = [];
+  let prevDayKey: string | null = null;
+  rows.forEach((row, index) => {
+    const dayKey = rowDayKey(row);
+    if (dayKey && dayKey !== prevDayKey && dayKey !== today) {
+      nodes.push(
+        <FeedRowItem
+          key={`day-${dayKey}-${start + index}`}
+          row={{ type: "dayHeader", dayKey, label: dayHeaderLabel(dayKey) }}
+          projectPaths={projectPaths}
+          onNavigateToOptimize={onNavigateToOptimize}
+        />
+      );
+    }
+    prevDayKey = dayKey;
+    nodes.push(
+      <FeedRowItem
+        key={feedRowKey(row, start + index)}
+        row={row}
+        projectPaths={projectPaths}
+        onNavigateToOptimize={onNavigateToOptimize}
+      />
+    );
+  });
+  return nodes;
+}
+
 function feedRowKey(row: FeedRow, index: number): string {
   if (row.type === "dayHeader") {
     return `day-${row.dayKey}`;
@@ -349,10 +393,20 @@ function singleKey(event: ActivityEvent, index: number): string {
       return `wr-${event.data.weekStart}`;
     case "learningsMilestone":
       return `lm-${event.data.count}-${event.data.observedAt}`;
+    case "trainSuggestion":
+      return `train-${event.data.projectPath}-${event.data.observedAt}`;
   }
 }
 
-function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string[] }) {
+function FeedRowItem({
+  row,
+  projectPaths,
+  onNavigateToOptimize
+}: {
+  row: FeedRow;
+  projectPaths: string[];
+  onNavigateToOptimize?: () => void;
+}) {
   if (row.type === "dayHeader") {
     return (
       <li className="activity-feed__day-header" aria-label={`Events from ${row.label}`}>
@@ -388,6 +442,13 @@ function FeedRowItem({ row, projectPaths }: { row: FeedRow; projectPaths: string
       return <WeeklyRecapRow event={event.data} />;
     case "learningsMilestone":
       return <LearningsMilestoneRow event={event.data} />;
+    case "trainSuggestion":
+      return (
+        <TrainSuggestionRow
+          event={event.data}
+          onNavigate={onNavigateToOptimize}
+        />
+      );
   }
 }
 
@@ -1039,6 +1100,51 @@ function NewModelRow({ event }: { event: NewModelEvent }) {
         ) : null}
       </div>
       <p className="activity-feed__content">First compression on {event.model}.</p>
+    </li>
+  );
+}
+
+function TrainSuggestionRow({
+  event,
+  onNavigate
+}: {
+  event: TrainSuggestionEvent;
+  onNavigate?: () => void;
+}) {
+  const isNeverTrained = event.kind === "never_trained";
+  const badgeLabel = isNeverTrained ? "Try Train" : "Retrain";
+  const copy = isNeverTrained
+    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Train run yet. Extract learnings into CLAUDE.md and MEMORY.md.`
+    : `${event.activeDaysSinceLastLearn} active day${event.activeDaysSinceLastLearn === 1 ? "" : "s"} on ${event.projectDisplayName} since the last Train run. Consider rerunning to pick up new patterns.`;
+  const canNavigate = typeof onNavigate === "function";
+  const handleActivate = () => {
+    if (canNavigate) onNavigate?.();
+  };
+  /* v8 ignore start — keyboard activation requires a DOM; see ExpandableRow. */
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
+    if (!canNavigate) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      handleActivate();
+    }
+  };
+  /* v8 ignore stop */
+  return (
+    <li
+      className={`activity-feed__item activity-feed__item--train${canNavigate ? " activity-feed__item--clickable" : ""}`}
+      role={canNavigate ? "button" : undefined}
+      tabIndex={canNavigate ? 0 : undefined}
+      onClick={canNavigate ? handleActivate : undefined}
+      onKeyDown={onKeyDown}
+    >
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--train">
+          {badgeLabel}
+        </span>
+        <TimeChip iso={event.observedAt} />
+        <span className="activity-feed__project">{event.projectDisplayName}</span>
+      </div>
+      <p className="activity-feed__content">{copy}</p>
     </li>
   );
 }
