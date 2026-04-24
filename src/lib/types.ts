@@ -361,19 +361,18 @@ export interface TrainSuggestionEvent {
   kind: string;
 }
 
-export type ActivityEvent =
-  | { kind: "transformation"; data: TransformationFeedEvent }
-  | { kind: "rtkBatch"; data: RtkBatchEvent }
-  | { kind: "record"; data: RecordEvent }
-  | { kind: "weeklyRecap"; data: WeeklyRecapEvent }
-  | { kind: "learningsMilestone"; data: LearningsMilestoneEvent }
-  | { kind: "trainSuggestion"; data: TrainSuggestionEvent };
+export interface ActivityFeedSnapshot {
+  transformation: TransformationFeedEvent | null;
+  record: RecordEvent | null;
+  rtkBatch: RtkBatchEvent | null;
+  learningsMilestone: LearningsMilestoneEvent | null;
+  weeklyRecap: WeeklyRecapEvent | null;
+  trainSuggestion: TrainSuggestionEvent | null;
+}
 
 export interface ActivityFeedResponse {
-  events: ActivityEvent[];
-  logFullMessages: boolean;
+  tiles: ActivityFeedSnapshot;
   proxyReachable: boolean;
-  memoryAvailable: boolean;
 }
 
 export type ClaudeAuthMethod = "claude_ai_oauth" | "api_key" | "unknown";

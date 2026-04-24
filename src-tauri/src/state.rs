@@ -64,11 +64,6 @@ pub struct PendingMilestones {
 #[derive(Debug, Default, Clone)]
 pub struct ActivityObservation {
     pub fresh: Vec<ActivityEvent>,
-    // Only read by tests today — the feed read path now calls
-    // `recent_activity_events()` directly, bypassing ActivityObservation
-    // entirely. Keeping the field lets existing test assertions compile.
-    #[allow(dead_code)]
-    pub recent: Vec<ActivityEvent>,
 }
 
 /// Emit the runtime upgrade progress event on the given AppHandle.
@@ -1250,10 +1245,7 @@ impl AppState {
         }
 
         let _ = facts.save_if_dirty();
-        ActivityObservation {
-            fresh,
-            recent: facts.recent_events(),
-        }
+        ActivityObservation { fresh }
     }
 
     pub fn observe_learnings_count(&self, count: usize) -> Option<ActivityEvent> {
@@ -1274,11 +1266,11 @@ impl AppState {
         events
     }
 
-    /// Read-only snapshot of the synthetic-event history already persisted to
-    /// ActivityFacts. Used by the feed read path so it never mutates state —
-    /// observation runs on a backend timer and is the sole writer.
-    pub fn recent_activity_events(&self) -> Vec<ActivityEvent> {
-        self.activity_facts.lock().recent_events()
+    /// Read-only snapshot of the latest-of-kind slots. The `get_activity_feed`
+    /// IPC command wraps this straight into the response; observation runs on
+    /// a backend timer and is the sole writer.
+    pub fn activity_feed_snapshot(&self) -> crate::models::ActivityFeedSnapshot {
+        self.activity_facts.lock().activity_feed_snapshot()
     }
 
     /// On Monday, emit a weekly recap rolling up the previous 7 days of
@@ -4421,18 +4413,20 @@ mod tests {
                 .any(|e| matches!(e, ActivityEvent::Record(_))),
             "first record should fire"
         );
-        assert_eq!(first.fresh.len(), first.recent.len());
+        // Snapshot after the first observation has the record slot populated.
+        let first_snapshot = state.activity_feed_snapshot();
+        assert!(first_snapshot.record.is_some());
+        assert!(first_snapshot.transformation.is_some());
 
         let second = state.observe_activity_from_transformations(&[transformation]);
         assert!(
             second.fresh.is_empty(),
             "second observation of same transformation should emit no fresh events"
         );
-        assert_eq!(
-            second.recent.len(),
-            first.recent.len(),
-            "recent history persists across calls"
-        );
+        // Snapshot still carries the slots across the no-op second call.
+        let second_snapshot = state.activity_feed_snapshot();
+        assert!(second_snapshot.record.is_some());
+        assert!(second_snapshot.transformation.is_some());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

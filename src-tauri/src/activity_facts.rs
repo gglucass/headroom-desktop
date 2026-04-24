@@ -6,16 +6,17 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent, RecordTag,
-    RtkBatchEvent, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
+    ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
+    RecordTag, RtkBatchEvent, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
 
-// Bumped from 2 → 3 when streak, savings-milestone, and memory-flush bookkeeping
-// were removed from the Activity tab. Old persisted state still carries those
-// fields; the mismatch handler drops the file and starts fresh.
-const SCHEMA_VERSION: u8 = 3;
+// Bumped from 3 → 4 when the transformation tile moved from a proxy-fetch on
+// every poll into a persisted `last_transformation` slot, same as the other
+// tiles. Old persisted state is missing the field; the mismatch handler drops
+// the file and starts fresh.
+const SCHEMA_VERSION: u8 = 4;
 // Hard cap on how big a facts file we'll even attempt to deserialize at boot.
 // The pre-v2 schema embedded full request/response bodies into queues that
 // could grow past 100MB; loading those synchronously hangs the boot path and
@@ -108,6 +109,8 @@ struct PersistedActivityFacts {
     // event of that kind. Rather than persist a queue of every event ever, we
     // store only the freshest event for each tile.
     #[serde(default)]
+    last_transformation: Option<TransformationFeedEvent>,
+    #[serde(default)]
     last_record: Option<RecordEvent>,
     #[serde(default)]
     last_rtk_batch: Option<RtkBatchEvent>,
@@ -131,8 +134,9 @@ pub struct ActivityFacts {
     daily_record_emitted_at: Option<DateTime<Utc>>,
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
-    // Latest-of-kind tile slots. Each observe_* writes to its slot; the slot
-    // is what `recent_activity_events` returns to the frontend.
+    // Latest-of-kind tile slots. Each observe_* writes to its slot; the
+    // snapshot builder reads them to populate the frontend response.
+    last_transformation: Option<TransformationFeedEvent>,
     last_record: Option<RecordEvent>,
     last_rtk_batch: Option<RtkBatchEvent>,
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
@@ -182,6 +186,7 @@ impl ActivityFacts {
             daily_record_emitted_at: persisted.daily_record_emitted_at,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
+            last_transformation: persisted.last_transformation,
             last_record: persisted.last_record,
             last_rtk_batch: persisted.last_rtk_batch,
             last_learnings_milestone: persisted.last_learnings_milestone,
@@ -205,6 +210,7 @@ impl ActivityFacts {
             daily_record_emitted_at: None,
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: BTreeMap::new(),
+            last_transformation: None,
             last_record: None,
             last_rtk_batch: None,
             last_learnings_milestone: None,
@@ -215,27 +221,17 @@ impl ActivityFacts {
         }
     }
 
-    /// Build the per-tile event list from the latest-of-kind slots. Order is
-    /// not sorted; the frontend's tile picker keys by `kind`, not by position.
-    /// Callers should expect at most one event per ActivityEvent variant.
-    pub fn recent_events(&self) -> Vec<ActivityEvent> {
-        let mut events: Vec<ActivityEvent> = Vec::with_capacity(5);
-        if let Some(e) = &self.last_record {
-            events.push(ActivityEvent::Record(e.clone()));
+    /// Build the Activity-tab snapshot from the latest-of-kind slots. One slot
+    /// per tile; each tile on the frontend renders its slot or a placeholder.
+    pub fn activity_feed_snapshot(&self) -> ActivityFeedSnapshot {
+        ActivityFeedSnapshot {
+            transformation: self.last_transformation.clone(),
+            record: self.last_record.clone(),
+            rtk_batch: self.last_rtk_batch.clone(),
+            learnings_milestone: self.last_learnings_milestone.clone(),
+            weekly_recap: self.last_weekly_recap.clone(),
+            train_suggestion: self.last_train_suggestion.clone(),
         }
-        if let Some(e) = &self.last_rtk_batch {
-            events.push(ActivityEvent::RtkBatch(e.clone()));
-        }
-        if let Some(e) = &self.last_learnings_milestone {
-            events.push(ActivityEvent::LearningsMilestone(e.clone()));
-        }
-        if let Some(e) = &self.last_weekly_recap {
-            events.push(ActivityEvent::WeeklyRecap(e.clone()));
-        }
-        if let Some(e) = &self.last_train_suggestion {
-            events.push(ActivityEvent::TrainSuggestion(e.clone()));
-        }
-        events
     }
 
     pub fn observe_transformation(
@@ -253,6 +249,22 @@ impl ActivityFacts {
         now: DateTime<Utc>,
     ) -> Vec<ActivityEvent> {
         let mut emitted = Vec::new();
+
+        // Refresh the transformation tile slot if this event is newer than
+        // what we have. The proxy feed is a sliding window replayed on every
+        // poll, and the observer iterates oldest-first; the last write wins
+        // naturally, but the guard is defensive against out-of-order replays.
+        let is_newer = self
+            .last_transformation
+            .as_ref()
+            .and_then(|prev| prev.timestamp.as_deref())
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|prev_ts| prev_ts.with_timezone(&Utc) <= observed_at)
+            .unwrap_or(true);
+        if is_newer {
+            self.last_transformation = Some(event.clone());
+            self.dirty = true;
+        }
 
         let tokens_saved = event
             .tokens_saved
@@ -545,6 +557,7 @@ impl ActivityFacts {
             daily_record_emitted_at: self.daily_record_emitted_at,
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
+            last_transformation: self.last_transformation.clone(),
             last_record: self.last_record.clone(),
             last_rtk_batch: self.last_rtk_batch.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),

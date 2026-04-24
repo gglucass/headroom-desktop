@@ -474,13 +474,26 @@ pub enum ActivityEvent {
     TrainSuggestion(TrainSuggestionEvent),
 }
 
+/// One slot per tile kind. `None` renders as a placeholder on the frontend,
+/// `Some(event)` renders the live row. Built from `ActivityFacts`'s latest-of-
+/// kind slots — no event stream, no dedupe logic on either side of the IPC
+/// boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityFeedSnapshot {
+    pub transformation: Option<TransformationFeedEvent>,
+    pub record: Option<RecordEvent>,
+    pub rtk_batch: Option<RtkBatchEvent>,
+    pub learnings_milestone: Option<LearningsMilestoneEvent>,
+    pub weekly_recap: Option<WeeklyRecapEvent>,
+    pub train_suggestion: Option<TrainSuggestionEvent>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityFeedResponse {
-    pub events: Vec<ActivityEvent>,
-    pub log_full_messages: bool,
+    pub tiles: ActivityFeedSnapshot,
     pub proxy_reachable: bool,
-    pub memory_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

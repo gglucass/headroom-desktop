@@ -129,7 +129,6 @@ import type {
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
-  ActivityEvent,
   DashboardState,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
@@ -335,37 +334,27 @@ function delay(ms: number) {
 
 /**
  * O(1) structural fingerprint of an activity feed response. Used by the
- * polling effects to skip `setActivityFeed` when the proxy's sliding window
- * returns the same events two polls in a row — which is the common case
- * between compressions. Skipping the state update avoids a top-level
- * re-render and re-coalescing of ~150 events every 4s.
- *
- * The fingerprint is length + proxyReachable + first-event-id + last-event-id.
- * If the head/tail of a 150-event window are the same, the window is the same.
+ * polling effect to skip `setActivityFeed` when the snapshot is identical two
+ * polls in a row (the common case between compressions). Each tile contributes
+ * a stable id for its slot — `null` when absent — so any slot flip shows up in
+ * the signature.
  */
 function activityFeedSignature(feed: ActivityFeedResponse): string {
-  const { events } = feed;
-  const sigOf = (event: ActivityEvent | undefined): string => {
-    if (!event) return "";
-    switch (event.kind) {
-      case "transformation":
-        return `t:${event.data.requestId ?? event.data.timestamp ?? ""}`;
-      case "weeklyRecap":
-        return `wr:${event.data.weekStart}`;
-      case "rtkBatch":
-      case "record":
-      case "learningsMilestone":
-        return `${event.kind[0]}:${event.data.observedAt}`;
-      case "trainSuggestion":
-        return `ts:${event.data.projectPath}:${event.data.observedAt}`;
-    }
-  };
-  return [
-    events.length,
+  const { tiles } = feed;
+  const parts = [
     feed.proxyReachable ? 1 : 0,
-    sigOf(events[0]),
-    sigOf(events[events.length - 1])
-  ].join("|");
+    tiles.transformation
+      ? `t:${tiles.transformation.requestId ?? tiles.transformation.timestamp ?? ""}`
+      : "t:-",
+    tiles.record ? `r:${tiles.record.observedAt}` : "r:-",
+    tiles.rtkBatch ? `b:${tiles.rtkBatch.observedAt}` : "b:-",
+    tiles.learningsMilestone ? `l:${tiles.learningsMilestone.observedAt}` : "l:-",
+    tiles.weeklyRecap ? `wr:${tiles.weeklyRecap.weekStart}` : "wr:-",
+    tiles.trainSuggestion
+      ? `ts:${tiles.trainSuggestion.projectPath}:${tiles.trainSuggestion.observedAt}`
+      : "ts:-"
+  ];
+  return parts.join("|");
 }
 
 const PRICING_CACHE_KEY = "headroom.cachedPricing";
@@ -742,10 +731,15 @@ export default function App() {
   const [headroomLearnPrereq, setHeadroomLearnPrereq] =
     useState<HeadroomLearnPrereqStatus>(idleHeadroomLearnPrereqStatus);
   const [activityFeed, setActivityFeed] = useState<ActivityFeedResponse>({
-    events: [],
-    logFullMessages: false,
-    proxyReachable: false,
-    memoryAvailable: false
+    tiles: {
+      transformation: null,
+      record: null,
+      rtkBatch: null,
+      learningsMilestone: null,
+      weeklyRecap: null,
+      trainSuggestion: null
+    },
+    proxyReachable: false
   });
   // Flipped true after the first activity feed fetch attempt resolves (success
   // OR failure). Before this the feed holds a placeholder value whose
@@ -760,11 +754,6 @@ export default function App() {
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
-  // 150 rows ≈ 15 pages at 10/row. Bigger windows make each poll transfer
-  // more data across the Tauri IPC boundary, parse more JSON, and do more
-  // coalescing/render work — with no user-visible benefit since nobody
-  // paginates that deep. Cut from 500.
-  const ACTIVITY_FEED_WINDOW = 150;
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
@@ -1581,7 +1570,7 @@ export default function App() {
       }
       void refreshClaudeProjects();
       void refreshHeadroomLearnPrereq();
-      invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
+      invoke<ActivityFeedResponse>("get_activity_feed")
         .then((next) => {
           if (!active) return;
           setActivityFeed((prev) =>
@@ -1611,7 +1600,7 @@ export default function App() {
     }
     let active = true;
     const refreshFeed = () => {
-      invoke<ActivityFeedResponse>("get_activity_feed", { limit: ACTIVITY_FEED_WINDOW })
+      invoke<ActivityFeedResponse>("get_activity_feed")
         .then((next) => {
           if (!active) return;
           setActivityFeed((prev) =>

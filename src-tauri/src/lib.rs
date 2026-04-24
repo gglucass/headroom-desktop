@@ -927,25 +927,17 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
     })
 }
 
-/// Read-only snapshot of the activity feed. Observation — writing to
-/// ActivityFacts, persisting, emitting OS notifications — happens on a
-/// dedicated background timer (see `spawn_activity_observer`), so this
-/// command never mutates state. That keeps the IPC hot path short (no disk
-/// writes, no notification dispatch) and decouples notification delivery
-/// from frontend polling: users get milestone notifications whether or not
-/// the Activity tab is currently on screen.
+/// Read-only snapshot of the activity feed. Observation — fetching the proxy,
+/// writing to ActivityFacts, persisting, emitting OS notifications — happens
+/// on a dedicated background timer (see `spawn_activity_observer`), so this
+/// command never mutates state. That keeps the IPC hot path short: one
+/// in-memory lock + a cheap /readyz ping to the local proxy.
 #[tauri::command]
-fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> ActivityFeedResponse {
-    let limit = limit.unwrap_or(50).min(500);
-    // Live proxy is the only source of transformation events now — persisted
-    // history was dropped along with the activity-facts queues. If the proxy
-    // is restarting, the transformation tile briefly disappears until the
-    // first new compression lands; acceptable in exchange for a tiny facts
-    // file and an unblocked IPC hot path.
-    let transformations = fetch_transformations_feed(limit).ok();
-    let recent_synthetic = state.recent_activity_events();
-    let memory_available = headroom_memory_db_path().exists();
-    build_activity_feed_response(transformations, recent_synthetic, memory_available)
+fn get_activity_feed(state: State<'_, AppState>) -> ActivityFeedResponse {
+    ActivityFeedResponse {
+        tiles: state.activity_feed_snapshot(),
+        proxy_reachable: crate::state::headroom_proxy_reachable(),
+    }
 }
 
 /// Observation cadence for background milestones and Activity notifications.
@@ -1024,37 +1016,6 @@ fn run_activity_observation(app: &AppHandle) {
 
     for payload in notifications::collect_notification_payloads(&fresh_events) {
         let _ = show_notification_impl(app, &payload.title, &payload.body, payload.action);
-    }
-}
-
-/// Build the feed response from the proxy's live transformations plus the
-/// per-tile synthetic events from ActivityFacts. The frontend's tile picker
-/// keys events by `kind` and selects the latest of each, so we don't need
-/// chronological sorting, RTK coalescing, or limit-with-variety truncation
-/// here — `synthetic_events` carries at most one of each kind already, and
-/// transformations come bounded by `limit` from the proxy.
-fn build_activity_feed_response(
-    transformations: Option<TransformationFeedResponse>,
-    synthetic_events: Vec<ActivityEvent>,
-    memory_available: bool,
-) -> ActivityFeedResponse {
-    let mut events: Vec<ActivityEvent> = Vec::with_capacity(synthetic_events.len() + 32);
-    let (proxy_reachable, log_full_messages) = match transformations {
-        Some(t) => {
-            for ev in t.transformations {
-                events.push(ActivityEvent::Transformation(ev));
-            }
-            (t.proxy_reachable, t.log_full_messages)
-        }
-        None => (false, false),
-    };
-    events.extend(synthetic_events);
-
-    ActivityFeedResponse {
-        events,
-        log_full_messages,
-        proxy_reachable,
-        memory_available,
     }
 }
 
@@ -2984,21 +2945,16 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
-        compute_tray_window_position, debounced_tray_runtime_visual,
+        build_release_updater_config, check_headroom_learn_prereqs,
+        compute_tray_window_position, count_memories_with_created_at, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
-        count_memories_with_created_at, is_prerelease_version, lifetime_token_milestone_kind,
+        is_prerelease_version, lifetime_token_milestone_kind,
         parse_live_learnings, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
         PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
         DEFAULT_UPDATER_PUBLIC_KEY,
     };
-    use crate::models::{
-        ActivityEvent, RecordEvent, RecordTag,
-        RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
-    };
-    use chrono::{TimeZone, Utc};
     use parking_lot::Mutex;
     use serde_json::json;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
@@ -3629,100 +3585,4 @@ mod tests {
         assert!(!err.is_empty(), "expected a non-empty error message");
     }
 
-    fn make_transformation(timestamp: &str) -> TransformationFeedEvent {
-        TransformationFeedEvent {
-            request_id: Some(format!("req-{timestamp}")),
-            timestamp: Some(timestamp.to_string()),
-            provider: Some("anthropic".into()),
-            model: Some("claude-sonnet-4-6".into()),
-            input_tokens_original: Some(1000),
-            input_tokens_optimized: Some(250),
-            tokens_saved: Some(750),
-            savings_percent: Some(75.0),
-            transforms_applied: vec!["interceptor:ast-grep".into()],
-            workspace: None,
-            turn_id: None,
-            request_messages: None,
-            compressed_messages: None,
-        }
-    }
-
-    #[test]
-    fn build_activity_feed_response_returns_empty_when_no_inputs() {
-        let resp = build_activity_feed_response(None, vec![], false);
-        assert!(resp.events.is_empty());
-        assert!(!resp.proxy_reachable);
-        assert!(!resp.log_full_messages);
-        assert!(!resp.memory_available);
-    }
-
-    #[test]
-    fn build_activity_feed_response_propagates_proxy_metadata() {
-        let transformations = TransformationFeedResponse {
-            log_full_messages: true,
-            proxy_reachable: true,
-            transformations: vec![],
-        };
-        let resp = build_activity_feed_response(Some(transformations), vec![], true);
-        assert!(resp.proxy_reachable);
-        assert!(resp.log_full_messages);
-        assert!(resp.memory_available);
-    }
-
-    #[test]
-    fn build_activity_feed_response_carries_all_inputs_through() {
-        // No sort, no coalesce, no truncate — the response just unions the
-        // proxy's transformations with the per-tile synthetic events. The
-        // frontend's tile picker keys by `kind`, so order doesn't matter
-        // here; we just assert nothing got dropped or duplicated.
-        let transformations = TransformationFeedResponse {
-            log_full_messages: false,
-            proxy_reachable: true,
-            transformations: vec![
-                make_transformation("2026-04-21T10:00:00Z"),
-                make_transformation("2026-04-21T12:00:00Z"),
-            ],
-        };
-        let synthetic = vec![
-            ActivityEvent::RtkBatch(RtkBatchEvent {
-                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 13, 0, 0).unwrap(),
-                commands_delta: 5,
-                tokens_saved_delta: 1234,
-                total_commands: 100,
-                total_saved: 50_000,
-            }),
-            ActivityEvent::Record(RecordEvent {
-                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 0, 0).unwrap(),
-                tags: vec![RecordTag::AllTime],
-                tokens_saved: 9_999,
-                savings_percent: Some(88.0),
-                model: Some("claude-opus-4-7".into()),
-                provider: Some("anthropic".into()),
-                request_id: Some("r".into()),
-                previous_record: Some(500),
-                day: None,
-                workspace: None,
-                request_messages: None,
-                compressed_messages: None,
-            }),
-        ];
-
-        let resp = build_activity_feed_response(Some(transformations), synthetic, true);
-
-        assert_eq!(resp.events.len(), 4);
-        let kind_count = |k: &str| {
-            resp.events
-                .iter()
-                .filter(|e| match (k, e) {
-                    ("transformation", ActivityEvent::Transformation(_)) => true,
-                    ("rtkBatch", ActivityEvent::RtkBatch(_)) => true,
-                    ("record", ActivityEvent::Record(_)) => true,
-                    _ => false,
-                })
-                .count()
-        };
-        assert_eq!(kind_count("transformation"), 2);
-        assert_eq!(kind_count("rtkBatch"), 1);
-        assert_eq!(kind_count("record"), 1);
-    }
 }

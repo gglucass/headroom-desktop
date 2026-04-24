@@ -1,11 +1,11 @@
-import { useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
 import type {
-  ActivityEvent,
   ActivityFeedResponse,
+  ActivityFeedSnapshot,
   LearningsMilestoneEvent,
   RecordEvent,
   RecordTag,
@@ -29,62 +29,50 @@ interface ActivityFeedProps {
   onNavigateToOptimize?: () => void;
 }
 
-// Fixed order for the activity tiles. Every kind always gets a tile: the most
-// recent event of that kind when one exists, otherwise a muted placeholder so
-// the user can see what the card means and anticipate where new activity will
-// land. Order is stable so tiles never reshuffle as events stream in.
-const TILE_ORDER: ActivityEvent["kind"][] = [
-  "trainSuggestion",
-  "transformation",
-  "rtkBatch",
-  "record",
-  "learningsMilestone",
-  "weeklyRecap"
-];
+// One entry per tile kind. `kind` matches the `ActivityFeedSnapshot` slot name
+// so the backend shape and frontend render stay in lockstep.
+type TileKind = keyof ActivityFeedSnapshot;
 
 const EMPTY_TILE_COPY: Record<
-  ActivityEvent["kind"],
-  { badgeClass: string; badgeLabel: string; copy: string }
+  TileKind,
+  { badgeClass: string; badgeLabel: string; copy: string; itemModifier: string }
 > = {
   trainSuggestion: {
     badgeClass: "activity-feed__badge--train",
     badgeLabel: "Train",
-    copy: "No training nudge. Visit Optimize to train any project."
+    copy: "No training nudge. Visit Optimize to train any project.",
+    itemModifier: "activity-feed__item--train"
   },
   transformation: {
     badgeClass: "activity-feed__badge--transformation",
     badgeLabel: "Compression",
-    copy: "No compressions yet — send a message through Claude Code."
+    copy: "No compressions yet — send a message through Claude Code.",
+    itemModifier: "activity-feed__item--transformation"
   },
   rtkBatch: {
     badgeClass: "activity-feed__badge--rtk",
     badgeLabel: "RTK",
-    copy: "No RTK commands observed yet."
+    copy: "No RTK commands observed yet.",
+    itemModifier: "activity-feed__item--rtk"
   },
   record: {
     badgeClass: "activity-feed__badge--record",
     badgeLabel: "Record",
-    copy: "No new records yet."
+    copy: "No new records yet.",
+    itemModifier: "activity-feed__item--record"
   },
   learningsMilestone: {
     badgeClass: "activity-feed__badge--learnings-milestone",
     badgeLabel: "Learnings",
-    copy: "No learnings yet."
+    copy: "No learnings yet.",
+    itemModifier: "activity-feed__item--learnings-milestone"
   },
   weeklyRecap: {
     badgeClass: "activity-feed__badge--weekly-recap",
     badgeLabel: "Weekly recap",
-    copy: "No recap yet — posts at the end of the week."
+    copy: "No recap yet — posts at the end of the week.",
+    itemModifier: "activity-feed__item--weekly-recap"
   }
-};
-
-const KIND_ITEM_MODIFIER: Record<ActivityEvent["kind"], string> = {
-  trainSuggestion: "activity-feed__item--train",
-  transformation: "activity-feed__item--transformation",
-  rtkBatch: "activity-feed__item--rtk",
-  record: "activity-feed__item--record",
-  learningsMilestone: "activity-feed__item--learnings-milestone",
-  weeklyRecap: "activity-feed__item--weekly-recap"
 };
 
 export function ActivityFeed({
@@ -93,14 +81,11 @@ export function ActivityFeed({
   loaded = true,
   onNavigateToOptimize
 }: ActivityFeedProps) {
-  const latestByKind = useMemo(
-    () => selectLatestByKind(feed.events),
-    [feed.events]
-  );
-  const tiles = TILE_ORDER.map((kind) => ({
-    kind,
-    event: latestByKind.get(kind) ?? null
-  }));
+  const { tiles } = feed;
+  // "Waiting for proxy" only fires when we've got nothing to show AND the
+  // proxy isn't answering. If any slot is populated (persisted state from a
+  // prior session), fall through to render it even while the proxy is down.
+  const hasAnyTile = Object.values(tiles).some((v) => v != null);
 
   return (
     <>
@@ -119,7 +104,7 @@ export function ActivityFeed({
           <div className="activity-feed__skeleton-row" />
           <div className="activity-feed__skeleton-row" />
         </div>
-      ) : !feed.proxyReachable && feed.events.length === 0 ? (
+      ) : !feed.proxyReachable && !hasAnyTile ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
             <WifiSlash weight="duotone" />
@@ -131,20 +116,34 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="activity-feed__list">
-          {tiles.map(({ kind, event }) =>
-            event ? (
-              <TileItem
-                key={kind}
-                event={event}
-                onNavigateToOptimize={onNavigateToOptimize}
-              />
-            ) : (
-              <EmptyTile
-                key={kind}
-                kind={kind}
-                onNavigateToOptimize={onNavigateToOptimize}
-              />
-            )
+          {tiles.trainSuggestion ? (
+            <TrainSuggestionRow
+              event={tiles.trainSuggestion}
+              onNavigate={onNavigateToOptimize}
+            />
+          ) : (
+            <EmptyTile kind="trainSuggestion" onNavigateToOptimize={onNavigateToOptimize} />
+          )}
+          {tiles.transformation ? (
+            <TransformationRow event={tiles.transformation} />
+          ) : (
+            <EmptyTile kind="transformation" />
+          )}
+          {tiles.rtkBatch ? (
+            <RtkBatchRow event={tiles.rtkBatch} />
+          ) : (
+            <EmptyTile kind="rtkBatch" />
+          )}
+          {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
+          {tiles.learningsMilestone ? (
+            <LearningsMilestoneRow event={tiles.learningsMilestone} />
+          ) : (
+            <EmptyTile kind="learningsMilestone" />
+          )}
+          {tiles.weeklyRecap ? (
+            <WeeklyRecapRow event={tiles.weeklyRecap} />
+          ) : (
+            <EmptyTile kind="weeklyRecap" />
           )}
         </ul>
       )}
@@ -152,59 +151,15 @@ export function ActivityFeed({
   );
 }
 
-function selectLatestByKind(
-  events: ActivityEvent[]
-): Map<ActivityEvent["kind"], ActivityEvent> {
-  const latest = new Map<ActivityEvent["kind"], ActivityEvent>();
-  const latestTs = new Map<ActivityEvent["kind"], number>();
-  for (const event of events) {
-    const ts = eventTimestampMs(event);
-    const prevTs = latestTs.get(event.kind) ?? -1;
-    if (ts > prevTs) {
-      latest.set(event.kind, event);
-      latestTs.set(event.kind, ts);
-    }
-  }
-  return latest;
-}
-
-function TileItem({
-  event,
-  onNavigateToOptimize
-}: {
-  event: ActivityEvent;
-  onNavigateToOptimize?: () => void;
-}) {
-  switch (event.kind) {
-    case "transformation":
-      return <TransformationRow event={event.data} />;
-    case "rtkBatch":
-      return <RtkBatchRow event={event.data} />;
-    case "record":
-      return <RecordRow event={event.data} />;
-    case "weeklyRecap":
-      return <WeeklyRecapRow event={event.data} />;
-    case "learningsMilestone":
-      return <LearningsMilestoneRow event={event.data} />;
-    case "trainSuggestion":
-      return (
-        <TrainSuggestionRow
-          event={event.data}
-          onNavigate={onNavigateToOptimize}
-        />
-      );
-  }
-}
-
 function EmptyTile({
   kind,
   onNavigateToOptimize
 }: {
-  kind: ActivityEvent["kind"];
+  kind: TileKind;
   onNavigateToOptimize?: () => void;
 }) {
-  const { badgeClass, badgeLabel, copy } = EMPTY_TILE_COPY[kind];
-  const itemClass = `activity-feed__item activity-feed__item--empty ${KIND_ITEM_MODIFIER[kind]}`;
+  const { badgeClass, badgeLabel, copy, itemModifier } = EMPTY_TILE_COPY[kind];
+  const itemClass = `activity-feed__item activity-feed__item--empty ${itemModifier}`;
   const canNavigate = kind === "trainSuggestion" && typeof onNavigateToOptimize === "function";
   const handleActivate = () => {
     if (canNavigate) onNavigateToOptimize?.();
@@ -234,20 +189,6 @@ function EmptyTile({
       <p className="activity-feed__content activity-feed__content--empty">{copy}</p>
     </li>
   );
-}
-
-function eventTimestampMs(event: ActivityEvent): number {
-  switch (event.kind) {
-    case "transformation":
-      return Date.parse(event.data.timestamp ?? "") || 0;
-    case "rtkBatch":
-    case "record":
-    case "learningsMilestone":
-    case "trainSuggestion":
-      return Date.parse(event.data.observedAt) || 0;
-    case "weeklyRecap":
-      return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
-  }
 }
 
 /**

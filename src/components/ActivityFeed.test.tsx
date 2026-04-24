@@ -2,8 +2,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { ActivityFeed, formatRequestMessages, groupTransforms } from "./ActivityFeed";
 import type {
-  ActivityEvent,
   ActivityFeedResponse,
+  ActivityFeedSnapshot,
   LearningsMilestoneEvent,
   RecordEvent,
   RtkBatchEvent,
@@ -12,29 +12,37 @@ import type {
   WeeklyRecapEvent
 } from "../lib/types";
 
-const baseFeed: ActivityFeedResponse = {
-  events: [],
-  logFullMessages: true,
-  proxyReachable: true,
-  memoryAvailable: true
+const emptyTiles: ActivityFeedSnapshot = {
+  transformation: null,
+  record: null,
+  rtkBatch: null,
+  learningsMilestone: null,
+  weeklyRecap: null,
+  trainSuggestion: null
 };
 
-function transformation(event: Partial<TransformationFeedEvent> = {}): ActivityEvent {
+const baseFeed: ActivityFeedResponse = {
+  tiles: emptyTiles,
+  proxyReachable: true
+};
+
+function transformation(event: Partial<TransformationFeedEvent> = {}): TransformationFeedEvent {
   return {
-    kind: "transformation",
-    data: {
-      requestId: "req-1",
-      timestamp: "2026-04-21T10:00:00Z",
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      inputTokensOriginal: 1000,
-      inputTokensOptimized: 250,
-      tokensSaved: 750,
-      savingsPercent: 75,
-      transformsApplied: ["interceptor:ast-grep"],
-      ...event
-    }
+    requestId: "req-1",
+    timestamp: "2026-04-21T10:00:00Z",
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    inputTokensOriginal: 1000,
+    inputTokensOptimized: 250,
+    tokensSaved: 750,
+    savingsPercent: 75,
+    transformsApplied: ["interceptor:ast-grep"],
+    ...event
   };
+}
+
+function feedWith(partial: Partial<ActivityFeedSnapshot>): ActivityFeedResponse {
+  return { ...baseFeed, tiles: { ...emptyTiles, ...partial } };
 }
 
 describe("ActivityFeed", () => {
@@ -52,15 +60,13 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__list");
   });
 
-  it("surfaces persisted events even when the proxy is unreachable", () => {
-    // Rust merges persisted compression history in when the live proxy fetch
-    // fails, sending them with proxyReachable=false. The feed must render
-    // them instead of the "Waiting" empty state — otherwise restarts look
-    // blank until the proxy re-comes online.
+  it("surfaces persisted tiles even when the proxy is unreachable", () => {
+    // ActivityFacts carries persisted slots across restarts. When the proxy
+    // is briefly unreachable but we still have state to show, render the
+    // tiles — not the "Waiting" empty — so a restart doesn't look blank.
     const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      proxyReachable: false,
-      events: [transformation({ requestId: "from-history" })]
+      ...feedWith({ transformation: transformation({ requestId: "from-history" }) }),
+      proxyReachable: false
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("activity-feed__list");
@@ -89,7 +95,7 @@ describe("ActivityFeed", () => {
   });
 
   it("keeps placeholders for other kinds when one live event is present", () => {
-    const feed: ActivityFeedResponse = { ...baseFeed, events: [transformation()] };
+    const feed = feedWith({ transformation: transformation() });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
     expect(emptyClassCount).toBe(5);
@@ -122,7 +128,7 @@ describe("ActivityFeed", () => {
   });
 
   it("renders a transformation row with provider, model, savings, delta, and transforms", () => {
-    const feed: ActivityFeedResponse = { ...baseFeed, events: [transformation()] };
+    const feed = feedWith({ transformation: transformation() });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Recent large compression");
     expect(markup).toContain("anthropic");
@@ -135,14 +141,11 @@ describe("ActivityFeed", () => {
   });
 
   it("renders friendly labels for read_lifecycle transforms", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          transformsApplied: ["read_lifecycle:stale", "read_lifecycle:superseded"]
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        transformsApplied: ["read_lifecycle:stale", "read_lifecycle:superseded"]
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Stale Read");
     expect(markup).toContain("Superseded Read");
@@ -151,20 +154,17 @@ describe("ActivityFeed", () => {
   });
 
   it("renders friendly labels for parametric transforms", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          transformsApplied: [
-            "tool_crush:7",
-            "router:tool_result:ast",
-            "kompress:user:0.45",
-            "inserted_3_cache_breakpoints",
-            "cache_align"
-          ]
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        transformsApplied: [
+          "tool_crush:7",
+          "router:tool_result:ast",
+          "kompress:user:0.45",
+          "inserted_3_cache_breakpoints",
+          "cache_align"
+        ]
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Crushed 7 tools");
     expect(markup).toContain("Tool result: ast");
@@ -174,34 +174,28 @@ describe("ActivityFeed", () => {
   });
 
   it("shows an estimated dollar savings alongside tokens saved", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          model: "claude-sonnet-4-6",
-          tokensSaved: 750_000,
-          savingsPercent: 75
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        model: "claude-sonnet-4-6",
+        tokensSaved: 750_000,
+        savingsPercent: 75
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     // sonnet: $3/M × 0.75M = $2.25
     expect(markup).toContain("~$2.25");
   });
 
   it("surfaces file paths from enriched read_lifecycle tags in the detail view", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          transformsApplied: [
-            "read_lifecycle:stale:/src/App.tsx",
-            "read_lifecycle:stale:/src/lib/foo.ts",
-            "tool_crush:2:Bash,Grep"
-          ]
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        transformsApplied: [
+          "read_lifecycle:stale:/src/App.tsx",
+          "read_lifecycle:stale:/src/lib/foo.ts",
+          "tool_crush:2:Bash,Grep"
+        ]
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("/src/App.tsx");
     expect(markup).toContain("/src/lib/foo.ts");
@@ -219,21 +213,18 @@ describe("ActivityFeed", () => {
     // the formatRequestMessages unit tests below.
     const withMessages = renderToStaticMarkup(
       <ActivityFeed
-        feed={{
-          ...baseFeed,
-          events: [
-            transformation({
-              // Strip every other detail-triggering field so clickability
-              // can only come from request/response.
-              requestId: null,
-              workspace: null,
-              transformsApplied: [],
-              tokensSaved: 0,
-              model: null,
-              requestMessages: [{ role: "user", content: "hi" }]
-            })
-          ]
-        }}
+        feed={feedWith({
+          transformation: transformation({
+            // Strip every other detail-triggering field so clickability
+            // can only come from request/response.
+            requestId: null,
+            workspace: null,
+            transformsApplied: [],
+            tokensSaved: 0,
+            model: null,
+            requestMessages: [{ role: "user", content: "hi" }]
+          })
+        })}
         error={null}
       />
     );
@@ -241,20 +232,16 @@ describe("ActivityFeed", () => {
 
     const withoutMessages = renderToStaticMarkup(
       <ActivityFeed
-        feed={{
-          ...baseFeed,
-          logFullMessages: false,
-          events: [
-            transformation({
-              requestId: null,
-              workspace: null,
-              transformsApplied: [],
-              tokensSaved: 0,
-              model: null,
-              requestMessages: null
-            })
-          ]
-        }}
+        feed={feedWith({
+          transformation: transformation({
+            requestId: null,
+            workspace: null,
+            transformsApplied: [],
+            tokensSaved: 0,
+            model: null,
+            requestMessages: null
+          })
+        })}
         error={null}
       />
     );
@@ -267,20 +254,17 @@ describe("ActivityFeed", () => {
     // legacy-only path above but for the new field.
     const markup = renderToStaticMarkup(
       <ActivityFeed
-        feed={{
-          ...baseFeed,
-          events: [
-            transformation({
-              requestId: null,
-              workspace: null,
-              transformsApplied: [],
-              tokensSaved: 0,
-              model: null,
-              requestMessages: null,
-              compressedMessages: [{ role: "user", content: "hi" }]
-            })
-          ]
-        }}
+        feed={feedWith({
+          transformation: transformation({
+            requestId: null,
+            workspace: null,
+            transformsApplied: [],
+            tokensSaved: 0,
+            model: null,
+            requestMessages: null,
+            compressedMessages: [{ role: "user", content: "hi" }]
+          })
+        })}
         error={null}
       />
     );
@@ -288,10 +272,9 @@ describe("ActivityFeed", () => {
   });
 
   it("falls back to the raw transform string when unknown", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [transformation({ transformsApplied: ["something:new:format"] })]
-    };
+    const feed = feedWith({
+      transformation: transformation({ transformsApplied: ["something:new:format"] })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("something:new:format");
   });
@@ -299,18 +282,15 @@ describe("ActivityFeed", () => {
   it("collapses repeated transforms into a single count chip", () => {
     // Before: 70 identical stale-read transforms rendered 70 separate chips
     // and flooded the row. Now: one chip "Stale Read × 70".
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          transformsApplied: [
-            ...Array(70).fill("read_lifecycle:stale"),
-            ...Array(42).fill("router:excluded:tool"),
-            "cache_align"
-          ]
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        transformsApplied: [
+          ...Array(70).fill("read_lifecycle:stale"),
+          ...Array(42).fill("router:excluded:tool"),
+          "cache_align"
+        ]
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const chipCount = (markup.match(/<li class="activity-feed__transform"/g) ?? []).length;
     expect(chipCount).toBe(3);
@@ -319,16 +299,19 @@ describe("ActivityFeed", () => {
     expect(markup).toContain(">Cache aligned<");
   });
 
-  it("surfaces only the most recent compression in the transformation tile", () => {
-    // One tile per kind — the compression tile updates its content to reflect
-    // the most recent transformation in the window. Older compressions are
-    // implied by the savings graph and totals elsewhere.
-    const events: ActivityEvent[] = [
-      transformation({ requestId: "latest", timestamp: "2026-04-21T10:02:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "middle", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 9_999, savingsPercent: 90 }),
-      transformation({ requestId: "oldest", timestamp: "2026-04-21T10:00:00Z", tokensSaved: 300, savingsPercent: 30 })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
+  it("shows the newest compression in the transformation tile (slot holds the latest)", () => {
+    // The transformation slot is populated by the newest-observed
+    // transformation — the backend writes in timestamp-asc order during its
+    // observation pass, so the last write wins and the frontend just reads
+    // that slot. This test seeds what ends up in the slot.
+    const feed = feedWith({
+      transformation: transformation({
+        requestId: "latest",
+        timestamp: "2026-04-21T10:02:00Z",
+        tokensSaved: 100,
+        savingsPercent: 10
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const liveBadgeCount = (markup.match(/Recent large compression/g) ?? []).length;
     expect(liveBadgeCount).toBe(1);
@@ -342,15 +325,12 @@ describe("ActivityFeed", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
     try {
-      const feed: ActivityFeedResponse = {
-        ...baseFeed,
-        events: [
-          transformation({
-            requestId: "relnow",
-            timestamp: "2026-04-21T09:50:00Z"
-          })
-        ]
-      };
+      const feed = feedWith({
+        transformation: transformation({
+          requestId: "relnow",
+          timestamp: "2026-04-21T09:50:00Z"
+        })
+      });
       const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
       expect(markup).toContain("10m ago");
       expect(markup).toMatch(/title="[^"]*2026[^"]*"/);
@@ -360,16 +340,13 @@ describe("ActivityFeed", () => {
   });
 
   it("exposes transformation detail (request ID + raw transforms) in an expandable row", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          requestId: "req-abc-123",
-          transformsApplied: ["interceptor:ast-grep", "cache_align"],
-          workspace: "/Users/u/Code/demo"
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        requestId: "req-abc-123",
+        transformsApplied: ["interceptor:ast-grep", "cache_align"],
+        workspace: "/Users/u/Code/demo"
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     // Row is marked clickable and carries the detail block so client render
     // can toggle it. SSR renders it with expanded=false, so the detail text
@@ -407,10 +384,7 @@ describe("ActivityFeed", () => {
       totalCommands: 2888,
       totalSaved: 12_805_724
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "rtkBatch", data }]
-    };
+    const feed = feedWith({ rtkBatch: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">RTK<");
     expect(markup).toContain("+3 commands");
@@ -431,10 +405,7 @@ describe("ActivityFeed", () => {
       previousRecord: null,
       day: "2026-04-21"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "record", data }]
-    };
+    const feed = feedWith({ record: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Record<");
     expect(markup).toContain(">Daily<");
@@ -455,10 +426,7 @@ describe("ActivityFeed", () => {
       previousRecord: 9500,
       day: null
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "record", data }]
-    };
+    const feed = feedWith({ record: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Record<");
     expect(markup).toContain(">All-time<");
@@ -478,10 +446,7 @@ describe("ActivityFeed", () => {
       previousRecord: 10000,
       day: "2026-04-21"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "record", data }]
-    };
+    const feed = feedWith({ record: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Record<");
     expect(markup).toContain(">Daily<");
@@ -510,16 +475,10 @@ describe("ActivityFeed", () => {
     };
     const withoutMessages: RecordEvent = { ...withMessages, requestMessages: null };
     const markupWith = renderToStaticMarkup(
-      <ActivityFeed
-        feed={{ ...baseFeed, events: [{ kind: "record", data: withMessages }] }}
-        error={null}
-      />
+      <ActivityFeed feed={feedWith({ record: withMessages })} error={null} />
     );
     const markupWithout = renderToStaticMarkup(
-      <ActivityFeed
-        feed={{ ...baseFeed, events: [{ kind: "record", data: withoutMessages }] }}
-        error={null}
-      />
+      <ActivityFeed feed={feedWith({ record: withoutMessages })} error={null} />
     );
     expect(markupWith).toContain("activity-feed__item--record");
     expect(markupWith).toContain("activity-feed__item--clickable");
@@ -536,10 +495,7 @@ describe("ActivityFeed", () => {
       totalSavingsUsd: 4.25,
       activeDays: 5
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "weeklyRecap", data }]
-    };
+    const feed = feedWith({ weeklyRecap: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Weekly recap");
     expect(markup).toContain("2026-04-20");
@@ -555,10 +511,7 @@ describe("ActivityFeed", () => {
       count: 3,
       kind: "first_3"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "learningsMilestone", data }]
-    };
+    const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Learnings<");
     expect(markup).toContain("3 patterns extracted");
@@ -573,10 +526,7 @@ describe("ActivityFeed", () => {
       activeDaysSinceLastLearn: 0,
       kind: "never_trained"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "trainSuggestion", data }]
-    };
+    const feed = feedWith({ trainSuggestion: data });
     const markup = renderToStaticMarkup(
       <ActivityFeed
         feed={feed}
@@ -603,10 +553,7 @@ describe("ActivityFeed", () => {
       activeDaysSinceLastLearn: 4,
       kind: "stale"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "trainSuggestion", data }]
-    };
+    const feed = feedWith({ trainSuggestion: data });
     const markup = renderToStaticMarkup(
       <ActivityFeed
         feed={feed}
@@ -628,10 +575,7 @@ describe("ActivityFeed", () => {
       activeDaysSinceLastLearn: 0,
       kind: "never_trained"
     };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "trainSuggestion", data }]
-    };
+    const feed = feedWith({ trainSuggestion: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("activity-feed__item--train");
     expect(markup).not.toContain("activity-feed__item--clickable");
@@ -639,41 +583,34 @@ describe("ActivityFeed", () => {
   });
 
   it("renders a workspace badge on a transformation when workspace is set", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [transformation({ workspace: "/Users/u/Code/demo-repo" })]
-    };
+    const feed = feedWith({
+      transformation: transformation({ workspace: "/Users/u/Code/demo-repo" })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("activity-feed__project");
     expect(markup).toContain(">demo-repo<");
   });
 
   it("omits the workspace badge when workspace is missing", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [transformation()]
-    };
+    const feed = feedWith({ transformation: transformation() });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).not.toContain("activity-feed__project");
   });
 
   it("falls back to 'unknown' provider and 0 savings when transformation fields are null", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        transformation({
-          requestId: null,
-          timestamp: null,
-          provider: null,
-          model: null,
-          inputTokensOriginal: null,
-          inputTokensOptimized: null,
-          tokensSaved: null,
-          savingsPercent: null,
-          transformsApplied: []
-        })
-      ]
-    };
+    const feed = feedWith({
+      transformation: transformation({
+        requestId: null,
+        timestamp: null,
+        provider: null,
+        model: null,
+        inputTokensOriginal: null,
+        inputTokensOptimized: null,
+        tokensSaved: null,
+        savingsPercent: null,
+        transformsApplied: []
+      })
+    });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("unknown");
     expect(markup).toContain("Saved 0 tokens (0.0%)");
