@@ -308,17 +308,17 @@ export function formatLearnStatus(project: {
   lastLearnRanAt: string | null;
 }): string {
   if (!project.lastLearnRanAt) {
-    return "never trained";
+    return "never scan";
   }
   const parsed = new Date(project.lastLearnRanAt);
   if (Number.isNaN(parsed.getTime())) {
-    return "never trained";
+    return "never scan";
   }
   const diffMs = Date.now() - parsed.getTime();
   const diffDays = Math.floor(diffMs / 86_400_000);
-  if (diffDays === 0) return "last training: today";
-  if (diffDays === 1) return "last training: yesterday";
-  return `last training: ${diffDays} days ago`;
+  if (diffDays === 0) return "last scan: today";
+  if (diffDays === 1) return "last scan: yesterday";
+  return `last scan: ${diffDays} days ago`;
 }
 
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {

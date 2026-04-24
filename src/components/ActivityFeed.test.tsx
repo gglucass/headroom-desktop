@@ -114,7 +114,7 @@ describe("ActivityFeed", () => {
     expect(trainSegment).not.toBeNull();
     expect(trainSegment![0]).toContain("activity-feed__item--clickable");
     expect(trainSegment![0]).toContain('role="button"');
-    expect(trainSegment![0]).toContain("No training nudge");
+    expect(trainSegment![0]).toContain("No scan nudge");
   });
 
   it("leaves the empty trainSuggestion card non-interactive when no handler is supplied", () => {
@@ -604,7 +604,7 @@ describe("ActivityFeed", () => {
     );
     expect(markup).toContain("activity-feed__item--train");
     expect(markup).toContain("activity-feed__badge--train");
-    expect(markup).toContain("Try Train");
+    expect(markup).toContain("Try Scan");
     expect(markup).toContain("demo-repo");
     expect(markup).toContain("7 sessions");
     // Clickable affordance present when navigation callback was provided.
@@ -629,7 +629,7 @@ describe("ActivityFeed", () => {
         onNavigateToOptimize={() => {}}
       />
     );
-    expect(markup).toContain("Retrain");
+    expect(markup).toContain("Rescan");
     expect(markup).toContain("4 active days");
     expect(markup).toContain("demo-repo");
   });

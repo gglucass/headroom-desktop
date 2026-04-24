@@ -172,10 +172,10 @@ describe("dashboard helpers", () => {
 
     expect(formatDateTime(null)).toBe("Never");
     expect(formatDateTime("not-a-date")).toBe("Unknown");
-    expect(formatLearnStatus({ lastLearnRanAt: null })).toBe("never trained");
-    expect(formatLearnStatus({ lastLearnRanAt: "invalid" })).toBe("never trained");
-    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-27T08:00:00Z" })).toBe("last training: today");
-    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-26T08:00:00Z" })).toBe("last training: yesterday");
-    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe("last training: 5 days ago");
+    expect(formatLearnStatus({ lastLearnRanAt: null })).toBe("never scan");
+    expect(formatLearnStatus({ lastLearnRanAt: "invalid" })).toBe("never scan");
+    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-27T08:00:00Z" })).toBe("last scan: today");
+    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-26T08:00:00Z" })).toBe("last scan: yesterday");
+    expect(formatLearnStatus({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe("last scan: 5 days ago");
   });
 });

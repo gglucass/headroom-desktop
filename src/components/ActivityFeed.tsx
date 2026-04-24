@@ -39,14 +39,14 @@ const EMPTY_TILE_COPY: Record<
 > = {
   trainSuggestion: {
     badgeClass: "activity-feed__badge--train",
-    badgeLabel: "Train",
-    copy: "No training nudge. Visit Optimize to train any project.",
+    badgeLabel: "Optimize",
+    copy: "No scan nudge. Visit Optimize to scan any project for learnings.",
     itemModifier: "activity-feed__item--train"
   },
   transformation: {
     badgeClass: "activity-feed__badge--transformation",
-    badgeLabel: "Compression",
-    copy: "No compressions yet — send a message through Claude Code.",
+    badgeLabel: "Recent Large Compression",
+    copy: "No large compressions yet — send more messages through Claude Code.",
     itemModifier: "activity-feed__item--transformation"
   },
   rtkToday: {
@@ -95,7 +95,7 @@ export function ActivityFeed({
             <span className="activity-card__title-icon" aria-hidden="true">
               <Bell weight="duotone" />
             </span>
-            <h1>Activity</h1>
+            <h1>Activity (beta)</h1>
           </div>
           <p className="activity-card__blurb">
             Compressions, learnings, RTK saves, and records — everything Headroom is
@@ -417,7 +417,6 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
           Recent large compression
         </span>
         <TimeChip iso={event.timestamp} />
-        <span className="activity-feed__provider">{event.provider ?? "unknown"}</span>
         {event.model ? <span className="activity-feed__model">{event.model}</span> : null}
         {workspace ? (
           <span className="activity-feed__project">{workspace}</span>
@@ -477,6 +476,7 @@ export function groupTransforms(
 ): TransformGroup[] {
   const byLabel = new Map<string, TransformGroup>();
   for (const raw of raws) {
+    if (raw === "router:noop") continue;
     const { label, title, target } = formatTransform(raw);
     const existing = byLabel.get(label);
     if (existing) {
@@ -765,10 +765,10 @@ function TrainSuggestionRow({
   onNavigate?: () => void;
 }) {
   const isNeverTrained = event.kind === "never_trained";
-  const badgeLabel = isNeverTrained ? "Try Train" : "Retrain";
+  const badgeLabel = isNeverTrained ? "Try Optimize" : "Rescan";
   const copy = isNeverTrained
-    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Train run yet. Extract learnings into CLAUDE.md and MEMORY.md.`
-    : `${event.activeDaysSinceLastLearn} active day${event.activeDaysSinceLastLearn === 1 ? "" : "s"} on ${event.projectDisplayName} since the last Train run. Consider rerunning to pick up new patterns.`;
+    ? `${event.sessionCount} session${event.sessionCount === 1 ? "" : "s"} on ${event.projectDisplayName} and no Scan run yet. Extract learnings into CLAUDE.md and MEMORY.md.`
+    : `${event.activeDaysSinceLastLearn} active day${event.activeDaysSinceLastLearn === 1 ? "" : "s"} on ${event.projectDisplayName} since the last Scan run. Consider rerunning to pick up new patterns.`;
   const canNavigate = typeof onNavigate === "function";
   const handleActivate = () => {
     if (canNavigate) onNavigate?.();

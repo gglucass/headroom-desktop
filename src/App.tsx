@@ -3998,8 +3998,8 @@ export default function App() {
                           (headroomLearnStatus.running && !isRunning);
                         const learnMeta = formatLearnStatus(project);
                         const refreshLabel = isRunning
-                          ? "Training…"
-                          : "Train now";
+                          ? "Scanning…"
+                          : "Scan now";
                         const projectResultTone = headroomLearnStatus.success === true
                           ? "success"
                           : (headroomLearnStatus.success === false || headroomLearnStatus.error)
@@ -4029,7 +4029,7 @@ export default function App() {
                                 <small>
                                   <span className="optimize-project-row__training" aria-live="polite">
                                     {isRunning
-                                      ? `Learning from sessions${
+                                      ? `Scanning sessions${
                                           typeof headroomLearnStatus.elapsedSeconds === "number"
                                             ? ` · ${headroomLearnStatus.elapsedSeconds}s`
                                             : ""
