@@ -90,9 +90,61 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("Waiting for the Headroom proxy");
   });
 
-  it("shows the empty state when proxy is up but no events", () => {
+  it("renders a placeholder card for every kind when proxy is up but no events", () => {
     const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
-    expect(markup).toContain("No requests yet");
+    expect(markup).not.toContain("No requests yet");
+    expect(markup).toContain("activity-feed__list");
+    const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
+    expect(emptyClassCount).toBe(9);
+    for (const cls of [
+      "activity-feed__item--train",
+      "activity-feed__item--transformation",
+      "activity-feed__item--memory",
+      "activity-feed__item--rtk",
+      "activity-feed__item--record",
+      "activity-feed__item--streak",
+      "activity-feed__item--savings-milestone",
+      "activity-feed__item--learnings-milestone",
+      "activity-feed__item--weekly-recap"
+    ]) {
+      expect(markup).toContain(cls);
+    }
+    expect(markup).toContain("No compressions yet");
+    expect(markup).toContain("No RTK commands observed yet.");
+    expect(markup).toContain("No recap yet");
+  });
+
+  it("keeps placeholders for other kinds when one live event is present", () => {
+    const feed: ActivityFeedResponse = { ...baseFeed, events: [transformation()] };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
+    expect(emptyClassCount).toBe(8);
+    expect(markup).toContain("Recent large compression");
+    expect(markup).not.toContain("No compressions yet");
+    expect(markup).toContain("No RTK commands observed yet.");
+  });
+
+  it("marks the empty trainSuggestion card as clickable when a navigate handler is supplied", () => {
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={baseFeed} error={null} onNavigateToOptimize={() => {}} />
+    );
+    const trainSegment = markup.match(
+      /<li[^>]*activity-feed__item--train[^>]*>[\s\S]*?<\/li>/
+    );
+    expect(trainSegment).not.toBeNull();
+    expect(trainSegment![0]).toContain("activity-feed__item--clickable");
+    expect(trainSegment![0]).toContain('role="button"');
+    expect(trainSegment![0]).toContain("No training nudge");
+  });
+
+  it("leaves the empty trainSuggestion card non-interactive when no handler is supplied", () => {
+    const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
+    const trainSegment = markup.match(
+      /<li[^>]*activity-feed__item--train[^>]*>[\s\S]*?<\/li>/
+    );
+    expect(trainSegment).not.toBeNull();
+    expect(trainSegment![0]).not.toContain("activity-feed__item--clickable");
+    expect(trainSegment![0]).not.toContain('role="button"');
   });
 
   it("renders a transformation row with provider, model, savings, delta, and transforms", () => {
@@ -312,7 +364,7 @@ describe("ActivityFeed", () => {
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).not.toContain("written to MEMORY.md");
     expect(markup).not.toContain("written to CLAUDE.md");
-    expect(markup).toContain("No requests yet");
+    expect(markup).toContain("No learnings written today.");
   });
 
   it("surfaces only the most recent compression in the transformation tile", () => {
@@ -326,9 +378,8 @@ describe("ActivityFeed", () => {
     ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    expect(rowCount).toBe(1);
-    expect(markup).toContain("Recent large compression");
+    const liveBadgeCount = (markup.match(/Recent large compression/g) ?? []).length;
+    expect(liveBadgeCount).toBe(1);
     expect(markup).toContain("Saved 100 tokens (10.0%)");
     expect(markup).not.toContain("9,999");
     expect(markup).not.toContain("Compression × ");
@@ -739,8 +790,8 @@ describe("ActivityFeed", () => {
     ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    expect(itemCount).toBe(1);
+    const liveLearningCount = (markup.match(/written to MEMORY\.md/g) ?? []).length;
+    expect(liveLearningCount).toBe(1);
     expect(markup).toContain("5 new memories written to MEMORY.md");
     expect(markup).toContain("4 new learnings written to CLAUDE.md");
   });

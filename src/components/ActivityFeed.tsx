@@ -1,5 +1,5 @@
 import { useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { Bell, WifiSlash } from "@phosphor-icons/react";
+import { WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
@@ -32,10 +32,10 @@ interface ActivityFeedProps {
   onNavigateToOptimize?: () => void;
 }
 
-// Fixed order for the activity tiles. Each kind gets at most one tile — the
-// most recent event of that kind — and kinds with no events in the window
-// are skipped. The order is stable so tiles never reshuffle as events stream
-// in; content inside each tile updates in place.
+// Fixed order for the activity tiles. Every kind always gets a tile: the most
+// recent event of that kind when one exists, otherwise a muted placeholder so
+// the user can see what the card means and anticipate where new activity will
+// land. Order is stable so tiles never reshuffle as events stream in.
 const TILE_ORDER: ActivityEvent["kind"][] = [
   "trainSuggestion",
   "transformation",
@@ -47,6 +47,69 @@ const TILE_ORDER: ActivityEvent["kind"][] = [
   "learningsMilestone",
   "weeklyRecap"
 ];
+
+const EMPTY_TILE_COPY: Record<
+  ActivityEvent["kind"],
+  { badgeClass: string; badgeLabel: string; copy: string }
+> = {
+  trainSuggestion: {
+    badgeClass: "activity-feed__badge--train",
+    badgeLabel: "Train",
+    copy: "No training nudge. Visit Optimize to train any project."
+  },
+  transformation: {
+    badgeClass: "activity-feed__badge--transformation",
+    badgeLabel: "Compression",
+    copy: "No compressions yet — send a message through Claude Code."
+  },
+  memoryFlush: {
+    badgeClass: "activity-feed__badge--memory",
+    badgeLabel: "Learning",
+    copy: "No learnings written today."
+  },
+  rtkBatch: {
+    badgeClass: "activity-feed__badge--rtk",
+    badgeLabel: "RTK",
+    copy: "No RTK commands observed yet."
+  },
+  record: {
+    badgeClass: "activity-feed__badge--record",
+    badgeLabel: "Record",
+    copy: "No new records yet."
+  },
+  streak: {
+    badgeClass: "activity-feed__badge--streak",
+    badgeLabel: "Streak",
+    copy: "No streak milestones yet."
+  },
+  savingsMilestone: {
+    badgeClass: "activity-feed__badge--savings-milestone",
+    badgeLabel: "Savings milestone",
+    copy: "No savings milestones yet."
+  },
+  learningsMilestone: {
+    badgeClass: "activity-feed__badge--learnings-milestone",
+    badgeLabel: "Learning milestone",
+    copy: "No learning milestones yet."
+  },
+  weeklyRecap: {
+    badgeClass: "activity-feed__badge--weekly-recap",
+    badgeLabel: "Weekly recap",
+    copy: "No recap yet — posts at the end of the week."
+  }
+};
+
+const KIND_ITEM_MODIFIER: Record<ActivityEvent["kind"], string> = {
+  trainSuggestion: "activity-feed__item--train",
+  transformation: "activity-feed__item--transformation",
+  memoryFlush: "activity-feed__item--memory",
+  rtkBatch: "activity-feed__item--rtk",
+  record: "activity-feed__item--record",
+  streak: "activity-feed__item--streak",
+  savingsMilestone: "activity-feed__item--savings-milestone",
+  learningsMilestone: "activity-feed__item--learnings-milestone",
+  weeklyRecap: "activity-feed__item--weekly-recap"
+};
 
 function localDayKey(now: Date = new Date()): string {
   const y = now.getFullYear();
@@ -66,9 +129,10 @@ export function ActivityFeed({
     () => selectLatestByKind(feed.events, today),
     [feed.events, today]
   );
-  const tiles = TILE_ORDER.map((kind) => latestByKind.get(kind)).filter(
-    (event): event is ActivityEvent => event != null
-  );
+  const tiles = TILE_ORDER.map((kind) => ({
+    kind,
+    event: latestByKind.get(kind) ?? null
+  }));
 
   return (
     <>
@@ -87,7 +151,7 @@ export function ActivityFeed({
           <div className="activity-feed__skeleton-row" />
           <div className="activity-feed__skeleton-row" />
         </div>
-      ) : !feed.proxyReachable && tiles.length === 0 ? (
+      ) : !feed.proxyReachable && feed.events.length === 0 ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
             <WifiSlash weight="duotone" />
@@ -97,26 +161,23 @@ export function ActivityFeed({
             Headroom will reconnect as soon as the proxy is back online.
           </p>
         </div>
-      ) : tiles.length === 0 ? (
-        <div className="activity-feed__empty">
-          <div className="activity-feed__empty-icon" aria-hidden="true">
-            <Bell weight="duotone" />
-          </div>
-          <p className="activity-feed__empty-title">No requests yet</p>
-          <p className="activity-feed__empty-body">
-            Send a message through Claude Code and you'll see compressions and learnings
-            stream in here.
-          </p>
-        </div>
       ) : (
         <ul className="activity-feed__list">
-          {tiles.map((event) => (
-            <TileItem
-              key={event.kind}
-              event={event}
-              onNavigateToOptimize={onNavigateToOptimize}
-            />
-          ))}
+          {tiles.map(({ kind, event }) =>
+            event ? (
+              <TileItem
+                key={kind}
+                event={event}
+                onNavigateToOptimize={onNavigateToOptimize}
+              />
+            ) : (
+              <EmptyTile
+                key={kind}
+                kind={kind}
+                onNavigateToOptimize={onNavigateToOptimize}
+              />
+            )
+          )}
         </ul>
       )}
     </>
@@ -178,6 +239,46 @@ function TileItem({
         />
       );
   }
+}
+
+function EmptyTile({
+  kind,
+  onNavigateToOptimize
+}: {
+  kind: ActivityEvent["kind"];
+  onNavigateToOptimize?: () => void;
+}) {
+  const { badgeClass, badgeLabel, copy } = EMPTY_TILE_COPY[kind];
+  const itemClass = `activity-feed__item activity-feed__item--empty ${KIND_ITEM_MODIFIER[kind]}`;
+  const canNavigate = kind === "trainSuggestion" && typeof onNavigateToOptimize === "function";
+  const handleActivate = () => {
+    if (canNavigate) onNavigateToOptimize?.();
+  };
+  /* v8 ignore start — keyboard activation requires a DOM; see ExpandableRow. */
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
+    if (!canNavigate) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      handleActivate();
+    }
+  };
+  /* v8 ignore stop */
+  return (
+    <li
+      className={canNavigate ? `${itemClass} activity-feed__item--clickable` : itemClass}
+      role={canNavigate ? "button" : undefined}
+      tabIndex={canNavigate ? 0 : undefined}
+      onClick={canNavigate ? handleActivate : undefined}
+      onKeyDown={onKeyDown}
+    >
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className={`activity-feed__badge ${badgeClass} activity-feed__badge--empty`}>
+          {badgeLabel}
+        </span>
+      </div>
+      <p className="activity-feed__content activity-feed__content--empty">{copy}</p>
+    </li>
+  );
 }
 
 function eventTimestampMs(event: ActivityEvent): number {
