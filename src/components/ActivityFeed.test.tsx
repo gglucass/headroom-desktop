@@ -89,7 +89,7 @@ describe("ActivityFeed", () => {
     ]) {
       expect(markup).toContain(cls);
     }
-    expect(markup).toContain("No compressions yet");
+    expect(markup).toContain("No large compressions yet");
     expect(markup).toContain("No RTK commands observed yet today.");
     expect(markup).toContain("No recap yet");
   });
@@ -131,7 +131,6 @@ describe("ActivityFeed", () => {
     const feed = feedWith({ transformation: transformation() });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain("Recent large compression");
-    expect(markup).toContain("anthropic");
     expect(markup).toContain("claude-sonnet-4-6");
     expect(markup).toContain("Saved 750 tokens (75.0%)");
     expect(markup).toContain("1,000");
@@ -604,7 +603,7 @@ describe("ActivityFeed", () => {
     );
     expect(markup).toContain("activity-feed__item--train");
     expect(markup).toContain("activity-feed__badge--train");
-    expect(markup).toContain("Try Scan");
+    expect(markup).toContain("Try Optimize");
     expect(markup).toContain("demo-repo");
     expect(markup).toContain("7 sessions");
     // Clickable affordance present when navigation callback was provided.
@@ -665,7 +664,7 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__project");
   });
 
-  it("falls back to 'unknown' provider and 0 savings when transformation fields are null", () => {
+  it("falls back to 0 savings when transformation fields are null", () => {
     const feed = feedWith({
       transformation: transformation({
         requestId: null,
@@ -680,7 +679,6 @@ describe("ActivityFeed", () => {
       })
     });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("unknown");
     expect(markup).toContain("Saved 0 tokens (0.0%)");
     expect(markup).not.toContain("activity-feed__delta");
     expect(markup).not.toContain("activity-feed__transforms");
