@@ -271,7 +271,7 @@ pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCo
         .send()
         .map_err(|err| {
             let msg = format!("Could not request sign-in code: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
+            sentry::capture_message(&msg, sentry::Level::Warning);
             msg
         })?;
 
@@ -371,7 +371,7 @@ pub fn activate_account(
         .send()
         .map_err(|err| {
             let msg = format!("Could not activate Headroom desktop access: {err}");
-            sentry::capture_message(&msg, sentry::Level::Error);
+            sentry::capture_message(&msg, sentry::Level::Warning);
             msg
         })?;
 

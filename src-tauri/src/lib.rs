@@ -29,10 +29,10 @@ use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
-use tauri::{Emitter, Manager};
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, Position, Rect, State, Window, WindowEvent,
 };
+use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
@@ -350,7 +350,12 @@ fn app_update_notification_body(version: &str) -> String {
 
 fn show_app_update_notification_impl(app: &AppHandle, version: &str) -> Result<(), String> {
     let body = app_update_notification_body(version);
-    show_notification_impl(app, "Headroom Update Available", &body, Some("update".into()))
+    show_notification_impl(
+        app,
+        "Headroom Update Available",
+        &body,
+        Some("update".into()),
+    )
 }
 
 #[tauri::command]
@@ -368,9 +373,8 @@ fn show_notification_impl(
     app: &AppHandle,
     title: &str,
     body: &str,
-    action: Option<String>,
+    _action: Option<String>,
 ) -> Result<(), String> {
-    let app_handle = app.clone();
     let title = title.to_string();
     let body = body.to_string();
     let identifier = if tauri::is_dev() {
@@ -382,24 +386,13 @@ fn show_notification_impl(
     std::thread::spawn(move || {
         // set_application is guarded by a Once internally, so repeat calls are cheap.
         let _ = mac_notification_sys::set_application(&identifier);
-        let response = mac_notification_sys::Notification::new()
+        let _ = mac_notification_sys::Notification::new()
             .title(&title)
             .message(&body)
-            .wait_for_click(true)
+            // Waiting for clicks spins a private NSRunLoop in mac-notification-sys
+            // and can hold a full CPU core while the notification is pending.
+            .asynchronous(true)
             .send();
-        let clicked = matches!(
-            response,
-            Ok(mac_notification_sys::NotificationResponse::Click)
-                | Ok(mac_notification_sys::NotificationResponse::ActionButton(_))
-                | Ok(mac_notification_sys::NotificationResponse::Reply(_))
-        );
-        if clicked {
-            let _ = show_main_window(&app_handle, None);
-            let _ = app_handle.emit(
-                "notification-clicked",
-                json!({ "action": action }),
-            );
-        }
     });
     Ok(())
 }
@@ -640,10 +633,7 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
             || {
-                sentry::capture_message(
-                    "bootstrap_failed (install_runtime)",
-                    sentry::Level::Error,
-                );
+                sentry::capture_message("bootstrap_failed (install_runtime)", sentry::Level::Error);
             },
         );
     } else {
@@ -735,22 +725,31 @@ pub(crate) fn capture_upgrade_failure(err: &anyhow::Error, restored: bool, phase
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
 pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
     let chain = format!("{err:#}").to_ascii_lowercase();
-    if chain.contains("network") || chain.contains("timed out") || chain.contains("dns")
-        || chain.contains("connection refused") || chain.contains("could not resolve")
+    if chain.contains("network")
+        || chain.contains("timed out")
+        || chain.contains("dns")
+        || chain.contains("connection refused")
+        || chain.contains("could not resolve")
     {
         return Some("Couldn't reach PyPI. Check your network and retry.".into());
     }
     if chain.contains("no space") || chain.contains("disk full") || chain.contains("enospc") {
-        return Some("Not enough disk space to install the update. Free up space and retry.".into());
+        return Some(
+            "Not enough disk space to install the update. Free up space and retry.".into(),
+        );
     }
     if chain.contains("sha256") || chain.contains("checksum") || chain.contains("digest") {
         return Some("The downloaded wheel's checksum didn't match. Retry to redownload.".into());
     }
     if chain.contains("import") && chain.contains("smoke test") {
-        return Some("The new Headroom version couldn't be imported. Try retrying or reinstalling.".into());
+        return Some(
+            "The new Headroom version couldn't be imported. Try retrying or reinstalling.".into(),
+        );
     }
     if chain.contains("resolution") || chain.contains("no matching distribution") {
-        return Some("Pip couldn't resolve dependencies for the new version. Please report this.".into());
+        return Some(
+            "Pip couldn't resolve dependencies for the new version. Please report this.".into(),
+        );
     }
     None
 }
@@ -772,6 +771,12 @@ fn retry_runtime_upgrade(app: AppHandle) -> Result<(), String> {
         let state: tauri::State<'_, AppState> = app_clone.state();
         state.retry_runtime_upgrade(&app_clone);
     });
+    Ok(())
+}
+
+#[tauri::command]
+fn dismiss_runtime_upgrade_failure(state: State<'_, AppState>) -> Result<(), String> {
+    state.dismiss_upgrade_failure();
     Ok(())
 }
 
@@ -947,10 +952,7 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
 /// from frontend polling: users get milestone notifications whether or not
 /// the Activity tab is currently on screen.
 #[tauri::command]
-fn get_activity_feed(
-    state: State<'_, AppState>,
-    limit: Option<u32>,
-) -> ActivityFeedResponse {
+fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> ActivityFeedResponse {
     let limit = limit.unwrap_or(50).min(500);
     let live_transformations = fetch_transformations_feed(limit).ok();
     let persisted_transformations = state.persisted_transformations();
@@ -993,10 +995,13 @@ fn merge_live_and_persisted_transformations(
     match live {
         Some(feed) => {
             let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            let mut merged: Vec<TransformationFeedEvent> = Vec::with_capacity(
-                feed.transformations.len() + persisted.len(),
-            );
-            for ev in feed.transformations.into_iter().chain(persisted.into_iter()) {
+            let mut merged: Vec<TransformationFeedEvent> =
+                Vec::with_capacity(feed.transformations.len() + persisted.len());
+            for ev in feed
+                .transformations
+                .into_iter()
+                .chain(persisted.into_iter())
+            {
                 let fingerprint = ev
                     .request_id
                     .clone()
@@ -1027,14 +1032,13 @@ fn merge_live_and_persisted_transformations(
     }
 }
 
-/// Observation cadence: frequent enough that a first-time user sees a
-/// milestone notification shortly after earning it, but slow enough that the
-/// 60s memory-export cache usually absorbs the Python subprocess.
-const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
-/// Rescan cadence for the Claude projects cache. Shorter than the 60s TTL
-/// by enough margin that a fresh warm lands before the cached value expires,
-/// so the frontend's IPC path essentially never re-scans the projects dir.
-const CLAUDE_PROJECTS_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+/// Observation cadence for background milestones and Activity notifications.
+/// A modest delay is fine here; foreground Activity still polls separately,
+/// and the memory-export path is intentionally kept away from tight loops.
+const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// Rescan cadence for the Claude projects cache. This keeps Optimize mostly
+/// warm without doing filesystem-heavy project scans every minute forever.
+const CLAUDE_PROJECTS_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(75);
 /// Matches the frontend's `ACTIVITY_FEED_WINDOW` in App.tsx so the observer
 /// sees the same transformations the UI will display.
 const ACTIVITY_OBSERVER_LIMIT: u32 = 150;
@@ -1096,10 +1100,7 @@ fn run_activity_observation(app: &AppHandle) {
     // No point nudging the user to run Train if the claude CLI isn't installed —
     // they'd just hit an install prompt. The Optimize tab surfaces the install
     // UI in that case; let them fix prereqs first.
-    if state
-        .headroom_learn_prereq_status()
-        .claude_cli_available
-    {
+    if state.headroom_learn_prereq_status().claude_cli_available {
         if let Ok(projects) = state.list_claude_code_projects() {
             fresh_events.extend(state.observe_train_suggestions(&projects));
         }
@@ -1160,8 +1161,7 @@ fn coalesce_rtk_batches(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
         if let ActivityEvent::RtkBatch(curr) = &ev {
             if let Some(ActivityEvent::RtkBatch(prev)) = out.last_mut() {
                 if prev.observed_at.signed_duration_since(curr.observed_at) <= window {
-                    prev.commands_delta =
-                        prev.commands_delta.saturating_add(curr.commands_delta);
+                    prev.commands_delta = prev.commands_delta.saturating_add(curr.commands_delta);
                     prev.tokens_saved_delta = prev
                         .tokens_saved_delta
                         .saturating_add(curr.tokens_saved_delta);
@@ -1183,10 +1183,7 @@ fn coalesce_rtk_batches(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
 /// newest low-signal events, then restore chronological order.
 ///
 /// Expects `events` sorted DESC by timestamp. Output is also DESC.
-fn truncate_preserving_variety(
-    events: Vec<ActivityEvent>,
-    limit: usize,
-) -> Vec<ActivityEvent> {
+fn truncate_preserving_variety(events: Vec<ActivityEvent>, limit: usize) -> Vec<ActivityEvent> {
     if events.len() <= limit {
         return events;
     }
@@ -1255,10 +1252,7 @@ fn aggregate_live_learnings(
     Ok(out)
 }
 
-fn memory_export_cached(
-    state: &State<'_, AppState>,
-    memory_path: &Path,
-) -> Result<String, String> {
+fn memory_export_cached(state: &State<'_, AppState>, memory_path: &Path) -> Result<String, String> {
     if let Some(cached) = state.cached_memory_export() {
         return Ok(cached);
     }
@@ -1269,10 +1263,7 @@ fn memory_export_cached(
 }
 
 #[tauri::command]
-fn delete_live_learning(
-    state: State<'_, AppState>,
-    memory_id: String,
-) -> Result<(), String> {
+fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> Result<(), String> {
     let memory_path = headroom_memory_db_path();
     if !memory_path.exists() {
         return Err("Memory database does not exist.".into());
@@ -1301,9 +1292,7 @@ fn delete_live_learning(
 }
 
 #[tauri::command]
-fn list_applied_patterns(
-    project_path: String,
-) -> Result<crate::models::AppliedPatterns, String> {
+fn list_applied_patterns(project_path: String) -> Result<crate::models::AppliedPatterns, String> {
     Ok(read_applied_patterns_for_project(&project_path))
 }
 
@@ -1346,11 +1335,8 @@ fn delete_applied_pattern(
     }
     let content =
         std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let updated = crate::tool_manager::delete_applied_bullet(
-        &content,
-        &section_title,
-        &bullet_text,
-    );
+    let updated =
+        crate::tool_manager::delete_applied_bullet(&content, &section_title, &bullet_text);
     if updated == content {
         return Ok(()); // no-op; nothing to write
     }
@@ -1376,10 +1362,7 @@ fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String
         .output()
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
-        return Err(format!(
-            "headroom memory export exited {}",
-            output.status
-        ));
+        return Err(format!("headroom memory export exited {}", output.status));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1551,7 +1534,9 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
                 Ok(_) => continue,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
-                    return Err(format!("Could not launch external link with {opener}: {err}"))
+                    return Err(format!(
+                        "Could not launch external link with {opener}: {err}"
+                    ))
                 }
             }
         }
@@ -1665,10 +1650,7 @@ fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupRe
                         );
                         scope.set_extra("checks", json!(result.verification.checks).into());
                         scope.set_extra("failures", json!(result.verification.failures).into());
-                        scope.set_extra(
-                            "already_configured",
-                            result.already_configured.into(),
-                        );
+                        scope.set_extra("already_configured", result.already_configured.into());
                     },
                     || {
                         sentry::capture_message(
@@ -1807,7 +1789,6 @@ fn quit_headroom(app: AppHandle) {
     exit_headroom(&app, QuitSource::SettingsButton);
 }
 
-
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
@@ -1935,6 +1916,7 @@ pub fn run() {
             get_bootstrap_progress,
             get_runtime_upgrade_progress,
             retry_runtime_upgrade,
+            dismiss_runtime_upgrade_failure,
             get_runtime_status,
             get_headroom_logs,
             get_rtk_activity,
@@ -1985,7 +1967,10 @@ pub fn run() {
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
             // outlives the desktop and the next launch reuses an orphan.
-            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
             }
@@ -2135,7 +2120,6 @@ fn check_headroom_learn_prereqs(
     Ok(())
 }
 
-
 fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>, String> {
     #[derive(serde::Deserialize)]
     struct RawMemory {
@@ -2151,8 +2135,7 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
         #[serde(default)]
         metadata: serde_json::Value,
     }
-    let raw: Vec<RawMemory> =
-        serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    let raw: Vec<RawMemory> = serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
     let mut events: Vec<MemoryFeedEvent> = raw
         .into_iter()
         .filter_map(|m| {
@@ -2215,8 +2198,7 @@ fn fetch_transformations_feed_from(
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let raw: RawTransformationsFeedResponse =
-        response.json().map_err(|err| err.to_string())?;
+    let raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
     Ok(TransformationFeedResponse {
         log_full_messages: raw.log_full_messages,
         transformations: raw.transformations,
@@ -2546,19 +2528,14 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Off
                 }
             };
-            let visual = debounced_tray_runtime_visual(
-                raw_visual,
-                last_non_booting,
-                &mut unhealthy_streak,
-            );
+            let visual =
+                debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
                 let tooltip = match visual {
                     TrayRuntimeVisual::Booting => "Headroom — starting",
                     TrayRuntimeVisual::Running => "Headroom — active",
-                    TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code running normally)"
-                    }
+                    TrayRuntimeVisual::Paused => "Headroom — paused (Claude Code running normally)",
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart"
                     }
@@ -2589,8 +2566,11 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         let changed_dollars = last_displayed_dollars != Some(dollars);
                         if changed_visual || changed_dollars {
                             let (bw, bh) = icons.running_dims;
-                            let (new_rgba, new_w, new_h) = build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
-                            let _ = tray.set_icon(Some(tauri::image::Image::new_owned(new_rgba, new_w, new_h)));
+                            let (new_rgba, new_w, new_h) =
+                                build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
+                            let _ = tray.set_icon(Some(tauri::image::Image::new_owned(
+                                new_rgba, new_w, new_h,
+                            )));
                             icon_changed = true;
                             last_non_booting = Some(TrayRuntimeVisual::Running);
                             last_displayed_dollars = Some(dollars);
@@ -2652,15 +2632,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 break;
             }
 
-            // Only the booting animation needs frame-rate polling; for every
-            // other steady-state the icon doesn't change visually between
-            // ticks. Slowing the idle cadence to 1.5s cuts `runtime_status()`
-            // calls from ~4/s to <1/s, which in turn drops the background
-            // HTTP ping to the local proxy from ~4/s to <1/s.
-            let sleep = if matches!(visual, TrayRuntimeVisual::Booting) {
-                std::time::Duration::from_millis(260)
-            } else {
-                std::time::Duration::from_millis(1500)
+            // Only transitional states need quick polling. In steady state the
+            // tray icon is unchanged, and `runtime_status()` is one of the few
+            // always-on paths that can still hit the local proxy / filesystem.
+            let sleep = match visual {
+                TrayRuntimeVisual::Booting => std::time::Duration::from_millis(260),
+                TrayRuntimeVisual::Unhealthy => std::time::Duration::from_millis(1500),
+                _ => std::time::Duration::from_secs(5),
             };
             std::thread::sleep(sleep);
         }
@@ -2744,22 +2722,20 @@ fn spawn_tray_savings_updater(app: AppHandle) {
     // fast enough that the badge feels live during active traffic and slow
     // enough that `build_dashboard` runs ~3x/min instead of 12x/min.
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(INTERVAL);
-            let state: tauri::State<'_, AppState> = app.state();
-            let dashboard = state.dashboard();
-            let today_key = Local::now().format("%Y-%m-%d").to_string();
-            let savings: f64 = dashboard
-                .hourly_savings
-                .iter()
-                .filter(|p| p.hour.starts_with(&today_key))
-                .map(|p| p.estimated_savings_usd)
-                .sum();
-            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-            *savings_state.0.lock() = savings;
-            let _ = app.emit("savings-today-updated", savings);
-        }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(INTERVAL);
+        let state: tauri::State<'_, AppState> = app.state();
+        let dashboard = state.dashboard();
+        let today_key = Local::now().format("%Y-%m-%d").to_string();
+        let savings: f64 = dashboard
+            .hourly_savings
+            .iter()
+            .filter(|p| p.hour.starts_with(&today_key))
+            .map(|p| p.estimated_savings_usd)
+            .sum();
+        let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+        *savings_state.0.lock() = savings;
+        let _ = app.emit("savings-today-updated", savings);
     });
 }
 
@@ -2964,18 +2940,18 @@ fn build_running_with_savings(
 // Each glyph is [[col0, col1, col2]; 5 rows], top to bottom.
 fn pixel_char(c: u8) -> [[u8; 3]; 5] {
     match c {
-        b'0' => [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
-        b'1' => [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
-        b'2' => [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
-        b'3' => [[1,1,1],[0,0,1],[1,1,1],[0,0,1],[1,1,1]],
-        b'4' => [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
-        b'5' => [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
-        b'6' => [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
-        b'7' => [[1,1,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]],
-        b'8' => [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
-        b'9' => [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
-        b'K' => [[1,0,1],[1,1,0],[1,0,0],[1,1,0],[1,0,1]],
-        _    => [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]],
+        b'0' => [[1, 1, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 1, 1]],
+        b'1' => [[0, 1, 0], [1, 1, 0], [0, 1, 0], [0, 1, 0], [1, 1, 1]],
+        b'2' => [[1, 1, 1], [0, 0, 1], [1, 1, 1], [1, 0, 0], [1, 1, 1]],
+        b'3' => [[1, 1, 1], [0, 0, 1], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+        b'4' => [[1, 0, 1], [1, 0, 1], [1, 1, 1], [0, 0, 1], [0, 0, 1]],
+        b'5' => [[1, 1, 1], [1, 0, 0], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+        b'6' => [[1, 1, 1], [1, 0, 0], [1, 1, 1], [1, 0, 1], [1, 1, 1]],
+        b'7' => [[1, 1, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 1]],
+        b'8' => [[1, 1, 1], [1, 0, 1], [1, 1, 1], [1, 0, 1], [1, 1, 1]],
+        b'9' => [[1, 1, 1], [1, 0, 1], [1, 1, 1], [0, 0, 1], [1, 1, 1]],
+        b'K' => [[1, 0, 1], [1, 1, 0], [1, 0, 0], [1, 1, 0], [1, 0, 1]],
+        _ => [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
     }
 }
 
@@ -3211,22 +3187,22 @@ mod tests {
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
         coalesce_rtk_batches, compute_tray_window_position, debounced_tray_runtime_visual,
-        empty_live_learnings_for_projects, fetch_transformations_feed_from,
-        install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
-        merge_live_and_persisted_transformations,
-        normalize_utc_timestamp, parse_live_learnings, parse_memory_export,
-        parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
-        store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
+        is_prerelease_version, lifetime_token_milestone_kind,
+        merge_live_and_persisted_transformations, normalize_utc_timestamp, parse_live_learnings,
+        parse_memory_export, parse_updater_endpoint_list, pattern_matches_project,
+        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
+        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
         ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent,
         RecordEvent, RecordTag, RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use chrono::{DateTime, TimeZone, Timelike, Utc};
-    use serde_json::json;
     use parking_lot::Mutex;
+    use serde_json::json;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
 
     struct FakePendingUpdate {
@@ -3671,10 +3647,13 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
 
-        let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
-            .unwrap_err();
+        let err =
+            fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50).unwrap_err();
         server.join().unwrap();
-        assert!(err.contains("503"), "expected status code in error, got: {err}");
+        assert!(
+            err.contains("503"),
+            "expected status code in error, got: {err}"
+        );
     }
 
     #[test]
@@ -3761,16 +3740,22 @@ mod tests {
     fn normalize_utc_timestamp_handles_naive_and_rfc3339() {
         let naive = normalize_utc_timestamp("2026-04-21T10:00:00").unwrap();
         let parsed = DateTime::parse_from_rfc3339(&naive).unwrap();
-        assert_eq!(parsed.with_timezone(&Utc).to_rfc3339(),
-                   "2026-04-21T10:00:00+00:00");
+        assert_eq!(
+            parsed.with_timezone(&Utc).to_rfc3339(),
+            "2026-04-21T10:00:00+00:00"
+        );
 
         let fractional = normalize_utc_timestamp("2026-04-21T10:00:00.123").unwrap();
         assert!(DateTime::parse_from_rfc3339(&fractional).is_ok());
 
         let with_z = normalize_utc_timestamp("2026-04-21T10:00:00Z").unwrap();
         assert_eq!(
-            DateTime::parse_from_rfc3339(&with_z).unwrap().with_timezone(&Utc),
-            DateTime::parse_from_rfc3339("2026-04-21T10:00:00+00:00").unwrap().with_timezone(&Utc)
+            DateTime::parse_from_rfc3339(&with_z)
+                .unwrap()
+                .with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2026-04-21T10:00:00+00:00")
+                .unwrap()
+                .with_timezone(&Utc)
         );
 
         assert!(normalize_utc_timestamp("not a date").is_none());
@@ -3856,7 +3841,11 @@ mod tests {
         ]))
         .unwrap();
 
-        let paths = vec!["/x/a".to_string(), "/x/b".to_string(), "/x/empty".to_string()];
+        let paths = vec![
+            "/x/a".to_string(),
+            "/x/b".to_string(),
+            "/x/empty".to_string(),
+        ];
         let map = aggregate_live_learnings(&json, &paths).unwrap();
 
         assert_eq!(map.len(), 3, "one entry per requested path");
@@ -3893,8 +3882,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let err = fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50)
-            .unwrap_err();
+        let err =
+            fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50).unwrap_err();
         assert!(!err.is_empty(), "expected a non-empty error message");
     }
 
@@ -3934,7 +3923,10 @@ mod tests {
         ];
         let merged = merge_live_and_persisted_transformations(None, persisted).unwrap();
         assert_eq!(merged.transformations.len(), 2);
-        assert!(!merged.proxy_reachable, "marked unreachable so UI can surface it");
+        assert!(
+            !merged.proxy_reachable,
+            "marked unreachable so UI can surface it"
+        );
     }
 
     #[test]
@@ -4045,11 +4037,7 @@ mod tests {
         let flood: Vec<TransformationFeedEvent> = (0..150)
             .map(|i| {
                 // All compressions newer than the milestone below.
-                make_transformation(&format!(
-                    "2026-04-22T12:{:02}:{:02}Z",
-                    i / 60,
-                    i % 60
-                ))
+                make_transformation(&format!("2026-04-22T12:{:02}:{:02}Z", i / 60, i % 60))
             })
             .collect();
         let transformations = TransformationFeedResponse {
@@ -4232,9 +4220,7 @@ mod tests {
 
     fn rtk(hour: u32, minute: u32, commands: u64, tokens: u64, total: u64) -> ActivityEvent {
         ActivityEvent::RtkBatch(RtkBatchEvent {
-            observed_at: Utc
-                .with_ymd_and_hms(2026, 4, 21, hour, minute, 0)
-                .unwrap(),
+            observed_at: Utc.with_ymd_and_hms(2026, 4, 21, hour, minute, 0).unwrap(),
             commands_delta: commands,
             tokens_saved_delta: tokens,
             total_commands: total,
@@ -4292,5 +4278,4 @@ mod tests {
         let one = coalesce_rtk_batches(vec![rtk(12, 0, 5, 1000, 100)]);
         assert_eq!(one.len(), 1);
     }
-
 }

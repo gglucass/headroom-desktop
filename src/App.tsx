@@ -2698,6 +2698,10 @@ export default function App() {
     !runtimeUpgradeProgress.running && upgradeFailure !== null;
   const upgradeExhausted =
     upgradeFailure !== null && upgradeFailure.attempts >= MAX_UPGRADE_AUTO_RETRIES;
+  const canDismissUpgradeFailure =
+    upgradeFailure !== null &&
+    upgradeFailure.rollbackRestored &&
+    runtimeStatus?.proxyReachable === true;
 
   const upgradeOverlay = (
     <>
@@ -2777,6 +2781,17 @@ export default function App() {
                 }
               >
                 Report issue
+              </button>
+            )}
+            {canDismissUpgradeFailure && (
+              <button
+                type="button"
+                className="secondary-button secondary-button--small"
+                onClick={() =>
+                  void invoke("dismiss_runtime_upgrade_failure").catch(() => {})
+                }
+              >
+                Dismiss
               </button>
             )}
           </div>

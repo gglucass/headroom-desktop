@@ -1043,6 +1043,11 @@ impl AppState {
         persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
+    pub fn dismiss_upgrade_failure(&self) {
+        self.clear_upgrade_failure();
+        self.invalidate_runtime_status_cache();
+    }
+
     fn record_upgrade_failure(&self, mut failure: RuntimeUpgradeFailure) {
         let mut profile = self.launch_profile.lock();
         let attempts = match profile.last_runtime_upgrade_failure.as_ref() {
@@ -1269,10 +1274,7 @@ impl AppState {
     /// prompted to run Train. Delegates the decision logic and bookkeeping
     /// (fire-once for never-trained, 7-day cooldown for stale) to
     /// `ActivityFacts::observe_train_suggestions`.
-    pub fn observe_train_suggestions(
-        &self,
-        projects: &[ClaudeCodeProject],
-    ) -> Vec<ActivityEvent> {
+    pub fn observe_train_suggestions(&self, projects: &[ClaudeCodeProject]) -> Vec<ActivityEvent> {
         let mut facts = self.activity_facts.lock();
         let events = facts.observe_train_suggestions(projects, Utc::now());
         let _ = facts.save_if_dirty();
@@ -1429,12 +1431,12 @@ impl AppState {
     /// Cache TTL for `list_claude_code_projects`. Long enough that rapid tab
     /// switches and pre-warms hit the cache instead of re-scanning the
     /// projects directory. A dedicated background thread
-    /// (`spawn_claude_projects_warmer`) keeps this fresh at ~45s cadence so
-    /// even the first post-expiry call hits a warm cache on the IPC path.
+    /// (`spawn_claude_projects_warmer`) keeps this fresh at ~75s cadence so
+    /// most Optimize opens still avoid a cold filesystem scan.
     /// Completed learn runs explicitly invalidate via
     /// `invalidate_claude_code_projects_cache`, so staleness isn't a concern
     /// for learn-driven UI updates.
-    const CLAUDE_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(60);
+    const CLAUDE_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(90);
 
     pub fn list_claude_code_projects(&self) -> Result<Vec<ClaudeCodeProject>> {
         if let Some(cached) = self.cached_claude_code_projects_fresh() {
@@ -4482,7 +4484,7 @@ mod tests {
     fn runtime_maintenance_plan_prefers_requirements_repair_when_only_lock_is_stale() {
         let base_dir = temp_test_dir("headroom-maintenance-repair");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        write_headroom_receipt(&base_dir, "0.10.4", "stale");
+        write_headroom_receipt(&base_dir, "0.10.7", "stale");
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(matches!(
@@ -4502,7 +4504,7 @@ mod tests {
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         match plan {
             Some(super::RuntimeMaintenancePlan::Upgrade(release)) => {
-                assert_eq!(release.version(), "0.10.4");
+                assert_eq!(release.version(), "0.10.7");
             }
             _ => panic!("expected version upgrade plan"),
         }

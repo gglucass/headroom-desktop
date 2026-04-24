@@ -22,10 +22,10 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.10.4";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/f0/a8/7626d0f8ca0d434d61c854bc417853465a0da06e4334b9f2cdf7c7ddf9c5/headroom_ai-0.10.4-py3-none-any.whl";
+const HEADROOM_PINNED_VERSION: &str = "0.10.7";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/2f/29/68a4fa5e60f958a41347b84965dd0e42d2d6a08a583ae4a218336305804a/headroom_ai-0.10.7-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "5b2b789303f6424e4ce7671ffe8818da710cb7c315dd95ab928ef27249d56dd6";
+    "c214d82b3448af0d9aebe6d475e4539fe79ba7415bd87467983bd1c223805e66";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -1403,15 +1403,37 @@ impl ToolManager {
         self.runtime.runtime_dir.join("upgrade.in_progress.json")
     }
 
-    fn write_upgrade_marker(&self, target_version: &str) -> Result<()> {
+    fn write_upgrade_marker(
+        &self,
+        target_version: &str,
+        wheel_only_previous_version: Option<&str>,
+    ) -> Result<()> {
         let marker = self.upgrade_marker_path();
-        let body = json!({
+        let mut body = json!({
             "target_version": target_version,
             "started_at": Utc::now().to_rfc3339(),
         });
+        if let Some(previous) = wheel_only_previous_version {
+            body["wheel_only"] = json!(true);
+            body["previous_version"] = json!(previous);
+        }
         std::fs::write(&marker, serde_json::to_vec_pretty(&body)?)
             .with_context(|| format!("writing {}", marker.display()))?;
         Ok(())
+    }
+
+    /// Read the in-progress upgrade marker and, if it records a wheel-only
+    /// upgrade, return (previous_version, target_version). Returns None for
+    /// missing markers and for full-venv-rebuild markers.
+    fn read_wheel_only_marker(&self) -> Option<(String, String)> {
+        let bytes = std::fs::read(self.upgrade_marker_path()).ok()?;
+        let body: Value = serde_json::from_slice(&bytes).ok()?;
+        if body.get("wheel_only").and_then(|v| v.as_bool()) != Some(true) {
+            return None;
+        }
+        let previous = body.get("previous_version")?.as_str()?.to_string();
+        let target = body.get("target_version")?.as_str()?.to_string();
+        Some((previous, target))
     }
 
     fn clear_upgrade_marker(&self) {
@@ -1431,6 +1453,27 @@ impl ToolManager {
         if !marker.exists() {
             return false;
         }
+
+        // Wheel-only recovery: pip install is atomic per-package, so the venv
+        // is either at target_version or previous_version. Force-reinstall
+        // previous_version so the next launch starts from a known-good state,
+        // then let `check_headroom_upgrade` retry the swap fresh.
+        if let Some((previous_version, _target)) = self.read_wheel_only_marker() {
+            eprintln!(
+                "recover_from_interrupted_upgrade: wheel-only upgrade was in progress; \
+                 reinstalling previous headroom-ai {previous_version}"
+            );
+            let _ = self.pip_force_reinstall_headroom_version(&previous_version);
+            let receipt_backup = self.headroom_receipt_backup_path();
+            let receipt_path = self.headroom_receipt_path();
+            if receipt_backup.exists() {
+                let _ = std::fs::copy(&receipt_backup, &receipt_path);
+                let _ = std::fs::remove_file(&receipt_backup);
+            }
+            self.clear_upgrade_marker();
+            return true;
+        }
+
         let backup_dir = self.venv_backup_dir();
         let venv_dir = &self.runtime.venv_dir;
         let receipt_backup = self.headroom_receipt_backup_path();
@@ -1508,6 +1551,13 @@ impl ToolManager {
         // Restore it before doing anything destructive.
         let _recovered = self.recover_from_interrupted_upgrade();
 
+        // Fast path: when only the headroom-ai version changed and the dep
+        // lock is unchanged, swap the wheel in place without rebuilding the
+        // venv or re-running `pip install -r lock`.
+        if let Some(previous_version) = self.can_do_wheel_only_upgrade_headroom() {
+            return self.wheel_only_upgrade_headroom(release, &previous_version, progress);
+        }
+
         let venv_dir = self.runtime.venv_dir.clone();
         let backup_dir = self.venv_backup_dir();
         let receipt_path = self.headroom_receipt_path();
@@ -1549,7 +1599,7 @@ impl ToolManager {
         // commit/rollback, the next launch can recognize and recover.
         let had_live_venv = venv_dir.exists();
         if had_live_venv {
-            if let Err(err) = self.write_upgrade_marker(&release.version) {
+            if let Err(err) = self.write_upgrade_marker(&release.version, None) {
                 return UpgradeOutcome::InstallFailed {
                     restored: false,
                     error: err.context("writing upgrade-in-progress marker"),
@@ -1640,6 +1690,26 @@ impl ToolManager {
     /// `state.rs` upgrade coordinator when boot validation fails.
     /// Idempotent — no-op if no backup exists.
     pub fn rollback_headroom_upgrade(&self) -> Result<()> {
+        // Wheel-only rollback: no venv backup, pip-reinstall the previous
+        // version in place and restore the receipt snapshot.
+        if let Some((previous_version, _)) = self.read_wheel_only_marker() {
+            self.pip_force_reinstall_headroom_version(&previous_version)
+                .with_context(|| {
+                    format!(
+                        "rollback failed — could not reinstall previous Headroom version {previous_version}"
+                    )
+                })?;
+            let receipt_backup = self.headroom_receipt_backup_path();
+            let receipt_path = self.headroom_receipt_path();
+            if receipt_backup.exists() {
+                std::fs::copy(&receipt_backup, &receipt_path)
+                    .with_context(|| format!("restoring {}", receipt_path.display()))?;
+                let _ = std::fs::remove_file(&receipt_backup);
+            }
+            self.clear_upgrade_marker();
+            return Ok(());
+        }
+
         let backup_dir = self.venv_backup_dir();
         if !backup_dir.exists() {
             return Ok(());
@@ -1653,6 +1723,246 @@ impl ToolManager {
                 self.runtime.venv_dir.display()
             );
         }
+        Ok(())
+    }
+
+    /// Returns `Some(previous_version)` if the next `atomic_upgrade_headroom`
+    /// call can be satisfied by a wheel-only swap (pip `--force-reinstall
+    /// --no-deps`) without rebuilding the venv. Requires an installed version
+    /// plus a stored requirements-lock sha that matches the current lock's
+    /// comment-insensitive sha (or a known legacy full-file sha).
+    fn can_do_wheel_only_upgrade_headroom(&self) -> Option<String> {
+        let installed = self.installed_headroom_version()?;
+        let stored = self.installed_requirements_lock_sha()?;
+        let current = requirements_lock_sha(bootstrap_requirements_lock());
+        if stored == current || LEGACY_REQUIREMENTS_LOCK_SHAS.contains(&stored.as_str()) {
+            Some(installed)
+        } else {
+            None
+        }
+    }
+
+    /// Wheel-only upgrade: swap the `headroom-ai` package in place with
+    /// `pip install --no-deps --force-reinstall`. The venv and all transitive
+    /// deps are untouched. Eligibility is gated by
+    /// [`Self::can_do_wheel_only_upgrade_headroom`].
+    ///
+    /// On smoke-test failure, attempts to re-pin the previous version via pip
+    /// (which will hit pip's wheel cache for the common case).
+    fn wheel_only_upgrade_headroom<F>(
+        &self,
+        release: &HeadroomRelease,
+        previous_version: &str,
+        mut progress: F,
+    ) -> UpgradeOutcome
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
+        let receipt_path = self.headroom_receipt_path();
+        let receipt_backup = self.headroom_receipt_backup_path();
+
+        // Purge stale receipt backup from any cleanly-completed prior upgrade.
+        let _ = std::fs::remove_file(&receipt_backup);
+
+        // Snapshot the receipt so rollback can restore the old artifact pointers.
+        if receipt_path.exists() {
+            if let Err(err) = std::fs::copy(&receipt_path, &receipt_backup) {
+                return UpgradeOutcome::InstallFailed {
+                    restored: true,
+                    error: anyhow!("failed to snapshot {}: {err}", receipt_path.display()),
+                };
+            }
+        }
+
+        // Write marker so an interrupted upgrade can be recovered on next launch.
+        if let Err(err) = self.write_upgrade_marker(&release.version, Some(previous_version)) {
+            let _ = std::fs::remove_file(&receipt_backup);
+            return UpgradeOutcome::InstallFailed {
+                restored: true,
+                error: err.context("writing upgrade-in-progress marker"),
+            };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Downloading update",
+            message: "Fetching Headroom update bundle.".into(),
+            eta_seconds: 10,
+            percent: 20,
+        });
+
+        let wheel_path = self
+            .runtime
+            .downloads_dir
+            .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
+        let use_wheel =
+            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+                Ok(()) => true,
+                Err(download_err) => {
+                    eprintln!(
+                    "headroom wheel download failed (will fall back to pip index): {download_err}"
+                );
+                    false
+                }
+            };
+
+        progress(BootstrapStepUpdate {
+            step: "Applying update",
+            message: "Installing the new Headroom wheel.".into(),
+            eta_seconds: 10,
+            percent: 55,
+        });
+
+        let headroom_spec = format!("headroom-ai=={}", release.version);
+        let headroom_arg = if use_wheel {
+            wheel_path.to_string_lossy().into_owned()
+        } else {
+            headroom_spec.clone()
+        };
+        if let Err(err) = run_pip_install_with_retries(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--no-deps",
+                "--force-reinstall",
+                &headroom_arg,
+            ],
+            &self.runtime.root_dir,
+        ) {
+            // pip install is atomic per-package; the venv remains on previous_version.
+            let _ = std::fs::remove_file(&receipt_backup);
+            self.clear_upgrade_marker();
+            let context_msg = if use_wheel {
+                "installing verified Headroom wheel into Headroom-managed virtualenv"
+            } else {
+                "installing headroom-ai from PyPI into Headroom-managed virtualenv"
+            };
+            return UpgradeOutcome::InstallFailed {
+                restored: true,
+                error: err.context(context_msg),
+            };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Verifying install",
+            message: "Running Headroom import smoke test.".into(),
+            eta_seconds: 3,
+            percent: 80,
+        });
+
+        if let Err(err) = self.smoke_test_headroom() {
+            let restored = self.rollback_wheel_only_upgrade_inner(previous_version);
+            return UpgradeOutcome::InstallFailed { restored, error: err };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Configuring integrations",
+            message: "Setting up Headroom MCP integration.".into(),
+            eta_seconds: 5,
+            percent: 90,
+        });
+
+        let mcp_install = match self.install_headroom_mcp() {
+            Ok(method) => json!({
+                "configured": true,
+                "proxyUrl": HEADROOM_PROXY_URL,
+                "installMethod": method.as_str(),
+            }),
+            Err(err) => {
+                eprintln!("headroom MCP setup skipped: {err}");
+                json!({
+                    "configured": false,
+                    "proxyUrl": HEADROOM_PROXY_URL,
+                    "error": err.to_string(),
+                })
+            }
+        };
+
+        if let Err(err) = self.update_headroom_receipt_after_wheel_swap(release, mcp_install) {
+            let restored = self.rollback_wheel_only_upgrade_inner(previous_version);
+            return UpgradeOutcome::InstallFailed { restored, error: err };
+        }
+
+        progress(BootstrapStepUpdate {
+            step: "Install complete",
+            message: "Install finished. Verifying Headroom boot…".into(),
+            eta_seconds: 0,
+            percent: 97,
+        });
+
+        UpgradeOutcome::InstalledPendingValidation
+    }
+
+    fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
+        let spec = format!("headroom-ai=={version}");
+        run_pip_install_with_retries(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--no-deps",
+                "--force-reinstall",
+                &spec,
+            ],
+            &self.runtime.root_dir,
+        )
+        .with_context(|| format!("reinstalling Headroom version {version}"))
+    }
+
+    fn rollback_wheel_only_upgrade_inner(&self, previous_version: &str) -> bool {
+        let pip_ok = self
+            .pip_force_reinstall_headroom_version(previous_version)
+            .is_ok();
+        let receipt_backup = self.headroom_receipt_backup_path();
+        let receipt_path = self.headroom_receipt_path();
+        let receipt_ok = if receipt_backup.exists() {
+            let copy_ok = std::fs::copy(&receipt_backup, &receipt_path).is_ok();
+            let _ = std::fs::remove_file(&receipt_backup);
+            copy_ok
+        } else {
+            true
+        };
+        self.clear_upgrade_marker();
+        pip_ok && receipt_ok
+    }
+
+    fn update_headroom_receipt_after_wheel_swap(
+        &self,
+        release: &HeadroomRelease,
+        mcp_install: Value,
+    ) -> Result<()> {
+        let receipt_path = self.headroom_receipt_path();
+        let bytes = std::fs::read(&receipt_path)
+            .with_context(|| format!("reading {}", receipt_path.display()))?;
+        let mut receipt: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", receipt_path.display()))?;
+        receipt["version"] = json!(release.version);
+        if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
+            artifact.insert("url".into(), json!(release.wheel_url));
+            artifact.insert("sha256".into(), json!(release.sha256));
+            // Migrate any legacy full-file sha to the comment-insensitive form.
+            artifact.insert(
+                "requirementsLockSha256".into(),
+                json!(requirements_lock_sha(bootstrap_requirements_lock())),
+            );
+        }
+        receipt["mcp"] = mcp_install;
+        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)
+            .with_context(|| format!("writing {}", receipt_path.display()))?;
         Ok(())
     }
 
@@ -3851,7 +4161,9 @@ after
         fs::create_dir_all(&runtime.venv_dir).expect("partial venv");
         fs::write(runtime.venv_dir.join("partial-marker"), b"interrupted").expect("partial");
         // Marker file and receipt backup (written by atomic_upgrade).
-        manager.write_upgrade_marker("0.8.2").expect("marker");
+        manager
+            .write_upgrade_marker("0.8.2", None)
+            .expect("marker");
         fs::copy(
             runtime.tools_dir.join("headroom.json"),
             manager.headroom_receipt_backup_path(),
@@ -3980,6 +4292,65 @@ after
             manager.requirements_are_stale(),
             "unknown sha must force a reinstall"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wheel_only_eligible_when_lock_sha_matches() {
+        let (root, runtime, manager) = seed_test_runtime("wheel-only-current");
+        let current_sha = requirements_lock_sha(super::bootstrap_requirements_lock());
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.10.4",
+                "artifact": { "requirementsLockSha256": current_sha },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+
+        assert_eq!(
+            manager.can_do_wheel_only_upgrade_headroom(),
+            Some("0.10.4".to_string())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wheel_only_eligible_when_stored_sha_is_legacy() {
+        let (root, runtime, manager) = seed_test_runtime("wheel-only-legacy");
+        let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.2.50",
+                "artifact": { "requirementsLockSha256": legacy_sha },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+
+        assert_eq!(
+            manager.can_do_wheel_only_upgrade_headroom(),
+            Some("0.2.50".to_string())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wheel_only_rejected_when_lock_sha_diverges() {
+        let (root, runtime, manager) = seed_test_runtime("wheel-only-divergent");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.10.4",
+                "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+
+        assert_eq!(manager.can_do_wheel_only_upgrade_headroom(), None);
         let _ = fs::remove_dir_all(root);
     }
 
