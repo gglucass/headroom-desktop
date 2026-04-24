@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { WifiSlash } from "@phosphor-icons/react";
+import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
@@ -89,13 +89,20 @@ export function ActivityFeed({
 
   return (
     <>
-      <header className="activity-feed__header">
-        <h2>Activity</h2>
-        <p className="activity-feed__subtitle">
-          Compressions, learnings, RTK saves, milestones, and records — everything Headroom is
-          doing.
-        </p>
-      </header>
+      <article className="soft-card activity-card">
+        <header className="activity-card__head">
+          <div className="activity-card__title-row">
+            <span className="activity-card__title-icon" aria-hidden="true">
+              <Bell weight="duotone" />
+            </span>
+            <h1>Activity</h1>
+          </div>
+          <p className="activity-card__blurb">
+            Compressions, learnings, RTK saves, milestones, and records — everything Headroom is
+            doing.
+          </p>
+        </header>
+      </article>
       {error ? (
         <p className="loading-copy">{error}</p>
       ) : !loaded ? (
@@ -116,6 +123,17 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="activity-feed__list">
+          {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
+          {tiles.transformation ? (
+            <TransformationRow event={tiles.transformation} />
+          ) : (
+            <EmptyTile kind="transformation" />
+          )}
+          {tiles.learningsMilestone ? (
+            <LearningsMilestoneRow event={tiles.learningsMilestone} />
+          ) : (
+            <EmptyTile kind="learningsMilestone" />
+          )}
           {tiles.trainSuggestion ? (
             <TrainSuggestionRow
               event={tiles.trainSuggestion}
@@ -124,21 +142,10 @@ export function ActivityFeed({
           ) : (
             <EmptyTile kind="trainSuggestion" onNavigateToOptimize={onNavigateToOptimize} />
           )}
-          {tiles.transformation ? (
-            <TransformationRow event={tiles.transformation} />
-          ) : (
-            <EmptyTile kind="transformation" />
-          )}
           {tiles.rtkBatch ? (
             <RtkBatchRow event={tiles.rtkBatch} />
           ) : (
             <EmptyTile kind="rtkBatch" />
-          )}
-          {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
-          {tiles.learningsMilestone ? (
-            <LearningsMilestoneRow event={tiles.learningsMilestone} />
-          ) : (
-            <EmptyTile kind="learningsMilestone" />
           )}
           {tiles.weeklyRecap ? (
             <WeeklyRecapRow event={tiles.weeklyRecap} />

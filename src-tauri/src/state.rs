@@ -63,6 +63,7 @@ pub struct PendingMilestones {
 
 #[derive(Debug, Default, Clone)]
 pub struct ActivityObservation {
+    #[allow(dead_code)] // read by tests; production callers discard observations
     pub fresh: Vec<ActivityEvent>,
 }
 
@@ -1486,9 +1487,16 @@ impl AppState {
 
             let project_path = extract_cwd_from_session_file(&latest_file)
                 .unwrap_or_else(|| decode_project_folder_name(&folder_name));
-            let project_path = std::fs::canonicalize(&project_path)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(project_path);
+            // Skip ghost projects: `~/.claude/projects/` holds session files
+            // for folders that have since been moved or deleted. Falling back
+            // to the raw (non-canonical) path surfaces these as live projects,
+            // triggers Train suggestions that can never resolve, and — when a
+            // ghost shares a basename with a real project — makes the Activity
+            // tile look like it's nagging about the working copy.
+            let project_path = match std::fs::canonicalize(&project_path) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            };
             if project_path.trim().is_empty() {
                 continue;
             }

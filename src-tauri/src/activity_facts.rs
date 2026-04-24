@@ -273,8 +273,11 @@ impl ActivityFacts {
         if let Some(tokens) = tokens_saved {
             let today = now.format("%Y-%m-%d").to_string();
             let event_day = observed_at.format("%Y-%m-%d").to_string();
-            let mut tags: Vec<RecordTag> = Vec::new();
+            let mut emit_tags: Vec<RecordTag> = Vec::new();
+            let mut tile_tags: Vec<RecordTag> = Vec::new();
             let mut all_time_previous: Option<u64> = None;
+            let mut beats_day_today = false;
+            let mut beats_all_time = false;
 
             // Only track + celebrate a Daily record for events that happened
             // today. The proxy's feed is a sliding window that re-returns
@@ -302,9 +305,11 @@ impl ActivityFacts {
                         request_id: event.request_id.clone(),
                         savings_percent: event.savings_percent,
                     });
+                    beats_day_today = true;
+                    tile_tags.push(RecordTag::Daily);
                     if !debounce_suppress(previous_same_day, self.daily_record_emitted_at, tokens, now) {
                         self.daily_record_emitted_at = Some(now);
-                        tags.push(RecordTag::Daily);
+                        emit_tags.push(RecordTag::Daily);
                     }
                 }
             }
@@ -317,22 +322,49 @@ impl ActivityFacts {
                     Some(previous_tokens)
                 };
                 self.all_time_record_tokens = tokens;
+                beats_all_time = true;
+                tile_tags.push(RecordTag::AllTime);
+                all_time_previous = previous;
                 if !debounce_suppress(previous, self.all_time_record_emitted_at, tokens, now) {
                     self.all_time_record_emitted_at = Some(now);
-                    tags.push(RecordTag::AllTime);
-                    all_time_previous = previous;
+                    emit_tags.push(RecordTag::AllTime);
                 }
             }
 
-            if !tags.is_empty() {
-                let day = if tags.contains(&RecordTag::Daily) {
+            // Tile slot always reflects the current best — a beat that bumps
+            // the internal counter should show on the Activity tab even if its
+            // notification was debounced. Otherwise the Record tile drifts
+            // behind after a burst of small beats and users see an outdated
+            // number while "Recent large compression" shows a bigger one.
+            if beats_day_today || beats_all_time {
+                let day = if beats_day_today { Some(today.clone()) } else { None };
+                let tile_record = RecordEvent {
+                    observed_at,
+                    tags: tile_tags,
+                    tokens_saved: tokens,
+                    savings_percent: event.savings_percent,
+                    model: event.model.clone(),
+                    provider: event.provider.clone(),
+                    request_id: event.request_id.clone(),
+                    previous_record: all_time_previous,
+                    day: day.clone(),
+                    workspace: event.workspace.clone(),
+                    request_messages: event.request_messages.clone(),
+                    compressed_messages: event.compressed_messages.clone(),
+                };
+                self.last_record = Some(tile_record);
+                self.dirty = true;
+            }
+
+            if !emit_tags.is_empty() {
+                let day = if emit_tags.contains(&RecordTag::Daily) {
                     Some(today)
                 } else {
                     None
                 };
                 let record = RecordEvent {
                     observed_at,
-                    tags,
+                    tags: emit_tags,
                     tokens_saved: tokens,
                     savings_percent: event.savings_percent,
                     model: event.model.clone(),
@@ -344,8 +376,6 @@ impl ActivityFacts {
                     request_messages: event.request_messages.clone(),
                     compressed_messages: event.compressed_messages.clone(),
                 };
-                self.last_record = Some(record.clone());
-                self.dirty = true;
                 emitted.push(ActivityEvent::Record(record));
             }
         }
@@ -428,16 +458,12 @@ impl ActivityFacts {
     ///
     /// - `"never_trained"` — user has logged `NEVER_TRAINED_MIN_SESSIONS`+
     ///   sessions but never run Train on this project. Fires once per project,
-    ///   ever (gated by `train_suggestions_fired`). The caller dispatches a
-    ///   macOS notification for this kind via
-    ///   `notifications::notification_for_event`.
+    ///   ever (gated by `train_suggestions_fired`).
     /// - `"stale"` — user has trained before but worked on the project 2+
     ///   active days since. Throttled to at most once per
     ///   `STALE_TRAIN_REFIRE_DAYS` per project via
     ///   `stale_train_suggestions_fired_at` so the Activity feed doesn't turn
-    ///   into a nag screen. No notification for this kind — the existing
-    ///   inline "consider rerunning" hint on the Optimize tab covers the
-    ///   signal, this just surfaces it on the Activity tab too.
+    ///   into a nag screen.
     pub fn observe_train_suggestions(
         &mut self,
         projects: &[ClaudeCodeProject],
@@ -499,6 +525,39 @@ impl ActivityFacts {
                 self.last_train_suggestion = Some(latest);
             }
             self.dirty = true;
+        }
+
+        // Clear a stale latch: the tile should stop showing "no Train run
+        // yet" for a project the user has clearly moved past.
+        //   - "never_trained" suggestions clear once the project has been
+        //     trained (last_learn_ran_at becomes Some).
+        //   - "stale" suggestions clear once active_days_since_last_learn
+        //     drops below the threshold.
+        //   - Any suggestion clears if the project's cwd no longer exists on
+        //     disk — `~/.claude/projects/` keeps session files for folders
+        //     that have been moved or deleted, so scanning surfaces "ghost"
+        //     projects whose display_name collides with the current working
+        //     copy and confuses the tile ("23 sessions on headroom-desktop
+        //     and no Train run yet" for a path that isn't there anymore).
+        if let Some(latched) = self.last_train_suggestion.as_ref() {
+            let still_qualifies = projects
+                .iter()
+                .find(|p| p.project_path == latched.project_path)
+                .map(|p| {
+                    if !Path::new(&p.project_path).exists() {
+                        return false;
+                    }
+                    match latched.kind.as_str() {
+                        "never_trained" => p.last_learn_ran_at.is_none(),
+                        "stale" => p.active_days_since_last_learn >= 2,
+                        _ => true,
+                    }
+                })
+                .unwrap_or(false);
+            if !still_qualifies {
+                self.last_train_suggestion = None;
+                self.dirty = true;
+            }
         }
         events
             .into_iter()
@@ -1144,6 +1203,55 @@ mod tests {
                 .observe_train_suggestions(&projects, at(11, 0))
                 .is_empty(),
             "fired set must survive reload"
+        );
+    }
+
+    #[test]
+    fn last_transformation_slot_survives_reload() {
+        // The whole point of the slot refactor is that tiles persist across
+        // restarts. Seed a transformation, save, reload, assert the slot is
+        // still populated with the same request_id.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let mut event = mk_transformation(Some("claude-opus-4-7"), Some(1_000), Some(50.0));
+        event.request_id = Some("req-persist".into());
+        facts.observe_transformation_at(&event, at(10, 0), at(10, 0));
+        facts.save_if_dirty().unwrap();
+
+        let reloaded = ActivityFacts::load_or_create(&base).unwrap();
+        let snapshot = reloaded.activity_feed_snapshot();
+        let slot = snapshot.transformation.expect("transformation slot");
+        assert_eq!(slot.request_id.as_deref(), Some("req-persist"));
+    }
+
+    #[test]
+    fn observe_transformation_keeps_newer_event_when_older_arrives_after() {
+        // The proxy feed is a sliding window replayed every poll; the observer
+        // iterates oldest-first so the "last write wins" path works naturally,
+        // but if an earlier event shows up after a later one (out-of-order
+        // replay), the guard in observe_transformation_at must keep the newer
+        // one in the slot.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        let mut newer = mk_transformation(Some("m"), Some(100), Some(10.0));
+        newer.request_id = Some("req-newer".into());
+        newer.timestamp = Some("2026-04-22T12:00:00Z".into());
+        facts.observe_transformation_at(&newer, at(12, 0), at(12, 0));
+
+        let mut older = mk_transformation(Some("m"), Some(200), Some(20.0));
+        older.request_id = Some("req-older".into());
+        older.timestamp = Some("2026-04-22T09:00:00Z".into());
+        facts.observe_transformation_at(&older, at(9, 0), at(12, 0));
+
+        let slot = facts
+            .activity_feed_snapshot()
+            .transformation
+            .expect("transformation slot");
+        assert_eq!(
+            slot.request_id.as_deref(),
+            Some("req-newer"),
+            "older replay must not clobber the newer slot"
         );
     }
 

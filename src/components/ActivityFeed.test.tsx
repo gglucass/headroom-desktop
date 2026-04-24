@@ -356,18 +356,18 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("renders tiles in the fixed TILE_ORDER (trainSuggestion → transformation → rtkBatch → record → learningsMilestone → weeklyRecap)", () => {
+  it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkBatch → weeklyRecap)", () => {
     // With all kinds as empty placeholders on an empty feed, the TILE_ORDER
-    // dictates DOM order: the trainSuggestion card lands before transformation,
-    // transformation before rtkBatch, etc. Asserts the contract that tile
-    // positions never reshuffle based on event arrival.
+    // dictates DOM order: the record card lands first, then transformation,
+    // etc. Asserts the contract that tile positions never reshuffle based on
+    // event arrival.
     const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
     const order = [
-      "activity-feed__item--train",
-      "activity-feed__item--transformation",
-      "activity-feed__item--rtk",
       "activity-feed__item--record",
+      "activity-feed__item--transformation",
       "activity-feed__item--learnings-milestone",
+      "activity-feed__item--train",
+      "activity-feed__item--rtk",
       "activity-feed__item--weekly-recap"
     ];
     const positions = order.map((cls) => markup.indexOf(cls));

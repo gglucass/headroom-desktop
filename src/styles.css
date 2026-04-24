@@ -26,6 +26,7 @@
   --surface-sunken:     rgba(36, 31, 29, 0.04);
   --surface-overlay:    rgba(255, 255, 255, 0.96);
   --surface-sidebar:    rgba(255, 255, 255, 0.7);
+  --surface-tint-warm:  #FAF3E9;
 
   /* Borders / dividers */
   --border-subtle:      rgba(36, 31, 29, 0.08);
@@ -70,6 +71,7 @@
     --surface-sunken:     rgba(255, 255, 255, 0.04);
     --surface-overlay:    rgba(255, 255, 255, 0.14);
     --surface-sidebar:    rgba(255, 255, 255, 0.04);
+    --surface-tint-warm:  rgba(255, 255, 255, 0.04);
 
     --border-subtle:      rgba(255, 255, 255, 0.08);
     --border-default:     rgba(255, 255, 255, 0.12);
@@ -4245,19 +4247,44 @@ html.window-hiding {
   justify-content: center;
 }
 
-.activity-feed__header {
+.activity-card {
+  padding: 0;
+  overflow: hidden;
+  background: var(--surface-raised);
   margin: 0 0 12px;
 }
 
-.activity-feed__header h2 {
-  margin: 0 0 4px;
-  font-size: var(--text-lg);
+.activity-card__head {
+  padding: 14px 18px;
+  background: var(--surface-tint-warm);
 }
 
-.activity-feed__subtitle {
+.activity-card__title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.activity-card__title-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+.activity-card__title-row h1 {
   margin: 0;
-  color: #7c7168;
+  font-size: var(--text-lg);
+  font-weight: 400;
+  line-height: 1.02;
+}
+
+.activity-card__blurb {
+  margin: 0;
   font-size: var(--text-sm);
+  color: var(--text-secondary);
   line-height: 1.4;
 }
 

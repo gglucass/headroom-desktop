@@ -7,7 +7,6 @@ mod device;
 mod insights;
 mod keychain;
 mod models;
-mod notifications;
 mod pricing;
 mod proxy_intercept;
 mod research;
@@ -37,7 +36,7 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
-    ActivityEvent, ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
+    ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
     HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, ResearchCandidate,
@@ -190,11 +189,6 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
                 })),
             );
             pricing::report_milestone(*milestone_tokens_saved);
-            if let Some(payload) =
-                notifications::notification_for_token_milestone(*milestone_tokens_saved)
-            {
-                let _ = show_notification_impl(&app, &payload.title, &payload.body, payload.action);
-            }
         }
 
         check_zero_spend_anomaly(&dashboard);
@@ -928,10 +922,10 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
 }
 
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
-/// writing to ActivityFacts, persisting, emitting OS notifications — happens
-/// on a dedicated background timer (see `spawn_activity_observer`), so this
-/// command never mutates state. That keeps the IPC hot path short: one
-/// in-memory lock + a cheap /readyz ping to the local proxy.
+/// writing to ActivityFacts, persisting — happens on a dedicated background
+/// timer (see `spawn_activity_observer`), so this command never mutates state.
+/// That keeps the IPC hot path short: one in-memory lock + a cheap /readyz
+/// ping to the local proxy.
 #[tauri::command]
 fn get_activity_feed(state: State<'_, AppState>) -> ActivityFeedResponse {
     ActivityFeedResponse {
@@ -940,9 +934,9 @@ fn get_activity_feed(state: State<'_, AppState>) -> ActivityFeedResponse {
     }
 }
 
-/// Observation cadence for background milestones and Activity notifications.
-/// A modest delay is fine here; foreground Activity still polls separately,
-/// and the memory-export path is intentionally kept away from tight loops.
+/// Observation cadence for background activity milestones. A modest delay is
+/// fine here; foreground Activity still polls separately, and the
+/// memory-export path is intentionally kept away from tight loops.
 const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Rescan cadence for the Claude projects cache. This keeps Optimize mostly
 /// warm without doing filesystem-heavy project scans every minute forever.
@@ -983,24 +977,18 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 
 fn run_activity_observation(app: &AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
-    let mut fresh_events: Vec<ActivityEvent> = Vec::new();
 
-    if let Some(event) = state.maybe_emit_weekly_recap() {
-        fresh_events.push(event);
-    }
+    let _ = state.maybe_emit_weekly_recap();
 
     if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
-        let observation = state.observe_activity_from_transformations(&feed.transformations);
-        fresh_events.extend(observation.fresh);
+        let _ = state.observe_activity_from_transformations(&feed.transformations);
     }
 
     let memory_path = headroom_memory_db_path();
     if memory_path.exists() {
         if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
             if let Ok(count) = count_memories_with_created_at(&stdout) {
-                if let Some(event) = state.observe_learnings_count(count) {
-                    fresh_events.push(event);
-                }
+                let _ = state.observe_learnings_count(count);
             }
         }
     }
@@ -1010,12 +998,8 @@ fn run_activity_observation(app: &AppHandle) {
     // UI in that case; let them fix prereqs first.
     if state.headroom_learn_prereq_status().claude_cli_available {
         if let Ok(projects) = state.list_claude_code_projects() {
-            fresh_events.extend(state.observe_train_suggestions(&projects));
+            let _ = state.observe_train_suggestions(&projects);
         }
-    }
-
-    for payload in notifications::collect_notification_payloads(&fresh_events) {
-        let _ = show_notification_impl(app, &payload.title, &payload.body, payload.action);
     }
 }
 
