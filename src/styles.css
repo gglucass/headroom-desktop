@@ -4947,3 +4947,64 @@ html.window-hiding {
   0% { background-position: 100% 0; }
   100% { background-position: -100% 0; }
 }
+
+@media (prefers-color-scheme: dark) {
+  .activity-feed__item {
+    background: var(--surface-raised);
+    border-color: var(--border-default);
+  }
+
+  .activity-feed__item--clickable:hover {
+    background: var(--fill-hover);
+    border-color: var(--border-strong);
+  }
+
+  .activity-feed__item--clickable.is-expanded {
+    background: var(--fill-hover);
+  }
+
+  .activity-feed__content {
+    color: var(--text-primary);
+  }
+
+  .activity-feed__row--meta,
+  .activity-feed__delta,
+  .activity-feed__importance {
+    color: var(--text-muted);
+  }
+
+  .activity-feed__savings {
+    color: var(--accent);
+  }
+
+  .activity-feed__transform,
+  .activity-feed__project {
+    background: var(--chip-bg);
+    color: var(--chip-text);
+  }
+
+  .activity-feed__badge--transformation,
+  .activity-feed__badge--new-model {
+    background: var(--accent-tint);
+    color: var(--accent);
+  }
+
+  .activity-feed__badge--milestone {
+    background: var(--warning-tint);
+    color: var(--warning);
+  }
+
+  .activity-feed__badge--rtk {
+    background: var(--danger-tint);
+    color: var(--danger);
+  }
+
+  .activity-feed__badge--weekly-recap {
+    background: var(--activity-train-tint);
+    color: var(--activity-train-strong);
+  }
+
+  .activity-feed__expand {
+    color: var(--activity-learnings-strong);
+  }
+}

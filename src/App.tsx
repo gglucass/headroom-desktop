@@ -347,7 +347,7 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
       ? `t:${tiles.transformation.requestId ?? tiles.transformation.timestamp ?? ""}`
       : "t:-",
     tiles.record ? `r:${tiles.record.observedAt}` : "r:-",
-    tiles.rtkBatch ? `b:${tiles.rtkBatch.observedAt}` : "b:-",
+    tiles.rtkToday ? `b:${tiles.rtkToday.date}:${tiles.rtkToday.savedTokens}` : "b:-",
     tiles.learningsMilestone ? `l:${tiles.learningsMilestone.observedAt}` : "l:-",
     tiles.weeklyRecap ? `wr:${tiles.weeklyRecap.weekStart}` : "wr:-",
     tiles.trainSuggestion
@@ -734,7 +734,7 @@ export default function App() {
     tiles: {
       transformation: null,
       record: null,
-      rtkBatch: null,
+      rtkToday: null,
       learningsMilestone: null,
       weeklyRecap: null,
       trainSuggestion: null
@@ -4027,8 +4027,14 @@ export default function App() {
                               <span className="optimize-project-row__name">
                                 <strong>{project.displayName}</strong>
                                 <small>
-                                  <span className="optimize-project-row__training">
-                                    {learnMeta}
+                                  <span className="optimize-project-row__training" aria-live="polite">
+                                    {isRunning
+                                      ? `Learning from sessions${
+                                          typeof headroomLearnStatus.elapsedSeconds === "number"
+                                            ? ` · ${headroomLearnStatus.elapsedSeconds}s`
+                                            : ""
+                                        }`
+                                      : learnMeta}
                                     <button
                                       type="button"
                                       className={`optimize-project-row__refresh${isRunning ? " is-spinning" : ""}`}
@@ -4066,19 +4072,6 @@ export default function App() {
                                   <span className={`optimize-project-row__status optimize-minimal__result--${projectResultTone}`}>
                                     {projectResultLabel}
                                   </span>
-                                ) : null}
-                                {isRunning ? (
-                                  <div className="headroom-learn__progress optimize-project-row__progress" aria-live="polite">
-                                    <div className="headroom-learn__progress-track">
-                                      <span style={{ width: `${Math.max(6, headroomLearnStatus.progressPercent)}%` }} />
-                                    </div>
-                                    <p>
-                                      {"Learning from sessions"}
-                                      {typeof headroomLearnStatus.elapsedSeconds === "number"
-                                        ? ` · ${headroomLearnStatus.elapsedSeconds}s`
-                                        : ""}
-                                    </p>
-                                  </div>
                                 ) : null}
                               </div>
                             </div>

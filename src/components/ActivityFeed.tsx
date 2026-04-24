@@ -9,7 +9,7 @@ import type {
   LearningsMilestoneEvent,
   RecordEvent,
   RecordTag,
-  RtkBatchEvent,
+  RtkTodayStats,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   TransformationRequestMessage,
@@ -49,10 +49,10 @@ const EMPTY_TILE_COPY: Record<
     copy: "No compressions yet — send a message through Claude Code.",
     itemModifier: "activity-feed__item--transformation"
   },
-  rtkBatch: {
+  rtkToday: {
     badgeClass: "activity-feed__badge--rtk",
     badgeLabel: "RTK",
-    copy: "No RTK commands observed yet.",
+    copy: "No RTK commands observed yet today.",
     itemModifier: "activity-feed__item--rtk"
   },
   record: {
@@ -64,7 +64,7 @@ const EMPTY_TILE_COPY: Record<
   learningsMilestone: {
     badgeClass: "activity-feed__badge--learnings-milestone",
     badgeLabel: "Learnings",
-    copy: "No learnings yet.",
+    copy: "0 patterns identified today, 0 reminders and 0 learnings written to memory.",
     itemModifier: "activity-feed__item--learnings-milestone"
   },
   weeklyRecap: {
@@ -98,7 +98,7 @@ export function ActivityFeed({
             <h1>Activity</h1>
           </div>
           <p className="activity-card__blurb">
-            Compressions, learnings, RTK saves, milestones, and records — everything Headroom is
+            Compressions, learnings, RTK saves, and records — everything Headroom is
             doing.
           </p>
         </header>
@@ -142,10 +142,10 @@ export function ActivityFeed({
           ) : (
             <EmptyTile kind="trainSuggestion" onNavigateToOptimize={onNavigateToOptimize} />
           )}
-          {tiles.rtkBatch ? (
-            <RtkBatchRow event={tiles.rtkBatch} />
+          {tiles.rtkToday ? (
+            <RtkTodayRow event={tiles.rtkToday} />
           ) : (
-            <EmptyTile kind="rtkBatch" />
+            <EmptyTile kind="rtkToday" />
           )}
           {tiles.weeklyRecap ? (
             <WeeklyRecapRow event={tiles.weeklyRecap} />
@@ -630,38 +630,21 @@ function splitColonN(s: string, parts: number): string[] {
   return result;
 }
 
-function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
-  const detail = (
-    <dl className="activity-feed__detail-grid">
-      <dt>Observed</dt>
-      <dd>{formatDateTime(event.observedAt)}</dd>
-      <dt>Lifetime commands</dt>
-      <dd>{event.totalCommands.toLocaleString()}</dd>
-      <dt>Lifetime tokens saved</dt>
-      <dd>{event.totalSaved.toLocaleString()}</dd>
-    </dl>
-  );
+function RtkTodayRow({ event }: { event: RtkTodayStats }) {
   return (
-    <ExpandableRow
-      className="activity-feed__item activity-feed__item--rtk"
-      detail={detail}
-    >
+    <li className="activity-feed__item activity-feed__item--rtk">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--rtk">RTK</span>
-        <TimeChip iso={event.observedAt} />
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          +{event.commandsDelta.toLocaleString()} command
-          {event.commandsDelta === 1 ? "" : "s"}, saved{" "}
-          {event.tokensSavedDelta.toLocaleString()} tokens
+          {event.savedTokens.toLocaleString()} tokens saved today
         </strong>
         <span className="activity-feed__delta">
-          lifetime {event.totalCommands.toLocaleString()} ·{" "}
-          {event.totalSaved.toLocaleString()} tokens
+          {event.commands.toLocaleString()} command{event.commands === 1 ? "" : "s"}
         </span>
       </div>
-    </ExpandableRow>
+    </li>
   );
 }
 
@@ -680,36 +663,66 @@ function RecordRow({ event }: { event: RecordEvent }) {
   const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
   const hasCompressedMessages =
     !!event.compressedMessages && event.compressedMessages.length > 0;
-  const detail =
-    hasRequestMessages || hasCompressedMessages ? (
-      <dl className="activity-feed__detail-grid">
-        {hasRequestMessages && hasCompressedMessages ? (
-          <>
-            <dt>Request (original)</dt>
-            <dd>
-              <pre className="activity-feed__message-dump">
-                {formatRequestMessages(event.requestMessages!)}
-              </pre>
-            </dd>
-            <dt>Request (compressed)</dt>
-            <dd>
-              <pre className="activity-feed__message-dump">
-                {formatRequestMessages(event.compressedMessages!)}
-              </pre>
-            </dd>
-          </>
-        ) : hasRequestMessages ? (
-          <>
-            <dt>Request</dt>
-            <dd>
-              <pre className="activity-feed__message-dump">
-                {formatRequestMessages(event.requestMessages!)}
-              </pre>
-            </dd>
-          </>
-        ) : null}
-      </dl>
-    ) : null;
+  const hasExactTokens =
+    event.inputTokensOriginal != null && event.inputTokensOptimized != null;
+  const hasRequestId = !!event.requestId;
+  const estimatedUsd = estimateCostSavingsUsd(event.model, event.tokensSaved);
+  const hasExtra =
+    estimatedUsd != null ||
+    hasExactTokens ||
+    hasRequestId ||
+    hasRequestMessages ||
+    hasCompressedMessages;
+  const detail = hasExtra ? (
+    <dl className="activity-feed__detail-grid">
+      {estimatedUsd != null ? (
+        <>
+          <dt>Estimated cost saved</dt>
+          <dd>{formatEstimatedUsd(estimatedUsd)}</dd>
+        </>
+      ) : null}
+      {hasExactTokens ? (
+        <>
+          <dt>Tokens in → out</dt>
+          <dd>
+            {event.inputTokensOriginal!.toLocaleString()} →{" "}
+            {event.inputTokensOptimized!.toLocaleString()}
+          </dd>
+        </>
+      ) : null}
+      {hasRequestId ? (
+        <>
+          <dt>Request ID</dt>
+          <dd className="activity-feed__detail-mono">{event.requestId}</dd>
+        </>
+      ) : null}
+      {hasRequestMessages && hasCompressedMessages ? (
+        <>
+          <dt>Request (original)</dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.requestMessages!)}
+            </pre>
+          </dd>
+          <dt>Request (compressed)</dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.compressedMessages!)}
+            </pre>
+          </dd>
+        </>
+      ) : hasRequestMessages ? (
+        <>
+          <dt>Request</dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.requestMessages!)}
+            </pre>
+          </dd>
+        </>
+      ) : null}
+    </dl>
+  ) : null;
   return (
     <ExpandableRow
       className="activity-feed__item activity-feed__item--record"
@@ -790,6 +803,7 @@ function TrainSuggestionRow({
 }
 
 function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
+  const { patternsToday, remindersToday, learningsToday, projectDisplayName } = event;
   return (
     <li className="activity-feed__item activity-feed__item--learnings-milestone">
       <div className="activity-feed__row activity-feed__row--meta">
@@ -797,9 +811,14 @@ function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
           Learnings
         </span>
         <TimeChip iso={event.observedAt} />
+        {projectDisplayName ? (
+          <span className="activity-feed__project">{projectDisplayName}</span>
+        ) : null}
       </div>
       <p className="activity-feed__content">
-        {event.count} patterns extracted from your work so far.
+        {patternsToday} pattern{patternsToday === 1 ? "" : "s"} identified today,{" "}
+        {remindersToday} reminder{remindersToday === 1 ? "" : "s"} and {learningsToday}{" "}
+        learning{learningsToday === 1 ? "" : "s"} written to memory.
       </p>
     </li>
   );

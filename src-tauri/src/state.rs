@@ -234,6 +234,7 @@ pub struct AppState {
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
     cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
+    cached_rtk_today_stats: Mutex<Option<(Option<crate::models::RtkTodayStats>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
     /// Cached stdout of `headroom memory export`. Shared by every OptimizePanel
     /// that mounts at once — without it, N panels = N Python cold-starts.
@@ -331,6 +332,7 @@ impl AppState {
             cached_headroom_stats: Mutex::new(None),
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
+            cached_rtk_today_stats: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
             cached_memory_export: Mutex::new(None),
             cached_claude_code_projects: Mutex::new(None),
@@ -1203,6 +1205,19 @@ impl AppState {
         stats
     }
 
+    fn cached_rtk_today_stats(&self) -> Option<crate::models::RtkTodayStats> {
+        const TTL: Duration = Duration::from_secs(10);
+        let mut cache = self.cached_rtk_today_stats.lock();
+        if let Some((stats, at)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return stats.clone();
+            }
+        }
+        let stats = self.tool_manager.rtk_today_stats();
+        *cache = Some((stats.clone(), Instant::now()));
+        stats
+    }
+
     pub fn dashboard(&self) -> DashboardState {
         // Callers that take this read-only path (tray updater, bootstrap
         // finalize, account activation) must NOT drain pending milestones —
@@ -1239,19 +1254,23 @@ impl AppState {
             fresh.extend(facts.observe_transformation(transformation, observed_at));
         }
 
-        if let Some(summary) = self.cached_rtk_gain_summary() {
-            if let Some(event) = facts.observe_rtk(&summary, Utc::now()) {
-                fresh.push(event);
-            }
-        }
-
         let _ = facts.save_if_dirty();
         ActivityObservation { fresh }
     }
 
-    pub fn observe_learnings_count(&self, count: usize) -> Option<ActivityEvent> {
+    pub fn observe_learnings_today(
+        &self,
+        patterns_today: u32,
+        project_inputs: Vec<crate::activity_facts::LearningsProjectInput>,
+        active_project_path: Option<&str>,
+    ) -> crate::models::LearningsMilestoneEvent {
         let mut facts = self.activity_facts.lock();
-        let event = facts.observe_learnings_count(count, Utc::now());
+        let event = facts.observe_learnings_today(
+            patterns_today,
+            project_inputs,
+            active_project_path,
+            Utc::now(),
+        );
         let _ = facts.save_if_dirty();
         event
     }
@@ -1271,19 +1290,28 @@ impl AppState {
     /// IPC command wraps this straight into the response; observation runs on
     /// a backend timer and is the sole writer.
     pub fn activity_feed_snapshot(&self) -> crate::models::ActivityFeedSnapshot {
-        self.activity_facts.lock().activity_feed_snapshot()
+        let mut snapshot = self.activity_facts.lock().activity_feed_snapshot();
+        snapshot.rtk_today = self.cached_rtk_today_stats();
+        snapshot
     }
 
-    /// On Monday, emit a weekly recap rolling up the previous 7 days of
-    /// savings. Idempotent per-week: only fires once per Monday even if the
-    /// activity feed polls many times that day.
+    /// Emit a weekly recap rolling up the 7 days ending last Sunday.
+    /// Previously Monday-only; now runs on any day whose check is due so the
+    /// first launch after an upgrade catches up on last week's recap if it
+    /// was missed. Two gates: `weekly_recap_check_due` (once per 24h) and
+    /// the per-week key inside `maybe_record_weekly_recap`.
     pub fn maybe_emit_weekly_recap(&self) -> Option<ActivityEvent> {
-        let today = Local::now().date_naive();
-        if today.weekday() != chrono::Weekday::Mon {
+        let now = Utc::now();
+        // Cheap pre-check — skip aggregation entirely if we've already
+        // checked within 24h. The callee re-checks defensively.
+        if !self.activity_facts.lock().weekly_recap_check_due(now) {
             return None;
         }
-        let start = today.checked_sub_days(chrono::Days::new(7))?;
-        let end = today.pred_opt()?;
+
+        let today = Local::now().date_naive();
+        let recap_monday = most_recent_monday(today);
+        let start = recap_monday.checked_sub_days(chrono::Days::new(7))?;
+        let end = recap_monday.pred_opt()?;
 
         let totals = {
             let tracker = self.savings_tracker.lock();
@@ -1291,7 +1319,7 @@ impl AppState {
         };
 
         let mut facts = self.activity_facts.lock();
-        let event = facts.maybe_record_weekly_recap(today, totals, Utc::now());
+        let event = facts.maybe_record_weekly_recap(recap_monday, totals, now);
         let _ = facts.save_if_dirty();
         event
     }
@@ -2051,25 +2079,32 @@ fn build_claude_code_project(
     let last_learn_ran_at = learn_summary.last_run_at;
     let has_persisted_learnings = learn_summary.has_persisted_learnings;
     let last_learn_pattern_count = learn_summary.pattern_count;
-    let active_days_since_last_learn = if let Some(ref learn_at_str) = last_learn_ran_at {
-        chrono::DateTime::parse_from_rfc3339(learn_at_str)
-            .ok()
-            .map(|learn_at| {
-                let learn_time = learn_at.with_timezone(&Utc);
-                let mut days = HashSet::new();
-                for file in &scan.session_files {
-                    if let Ok(meta) = std::fs::metadata(file) {
-                        if let Ok(m) = meta.modified() {
-                            let t: chrono::DateTime<Utc> = m.into();
-                            if t > learn_time {
-                                days.insert(t.date_naive());
-                            }
-                        }
-                    }
-                }
-                days.len()
-            })
-            .unwrap_or(0)
+    let learn_time = last_learn_ran_at
+        .as_ref()
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|ts| ts.with_timezone(&Utc));
+    let today = Utc::now().date_naive();
+    let mut days_since_learn: HashSet<chrono::NaiveDate> = HashSet::new();
+    let mut sessions_today: usize = 0;
+    for file in &scan.session_files {
+        let Ok(meta) = std::fs::metadata(file) else {
+            continue;
+        };
+        let Ok(m) = meta.modified() else {
+            continue;
+        };
+        let t: chrono::DateTime<Utc> = m.into();
+        if t.date_naive() == today {
+            sessions_today += 1;
+        }
+        if let Some(learn_time) = learn_time {
+            if t > learn_time {
+                days_since_learn.insert(t.date_naive());
+            }
+        }
+    }
+    let active_days_since_last_learn = if learn_time.is_some() {
+        days_since_learn.len()
     } else {
         0
     };
@@ -2080,6 +2115,7 @@ fn build_claude_code_project(
         display_name,
         last_worked_at: last_worked_at.to_rfc3339(),
         session_count,
+        sessions_today,
         last_learn_ran_at,
         has_persisted_learnings,
         active_days_since_last_learn,
@@ -2909,6 +2945,14 @@ impl SavingsTracker {
             .with_context(|| format!("writing {}", self.state_path.display()))?;
         Ok(())
     }
+}
+
+/// The Monday of the week that contains `d`, or `d` itself if it already is
+/// a Monday. Used by the weekly recap: the recap for `d` covers the 7 days
+/// ending the day before this Monday.
+fn most_recent_monday(d: chrono::NaiveDate) -> chrono::NaiveDate {
+    let days_past = d.weekday().num_days_from_monday() as u64;
+    d.checked_sub_days(chrono::Days::new(days_past)).unwrap_or(d)
 }
 
 fn aggregate_weekly_totals(
@@ -4120,7 +4164,7 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         bootstrap_complete_state, bootstrap_failed_state, classify_startup_error,
         lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, merge_daily_savings,
-        merge_hourly_savings, parse_headroom_stats_from_json,
+        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, AppState, ClaudeProjectScan, DailySavingsBucket,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
         SavingsObservation, SavingsTracker,
@@ -4383,6 +4427,26 @@ mod tests {
         assert_eq!(totals.active_days, 2);
         assert_eq!(totals.total_tokens_saved, 300);
         assert!((totals.total_savings_usd - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn most_recent_monday_maps_every_weekday_to_this_weeks_monday() {
+        use chrono::NaiveDate;
+        // Monday 2026-04-27 — itself.
+        assert_eq!(
+            most_recent_monday(NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()),
+            NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
+        // Wednesday 2026-04-29 — back to Monday 27.
+        assert_eq!(
+            most_recent_monday(NaiveDate::from_ymd_opt(2026, 4, 29).unwrap()),
+            NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
+        // Sunday 2026-05-03 — back to Monday 27 (6 days back).
+        assert_eq!(
+            most_recent_monday(NaiveDate::from_ymd_opt(2026, 5, 3).unwrap()),
+            NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
     }
 
     #[test]

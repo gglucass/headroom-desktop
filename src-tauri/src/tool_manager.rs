@@ -11,14 +11,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-use crate::models::{ManagedTool, ToolStatus};
+use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
@@ -194,8 +194,11 @@ struct ToolLogMarkerCache {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RtkGainOutput {
-    summary: RtkGainSummary,
+struct RtkDailyGainOutput {
+    #[serde(default)]
+    summary: Option<RtkGainSummary>,
+    #[serde(default)]
+    daily: Vec<RtkDailyEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,6 +206,15 @@ pub struct RtkGainSummary {
     pub total_commands: u64,
     pub total_saved: u64,
     pub avg_savings_pct: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RtkDailyEntry {
+    date: String,
+    #[serde(default)]
+    commands: u64,
+    #[serde(default)]
+    saved_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -778,23 +790,36 @@ impl ToolManager {
             .map(|v| v.to_string())
     }
 
-    pub fn rtk_gain_summary(&self) -> Option<RtkGainSummary> {
+    fn rtk_gain_output(&self) -> Option<RtkDailyGainOutput> {
         if !self.rtk_installed() {
             return None;
         }
-
         let output = Command::new(self.rtk_entrypoint())
-            .args(["gain", "--all", "--format", "json"])
+            .args(["gain", "--daily", "--format", "json"])
             .current_dir(&self.runtime.root_dir)
             .output()
             .ok()?;
         if !output.status.success() {
             return None;
         }
+        serde_json::from_slice(&output.stdout).ok()
+    }
 
-        serde_json::from_slice::<RtkGainOutput>(&output.stdout)
-            .ok()
-            .map(|parsed| parsed.summary)
+    pub fn rtk_gain_summary(&self) -> Option<RtkGainSummary> {
+        self.rtk_gain_output()?.summary
+    }
+
+    pub fn rtk_today_stats(&self) -> Option<RtkTodayStats> {
+        let today = Local::now().date_naive().to_string();
+        self.rtk_gain_output()?
+            .daily
+            .into_iter()
+            .find(|entry| entry.date == today)
+            .map(|entry| RtkTodayStats {
+                date: entry.date,
+                saved_tokens: entry.saved_tokens,
+                commands: entry.commands,
+            })
     }
 
     /// Returns the pinned release if the installed version differs from the pin.
@@ -3626,6 +3651,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use chrono::Local;
+
     use super::{
         bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
         headroom_python_startup_args, proxy_argv_contains_expected_flags,
@@ -3814,27 +3841,44 @@ mod tests {
     }
 
     #[test]
-    fn rtk_gain_summary_parses_json_output() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-gain");
-        write_executable(
-            &runtime.bin_dir.join("rtk"),
-            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  cat <<'EOF'\n{\"summary\":{\"total_commands\":12,\"total_saved\":3456,\"avg_savings_pct\":67.5}}\nEOF\n  exit 0\nfi\nexit 9\n",
+    fn rtk_today_stats_returns_matching_daily_row() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-today");
+        let today = Local::now().date_naive().to_string();
+        let script = format!(
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  cat <<'EOF'\n{{\"daily\":[{{\"date\":\"1999-01-01\",\"commands\":1,\"saved_tokens\":2}},{{\"date\":\"{today}\",\"commands\":7,\"saved_tokens\":1234}}]}}\nEOF\n  exit 0\nfi\nexit 9\n",
         );
+        write_executable(&runtime.bin_dir.join("rtk"), &script);
         manager
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
 
-        let summary = manager.rtk_gain_summary().expect("gain summary");
-        assert_eq!(summary.total_commands, 12);
-        assert_eq!(summary.total_saved, 3456);
-        assert_eq!(summary.avg_savings_pct, 67.5);
+        let stats = manager.rtk_today_stats().expect("today stats");
+        assert_eq!(stats.date, today);
+        assert_eq!(stats.commands, 7);
+        assert_eq!(stats.saved_tokens, 1234);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn rtk_gain_summary_returns_none_on_command_failure() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-gain-fail");
+    fn rtk_today_stats_returns_none_when_today_absent() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-today-missing");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo '{\"daily\":[{\"date\":\"1999-01-01\",\"commands\":1,\"saved_tokens\":2}]}';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+
+        assert!(manager.rtk_today_stats().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rtk_today_stats_returns_none_on_command_failure() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-today-fail");
         write_executable(
             &runtime.bin_dir.join("rtk"),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'boom' 1>&2;\n  exit 4\nfi\nexit 9\n",
@@ -3843,14 +3887,14 @@ mod tests {
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
 
-        assert!(manager.rtk_gain_summary().is_none());
+        assert!(manager.rtk_today_stats().is_none());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn rtk_gain_summary_returns_none_on_invalid_json() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-gain-invalid-json");
+    fn rtk_today_stats_returns_none_on_invalid_json() {
+        let (root, runtime, manager) = seed_test_runtime("rtk-today-invalid-json");
         write_executable(
             &runtime.bin_dir.join("rtk"),
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo 'not-json';\n  exit 0\nfi\nexit 9\n",
@@ -3859,7 +3903,7 @@ mod tests {
             .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
             .expect("rtk receipt");
 
-        assert!(manager.rtk_gain_summary().is_none());
+        assert!(manager.rtk_today_stats().is_none());
 
         let _ = fs::remove_dir_all(root);
     }

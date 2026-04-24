@@ -6,7 +6,7 @@ import type {
   ActivityFeedSnapshot,
   LearningsMilestoneEvent,
   RecordEvent,
-  RtkBatchEvent,
+  RtkTodayStats,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
@@ -15,7 +15,7 @@ import type {
 const emptyTiles: ActivityFeedSnapshot = {
   transformation: null,
   record: null,
-  rtkBatch: null,
+  rtkToday: null,
   learningsMilestone: null,
   weeklyRecap: null,
   trainSuggestion: null
@@ -90,7 +90,7 @@ describe("ActivityFeed", () => {
       expect(markup).toContain(cls);
     }
     expect(markup).toContain("No compressions yet");
-    expect(markup).toContain("No RTK commands observed yet.");
+    expect(markup).toContain("No RTK commands observed yet today.");
     expect(markup).toContain("No recap yet");
   });
 
@@ -101,7 +101,7 @@ describe("ActivityFeed", () => {
     expect(emptyClassCount).toBe(5);
     expect(markup).toContain("Recent large compression");
     expect(markup).not.toContain("No compressions yet");
-    expect(markup).toContain("No RTK commands observed yet.");
+    expect(markup).toContain("No RTK commands observed yet today.");
   });
 
   it("marks the empty trainSuggestion card as clickable when a navigate handler is supplied", () => {
@@ -356,7 +356,7 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkBatch → weeklyRecap)", () => {
+  it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkToday → weeklyRecap)", () => {
     // With all kinds as empty placeholders on an empty feed, the TILE_ORDER
     // dictates DOM order: the record card lands first, then transformation,
     // etc. Asserts the contract that tile positions never reshuffle based on
@@ -376,21 +376,17 @@ describe("ActivityFeed", () => {
     }
   });
 
-  it("renders an RTK batch row with deltas and cumulative totals", () => {
-    const data: RtkBatchEvent = {
-      observedAt: "2026-04-21T14:00:00Z",
-      commandsDelta: 3,
-      tokensSavedDelta: 1234,
-      totalCommands: 2888,
-      totalSaved: 12_805_724
+  it("renders an RTK today row with saved tokens and command count", () => {
+    const data: RtkTodayStats = {
+      date: "2026-04-21",
+      savedTokens: 1234,
+      commands: 3
     };
-    const feed = feedWith({ rtkBatch: data });
+    const feed = feedWith({ rtkToday: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">RTK<");
-    expect(markup).toContain("+3 commands");
-    expect(markup).toContain("1,234 tokens");
-    expect(markup).toContain("2,888");
-    expect(markup).toContain("12,805,724");
+    expect(markup).toContain("1,234 tokens saved today");
+    expect(markup).toContain("3 commands");
   });
 
   it("renders a daily record row with model and savings percent", () => {
@@ -473,17 +469,53 @@ describe("ActivityFeed", () => {
       day: "2026-04-21",
       requestMessages: [{ role: "user", content: "refactor this" }]
     };
-    const withoutMessages: RecordEvent = { ...withMessages, requestMessages: null };
+    // Bare event with no detail-worthy fields: no requestId, no token pair,
+    // no messages, and tokensSaved=0 so the cost estimate falls through to
+    // null. That's the only shape that now collapses the expand affordance.
+    const bare: RecordEvent = {
+      ...withMessages,
+      tokensSaved: 0,
+      model: null,
+      requestId: null,
+      requestMessages: null
+    };
     const markupWith = renderToStaticMarkup(
       <ActivityFeed feed={feedWith({ record: withMessages })} error={null} />
     );
-    const markupWithout = renderToStaticMarkup(
-      <ActivityFeed feed={feedWith({ record: withoutMessages })} error={null} />
+    const markupBare = renderToStaticMarkup(
+      <ActivityFeed feed={feedWith({ record: bare })} error={null} />
     );
     expect(markupWith).toContain("activity-feed__item--record");
     expect(markupWith).toContain("activity-feed__item--clickable");
-    expect(markupWithout).toContain("activity-feed__item--record");
-    expect(markupWithout).not.toContain("activity-feed__item--clickable");
+    expect(markupBare).toContain("activity-feed__item--record");
+    expect(markupBare).not.toContain("activity-feed__item--clickable");
+  });
+
+  it("marks the record row clickable when only requestId / exact tokens are present (no messages)", () => {
+    // The record row now carries forward cost, exact tokens, and request ID
+    // from the source transformation. Any one of those should make the row
+    // expandable even when full-message logging is off. SSR renders detail
+    // collapsed, so the signal is the `--clickable` class + aria wiring.
+    const event: RecordEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      tags: ["allTime"],
+      tokensSaved: 39901,
+      savingsPercent: 40.9,
+      model: "claude-opus-4-7",
+      provider: "anthropic",
+      requestId: "hr_1777038929_000202",
+      previousRecord: 30000,
+      day: null,
+      inputTokensOriginal: 97571,
+      inputTokensOptimized: 57670
+    };
+    const markup = renderToStaticMarkup(
+      <ActivityFeed feed={feedWith({ record: event })} error={null} />
+    );
+    expect(markup).toContain("activity-feed__item--record");
+    expect(markup).toContain("activity-feed__item--clickable");
+    expect(markup).toContain('role="button"');
+    expect(markup).toContain('aria-expanded="false"');
   });
 
   it("renders a weekly recap row with the week range and totals", () => {
@@ -505,16 +537,52 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("5 active days");
   });
 
-  it("renders a learnings milestone row with the extracted-count copy", () => {
+  it("renders a learnings milestone row with the today-scoped copy and project chip", () => {
     const data: LearningsMilestoneEvent = {
       observedAt: "2026-04-22T10:00:00Z",
-      count: 3,
-      kind: "first_3"
+      patternsToday: 4,
+      remindersToday: 2,
+      learningsToday: 3,
+      projectPath: "/Users/u/Code/demo-repo",
+      projectDisplayName: "demo-repo"
     };
     const feed = feedWith({ learningsMilestone: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">Learnings<");
-    expect(markup).toContain("3 patterns extracted");
+    expect(markup).toContain("4 patterns identified today");
+    expect(markup).toContain("2 reminders");
+    expect(markup).toContain("3 learnings written to memory");
+    expect(markup).toContain("demo-repo");
+  });
+
+  it("omits the project chip when no project is active today", () => {
+    const data: LearningsMilestoneEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      patternsToday: 0,
+      remindersToday: 0,
+      learningsToday: 0,
+      projectPath: null,
+      projectDisplayName: null
+    };
+    const feed = feedWith({ learningsMilestone: data });
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("0 patterns identified today");
+    expect(markup).not.toContain("activity-feed__project");
+  });
+
+  it("singularises the learnings copy for single-count values", () => {
+    const data: LearningsMilestoneEvent = {
+      observedAt: "2026-04-22T10:00:00Z",
+      patternsToday: 1,
+      remindersToday: 1,
+      learningsToday: 1,
+      projectPath: null,
+      projectDisplayName: null
+    };
+    const feed = feedWith({ learningsMilestone: data });
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("1 pattern identified today");
+    expect(markup).toContain("1 reminder and 1 learning written to memory");
   });
 
   it("renders a never-trained TrainSuggestion row with project + session count", () => {

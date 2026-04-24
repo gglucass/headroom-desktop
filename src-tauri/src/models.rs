@@ -281,6 +281,10 @@ pub struct ClaudeCodeProject {
     pub display_name: String,
     pub last_worked_at: String,
     pub session_count: usize,
+    // Count of this project's session JSONL files whose mtime falls within the
+    // current UTC day. Used by the learnings tile to pick the "most active
+    // today" project without rescanning session files a second time.
+    pub sessions_today: usize,
     pub last_learn_ran_at: Option<String>,
     pub has_persisted_learnings: bool,
     pub active_days_since_last_learn: usize,
@@ -386,12 +390,10 @@ pub struct AppliedPatterns {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RtkBatchEvent {
-    pub observed_at: DateTime<Utc>,
-    pub commands_delta: u64,
-    pub tokens_saved_delta: u64,
-    pub total_commands: u64,
-    pub total_saved: u64,
+pub struct RtkTodayStats {
+    pub date: String,
+    pub saved_tokens: u64,
+    pub commands: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -416,6 +418,12 @@ pub struct RecordEvent {
     pub day: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
+    // Pass-through from the source transformation so the record card can show
+    // the same "Tokens in → out" pair as the compression card.
+    #[serde(default, alias = "input_tokens_original")]
+    pub input_tokens_original: Option<u64>,
+    #[serde(default, alias = "input_tokens_optimized")]
+    pub input_tokens_optimized: Option<u64>,
     // Carried forward from the source transformation so the record row can
     // show what the record-setting compression was actually about. Populated
     // only when the proxy's `log_full_messages` is enabled. `compressed_messages`
@@ -437,12 +445,30 @@ pub struct WeeklyRecapEvent {
     pub active_days: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `serde(default)` on every field so a pre-v5 `activity-facts.json` (which
+// had a different shape — `count`, `kind`) still deserializes via its default
+// values; the SCHEMA_VERSION mismatch then drops the file and reinitialises
+// from scratch. Without the defaults, the outer parse fails before we can
+// reach the version check and the app panics at boot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningsMilestoneEvent {
+    #[serde(default = "default_observed_at")]
     pub observed_at: DateTime<Utc>,
-    pub count: u32,
-    pub kind: String,
+    #[serde(default)]
+    pub patterns_today: u32,
+    #[serde(default)]
+    pub reminders_today: u32,
+    #[serde(default)]
+    pub learnings_today: u32,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub project_display_name: Option<String>,
+}
+
+fn default_observed_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,8 +488,6 @@ pub struct TrainSuggestionEvent {
 pub enum ActivityEvent {
     #[serde(rename = "transformation")]
     Transformation(TransformationFeedEvent),
-    #[serde(rename = "rtkBatch")]
-    RtkBatch(RtkBatchEvent),
     #[serde(rename = "record")]
     Record(RecordEvent),
     #[serde(rename = "weeklyRecap")]
@@ -483,7 +507,7 @@ pub enum ActivityEvent {
 pub struct ActivityFeedSnapshot {
     pub transformation: Option<TransformationFeedEvent>,
     pub record: Option<RecordEvent>,
-    pub rtk_batch: Option<RtkBatchEvent>,
+    pub rtk_today: Option<RtkTodayStats>,
     pub learnings_milestone: Option<LearningsMilestoneEvent>,
     pub weekly_recap: Option<WeeklyRecapEvent>,
     pub train_suggestion: Option<TrainSuggestionEvent>,

@@ -984,23 +984,69 @@ fn run_activity_observation(app: &AppHandle) {
         let _ = state.observe_activity_from_transformations(&feed.transformations);
     }
 
+    let projects = state.list_claude_code_projects().unwrap_or_default();
+
+    // Memory.db "patterns today" comes from the export JSON's `created_at`
+    // field. Everything else (reminders / learnings today) is derived from
+    // per-project CLAUDE.md + MEMORY.md bullet diffs.
     let memory_path = headroom_memory_db_path();
-    if memory_path.exists() {
-        if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
-            if let Ok(count) = count_memories_with_created_at(&stdout) {
-                let _ = state.observe_learnings_count(count);
+    let patterns_today = if memory_path.exists() {
+        memory_export_cached(&state, &memory_path)
+            .ok()
+            .and_then(|stdout| count_memories_created_today(&stdout, Utc::now()).ok())
+            .unwrap_or(0) as u32
+    } else {
+        0
+    };
+
+    // Collect current bullet sets for every project the user has touched
+    // today, so `observe_learnings_today` has a baseline regardless of which
+    // one ends up being "most active".
+    let project_inputs: Vec<crate::activity_facts::LearningsProjectInput> = projects
+        .iter()
+        .filter(|p| p.sessions_today > 0)
+        .map(|p| {
+            let applied = read_applied_patterns_for_project(&p.project_path);
+            crate::activity_facts::LearningsProjectInput {
+                project_path: p.project_path.clone(),
+                project_display_name: p.display_name.clone(),
+                claude_md_bullets: flatten_applied_bullets(&applied.claude_md),
+                memory_md_bullets: flatten_applied_bullets(&applied.memory_md),
             }
-        }
-    }
+        })
+        .collect();
+
+    // Most active = highest sessions_today; ties broken by most recent
+    // last_worked_at so the chip tracks what the user is working on right now.
+    let active_project_path = projects
+        .iter()
+        .filter(|p| p.sessions_today > 0)
+        .max_by(|a, b| {
+            a.sessions_today
+                .cmp(&b.sessions_today)
+                .then(a.last_worked_at.cmp(&b.last_worked_at))
+        })
+        .map(|p| p.project_path.clone());
+
+    let _ = state.observe_learnings_today(
+        patterns_today,
+        project_inputs,
+        active_project_path.as_deref(),
+    );
 
     // No point nudging the user to run Train if the claude CLI isn't installed —
     // they'd just hit an install prompt. The Optimize tab surfaces the install
     // UI in that case; let them fix prereqs first.
     if state.headroom_learn_prereq_status().claude_cli_available {
-        if let Ok(projects) = state.list_claude_code_projects() {
-            let _ = state.observe_train_suggestions(&projects);
-        }
+        let _ = state.observe_train_suggestions(&projects);
     }
+}
+
+fn flatten_applied_bullets(sections: &[crate::models::AppliedSection]) -> Vec<String> {
+    sections
+        .iter()
+        .flat_map(|sec| sec.bullets.iter().cloned())
+        .collect()
 }
 
 #[tauri::command]
@@ -1903,20 +1949,49 @@ fn check_headroom_learn_prereqs(
     Ok(())
 }
 
-/// Count entries in a `headroom memory export` JSON payload that have a
-/// non-null `created_at`. Mirrors the filter `parse_memory_export` used to
-/// apply — just without building an intermediate struct, since the only
-/// caller wants the count for the learnings-milestone threshold.
-fn count_memories_with_created_at(json: &str) -> Result<usize, String> {
+/// Count entries in a `headroom memory export` JSON payload whose `created_at`
+/// parses into the same UTC day as `now`. The export writes `created_at` as an
+/// RFC3339-ish string without a timezone suffix (`2026-04-21T10:00:00`); we
+/// treat those as UTC, matching the rest of the activity pipeline.
+fn count_memories_created_today(
+    json: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, String> {
     let raw: Vec<serde_json::Value> =
         serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    let today = now.date_naive();
     Ok(raw
         .into_iter()
-        .filter(|v| {
+        .filter_map(|v| {
             v.get("created_at")
-                .is_some_and(|c| !c.is_null() && c.as_str().is_some_and(|s| !s.is_empty()))
+                .and_then(|c| c.as_str())
+                .and_then(parse_memory_created_at)
         })
+        .filter(|dt| dt.date_naive() == today)
         .count())
+}
+
+fn parse_memory_created_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // The export omits timezone info (`2026-04-21T10:00:00`); treat as UTC.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+    None
 }
 
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
@@ -2930,7 +3005,7 @@ mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         build_release_updater_config, check_headroom_learn_prereqs,
-        compute_tray_window_position, count_memories_with_created_at, debounced_tray_runtime_visual,
+        compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
         is_prerelease_version, lifetime_token_milestone_kind,
         parse_live_learnings, parse_updater_endpoint_list,
@@ -3417,30 +3492,36 @@ mod tests {
     }
 
     #[test]
-    fn count_memories_with_created_at_counts_valid_entries() {
+    fn count_memories_created_today_only_counts_today_entries() {
+        use chrono::TimeZone;
         let json = r#"[
-            {"id":"a","created_at":"2026-04-21T10:00:00"},
-            {"id":"b","created_at":"2026-04-21T11:00:00"},
-            {"id":"c","created_at":"2026-04-21T12:00:00"}
+            {"id":"a","created_at":"2026-04-22T10:00:00"},
+            {"id":"b","created_at":"2026-04-22T23:59:59"},
+            {"id":"c","created_at":"2026-04-21T23:00:00"},
+            {"id":"d","created_at":null},
+            {"id":"e"}
         ]"#;
-        assert_eq!(count_memories_with_created_at(json).unwrap(), 3);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
     }
 
     #[test]
-    fn count_memories_with_created_at_skips_missing_and_empty() {
+    fn count_memories_created_today_accepts_rfc3339_with_tz() {
+        use chrono::TimeZone;
         let json = r#"[
-            {"id":"a","created_at":"2026-04-21T10:00:00"},
-            {"id":"b","created_at":null},
-            {"id":"c"},
-            {"id":"d","created_at":""}
+            {"id":"a","created_at":"2026-04-22T10:00:00Z"},
+            {"id":"b","created_at":"2026-04-22T02:00:00-09:00"}
         ]"#;
-        assert_eq!(count_memories_with_created_at(json).unwrap(), 1);
+        // 2026-04-22T02:00:00-09:00 == 2026-04-22T11:00:00Z, both land on today.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
     }
 
     #[test]
-    fn count_memories_with_created_at_handles_empty_and_errors() {
-        assert_eq!(count_memories_with_created_at("[]").unwrap(), 0);
-        assert!(count_memories_with_created_at("not json").is_err());
+    fn count_memories_created_today_handles_empty_and_errors() {
+        let now = chrono::Utc::now();
+        assert_eq!(count_memories_created_today("[]", now).unwrap(), 0);
+        assert!(count_memories_created_today("not json", now).is_err());
     }
 
     #[test]

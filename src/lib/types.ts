@@ -306,12 +306,10 @@ export interface AppliedPatterns {
   memoryMd: AppliedSection[];
 }
 
-export interface RtkBatchEvent {
-  observedAt: string;
-  commandsDelta: number;
-  tokensSavedDelta: number;
-  totalCommands: number;
-  totalSaved: number;
+export interface RtkTodayStats {
+  date: string;
+  savedTokens: number;
+  commands: number;
 }
 
 export type RecordTag = "daily" | "weekly" | "allTime";
@@ -327,6 +325,8 @@ export interface RecordEvent {
   previousRecord: number | null;
   day: string | null;
   workspace?: string | null;
+  inputTokensOriginal?: number | null;
+  inputTokensOptimized?: number | null;
   // Carried forward from the record-setting transformation so the record row
   // can surface the same request/compressed detail as the compression card.
   // Populated only when the proxy's `log_full_messages` is enabled;
@@ -347,8 +347,11 @@ export interface WeeklyRecapEvent {
 
 export interface LearningsMilestoneEvent {
   observedAt: string;
-  count: number;
-  kind: string;
+  patternsToday: number;
+  remindersToday: number;
+  learningsToday: number;
+  projectPath: string | null;
+  projectDisplayName: string | null;
 }
 
 export interface TrainSuggestionEvent {
@@ -364,7 +367,7 @@ export interface TrainSuggestionEvent {
 export interface ActivityFeedSnapshot {
   transformation: TransformationFeedEvent | null;
   record: RecordEvent | null;
-  rtkBatch: RtkBatchEvent | null;
+  rtkToday: RtkTodayStats | null;
   learningsMilestone: LearningsMilestoneEvent | null;
   weeklyRecap: WeeklyRecapEvent | null;
   trainSuggestion: TrainSuggestionEvent | null;

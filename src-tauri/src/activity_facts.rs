@@ -2,21 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
     ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
-    RecordTag, RtkBatchEvent, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
+    RecordTag, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
-use crate::tool_manager::RtkGainSummary;
 
-// Bumped from 3 → 4 when the transformation tile moved from a proxy-fetch on
-// every poll into a persisted `last_transformation` slot, same as the other
-// tiles. Old persisted state is missing the field; the mismatch handler drops
-// the file and starts fresh.
-const SCHEMA_VERSION: u8 = 4;
+// Bumped from 4 → 5 when the learnings tile moved from a one-shot milestone
+// (count, kind) to a daily diff shape (patterns/reminders/learnings today +
+// project attribution). Old persisted state can't be reused since the event
+// fields changed, so the mismatch handler drops the file and starts fresh.
+const SCHEMA_VERSION: u8 = 5;
 // Hard cap on how big a facts file we'll even attempt to deserialize at boot.
 // The pre-v2 schema embedded full request/response bodies into queues that
 // could grow past 100MB; loading those synchronously hangs the boot path and
@@ -31,7 +30,19 @@ pub(crate) const NEVER_TRAINED_MIN_SESSIONS: usize = 5;
 // Cooldown between stale re-suggestions per project. Once the user has trained
 // at least once, we only remind them weekly at most so the Activity feed
 // doesn't turn into a nag screen.
-pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 7;
+pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 5;
+// Only nudge Train for projects the user has touched recently. An abandoned
+// project with 50 sessions and no train run shouldn't claim the tile forever.
+pub(crate) const TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS: i64 = 2;
+
+// The "Recent large compression" tile should actually be *large*. A pipeline
+// run that stripped nothing (tokens_saved ~ 0, savings_percent near 0) would
+// otherwise claim the slot and render "Saved 0 tokens".
+const TRANSFORMATION_TILE_MIN_SAVINGS_PERCENT: f64 = 20.0;
+// Even a genuine huge compression shouldn't pin the tile forever — swap in
+// any qualifying event once the current one has been sitting around for this
+// long, so the feed keeps circulating.
+const TRANSFORMATION_TILE_STALE_AFTER_MINUTES: i64 = 10;
 
 pub struct WeeklyTotals {
     pub total_tokens_saved: u64,
@@ -61,6 +72,43 @@ fn debounce_suppress(
     }
 }
 
+// True when `last_worked_at` (RFC3339 from ClaudeCodeProject) is within the
+// Train-suggestion active window of `observed_at`. Unparseable timestamps are
+// treated as inactive — it's safer to stay silent than to nag the user about
+// a project whose recency we can't verify.
+fn worked_within_active_window(last_worked_at: &str, observed_at: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(last_worked_at) {
+        Ok(ts) => {
+            observed_at.signed_duration_since(ts.with_timezone(&Utc))
+                <= Duration::days(TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Per-project snapshot of the bullets seen at the start of the current UTC
+/// day. `observe_learnings_today` diffs the incoming bullet set against this
+/// snapshot to compute "added today" counts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBulletSnapshot {
+    #[serde(default)]
+    claude_md: Vec<String>,
+    #[serde(default)]
+    memory_md: Vec<String>,
+}
+
+/// Per-project bullet lists supplied by the caller for the current observation.
+/// The caller reads CLAUDE.md / MEMORY.md for every project that saw session
+/// activity today so `observe_learnings_today` has a baseline regardless of
+/// which project ends up being picked as most-active.
+pub struct LearningsProjectInput {
+    pub project_path: String,
+    pub project_display_name: String,
+    pub claude_md_bullets: Vec<String>,
+    pub memory_md_bullets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyRecordFact {
@@ -77,19 +125,17 @@ pub struct DailyRecordFact {
 #[serde(rename_all = "camelCase")]
 struct PersistedActivityFacts {
     schema_version: u8,
-    // -- record / RTK delta bookkeeping --
+    // -- record bookkeeping --
     #[serde(default)]
     all_time_record_tokens: u64,
     #[serde(default)]
     daily_record: Option<DailyRecordFact>,
     #[serde(default)]
-    last_rtk_total_commands: u64,
-    #[serde(default)]
-    last_rtk_total_saved: u64,
-    #[serde(default)]
     last_weekly_recap_week_key: Option<String>,
     #[serde(default)]
-    learnings_milestones_fired: BTreeSet<u32>,
+    learnings_snapshot_day: Option<NaiveDate>,
+    #[serde(default)]
+    learnings_snapshots: BTreeMap<String, ProjectBulletSnapshot>,
     // Timestamps of the last record-tag emission we actually made for each
     // scope. Used to debounce near-identical beats so a burst of compressions
     // doesn't repaint the same chip every row (24h / 25% rule in
@@ -98,6 +144,14 @@ struct PersistedActivityFacts {
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     daily_record_emitted_at: Option<DateTime<Utc>>,
+    // Wall-clock time of the last weekly-recap *check* (not emission). Used
+    // to rate-limit check attempts to once per 24h — the emission itself is
+    // idempotent via `last_weekly_recap_week_key`, but the gate stops us
+    // from re-aggregating `daily_savings` on every observation tick.
+    // Absence (None) means "never checked" → due immediately, which is what
+    // triggers the catch-up recap on the first launch after an upgrade.
+    #[serde(default)]
+    last_weekly_recap_check_at: Option<DateTime<Utc>>,
     // TrainSuggestion fire-once / cooldown maps. See observe_train_suggestions.
     #[serde(default)]
     train_suggestions_fired: BTreeSet<String>,
@@ -113,8 +167,6 @@ struct PersistedActivityFacts {
     #[serde(default)]
     last_record: Option<RecordEvent>,
     #[serde(default)]
-    last_rtk_batch: Option<RtkBatchEvent>,
-    #[serde(default)]
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     #[serde(default)]
     last_weekly_recap: Option<WeeklyRecapEvent>,
@@ -126,23 +178,21 @@ pub struct ActivityFacts {
     path: PathBuf,
     all_time_record_tokens: u64,
     daily_record: Option<DailyRecordFact>,
-    last_rtk_total_commands: u64,
-    last_rtk_total_saved: u64,
     last_weekly_recap_week_key: Option<String>,
-    learnings_milestones_fired: BTreeSet<u32>,
+    learnings_snapshot_day: Option<NaiveDate>,
+    learnings_snapshots: BTreeMap<String, ProjectBulletSnapshot>,
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     daily_record_emitted_at: Option<DateTime<Utc>>,
+    last_weekly_recap_check_at: Option<DateTime<Utc>>,
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
     // Latest-of-kind tile slots. Each observe_* writes to its slot; the
     // snapshot builder reads them to populate the frontend response.
     last_transformation: Option<TransformationFeedEvent>,
     last_record: Option<RecordEvent>,
-    last_rtk_batch: Option<RtkBatchEvent>,
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
-    rtk_initialized: bool,
     dirty: bool,
 }
 
@@ -178,21 +228,19 @@ impl ActivityFacts {
             path,
             all_time_record_tokens: persisted.all_time_record_tokens,
             daily_record: persisted.daily_record,
-            last_rtk_total_commands: persisted.last_rtk_total_commands,
-            last_rtk_total_saved: persisted.last_rtk_total_saved,
             last_weekly_recap_week_key: persisted.last_weekly_recap_week_key,
-            learnings_milestones_fired: persisted.learnings_milestones_fired,
+            learnings_snapshot_day: persisted.learnings_snapshot_day,
+            learnings_snapshots: persisted.learnings_snapshots,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
             daily_record_emitted_at: persisted.daily_record_emitted_at,
+            last_weekly_recap_check_at: persisted.last_weekly_recap_check_at,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
             last_transformation: persisted.last_transformation,
             last_record: persisted.last_record,
-            last_rtk_batch: persisted.last_rtk_batch,
             last_learnings_milestone: persisted.last_learnings_milestone,
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
-            rtk_initialized: true,
             dirty: false,
         })
     }
@@ -202,21 +250,19 @@ impl ActivityFacts {
             path,
             all_time_record_tokens: 0,
             daily_record: None,
-            last_rtk_total_commands: 0,
-            last_rtk_total_saved: 0,
             last_weekly_recap_week_key: None,
-            learnings_milestones_fired: BTreeSet::new(),
+            learnings_snapshot_day: None,
+            learnings_snapshots: BTreeMap::new(),
             all_time_record_emitted_at: None,
             daily_record_emitted_at: None,
+            last_weekly_recap_check_at: None,
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: BTreeMap::new(),
             last_transformation: None,
             last_record: None,
-            last_rtk_batch: None,
             last_learnings_milestone: None,
             last_weekly_recap: None,
             last_train_suggestion: None,
-            rtk_initialized: false,
             dirty: false,
         }
     }
@@ -227,7 +273,7 @@ impl ActivityFacts {
         ActivityFeedSnapshot {
             transformation: self.last_transformation.clone(),
             record: self.last_record.clone(),
-            rtk_batch: self.last_rtk_batch.clone(),
+            rtk_today: None,
             learnings_milestone: self.last_learnings_milestone.clone(),
             weekly_recap: self.last_weekly_recap.clone(),
             train_suggestion: self.last_train_suggestion.clone(),
@@ -250,27 +296,50 @@ impl ActivityFacts {
     ) -> Vec<ActivityEvent> {
         let mut emitted = Vec::new();
 
-        // Refresh the transformation tile slot if this event is newer than
-        // what we have. The proxy feed is a sliding window replayed on every
-        // poll, and the observer iterates oldest-first; the last write wins
-        // naturally, but the guard is defensive against out-of-order replays.
-        let is_newer = self
-            .last_transformation
-            .as_ref()
-            .and_then(|prev| prev.timestamp.as_deref())
-            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-            .map(|prev_ts| prev_ts.with_timezone(&Utc) <= observed_at)
-            .unwrap_or(true);
-        if is_newer {
-            self.last_transformation = Some(event.clone());
-            self.dirty = true;
-        }
-
         let tokens_saved = event
             .tokens_saved
             .and_then(|n| if n > 0 { Some(n as u64) } else { None });
+        let savings_percent = event.savings_percent.unwrap_or(0.0);
 
         if let Some(tokens) = tokens_saved {
+            // "Recent large compression" tile: must actually be large, and
+            // we replace the current pick only if the new one is bigger or
+            // the current one has been pinned longer than the stale window.
+            if savings_percent > TRANSFORMATION_TILE_MIN_SAVINGS_PERCENT {
+                let should_replace = match self.last_transformation.as_ref() {
+                    None => true,
+                    Some(prev) => {
+                        let prev_tokens = prev
+                            .tokens_saved
+                            .and_then(|n| u64::try_from(n).ok())
+                            .unwrap_or(0);
+                        if tokens > prev_tokens {
+                            true
+                        } else {
+                            // Only swap a same-or-smaller event in when the
+                            // tile's current pick has aged past the stale
+                            // window. Comparison is against wall-clock `now`
+                            // so the rule matches the user's experience
+                            // ("tile hasn't moved in 10 minutes, rotate it").
+                            prev.timestamp
+                                .as_deref()
+                                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                                .map(|prev_ts| {
+                                    now.signed_duration_since(prev_ts.with_timezone(&Utc))
+                                        > Duration::minutes(
+                                            TRANSFORMATION_TILE_STALE_AFTER_MINUTES,
+                                        )
+                                })
+                                .unwrap_or(true)
+                        }
+                    }
+                };
+                if should_replace {
+                    self.last_transformation = Some(event.clone());
+                    self.dirty = true;
+                }
+            }
+
             let today = now.format("%Y-%m-%d").to_string();
             let event_day = observed_at.format("%Y-%m-%d").to_string();
             let mut emit_tags: Vec<RecordTag> = Vec::new();
@@ -349,6 +418,8 @@ impl ActivityFacts {
                     previous_record: all_time_previous,
                     day: day.clone(),
                     workspace: event.workspace.clone(),
+                    input_tokens_original: event.input_tokens_original,
+                    input_tokens_optimized: event.input_tokens_optimized,
                     request_messages: event.request_messages.clone(),
                     compressed_messages: event.compressed_messages.clone(),
                 };
@@ -373,6 +444,8 @@ impl ActivityFacts {
                     previous_record: all_time_previous,
                     day,
                     workspace: event.workspace.clone(),
+                    input_tokens_original: event.input_tokens_original,
+                    input_tokens_optimized: event.input_tokens_optimized,
                     request_messages: event.request_messages.clone(),
                     compressed_messages: event.compressed_messages.clone(),
                 };
@@ -383,78 +456,117 @@ impl ActivityFacts {
         emitted
     }
 
-    pub fn observe_rtk(
+    /// Refresh the learnings tile with today's diff against a per-project
+    /// bullet-set snapshot taken on the first observation of each day.
+    ///
+    /// - `patterns_today`: already-computed count of memory.db entries whose
+    ///   `created_at` falls within today (caller filters the export JSON).
+    /// - `project_inputs`: current CLAUDE.md / MEMORY.md bullet sets for every
+    ///   project that had session activity today. Keyed by absolute project
+    ///   path. Snapshots are taken against this set, so giving us a baseline
+    ///   for any project the user might touch later in the day.
+    /// - `active_project_path`: the project attributed to today's counts (the
+    ///   one with the most Claude Code session files modified today). `None`
+    ///   when the user hasn't worked on anything today.
+    pub fn observe_learnings_today(
         &mut self,
-        summary: &RtkGainSummary,
+        patterns_today: u32,
+        project_inputs: Vec<LearningsProjectInput>,
+        active_project_path: Option<&str>,
         observed_at: DateTime<Utc>,
-    ) -> Option<ActivityEvent> {
-        if !self.rtk_initialized {
-            self.last_rtk_total_commands = summary.total_commands;
-            self.last_rtk_total_saved = summary.total_saved;
-            self.rtk_initialized = true;
+    ) -> LearningsMilestoneEvent {
+        let today = observed_at.date_naive();
+        let day_changed = self.learnings_snapshot_day != Some(today);
+
+        if day_changed {
+            // New UTC day — drop yesterday's snapshots and re-baseline against
+            // whatever the caller just observed. Today's diffs against this
+            // set start at zero.
+            self.learnings_snapshots.clear();
+            self.learnings_snapshot_day = Some(today);
+            for input in &project_inputs {
+                self.learnings_snapshots.insert(
+                    input.project_path.clone(),
+                    ProjectBulletSnapshot {
+                        claude_md: input.claude_md_bullets.clone(),
+                        memory_md: input.memory_md_bullets.clone(),
+                    },
+                );
+            }
             self.dirty = true;
-            return None;
+        } else {
+            // Same day — add baselines for any project we haven't seen yet.
+            // Existing snapshots are left alone so subsequent diffs keep the
+            // start-of-day baseline.
+            for input in &project_inputs {
+                if !self.learnings_snapshots.contains_key(&input.project_path) {
+                    self.learnings_snapshots.insert(
+                        input.project_path.clone(),
+                        ProjectBulletSnapshot {
+                            claude_md: input.claude_md_bullets.clone(),
+                            memory_md: input.memory_md_bullets.clone(),
+                        },
+                    );
+                    self.dirty = true;
+                }
+            }
         }
 
-        if summary.total_commands < self.last_rtk_total_commands
-            || summary.total_saved < self.last_rtk_total_saved
-        {
-            self.last_rtk_total_commands = summary.total_commands;
-            self.last_rtk_total_saved = summary.total_saved;
-            self.dirty = true;
-            return None;
-        }
+        let active_input = active_project_path.and_then(|path| {
+            project_inputs
+                .iter()
+                .find(|input| input.project_path == path)
+        });
 
-        if summary.total_commands == self.last_rtk_total_commands {
-            return None;
-        }
+        let (learnings_today, reminders_today, project_path, project_display_name) =
+            if let Some(input) = active_input {
+                let snapshot = self.learnings_snapshots.get(&input.project_path);
+                let claude_baseline: BTreeSet<&str> = snapshot
+                    .map(|s| s.claude_md.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let memory_baseline: BTreeSet<&str> = snapshot
+                    .map(|s| s.memory_md.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let learnings_today = input
+                    .claude_md_bullets
+                    .iter()
+                    .filter(|b| !claude_baseline.contains(b.as_str()))
+                    .count() as u32;
+                let reminders_today = input
+                    .memory_md_bullets
+                    .iter()
+                    .filter(|b| !memory_baseline.contains(b.as_str()))
+                    .count() as u32;
+                (
+                    learnings_today,
+                    reminders_today,
+                    Some(input.project_path.clone()),
+                    Some(input.project_display_name.clone()),
+                )
+            } else {
+                (0, 0, None, None)
+            };
 
-        let commands_delta = summary
-            .total_commands
-            .saturating_sub(self.last_rtk_total_commands);
-        let tokens_saved_delta = summary
-            .total_saved
-            .saturating_sub(self.last_rtk_total_saved);
-        let batch = RtkBatchEvent {
+        let event = LearningsMilestoneEvent {
             observed_at,
-            commands_delta,
-            tokens_saved_delta,
-            total_commands: summary.total_commands,
-            total_saved: summary.total_saved,
+            patterns_today,
+            reminders_today,
+            learnings_today,
+            project_path,
+            project_display_name,
         };
 
-        self.last_rtk_total_commands = summary.total_commands;
-        self.last_rtk_total_saved = summary.total_saved;
-        self.last_rtk_batch = Some(batch.clone());
-        self.dirty = true;
-        Some(ActivityEvent::RtkBatch(batch))
-    }
-
-    pub fn observe_learnings_count(
-        &mut self,
-        count: usize,
-        observed_at: DateTime<Utc>,
-    ) -> Option<ActivityEvent> {
-        const THRESHOLD: u32 = 3;
-        if count < THRESHOLD as usize {
-            return None;
+        if self.last_learnings_milestone.as_ref() != Some(&event) {
+            self.last_learnings_milestone = Some(event.clone());
+            self.dirty = true;
         }
-        if self.learnings_milestones_fired.contains(&THRESHOLD) {
-            return None;
-        }
-        self.learnings_milestones_fired.insert(THRESHOLD);
-        let milestone = LearningsMilestoneEvent {
-            observed_at,
-            count: THRESHOLD,
-            kind: "first_3".into(),
-        };
-        self.last_learnings_milestone = Some(milestone.clone());
-        self.dirty = true;
-        Some(ActivityEvent::LearningsMilestone(milestone))
+        event
     }
 
     /// Scan project metadata and emit a `TrainSuggestion` for any project that
-    /// matches a trigger. Two kinds:
+    /// matches a trigger. Applies to both kinds only when the user has worked
+    /// on the project within `TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS` — the tile
+    /// is for ongoing work, not abandoned folders. Two kinds:
     ///
     /// - `"never_trained"` — user has logged `NEVER_TRAINED_MIN_SESSIONS`+
     ///   sessions but never run Train on this project. Fires once per project,
@@ -471,6 +583,9 @@ impl ActivityFacts {
     ) -> Vec<ActivityEvent> {
         let mut events: Vec<TrainSuggestionEvent> = Vec::new();
         for project in projects {
+            if !worked_within_active_window(&project.last_worked_at, observed_at) {
+                continue;
+            }
             let (kind, active_days) = if project.last_learn_ran_at.is_none() {
                 if project.session_count < NEVER_TRAINED_MIN_SESSIONS {
                     continue;
@@ -533,6 +648,9 @@ impl ActivityFacts {
         //     trained (last_learn_ran_at becomes Some).
         //   - "stale" suggestions clear once active_days_since_last_learn
         //     drops below the threshold.
+        //   - Any suggestion clears if the user hasn't touched the project
+        //     in the active window — same gate that blocks emission, applied
+        //     to the latch so an abandoned project doesn't stay pinned.
         //   - Any suggestion clears if the project's cwd no longer exists on
         //     disk — `~/.claude/projects/` keeps session files for folders
         //     that have been moved or deleted, so scanning surfaces "ghost"
@@ -545,6 +663,9 @@ impl ActivityFacts {
                 .find(|p| p.project_path == latched.project_path)
                 .map(|p| {
                     if !Path::new(&p.project_path).exists() {
+                        return false;
+                    }
+                    if !worked_within_active_window(&p.last_worked_at, observed_at) {
                         return false;
                     }
                     match latched.kind.as_str() {
@@ -565,27 +686,53 @@ impl ActivityFacts {
             .collect()
     }
 
+    /// True when we haven't checked the weekly recap within the last 24h.
+    /// Used as a cheap pre-gate in the caller so `daily_savings` isn't
+    /// re-aggregated on every observation tick. First-ever call (never
+    /// checked) returns true, which is what drives the catch-up recap on
+    /// the first launch after an upgrade.
+    pub fn weekly_recap_check_due(&self, now: DateTime<Utc>) -> bool {
+        self.last_weekly_recap_check_at
+            .map(|last| now.signed_duration_since(last) > Duration::hours(24))
+            .unwrap_or(true)
+    }
+
+    /// Record a weekly recap for the 7 days ending the day before
+    /// `recap_monday` (so `recap_monday = 2026-04-27` recaps Mon 04-20 → Sun
+    /// 04-26). Caller is responsible for passing a Monday; the function
+    /// trusts that invariant.
+    ///
+    /// Two idempotency gates:
+    ///   1. `weekly_recap_check_due` — skip if we ran a check within 24h.
+    ///   2. `last_weekly_recap_week_key` — skip if this specific week has
+    ///      already been recapped.
+    ///
+    /// The first gate always updates `last_weekly_recap_check_at` when it
+    /// passes, even if the second gate or `active_days == 0` blocks emission
+    /// — otherwise a dead week would trigger aggregation every poll forever.
     pub fn maybe_record_weekly_recap(
         &mut self,
-        today_local: NaiveDate,
+        recap_monday: NaiveDate,
         totals: WeeklyTotals,
         observed_at: DateTime<Utc>,
     ) -> Option<ActivityEvent> {
-        if today_local.weekday() != chrono::Weekday::Mon {
+        if !self.weekly_recap_check_due(observed_at) {
             return None;
         }
-        let week_key = today_local.format("%Y-%m-%d").to_string();
+        self.last_weekly_recap_check_at = Some(observed_at);
+        self.dirty = true;
+
+        let week_key = recap_monday.format("%Y-%m-%d").to_string();
         if self.last_weekly_recap_week_key.as_deref() == Some(week_key.as_str()) {
             return None;
         }
         if totals.active_days == 0 {
             return None;
         }
-        let week_start = today_local
-            .pred_opt()
-            .and_then(|d| d.checked_sub_days(chrono::Days::new(6)))
-            .unwrap_or(today_local);
-        let week_end = today_local.pred_opt().unwrap_or(today_local);
+        let week_start = recap_monday
+            .checked_sub_days(chrono::Days::new(7))
+            .unwrap_or(recap_monday);
+        let week_end = recap_monday.pred_opt().unwrap_or(recap_monday);
         let recap = WeeklyRecapEvent {
             observed_at,
             week_start: week_start.format("%Y-%m-%d").to_string(),
@@ -596,7 +743,6 @@ impl ActivityFacts {
         };
         self.last_weekly_recap_week_key = Some(week_key);
         self.last_weekly_recap = Some(recap.clone());
-        self.dirty = true;
         Some(ActivityEvent::WeeklyRecap(recap))
     }
 
@@ -608,17 +754,16 @@ impl ActivityFacts {
             schema_version: SCHEMA_VERSION,
             all_time_record_tokens: self.all_time_record_tokens,
             daily_record: self.daily_record.clone(),
-            last_rtk_total_commands: self.last_rtk_total_commands,
-            last_rtk_total_saved: self.last_rtk_total_saved,
             last_weekly_recap_week_key: self.last_weekly_recap_week_key.clone(),
-            learnings_milestones_fired: self.learnings_milestones_fired.clone(),
+            learnings_snapshot_day: self.learnings_snapshot_day,
+            learnings_snapshots: self.learnings_snapshots.clone(),
             all_time_record_emitted_at: self.all_time_record_emitted_at,
             daily_record_emitted_at: self.daily_record_emitted_at,
+            last_weekly_recap_check_at: self.last_weekly_recap_check_at,
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
             last_transformation: self.last_transformation.clone(),
             last_record: self.last_record.clone(),
-            last_rtk_batch: self.last_rtk_batch.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),
             last_weekly_recap: self.last_weekly_recap.clone(),
             last_train_suggestion: self.last_train_suggestion.clone(),
@@ -634,7 +779,7 @@ impl ActivityFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
     use tempfile::TempDir;
 
     fn mk_transformation(
@@ -892,73 +1037,6 @@ mod tests {
     }
 
     #[test]
-    fn rtk_first_observation_is_silent_and_growth_emits() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        assert!(facts
-            .observe_rtk(
-                &RtkGainSummary {
-                    total_commands: 10,
-                    total_saved: 5_000,
-                    avg_savings_pct: 50.0,
-                },
-                at(10, 0)
-            )
-            .is_none());
-        let ev = facts
-            .observe_rtk(
-                &RtkGainSummary {
-                    total_commands: 12,
-                    total_saved: 6_500,
-                    avg_savings_pct: 52.0,
-                },
-                at(10, 1),
-            )
-            .expect("rtk batch");
-        match ev {
-            ActivityEvent::RtkBatch(b) => {
-                assert_eq!(b.commands_delta, 2);
-                assert_eq!(b.tokens_saved_delta, 1_500);
-            }
-            _ => panic!("wrong event kind"),
-        }
-    }
-
-    #[test]
-    fn rtk_shrink_resets_silently() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_rtk(
-            &RtkGainSummary {
-                total_commands: 100,
-                total_saved: 50_000,
-                avg_savings_pct: 50.0,
-            },
-            at(10, 0),
-        );
-        assert!(facts
-            .observe_rtk(
-                &RtkGainSummary {
-                    total_commands: 10,
-                    total_saved: 5_000,
-                    avg_savings_pct: 50.0,
-                },
-                at(10, 1)
-            )
-            .is_none());
-        // Subsequent growth above the new baseline emits.
-        let ev = facts.observe_rtk(
-            &RtkGainSummary {
-                total_commands: 12,
-                total_saved: 6_000,
-                avg_savings_pct: 50.0,
-            },
-            at(10, 2),
-        );
-        assert!(matches!(ev, Some(ActivityEvent::RtkBatch(_))));
-    }
-
-    #[test]
     fn save_and_reload_is_idempotent() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
@@ -978,27 +1056,13 @@ mod tests {
     }
 
     #[test]
-    fn weekly_recap_emits_only_on_monday() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let tuesday = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
-        let out = facts.maybe_record_weekly_recap(
-            tuesday,
-            WeeklyTotals {
-                total_tokens_saved: 100,
-                total_savings_usd: 1.0,
-                active_days: 3,
-            },
-            Utc::now(),
-        );
-        assert!(out.is_none());
-    }
-
-    #[test]
-    fn weekly_recap_emits_once_per_week() {
+    fn weekly_recap_same_week_does_not_re_emit_after_24h() {
+        // Week-key idempotency: even if the 24h check gate has passed, the
+        // same week key must not produce a second emission.
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         let monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 4, 27, 10, 0, 0).unwrap();
         let first = facts.maybe_record_weekly_recap(
             monday,
             WeeklyTotals {
@@ -1006,9 +1070,10 @@ mod tests {
                 total_savings_usd: 2.5,
                 active_days: 4,
             },
-            Utc::now(),
+            t0,
         );
         assert!(first.is_some());
+        // 48h later — 24h gate is open, but week key matches.
         let second = facts.maybe_record_weekly_recap(
             monday,
             WeeklyTotals {
@@ -1016,9 +1081,80 @@ mod tests {
                 total_savings_usd: 5.0,
                 active_days: 7,
             },
-            Utc::now(),
+            t0 + Duration::hours(48),
         );
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn weekly_recap_24h_gate_blocks_rapid_re_check() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 4, 27, 10, 0, 0).unwrap();
+        // First call stamps the check timestamp regardless of outcome.
+        facts.maybe_record_weekly_recap(
+            monday,
+            WeeklyTotals {
+                total_tokens_saved: 0,
+                total_savings_usd: 0.0,
+                active_days: 0,
+            },
+            t0,
+        );
+        // Different week, same day — 24h gate still blocks.
+        let next_monday = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let blocked = facts.maybe_record_weekly_recap(
+            next_monday,
+            WeeklyTotals {
+                total_tokens_saved: 500,
+                total_savings_usd: 2.0,
+                active_days: 3,
+            },
+            t0 + Duration::hours(12),
+        );
+        assert!(blocked.is_none());
+        // > 24h later, the gate opens and the new week emits.
+        let fresh = facts.maybe_record_weekly_recap(
+            next_monday,
+            WeeklyTotals {
+                total_tokens_saved: 500,
+                total_savings_usd: 2.0,
+                active_days: 3,
+            },
+            t0 + Duration::hours(25),
+        );
+        assert!(fresh.is_some());
+    }
+
+    #[test]
+    fn weekly_recap_catches_up_on_first_launch_after_gap() {
+        // First launch after an upgrade: last_weekly_recap_check_at is None,
+        // the check is due, and a recap fires for the most recent completed
+        // week — even when observed on a Wednesday.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let recap_monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        let wednesday = Utc.with_ymd_and_hms(2026, 4, 29, 10, 0, 0).unwrap();
+        let event = facts
+            .maybe_record_weekly_recap(
+                recap_monday,
+                WeeklyTotals {
+                    total_tokens_saved: 1_234,
+                    total_savings_usd: 3.0,
+                    active_days: 5,
+                },
+                wednesday,
+            )
+            .expect("catch-up recap must emit");
+        match event {
+            ActivityEvent::WeeklyRecap(e) => {
+                assert_eq!(e.week_start, "2026-04-20");
+                assert_eq!(e.week_end, "2026-04-26");
+                assert_eq!(e.active_days, 5);
+            }
+            _ => panic!("expected weekly recap"),
+        }
     }
 
     #[test]
@@ -1036,6 +1172,13 @@ mod tests {
             Utc::now(),
         );
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn weekly_recap_check_due_returns_true_when_never_checked() {
+        let (_tmp, base) = base_dir();
+        let facts = ActivityFacts::load_or_create(&base).unwrap();
+        assert!(facts.weekly_recap_check_due(Utc::now()));
     }
 
     #[test]
@@ -1057,33 +1200,140 @@ mod tests {
         assert_eq!(record.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
     }
 
-    #[test]
-    fn learnings_milestone_fires_once_at_three() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        assert!(facts.observe_learnings_count(2, at(10, 0)).is_none());
-        let event = facts
-            .observe_learnings_count(3, at(10, 1))
-            .expect("should fire at 3");
-        match event {
-            ActivityEvent::LearningsMilestone(e) => {
-                assert_eq!(e.count, 3);
-                assert_eq!(e.kind, "first_3");
-            }
-            _ => panic!("expected learnings milestone"),
+    fn mk_learn_input(
+        path: &str,
+        display: &str,
+        claude_md: &[&str],
+        memory_md: &[&str],
+    ) -> LearningsProjectInput {
+        LearningsProjectInput {
+            project_path: path.into(),
+            project_display_name: display.into(),
+            claude_md_bullets: claude_md.iter().map(|s| (*s).to_string()).collect(),
+            memory_md_bullets: memory_md.iter().map(|s| (*s).to_string()).collect(),
         }
-        assert!(facts.observe_learnings_count(5, at(10, 2)).is_none());
     }
 
     #[test]
-    fn learnings_milestone_idempotent_across_reload() {
+    fn learnings_today_baselines_on_first_observation_then_counts_diff() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_learnings_count(10, at(10, 0));
+
+        // First observation of the day: baseline is taken, today counts = 0.
+        let first = facts.observe_learnings_today(
+            0,
+            vec![mk_learn_input(
+                "/x/demo",
+                "demo",
+                &["existing learning"],
+                &["existing reminder"],
+            )],
+            Some("/x/demo"),
+            at(10, 0),
+        );
+        assert_eq!(first.learnings_today, 0);
+        assert_eq!(first.reminders_today, 0);
+        assert_eq!(first.project_display_name.as_deref(), Some("demo"));
+
+        // Second observation, same day, with two new bullets in each file.
+        let second = facts.observe_learnings_today(
+            3,
+            vec![mk_learn_input(
+                "/x/demo",
+                "demo",
+                &["existing learning", "new learning A", "new learning B"],
+                &["existing reminder", "new reminder"],
+            )],
+            Some("/x/demo"),
+            at(11, 0),
+        );
+        assert_eq!(second.patterns_today, 3);
+        assert_eq!(second.learnings_today, 2);
+        assert_eq!(second.reminders_today, 1);
+    }
+
+    #[test]
+    fn learnings_today_resets_snapshot_on_new_day() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        // Day one — baseline with three bullets.
+        let day1 = Utc.with_ymd_and_hms(2026, 4, 23, 10, 0, 0).unwrap();
+        facts.observe_learnings_today(
+            0,
+            vec![mk_learn_input("/x/demo", "demo", &["a", "b", "c"], &[])],
+            Some("/x/demo"),
+            day1,
+        );
+
+        // Day two — snapshot should reset, and 'd' is a new bullet today.
+        let day2 = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
+        let before_add = facts.observe_learnings_today(
+            0,
+            vec![mk_learn_input(
+                "/x/demo",
+                "demo",
+                &["a", "b", "c"],
+                &[],
+            )],
+            Some("/x/demo"),
+            day2,
+        );
+        assert_eq!(before_add.learnings_today, 0, "new day re-baselines to 0");
+
+        let after_add = facts.observe_learnings_today(
+            0,
+            vec![mk_learn_input(
+                "/x/demo",
+                "demo",
+                &["a", "b", "c", "d"],
+                &[],
+            )],
+            Some("/x/demo"),
+            day2.with_hour(11).unwrap(),
+        );
+        assert_eq!(after_add.learnings_today, 1);
+    }
+
+    #[test]
+    fn learnings_today_no_active_project_yields_zero_counts() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        let event = facts.observe_learnings_today(0, Vec::new(), None, at(10, 0));
+        assert_eq!(event.patterns_today, 0);
+        assert_eq!(event.learnings_today, 0);
+        assert_eq!(event.reminders_today, 0);
+        assert!(event.project_path.is_none());
+        assert!(event.project_display_name.is_none());
+    }
+
+    #[test]
+    fn learnings_today_persists_snapshot_across_reload() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        facts.observe_learnings_today(
+            0,
+            vec![mk_learn_input("/x/demo", "demo", &["a"], &["m"])],
+            Some("/x/demo"),
+            at(10, 0),
+        );
         facts.save_if_dirty().unwrap();
 
         let mut reloaded = ActivityFacts::load_or_create(&base).unwrap();
-        assert!(reloaded.observe_learnings_count(20, at(11, 0)).is_none());
+        let event = reloaded.observe_learnings_today(
+            0,
+            vec![mk_learn_input(
+                "/x/demo",
+                "demo",
+                &["a", "new"],
+                &["m", "n"],
+            )],
+            Some("/x/demo"),
+            at(11, 0),
+        );
+        assert_eq!(event.learnings_today, 1);
+        assert_eq!(event.reminders_today, 1);
     }
 
     #[test]
@@ -1117,13 +1367,15 @@ mod tests {
         sessions: usize,
         last_learn: Option<&str>,
         active_days: usize,
+        last_worked_at: &str,
     ) -> ClaudeCodeProject {
         ClaudeCodeProject {
             id: path.chars().take(12).collect(),
             project_path: path.into(),
             display_name: path.rsplit('/').next().unwrap_or(path).into(),
-            last_worked_at: "2026-04-22T10:00:00Z".into(),
+            last_worked_at: last_worked_at.into(),
             session_count: sessions,
+            sessions_today: 0,
             last_learn_ran_at: last_learn.map(str::to_string),
             has_persisted_learnings: last_learn.is_some(),
             active_days_since_last_learn: active_days,
@@ -1135,7 +1387,13 @@ mod tests {
     fn train_suggestion_never_trained_fires_once_over_threshold() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
+        let projects = vec![mk_project(
+            "/Users/u/Code/demo",
+            5,
+            None,
+            0,
+            "2026-04-22T10:00:00Z",
+        )];
         let first = facts.observe_train_suggestions(&projects, at(10, 0));
         assert_eq!(first.len(), 1);
         match &first[0] {
@@ -1154,7 +1412,13 @@ mod tests {
     fn train_suggestion_never_trained_below_threshold_silent() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project("/Users/u/Code/demo", 4, None, 0)];
+        let projects = vec![mk_project(
+            "/Users/u/Code/demo",
+            4,
+            None,
+            0,
+            "2026-04-22T10:00:00Z",
+        )];
         assert!(facts
             .observe_train_suggestions(&projects, at(10, 0))
             .is_empty());
@@ -1164,14 +1428,20 @@ mod tests {
     fn train_suggestion_stale_throttled_to_weekly() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project(
-            "/Users/u/Code/demo",
-            10,
-            Some("2026-04-15T10:00:00Z"),
-            3,
-        )];
+        // Rebuild the project with a fresh last_worked_at at each observation
+        // — the active-window gate requires the user to still be touching the
+        // project; we're testing the *cooldown*, not the active window.
+        let mk = |worked_at: &str| {
+            vec![mk_project(
+                "/Users/u/Code/demo",
+                10,
+                Some("2026-04-15T10:00:00Z"),
+                3,
+                worked_at,
+            )]
+        };
         let day0 = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
-        let first = facts.observe_train_suggestions(&projects, day0);
+        let first = facts.observe_train_suggestions(&mk("2026-04-22T10:00:00Z"), day0);
         assert_eq!(first.len(), 1);
         match &first[0] {
             ActivityEvent::TrainSuggestion(e) => assert_eq!(e.kind, "stale"),
@@ -1179,11 +1449,14 @@ mod tests {
         }
         let day3 = day0 + Duration::days(3);
         assert!(
-            facts.observe_train_suggestions(&projects, day3).is_empty(),
-            "within 7-day cooldown must not re-fire"
+            facts
+                .observe_train_suggestions(&mk("2026-04-25T10:00:00Z"), day3)
+                .is_empty(),
+            "within cooldown must not re-fire"
         );
         let day8 = day0 + Duration::days(8);
-        let third = facts.observe_train_suggestions(&projects, day8);
+        let third =
+            facts.observe_train_suggestions(&mk("2026-04-30T10:00:00Z"), day8);
         assert_eq!(third.len(), 1, "after cooldown, stale must re-fire");
     }
 
@@ -1191,7 +1464,13 @@ mod tests {
     fn train_suggestion_persists_across_reload() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
+        let projects = vec![mk_project(
+            "/Users/u/Code/demo",
+            5,
+            None,
+            0,
+            "2026-04-22T10:00:00Z",
+        )];
         assert_eq!(
             facts.observe_train_suggestions(&projects, at(10, 0)).len(),
             1
@@ -1203,6 +1482,39 @@ mod tests {
                 .observe_train_suggestions(&projects, at(11, 0))
                 .is_empty(),
             "fired set must survive reload"
+        );
+    }
+
+    #[test]
+    fn train_suggestion_skipped_when_project_idle_for_days() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        // Over the never-trained session threshold, but the user hasn't
+        // touched the project in 3 days — outside the active window.
+        let never_trained = vec![mk_project(
+            "/Users/u/Code/abandoned",
+            10,
+            None,
+            0,
+            "2026-04-19T10:00:00Z",
+        )];
+        assert!(
+            facts
+                .observe_train_suggestions(&never_trained, at(10, 0))
+                .is_empty(),
+            "never-trained must not fire for idle projects"
+        );
+        // Same gate applies to the stale branch.
+        let stale = vec![mk_project(
+            "/Users/u/Code/abandoned-stale",
+            10,
+            Some("2026-04-15T10:00:00Z"),
+            5,
+            "2026-04-19T10:00:00Z",
+        )];
+        assert!(
+            facts.observe_train_suggestions(&stale, at(10, 0)).is_empty(),
+            "stale must not fire for idle projects"
         );
     }
 
@@ -1224,35 +1536,86 @@ mod tests {
         assert_eq!(slot.request_id.as_deref(), Some("req-persist"));
     }
 
+    fn mk_tile_event(request_id: &str, timestamp: &str, tokens: i64, pct: f64) -> TransformationFeedEvent {
+        let mut ev = mk_transformation(Some("m"), Some(tokens), Some(pct));
+        ev.request_id = Some(request_id.into());
+        ev.timestamp = Some(timestamp.into());
+        ev
+    }
+
     #[test]
-    fn observe_transformation_keeps_newer_event_when_older_arrives_after() {
-        // The proxy feed is a sliding window replayed every poll; the observer
-        // iterates oldest-first so the "last write wins" path works naturally,
-        // but if an earlier event shows up after a later one (out-of-order
-        // replay), the guard in observe_transformation_at must keep the newer
-        // one in the slot.
+    fn transformation_tile_skips_zero_token_events() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let ev = mk_tile_event("req-zero", "2026-04-22T10:00:00Z", 0, 90.0);
+        facts.observe_transformation_at(&ev, at(10, 0), at(10, 0));
+        assert!(facts.activity_feed_snapshot().transformation.is_none());
+    }
 
-        let mut newer = mk_transformation(Some("m"), Some(100), Some(10.0));
-        newer.request_id = Some("req-newer".into());
-        newer.timestamp = Some("2026-04-22T12:00:00Z".into());
-        facts.observe_transformation_at(&newer, at(12, 0), at(12, 0));
+    #[test]
+    fn transformation_tile_skips_low_savings_percent() {
+        // 20% exactly is still below the strictly-greater-than gate.
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let ev = mk_tile_event("req-small", "2026-04-22T10:00:00Z", 1_000, 20.0);
+        facts.observe_transformation_at(&ev, at(10, 0), at(10, 0));
+        assert!(facts.activity_feed_snapshot().transformation.is_none());
+    }
 
-        let mut older = mk_transformation(Some("m"), Some(200), Some(20.0));
-        older.request_id = Some("req-older".into());
-        older.timestamp = Some("2026-04-22T09:00:00Z".into());
-        facts.observe_transformation_at(&older, at(9, 0), at(12, 0));
+    #[test]
+    fn transformation_tile_replaces_when_new_event_is_larger() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let first = mk_tile_event("req-first", "2026-04-22T10:00:00Z", 1_000, 50.0);
+        facts.observe_transformation_at(&first, at(10, 0), at(10, 0));
+
+        // Two minutes later, a bigger qualifying event arrives — replace.
+        let bigger = mk_tile_event("req-bigger", "2026-04-22T10:02:00Z", 2_000, 60.0);
+        facts.observe_transformation_at(&bigger, at(10, 2), at(10, 2));
 
         let slot = facts
             .activity_feed_snapshot()
             .transformation
             .expect("transformation slot");
-        assert_eq!(
-            slot.request_id.as_deref(),
-            Some("req-newer"),
-            "older replay must not clobber the newer slot"
-        );
+        assert_eq!(slot.request_id.as_deref(), Some("req-bigger"));
+    }
+
+    #[test]
+    fn transformation_tile_keeps_larger_event_when_new_one_is_smaller_and_fresh() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let big = mk_tile_event("req-big", "2026-04-22T10:00:00Z", 5_000, 80.0);
+        facts.observe_transformation_at(&big, at(10, 0), at(10, 0));
+
+        // Smaller event 5 minutes later — inside the 10-min stale window, so
+        // the bigger pick must stay.
+        let small = mk_tile_event("req-small", "2026-04-22T10:05:00Z", 1_000, 30.0);
+        facts.observe_transformation_at(&small, at(10, 5), at(10, 5));
+
+        let slot = facts
+            .activity_feed_snapshot()
+            .transformation
+            .expect("transformation slot");
+        assert_eq!(slot.request_id.as_deref(), Some("req-big"));
+    }
+
+    #[test]
+    fn transformation_tile_rotates_stale_pick_even_for_smaller_event() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let big = mk_tile_event("req-big", "2026-04-22T10:00:00Z", 5_000, 80.0);
+        facts.observe_transformation_at(&big, at(10, 0), at(10, 0));
+
+        // 11 minutes later — past the stale window — a smaller qualifying
+        // event arrives. The tile should rotate even though it's smaller.
+        let small = mk_tile_event("req-fresh", "2026-04-22T10:11:00Z", 1_000, 30.0);
+        facts.observe_transformation_at(&small, at(10, 11), at(10, 11));
+
+        let slot = facts
+            .activity_feed_snapshot()
+            .transformation
+            .expect("transformation slot");
+        assert_eq!(slot.request_id.as_deref(), Some("req-fresh"));
     }
 
 }
