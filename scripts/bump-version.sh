@@ -99,6 +99,10 @@ node -e "
 
 echo "Done. Updated package.json, package-lock.json, src-tauri/tauri.conf.json, src-tauri/Cargo.toml, and src-tauri/Cargo.lock to ${VERSION}."
 
+# Prepopulate GitHub Desktop's commit summary with the version string.
+GIT_DIR="$(git -C "${REPO_ROOT}" rev-parse --git-dir)"
+printf '%s\n' "${VERSION}" > "${GIT_DIR}/COMMIT_EDITMSG"
+
 # Stable release (no -rc.N): the release workflow reads
 # .github/release-notes/<VERSION>.md into latest.json's `notes`, which the
 # in-app update dialog renders as "What's new". Nudge the user to write one.
