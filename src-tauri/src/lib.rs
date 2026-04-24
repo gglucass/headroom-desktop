@@ -41,7 +41,7 @@ use crate::models::{
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
     HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, MemoryFeedEvent,
-    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedEvent,
+    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress,
     TransformationFeedResponse,
 };
 use crate::state::AppState;
@@ -954,82 +954,31 @@ fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
 #[tauri::command]
 fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> ActivityFeedResponse {
     let limit = limit.unwrap_or(50).min(500);
-    let live_transformations = fetch_transformations_feed(limit).ok();
-    let persisted_transformations = state.persisted_transformations();
-    // Merge the proxy's in-memory sliding window with our persisted history
-    // so compressions carry across app/proxy restarts. If the proxy fetch
-    // failed (e.g. transient restart) but we have persisted data, synthesize
-    // a response from the persisted list alone — the frontend shows the
-    // history and will transparently refresh once the proxy is back.
-    let transformations =
-        merge_live_and_persisted_transformations(live_transformations, persisted_transformations);
+    // Live proxy is the only source of transformation events now — persisted
+    // history was dropped along with the activity-facts queues. If the proxy
+    // is restarting, the transformation tile briefly disappears until the
+    // first new compression lands; acceptable in exchange for a tiny facts
+    // file and an unblocked IPC hot path.
+    let transformations = fetch_transformations_feed(limit).ok();
+
+    // Refresh today's memory-flush snapshot opportunistically on every feed
+    // poll so the tile updates between observer ticks (frontend polls every
+    // 4s; observer runs every 20s). The observe_memory_flush call only marks
+    // state dirty when totals actually changed, so the steady-state path
+    // does no disk writes.
     let memory_path = headroom_memory_db_path();
-    let memories = if memory_path.exists() {
-        match memory_export_cached(&state, &memory_path) {
-            Ok(stdout) => parse_memory_export(&stdout, limit as usize).unwrap_or_default(),
-            Err(_) => Vec::new(),
+    if memory_path.exists() {
+        if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
+            if let Ok(memories) = parse_memory_export(&stdout, limit as usize) {
+                let (memory_md, claude_md) = count_flush_targets(&memories);
+                let _ = state.observe_memory_flush(memory_md, claude_md);
+            }
         }
-    } else {
-        Vec::new()
-    };
+    }
 
     let recent_synthetic = state.recent_activity_events();
     let memory_available = memory_path.exists();
-    build_activity_feed_response(
-        transformations,
-        memories,
-        recent_synthetic,
-        memory_available,
-        limit as usize,
-    )
-}
-
-/// Merge the proxy's live transformation feed with our persisted history,
-/// preferring the live copy when the same `request_id` appears in both.
-/// Falls back to persisted-only (with `proxy_reachable: false`) when the
-/// proxy fetch failed but we have history to show.
-fn merge_live_and_persisted_transformations(
-    live: Option<TransformationFeedResponse>,
-    persisted: Vec<TransformationFeedEvent>,
-) -> Option<TransformationFeedResponse> {
-    match live {
-        Some(feed) => {
-            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            let mut merged: Vec<TransformationFeedEvent> =
-                Vec::with_capacity(feed.transformations.len() + persisted.len());
-            for ev in feed
-                .transformations
-                .into_iter()
-                .chain(persisted.into_iter())
-            {
-                let fingerprint = ev
-                    .request_id
-                    .clone()
-                    .or_else(|| ev.timestamp.clone())
-                    .unwrap_or_default();
-                if fingerprint.is_empty() {
-                    // Events without identity can't be deduped; keep them but
-                    // they may appear twice if re-observed.
-                    merged.push(ev);
-                    continue;
-                }
-                if seen.insert(fingerprint) {
-                    merged.push(ev);
-                }
-            }
-            Some(TransformationFeedResponse {
-                transformations: merged,
-                log_full_messages: feed.log_full_messages,
-                proxy_reachable: feed.proxy_reachable,
-            })
-        }
-        None if persisted.is_empty() => None,
-        None => Some(TransformationFeedResponse {
-            transformations: persisted,
-            log_full_messages: false,
-            proxy_reachable: false,
-        }),
-    }
+    build_activity_feed_response(transformations, recent_synthetic, memory_available)
 }
 
 /// Observation cadence for background milestones and Activity notifications.
@@ -1093,6 +1042,12 @@ fn run_activity_observation(app: &AppHandle) {
                 if let Some(event) = state.observe_learnings_count(memories.len()) {
                     fresh_events.push(event);
                 }
+                // Today's memory-flush snapshot. Re-emitted on every observer
+                // tick so the tile always carries the freshest counts.
+                let (memory_md, claude_md) = count_flush_targets(&memories);
+                if let Some(event) = state.observe_memory_flush(memory_md, claude_md) {
+                    fresh_events.push(event);
+                }
             }
         }
     }
@@ -1111,17 +1066,18 @@ fn run_activity_observation(app: &AppHandle) {
     }
 }
 
-/// Pure merge/sort core of `get_activity_feed`. Combines transformations,
-/// memories, and synthesized activity events into a single chronological
-/// stream sorted DESC by timestamp, capped at `limit` events.
+/// Build the feed response from the proxy's live transformations plus the
+/// per-tile synthetic events from ActivityFacts. The frontend's tile picker
+/// keys events by `kind` and selects the latest of each, so we don't need
+/// chronological sorting, RTK coalescing, or limit-with-variety truncation
+/// here — `synthetic_events` carries at most one of each kind already, and
+/// transformations come bounded by `limit` from the proxy.
 fn build_activity_feed_response(
     transformations: Option<TransformationFeedResponse>,
-    memories: Vec<MemoryFeedEvent>,
     synthetic_events: Vec<ActivityEvent>,
     memory_available: bool,
-    limit: usize,
 ) -> ActivityFeedResponse {
-    let mut events: Vec<ActivityEvent> = Vec::new();
+    let mut events: Vec<ActivityEvent> = Vec::with_capacity(synthetic_events.len() + 32);
     let (proxy_reachable, log_full_messages) = match transformations {
         Some(t) => {
             for ev in t.transformations {
@@ -1131,16 +1087,7 @@ fn build_activity_feed_response(
         }
         None => (false, false),
     };
-    for m in memories {
-        events.push(ActivityEvent::Memory(m));
-    }
-    for e in synthetic_events {
-        events.push(e);
-    }
-
-    events.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
-    let events = coalesce_rtk_batches(events);
-    let events = truncate_preserving_variety(events, limit);
+    events.extend(synthetic_events);
 
     ActivityFeedResponse {
         events,
@@ -1148,60 +1095,6 @@ fn build_activity_feed_response(
         proxy_reachable,
         memory_available,
     }
-}
-
-/// Merge adjacent `RtkBatch` events within a 10-minute window into a single
-/// aggregated row. The feed polls every 2s, so an active RTK session produces
-/// many small batches; coalescing keeps the feed readable without touching the
-/// persistent fact store. Expects `events` sorted DESC by timestamp.
-fn coalesce_rtk_batches(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
-    let window = chrono::Duration::minutes(10);
-    let mut out: Vec<ActivityEvent> = Vec::with_capacity(events.len());
-    for ev in events {
-        if let ActivityEvent::RtkBatch(curr) = &ev {
-            if let Some(ActivityEvent::RtkBatch(prev)) = out.last_mut() {
-                if prev.observed_at.signed_duration_since(curr.observed_at) <= window {
-                    prev.commands_delta = prev.commands_delta.saturating_add(curr.commands_delta);
-                    prev.tokens_saved_delta = prev
-                        .tokens_saved_delta
-                        .saturating_add(curr.tokens_saved_delta);
-                    continue;
-                }
-            }
-        }
-        out.push(ev);
-    }
-    out
-}
-
-/// Truncate the feed to `limit` events while preserving all high-signal
-/// events (records, milestones, streaks, etc.). A burst of 150+ compressions
-/// in a single session would otherwise monopolize a timestamp-ordered
-/// truncation and push rare, interesting events off the response — even
-/// when they're still within the persisted ring buffer. We keep every
-/// high-signal event (they're rare by nature) and fill the rest with the
-/// newest low-signal events, then restore chronological order.
-///
-/// Expects `events` sorted DESC by timestamp. Output is also DESC.
-fn truncate_preserving_variety(events: Vec<ActivityEvent>, limit: usize) -> Vec<ActivityEvent> {
-    if events.len() <= limit {
-        return events;
-    }
-    let (high, low): (Vec<_>, Vec<_>) = events
-        .into_iter()
-        .partition(crate::activity_facts::is_high_signal);
-    let low_budget = limit.saturating_sub(high.len());
-    let mut low = low;
-    low.truncate(low_budget);
-    let mut merged: Vec<ActivityEvent> = Vec::with_capacity(high.len() + low.len());
-    merged.extend(high);
-    merged.extend(low);
-    merged.sort_by(|a, b| activity_event_timestamp(b).cmp(&activity_event_timestamp(a)));
-    // Safety valve: if high-signal alone exceeds the cap (extremely unlikely
-    // given their rarity), still enforce `limit` so callers never see more
-    // than requested.
-    merged.truncate(limit);
-    merged
 }
 
 #[tauri::command]
@@ -1446,20 +1339,6 @@ fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: 
         }
     }
     false
-}
-
-fn activity_event_timestamp(event: &ActivityEvent) -> String {
-    match event {
-        ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
-        ActivityEvent::Memory(m) => m.created_at.clone(),
-        ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::TrainSuggestion(e) => e.observed_at.to_rfc3339(),
-    }
 }
 
 #[tauri::command]
@@ -2130,6 +2009,11 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
         created_at: Option<String>,
         #[serde(default)]
         importance: Option<f64>,
+        // Top-level `category` is preferred (matches the proxy's export shape);
+        // fall back to `metadata.category` for older payloads. Routes a flushed
+        // pattern to the right destination file (CLAUDE.md vs MEMORY.md).
+        #[serde(default)]
+        category: Option<String>,
         #[serde(default)]
         metadata: serde_json::Value,
     }
@@ -2142,6 +2026,12 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
                 .get("evidence_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
+            let category = m.category.or_else(|| {
+                m.metadata
+                    .get("category")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
             Some(MemoryFeedEvent {
                 id: m.id,
                 created_at: normalize_utc_timestamp(&m.created_at?)?,
@@ -2149,12 +2039,41 @@ fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>,
                 content: m.content,
                 importance: m.importance.unwrap_or(0.0),
                 evidence_count,
+                category,
             })
         })
         .collect();
     events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     events.truncate(limit);
     Ok(events)
+}
+
+/// Categories that traffic_learner routes to CLAUDE.md (context_file).
+/// Mirrors `_CATEGORY_TO_TARGET` in the upstream Python (traffic_learner.py).
+const CLAUDE_MD_CATEGORIES: &[&str] = &["environment", "architecture"];
+/// Categories that traffic_learner routes to MEMORY.md (memory_file).
+const MEMORY_MD_CATEGORIES: &[&str] = &["preference", "error_recovery"];
+
+/// Count evidence>=2 memories partitioned by destination file (CLAUDE.md vs
+/// MEMORY.md). Patterns with no/unknown category are skipped — only the
+/// categories the upstream traffic_learner knows how to flush are counted.
+fn count_flush_targets(memories: &[MemoryFeedEvent]) -> (u32, u32) {
+    let mut memory_md = 0u32;
+    let mut claude_md = 0u32;
+    for m in memories {
+        if m.evidence_count < 2 {
+            continue;
+        }
+        let Some(cat) = m.category.as_deref() else {
+            continue;
+        };
+        if MEMORY_MD_CATEGORIES.contains(&cat) {
+            memory_md = memory_md.saturating_add(1);
+        } else if CLAUDE_MD_CATEGORIES.contains(&cat) {
+            claude_md = claude_md.saturating_add(1);
+        }
+    }
+    (memory_md, claude_md)
 }
 
 /// Normalize an ISO-8601 timestamp string to RFC3339 UTC (`...Z`).
@@ -3184,18 +3103,17 @@ mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
-        coalesce_rtk_batches, compute_tray_window_position, debounced_tray_runtime_visual,
+        compute_tray_window_position, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
-        is_prerelease_version, lifetime_token_milestone_kind,
-        merge_live_and_persisted_transformations, normalize_utc_timestamp, parse_live_learnings,
-        parse_memory_export, parse_updater_endpoint_list, pattern_matches_project,
-        physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
+        is_prerelease_version, lifetime_token_milestone_kind, normalize_utc_timestamp,
+        parse_live_learnings, parse_memory_export, parse_updater_endpoint_list,
+        pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
         PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
         DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
-        ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, RecordEvent, RecordTag,
+        ActivityEvent, RecordEvent, RecordTag,
         RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use chrono::{DateTime, TimeZone, Timelike, Utc};
@@ -3907,54 +3825,6 @@ mod tests {
         assert!(!err.is_empty(), "expected a non-empty error message");
     }
 
-    #[test]
-    fn merge_prefers_live_copy_when_request_id_matches() {
-        // Live and persisted both contain the same transformation. The merged
-        // list must keep exactly one copy, preferring the live version (it's
-        // the freshest view).
-        let live = TransformationFeedResponse {
-            transformations: vec![make_transformation("2026-04-22T10:02:00Z")],
-            log_full_messages: true,
-            proxy_reachable: true,
-        };
-        let persisted = vec![
-            make_transformation("2026-04-22T10:02:00Z"),
-            make_transformation("2026-04-22T09:59:00Z"),
-        ];
-        let merged = merge_live_and_persisted_transformations(Some(live), persisted).unwrap();
-        assert_eq!(merged.transformations.len(), 2);
-        assert_eq!(
-            merged.transformations[0].request_id.as_deref(),
-            Some("req-2026-04-22T10:02:00Z"),
-            "live copy kept at the front"
-        );
-        assert_eq!(
-            merged.transformations[1].request_id.as_deref(),
-            Some("req-2026-04-22T09:59:00Z")
-        );
-        assert!(merged.proxy_reachable);
-    }
-
-    #[test]
-    fn merge_falls_back_to_persisted_when_proxy_fetch_failed() {
-        let persisted = vec![
-            make_transformation("2026-04-22T10:00:00Z"),
-            make_transformation("2026-04-22T09:00:00Z"),
-        ];
-        let merged = merge_live_and_persisted_transformations(None, persisted).unwrap();
-        assert_eq!(merged.transformations.len(), 2);
-        assert!(
-            !merged.proxy_reachable,
-            "marked unreachable so UI can surface it"
-        );
-    }
-
-    #[test]
-    fn merge_returns_none_when_both_empty_and_proxy_down() {
-        let merged = merge_live_and_persisted_transformations(None, vec![]);
-        assert!(merged.is_none());
-    }
-
     fn make_transformation(timestamp: &str) -> TransformationFeedEvent {
         TransformationFeedEvent {
             request_id: Some(format!("req-{timestamp}")),
@@ -3973,21 +3843,9 @@ mod tests {
         }
     }
 
-    fn make_memory(id: &str, created_at: &str) -> MemoryFeedEvent {
-        MemoryFeedEvent {
-            id: id.into(),
-            created_at: created_at.into(),
-            scope: "user".into(),
-            content: format!("memory {id}"),
-            importance: 0.5,
-            evidence_count: 1,
-        }
-    }
-
     fn timestamp_of(event: &ActivityEvent) -> String {
         match event {
             ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
-            ActivityEvent::Memory(m) => m.created_at.clone(),
             ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
@@ -3995,12 +3853,13 @@ mod tests {
             ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::TrainSuggestion(e) => e.observed_at.to_rfc3339(),
+            ActivityEvent::MemoryFlush(e) => e.observed_at.to_rfc3339(),
         }
     }
 
     #[test]
     fn build_activity_feed_response_returns_empty_when_no_inputs() {
-        let resp = build_activity_feed_response(None, vec![], vec![], false, 50);
+        let resp = build_activity_feed_response(None, vec![], false);
         assert!(resp.events.is_empty());
         assert!(!resp.proxy_reachable);
         assert!(!resp.log_full_messages);
@@ -4014,85 +3873,18 @@ mod tests {
             proxy_reachable: true,
             transformations: vec![],
         };
-        let resp = build_activity_feed_response(Some(transformations), vec![], vec![], true, 50);
+        let resp = build_activity_feed_response(Some(transformations), vec![], true);
         assert!(resp.proxy_reachable);
         assert!(resp.log_full_messages);
         assert!(resp.memory_available);
     }
 
     #[test]
-    fn build_activity_feed_response_sorts_mixed_events_descending_by_timestamp() {
-        let transformations = TransformationFeedResponse {
-            log_full_messages: true,
-            proxy_reachable: true,
-            transformations: vec![
-                make_transformation("2026-04-21T10:00:00Z"),
-                make_transformation("2026-04-21T12:00:00Z"),
-            ],
-        };
-        let memories = vec![
-            make_memory("a", "2026-04-21T11:00:00Z"),
-            make_memory("b", "2026-04-21T13:00:00Z"),
-        ];
-
-        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 50);
-
-        let timestamps: Vec<String> = resp.events.iter().map(timestamp_of).collect();
-        assert_eq!(
-            timestamps,
-            vec![
-                "2026-04-21T13:00:00Z".to_string(),
-                "2026-04-21T12:00:00Z".to_string(),
-                "2026-04-21T11:00:00Z".to_string(),
-                "2026-04-21T10:00:00Z".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_activity_feed_response_preserves_high_signal_under_compression_flood() {
-        // Regression: a burst of 150 compressions sorted DESC by timestamp
-        // would otherwise monopolize a timestamp-ordered truncation and push
-        // the older-but-high-signal LearningsMilestone off the response.
-        let flood: Vec<TransformationFeedEvent> = (0..150)
-            .map(|i| {
-                // All compressions newer than the milestone below.
-                make_transformation(&format!("2026-04-22T12:{:02}:{:02}Z", i / 60, i % 60))
-            })
-            .collect();
-        let transformations = TransformationFeedResponse {
-            log_full_messages: false,
-            proxy_reachable: true,
-            transformations: flood,
-        };
-        let milestone = ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
-            observed_at: chrono::Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap(),
-            count: 100,
-            kind: "first_100".into(),
-        });
-
-        let resp = build_activity_feed_response(
-            Some(transformations),
-            vec![],
-            vec![milestone],
-            false,
-            150,
-        );
-
-        let milestone_count = resp
-            .events
-            .iter()
-            .filter(|e| matches!(e, ActivityEvent::LearningsMilestone(_)))
-            .count();
-        assert_eq!(
-            milestone_count, 1,
-            "high-signal event must survive a compression flood at the limit boundary"
-        );
-        assert!(resp.events.len() <= 150, "limit must still be honored");
-    }
-
-    #[test]
-    fn build_activity_feed_response_caps_to_limit_after_sorting() {
+    fn build_activity_feed_response_carries_all_inputs_through() {
+        // No sort, no coalesce, no truncate — the response just unions the
+        // proxy's transformations with the per-tile synthetic events. The
+        // frontend's tile picker keys by `kind`, so order doesn't matter
+        // here; we just assert nothing got dropped or duplicated.
         let transformations = TransformationFeedResponse {
             log_full_messages: false,
             proxy_reachable: true,
@@ -4101,74 +3893,6 @@ mod tests {
                 make_transformation("2026-04-21T12:00:00Z"),
             ],
         };
-        let memories = vec![
-            make_memory("a", "2026-04-21T11:00:00Z"),
-            make_memory("b", "2026-04-21T13:00:00Z"),
-        ];
-
-        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 2);
-
-        assert_eq!(resp.events.len(), 2);
-        let timestamps: Vec<String> = resp.events.iter().map(timestamp_of).collect();
-        assert_eq!(
-            timestamps,
-            vec![
-                "2026-04-21T13:00:00Z".to_string(),
-                "2026-04-21T12:00:00Z".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_activity_feed_response_treats_transformation_with_no_timestamp_as_oldest() {
-        // Transformations from the proxy may have null timestamps; they
-        // shouldn't shove themselves to the top of the feed.
-        let mut t_no_ts = make_transformation("ignored");
-        t_no_ts.timestamp = None;
-        let transformations = TransformationFeedResponse {
-            log_full_messages: false,
-            proxy_reachable: true,
-            transformations: vec![t_no_ts, make_transformation("2026-04-21T12:00:00Z")],
-        };
-        let memories = vec![make_memory("m", "2026-04-21T11:00:00Z")];
-
-        let resp = build_activity_feed_response(Some(transformations), memories, vec![], true, 50);
-
-        let last = resp.events.last().unwrap();
-        match last {
-            ActivityEvent::Transformation(t) => assert!(t.timestamp.is_none()),
-            _ => panic!("expected the no-timestamp transformation to sort last"),
-        }
-    }
-
-    #[test]
-    fn build_activity_feed_response_with_only_memories_still_sorts_them() {
-        let memories = vec![
-            make_memory("a", "2026-04-21T10:00:00Z"),
-            make_memory("b", "2026-04-21T12:00:00Z"),
-            make_memory("c", "2026-04-21T11:00:00Z"),
-        ];
-        let resp = build_activity_feed_response(None, memories, vec![], true, 50);
-        assert_eq!(resp.events.len(), 3);
-        let ids: Vec<&str> = resp
-            .events
-            .iter()
-            .map(|e| match e {
-                ActivityEvent::Memory(m) => m.id.as_str(),
-                _ => panic!(),
-            })
-            .collect();
-        assert_eq!(ids, vec!["b", "c", "a"]);
-    }
-
-    #[test]
-    fn build_activity_feed_response_merges_synthetic_events_into_sorted_stream() {
-        let transformations = TransformationFeedResponse {
-            log_full_messages: false,
-            proxy_reachable: true,
-            transformations: vec![make_transformation("2026-04-21T10:00:00Z")],
-        };
-        let memories = vec![make_memory("m", "2026-04-21T12:30:00Z")];
         let synthetic = vec![
             ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 13, 0, 0).unwrap(),
@@ -4188,92 +3912,27 @@ mod tests {
                 previous_record: Some(500),
                 day: None,
                 workspace: None,
+                request_messages: None,
+                response_content: None,
             }),
         ];
 
-        let resp =
-            build_activity_feed_response(Some(transformations), memories, synthetic, true, 50);
+        let resp = build_activity_feed_response(Some(transformations), synthetic, true);
 
         assert_eq!(resp.events.len(), 4);
-        let kinds: Vec<&str> = resp
-            .events
-            .iter()
-            .map(|e| match e {
-                ActivityEvent::Transformation(_) => "transformation",
-                ActivityEvent::Memory(_) => "memory",
-                ActivityEvent::RtkBatch(_) => "rtkBatch",
-                ActivityEvent::Record(_) => "record",
-                ActivityEvent::Streak(_) => "streak",
-                ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
-                ActivityEvent::WeeklyRecap(_) => "weeklyRecap",
-                ActivityEvent::LearningsMilestone(_) => "learningsMilestone",
-                ActivityEvent::TrainSuggestion(_) => "trainSuggestion",
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            vec!["rtkBatch", "memory", "record", "transformation"]
-        );
-    }
-
-    fn rtk(hour: u32, minute: u32, commands: u64, tokens: u64, total: u64) -> ActivityEvent {
-        ActivityEvent::RtkBatch(RtkBatchEvent {
-            observed_at: Utc.with_ymd_and_hms(2026, 4, 21, hour, minute, 0).unwrap(),
-            commands_delta: commands,
-            tokens_saved_delta: tokens,
-            total_commands: total,
-            total_saved: total * 500,
-        })
-    }
-
-    #[test]
-    fn coalesce_rtk_batches_merges_events_within_10_minutes() {
-        // Sorted DESC by timestamp (newer first).
-        let events = vec![
-            rtk(12, 0, 5, 1000, 100),
-            rtk(11, 55, 3, 600, 95),
-            rtk(11, 51, 2, 400, 92),
-        ];
-        let merged = coalesce_rtk_batches(events);
-        assert_eq!(merged.len(), 1);
-        match &merged[0] {
-            ActivityEvent::RtkBatch(b) => {
-                assert_eq!(b.commands_delta, 10);
-                assert_eq!(b.tokens_saved_delta, 2000);
-                // Totals remain from the newest (first) entry.
-                assert_eq!(b.total_commands, 100);
-                assert_eq!(b.observed_at.hour(), 12);
-            }
-            _ => panic!("expected RtkBatch"),
-        }
-    }
-
-    #[test]
-    fn coalesce_rtk_batches_keeps_events_outside_window_separate() {
-        let events = vec![rtk(12, 0, 5, 1000, 100), rtk(11, 45, 3, 600, 95)];
-        let merged = coalesce_rtk_batches(events);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn coalesce_rtk_batches_does_not_merge_across_non_rtk_event() {
-        let events = vec![
-            rtk(12, 0, 5, 1000, 100),
-            ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
-                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 55, 0).unwrap(),
-                count: 3,
-                kind: "first_3".into(),
-            }),
-            rtk(11, 51, 2, 400, 92),
-        ];
-        let merged = coalesce_rtk_batches(events);
-        assert_eq!(merged.len(), 3);
-    }
-
-    #[test]
-    fn coalesce_rtk_batches_is_noop_on_empty_and_single() {
-        assert!(coalesce_rtk_batches(vec![]).is_empty());
-        let one = coalesce_rtk_batches(vec![rtk(12, 0, 5, 1000, 100)]);
-        assert_eq!(one.len(), 1);
+        let kind_count = |k: &str| {
+            resp.events
+                .iter()
+                .filter(|e| match (k, e) {
+                    ("transformation", ActivityEvent::Transformation(_)) => true,
+                    ("rtkBatch", ActivityEvent::RtkBatch(_)) => true,
+                    ("record", ActivityEvent::Record(_)) => true,
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(kind_count("transformation"), 2);
+        assert_eq!(kind_count("rtkBatch"), 1);
+        assert_eq!(kind_count("record"), 1);
     }
 }

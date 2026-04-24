@@ -7,7 +7,7 @@ import type {
   ActivityEvent,
   ActivityFeedResponse,
   LearningsMilestoneEvent,
-  MemoryFeedEvent,
+  MemoryFlushEvent,
   RecordEvent,
   RecordTag,
   RtkBatchEvent,
@@ -26,22 +26,11 @@ interface ActivityFeedProps {
   // prop is a default placeholder whose `proxyReachable: false` would
   // otherwise render the "proxy unreachable" state on initial load.
   loaded?: boolean;
-  // Paths of known Claude projects, used to heuristically associate a memory
-  // row with a project by substring match on the memory's content. Mirrors
-  // the logic in `pattern_matches_project` in the Rust backend. Memories do
-  // not carry an explicit project link today (scope/entity_refs are absent
-  // from the Python export), so content-matching is the only signal.
-  projectPaths?: string[];
   // Invoked when a TrainSuggestion row is clicked, so the parent can switch
   // tabs. Left optional so the component keeps rendering in contexts that
   // can't navigate (tests, embedded previews).
   onNavigateToOptimize?: () => void;
 }
-
-// Memories below this evidence threshold are noise (a single observation
-// isn't a pattern). Applied when picking the "latest learning" tile so a
-// low-signal memory doesn't hijack the slot.
-const MIN_MEMORY_EVIDENCE = 2;
 
 // Fixed order for the activity tiles. Each kind gets at most one tile — the
 // most recent event of that kind — and kinds with no events in the window
@@ -50,7 +39,7 @@ const MIN_MEMORY_EVIDENCE = 2;
 const TILE_ORDER: ActivityEvent["kind"][] = [
   "trainSuggestion",
   "transformation",
-  "memory",
+  "memoryFlush",
   "rtkBatch",
   "record",
   "streak",
@@ -59,16 +48,23 @@ const TILE_ORDER: ActivityEvent["kind"][] = [
   "weeklyRecap"
 ];
 
+function localDayKey(now: Date = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 export function ActivityFeed({
   feed,
   error,
   loaded = true,
-  projectPaths = [],
   onNavigateToOptimize
 }: ActivityFeedProps) {
+  const today = localDayKey();
   const latestByKind = useMemo(
-    () => selectLatestByKind(feed.events),
-    [feed.events]
+    () => selectLatestByKind(feed.events, today),
+    [feed.events, today]
   );
   const tiles = TILE_ORDER.map((kind) => latestByKind.get(kind)).filter(
     (event): event is ActivityEvent => event != null
@@ -118,7 +114,6 @@ export function ActivityFeed({
             <TileItem
               key={event.kind}
               event={event}
-              projectPaths={projectPaths}
               onNavigateToOptimize={onNavigateToOptimize}
             />
           ))}
@@ -129,15 +124,16 @@ export function ActivityFeed({
 }
 
 function selectLatestByKind(
-  events: ActivityEvent[]
+  events: ActivityEvent[],
+  today: string
 ): Map<ActivityEvent["kind"], ActivityEvent> {
   const latest = new Map<ActivityEvent["kind"], ActivityEvent>();
   const latestTs = new Map<ActivityEvent["kind"], number>();
   for (const event of events) {
-    if (
-      event.kind === "memory" &&
-      event.data.evidenceCount < MIN_MEMORY_EVIDENCE
-    ) {
+    // Memory-flush counts are scoped to a calendar day. Yesterday's snapshot
+    // would still be in the feed window after midnight; drop it so the tile
+    // disappears until today gets its first flush.
+    if (event.kind === "memoryFlush" && event.data.day !== today) {
       continue;
     }
     const ts = eventTimestampMs(event);
@@ -152,18 +148,16 @@ function selectLatestByKind(
 
 function TileItem({
   event,
-  projectPaths,
   onNavigateToOptimize
 }: {
   event: ActivityEvent;
-  projectPaths: string[];
   onNavigateToOptimize?: () => void;
 }) {
   switch (event.kind) {
     case "transformation":
       return <TransformationRow event={event.data} />;
-    case "memory":
-      return <MemoryRow event={event.data} projectPaths={projectPaths} />;
+    case "memoryFlush":
+      return <MemoryFlushRow event={event.data} />;
     case "rtkBatch":
       return <RtkBatchRow event={event.data} />;
     case "record":
@@ -190,14 +184,13 @@ function eventTimestampMs(event: ActivityEvent): number {
   switch (event.kind) {
     case "transformation":
       return Date.parse(event.data.timestamp ?? "") || 0;
-    case "memory":
-      return Date.parse(event.data.createdAt) || 0;
     case "rtkBatch":
     case "record":
     case "streak":
     case "savingsMilestone":
     case "learningsMilestone":
     case "trainSuggestion":
+    case "memoryFlush":
       return Date.parse(event.data.observedAt) || 0;
     case "weeklyRecap":
       return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
@@ -263,40 +256,10 @@ function TimeChip({ iso }: { iso: string | null | undefined }) {
   );
 }
 
-function projectBasename(scope: string): string | null {
-  if (!scope.startsWith("project:")) return null;
-  const path = scope.slice("project:".length);
-  const segments = path.split("/").filter(Boolean);
-  return segments.length > 0 ? segments[segments.length - 1] : null;
-}
-
 function workspaceBasename(path: string | null | undefined): string | null {
   if (!path) return null;
   const segments = path.split("/").filter(Boolean);
   return segments.length > 0 ? segments[segments.length - 1] : null;
-}
-
-const basenameOf = workspaceBasename;
-
-// Heuristic project attribution for memories without explicit scope/entity_refs.
-// Mirrors `pattern_matches_project` in src-tauri/src/lib.rs: a memory "belongs
-// to" a project if its content contains the project's root path followed by a
-// boundary character (/, ", or `). Longest match wins so `/foo/bar` beats `/foo`
-// when both are candidates.
-function matchProjectPath(content: string, projectPaths: string[]): string | null {
-  let best: string | null = null;
-  for (const path of projectPaths) {
-    const root = path.replace(/\/+$/, "");
-    if (!root) continue;
-    if (
-      content.includes(root + "/") ||
-      content.includes(root + "\"") ||
-      content.includes(root + "`")
-    ) {
-      if (!best || root.length > best.length) best = root;
-    }
-  }
-  return best;
 }
 
 // Extract displayable text from a single proxy-logged message. Anthropic sends
@@ -639,65 +602,26 @@ function splitColonN(s: string, parts: number): string[] {
   return result;
 }
 
-function MemoryRow({
-  event,
-  projectPaths
-}: {
-  event: MemoryFeedEvent;
-  projectPaths: string[];
-}) {
-  const [expanded, setExpanded] = useState(false);
-  // Prefer an explicit project scope (`project:/path`) if the backend ever
-  // emits one; fall back to a substring match against known project paths.
-  // Mirrors `pattern_matches_project` in the Rust backend — memories today
-  // carry no formal project link, so this content-based heuristic is the
-  // only signal available.
-  const scopeProject = projectBasename(event.scope);
-  const matchedPath = scopeProject ? null : matchProjectPath(event.content, projectPaths);
-  const project = scopeProject ?? (matchedPath ? basenameOf(matchedPath) : null);
-  const canExpand = event.content.length > 60 || event.content.includes("\n");
-  /* v8 ignore start — interactive handlers require a DOM; see ExpandableRow. */
-  const toggle = () => {
-    if (canExpand) setExpanded((prev) => !prev);
-  };
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
-    if (!canExpand) return;
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      toggle();
-    }
-  };
-  /* v8 ignore stop */
+function MemoryFlushRow({ event }: { event: MemoryFlushEvent }) {
+  const memCount = event.memoryMdCount;
+  const claudeCount = event.claudeMdCount;
+  const parts: string[] = [];
+  if (memCount > 0) {
+    parts.push(`${memCount} new ${memCount === 1 ? "memory" : "memories"} written to MEMORY.md`);
+  }
+  if (claudeCount > 0) {
+    parts.push(
+      `${claudeCount} new ${claudeCount === 1 ? "learning" : "learnings"} written to CLAUDE.md`
+    );
+  }
   return (
-    <li
-      className={
-        "activity-feed__item activity-feed__item--memory" +
-        (canExpand ? " activity-feed__item--clickable" : "") +
-        (expanded ? " is-expanded" : "")
-      }
-      role={canExpand ? "button" : undefined}
-      tabIndex={canExpand ? 0 : undefined}
-      aria-expanded={canExpand ? expanded : undefined}
-      onClick={toggle}
-      onKeyDown={onKeyDown}
-    >
+    <li className="activity-feed__item activity-feed__item--memory">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--memory">Learning</span>
-        <TimeChip iso={event.createdAt} />
-        {project ? (
-          <span className="activity-feed__project">{project}</span>
-        ) : null}
+        <TimeChip iso={event.observedAt} />
+        <span className="activity-feed__week-range">today</span>
       </div>
-      <p
-        className={
-          expanded
-            ? "activity-feed__content"
-            : "activity-feed__content activity-feed__content--clamped-one"
-        }
-        title={canExpand && !expanded ? event.content : undefined}
-      >
-        {event.content}
-      </p>
+      <p className="activity-feed__content">{parts.join(" and ")}.</p>
     </li>
   );
 }
@@ -749,8 +673,36 @@ function RecordRow({ event }: { event: RecordEvent }) {
   const workspace = workspaceBasename(event.workspace);
   const pct = event.savingsPercent;
   const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
+  const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
+  const hasResponseContent = !!event.responseContent && event.responseContent.length > 0;
+  const detail =
+    hasRequestMessages || hasResponseContent ? (
+      <dl className="activity-feed__detail-grid">
+        {hasRequestMessages ? (
+          <>
+            <dt>Request</dt>
+            <dd>
+              <pre className="activity-feed__message-dump">
+                {formatRequestMessages(event.requestMessages!)}
+              </pre>
+            </dd>
+          </>
+        ) : null}
+        {hasResponseContent ? (
+          <>
+            <dt>Response</dt>
+            <dd>
+              <pre className="activity-feed__message-dump">{event.responseContent}</pre>
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    ) : null;
   return (
-    <li className="activity-feed__item activity-feed__item--record">
+    <ExpandableRow
+      className="activity-feed__item activity-feed__item--record"
+      detail={detail}
+    >
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--record">Record</span>
         {orderedTags.map((tag) => (
@@ -776,7 +728,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
           </span>
         ) : null}
       </div>
-    </li>
+    </ExpandableRow>
   );
 }
 

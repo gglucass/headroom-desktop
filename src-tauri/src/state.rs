@@ -1264,6 +1264,23 @@ impl AppState {
         event
     }
 
+    /// Update today's memory-flush running totals from the latest memory.db
+    /// snapshot. Returns the current MemoryFlush event (today's totals) when
+    /// non-zero, or None on bootstrap / empty days. The caller dispatches it
+    /// alongside other observation-cycle events.
+    pub fn observe_memory_flush(
+        &self,
+        memory_md_total: u32,
+        claude_md_total: u32,
+    ) -> Option<ActivityEvent> {
+        let local_day = Local::now().format("%Y-%m-%d").to_string();
+        let mut facts = self.activity_facts.lock();
+        let event =
+            facts.observe_memory_flush(memory_md_total, claude_md_total, local_day, Utc::now());
+        let _ = facts.save_if_dirty();
+        event
+    }
+
     /// Scan the Claude Code project list for candidates that should be
     /// prompted to run Train. Delegates the decision logic and bookkeeping
     /// (fire-once for never-trained, 7-day cooldown for stale) to
@@ -1280,13 +1297,6 @@ impl AppState {
     /// observation runs on a backend timer and is the sole writer.
     pub fn recent_activity_events(&self) -> Vec<ActivityEvent> {
         self.activity_facts.lock().recent_events()
-    }
-
-    /// Persisted compression history. Carried across app restarts so the
-    /// Activity feed isn't blank for the first few seconds after launch
-    /// while the proxy's own in-memory window is still warming up.
-    pub fn persisted_transformations(&self) -> Vec<TransformationFeedEvent> {
-        self.activity_facts.lock().transformation_history()
     }
 
     /// Record USD savings milestones into ActivityFacts so they appear in the

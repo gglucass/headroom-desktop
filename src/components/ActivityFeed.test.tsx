@@ -5,7 +5,7 @@ import type {
   ActivityEvent,
   ActivityFeedResponse,
   LearningsMilestoneEvent,
-  MemoryFeedEvent,
+  MemoryFlushEvent,
   RecordEvent,
   RtkBatchEvent,
   SavingsMilestoneEvent,
@@ -14,6 +14,13 @@ import type {
   TransformationFeedEvent,
   WeeklyRecapEvent
 } from "../lib/types";
+
+function todayKey(now: Date = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
 
 const baseFeed: ActivityFeedResponse = {
   events: [],
@@ -40,16 +47,14 @@ function transformation(event: Partial<TransformationFeedEvent> = {}): ActivityE
   };
 }
 
-function memory(event: Partial<MemoryFeedEvent> = {}): ActivityEvent {
+function memoryFlush(event: Partial<MemoryFlushEvent> = {}): ActivityEvent {
   return {
-    kind: "memory",
+    kind: "memoryFlush",
     data: {
-      id: "mem-1",
-      createdAt: "2026-04-21T10:01:00Z",
-      scope: "user",
-      content: "user prefers tabs over spaces",
-      importance: 0.85,
-      evidenceCount: 2,
+      observedAt: "2026-04-21T10:01:00Z",
+      day: todayKey(),
+      memoryMdCount: 0,
+      claudeMdCount: 0,
       ...event
     }
   };
@@ -263,20 +268,50 @@ describe("ActivityFeed", () => {
     expect(markup).toContain(">Cache aligned<");
   });
 
-  it("renders a memory row with content", () => {
-    const feed: ActivityFeedResponse = { ...baseFeed, events: [memory()] };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Learning");
-    expect(markup).toContain("user prefers tabs over spaces");
-  });
-
-  it("hides learnings below the evidence threshold", () => {
+  it("renders a memoryFlush tile with today's split MEMORY.md / CLAUDE.md counts", () => {
     const feed: ActivityFeedResponse = {
       ...baseFeed,
-      events: [memory({ id: "weak", content: "noisy one-off", evidenceCount: 1 })]
+      events: [memoryFlush({ memoryMdCount: 3, claudeMdCount: 2 })]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).not.toContain("noisy one-off");
+    expect(markup).toContain("3 new memories written to MEMORY.md");
+    expect(markup).toContain("2 new learnings written to CLAUDE.md");
+  });
+
+  it("singularises MEMORY.md and CLAUDE.md copy when count is 1", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [memoryFlush({ memoryMdCount: 1, claudeMdCount: 1 })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("1 new memory written to MEMORY.md");
+    expect(markup).toContain("1 new learning written to CLAUDE.md");
+  });
+
+  it("omits the MEMORY.md half when only CLAUDE.md got writes today", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [memoryFlush({ memoryMdCount: 0, claudeMdCount: 4 })]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).toContain("4 new learnings written to CLAUDE.md");
+    expect(markup).not.toContain("MEMORY.md");
+  });
+
+  it("drops memoryFlush events from prior days (today filter)", () => {
+    const feed: ActivityFeedResponse = {
+      ...baseFeed,
+      events: [
+        memoryFlush({
+          day: "2020-01-01",
+          memoryMdCount: 9,
+          claudeMdCount: 9
+        })
+      ]
+    };
+    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    expect(markup).not.toContain("written to MEMORY.md");
+    expect(markup).not.toContain("written to CLAUDE.md");
     expect(markup).toContain("No requests yet");
   });
 
@@ -341,20 +376,20 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("renders both kinds in the fixed tile order (transformation before memory)", () => {
+  it("renders both kinds in the fixed tile order (transformation before memoryFlush)", () => {
     const feed: ActivityFeedResponse = {
       ...baseFeed,
       events: [
-        memory({ id: "mem-2", content: "second" }),
+        memoryFlush({ memoryMdCount: 1, claudeMdCount: 0 }),
         transformation({ requestId: "req-2", provider: "openai" })
       ]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const memoryIdx = markup.indexOf("second");
+    const memoryIdx = markup.indexOf("written to MEMORY.md");
     const transformationIdx = markup.indexOf("openai");
     expect(memoryIdx).toBeGreaterThan(-1);
     expect(transformationIdx).toBeGreaterThan(-1);
-    // Tiles render in TILE_ORDER: transformation before memory.
+    // Tiles render in TILE_ORDER: transformation before memoryFlush.
     expect(transformationIdx).toBeLessThan(memoryIdx);
   });
 
@@ -447,6 +482,44 @@ describe("ActivityFeed", () => {
     expect(markup).toContain(">All-time<");
     expect(markup).toContain("Saved 15,000 tokens (88.2%)");
     expect(markup).toContain("previous record 10,000");
+  });
+
+  it("makes a record row expandable when request/response messages came through from the source compression", () => {
+    // The record row now carries forward the same requestMessages /
+    // responseContent as the transformation that set it, so the user can
+    // see what the record-setting compression was about. Static markup
+    // keeps the detail pane collapsed; the signal the row is render-wise
+    // aware of the data is the `activity-feed__item--clickable` class.
+    const withMessages: RecordEvent = {
+      observedAt: "2026-04-21T09:00:00Z",
+      tags: ["daily"],
+      tokensSaved: 7500,
+      savingsPercent: 82.5,
+      model: "claude-opus-4-7",
+      provider: "anthropic",
+      requestId: "r-9",
+      previousRecord: null,
+      day: "2026-04-21",
+      requestMessages: [{ role: "user", content: "refactor this" }],
+      responseContent: "done"
+    };
+    const withoutMessages: RecordEvent = { ...withMessages, requestMessages: null, responseContent: null };
+    const markupWith = renderToStaticMarkup(
+      <ActivityFeed
+        feed={{ ...baseFeed, events: [{ kind: "record", data: withMessages }] }}
+        error={null}
+      />
+    );
+    const markupWithout = renderToStaticMarkup(
+      <ActivityFeed
+        feed={{ ...baseFeed, events: [{ kind: "record", data: withoutMessages }] }}
+        error={null}
+      />
+    );
+    expect(markupWith).toContain("activity-feed__item--record");
+    expect(markupWith).toContain("activity-feed__item--clickable");
+    expect(markupWithout).toContain("activity-feed__item--record");
+    expect(markupWithout).not.toContain("activity-feed__item--clickable");
   });
 
   it("renders a streak row without the new-record tag on a threshold event", () => {
@@ -606,76 +679,6 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain('role="button"');
   });
 
-  it("renders a project badge on learnings with a project-scoped memory", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [memory({ scope: "project:/Users/u/Code/headroom-desktop" })]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("activity-feed__project");
-    expect(markup).toContain(">headroom-desktop<");
-    expect(markup).not.toContain("activity-feed__scope");
-  });
-
-  it("omits the scope chip when scope is not project-prefixed", () => {
-    // Memory scope/entity_refs are absent from the Python export today, so the
-    // fallback chip was always literal "unknown" noise. We drop it entirely and
-    // only render a project chip when there's actually a project path.
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [memory({ scope: "user" })]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).not.toContain("activity-feed__scope");
-    expect(markup).not.toContain("activity-feed__project");
-  });
-
-  it("attributes a memory to a known project by substring-matching content", () => {
-    // Mirrors `pattern_matches_project` in the Rust backend: memories carry no
-    // formal project link, so the project chip is inferred from a path match
-    // on the memory's content.
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        memory({
-          scope: "user",
-          content:
-            "File `/Users/u/Code/demo-repo/src/main.rs` does not exist. The correct path is ..."
-        })
-      ]
-    };
-    const markup = renderToStaticMarkup(
-      <ActivityFeed
-        feed={feed}
-        error={null}
-        projectPaths={["/Users/u/Code/other", "/Users/u/Code/demo-repo"]}
-      />
-    );
-    expect(markup).toContain("activity-feed__project");
-    expect(markup).toContain(">demo-repo<");
-  });
-
-  it("picks the longest matching project path when multiple match", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        memory({
-          scope: "user",
-          content: "Error in `/Users/u/Code/demo/packages/web/src/index.ts`"
-        })
-      ]
-    };
-    const markup = renderToStaticMarkup(
-      <ActivityFeed
-        feed={feed}
-        error={null}
-        projectPaths={["/Users/u/Code/demo", "/Users/u/Code/demo/packages/web"]}
-      />
-    );
-    expect(markup).toContain(">web<");
-    expect(markup).not.toContain(">demo<");
-  });
-
   it("renders a workspace badge on a transformation when workspace is set", () => {
     const feed: ActivityFeedResponse = {
       ...baseFeed,
@@ -719,27 +722,27 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__transforms");
   });
 
-  it("collapses many memories into a single Learning tile (latest wins)", () => {
-    const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
-      const minutes = i * 35;
-      const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
-      const mm = String(minutes % 60).padStart(2, "0");
-      return memory({
-        id: `mem-${i}`,
-        createdAt: `2026-04-21T${hh}:${mm}:00Z`,
-        content: `learning #${i}`
-      });
-    });
+  it("renders only one Learning tile when multiple memoryFlush events are present (latest wins)", () => {
+    // Backend already debounces to one MemoryFlush per kind, but the latest-
+    // by-kind selector should be defensive against duplicates anyway.
+    const events: ActivityEvent[] = [
+      memoryFlush({
+        observedAt: "2026-04-21T10:00:00Z",
+        memoryMdCount: 1,
+        claudeMdCount: 1
+      }),
+      memoryFlush({
+        observedAt: "2026-04-21T11:00:00Z",
+        memoryMdCount: 5,
+        claudeMdCount: 4
+      })
+    ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    // One tile per kind; all 13 memories are the same kind.
     expect(itemCount).toBe(1);
-    // Latest memory (highest index) wins the tile.
-    expect(markup).toContain("learning #12");
-    // No pagination UI remains.
-    expect(markup).not.toContain("activity-feed__pagination");
-    expect(markup).not.toContain("Page 1 of");
+    expect(markup).toContain("5 new memories written to MEMORY.md");
+    expect(markup).toContain("4 new learnings written to CLAUDE.md");
   });
 
 });

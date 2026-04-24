@@ -350,10 +350,10 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
     switch (event.kind) {
       case "transformation":
         return `t:${event.data.requestId ?? event.data.timestamp ?? ""}`;
-      case "memory":
-        return `m:${event.data.id}`;
       case "weeklyRecap":
         return `wr:${event.data.weekStart}`;
+      case "memoryFlush":
+        return `mf:${event.data.day}:${event.data.memoryMdCount}:${event.data.claudeMdCount}`;
       case "rtkBatch":
       case "record":
       case "streak":
@@ -4138,7 +4138,6 @@ export default function App() {
             feed={activityFeed}
             error={activityFeedError}
             loaded={activityFeedLoaded}
-            projectPaths={claudeProjects.map((p) => p.projectPath)}
             onNavigateToOptimize={() => setActiveView("optimization")}
           />
         </div>

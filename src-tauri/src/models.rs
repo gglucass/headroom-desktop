@@ -364,6 +364,25 @@ pub struct MemoryFeedEvent {
     pub content: String,
     pub importance: f64,
     pub evidence_count: u32,
+    // Pulled from the row's metadata. Routes a flushed pattern to the right
+    // file: `environment` / `architecture` → CLAUDE.md (context_file),
+    // `preference` / `error_recovery` → MEMORY.md (memory_file). Other
+    // values are uncategorised — they go nowhere.
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
+/// Snapshot of how many evidence>=2 patterns headroom has flushed today,
+/// partitioned by destination file. Built daily-aggregated on the backend
+/// so the Activity tile can show a simple "X memories / Y learnings written
+/// today" summary that resets at local midnight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryFlushEvent {
+    pub observed_at: DateTime<Utc>,
+    pub day: String,
+    pub memory_md_count: u32,
+    pub claude_md_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +442,13 @@ pub struct RecordEvent {
     pub day: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
+    // Carried forward from the source transformation so the record row can
+    // show what the record-setting compression was actually about. Populated
+    // only when the proxy's `log_full_messages` is enabled.
+    #[serde(default)]
+    pub request_messages: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,8 +503,6 @@ pub struct TrainSuggestionEvent {
 pub enum ActivityEvent {
     #[serde(rename = "transformation")]
     Transformation(TransformationFeedEvent),
-    #[serde(rename = "memory")]
-    Memory(MemoryFeedEvent),
     #[serde(rename = "rtkBatch")]
     RtkBatch(RtkBatchEvent),
     #[serde(rename = "record")]
@@ -493,6 +517,8 @@ pub enum ActivityEvent {
     LearningsMilestone(LearningsMilestoneEvent),
     #[serde(rename = "trainSuggestion")]
     TrainSuggestion(TrainSuggestionEvent),
+    #[serde(rename = "memoryFlush")]
+    MemoryFlush(MemoryFlushEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -289,6 +289,18 @@ export interface MemoryFeedEvent {
   content: string;
   importance: number;
   evidenceCount: number;
+  category?: string | null;
+}
+
+// Today's running totals of evidence>=2 patterns headroom has flushed to file.
+// Resets at local midnight (the `day` field is the local YYYY-MM-DD the
+// counts apply to). The activity tile uses this snapshot to render
+// "X memories written to MEMORY.md and Y learnings written to CLAUDE.md".
+export interface MemoryFlushEvent {
+  observedAt: string;
+  day: string;
+  memoryMdCount: number;
+  claudeMdCount: number;
 }
 
 export interface LiveLearning {
@@ -331,6 +343,11 @@ export interface RecordEvent {
   previousRecord: number | null;
   day: string | null;
   workspace?: string | null;
+  // Carried forward from the record-setting transformation so the record row
+  // can surface the same request/response detail as the compression card.
+  // Populated only when the proxy's `log_full_messages` is enabled.
+  requestMessages?: TransformationRequestMessage[] | null;
+  responseContent?: string | null;
 }
 
 export interface StreakEvent {
@@ -372,14 +389,14 @@ export interface TrainSuggestionEvent {
 
 export type ActivityEvent =
   | { kind: "transformation"; data: TransformationFeedEvent }
-  | { kind: "memory"; data: MemoryFeedEvent }
   | { kind: "rtkBatch"; data: RtkBatchEvent }
   | { kind: "record"; data: RecordEvent }
   | { kind: "streak"; data: StreakEvent }
   | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }
   | { kind: "weeklyRecap"; data: WeeklyRecapEvent }
   | { kind: "learningsMilestone"; data: LearningsMilestoneEvent }
-  | { kind: "trainSuggestion"; data: TrainSuggestionEvent };
+  | { kind: "trainSuggestion"; data: TrainSuggestionEvent }
+  | { kind: "memoryFlush"; data: MemoryFlushEvent };
 
 export interface ActivityFeedResponse {
   events: ActivityEvent[];

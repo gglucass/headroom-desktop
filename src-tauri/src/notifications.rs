@@ -130,7 +130,7 @@ fn format_with_commas(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        LearningsMilestoneEvent, MemoryFeedEvent, RecordEvent, RecordTag, RtkBatchEvent,
+        LearningsMilestoneEvent, MemoryFlushEvent, RecordEvent, RecordTag, RtkBatchEvent,
         SavingsMilestoneEvent, StreakEvent, TrainSuggestionEvent, TransformationFeedEvent,
         WeeklyRecapEvent,
     };
@@ -190,6 +190,8 @@ mod tests {
             previous_record: Some(500),
             day: None,
             workspace: None,
+            request_messages: None,
+            response_content: None,
         });
         let p = notification_for_event(&ev).expect("should notify");
         assert!(p.title.contains("New record"));
@@ -209,6 +211,8 @@ mod tests {
             previous_record: None,
             day: Some("2026-04-22".into()),
             workspace: None,
+            request_messages: None,
+            response_content: None,
         });
         assert!(notification_for_event(&ev).is_none());
     }
@@ -300,6 +304,8 @@ mod tests {
                 previous_record: None,
                 day: Some("2026-04-22".into()),
                 workspace: None,
+                request_messages: None,
+                response_content: None,
             }),
             ActivityEvent::SavingsMilestone(SavingsMilestoneEvent {
                 observed_at: ts(),
@@ -328,13 +334,11 @@ mod tests {
                 request_messages: None,
                 response_content: None,
             }),
-            ActivityEvent::Memory(MemoryFeedEvent {
-                id: "m".into(),
-                created_at: "2026-04-22T10:00:00Z".into(),
-                scope: "user".into(),
-                content: "x".into(),
-                importance: 0.5,
-                evidence_count: 1,
+            ActivityEvent::MemoryFlush(MemoryFlushEvent {
+                observed_at: ts(),
+                day: "2026-04-22".into(),
+                memory_md_count: 3,
+                claude_md_count: 1,
             }),
         ];
         for ev in candidates.iter() {

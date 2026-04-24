@@ -1,38 +1,28 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent, RecordTag,
-    RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
+    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, MemoryFlushEvent, RecordEvent,
+    RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
     TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
 
-const SCHEMA_VERSION: u8 = 1;
-const RECENT_EVENTS_CAP: usize = 300;
-
-fn deserialize_recent_events<'de, D>(deserializer: D) -> Result<VecDeque<ActivityEvent>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
-    let mut out = VecDeque::with_capacity(raw.len());
-    for entry in raw {
-        match serde_json::from_value::<ActivityEvent>(entry.clone()) {
-            Ok(event) => out.push_back(event),
-            Err(err) => {
-                let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("<missing>");
-                eprintln!("dropping persisted ActivityEvent (kind={kind}): {err}");
-            }
-        }
-    }
-    Ok(out)
-}
+// Bumped from 1 → 2 when we replaced the recent_events / transformation_history
+// queues with latest-of-kind slots. Old persisted state can't be carried
+// forward usefully — there are no users on a prior release that would notice.
+const SCHEMA_VERSION: u8 = 2;
+// Hard cap on how big a facts file we'll even attempt to deserialize at boot.
+// The pre-v2 schema embedded full request/response bodies into queues that
+// could grow past 100MB; loading those synchronously hangs the boot path and
+// then the IPC hot path on every save. Anything bigger than this is treated
+// as a schema mismatch and reset.
+const MAX_FACTS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 // Minimum Claude Code session count before we nudge a never-trained project.
 // Below this, the user probably hasn't done enough real work on the project
@@ -42,30 +32,6 @@ pub(crate) const NEVER_TRAINED_MIN_SESSIONS: usize = 5;
 // at least once, we only remind them weekly at most so the Activity feed
 // doesn't turn into a nag screen.
 pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 7;
-
-// High-signal events (records, milestones, streaks, etc.) are rare and
-// intrinsically interesting. Protect them from FIFO eviction caused by
-// bursts of compressions / rtk batches / memories, which can push 150+
-// events through the buffer in a single session and otherwise drown them
-// out before the UI ever sees them.
-pub(crate) fn is_high_signal(event: &ActivityEvent) -> bool {
-    match event {
-        ActivityEvent::Transformation(_)
-        | ActivityEvent::Memory(_)
-        | ActivityEvent::RtkBatch(_) => false,
-        ActivityEvent::Record(_)
-        | ActivityEvent::Streak(_)
-        | ActivityEvent::SavingsMilestone(_)
-        | ActivityEvent::LearningsMilestone(_)
-        | ActivityEvent::WeeklyRecap(_)
-        | ActivityEvent::TrainSuggestion(_) => true,
-    }
-}
-
-// Persisted compression history cap. Big enough to cover a few days of
-// moderate traffic but small enough to keep `activity-facts.json` well
-// under a megabyte even with ~500-byte JSON events.
-const TRANSFORMATION_HISTORY_CAP: usize = 500;
 
 const FIRST_STREAKS: [u32; 4] = [3, 7, 14, 30];
 const REPEATING_STREAK_STEP: u32 = 30;
@@ -77,42 +43,6 @@ fn savings_milestone_kind(milestone_usd: u64) -> &'static str {
         100 => "first_100",
         _ => "repeating_100",
     }
-}
-
-/// Stable identity for a transformation, used to dedup the persisted
-/// history when the proxy's sliding window re-returns the same events on
-/// subsequent polls. `request_id` is the authoritative key; fall back to
-/// `timestamp` for older payloads without it. Returns `None` when neither
-/// is present — such events can't be deduped, so we don't persist them
-/// (the proxy will keep surfacing them while they're in its window).
-fn transformation_fingerprint(event: &TransformationFeedEvent) -> Option<String> {
-    event.request_id.clone().or_else(|| event.timestamp.clone())
-}
-
-/// Append `event` to `history` if no entry with the same fingerprint exists.
-/// Enforces the cap by popping the oldest entries from the front. Returns
-/// `true` iff a new entry was actually added (i.e. the caller should mark
-/// state dirty).
-fn push_transformation_history_unique(
-    history: &mut VecDeque<TransformationFeedEvent>,
-    event: &TransformationFeedEvent,
-    cap: usize,
-) -> bool {
-    let Some(fp) = transformation_fingerprint(event) else {
-        return false;
-    };
-    // Walk newest-first; dups are almost always at the tail from the most
-    // recent poll, so this is O(k) in the overlap between polls, not O(n).
-    for existing in history.iter().rev() {
-        if transformation_fingerprint(existing).as_deref() == Some(fp.as_str()) {
-            return false;
-        }
-    }
-    history.push_back(event.clone());
-    while history.len() > cap {
-        history.pop_front();
-    }
-    true
 }
 
 fn streaks_crossed(previous: u32, current: u32) -> Vec<u32> {
@@ -178,6 +108,7 @@ pub struct DailyRecordFact {
 #[serde(rename_all = "camelCase")]
 struct PersistedActivityFacts {
     schema_version: u8,
+    // -- record / streak / RTK delta bookkeeping --
     #[serde(default)]
     all_time_record_tokens: u64,
     #[serde(default)]
@@ -186,12 +117,6 @@ struct PersistedActivityFacts {
     last_rtk_total_commands: u64,
     #[serde(default)]
     last_rtk_total_saved: u64,
-    // Tolerant deserializer: entries whose `kind` has been retired in a later
-    // schema (e.g. the old `milestone` → now-split `savingsMilestone`) are
-    // silently dropped rather than panicking at startup. Persisted state is
-    // user-local and can't be migrated atomically with a release.
-    #[serde(default, deserialize_with = "deserialize_recent_events")]
-    recent_events: VecDeque<ActivityEvent>,
     #[serde(default)]
     current_streak: u32,
     #[serde(default)]
@@ -202,29 +127,55 @@ struct PersistedActivityFacts {
     last_weekly_recap_week_key: Option<String>,
     #[serde(default)]
     learnings_milestones_fired: BTreeSet<u32>,
+    // Timestamps of the last record-tag emission we actually made for each
+    // scope. Used to debounce near-identical beats so a burst of compressions
+    // doesn't repaint the same chip every row (24h / 25% rule in
+    // `debounce_suppress`).
     #[serde(default)]
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     daily_record_emitted_at: Option<DateTime<Utc>>,
-    // Rolling window of compression events, deduped by request_id (fallback
-    // timestamp). The proxy keeps its own sliding window but loses it on
-    // restart; persisting here lets the Activity feed carry history across
-    // app restarts without reading the proxy's state. Cap kept modest —
-    // users don't need a forever archive, just enough context to feel
-    // continuous.
-    #[serde(default)]
-    transformation_history: VecDeque<TransformationFeedEvent>,
-    // Projects we've already nudged with a "never trained" TrainSuggestion.
-    // Fire-once per project, ever — once it's in the set we never re-emit the
-    // never-trained kind for that project (even after the user trains and
-    // re-resets state). Stale re-suggestions have their own throttle map.
+    // TrainSuggestion fire-once / cooldown maps. See observe_train_suggestions.
     #[serde(default)]
     train_suggestions_fired: BTreeSet<String>,
-    // Last time we emitted a "stale" TrainSuggestion per project. Used to
-    // throttle re-fires to `STALE_TRAIN_REFIRE_DAYS` so a long-neglected
-    // project doesn't churn a new Activity row on every observer tick.
     #[serde(default)]
-    stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
+    stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
+
+    // -- memory-flush bookkeeping (today's running counts; reset at midnight) --
+    #[serde(default)]
+    last_total_memory_md: u32,
+    #[serde(default)]
+    last_total_claude_md: u32,
+    #[serde(default)]
+    memory_flush_initialized: bool,
+    #[serde(default)]
+    today_flush_day: Option<String>,
+    #[serde(default)]
+    today_memory_md_count: u32,
+    #[serde(default)]
+    today_claude_md_count: u32,
+    #[serde(default)]
+    today_flush_observed_at: Option<DateTime<Utc>>,
+
+    // -- latest-of-kind tile slots --
+    // The Activity tab shows one tile per kind, populated by the most recent
+    // event of that kind. Rather than persist a queue of every event ever, we
+    // store only the freshest event for each tile. The MemoryFlush tile is
+    // synthesised on read from the today_* counters above.
+    #[serde(default)]
+    last_record: Option<RecordEvent>,
+    #[serde(default)]
+    last_streak: Option<StreakEvent>,
+    #[serde(default)]
+    last_rtk_batch: Option<RtkBatchEvent>,
+    #[serde(default)]
+    last_savings_milestone: Option<SavingsMilestoneEvent>,
+    #[serde(default)]
+    last_learnings_milestone: Option<LearningsMilestoneEvent>,
+    #[serde(default)]
+    last_weekly_recap: Option<WeeklyRecapEvent>,
+    #[serde(default)]
+    last_train_suggestion: Option<TrainSuggestionEvent>,
 }
 
 pub struct ActivityFacts {
@@ -233,22 +184,31 @@ pub struct ActivityFacts {
     daily_record: Option<DailyRecordFact>,
     last_rtk_total_commands: u64,
     last_rtk_total_saved: u64,
-    recent_events: VecDeque<ActivityEvent>,
     current_streak: u32,
     longest_streak: u32,
     last_active_day: Option<String>,
     last_weekly_recap_week_key: Option<String>,
     learnings_milestones_fired: BTreeSet<u32>,
-    // Timestamps of the last record-tag emission we actually made for each
-    // scope (not just the last time the underlying counter updated). Used to
-    // debounce near-identical beats: a burst of compressions that each nudge
-    // the record up by a fraction of a percent would otherwise flood the
-    // feed with chips that keep saying the same thing.
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     daily_record_emitted_at: Option<DateTime<Utc>>,
-    transformation_history: VecDeque<TransformationFeedEvent>,
     train_suggestions_fired: BTreeSet<String>,
-    stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
+    stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
+    last_total_memory_md: u32,
+    last_total_claude_md: u32,
+    memory_flush_initialized: bool,
+    today_flush_day: Option<String>,
+    today_memory_md_count: u32,
+    today_claude_md_count: u32,
+    today_flush_observed_at: Option<DateTime<Utc>>,
+    // Latest-of-kind tile slots. Each observe_* writes to its slot; the slot
+    // is what `recent_activity_events` returns to the frontend.
+    last_record: Option<RecordEvent>,
+    last_streak: Option<StreakEvent>,
+    last_rtk_batch: Option<RtkBatchEvent>,
+    last_savings_milestone: Option<SavingsMilestoneEvent>,
+    last_learnings_milestone: Option<LearningsMilestoneEvent>,
+    last_weekly_recap: Option<WeeklyRecapEvent>,
+    last_train_suggestion: Option<TrainSuggestionEvent>,
     rtk_initialized: bool,
     dirty: bool,
 }
@@ -260,10 +220,24 @@ impl ActivityFacts {
             return Ok(Self::empty(path));
         }
 
+        // Pre-v2 schemas accumulated full request/response bodies in two
+        // queues and could grow into the 100s of MB. Refuse to even load
+        // those — drop the file and start fresh. Keeps boot fast and the
+        // IPC hot path unblocked.
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if metadata.len() > MAX_FACTS_FILE_BYTES {
+                let _ = std::fs::remove_file(&path);
+                return Ok(Self::empty(path));
+            }
+        }
+
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let persisted = serde_json::from_slice::<PersistedActivityFacts>(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         if persisted.schema_version != SCHEMA_VERSION {
+            // Best-effort delete so the next save replaces the stale file
+            // outright rather than silently leaving the old payload behind.
+            let _ = std::fs::remove_file(&path);
             return Ok(Self::empty(path));
         }
 
@@ -273,7 +247,6 @@ impl ActivityFacts {
             daily_record: persisted.daily_record,
             last_rtk_total_commands: persisted.last_rtk_total_commands,
             last_rtk_total_saved: persisted.last_rtk_total_saved,
-            recent_events: persisted.recent_events,
             current_streak: persisted.current_streak,
             longest_streak: persisted.longest_streak,
             last_active_day: persisted.last_active_day,
@@ -281,9 +254,22 @@ impl ActivityFacts {
             learnings_milestones_fired: persisted.learnings_milestones_fired,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
             daily_record_emitted_at: persisted.daily_record_emitted_at,
-            transformation_history: persisted.transformation_history,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
+            last_total_memory_md: persisted.last_total_memory_md,
+            last_total_claude_md: persisted.last_total_claude_md,
+            memory_flush_initialized: persisted.memory_flush_initialized,
+            today_flush_day: persisted.today_flush_day,
+            today_memory_md_count: persisted.today_memory_md_count,
+            today_claude_md_count: persisted.today_claude_md_count,
+            today_flush_observed_at: persisted.today_flush_observed_at,
+            last_record: persisted.last_record,
+            last_streak: persisted.last_streak,
+            last_rtk_batch: persisted.last_rtk_batch,
+            last_savings_milestone: persisted.last_savings_milestone,
+            last_learnings_milestone: persisted.last_learnings_milestone,
+            last_weekly_recap: persisted.last_weekly_recap,
+            last_train_suggestion: persisted.last_train_suggestion,
             rtk_initialized: true,
             dirty: false,
         })
@@ -296,7 +282,6 @@ impl ActivityFacts {
             daily_record: None,
             last_rtk_total_commands: 0,
             last_rtk_total_saved: 0,
-            recent_events: VecDeque::new(),
             current_streak: 0,
             longest_streak: 0,
             last_active_day: None,
@@ -304,44 +289,71 @@ impl ActivityFacts {
             learnings_milestones_fired: BTreeSet::new(),
             all_time_record_emitted_at: None,
             daily_record_emitted_at: None,
-            transformation_history: VecDeque::new(),
             train_suggestions_fired: BTreeSet::new(),
-            stale_train_suggestions_fired_at: std::collections::BTreeMap::new(),
+            stale_train_suggestions_fired_at: BTreeMap::new(),
+            last_total_memory_md: 0,
+            last_total_claude_md: 0,
+            memory_flush_initialized: false,
+            today_flush_day: None,
+            today_memory_md_count: 0,
+            today_claude_md_count: 0,
+            today_flush_observed_at: None,
+            last_record: None,
+            last_streak: None,
+            last_rtk_batch: None,
+            last_savings_milestone: None,
+            last_learnings_milestone: None,
+            last_weekly_recap: None,
+            last_train_suggestion: None,
             rtk_initialized: false,
             dirty: false,
         }
     }
 
+    /// Build the per-tile event list from the latest-of-kind slots plus the
+    /// synthesised MemoryFlush. Order is not sorted; the frontend's tile
+    /// picker keys by `kind`, not by position. Callers should expect at most
+    /// one event per ActivityEvent variant.
     pub fn recent_events(&self) -> Vec<ActivityEvent> {
-        // Defense against any residual duplication: if multiple Record events
-        // tagged Daily share the same day, keep only the most recent one
-        // (highest observed_at). Walk newest-first, remember days we've
-        // already emitted a Daily-tagged Record for, and drop subsequent
-        // ones.
-        let mut seen_dr_days: BTreeSet<String> = BTreeSet::new();
-        let mut kept_rev: Vec<ActivityEvent> = Vec::with_capacity(self.recent_events.len());
-        for event in self.recent_events.iter().rev() {
-            if let ActivityEvent::Record(rec) = event {
-                if rec.tags.contains(&RecordTag::Daily) {
-                    let day = rec
-                        .day
-                        .clone()
-                        .unwrap_or_else(|| rec.observed_at.format("%Y-%m-%d").to_string());
-                    if !seen_dr_days.insert(day) {
-                        continue;
-                    }
-                }
-            }
-            kept_rev.push(event.clone());
+        let mut events: Vec<ActivityEvent> = Vec::with_capacity(8);
+        if let Some(e) = &self.last_record {
+            events.push(ActivityEvent::Record(e.clone()));
         }
-        kept_rev.reverse();
-        kept_rev
+        if let Some(e) = &self.last_streak {
+            events.push(ActivityEvent::Streak(e.clone()));
+        }
+        if let Some(e) = &self.last_rtk_batch {
+            events.push(ActivityEvent::RtkBatch(e.clone()));
+        }
+        if let Some(e) = &self.last_savings_milestone {
+            events.push(ActivityEvent::SavingsMilestone(e.clone()));
+        }
+        if let Some(e) = &self.last_learnings_milestone {
+            events.push(ActivityEvent::LearningsMilestone(e.clone()));
+        }
+        if let Some(e) = &self.last_weekly_recap {
+            events.push(ActivityEvent::WeeklyRecap(e.clone()));
+        }
+        if let Some(e) = &self.last_train_suggestion {
+            events.push(ActivityEvent::TrainSuggestion(e.clone()));
+        }
+        if let Some(flush) = self.synthesised_memory_flush() {
+            events.push(ActivityEvent::MemoryFlush(flush));
+        }
+        events
     }
 
-    /// Persisted compression history, oldest-first. Callers typically merge
-    /// this with the proxy's live feed and dedup by request_id.
-    pub fn transformation_history(&self) -> Vec<TransformationFeedEvent> {
-        self.transformation_history.iter().cloned().collect()
+    fn synthesised_memory_flush(&self) -> Option<MemoryFlushEvent> {
+        let day = self.today_flush_day.as_ref()?;
+        if self.today_memory_md_count == 0 && self.today_claude_md_count == 0 {
+            return None;
+        }
+        Some(MemoryFlushEvent {
+            observed_at: self.today_flush_observed_at.unwrap_or_else(Utc::now),
+            day: day.clone(),
+            memory_md_count: self.today_memory_md_count,
+            claude_md_count: self.today_claude_md_count,
+        })
     }
 
     pub fn observe_transformation(
@@ -360,18 +372,6 @@ impl ActivityFacts {
     ) -> Vec<ActivityEvent> {
         let mut emitted = Vec::new();
 
-        // Persist compression history so it survives across app restarts.
-        // The proxy's /transformations/feed is an in-memory sliding window
-        // and returns nothing on a cold start; without this the Activity
-        // feed would show an empty slate every time the proxy restarts.
-        if push_transformation_history_unique(
-            &mut self.transformation_history,
-            event,
-            TRANSFORMATION_HISTORY_CAP,
-        ) {
-            self.dirty = true;
-        }
-
         let tokens_saved = event
             .tokens_saved
             .and_then(|n| if n > 0 { Some(n as u64) } else { None });
@@ -384,11 +384,9 @@ impl ActivityFacts {
 
             // Only track + celebrate a Daily record for events that happened
             // today. The proxy's feed is a sliding window that re-returns
-            // historical transformations on every poll. Without this guard,
-            // each day boundary in the feed oscillates `daily_record` and
-            // emits a fresh (duplicate) Daily-tagged Record on every poll —
-            // which stacks up in `recent_events` and shows the user the same
-            // record N times.
+            // historical transformations on every poll; without this guard,
+            // each day boundary in the feed would oscillate `daily_record`
+            // and emit a fresh (duplicate) Daily-tagged Record on every poll.
             if event_day == today {
                 // `beats_day` plus the previous same-day tokens (None when
                 // this is the first Daily of a new calendar day — so the
@@ -438,7 +436,7 @@ impl ActivityFacts {
                 } else {
                     None
                 };
-                emitted.push(ActivityEvent::Record(RecordEvent {
+                let record = RecordEvent {
                     observed_at,
                     tags,
                     tokens_saved: tokens,
@@ -449,28 +447,35 @@ impl ActivityFacts {
                     previous_record: all_time_previous,
                     day,
                     workspace: event.workspace.clone(),
-                }));
+                    request_messages: event.request_messages.clone(),
+                    response_content: event.response_content.clone(),
+                };
+                self.last_record = Some(record.clone());
+                self.dirty = true;
+                emitted.push(ActivityEvent::Record(record));
             }
         }
 
         let streak_events = self.process_streak(observed_at);
         if !streak_events.is_empty() {
-            emitted.extend(streak_events.clone());
-            self.push_recent(streak_events);
-            self.dirty = true;
+            // Multiple streak events can fire in one observation (a threshold
+            // crossing plus a new-record). The tile only shows one, so latch
+            // the latest by observed_at; older threshold events still flow
+            // through `emitted` so notification dispatch fires for each.
+            if let Some(latest) = streak_events
+                .iter()
+                .filter_map(|e| match e {
+                    ActivityEvent::Streak(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .max_by_key(|s| s.observed_at)
+            {
+                self.last_streak = Some(latest);
+                self.dirty = true;
+            }
+            emitted.extend(streak_events);
         }
 
-        if !emitted.is_empty() {
-            // Daily/all-time/new-model events are already in `emitted` but not
-            // yet in recent_events (streak events are already pushed above).
-            let non_streak: Vec<ActivityEvent> = emitted
-                .iter()
-                .filter(|e| !matches!(e, ActivityEvent::Streak(_)))
-                .cloned()
-                .collect();
-            self.push_recent(non_streak);
-            self.dirty = true;
-        }
         emitted
     }
 
@@ -557,19 +562,19 @@ impl ActivityFacts {
         let tokens_saved_delta = summary
             .total_saved
             .saturating_sub(self.last_rtk_total_saved);
-        let event = ActivityEvent::RtkBatch(RtkBatchEvent {
+        let batch = RtkBatchEvent {
             observed_at,
             commands_delta,
             tokens_saved_delta,
             total_commands: summary.total_commands,
             total_saved: summary.total_saved,
-        });
+        };
 
         self.last_rtk_total_commands = summary.total_commands;
         self.last_rtk_total_saved = summary.total_saved;
-        self.push_recent(vec![event.clone()]);
+        self.last_rtk_batch = Some(batch.clone());
         self.dirty = true;
-        Some(event)
+        Some(ActivityEvent::RtkBatch(batch))
     }
 
     pub fn record_savings_milestones(
@@ -580,19 +585,24 @@ impl ActivityFacts {
         if milestones.is_empty() {
             return Vec::new();
         }
-        let events: Vec<ActivityEvent> = milestones
+        let events: Vec<SavingsMilestoneEvent> = milestones
             .iter()
-            .map(|usd| {
-                ActivityEvent::SavingsMilestone(SavingsMilestoneEvent {
-                    observed_at,
-                    milestone_usd: *usd,
-                    kind: savings_milestone_kind(*usd).to_string(),
-                })
+            .map(|usd| SavingsMilestoneEvent {
+                observed_at,
+                milestone_usd: *usd,
+                kind: savings_milestone_kind(*usd).to_string(),
             })
             .collect();
-        self.push_recent(events.clone());
-        self.dirty = true;
+        // Tile only shows one — latch the largest milestone in this batch
+        // (most impressive number wins). Notification path still sees each.
+        if let Some(latest) = events.iter().max_by_key(|e| e.milestone_usd) {
+            self.last_savings_milestone = Some(latest.clone());
+            self.dirty = true;
+        }
         events
+            .into_iter()
+            .map(ActivityEvent::SavingsMilestone)
+            .collect()
     }
 
     pub fn observe_learnings_count(
@@ -608,14 +618,92 @@ impl ActivityFacts {
             return None;
         }
         self.learnings_milestones_fired.insert(THRESHOLD);
-        let event = ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
+        let milestone = LearningsMilestoneEvent {
             observed_at,
             count: THRESHOLD,
             kind: "first_3".into(),
-        });
-        self.push_recent(vec![event.clone()]);
+        };
+        self.last_learnings_milestone = Some(milestone.clone());
         self.dirty = true;
-        Some(event)
+        Some(ActivityEvent::LearningsMilestone(milestone))
+    }
+
+    /// Observe the current totals of evidence>=2 patterns in memory.db,
+    /// partitioned by destination file (MEMORY.md vs CLAUDE.md). Maintains a
+    /// per-day running tally so the tile can show "X memories / Y learnings
+    /// written today" — resets when `local_day` rolls over. Today's totals
+    /// are persisted as plain scalars; the MemoryFlush event itself is
+    /// synthesised on read by `recent_events`.
+    ///
+    /// Returns `Some(MemoryFlush)` only when today's totals actually changed
+    /// in this call (delta detected, day rollover that left non-zero counts,
+    /// or a defensive shrink rebaseline). The notification path uses the
+    /// return value to decide whether to dispatch — so steady-state polls
+    /// where nothing moved must return None to avoid notification spam *and*
+    /// to keep `dirty` clean so the file doesn't re-save on every poll.
+    ///
+    /// On first call ever (post fresh install / wiped state), the high-water
+    /// marks are baselined silently — pre-existing patterns don't get
+    /// retroactively counted as today's flushes.
+    pub fn observe_memory_flush(
+        &mut self,
+        memory_md_total: u32,
+        claude_md_total: u32,
+        local_day: String,
+        observed_at: DateTime<Utc>,
+    ) -> Option<ActivityEvent> {
+        // Bootstrap: silently baseline on the first observation so existing
+        // memory.db rows from prior runs don't all show up as "today's".
+        if !self.memory_flush_initialized {
+            self.last_total_memory_md = memory_md_total;
+            self.last_total_claude_md = claude_md_total;
+            self.memory_flush_initialized = true;
+            self.dirty = true;
+            return None;
+        }
+
+        // Day rollover: reset today's running totals. A reset alone doesn't
+        // emit — we wait for the next actual flush so the tile naturally
+        // disappears at midnight and reappears on the day's first flush.
+        let day_rolled = self.today_flush_day.as_deref() != Some(local_day.as_str());
+        if day_rolled {
+            self.today_flush_day = Some(local_day.clone());
+            self.today_memory_md_count = 0;
+            self.today_claude_md_count = 0;
+            self.today_flush_observed_at = None;
+            self.dirty = true;
+        }
+
+        // Defensive: if the totals shrank (memory.db rebuilt, user wiped data)
+        // re-baseline rather than emit phantom counts.
+        let shrank = memory_md_total < self.last_total_memory_md
+            || claude_md_total < self.last_total_claude_md;
+        if shrank {
+            self.last_total_memory_md = memory_md_total;
+            self.last_total_claude_md = claude_md_total;
+            self.dirty = true;
+            return self.synthesised_memory_flush().map(ActivityEvent::MemoryFlush);
+        }
+
+        let memory_md_delta = memory_md_total.saturating_sub(self.last_total_memory_md);
+        let claude_md_delta = claude_md_total.saturating_sub(self.last_total_claude_md);
+
+        if memory_md_delta == 0 && claude_md_delta == 0 {
+            // Nothing new since last observation. Don't touch state, don't
+            // dirty — this is the steady-state path and must be cheap.
+            return None;
+        }
+
+        self.today_memory_md_count =
+            self.today_memory_md_count.saturating_add(memory_md_delta);
+        self.today_claude_md_count =
+            self.today_claude_md_count.saturating_add(claude_md_delta);
+        self.last_total_memory_md = memory_md_total;
+        self.last_total_claude_md = claude_md_total;
+        self.today_flush_observed_at = Some(observed_at);
+        self.dirty = true;
+
+        self.synthesised_memory_flush().map(ActivityEvent::MemoryFlush)
     }
 
     /// Scan project metadata and emit a `TrainSuggestion` for any project that
@@ -638,7 +726,7 @@ impl ActivityFacts {
         projects: &[ClaudeCodeProject],
         observed_at: DateTime<Utc>,
     ) -> Vec<ActivityEvent> {
-        let mut events: Vec<ActivityEvent> = Vec::new();
+        let mut events: Vec<TrainSuggestionEvent> = Vec::new();
         for project in projects {
             let (kind, active_days) = if project.last_learn_ran_at.is_none() {
                 if project.session_count < NEVER_TRAINED_MIN_SESSIONS {
@@ -664,14 +752,14 @@ impl ActivityFacts {
                 continue;
             };
 
-            events.push(ActivityEvent::TrainSuggestion(TrainSuggestionEvent {
+            events.push(TrainSuggestionEvent {
                 observed_at,
                 project_path: project.project_path.clone(),
                 project_display_name: project.display_name.clone(),
                 session_count: project.session_count as u32,
                 active_days_since_last_learn: active_days,
                 kind: kind.into(),
-            }));
+            });
 
             match kind {
                 "never_trained" => {
@@ -687,10 +775,18 @@ impl ActivityFacts {
         }
 
         if !events.is_empty() {
-            self.push_recent(events.clone());
+            // Tile shows one — latch the latest by observed_at. (All emissions
+            // in a single observe call share the same `observed_at`, so this
+            // effectively keeps the last project iterated.)
+            if let Some(latest) = events.iter().max_by_key(|e| e.observed_at).cloned() {
+                self.last_train_suggestion = Some(latest);
+            }
             self.dirty = true;
         }
         events
+            .into_iter()
+            .map(ActivityEvent::TrainSuggestion)
+            .collect()
     }
 
     pub fn maybe_record_weekly_recap(
@@ -714,39 +810,18 @@ impl ActivityFacts {
             .and_then(|d| d.checked_sub_days(chrono::Days::new(6)))
             .unwrap_or(today_local);
         let week_end = today_local.pred_opt().unwrap_or(today_local);
-        let event = ActivityEvent::WeeklyRecap(WeeklyRecapEvent {
+        let recap = WeeklyRecapEvent {
             observed_at,
             week_start: week_start.format("%Y-%m-%d").to_string(),
             week_end: week_end.format("%Y-%m-%d").to_string(),
             total_tokens_saved: totals.total_tokens_saved,
             total_savings_usd: totals.total_savings_usd,
             active_days: totals.active_days,
-        });
+        };
         self.last_weekly_recap_week_key = Some(week_key);
-        self.push_recent(vec![event.clone()]);
+        self.last_weekly_recap = Some(recap.clone());
         self.dirty = true;
-        Some(event)
-    }
-
-    fn push_recent(&mut self, events: Vec<ActivityEvent>) {
-        for event in events {
-            self.recent_events.push_back(event);
-        }
-        while self.recent_events.len() > RECENT_EVENTS_CAP {
-            // Prefer evicting the oldest non-high-signal event so a burst
-            // of compressions can't push out a learnings milestone or a
-            // new daily record. Fall back to pop_front only when the entire
-            // buffer is high-signal (rare — these kinds are sparse).
-            if let Some(idx) = self
-                .recent_events
-                .iter()
-                .position(|event| !is_high_signal(event))
-            {
-                self.recent_events.remove(idx);
-            } else {
-                self.recent_events.pop_front();
-            }
-        }
+        Some(ActivityEvent::WeeklyRecap(recap))
     }
 
     pub fn save_if_dirty(&mut self) -> Result<()> {
@@ -759,7 +834,6 @@ impl ActivityFacts {
             daily_record: self.daily_record.clone(),
             last_rtk_total_commands: self.last_rtk_total_commands,
             last_rtk_total_saved: self.last_rtk_total_saved,
-            recent_events: self.recent_events.clone(),
             current_streak: self.current_streak,
             longest_streak: self.longest_streak,
             last_active_day: self.last_active_day.clone(),
@@ -767,9 +841,22 @@ impl ActivityFacts {
             learnings_milestones_fired: self.learnings_milestones_fired.clone(),
             all_time_record_emitted_at: self.all_time_record_emitted_at,
             daily_record_emitted_at: self.daily_record_emitted_at,
-            transformation_history: self.transformation_history.clone(),
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
+            last_total_memory_md: self.last_total_memory_md,
+            last_total_claude_md: self.last_total_claude_md,
+            memory_flush_initialized: self.memory_flush_initialized,
+            today_flush_day: self.today_flush_day.clone(),
+            today_memory_md_count: self.today_memory_md_count,
+            today_claude_md_count: self.today_claude_md_count,
+            today_flush_observed_at: self.today_flush_observed_at,
+            last_record: self.last_record.clone(),
+            last_streak: self.last_streak.clone(),
+            last_rtk_batch: self.last_rtk_batch.clone(),
+            last_savings_milestone: self.last_savings_milestone.clone(),
+            last_learnings_milestone: self.last_learnings_milestone.clone(),
+            last_weekly_recap: self.last_weekly_recap.clone(),
+            last_train_suggestion: self.last_train_suggestion.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
         std::fs::write(&self.path, bytes)
@@ -895,159 +982,6 @@ mod tests {
                 "re-observing same tx (obs_at={obs_at}) must not re-fire DailyRecord",
             );
         }
-    }
-
-    #[test]
-    fn recent_events_dedupes_daily_records_by_day() {
-        // Belt-and-suspenders: even if something injects multiple DailyRecord
-        // events for the same day into recent_events, the API surface only
-        // shows one row per day (newest observed_at wins).
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let obs_early = Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap();
-        let obs_late = Utc.with_ymd_and_hms(2026, 4, 22, 15, 0, 0).unwrap();
-        let mk = |obs: DateTime<Utc>, tokens: u64| RecordEvent {
-            observed_at: obs,
-            tags: vec![RecordTag::Daily],
-            tokens_saved: tokens,
-            savings_percent: Some(10.0),
-            model: Some("a".into()),
-            provider: Some("anthropic".into()),
-            request_id: Some("r".into()),
-            previous_record: None,
-            day: Some("2026-04-22".into()),
-            workspace: None,
-        };
-        facts
-            .recent_events
-            .push_back(ActivityEvent::Record(mk(obs_early, 100)));
-        facts
-            .recent_events
-            .push_back(ActivityEvent::Record(mk(obs_late, 200)));
-
-        let visible = facts.recent_events();
-        let drs: Vec<_> = visible
-            .iter()
-            .filter_map(|e| match e {
-                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Daily) => Some(r),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(drs.len(), 1);
-        assert_eq!(drs[0].observed_at, obs_late, "newest entry wins");
-    }
-
-    #[test]
-    fn push_recent_preserves_high_signal_events_under_burst() {
-        // A long coding session emits hundreds of compression events. Without
-        // kind-aware eviction, a rare learnings milestone pushed early would
-        // be FIFO'd out before the frontend ever saw it. Confirm it survives.
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let milestone_at = Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap();
-        facts.push_recent(vec![ActivityEvent::LearningsMilestone(
-            LearningsMilestoneEvent {
-                observed_at: milestone_at,
-                count: 100,
-                kind: "first_100".into(),
-            },
-        )]);
-
-        // Flood past the cap with transformations.
-        let flood: Vec<ActivityEvent> = (0..RECENT_EVENTS_CAP + 50)
-            .map(|i| {
-                ActivityEvent::Transformation(TransformationFeedEvent {
-                    request_id: Some(format!("req-{i}")),
-                    timestamp: Some("2026-04-22T10:00:00Z".into()),
-                    provider: Some("anthropic".into()),
-                    model: Some("claude".into()),
-                    input_tokens_original: Some(1000),
-                    input_tokens_optimized: Some(300),
-                    tokens_saved: Some(500),
-                    savings_percent: Some(50.0),
-                    transforms_applied: vec!["kompress".into()],
-                    workspace: None,
-                    turn_id: None,
-                    request_messages: None,
-                    response_content: None,
-                })
-            })
-            .collect();
-        facts.push_recent(flood);
-
-        assert!(facts.recent_events.len() <= RECENT_EVENTS_CAP);
-        let milestone_count = facts
-            .recent_events
-            .iter()
-            .filter(|e| matches!(e, ActivityEvent::LearningsMilestone(_)))
-            .count();
-        assert_eq!(
-            milestone_count, 1,
-            "learnings milestone must survive a compression burst"
-        );
-    }
-
-    #[test]
-    fn transformation_history_persists_across_observations_and_dedups() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let t = at(10, 0);
-
-        let mut tx_a = mk_transformation(Some("m"), Some(500), Some(50.0));
-        tx_a.request_id = Some("req-A".into());
-        tx_a.timestamp = Some("2026-04-22T10:00:00Z".into());
-        let mut tx_b = mk_transformation(Some("m"), Some(600), Some(55.0));
-        tx_b.request_id = Some("req-B".into());
-        tx_b.timestamp = Some("2026-04-22T10:01:00Z".into());
-
-        facts.observe_transformation_at(&tx_a, t, t);
-        facts.observe_transformation_at(&tx_b, t, t);
-        // Re-observing the same events (what the proxy's sliding window
-        // returns every poll) must not duplicate them in history.
-        facts.observe_transformation_at(&tx_a, t, t);
-        facts.observe_transformation_at(&tx_b, t, t);
-
-        let history = facts.transformation_history();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].request_id.as_deref(), Some("req-A"));
-        assert_eq!(history[1].request_id.as_deref(), Some("req-B"));
-    }
-
-    #[test]
-    fn push_transformation_history_unique_enforces_cap_by_evicting_oldest() {
-        use std::collections::VecDeque;
-        let mut history: VecDeque<TransformationFeedEvent> = VecDeque::new();
-        let make = |n: u64| {
-            let mut ev = mk_transformation(Some("m"), Some(n as i64), Some(10.0));
-            ev.request_id = Some(format!("req-{n}"));
-            ev
-        };
-        for n in 0..5 {
-            assert!(push_transformation_history_unique(
-                &mut history,
-                &make(n),
-                3
-            ));
-        }
-        assert_eq!(history.len(), 3);
-        assert_eq!(
-            history.front().unwrap().request_id.as_deref(),
-            Some("req-2")
-        );
-        assert_eq!(history.back().unwrap().request_id.as_deref(), Some("req-4"));
-    }
-
-    #[test]
-    fn push_transformation_history_unique_skips_fingerprint_less_events() {
-        // Events with neither request_id nor timestamp can't be deduped, so
-        // we don't persist them — the proxy keeps returning them live.
-        use std::collections::VecDeque;
-        let mut history: VecDeque<TransformationFeedEvent> = VecDeque::new();
-        let mut ev = mk_transformation(Some("m"), Some(100), Some(10.0));
-        ev.request_id = None;
-        ev.timestamp = None;
-        assert!(!push_transformation_history_unique(&mut history, &ev, 10));
-        assert!(history.is_empty());
     }
 
     #[test]
@@ -1635,25 +1569,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn train_suggestion_survives_low_signal_eviction() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project("/Users/u/Code/demo", 5, None, 0)];
-        facts.observe_train_suggestions(&projects, at(10, 0));
-        for _ in 0..(RECENT_EVENTS_CAP + 10) {
-            facts.push_recent(vec![ActivityEvent::Transformation(mk_transformation(
-                Some("claude-x"),
-                Some(1),
-                Some(1.0),
-            ))]);
-        }
-        let recent = facts.recent_events();
-        assert!(
-            recent
-                .iter()
-                .any(|e| matches!(e, ActivityEvent::TrainSuggestion(_))),
-            "TrainSuggestion must survive FIFO eviction"
-        );
-    }
 }
