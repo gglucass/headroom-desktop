@@ -61,21 +61,8 @@ pub fn collect_notification_payloads(events: &[ActivityEvent]) -> Vec<Notificati
 
 pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPayload> {
     match event {
-        ActivityEvent::Milestone(m) => notification_for_token_milestone(m.milestone_tokens_saved),
         ActivityEvent::Record(r) => {
-            if r.tags.contains(&RecordTag::Turn) {
-                let call_count = r.call_count.unwrap_or(0);
-                Some(NotificationPayload {
-                    title: "New record prompt".into(),
-                    body: format!(
-                        "Saved {} tokens across {} call{} on a single prompt. Your biggest one yet.",
-                        format_with_commas(r.tokens_saved),
-                        call_count,
-                        if call_count == 1 { "" } else { "s" }
-                    ),
-                    action: Some("activity".into()),
-                })
-            } else if r.tags.contains(&RecordTag::AllTime) {
+            if r.tags.contains(&RecordTag::AllTime) {
                 Some(NotificationPayload {
                     title: "New record compression".into(),
                     body: format!(
@@ -143,9 +130,9 @@ fn format_with_commas(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent, RecordEvent,
-        RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TrainSuggestionEvent,
-        TransformationFeedEvent, WeeklyRecapEvent,
+        LearningsMilestoneEvent, MemoryFeedEvent, RecordEvent, RecordTag, RtkBatchEvent,
+        SavingsMilestoneEvent, StreakEvent, TrainSuggestionEvent, TransformationFeedEvent,
+        WeeklyRecapEvent,
     };
     use chrono::{TimeZone, Utc};
 
@@ -191,28 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn notifies_for_eligible_milestone() {
-        let ev = ActivityEvent::Milestone(MilestoneEvent {
-            observed_at: ts(),
-            milestone_tokens_saved: 5_000_000,
-            kind: "first_5m".into(),
-        });
-        let p = notification_for_event(&ev).expect("should notify");
-        assert!(p.title.contains("5M"));
-        assert!(p.body.contains("5M"));
-    }
-
-    #[test]
-    fn does_not_notify_for_feed_only_milestone() {
-        let ev = ActivityEvent::Milestone(MilestoneEvent {
-            observed_at: ts(),
-            milestone_tokens_saved: 20_000_000,
-            kind: "repeating_10m".into(),
-        });
-        assert!(notification_for_event(&ev).is_none());
-    }
-
-    #[test]
     fn notifies_for_all_time_record() {
         let ev = ActivityEvent::Record(RecordEvent {
             observed_at: ts(),
@@ -225,34 +190,10 @@ mod tests {
             previous_record: Some(500),
             day: None,
             workspace: None,
-            turn_id: None,
-            call_count: None,
         });
         let p = notification_for_event(&ev).expect("should notify");
         assert!(p.title.contains("New record"));
         assert!(p.body.contains("12,345"));
-    }
-
-    #[test]
-    fn notifies_for_turn_record() {
-        let ev = ActivityEvent::Record(RecordEvent {
-            observed_at: ts(),
-            tags: vec![RecordTag::Turn],
-            tokens_saved: 30_000,
-            savings_percent: None,
-            model: Some("m".into()),
-            provider: None,
-            request_id: None,
-            previous_record: Some(10_000),
-            day: None,
-            workspace: None,
-            turn_id: Some("t".into()),
-            call_count: Some(3),
-        });
-        let p = notification_for_event(&ev).expect("should notify");
-        assert!(p.title.contains("New record prompt"));
-        assert!(p.body.contains("30,000"));
-        assert!(p.body.contains("3 calls"));
     }
 
     #[test]
@@ -268,8 +209,6 @@ mod tests {
             previous_record: None,
             day: Some("2026-04-22".into()),
             workspace: None,
-            turn_id: None,
-            call_count: None,
         });
         assert!(notification_for_event(&ev).is_none());
     }
@@ -325,16 +264,6 @@ mod tests {
                 days: 3,
                 kind: "threshold".into(), // dropped
             }),
-            ActivityEvent::Milestone(MilestoneEvent {
-                observed_at: ts(),
-                milestone_tokens_saved: 1_000_000, // kept
-                kind: "first_1m".into(),
-            }),
-            ActivityEvent::Milestone(MilestoneEvent {
-                observed_at: ts(),
-                milestone_tokens_saved: 20_000_000, // dropped (not in notify set)
-                kind: "repeating_10m".into(),
-            }),
             ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
                 observed_at: ts(),
                 count: 3,
@@ -347,10 +276,9 @@ mod tests {
             }),
         ];
         let payloads = collect_notification_payloads(&events);
-        assert_eq!(payloads.len(), 3);
-        assert!(payloads[0].title.contains("1M"));
-        assert!(payloads[1].title.contains("Headroom is learning"));
-        assert!(payloads[2].title.contains("New longest streak"));
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads[0].title.contains("Headroom is learning"));
+        assert!(payloads[1].title.contains("New longest streak"));
     }
 
     #[test]
@@ -372,19 +300,11 @@ mod tests {
                 previous_record: None,
                 day: Some("2026-04-22".into()),
                 workspace: None,
-                turn_id: None,
-                call_count: None,
             }),
             ActivityEvent::SavingsMilestone(SavingsMilestoneEvent {
                 observed_at: ts(),
                 milestone_usd: 10,
                 kind: "first_10".into(),
-            }),
-            ActivityEvent::NewModel(NewModelEvent {
-                observed_at: ts(),
-                model: "x".into(),
-                provider: None,
-                workspace: None,
             }),
             ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: ts(),

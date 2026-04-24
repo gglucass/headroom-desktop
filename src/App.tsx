@@ -355,9 +355,7 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
       case "weeklyRecap":
         return `wr:${event.data.weekStart}`;
       case "rtkBatch":
-      case "milestone":
       case "record":
-      case "newModel":
       case "streak":
       case "savingsMilestone":
       case "learningsMilestone":
@@ -4013,17 +4011,7 @@ export default function App() {
                           headroomLearnBusy ||
                           claudeProjectsBusy ||
                           (headroomLearnStatus.running && !isRunning);
-                        const suggestRerun =
-                          !isRunning &&
-                          project.lastLearnRanAt !== null &&
-                          project.activeDaysSinceLastLearn >= 2;
-                        const learnMeta = (() => {
-                          const base = formatLearnStatus(project);
-                          const stalePart = suggestRerun
-                            ? `${project.activeDaysSinceLastLearn} active day${project.activeDaysSinceLastLearn === 1 ? "" : "s"} since · consider rerunning`
-                            : null;
-                          return [base, stalePart].filter(Boolean).join(" · ");
-                        })();
+                        const learnMeta = formatLearnStatus(project);
                         const refreshLabel = isRunning
                           ? "Training…"
                           : "Train now";
@@ -4053,7 +4041,7 @@ export default function App() {
                             <div className="optimize-project-row__main">
                               <span className="optimize-project-row__name">
                                 <strong>{project.displayName}</strong>
-                                <small className={suggestRerun ? "optimize-project-row__stale" : undefined}>
+                                <small>
                                   <span className="optimize-project-row__training">
                                     {learnMeta}
                                     <button
@@ -4840,6 +4828,12 @@ export default function App() {
                     Published: {formatDateTime(appUpdateAvailable.publishedAt ?? null)}
                   </li>
                 </ul>
+                {appUpdateAvailable.notes && appUpdateAvailable.notes.trim() ? (
+                  <div className="release-notes">
+                    <h4>What&apos;s new</h4>
+                    <pre>{appUpdateAvailable.notes.trim()}</pre>
+                  </div>
+                ) : null}
                 <div className="modal-actions">
                   <button
                     className="secondary-button"

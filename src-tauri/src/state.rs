@@ -72,12 +72,6 @@ pub struct ActivityObservation {
     pub recent: Vec<ActivityEvent>,
 }
 
-impl PendingMilestones {
-    pub fn is_empty(&self) -> bool {
-        self.token.is_empty() && self.usd.is_empty()
-    }
-}
-
 /// Emit the runtime upgrade progress event on the given AppHandle.
 pub fn emit_runtime_upgrade_progress(app: &tauri::AppHandle, state: &AppState) {
     use tauri::Emitter;
@@ -1295,20 +1289,17 @@ impl AppState {
         self.activity_facts.lock().transformation_history()
     }
 
-    /// Record milestone crossings into ActivityFacts so they appear in the
-    /// next activity feed poll. Called alongside the existing telemetry path.
+    /// Record USD savings milestones into ActivityFacts so they appear in the
+    /// next activity feed poll. Token milestones still feed analytics + the
+    /// desktop notification via `notification_for_token_milestone` in lib.rs,
+    /// but they no longer surface in the Activity tab.
     pub fn record_activity_milestones(&self, milestones: &PendingMilestones) {
-        if milestones.is_empty() {
+        if milestones.usd.is_empty() {
             return;
         }
         let mut facts = self.activity_facts.lock();
         let observed_at = Utc::now();
-        if !milestones.token.is_empty() {
-            facts.record_milestones(&milestones.token, observed_at);
-        }
-        if !milestones.usd.is_empty() {
-            facts.record_savings_milestones(&milestones.usd, observed_at);
-        }
+        facts.record_savings_milestones(&milestones.usd, observed_at);
         let _ = facts.save_if_dirty();
     }
 
@@ -4441,12 +4432,14 @@ mod tests {
             !first.fresh.is_empty(),
             "first observation should emit fresh events"
         );
+        // First compression that beats the zero baseline emits a Daily+AllTime
+        // Record.
         assert!(
             first
                 .fresh
                 .iter()
-                .any(|e| matches!(e, ActivityEvent::NewModel(_))),
-            "first seen model should fire"
+                .any(|e| matches!(e, ActivityEvent::Record(_))),
+            "first record should fire"
         );
         assert_eq!(first.fresh.len(), first.recent.len());
 
@@ -4484,7 +4477,7 @@ mod tests {
     fn runtime_maintenance_plan_prefers_requirements_repair_when_only_lock_is_stale() {
         let base_dir = temp_test_dir("headroom-maintenance-repair");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        write_headroom_receipt(&base_dir, "0.10.7", "stale");
+        write_headroom_receipt(&base_dir, "0.10.8", "stale");
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(matches!(
@@ -4504,7 +4497,7 @@ mod tests {
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         match plan {
             Some(super::RuntimeMaintenancePlan::Upgrade(release)) => {
-                assert_eq!(release.version(), "0.10.7");
+                assert_eq!(release.version(), "0.10.8");
             }
             _ => panic!("expected version upgrade plan"),
         }

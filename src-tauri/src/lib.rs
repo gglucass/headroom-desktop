@@ -1453,9 +1453,7 @@ fn activity_event_timestamp(event: &ActivityEvent) -> String {
         ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
         ActivityEvent::Memory(m) => m.created_at.clone(),
         ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
-        ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
         ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
@@ -3197,8 +3195,8 @@ mod tests {
         DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use crate::models::{
-        ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, MilestoneEvent, NewModelEvent,
-        RecordEvent, RecordTag, RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
+        ActivityEvent, LearningsMilestoneEvent, MemoryFeedEvent, RecordEvent, RecordTag,
+        RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
     use chrono::{DateTime, TimeZone, Timelike, Utc};
     use parking_lot::Mutex;
@@ -3366,6 +3364,28 @@ mod tests {
         assert_eq!(
             app_update_notification_body("   "),
             "A Headroom update is ready to install. Open Headroom to review the release and install it."
+        );
+    }
+
+    #[test]
+    fn macos_notifications_do_not_wait_for_clicks() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("#[cfg(target_os = \"macos\")]\nfn show_notification_impl")
+            .expect("macOS notification implementation exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n#[cfg(not(target_os = \"macos\"))]")
+            .expect("non-macOS notification implementation follows macOS implementation");
+        let macos_impl = &rest[..end];
+
+        assert!(
+            macos_impl.contains(".asynchronous(true)"),
+            "macOS notifications must be fire-and-forget so they do not spin a click-wait run loop"
+        );
+        assert!(
+            !macos_impl.contains(".wait_for_click("),
+            "wait_for_click caused Headroom to hold a full CPU core while notifications were pending"
         );
     }
 
@@ -3967,9 +3987,7 @@ mod tests {
             ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
             ActivityEvent::Memory(m) => m.created_at.clone(),
             ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::Milestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::NewModel(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
             ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
@@ -4150,17 +4168,6 @@ mod tests {
         };
         let memories = vec![make_memory("m", "2026-04-21T12:30:00Z")];
         let synthetic = vec![
-            ActivityEvent::Milestone(MilestoneEvent {
-                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 14, 0, 0).unwrap(),
-                milestone_tokens_saved: 1_000_000,
-                kind: "first_1m".into(),
-            }),
-            ActivityEvent::NewModel(NewModelEvent {
-                observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 9, 0, 0).unwrap(),
-                model: "claude-opus-4-7".into(),
-                provider: Some("anthropic".into()),
-                workspace: None,
-            }),
             ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 13, 0, 0).unwrap(),
                 commands_delta: 5,
@@ -4179,15 +4186,13 @@ mod tests {
                 previous_record: Some(500),
                 day: None,
                 workspace: None,
-                turn_id: None,
-                call_count: None,
             }),
         ];
 
         let resp =
             build_activity_feed_response(Some(transformations), memories, synthetic, true, 50);
 
-        assert_eq!(resp.events.len(), 6);
+        assert_eq!(resp.events.len(), 4);
         let kinds: Vec<&str> = resp
             .events
             .iter()
@@ -4195,9 +4200,7 @@ mod tests {
                 ActivityEvent::Transformation(_) => "transformation",
                 ActivityEvent::Memory(_) => "memory",
                 ActivityEvent::RtkBatch(_) => "rtkBatch",
-                ActivityEvent::Milestone(_) => "milestone",
                 ActivityEvent::Record(_) => "record",
-                ActivityEvent::NewModel(_) => "newModel",
                 ActivityEvent::Streak(_) => "streak",
                 ActivityEvent::SavingsMilestone(_) => "savingsMilestone",
                 ActivityEvent::WeeklyRecap(_) => "weeklyRecap",
@@ -4207,14 +4210,7 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![
-                "milestone",
-                "rtkBatch",
-                "memory",
-                "record",
-                "transformation",
-                "newModel",
-            ]
+            vec!["rtkBatch", "memory", "record", "transformation"]
         );
     }
 
@@ -4261,10 +4257,10 @@ mod tests {
     fn coalesce_rtk_batches_does_not_merge_across_non_rtk_event() {
         let events = vec![
             rtk(12, 0, 5, 1000, 100),
-            ActivityEvent::Milestone(MilestoneEvent {
+            ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
                 observed_at: Utc.with_ymd_and_hms(2026, 4, 21, 11, 55, 0).unwrap(),
-                milestone_tokens_saved: 1_000_000,
-                kind: "first_1m".into(),
+                count: 3,
+                kind: "first_3".into(),
             }),
             rtk(11, 51, 2, 400, 92),
         ];

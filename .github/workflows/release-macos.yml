@@ -235,6 +235,26 @@ jobs:
         if: steps.release_guard.outputs.should_release == 'true'
         run: ./scripts/verify-release.sh
 
+      - name: Load release notes
+        if: steps.release_guard.outputs.should_release == 'true'
+        id: release_notes
+        env:
+          PACKAGE_VERSION: ${{ steps.release_guard.outputs.package_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes_file=".github/release-notes/${PACKAGE_VERSION}.md"
+          # Body drives both the GitHub release page and latest.json `notes`,
+          # which the in-app update dialog renders. When the per-version file
+          # is missing, ship an empty body so the dialog skips the notes block.
+          {
+            echo "body<<RELEASE_NOTES_EOF"
+            if [[ -f "$notes_file" ]]; then
+              cat "$notes_file"
+            fi
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish Tauri release
         if: steps.release_guard.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@action-v0.6.2
@@ -258,9 +278,8 @@ jobs:
           projectPath: .
           tagName: v__VERSION__
           releaseName: Headroom v__VERSION__
-          releaseBody: |
-            macOS release artifacts for Headroom.
-          generateReleaseNotes: true
+          releaseBody: ${{ steps.release_notes.outputs.body }}
+          generateReleaseNotes: false
           releaseDraft: false
           prerelease: false
           assetNamePattern: '[name]_[version]_mac[ext]'

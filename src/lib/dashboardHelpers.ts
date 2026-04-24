@@ -306,14 +306,13 @@ export function formatRelativeTime(
 
 export function formatLearnStatus(project: {
   lastLearnRanAt: string | null;
-  hasPersistedLearnings?: boolean;
 }): string {
   if (!project.lastLearnRanAt) {
-    return project.hasPersistedLearnings ? "existing training found" : "never trained";
+    return "never trained";
   }
   const parsed = new Date(project.lastLearnRanAt);
   if (Number.isNaN(parsed.getTime())) {
-    return project.hasPersistedLearnings ? "existing training found" : "never trained";
+    return "never trained";
   }
   const diffMs = Date.now() - parsed.getTime();
   const diffDays = Math.floor(diffMs / 86_400_000);

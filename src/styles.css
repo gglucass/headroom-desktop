@@ -2198,10 +2198,6 @@ select {
   padding: 12px;
 }
 
-.optimize-project-row__stale {
-  color: #9C7A54;
-}
-
 .optimize-card {
   padding: 0;
   overflow: hidden;
@@ -2701,6 +2697,35 @@ details[open] .optimize-minimal__details summary::after {
 
 .api-key-guide a:hover {
   text-decoration: underline;
+}
+
+.release-notes {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.release-notes h4 {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.release-notes pre {
+  margin: 0;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .api-key-input-row {
@@ -4375,19 +4400,9 @@ html.window-hiding {
   color: #5a4990;
 }
 
-.activity-feed__item--memory {
-  background: rgba(247, 244, 250, 0.7);
-  border-color: rgba(108, 90, 165, 0.18);
-}
-
 .activity-feed__badge--rtk {
   background: rgba(190, 95, 55, 0.15);
   color: #9a4a2b;
-}
-
-.activity-feed__item--rtk {
-  background: rgba(250, 245, 240, 0.7);
-  border-color: rgba(190, 95, 55, 0.18);
 }
 
 .activity-feed__badge--milestone {
@@ -4395,19 +4410,9 @@ html.window-hiding {
   color: #8a5a14;
 }
 
-.activity-feed__item--milestone {
-  background: rgba(251, 247, 235, 0.7);
-  border-color: rgba(203, 150, 50, 0.2);
-}
-
 .activity-feed__badge--record {
   background: var(--accent-tint-strong);
   color: var(--accent-strong);
-}
-
-.activity-feed__item--record {
-  background: var(--accent-tint);
-  border-color: var(--accent-tint-strong);
 }
 
 .activity-feed__tag {
@@ -4434,19 +4439,9 @@ html.window-hiding {
   color: #2e6b52;
 }
 
-.activity-feed__item--new-model {
-  background: rgba(242, 249, 245, 0.7);
-  border-color: rgba(70, 140, 110, 0.18);
-}
-
 .activity-feed__badge--streak {
   background: rgba(160, 100, 200, 0.15);
   color: #5a3480;
-}
-
-.activity-feed__item--streak {
-  background: rgba(247, 243, 252, 0.7);
-  border-color: rgba(160, 100, 200, 0.18);
 }
 
 .activity-feed__streak-record {
@@ -4462,19 +4457,9 @@ html.window-hiding {
   color: #6e4a10;
 }
 
-.activity-feed__item--savings-milestone {
-  background: rgba(252, 248, 238, 0.7);
-  border-color: rgba(220, 165, 60, 0.2);
-}
-
 .activity-feed__badge--weekly-recap {
   background: rgba(90, 130, 170, 0.15);
   color: #2d4a6e;
-}
-
-.activity-feed__item--weekly-recap {
-  background: rgba(242, 246, 251, 0.7);
-  border-color: rgba(90, 130, 170, 0.18);
 }
 
 .activity-feed__week-range {
@@ -4497,19 +4482,9 @@ html.window-hiding {
   color: #4a3a82;
 }
 
-.activity-feed__item--learnings-milestone {
-  background: rgba(247, 244, 252, 0.7);
-  border-color: rgba(108, 90, 165, 0.22);
-}
-
 .activity-feed__badge--train {
   background: var(--accent-tint-strong);
   color: var(--accent-strong);
-}
-
-.activity-feed__item--train {
-  background: var(--accent-tint);
-  border-color: var(--accent-tint-strong);
 }
 
 .activity-feed__scope {

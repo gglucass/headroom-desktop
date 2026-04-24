@@ -22,10 +22,10 @@ use crate::models::{ManagedTool, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.10.7";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/2f/29/68a4fa5e60f958a41347b84965dd0e42d2d6a08a583ae4a218336305804a/headroom_ai-0.10.7-py3-none-any.whl";
+const HEADROOM_PINNED_VERSION: &str = "0.10.8";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/cd/e8/47c8c19857de3eb5eeefe408955bcd0114df666a2d401bcc89950b681e71/headroom_ai-0.10.8-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "c214d82b3448af0d9aebe6d475e4539fe79ba7415bd87467983bd1c223805e66";
+    "5e9df6b33af3d238355ab2045b2f28dda45fae8ab0ae5eb703b30870227f9764";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -1406,34 +1406,42 @@ impl ToolManager {
     fn write_upgrade_marker(
         &self,
         target_version: &str,
-        wheel_only_previous_version: Option<&str>,
+        in_place_previous_version: Option<&str>,
+        in_place_previous_lock_backup: Option<&Path>,
     ) -> Result<()> {
         let marker = self.upgrade_marker_path();
         let mut body = json!({
             "target_version": target_version,
             "started_at": Utc::now().to_rfc3339(),
         });
-        if let Some(previous) = wheel_only_previous_version {
-            body["wheel_only"] = json!(true);
+        if let Some(previous) = in_place_previous_version {
+            body["in_place"] = json!(true);
             body["previous_version"] = json!(previous);
+        }
+        if let Some(backup) = in_place_previous_lock_backup {
+            body["previous_lock_backup"] = json!(backup);
         }
         std::fs::write(&marker, serde_json::to_vec_pretty(&body)?)
             .with_context(|| format!("writing {}", marker.display()))?;
         Ok(())
     }
 
-    /// Read the in-progress upgrade marker and, if it records a wheel-only
-    /// upgrade, return (previous_version, target_version). Returns None for
-    /// missing markers and for full-venv-rebuild markers.
-    fn read_wheel_only_marker(&self) -> Option<(String, String)> {
+    /// Read the in-progress upgrade marker and, if it records an in-place
+    /// upgrade, return (previous_version, target_version, previous_lock_backup).
+    /// Returns None for missing markers and for full-venv-rebuild markers.
+    fn read_in_place_marker(&self) -> Option<(String, String, Option<PathBuf>)> {
         let bytes = std::fs::read(self.upgrade_marker_path()).ok()?;
         let body: Value = serde_json::from_slice(&bytes).ok()?;
-        if body.get("wheel_only").and_then(|v| v.as_bool()) != Some(true) {
+        if body.get("in_place").and_then(|v| v.as_bool()) != Some(true) {
             return None;
         }
         let previous = body.get("previous_version")?.as_str()?.to_string();
         let target = body.get("target_version")?.as_str()?.to_string();
-        Some((previous, target))
+        let lock_backup = body
+            .get("previous_lock_backup")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        Some((previous, target, lock_backup))
     }
 
     fn clear_upgrade_marker(&self) {
@@ -1454,15 +1462,23 @@ impl ToolManager {
             return false;
         }
 
-        // Wheel-only recovery: pip install is atomic per-package, so the venv
-        // is either at target_version or previous_version. Force-reinstall
-        // previous_version so the next launch starts from a known-good state,
-        // then let `check_headroom_upgrade` retry the swap fresh.
-        if let Some((previous_version, _target)) = self.read_wheel_only_marker() {
+        // In-place recovery: pip install is atomic per-package, so the venv
+        // may be in a mixed state (some packages at target pins, others at
+        // previous pins). Restore deps from the lock snapshot (if the
+        // interrupted upgrade took that path) and force-reinstall the prior
+        // headroom-ai so the next launch starts from a known-good state.
+        // `check_headroom_upgrade` will then retry the swap fresh.
+        if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
+        {
             eprintln!(
-                "recover_from_interrupted_upgrade: wheel-only upgrade was in progress; \
+                "recover_from_interrupted_upgrade: in-place upgrade was in progress; \
                  reinstalling previous headroom-ai {previous_version}"
             );
+            if let Some(ref backup) = previous_lock_backup {
+                let _ = self.pip_restore_deps_from_backup(backup);
+                let _ = std::fs::copy(backup, self.active_lock_path());
+                let _ = std::fs::remove_file(backup);
+            }
             let _ = self.pip_force_reinstall_headroom_version(&previous_version);
             let receipt_backup = self.headroom_receipt_backup_path();
             let receipt_path = self.headroom_receipt_path();
@@ -1551,11 +1567,14 @@ impl ToolManager {
         // Restore it before doing anything destructive.
         let _recovered = self.recover_from_interrupted_upgrade();
 
-        // Fast path: when only the headroom-ai version changed and the dep
-        // lock is unchanged, swap the wheel in place without rebuilding the
-        // venv or re-running `pip install -r lock`.
-        if let Some(previous_version) = self.can_do_wheel_only_upgrade_headroom() {
-            return self.wheel_only_upgrade_headroom(release, &previous_version, progress);
+        // In-place path: mutate the live venv rather than rebuilding it.
+        // Covers both the wheel-only case (lock unchanged) and the lock-churn
+        // case (`pip install --upgrade -r lock` reinstalls only the pins that
+        // actually differ). Falls through to the atomic rebuild only for
+        // fresh installs and the rare case where the lock snapshot needed
+        // for safe rollback is missing on disk.
+        if let Some(ctx) = self.prepare_in_place_upgrade() {
+            return self.in_place_upgrade_headroom(release, ctx, progress);
         }
 
         let venv_dir = self.runtime.venv_dir.clone();
@@ -1599,7 +1618,7 @@ impl ToolManager {
         // commit/rollback, the next launch can recognize and recover.
         let had_live_venv = venv_dir.exists();
         if had_live_venv {
-            if let Err(err) = self.write_upgrade_marker(&release.version, None) {
+            if let Err(err) = self.write_upgrade_marker(&release.version, None, None) {
                 return UpgradeOutcome::InstallFailed {
                     restored: false,
                     error: err.context("writing upgrade-in-progress marker"),
@@ -1690,9 +1709,21 @@ impl ToolManager {
     /// `state.rs` upgrade coordinator when boot validation fails.
     /// Idempotent — no-op if no backup exists.
     pub fn rollback_headroom_upgrade(&self) -> Result<()> {
-        // Wheel-only rollback: no venv backup, pip-reinstall the previous
-        // version in place and restore the receipt snapshot.
-        if let Some((previous_version, _)) = self.read_wheel_only_marker() {
+        // In-place rollback: no venv backup. Restore deps from the lock
+        // snapshot (if the upgrade touched the lock), then pip-reinstall the
+        // previous headroom-ai and restore the receipt.
+        if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
+        {
+            if let Some(ref backup) = previous_lock_backup {
+                self.pip_restore_deps_from_backup(backup).with_context(|| {
+                    format!(
+                        "rollback failed — could not restore dependencies from {}",
+                        backup.display()
+                    )
+                })?;
+                let _ = std::fs::copy(backup, self.active_lock_path());
+                let _ = std::fs::remove_file(backup);
+            }
             self.pip_force_reinstall_headroom_version(&previous_version)
                 .with_context(|| {
                     format!(
@@ -1726,33 +1757,70 @@ impl ToolManager {
         Ok(())
     }
 
-    /// Returns `Some(previous_version)` if the next `atomic_upgrade_headroom`
-    /// call can be satisfied by a wheel-only swap (pip `--force-reinstall
-    /// --no-deps`) without rebuilding the venv. Requires an installed version
-    /// plus a stored requirements-lock sha that matches the current lock's
-    /// comment-insensitive sha (or a known legacy full-file sha).
-    fn can_do_wheel_only_upgrade_headroom(&self) -> Option<String> {
-        let installed = self.installed_headroom_version()?;
-        let stored = self.installed_requirements_lock_sha()?;
+    /// Returns true if the bundled requirements lock's dep pins differ from
+    /// what was installed (ignoring comment/whitespace churn). Conservative:
+    /// if we can't determine the installed sha, assume it differs.
+    fn lock_pins_differ_from_installed(&self) -> bool {
+        let Some(stored) = self.installed_requirements_lock_sha() else {
+            return true;
+        };
         let current = requirements_lock_sha(bootstrap_requirements_lock());
-        if stored == current || LEGACY_REQUIREMENTS_LOCK_SHAS.contains(&stored.as_str()) {
-            Some(installed)
-        } else {
-            None
-        }
+        stored != current && !LEGACY_REQUIREMENTS_LOCK_SHAS.contains(&stored.as_str())
     }
 
-    /// Wheel-only upgrade: swap the `headroom-ai` package in place with
-    /// `pip install --no-deps --force-reinstall`. The venv and all transitive
-    /// deps are untouched. Eligibility is gated by
-    /// [`Self::can_do_wheel_only_upgrade_headroom`].
+    fn active_lock_path(&self) -> PathBuf {
+        self.runtime
+            .downloads_dir
+            .join("headroom-requirements.lock")
+    }
+
+    fn lock_backup_path(&self) -> PathBuf {
+        self.runtime
+            .downloads_dir
+            .join("headroom-requirements.lock.backup")
+    }
+
+    /// Prepare to upgrade the runtime in place (no venv rebuild). Returns
+    /// `None` when the caller should fall back to the full atomic rebuild:
+    /// either there is no prior install to upgrade, or the lock churned but
+    /// the active lock file is missing on disk so we can't safely snapshot
+    /// for rollback.
     ///
-    /// On smoke-test failure, attempts to re-pin the previous version via pip
-    /// (which will hit pip's wheel cache for the common case).
-    fn wheel_only_upgrade_headroom<F>(
+    /// When `Some`, the caller owns `previous_lock_backup` (if set): on
+    /// success, `commit_headroom_upgrade` deletes it; on failure, rollback
+    /// uses it to restore the prior pin set.
+    fn prepare_in_place_upgrade(&self) -> Option<InPlaceUpgradeContext> {
+        let previous_version = self.installed_headroom_version()?;
+        let previous_lock_backup = if self.lock_pins_differ_from_installed() {
+            let active = self.active_lock_path();
+            if !active.exists() {
+                return None;
+            }
+            let backup = self.lock_backup_path();
+            let _ = std::fs::remove_file(&backup);
+            std::fs::copy(&active, &backup).ok()?;
+            Some(backup)
+        } else {
+            None
+        };
+        Some(InPlaceUpgradeContext {
+            previous_version,
+            previous_lock_backup,
+        })
+    }
+
+    /// In-place upgrade: mutate the live venv rather than rebuilding it.
+    /// When `ctx.previous_lock_backup` is set, runs
+    /// `pip install --upgrade -r lock` first so only churned dep pins are
+    /// reinstalled (pip skips packages already at the pinned version). Then
+    /// force-reinstalls the new `headroom-ai` wheel.
+    ///
+    /// On any failure, attempts to restore the prior version and (if
+    /// applicable) the prior lock via the same pip mechanism.
+    fn in_place_upgrade_headroom<F>(
         &self,
         release: &HeadroomRelease,
-        previous_version: &str,
+        ctx: InPlaceUpgradeContext,
         mut progress: F,
     ) -> UpgradeOutcome
     where
@@ -1767,6 +1835,9 @@ impl ToolManager {
         // Snapshot the receipt so rollback can restore the old artifact pointers.
         if receipt_path.exists() {
             if let Err(err) = std::fs::copy(&receipt_path, &receipt_backup) {
+                if let Some(ref p) = ctx.previous_lock_backup {
+                    let _ = std::fs::remove_file(p);
+                }
                 return UpgradeOutcome::InstallFailed {
                     restored: true,
                     error: anyhow!("failed to snapshot {}: {err}", receipt_path.display()),
@@ -1775,19 +1846,84 @@ impl ToolManager {
         }
 
         // Write marker so an interrupted upgrade can be recovered on next launch.
-        if let Err(err) = self.write_upgrade_marker(&release.version, Some(previous_version)) {
+        if let Err(err) = self.write_upgrade_marker(
+            &release.version,
+            Some(&ctx.previous_version),
+            ctx.previous_lock_backup.as_deref(),
+        ) {
             let _ = std::fs::remove_file(&receipt_backup);
+            if let Some(ref p) = ctx.previous_lock_backup {
+                let _ = std::fs::remove_file(p);
+            }
             return UpgradeOutcome::InstallFailed {
                 restored: true,
                 error: err.context("writing upgrade-in-progress marker"),
             };
         }
 
+        // Dep-lock upgrade (only when pins changed).
+        if ctx.previous_lock_backup.is_some() {
+            progress(BootstrapStepUpdate {
+                step: "Updating dependencies",
+                message: "Updating Headroom's bundled dependencies.".into(),
+                eta_seconds: 45,
+                percent: 15,
+            });
+
+            let requirements_lock = bootstrap_requirements_lock();
+            let lock_path = match self.write_headroom_requirements_lock(requirements_lock) {
+                Ok(p) => p,
+                Err(err) => {
+                    let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                    return UpgradeOutcome::InstallFailed { restored, error: err };
+                }
+            };
+
+            let deps_start = std::time::Instant::now();
+            let deps_progress_ref = std::cell::RefCell::new(&mut progress);
+            let mut dep_counter: u32 = 0;
+            if let Err(err) = run_pip_install_with_retries_streaming(
+                &self.runtime.managed_python(),
+                &[
+                    "-m",
+                    "pip",
+                    "install",
+                    "--timeout",
+                    "180",
+                    "--retries",
+                    "10",
+                    "--find-links",
+                    VENDOR_WHEELS_INDEX_URL,
+                    "--extra-index-url",
+                    "https://pypi.org/simple",
+                    "--upgrade",
+                    "--requirement",
+                    lock_path.to_string_lossy().as_ref(),
+                ],
+                &self.runtime.root_dir,
+                |line| {
+                    if let Some(update) =
+                        pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 15, 55)
+                    {
+                        if let Ok(mut cb) = deps_progress_ref.try_borrow_mut() {
+                            (cb)(update);
+                        }
+                    }
+                },
+            ) {
+                let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                return UpgradeOutcome::InstallFailed {
+                    restored,
+                    error: err.context("upgrading Headroom's bundled dependencies in place"),
+                };
+            }
+        }
+
         progress(BootstrapStepUpdate {
             step: "Downloading update",
             message: "Fetching Headroom update bundle.".into(),
             eta_seconds: 10,
-            percent: 20,
+            percent: 60,
         });
 
         let wheel_path = self
@@ -1809,7 +1945,7 @@ impl ToolManager {
             step: "Applying update",
             message: "Installing the new Headroom wheel.".into(),
             eta_seconds: 10,
-            percent: 55,
+            percent: 75,
         });
 
         let headroom_spec = format!("headroom-ai=={}", release.version);
@@ -1836,16 +1972,14 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
         ) {
-            // pip install is atomic per-package; the venv remains on previous_version.
-            let _ = std::fs::remove_file(&receipt_backup);
-            self.clear_upgrade_marker();
+            let restored = self.rollback_in_place_upgrade_inner(&ctx);
             let context_msg = if use_wheel {
                 "installing verified Headroom wheel into Headroom-managed virtualenv"
             } else {
                 "installing headroom-ai from PyPI into Headroom-managed virtualenv"
             };
             return UpgradeOutcome::InstallFailed {
-                restored: true,
+                restored,
                 error: err.context(context_msg),
             };
         }
@@ -1854,11 +1988,11 @@ impl ToolManager {
             step: "Verifying install",
             message: "Running Headroom import smoke test.".into(),
             eta_seconds: 3,
-            percent: 80,
+            percent: 85,
         });
 
         if let Err(err) = self.smoke_test_headroom() {
-            let restored = self.rollback_wheel_only_upgrade_inner(previous_version);
+            let restored = self.rollback_in_place_upgrade_inner(&ctx);
             return UpgradeOutcome::InstallFailed { restored, error: err };
         }
 
@@ -1866,7 +2000,7 @@ impl ToolManager {
             step: "Configuring integrations",
             message: "Setting up Headroom MCP integration.".into(),
             eta_seconds: 5,
-            percent: 90,
+            percent: 92,
         });
 
         let mcp_install = match self.install_headroom_mcp() {
@@ -1885,8 +2019,9 @@ impl ToolManager {
             }
         };
 
-        if let Err(err) = self.update_headroom_receipt_after_wheel_swap(release, mcp_install) {
-            let restored = self.rollback_wheel_only_upgrade_inner(previous_version);
+        if let Err(err) = self.update_headroom_receipt_after_in_place_upgrade(release, mcp_install)
+        {
+            let restored = self.rollback_in_place_upgrade_inner(&ctx);
             return UpgradeOutcome::InstallFailed { restored, error: err };
         }
 
@@ -1923,9 +2058,53 @@ impl ToolManager {
         .with_context(|| format!("reinstalling Headroom version {version}"))
     }
 
-    fn rollback_wheel_only_upgrade_inner(&self, previous_version: &str) -> bool {
-        let pip_ok = self
-            .pip_force_reinstall_headroom_version(previous_version)
+    /// Restore deps from `previous_lock_backup` via
+    /// `pip install --upgrade -r <backup>` — packages already at the old pin
+    /// are skipped by pip, only packages that were actually churned by the
+    /// failed upgrade get reinstalled.
+    fn pip_restore_deps_from_backup(&self, backup_lock: &Path) -> Result<()> {
+        run_pip_install_with_retries(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--find-links",
+                VENDOR_WHEELS_INDEX_URL,
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--upgrade",
+                "--requirement",
+                backup_lock.to_string_lossy().as_ref(),
+            ],
+            &self.runtime.root_dir,
+        )
+        .with_context(|| {
+            format!(
+                "restoring Headroom dependencies from {}",
+                backup_lock.display()
+            )
+        })
+    }
+
+    fn rollback_in_place_upgrade_inner(&self, ctx: &InPlaceUpgradeContext) -> bool {
+        // Restore deps first so headroom-ai lands on a consistent dep set.
+        let deps_ok = match ctx.previous_lock_backup.as_deref() {
+            Some(backup) => {
+                let ok = self.pip_restore_deps_from_backup(backup).is_ok();
+                let active = self.active_lock_path();
+                let _ = std::fs::copy(backup, &active);
+                let _ = std::fs::remove_file(backup);
+                ok
+            }
+            None => true,
+        };
+        let wheel_ok = self
+            .pip_force_reinstall_headroom_version(&ctx.previous_version)
             .is_ok();
         let receipt_backup = self.headroom_receipt_backup_path();
         let receipt_path = self.headroom_receipt_path();
@@ -1937,10 +2116,10 @@ impl ToolManager {
             true
         };
         self.clear_upgrade_marker();
-        pip_ok && receipt_ok
+        deps_ok && wheel_ok && receipt_ok
     }
 
-    fn update_headroom_receipt_after_wheel_swap(
+    fn update_headroom_receipt_after_in_place_upgrade(
         &self,
         release: &HeadroomRelease,
         mcp_install: Value,
@@ -1954,7 +2133,6 @@ impl ToolManager {
         if let Some(artifact) = receipt.get_mut("artifact").and_then(|a| a.as_object_mut()) {
             artifact.insert("url".into(), json!(release.wheel_url));
             artifact.insert("sha256".into(), json!(release.sha256));
-            // Migrate any legacy full-file sha to the comment-insensitive form.
             artifact.insert(
                 "requirementsLockSha256".into(),
                 json!(requirements_lock_sha(bootstrap_requirements_lock())),
@@ -1980,6 +2158,7 @@ impl ToolManager {
             }
         }
         let _ = std::fs::remove_file(self.headroom_receipt_backup_path());
+        let _ = std::fs::remove_file(self.lock_backup_path());
         // Clear the in-progress marker last, so a mid-commit crash (e.g.,
         // between the remove_dir_all of the backup and the marker cleanup)
         // still looks like an interrupted upgrade on the next launch and
@@ -2596,6 +2775,16 @@ pub enum UpgradeOutcome {
         restored: bool,
         error: anyhow::Error,
     },
+}
+
+/// State required to perform (and roll back) an in-place upgrade — i.e. an
+/// upgrade that mutates the live venv instead of rebuilding it. When
+/// `previous_lock_backup` is `Some`, the dep lock has churned and the file at
+/// that path is the pre-upgrade lock content, used by rollback and recovery
+/// to `pip install --upgrade -r <backup>` back to the prior pin set.
+pub(crate) struct InPlaceUpgradeContext {
+    pub(crate) previous_version: String,
+    pub(crate) previous_lock_backup: Option<PathBuf>,
 }
 
 /// Best-effort free-bytes query for the volume backing `path`. Returns None
@@ -4096,6 +4285,100 @@ after
     }
 
     #[test]
+    fn commit_headroom_upgrade_removes_lock_backup() {
+        let (root, _runtime, manager) = seed_test_runtime("commit-lock-backup");
+        let lock_backup = manager.lock_backup_path();
+        fs::write(&lock_backup, b"old-lock==1.0\n").expect("seed lock backup");
+
+        manager.commit_headroom_upgrade().expect("commit ok");
+
+        assert!(
+            !lock_backup.exists(),
+            "in-place lock backup should be removed on commit"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_and_read_in_place_marker_roundtrip() {
+        let (root, _runtime, manager) = seed_test_runtime("marker-roundtrip");
+        let lock_backup = manager.lock_backup_path();
+        fs::write(&lock_backup, b"old-lock\n").expect("seed lock backup");
+
+        manager
+            .write_upgrade_marker("0.11.0", Some("0.10.8"), Some(&lock_backup))
+            .expect("marker");
+
+        let (prev, target, backup) = manager
+            .read_in_place_marker()
+            .expect("marker should parse as in-place");
+        assert_eq!(prev, "0.10.8");
+        assert_eq!(target, "0.11.0");
+        assert_eq!(backup.as_deref(), Some(lock_backup.as_path()));
+
+        // Atomic-rebuild markers (no previous_version) must not parse as in-place.
+        manager
+            .write_upgrade_marker("0.11.0", None, None)
+            .expect("atomic marker");
+        assert!(manager.read_in_place_marker().is_none());
+
+        // Wheel-only shape (previous_version but no lock backup).
+        manager
+            .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
+            .expect("wheel-only marker");
+        let (prev, target, backup) = manager.read_in_place_marker().expect("parse");
+        assert_eq!(prev, "0.10.7");
+        assert_eq!(target, "0.10.8");
+        assert!(backup.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_headroom_receipt_after_in_place_upgrade_rewrites_artifact() {
+        let (root, runtime, manager) = seed_test_runtime("receipt-rewrite");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.10.4",
+                "artifact": {
+                    "url": "https://old.example/headroom_ai-0.10.4.whl",
+                    "sha256": "oldoldold",
+                    "requirementsLockSha256": super::LEGACY_REQUIREMENTS_LOCK_SHAS[0],
+                },
+                "mcp": { "configured": false },
+            }))
+            .unwrap(),
+        )
+        .expect("seed receipt");
+
+        let release = HeadroomRelease {
+            version: "0.10.8".into(),
+            wheel_url: "https://new.example/headroom_ai-0.10.8.whl".into(),
+            sha256: "newnewnew".into(),
+        };
+        let mcp = serde_json::json!({ "configured": true, "proxyUrl": "http://127.0.0.1:6767" });
+        manager
+            .update_headroom_receipt_after_in_place_upgrade(&release, mcp.clone())
+            .expect("receipt update ok");
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("headroom.json")).expect("read receipt"),
+        )
+        .expect("parse receipt");
+        assert_eq!(receipt["version"], "0.10.8");
+        assert_eq!(receipt["artifact"]["url"], release.wheel_url);
+        assert_eq!(receipt["artifact"]["sha256"], release.sha256);
+        assert_eq!(
+            receipt["artifact"]["requirementsLockSha256"],
+            requirements_lock_sha(super::bootstrap_requirements_lock()),
+            "legacy sha must be migrated to the comment-insensitive form"
+        );
+        assert_eq!(receipt["mcp"], mcp);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rollback_headroom_upgrade_restores_from_backup() {
         // Simulate state after a boot-validation failure: a NEW venv is live
         // at venv_dir, the previous one is at venv_dir.backup, and the old
@@ -4162,7 +4445,7 @@ after
         fs::write(runtime.venv_dir.join("partial-marker"), b"interrupted").expect("partial");
         // Marker file and receipt backup (written by atomic_upgrade).
         manager
-            .write_upgrade_marker("0.8.2", None)
+            .write_upgrade_marker("0.8.2", None, None)
             .expect("marker");
         fs::copy(
             runtime.tools_dir.join("headroom.json"),
@@ -4199,6 +4482,84 @@ after
     fn recover_from_interrupted_upgrade_is_noop_without_marker() {
         let (root, _runtime, manager) = seed_test_runtime("interrupted-noop");
         assert!(!manager.recover_from_interrupted_upgrade());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_from_interrupted_upgrade_handles_wheel_only_marker() {
+        // In-place marker without a lock backup (wheel-only interrupted
+        // upgrade). The pip reinstall inside recovery fails harmlessly without
+        // a real python; we only assert the file-manipulation side: receipt
+        // restored, marker cleared.
+        let (root, runtime, manager) = seed_test_runtime("recover-wheel-only");
+        manager
+            .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.7"}"#,
+        )
+        .expect("receipt snapshot");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.10.8-partial"}"#,
+        )
+        .expect("partial receipt");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+
+        assert!(
+            !manager.upgrade_marker_path().exists(),
+            "marker cleared after recovery"
+        );
+        assert!(
+            !manager.headroom_receipt_backup_path().exists(),
+            "receipt backup consumed"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("headroom.json")).expect("read receipt"),
+        )
+        .expect("parse receipt");
+        assert_eq!(receipt["version"], "0.10.7", "receipt restored to previous");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_from_interrupted_upgrade_handles_in_place_marker_with_lock_backup() {
+        // In-place marker with a lock backup. Recovery should: copy the lock
+        // backup back to the active lock path, remove the backup, restore the
+        // receipt, and clear the marker. Pip calls fail harmlessly without a
+        // real python.
+        let (root, runtime, manager) = seed_test_runtime("recover-lock-backup");
+        let active_lock = manager.active_lock_path();
+        let lock_backup = manager.lock_backup_path();
+        fs::write(&active_lock, b"new-lock==2.0\n").expect("seed active lock");
+        fs::write(&lock_backup, b"old-lock==1.0\n").expect("seed lock backup");
+
+        manager
+            .write_upgrade_marker("0.11.0", Some("0.10.8"), Some(&lock_backup))
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.8"}"#,
+        )
+        .expect("receipt snapshot");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+
+        assert!(!manager.upgrade_marker_path().exists(), "marker cleared");
+        assert!(!lock_backup.exists(), "lock backup consumed");
+        assert_eq!(
+            fs::read(&active_lock).expect("read active lock"),
+            b"old-lock==1.0\n",
+            "active lock rolled back to snapshot content"
+        );
+        assert!(!manager.headroom_receipt_backup_path().exists());
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("headroom.json")).expect("read receipt"),
+        )
+        .expect("parse receipt");
+        assert_eq!(receipt["version"], "0.10.8");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4296,29 +4657,33 @@ after
     }
 
     #[test]
-    fn wheel_only_eligible_when_lock_sha_matches() {
-        let (root, runtime, manager) = seed_test_runtime("wheel-only-current");
+    fn prepare_in_place_skips_lock_snapshot_when_sha_matches() {
+        let (root, runtime, manager) = seed_test_runtime("in-place-current");
         let current_sha = requirements_lock_sha(super::bootstrap_requirements_lock());
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "0.10.4",
+                "version": "0.10.8",
                 "artifact": { "requirementsLockSha256": current_sha },
             }))
             .unwrap(),
         )
         .expect("receipt");
 
-        assert_eq!(
-            manager.can_do_wheel_only_upgrade_headroom(),
-            Some("0.10.4".to_string())
+        let ctx = manager
+            .prepare_in_place_upgrade()
+            .expect("eligible for in-place");
+        assert_eq!(ctx.previous_version, "0.10.8");
+        assert!(
+            ctx.previous_lock_backup.is_none(),
+            "lock unchanged => no snapshot"
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn wheel_only_eligible_when_stored_sha_is_legacy() {
-        let (root, runtime, manager) = seed_test_runtime("wheel-only-legacy");
+    fn prepare_in_place_skips_lock_snapshot_when_stored_sha_is_legacy() {
+        let (root, runtime, manager) = seed_test_runtime("in-place-legacy");
         let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
         fs::write(
             runtime.tools_dir.join("headroom.json"),
@@ -4330,16 +4695,17 @@ after
         )
         .expect("receipt");
 
-        assert_eq!(
-            manager.can_do_wheel_only_upgrade_headroom(),
-            Some("0.2.50".to_string())
-        );
+        let ctx = manager
+            .prepare_in_place_upgrade()
+            .expect("eligible for in-place");
+        assert_eq!(ctx.previous_version, "0.2.50");
+        assert!(ctx.previous_lock_backup.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn wheel_only_rejected_when_lock_sha_diverges() {
-        let (root, runtime, manager) = seed_test_runtime("wheel-only-divergent");
+    fn prepare_in_place_snapshots_lock_when_pins_differ() {
+        let (root, runtime, manager) = seed_test_runtime("in-place-lock-churn");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -4349,8 +4715,49 @@ after
             .unwrap(),
         )
         .expect("receipt");
+        fs::write(manager.active_lock_path(), b"old-lock-content==1.0\n")
+            .expect("seed active lock");
 
-        assert_eq!(manager.can_do_wheel_only_upgrade_headroom(), None);
+        let ctx = manager
+            .prepare_in_place_upgrade()
+            .expect("eligible for in-place");
+        assert_eq!(ctx.previous_version, "0.10.4");
+        let backup = ctx
+            .previous_lock_backup
+            .as_ref()
+            .expect("lock changed => snapshot taken");
+        assert_eq!(
+            fs::read(backup).expect("backup readable"),
+            b"old-lock-content==1.0\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_in_place_falls_back_to_atomic_when_lock_missing() {
+        // Lock pins differ AND the active lock is missing on disk => caller
+        // should fall through to the full atomic rebuild so rollback stays
+        // safe.
+        let (root, runtime, manager) = seed_test_runtime("in-place-no-lock-on-disk");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.10.4",
+                "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+        // no active lock written
+        assert!(manager.prepare_in_place_upgrade().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_in_place_skipped_without_installed_version() {
+        let (root, runtime, manager) = seed_test_runtime("in-place-no-receipt");
+        fs::remove_file(runtime.tools_dir.join("headroom.json")).expect("drop receipt");
+        assert!(manager.prepare_in_place_upgrade().is_none());
         let _ = fs::remove_dir_all(root);
     }
 

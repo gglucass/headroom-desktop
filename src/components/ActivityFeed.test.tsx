@@ -6,8 +6,6 @@ import type {
   ActivityFeedResponse,
   LearningsMilestoneEvent,
   MemoryFeedEvent,
-  MilestoneEvent,
-  NewModelEvent,
   RecordEvent,
   RtkBatchEvent,
   SavingsMilestoneEvent,
@@ -231,22 +229,22 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("No requests yet");
   });
 
-  it("keeps only the single largest compression and drops the rest", () => {
-    // Presence of compression is already conveyed by the savings graph and
-    // totals; a chronological list of every compression drowns out rarer
-    // events. The feed surfaces one "Recent large compression" row sourced
-    // from the biggest compression (by tokens saved) in the window.
+  it("surfaces only the most recent compression in the transformation tile", () => {
+    // One tile per kind — the compression tile updates its content to reflect
+    // the most recent transformation in the window. Older compressions are
+    // implied by the savings graph and totals elsewhere.
     const events: ActivityEvent[] = [
-      transformation({ requestId: "a", timestamp: "2026-04-21T10:02:00Z", tokensSaved: 100, savingsPercent: 10 }),
-      transformation({ requestId: "biggest", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 9_999, savingsPercent: 90 }),
-      transformation({ requestId: "c", timestamp: "2026-04-21T10:00:00Z", tokensSaved: 300, savingsPercent: 30 })
+      transformation({ requestId: "latest", timestamp: "2026-04-21T10:02:00Z", tokensSaved: 100, savingsPercent: 10 }),
+      transformation({ requestId: "middle", timestamp: "2026-04-21T10:01:00Z", tokensSaved: 9_999, savingsPercent: 90 }),
+      transformation({ requestId: "oldest", timestamp: "2026-04-21T10:00:00Z", tokensSaved: 300, savingsPercent: 30 })
     ];
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const rowCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
     expect(rowCount).toBe(1);
     expect(markup).toContain("Recent large compression");
-    expect(markup).toContain("Saved 9,999 tokens (90.0%)");
+    expect(markup).toContain("Saved 100 tokens (10.0%)");
+    expect(markup).not.toContain("9,999");
     expect(markup).not.toContain("Compression × ");
   });
 
@@ -292,31 +290,7 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("inserts a day-header row when a single compression on an earlier day survives the filter", () => {
-    // Only the largest compression across all days survives filterLowSignal;
-    // here that's the one from 2026-04-21. A memory on 2026-04-22 provides a
-    // second day so the renderer emits two day-headers, confirming the
-    // header logic still fires even though transformations no longer group.
-    // Pin "now" so neither fixture date is "today" (today's header is hidden).
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-25T10:00:00Z"));
-    try {
-      const events: ActivityEvent[] = [
-        memory({ id: "mem-late", createdAt: "2026-04-22T12:00:00Z" }),
-        transformation({ requestId: "earlier", timestamp: "2026-04-21T12:00:00Z", tokensSaved: 9_999, savingsPercent: 90 })
-      ];
-      const feed: ActivityFeedResponse = { ...baseFeed, events };
-      const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-      const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
-      expect(headerCount).toBe(2);
-      expect(markup).toContain("Recent large compression");
-      expect(markup).not.toContain("Compression × ");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("renders both kinds in the order they appear in the feed", () => {
+  it("renders both kinds in the fixed tile order (transformation before memory)", () => {
     const feed: ActivityFeedResponse = {
       ...baseFeed,
       events: [
@@ -329,7 +303,8 @@ describe("ActivityFeed", () => {
     const transformationIdx = markup.indexOf("openai");
     expect(memoryIdx).toBeGreaterThan(-1);
     expect(transformationIdx).toBeGreaterThan(-1);
-    expect(memoryIdx).toBeLessThan(transformationIdx);
+    // Tiles render in TILE_ORDER: transformation before memory.
+    expect(transformationIdx).toBeLessThan(memoryIdx);
   });
 
   it("renders an RTK batch row with deltas and cumulative totals", () => {
@@ -350,21 +325,6 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("1,234 tokens");
     expect(markup).toContain("2,888");
     expect(markup).toContain("12,805,724");
-  });
-
-  it("renders a milestone row with the formatted token count", () => {
-    const data: MilestoneEvent = {
-      observedAt: "2026-04-21T14:30:00Z",
-      milestoneTokensSaved: 5_000_000,
-      kind: "first_5m"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "milestone", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Milestone");
-    expect(markup).toContain("5M");
   });
 
   it("renders a daily record row with model and savings percent", () => {
@@ -436,22 +396,6 @@ describe("ActivityFeed", () => {
     expect(markup).toContain(">All-time<");
     expect(markup).toContain("Saved 15,000 tokens (88.2%)");
     expect(markup).toContain("previous record 10,000");
-  });
-
-  it("renders a new model row with model and provider", () => {
-    const data: NewModelEvent = {
-      observedAt: "2026-04-21T09:00:00Z",
-      model: "claude-haiku-4-7",
-      provider: "anthropic"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "newModel", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("New model");
-    expect(markup).toContain("First compression on claude-haiku-4-7");
-    expect(markup).toContain(">anthropic<");
   });
 
   it("renders a streak row without the new-record tag on a threshold event", () => {
@@ -724,255 +668,29 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("activity-feed__transforms");
   });
 
-  it("paginates at 5 activity rows per page and shows navigation when there are more", () => {
-    // Memory rows coalesce into groups when 3+ land within COALESCE_GAP_MS of
-    // each other, so this fixture spaces them 35 minutes apart to keep every
-    // entry as its own row. Day headers do not count toward PAGE_SIZE — they
-    // render in addition to the 5 activity rows. All 13 entries share the
-    // same local day (2026-04-21, pinned below as not "today" so the header
-    // emits), so page 1 shows 5 item rows plus 1 day header = 6 rows total.
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-25T10:00:00Z"));
-    try {
-      const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
-        const minutes = i * 35;
-        const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
-        const mm = String(minutes % 60).padStart(2, "0");
-        return memory({ id: `mem-${i}`, createdAt: `2026-04-21T${hh}:${mm}:00Z` });
+  it("collapses many memories into a single Learning tile (latest wins)", () => {
+    const events: ActivityEvent[] = Array.from({ length: 13 }, (_, i) => {
+      const minutes = i * 35;
+      const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
+      const mm = String(minutes % 60).padStart(2, "0");
+      return memory({
+        id: `mem-${i}`,
+        createdAt: `2026-04-21T${hh}:${mm}:00Z`,
+        content: `learning #${i}`
       });
-      const feed: ActivityFeedResponse = { ...baseFeed, events };
-      const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-      const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-      const headerCount = (markup.match(/<li class="activity-feed__day-header"/g) ?? []).length;
-      expect(itemCount).toBe(5);
-      expect(headerCount).toBe(1);
-      expect(markup).toContain("Page 1 of 3");
-      expect(markup).toContain("← Prev");
-      expect(markup).toContain("Next →");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("hides pagination when there are 5 or fewer events", () => {
-    const events: ActivityEvent[] = Array.from({ length: 4 }, (_, i) =>
-      memory({ id: `mem-${i}`, createdAt: `2026-04-21T${10 + i}:00:00Z` })
-    );
+    });
     const feed: ActivityFeedResponse = { ...baseFeed, events };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
+    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
+    // One tile per kind; all 13 memories are the same kind.
+    expect(itemCount).toBe(1);
+    // Latest memory (highest index) wins the tile.
+    expect(markup).toContain("learning #12");
+    // No pagination UI remains.
     expect(markup).not.toContain("activity-feed__pagination");
     expect(markup).not.toContain("Page 1 of");
   });
 
-  it("coalesces consecutive rtkBatch events into a single RTK group row", () => {
-    const batches: ActivityEvent[] = [
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:05:00Z",
-          commandsDelta: 3,
-          tokensSavedDelta: 1200,
-          totalCommands: 10,
-          totalSaved: 5000
-        }
-      },
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:04:00Z",
-          commandsDelta: 1,
-          tokensSavedDelta: 400,
-          totalCommands: 7,
-          totalSaved: 3800
-        }
-      }
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events: batches };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("activity-feed__item--rtk");
-    expect(markup).toContain("RTK × 2");
-    expect(markup).toContain("+4 commands");
-    expect(markup).toContain("1,600 tokens");
-  });
-
-  it("coalesces RTK events across a single non-RTK interloper", () => {
-    const events: ActivityEvent[] = [
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:05:00Z",
-          commandsDelta: 4,
-          tokensSavedDelta: 2000,
-          totalCommands: 20,
-          totalSaved: 10000
-        }
-      },
-      memory({
-        id: "mem-between",
-        createdAt: "2026-04-21T10:04:30Z",
-        content: "a learning dropped in between the RTK batches"
-      }),
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:04:00Z",
-          commandsDelta: 3,
-          tokensSavedDelta: 1000,
-          totalCommands: 17,
-          totalSaved: 8000
-        }
-      }
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("RTK × 2");
-    expect(markup).toContain("+7 commands");
-    // The interloper still renders — absorbed events are never dropped.
-    expect(markup).toContain("a learning dropped in between");
-    // Group row precedes the absorbed interloper in the rendered order.
-    const groupIdx = markup.indexOf("RTK × 2");
-    const interIdx = markup.indexOf("a learning dropped in between");
-    expect(groupIdx).toBeLessThan(interIdx);
-  });
-
-  it("does not coalesce two RTK events split by two interlopers", () => {
-    const events: ActivityEvent[] = [
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:05:00Z",
-          commandsDelta: 2,
-          tokensSavedDelta: 500,
-          totalCommands: 12,
-          totalSaved: 6000
-        }
-      },
-      memory({
-        id: "mem-a",
-        createdAt: "2026-04-21T10:04:40Z",
-        content: "first interloper learning"
-      }),
-      memory({
-        id: "mem-b",
-        createdAt: "2026-04-21T10:04:20Z",
-        content: "second interloper learning"
-      }),
-      {
-        kind: "rtkBatch",
-        data: {
-          observedAt: "2026-04-21T10:04:00Z",
-          commandsDelta: 1,
-          tokensSavedDelta: 300,
-          totalCommands: 10,
-          totalSaved: 5500
-        }
-      }
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    // MAX_INTERLOPERS = 1, so two interlopers force both RTKs to stand alone.
-    expect(markup).not.toContain("RTK × 2");
-  });
-
-  it("coalesces a burst of 3+ memories into a Learning group", () => {
-    const events: ActivityEvent[] = [
-      memory({ id: "m1", createdAt: "2026-04-21T10:03:00Z", content: "first learning" }),
-      memory({ id: "m2", createdAt: "2026-04-21T10:02:00Z", content: "second learning" }),
-      memory({ id: "m3", createdAt: "2026-04-21T10:01:00Z", content: "third learning" })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Learning × 3");
-    // The group collapses the three memory rows into one — no individual row
-    // should render. Preview line shows the latest learning's content.
-    expect(markup).toContain("first learning");
-    expect(markup).toContain("activity-feed__item--clickable");
-    expect(markup).toContain('aria-expanded="false"');
-    const itemCount = (markup.match(/<li class="activity-feed__item /g) ?? []).length;
-    expect(itemCount).toBe(1);
-  });
-
-  it("does not coalesce a pair of memories (threshold is 3)", () => {
-    const events: ActivityEvent[] = [
-      memory({ id: "m1", createdAt: "2026-04-21T10:02:00Z", content: "alpha learning" }),
-      memory({ id: "m2", createdAt: "2026-04-21T10:01:00Z", content: "beta learning" })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).not.toContain("Learning × 2");
-    expect(markup).toContain("alpha learning");
-    expect(markup).toContain("beta learning");
-  });
-
-  it("shows a shared project badge on a memory group when all learnings match", () => {
-    const projectPaths = ["/Users/u/Code/demo"];
-    const content = "touched /Users/u/Code/demo/file.ts in this run";
-    const events: ActivityEvent[] = [
-      memory({ id: "m1", createdAt: "2026-04-21T10:03:00Z", content }),
-      memory({ id: "m2", createdAt: "2026-04-21T10:02:00Z", content }),
-      memory({ id: "m3", createdAt: "2026-04-21T10:01:00Z", content })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(
-      <ActivityFeed feed={feed} error={null} projectPaths={projectPaths} />
-    );
-    expect(markup).toContain("Learning × 3");
-    expect(markup).toContain(">demo<");
-  });
-
-  it("renders a turn record row with totals, call count, and previous record", () => {
-    const data: RecordEvent = {
-      observedAt: "2026-04-22T10:00:00Z",
-      tags: ["turn"],
-      tokensSaved: 3_210,
-      savingsPercent: null,
-      model: "claude-opus-4-7",
-      provider: null,
-      requestId: null,
-      previousRecord: 2_500,
-      day: null,
-      turnId: "turn-X",
-      callCount: 4,
-      workspace: "/Users/u/Code/demo"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "record", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain(">Record<");
-    expect(markup).toContain(">Turn<");
-    expect(markup).toContain("Saved 3,210 tokens across 4 calls");
-    expect(markup).toContain("previous record 2,500");
-    expect(markup).toContain(">demo<");
-    expect(markup).toContain(">claude-opus-4-7<");
-  });
-
-  it("renders a turn record row without previous/workspace when null", () => {
-    const data: RecordEvent = {
-      observedAt: "2026-04-22T10:00:00Z",
-      tags: ["turn"],
-      tokensSaved: 100,
-      savingsPercent: null,
-      model: null,
-      provider: null,
-      requestId: null,
-      previousRecord: null,
-      day: null,
-      turnId: "turn-Y",
-      callCount: 1,
-      workspace: null
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "record", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Saved 100 tokens across 1 call");
-    expect(markup).not.toContain("previous record");
-    expect(markup).not.toContain("activity-feed__project");
-    expect(markup).not.toContain("activity-feed__model");
-  });
 });
 
 describe("groupTransforms", () => {

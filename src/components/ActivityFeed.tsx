@@ -8,8 +8,6 @@ import type {
   ActivityFeedResponse,
   LearningsMilestoneEvent,
   MemoryFeedEvent,
-  MilestoneEvent,
-  NewModelEvent,
   RecordEvent,
   RecordTag,
   RtkBatchEvent,
@@ -39,8 +37,26 @@ interface ActivityFeedProps {
   onNavigateToOptimize?: () => void;
 }
 
-const PAGE_SIZE = 5;
+// Memories below this evidence threshold are noise (a single observation
+// isn't a pattern). Applied when picking the "latest learning" tile so a
+// low-signal memory doesn't hijack the slot.
 const MIN_MEMORY_EVIDENCE = 2;
+
+// Fixed order for the activity tiles. Each kind gets at most one tile — the
+// most recent event of that kind — and kinds with no events in the window
+// are skipped. The order is stable so tiles never reshuffle as events stream
+// in; content inside each tile updates in place.
+const TILE_ORDER: ActivityEvent["kind"][] = [
+  "trainSuggestion",
+  "transformation",
+  "memory",
+  "rtkBatch",
+  "record",
+  "streak",
+  "savingsMilestone",
+  "learningsMilestone",
+  "weeklyRecap"
+];
 
 export function ActivityFeed({
   feed,
@@ -49,17 +65,13 @@ export function ActivityFeed({
   projectPaths = [],
   onNavigateToOptimize
 }: ActivityFeedProps) {
-  const [page, setPage] = useState(0);
-  // Memoize the derived feed shapes so page changes (or any re-render that
-  // doesn't actually change `feed.events`) skip the O(N) filter + coalesce
-  // pass. Combined with the signature-based bail in App.tsx's poll, identical
-  // polls become cheap: same `feed.events` reference → memo hits → no work.
-  const filteredEvents = useMemo(() => filterLowSignal(feed.events), [feed.events]);
-  const visibleEvents = useMemo(() => coalesceFeed(filteredEvents), [filteredEvents]);
-  const totalPages = Math.max(1, Math.ceil(visibleEvents.length / PAGE_SIZE));
-  const clampedPage = Math.min(page, totalPages - 1);
-  const start = clampedPage * PAGE_SIZE;
-  const pageEvents = visibleEvents.slice(start, start + PAGE_SIZE);
+  const latestByKind = useMemo(
+    () => selectLatestByKind(feed.events),
+    [feed.events]
+  );
+  const tiles = TILE_ORDER.map((kind) => latestByKind.get(kind)).filter(
+    (event): event is ActivityEvent => event != null
+  );
 
   return (
     <>
@@ -78,7 +90,7 @@ export function ActivityFeed({
           <div className="activity-feed__skeleton-row" />
           <div className="activity-feed__skeleton-row" />
         </div>
-      ) : !feed.proxyReachable && visibleEvents.length === 0 ? (
+      ) : !feed.proxyReachable && tiles.length === 0 ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon activity-feed__empty-icon--waiting" aria-hidden="true">
             <WifiSlash weight="duotone" />
@@ -88,7 +100,7 @@ export function ActivityFeed({
             Headroom will reconnect as soon as the proxy is back online.
           </p>
         </div>
-      ) : visibleEvents.length === 0 ? (
+      ) : tiles.length === 0 ? (
         <div className="activity-feed__empty">
           <div className="activity-feed__empty-icon" aria-hidden="true">
             <Bell weight="duotone" />
@@ -100,327 +112,52 @@ export function ActivityFeed({
           </p>
         </div>
       ) : (
-        <>
-          <ul className="activity-feed__list">
-            {renderPageWithDayHeaders(
-              pageEvents,
-              start,
-              projectPaths,
-              onNavigateToOptimize
-            )}
-          </ul>
-          {totalPages > 1 ? (
-            <nav className="activity-feed__pagination" aria-label="Activity pagination">
-              <button
-                type="button"
-                className="activity-feed__page-button"
-                onClick={() => setPage((p) => Math.max(0, p - 1))}
-                disabled={clampedPage === 0}
-              >
-                ← Prev
-              </button>
-              <span className="activity-feed__page-indicator">
-                Page {clampedPage + 1} of {totalPages}
-              </span>
-              <button
-                type="button"
-                className="activity-feed__page-button"
-                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
-                disabled={clampedPage >= totalPages - 1}
-              >
-                Next →
-              </button>
-            </nav>
-          ) : null}
-        </>
+        <ul className="activity-feed__list">
+          {tiles.map((event) => (
+            <TileItem
+              key={event.kind}
+              event={event}
+              projectPaths={projectPaths}
+              onNavigateToOptimize={onNavigateToOptimize}
+            />
+          ))}
+        </ul>
       )}
     </>
   );
 }
 
-type FeedRow =
-  | { type: "single"; event: ActivityEvent }
-  | { type: "rtkGroup"; events: RtkBatchEvent[] }
-  | { type: "memoryGroup"; events: MemoryFeedEvent[] }
-  | { type: "dayHeader"; dayKey: string; label: string };
-
-// Minimum same-kind run length required to emit a group row. Kinds absent
-// from this map never coalesce (milestones/records/streaks are rare enough
-// that each deserves its own row). RTK coalesces in pairs; memory needs a
-// burst of 3+ because a single learning has distinct content worth seeing
-// but a spammy burst (the common case when `headroom learn` extracts a
-// batch of similar patterns) should fold into one group. Transformations
-// are not coalesced because `filterLowSignal` keeps only the single largest
-// one in the window — presence of compression is already conveyed by the
-// savings graph and the big number, so one "Recent large compression" row
-// is all we need.
-const COALESCE_MIN_LENGTH: Partial<Record<ActivityEvent["kind"], number>> = {
-  rtkBatch: 2,
-  memory: 3
-};
-
-// Break a coalesced run when consecutive same-kind events are further apart
-// than this. Picks a natural "work session" boundary — a morning burst and
-// an afternoon burst become two groups instead of one blob.
-const COALESCE_GAP_MS = 30 * 60 * 1000;
-
-// Max different-kind events allowed to sit between two same-kind events
-// without breaking the run. Handles the common case of 3 RTK batches in a
-// minute with 1 learning interleaved — the RTKs still coalesce. Absorbed
-// interlopers still render (as their own single row) right after the group.
-const MAX_INTERLOPERS = 1;
-
-function filterLowSignal(events: ActivityEvent[]): ActivityEvent[] {
-  // Of all compressions in the window, keep only the single largest (by
-  // tokens saved). The stream of individual compression events is already
-  // summarised by the savings graph and the big totals number, so a long
-  // chronological list of them drowns out more interesting activity. One
-  // "recent large compression" card captures the only compression detail
-  // worth surfacing in this view.
-  let largestTransformation: ActivityEvent | null = null;
-  let largestTokens = -1;
+function selectLatestByKind(
+  events: ActivityEvent[]
+): Map<ActivityEvent["kind"], ActivityEvent> {
+  const latest = new Map<ActivityEvent["kind"], ActivityEvent>();
+  const latestTs = new Map<ActivityEvent["kind"], number>();
   for (const event of events) {
-    if (event.kind !== "transformation") continue;
-    const tokens = event.data.tokensSaved ?? 0;
-    if (tokens > largestTokens) {
-      largestTokens = tokens;
-      largestTransformation = event;
+    if (
+      event.kind === "memory" &&
+      event.data.evidenceCount < MIN_MEMORY_EVIDENCE
+    ) {
+      continue;
     }
-  }
-  return events.filter((event) => {
-    if (event.kind === "transformation") {
-      return event === largestTransformation;
-    }
-    if (event.kind === "memory") {
-      return event.data.evidenceCount >= MIN_MEMORY_EVIDENCE;
-    }
-    return true;
-  });
-}
-
-function eventTimestampMs(event: ActivityEvent): number {
-  switch (event.kind) {
-    case "transformation":
-      return Date.parse(event.data.timestamp ?? "") || 0;
-    case "memory":
-      return Date.parse(event.data.createdAt) || 0;
-    case "rtkBatch":
-    case "milestone":
-    case "record":
-    case "newModel":
-    case "streak":
-    case "savingsMilestone":
-    case "learningsMilestone":
-    case "trainSuggestion":
-      return Date.parse(event.data.observedAt) || 0;
-    case "weeklyRecap":
-      return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
-  }
-}
-
-function localDayKey(ms: number): string {
-  if (!ms) return "";
-  const d = new Date(ms);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function dayHeaderLabel(dayKey: string, now: Date = new Date()): string {
-  if (!dayKey) return "";
-  const today = localDayKey(now.getTime());
-  const yesterday = localDayKey(now.getTime() - 86_400_000);
-  if (dayKey === today) return "Today";
-  if (dayKey === yesterday) return "Yesterday";
-  const [y, m, d] = dayKey.split("-").map(Number);
-  const dt = new Date(y, m - 1, d);
-  const sameYear = dt.getFullYear() === now.getFullYear();
-  return new Intl.DateTimeFormat(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    year: sameYear ? undefined : "numeric"
-  }).format(dt);
-}
-
-function coalesceFeed(events: ActivityEvent[]): FeedRow[] {
-  const out: FeedRow[] = [];
-  const consumed = new Set<number>();
-  for (let i = 0; i < events.length; i++) {
-    if (consumed.has(i)) continue;
-    const event = events[i];
     const ts = eventTimestampMs(event);
-    const dayKey = localDayKey(ts);
-    const minRun = COALESCE_MIN_LENGTH[event.kind];
-    if (!minRun) {
-      out.push({ type: "single", event });
-      continue;
-    }
-    // Walk forward collecting same-kind events into a group, allowing up to
-    // MAX_INTERLOPERS different-kind events to pass through without ending
-    // the run. Bail on a calendar-day flip or a gap larger than
-    // COALESCE_GAP_MS. Interlopers still render (as their own single rows)
-    // right after the group so nothing disappears.
-    const groupIndices: number[] = [i];
-    const interloperIndices: number[] = [];
-    let prevTs = ts;
-    let interlopersUsed = 0;
-    for (let j = i + 1; j < events.length; j++) {
-      if (consumed.has(j)) break;
-      const candidate = events[j];
-      const candidateTs = eventTimestampMs(candidate);
-      if (localDayKey(candidateTs) !== dayKey) break;
-      if (Math.abs(prevTs - candidateTs) > COALESCE_GAP_MS) break;
-      if (candidate.kind === event.kind) {
-        groupIndices.push(j);
-        prevTs = candidateTs;
-      } else if (interlopersUsed < MAX_INTERLOPERS) {
-        interloperIndices.push(j);
-        interlopersUsed++;
-      } else {
-        break;
-      }
-    }
-    if (groupIndices.length < minRun) {
-      out.push({ type: "single", event });
-      continue;
-    }
-    if (event.kind === "rtkBatch") {
-      out.push({
-        type: "rtkGroup",
-        events: groupIndices.map(
-          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "rtkBatch" }>).data
-        )
-      });
-    } else if (event.kind === "memory") {
-      out.push({
-        type: "memoryGroup",
-        events: groupIndices.map(
-          (idx) => (events[idx] as Extract<ActivityEvent, { kind: "memory" }>).data
-        )
-      });
-    }
-    for (const idx of groupIndices) consumed.add(idx);
-    for (const idx of interloperIndices) {
-      out.push({ type: "single", event: events[idx] });
-      consumed.add(idx);
+    const prevTs = latestTs.get(event.kind) ?? -1;
+    if (ts > prevTs) {
+      latest.set(event.kind, event);
+      latestTs.set(event.kind, ts);
     }
   }
-  return out;
+  return latest;
 }
 
-function rowDayKey(row: FeedRow): string {
-  if (row.type === "dayHeader") return row.dayKey;
-  if (row.type === "single") return localDayKey(eventTimestampMs(row.event));
-  if (row.type === "rtkGroup") {
-    return localDayKey(Date.parse(row.events[0]?.observedAt ?? "") || 0);
-  }
-  return localDayKey(Date.parse(row.events[0]?.createdAt ?? "") || 0);
-}
-
-function renderPageWithDayHeaders(
-  rows: FeedRow[],
-  start: number,
-  projectPaths: string[],
-  onNavigateToOptimize: (() => void) | undefined
-): ReactNode[] {
-  const today = localDayKey(Date.now());
-  const nodes: ReactNode[] = [];
-  let prevDayKey: string | null = null;
-  rows.forEach((row, index) => {
-    const dayKey = rowDayKey(row);
-    if (dayKey && dayKey !== prevDayKey && dayKey !== today) {
-      nodes.push(
-        <FeedRowItem
-          key={`day-${dayKey}-${start + index}`}
-          row={{ type: "dayHeader", dayKey, label: dayHeaderLabel(dayKey) }}
-          projectPaths={projectPaths}
-          onNavigateToOptimize={onNavigateToOptimize}
-        />
-      );
-    }
-    prevDayKey = dayKey;
-    nodes.push(
-      <FeedRowItem
-        key={feedRowKey(row, start + index)}
-        row={row}
-        projectPaths={projectPaths}
-        onNavigateToOptimize={onNavigateToOptimize}
-      />
-    );
-  });
-  return nodes;
-}
-
-function feedRowKey(row: FeedRow, index: number): string {
-  if (row.type === "dayHeader") {
-    return `day-${row.dayKey}`;
-  }
-  if (row.type === "single") {
-    return singleKey(row.event, index);
-  }
-  if (row.type === "memoryGroup") {
-    return `mg-${row.events[0].id}-${row.events.length}`;
-  }
-  return `rg-${row.events[0].observedAt}-${row.events.length}`;
-}
-
-function singleKey(event: ActivityEvent, index: number): string {
-  switch (event.kind) {
-    case "transformation":
-      return `t-${event.data.requestId ?? event.data.timestamp ?? index}`;
-    case "memory":
-      // Include createdAt so the React key survives a theoretical ID
-      // collision without bleeding state between sibling MemoryRows.
-      return `m-${event.data.id}-${event.data.createdAt}`;
-    case "rtkBatch":
-      return `rtk-${event.data.observedAt}`;
-    case "milestone":
-      return `ms-${event.data.milestoneTokensSaved}-${event.data.observedAt}`;
-    case "record": {
-      const id =
-        event.data.requestId ?? event.data.turnId ?? event.data.observedAt;
-      return `rec-${event.data.tags.join(",")}-${id}`;
-    }
-    case "newModel":
-      return `nm-${event.data.model}-${event.data.observedAt}`;
-    case "streak":
-      return `streak-${event.data.days}-${event.data.kind}-${event.data.observedAt}`;
-    case "savingsMilestone":
-      return `smile-${event.data.milestoneUsd}-${event.data.observedAt}`;
-    case "weeklyRecap":
-      return `wr-${event.data.weekStart}`;
-    case "learningsMilestone":
-      return `lm-${event.data.count}-${event.data.observedAt}`;
-    case "trainSuggestion":
-      return `train-${event.data.projectPath}-${event.data.observedAt}`;
-  }
-}
-
-function FeedRowItem({
-  row,
+function TileItem({
+  event,
   projectPaths,
   onNavigateToOptimize
 }: {
-  row: FeedRow;
+  event: ActivityEvent;
   projectPaths: string[];
   onNavigateToOptimize?: () => void;
 }) {
-  if (row.type === "dayHeader") {
-    return (
-      <li className="activity-feed__day-header" aria-label={`Events from ${row.label}`}>
-        <span>{row.label}</span>
-      </li>
-    );
-  }
-  if (row.type === "rtkGroup") {
-    return <RtkGroupRow events={row.events} />;
-  }
-  if (row.type === "memoryGroup") {
-    return <MemoryGroupRow events={row.events} projectPaths={projectPaths} />;
-  }
-  const event = row.event;
   switch (event.kind) {
     case "transformation":
       return <TransformationRow event={event.data} />;
@@ -428,12 +165,8 @@ function FeedRowItem({
       return <MemoryRow event={event.data} projectPaths={projectPaths} />;
     case "rtkBatch":
       return <RtkBatchRow event={event.data} />;
-    case "milestone":
-      return <MilestoneRow event={event.data} />;
     case "record":
       return <RecordRow event={event.data} />;
-    case "newModel":
-      return <NewModelRow event={event.data} />;
     case "streak":
       return <StreakRow event={event.data} />;
     case "savingsMilestone":
@@ -449,6 +182,24 @@ function FeedRowItem({
           onNavigate={onNavigateToOptimize}
         />
       );
+  }
+}
+
+function eventTimestampMs(event: ActivityEvent): number {
+  switch (event.kind) {
+    case "transformation":
+      return Date.parse(event.data.timestamp ?? "") || 0;
+    case "memory":
+      return Date.parse(event.data.createdAt) || 0;
+    case "rtkBatch":
+    case "record":
+    case "streak":
+    case "savingsMilestone":
+    case "learningsMilestone":
+    case "trainSuggestion":
+      return Date.parse(event.data.observedAt) || 0;
+    case "weeklyRecap":
+      return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
   }
 }
 
@@ -508,100 +259,6 @@ function TimeChip({ iso }: { iso: string | null | undefined }) {
     <span className="activity-feed__time" title={formatDateTime(iso)}>
       {formatRelativeTime(iso)}
     </span>
-  );
-}
-
-function RtkGroupRow({ events }: { events: RtkBatchEvent[] }) {
-  const commandsDelta = events.reduce((sum, e) => sum + e.commandsDelta, 0);
-  const tokensDelta = events.reduce((sum, e) => sum + e.tokensSavedDelta, 0);
-  const latest = events[0];
-  const detail = (
-    <ul className="activity-feed__detail-list">
-      {events.map((ev, i) => (
-        <li key={`rg-sub-${ev.observedAt}-${i}`} className="activity-feed__detail-item">
-          <TimeChip iso={ev.observedAt} />
-          <span className="activity-feed__detail-primary">
-            +{ev.commandsDelta.toLocaleString()} command
-            {ev.commandsDelta === 1 ? "" : "s"}, saved{" "}
-            {ev.tokensSavedDelta.toLocaleString()} tokens
-          </span>
-        </li>
-      ))}
-    </ul>
-  );
-  return (
-    <ExpandableRow
-      className="activity-feed__item activity-feed__item--rtk"
-      detail={detail}
-    >
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--rtk">
-          RTK × {events.length}
-        </span>
-        <TimeChip iso={latest.observedAt} />
-      </div>
-      <div className="activity-feed__row activity-feed__row--savings">
-        <strong className="activity-feed__savings">
-          +{commandsDelta.toLocaleString()} command{commandsDelta === 1 ? "" : "s"}, saved{" "}
-          {tokensDelta.toLocaleString()} tokens
-        </strong>
-      </div>
-    </ExpandableRow>
-  );
-}
-
-function MemoryGroupRow({
-  events,
-  projectPaths
-}: {
-  events: MemoryFeedEvent[];
-  projectPaths: string[];
-}) {
-  const latest = events[0];
-  // Resolve each learning's project and keep the value only if every learning
-  // in the group agrees. Mixed groups drop the badge — otherwise the label
-  // would misrepresent learnings from other projects.
-  const perEventProject = events.map((ev) => {
-    const scopeProject = projectBasename(ev.scope);
-    if (scopeProject) return scopeProject;
-    const matched = matchProjectPath(ev.content, projectPaths);
-    return matched ? basenameOf(matched) : null;
-  });
-  const sharedProject =
-    perEventProject[0] && perEventProject.every((p) => p === perEventProject[0])
-      ? perEventProject[0]
-      : null;
-  const detail = (
-    <ul className="activity-feed__detail-list">
-      {events.map((ev) => (
-        <li
-          key={`mg-sub-${ev.id}-${ev.createdAt}`}
-          className="activity-feed__detail-item"
-        >
-          <TimeChip iso={ev.createdAt} />
-          <p className="activity-feed__content">{ev.content}</p>
-        </li>
-      ))}
-    </ul>
-  );
-  return (
-    <ExpandableRow
-      className="activity-feed__item activity-feed__item--memory"
-      detail={detail}
-    >
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--memory">
-          Learning × {events.length}
-        </span>
-        <TimeChip iso={latest.createdAt} />
-        {sharedProject ? (
-          <span className="activity-feed__project">{sharedProject}</span>
-        ) : null}
-      </div>
-      <p className="activity-feed__content activity-feed__content--clamped-one">
-        {latest.content}
-      </p>
-    </ExpandableRow>
   );
 }
 
@@ -1023,33 +680,17 @@ function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
   );
 }
 
-function MilestoneRow({ event }: { event: MilestoneEvent }) {
-  return (
-    <li className="activity-feed__item activity-feed__item--milestone">
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--milestone">Milestone</span>
-        <TimeChip iso={event.observedAt} />
-      </div>
-      <p className="activity-feed__content">
-        Crossed {formatTokensShort(event.milestoneTokensSaved)} lifetime tokens saved.
-      </p>
-    </li>
-  );
-}
-
-const RECORD_TAG_ORDER: RecordTag[] = ["turn", "daily", "weekly", "allTime"];
+const RECORD_TAG_ORDER: RecordTag[] = ["daily", "weekly", "allTime"];
 
 const RECORD_TAG_LABEL: Record<RecordTag, string> = {
   daily: "Daily",
   weekly: "Weekly",
-  allTime: "All-time",
-  turn: "Turn"
+  allTime: "All-time"
 };
 
 function RecordRow({ event }: { event: RecordEvent }) {
   const workspace = workspaceBasename(event.workspace);
   const pct = event.savingsPercent;
-  const callCount = event.callCount ?? null;
   const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
   return (
     <li className="activity-feed__item activity-feed__item--record">
@@ -1071,9 +712,6 @@ function RecordRow({ event }: { event: RecordEvent }) {
         <strong className="activity-feed__savings">
           Saved {event.tokensSaved.toLocaleString()} tokens
           {pct != null ? ` (${pct.toFixed(1)}%)` : ""}
-          {callCount != null && callCount > 0
-            ? ` across ${callCount} call${callCount === 1 ? "" : "s"}`
-            : ""}
         </strong>
         {event.previousRecord != null ? (
           <span className="activity-feed__delta">
@@ -1081,25 +719,6 @@ function RecordRow({ event }: { event: RecordEvent }) {
           </span>
         ) : null}
       </div>
-    </li>
-  );
-}
-
-function NewModelRow({ event }: { event: NewModelEvent }) {
-  const workspace = workspaceBasename(event.workspace);
-  return (
-    <li className="activity-feed__item activity-feed__item--new-model">
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--new-model">New model</span>
-        <TimeChip iso={event.observedAt} />
-        {event.provider ? (
-          <span className="activity-feed__provider">{event.provider}</span>
-        ) : null}
-        {workspace ? (
-          <span className="activity-feed__project">{workspace}</span>
-        ) : null}
-      </div>
-      <p className="activity-feed__content">First compression on {event.model}.</p>
     </li>
   );
 }
@@ -1225,15 +844,3 @@ function WeeklyRecapRow({ event }: { event: WeeklyRecapEvent }) {
   );
 }
 
-function formatTokensShort(tokens: number): string {
-  if (tokens >= 1_000_000_000) {
-    return `${(tokens / 1_000_000_000).toFixed(tokens % 1_000_000_000 === 0 ? 0 : 1)}B`;
-  }
-  if (tokens >= 1_000_000) {
-    return `${(tokens / 1_000_000).toFixed(tokens % 1_000_000 === 0 ? 0 : 1)}M`;
-  }
-  if (tokens >= 1_000) {
-    return `${(tokens / 1_000).toFixed(0)}K`;
-  }
-  return tokens.toLocaleString();
-}

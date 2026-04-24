@@ -98,3 +98,36 @@ node -e "
 "
 
 echo "Done. Updated package.json, package-lock.json, src-tauri/tauri.conf.json, src-tauri/Cargo.toml, and src-tauri/Cargo.lock to ${VERSION}."
+
+# Stable release (no -rc.N): the release workflow reads
+# .github/release-notes/<VERSION>.md into latest.json's `notes`, which the
+# in-app update dialog renders as "What's new". Nudge the user to write one.
+if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  NOTES_FILE="${REPO_ROOT}/.github/release-notes/${VERSION}.md"
+  if [[ -f "${NOTES_FILE}" ]]; then
+    echo "Release notes already exist at ${NOTES_FILE}."
+  elif [[ -t 0 ]]; then
+    printf "\nStable release. Write release notes now? [Y/n] "
+    reply=""
+    read -r reply || reply=""
+    case "${reply}" in
+      ""|y|Y)
+        mkdir -p "$(dirname "${NOTES_FILE}")"
+        tmpfile="$(mktemp "${TMPDIR:-/tmp}/headroom-release-notes.XXXXXX")"
+        "${EDITOR:-vi}" "${tmpfile}" || true
+        if [[ -s "${tmpfile}" ]]; then
+          mv "${tmpfile}" "${NOTES_FILE}"
+          echo "Wrote ${NOTES_FILE}"
+        else
+          rm -f "${tmpfile}"
+          echo "Empty input; no release notes file created. Add ${NOTES_FILE} before releasing."
+        fi
+        ;;
+      *)
+        echo "Skipped. Add ${NOTES_FILE} before releasing to populate the in-app update dialog."
+        ;;
+    esac
+  else
+    echo "No release notes at ${NOTES_FILE}. Create it before releasing to populate the in-app update dialog."
+  fi
+fi

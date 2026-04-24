@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,9 +6,9 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, MilestoneEvent, NewModelEvent,
-    RecordEvent, RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent,
-    TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
+    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent, RecordTag,
+    RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
+    TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
@@ -35,9 +35,7 @@ pub(crate) fn is_high_signal(event: &ActivityEvent) -> bool {
         ActivityEvent::Transformation(_)
         | ActivityEvent::Memory(_)
         | ActivityEvent::RtkBatch(_) => false,
-        ActivityEvent::Milestone(_)
-        | ActivityEvent::Record(_)
-        | ActivityEvent::NewModel(_)
+        ActivityEvent::Record(_)
         | ActivityEvent::Streak(_)
         | ActivityEvent::SavingsMilestone(_)
         | ActivityEvent::LearningsMilestone(_)
@@ -53,16 +51,6 @@ const TRANSFORMATION_HISTORY_CAP: usize = 500;
 
 const FIRST_STREAKS: [u32; 4] = [3, 7, 14, 30];
 const REPEATING_STREAK_STEP: u32 = 30;
-
-fn milestone_kind(milestone_tokens_saved: u64) -> &'static str {
-    match milestone_tokens_saved {
-        100_000 => "first_100k",
-        1_000_000 => "first_1m",
-        5_000_000 => "first_5m",
-        10_000_000 => "first_10m",
-        _ => "repeating_10m",
-    }
-}
 
 fn savings_milestone_kind(milestone_usd: u64) -> &'static str {
     match milestone_usd {
@@ -173,8 +161,6 @@ pub struct DailyRecordFact {
 struct PersistedActivityFacts {
     schema_version: u8,
     #[serde(default)]
-    seen_models: BTreeSet<String>,
-    #[serde(default)]
     all_time_record_tokens: u64,
     #[serde(default)]
     daily_record: Option<DailyRecordFact>,
@@ -194,8 +180,6 @@ struct PersistedActivityFacts {
     last_weekly_recap_week_key: Option<String>,
     #[serde(default)]
     learnings_milestones_fired: BTreeSet<u32>,
-    #[serde(default)]
-    prompt_all_time_record_tokens: u64,
     #[serde(default)]
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -221,26 +205,8 @@ struct PersistedActivityFacts {
     stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct TurnAccumulator {
-    tokens_saved: u64,
-    seen_request_ids: BTreeSet<String>,
-    call_count: u32,
-    last_updated: DateTime<Utc>,
-    model: Option<String>,
-    workspace: Option<String>,
-    record_emitted: bool,
-}
-
-// Cap the in-memory map and age-out old turns so a long-running app doesn't
-// grow unbounded. 2 hours comfortably exceeds any realistic agent-loop turn
-// length; 1024 caps the worst case of many short-lived turns.
-const TURN_ACCUMULATOR_TTL_HOURS: i64 = 2;
-const MAX_TURN_ACCUMULATORS: usize = 1024;
-
 pub struct ActivityFacts {
     path: PathBuf,
-    seen_models: BTreeSet<String>,
     all_time_record_tokens: u64,
     daily_record: Option<DailyRecordFact>,
     last_rtk_total_commands: u64,
@@ -251,7 +217,6 @@ pub struct ActivityFacts {
     last_active_day: Option<String>,
     last_weekly_recap_week_key: Option<String>,
     learnings_milestones_fired: BTreeSet<u32>,
-    prompt_all_time_record_tokens: u64,
     // Timestamps of the last record-tag emission we actually made for each
     // scope (not just the last time the underlying counter updated). Used to
     // debounce near-identical beats: a burst of compressions that each nudge
@@ -262,7 +227,6 @@ pub struct ActivityFacts {
     transformation_history: VecDeque<TransformationFeedEvent>,
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: std::collections::BTreeMap<String, DateTime<Utc>>,
-    turn_accumulators: HashMap<String, TurnAccumulator>,
     rtk_initialized: bool,
     dirty: bool,
 }
@@ -283,7 +247,6 @@ impl ActivityFacts {
 
         Ok(Self {
             path,
-            seen_models: persisted.seen_models,
             all_time_record_tokens: persisted.all_time_record_tokens,
             daily_record: persisted.daily_record,
             last_rtk_total_commands: persisted.last_rtk_total_commands,
@@ -294,13 +257,11 @@ impl ActivityFacts {
             last_active_day: persisted.last_active_day,
             last_weekly_recap_week_key: persisted.last_weekly_recap_week_key,
             learnings_milestones_fired: persisted.learnings_milestones_fired,
-            prompt_all_time_record_tokens: persisted.prompt_all_time_record_tokens,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
             daily_record_emitted_at: persisted.daily_record_emitted_at,
             transformation_history: persisted.transformation_history,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
-            turn_accumulators: HashMap::new(),
             rtk_initialized: true,
             dirty: false,
         })
@@ -309,7 +270,6 @@ impl ActivityFacts {
     fn empty(path: PathBuf) -> Self {
         Self {
             path,
-            seen_models: BTreeSet::new(),
             all_time_record_tokens: 0,
             daily_record: None,
             last_rtk_total_commands: 0,
@@ -320,13 +280,11 @@ impl ActivityFacts {
             last_active_day: None,
             last_weekly_recap_week_key: None,
             learnings_milestones_fired: BTreeSet::new(),
-            prompt_all_time_record_tokens: 0,
             all_time_record_emitted_at: None,
             daily_record_emitted_at: None,
             transformation_history: VecDeque::new(),
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: std::collections::BTreeMap::new(),
-            turn_accumulators: HashMap::new(),
             rtk_initialized: false,
             dirty: false,
         }
@@ -337,7 +295,7 @@ impl ActivityFacts {
         // tagged Daily share the same day, keep only the most recent one
         // (highest observed_at). Walk newest-first, remember days we've
         // already emitted a Daily-tagged Record for, and drop subsequent
-        // ones. Turn-only Records don't carry a day tag and aren't filtered.
+        // ones.
         let mut seen_dr_days: BTreeSet<String> = BTreeSet::new();
         let mut kept_rev: Vec<ActivityEvent> = Vec::with_capacity(self.recent_events.len());
         for event in self.recent_events.iter().rev() {
@@ -390,17 +348,6 @@ impl ActivityFacts {
             TRANSFORMATION_HISTORY_CAP,
         ) {
             self.dirty = true;
-        }
-
-        if let Some(model) = event.model.as_ref() {
-            if !model.is_empty() && self.seen_models.insert(model.clone()) {
-                emitted.push(ActivityEvent::NewModel(NewModelEvent {
-                    observed_at,
-                    model: model.clone(),
-                    provider: event.provider.clone(),
-                    workspace: event.workspace.clone(),
-                }));
-            }
         }
 
         let tokens_saved = event
@@ -480,14 +427,8 @@ impl ActivityFacts {
                     previous_record: all_time_previous,
                     day,
                     workspace: event.workspace.clone(),
-                    turn_id: None,
-                    call_count: None,
                 }));
             }
-        }
-
-        if let Some(prompt_record) = self.process_turn(event, observed_at) {
-            emitted.push(prompt_record);
         }
 
         let streak_events = self.process_streak(observed_at);
@@ -509,97 +450,6 @@ impl ActivityFacts {
             self.dirty = true;
         }
         emitted
-    }
-
-    fn process_turn(
-        &mut self,
-        event: &TransformationFeedEvent,
-        observed_at: DateTime<Utc>,
-    ) -> Option<ActivityEvent> {
-        // Emits an all-time record at the *prompt* level — summed tokens saved
-        // across every agent-loop API call from one user prompt, grouped by
-        // the proxy-emitted turn_id. Returns None if the feed event lacks a
-        // turn_id (older proxy) or request_id (can't dedupe across the feed's
-        // sliding window, which re-surfaces the same event on every poll).
-        let turn_id = event.turn_id.as_ref()?;
-        let request_id = event.request_id.as_ref()?;
-        let tokens_saved =
-            event
-                .tokens_saved
-                .and_then(|n| if n > 0 { Some(n as u64) } else { None })?;
-
-        let previous_record = self.prompt_all_time_record_tokens;
-
-        let acc = self.turn_accumulators.entry(turn_id.clone()).or_default();
-
-        if !acc.seen_request_ids.insert(request_id.clone()) {
-            // Same transformation re-observed on a later feed poll — already counted.
-            return None;
-        }
-
-        acc.tokens_saved = acc.tokens_saved.saturating_add(tokens_saved);
-        acc.call_count = acc.call_count.saturating_add(1);
-        acc.last_updated = observed_at;
-        if acc.model.is_none() {
-            acc.model = event.model.clone();
-        }
-        if acc.workspace.is_none() {
-            acc.workspace = event.workspace.clone();
-        }
-
-        let beats_record = acc.tokens_saved > self.prompt_all_time_record_tokens;
-        let should_emit = beats_record && !acc.record_emitted;
-        // Persist the new high-water mark even on subsequent transformations
-        // of the same turn so restarts compare against the correct value.
-        if beats_record {
-            self.prompt_all_time_record_tokens = acc.tokens_saved;
-            self.dirty = true;
-        }
-        let emitted = if should_emit {
-            acc.record_emitted = true;
-            Some(ActivityEvent::Record(RecordEvent {
-                observed_at,
-                tags: vec![RecordTag::Turn],
-                tokens_saved: acc.tokens_saved,
-                savings_percent: None,
-                model: acc.model.clone(),
-                provider: None,
-                request_id: None,
-                previous_record: if previous_record == 0 {
-                    None
-                } else {
-                    Some(previous_record)
-                },
-                day: None,
-                workspace: acc.workspace.clone(),
-                turn_id: Some(turn_id.clone()),
-                call_count: Some(acc.call_count),
-            }))
-        } else {
-            None
-        };
-
-        self.prune_turn_accumulators(observed_at);
-        emitted
-    }
-
-    fn prune_turn_accumulators(&mut self, now: DateTime<Utc>) {
-        let cutoff = now - Duration::hours(TURN_ACCUMULATOR_TTL_HOURS);
-        self.turn_accumulators
-            .retain(|_, acc| acc.last_updated >= cutoff);
-        if self.turn_accumulators.len() > MAX_TURN_ACCUMULATORS {
-            // Drop the oldest entries by last_updated until within cap.
-            let mut by_age: Vec<(String, DateTime<Utc>)> = self
-                .turn_accumulators
-                .iter()
-                .map(|(k, v)| (k.clone(), v.last_updated))
-                .collect();
-            by_age.sort_by_key(|(_, ts)| *ts);
-            let excess = self.turn_accumulators.len() - MAX_TURN_ACCUMULATORS;
-            for (k, _) in by_age.into_iter().take(excess) {
-                self.turn_accumulators.remove(&k);
-            }
-        }
     }
 
     fn process_streak(&mut self, observed_at: DateTime<Utc>) -> Vec<ActivityEvent> {
@@ -698,29 +548,6 @@ impl ActivityFacts {
         self.push_recent(vec![event.clone()]);
         self.dirty = true;
         Some(event)
-    }
-
-    pub fn record_milestones(
-        &mut self,
-        milestones: &[u64],
-        observed_at: DateTime<Utc>,
-    ) -> Vec<ActivityEvent> {
-        if milestones.is_empty() {
-            return Vec::new();
-        }
-        let events: Vec<ActivityEvent> = milestones
-            .iter()
-            .map(|tokens| {
-                ActivityEvent::Milestone(MilestoneEvent {
-                    observed_at,
-                    milestone_tokens_saved: *tokens,
-                    kind: milestone_kind(*tokens).to_string(),
-                })
-            })
-            .collect();
-        self.push_recent(events.clone());
-        self.dirty = true;
-        events
     }
 
     pub fn record_savings_milestones(
@@ -906,7 +733,6 @@ impl ActivityFacts {
         }
         let persisted = PersistedActivityFacts {
             schema_version: SCHEMA_VERSION,
-            seen_models: self.seen_models.clone(),
             all_time_record_tokens: self.all_time_record_tokens,
             daily_record: self.daily_record.clone(),
             last_rtk_total_commands: self.last_rtk_total_commands,
@@ -917,7 +743,6 @@ impl ActivityFacts {
             last_active_day: self.last_active_day.clone(),
             last_weekly_recap_week_key: self.last_weekly_recap_week_key.clone(),
             learnings_milestones_fired: self.learnings_milestones_fired.clone(),
-            prompt_all_time_record_tokens: self.prompt_all_time_record_tokens,
             all_time_record_emitted_at: self.all_time_record_emitted_at,
             daily_record_emitted_at: self.daily_record_emitted_at,
             transformation_history: self.transformation_history.clone(),
@@ -969,36 +794,12 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 4, 22, h, m, 0).unwrap()
     }
 
-    #[test]
-    fn new_model_emits_once_per_model() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let events = facts.observe_transformation(
-            &mk_transformation(Some("claude-opus-4-7"), Some(500), Some(50.0)),
-            at(10, 0),
-        );
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::NewModel(_))));
-        let events2 = facts.observe_transformation(
-            &mk_transformation(Some("claude-opus-4-7"), Some(400), Some(40.0)),
-            at(10, 1),
-        );
-        assert!(!events2
-            .iter()
-            .any(|e| matches!(e, ActivityEvent::NewModel(_))));
-    }
-
     fn is_daily_record(e: &ActivityEvent) -> bool {
         matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Daily))
     }
 
     fn is_all_time_record(e: &ActivityEvent) -> bool {
         matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::AllTime))
-    }
-
-    fn is_turn_record(e: &ActivityEvent) -> bool {
-        matches!(e, ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn))
     }
 
     #[test]
@@ -1092,8 +893,6 @@ mod tests {
             previous_record: None,
             day: Some("2026-04-22".into()),
             workspace: None,
-            turn_id: None,
-            call_count: None,
         };
         facts
             .recent_events
@@ -1342,85 +1141,6 @@ mod tests {
         assert!(next_ev.iter().any(is_daily_record));
     }
 
-    fn mk_turn(turn_id: &str, request_id: &str, tokens_saved: i64) -> TransformationFeedEvent {
-        let mut e = mk_transformation(Some("a"), Some(tokens_saved), Some(10.0));
-        e.turn_id = Some(turn_id.into());
-        e.request_id = Some(request_id.into());
-        e
-    }
-
-    #[test]
-    fn prompt_all_time_record_sums_across_turn_and_emits_once() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-
-        // First turn beats the implicit zero record, so it emits with
-        // previous_record=None.
-        let first = facts.observe_transformation(&mk_turn("turn-A", "req-1", 500), at(10, 0));
-        let first_rec = first
-            .iter()
-            .find_map(|e| match e {
-                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn) => Some(r),
-                _ => None,
-            })
-            .expect("initial record event");
-        assert_eq!(first_rec.tokens_saved, 500);
-        assert_eq!(first_rec.call_count, Some(1));
-        assert_eq!(first_rec.previous_record, None);
-        assert_eq!(first_rec.turn_id.as_deref(), Some("turn-A"));
-
-        // Start a second turn. First call: 300 (under record of 500). Second
-        // call same turn: +400 = 700 total, beats the 500 record.
-        let second = facts.observe_transformation(&mk_turn("turn-B", "req-2", 300), at(10, 1));
-        assert!(!second.iter().any(is_turn_record));
-        let third = facts.observe_transformation(&mk_turn("turn-B", "req-3", 400), at(10, 2));
-        let rec = third
-            .iter()
-            .find_map(|e| match e {
-                ActivityEvent::Record(r) if r.tags.contains(&RecordTag::Turn) => Some(r),
-                _ => None,
-            })
-            .expect("prompt record event");
-        assert_eq!(rec.tokens_saved, 700);
-        assert_eq!(rec.call_count, Some(2));
-        assert_eq!(rec.previous_record, Some(500));
-        assert_eq!(rec.turn_id.as_deref(), Some("turn-B"));
-
-        // Further growth within the same turn must NOT re-emit.
-        let fourth = facts.observe_transformation(&mk_turn("turn-B", "req-4", 100), at(10, 3));
-        assert!(!fourth.iter().any(is_turn_record));
-        // But the persisted record should reflect the new total.
-        assert_eq!(facts.prompt_all_time_record_tokens, 800);
-    }
-
-    #[test]
-    fn prompt_record_dedupes_replayed_feed_events() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-
-        facts.observe_transformation(&mk_turn("t1", "r1", 400), at(10, 0));
-        // Same request_id observed again on a later poll — must not double-count.
-        facts.observe_transformation(&mk_turn("t1", "r1", 400), at(10, 1));
-        // Now one genuinely new call in the same turn.
-        facts.observe_transformation(&mk_turn("t1", "r2", 100), at(10, 2));
-
-        assert_eq!(facts.prompt_all_time_record_tokens, 500);
-        assert_eq!(facts.turn_accumulators.get("t1").unwrap().call_count, 2);
-    }
-
-    #[test]
-    fn prompt_record_skipped_when_turn_id_absent() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        // Older proxy: turn_id None.
-        let events = facts.observe_transformation(
-            &mk_transformation(Some("a"), Some(5000), Some(50.0)),
-            at(10, 0),
-        );
-        assert!(!events.iter().any(is_turn_record));
-        assert_eq!(facts.prompt_all_time_record_tokens, 0);
-    }
-
     #[test]
     fn single_transformation_beating_daily_and_all_time_emits_one_record_with_both_tags() {
         // A single transformation that qualifies for Daily and All-time must
@@ -1511,17 +1231,6 @@ mod tests {
             at(10, 2),
         );
         assert!(matches!(ev, Some(ActivityEvent::RtkBatch(_))));
-    }
-
-    #[test]
-    fn record_milestones_appends_events() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let events = facts.record_milestones(&[1_000_000, 5_000_000], at(10, 0));
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], ActivityEvent::Milestone(_)));
-        let empty = facts.record_milestones(&[], at(10, 1));
-        assert!(empty.is_empty());
     }
 
     #[test]
@@ -1733,23 +1442,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_threads_through_to_new_model_and_record_events() {
+    fn workspace_threads_through_to_record_events() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         let mut transformation = mk_transformation(Some("claude-x"), Some(1_000), Some(50.0));
         transformation.workspace = Some("/Users/u/Code/demo-repo".into());
         let events = facts.observe_transformation_at(&transformation, at(10, 0), at(10, 0));
-        let new_model = events
-            .iter()
-            .find_map(|e| match e {
-                ActivityEvent::NewModel(m) => Some(m),
-                _ => None,
-            })
-            .expect("new model");
-        assert_eq!(
-            new_model.workspace.as_deref(),
-            Some("/Users/u/Code/demo-repo")
-        );
         let record = events
             .iter()
             .find_map(|e| match e {
@@ -1760,13 +1458,6 @@ mod tests {
         assert!(record.tags.contains(&RecordTag::Daily));
         assert!(record.tags.contains(&RecordTag::AllTime));
         assert_eq!(record.workspace.as_deref(), Some("/Users/u/Code/demo-repo"));
-    }
-
-    #[test]
-    fn milestone_kind_includes_first_100k() {
-        assert_eq!(milestone_kind(100_000), "first_100k");
-        assert_eq!(milestone_kind(1_000_000), "first_1m");
-        assert_eq!(milestone_kind(20_000_000), "repeating_10m");
     }
 
     #[test]
