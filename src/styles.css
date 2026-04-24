@@ -4576,6 +4576,22 @@ html.window-hiding {
   font-size: 0.72rem;
 }
 
+.activity-feed__message-dump {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .activity-feed__detail-list {
   list-style: none;
   margin: 0;

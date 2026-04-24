@@ -325,6 +325,8 @@ mod tests {
                 transforms_applied: vec![],
                 workspace: None,
                 turn_id: None,
+                request_messages: None,
+                response_content: None,
             }),
             ActivityEvent::Memory(MemoryFeedEvent {
                 id: "m".into(),

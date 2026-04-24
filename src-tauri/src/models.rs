@@ -336,6 +336,15 @@ pub struct TransformationFeedEvent {
     pub workspace: Option<String>,
     #[serde(default, alias = "turn_id")]
     pub turn_id: Option<String>,
+    // Raw request/response payload captured by the proxy's RequestLogger when
+    // `log_full_messages` is enabled. Pass-through as `serde_json::Value` so
+    // the exact Anthropic/OpenAI message shape (role + structured content
+    // blocks) reaches the frontend unchanged; the desktop renders it, it
+    // does not need to re-parse it.
+    #[serde(default, alias = "request_messages")]
+    pub request_messages: Option<serde_json::Value>,
+    #[serde(default, alias = "response_content")]
+    pub response_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

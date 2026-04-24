@@ -245,6 +245,16 @@ export interface HeadroomLearnPrereqStatus {
   claudeCliPath?: string | null;
 }
 
+// A single entry in `requestMessages`. Intentionally loose — the proxy passes
+// through whatever shape the upstream provider uses (Anthropic: `content` is a
+// string or structured blocks list; OpenAI: string-only). The UI extracts
+// displayable text in `ActivityFeed.tsx`.
+export interface TransformationRequestMessage {
+  role?: string;
+  content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }>;
+  [k: string]: unknown;
+}
+
 export interface TransformationFeedEvent {
   requestId?: string | null;
   timestamp?: string | null;
@@ -257,6 +267,13 @@ export interface TransformationFeedEvent {
   transformsApplied: string[];
   workspace?: string | null;
   turnId?: string | null;
+  // Populated only when the proxy was started with `--log-messages` (or
+  // `HEADROOM_LOG_MESSAGES=1`), reflected in
+  // `TransformationFeedResponse.logFullMessages`. Both fields are pass-through
+  // from the proxy's `RequestLogger` — the desktop renders them, it does not
+  // reinterpret them.
+  requestMessages?: TransformationRequestMessage[] | null;
+  responseContent?: string | null;
 }
 
 export interface TransformationFeedResponse {

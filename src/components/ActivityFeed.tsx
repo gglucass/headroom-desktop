@@ -15,6 +15,7 @@ import type {
   StreakEvent,
   TrainSuggestionEvent,
   TransformationFeedEvent,
+  TransformationRequestMessage,
   WeeklyRecapEvent
 } from "../lib/types";
 
@@ -298,6 +299,37 @@ function matchProjectPath(content: string, projectPaths: string[]): string | nul
   return best;
 }
 
+// Extract displayable text from a single proxy-logged message. Anthropic sends
+// `content` as a block list (text / tool_use / tool_result / ...); OpenAI sends
+// a plain string. Text blocks are flattened verbatim; other block types are
+// shown as a short `[type]` marker rather than dropped, so the reader sees
+// that something was there.
+function messageText(msg: TransformationRequestMessage): string {
+  const c = msg.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c
+      .map((block) => {
+        if (!block || typeof block !== "object") return "";
+        if (typeof block.text === "string") return block.text;
+        if (typeof block.type === "string") return `[${block.type}]`;
+        return "";
+      })
+      .filter((s) => s.length > 0)
+      .join("\n");
+  }
+  return "";
+}
+
+export function formatRequestMessages(messages: TransformationRequestMessage[]): string {
+  return messages
+    .map((m) => {
+      const role = (m.role ?? "").trim() || "(unknown)";
+      return `${role}:\n${messageText(m)}`;
+    })
+    .join("\n\n");
+}
+
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
@@ -309,8 +341,15 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const groups = hasRawTransforms ? groupTransforms(event.transformsApplied) : [];
   const groupsWithTargets = groups.filter((g) => g.targets.length > 0);
   const estimatedUsd = estimateCostSavingsUsd(event.model, saved);
+  const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
+  const hasResponseContent = !!event.responseContent && event.responseContent.length > 0;
   const hasExtra =
-    hasRequestId || hasRawTransforms || event.workspace != null || estimatedUsd != null;
+    hasRequestId ||
+    hasRawTransforms ||
+    event.workspace != null ||
+    estimatedUsd != null ||
+    hasRequestMessages ||
+    hasResponseContent;
   const detail = hasExtra ? (
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
@@ -355,6 +394,24 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <>
           <dt>Request ID</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
+        </>
+      ) : null}
+      {hasRequestMessages ? (
+        <>
+          <dt>Request</dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.requestMessages!)}
+            </pre>
+          </dd>
+        </>
+      ) : null}
+      {hasResponseContent ? (
+        <>
+          <dt>Response</dt>
+          <dd>
+            <pre className="activity-feed__message-dump">{event.responseContent}</pre>
+          </dd>
         </>
       ) : null}
     </dl>

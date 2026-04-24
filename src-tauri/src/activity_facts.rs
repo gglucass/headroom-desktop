@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent, RecordTag,
@@ -15,6 +15,24 @@ use crate::tool_manager::RtkGainSummary;
 
 const SCHEMA_VERSION: u8 = 1;
 const RECENT_EVENTS_CAP: usize = 300;
+
+fn deserialize_recent_events<'de, D>(deserializer: D) -> Result<VecDeque<ActivityEvent>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    let mut out = VecDeque::with_capacity(raw.len());
+    for entry in raw {
+        match serde_json::from_value::<ActivityEvent>(entry.clone()) {
+            Ok(event) => out.push_back(event),
+            Err(err) => {
+                let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("<missing>");
+                eprintln!("dropping persisted ActivityEvent (kind={kind}): {err}");
+            }
+        }
+    }
+    Ok(out)
+}
 
 // Minimum Claude Code session count before we nudge a never-trained project.
 // Below this, the user probably hasn't done enough real work on the project
@@ -168,7 +186,11 @@ struct PersistedActivityFacts {
     last_rtk_total_commands: u64,
     #[serde(default)]
     last_rtk_total_saved: u64,
-    #[serde(default)]
+    // Tolerant deserializer: entries whose `kind` has been retired in a later
+    // schema (e.g. the old `milestone` → now-split `savingsMilestone`) are
+    // silently dropped rather than panicking at startup. Persisted state is
+    // user-local and can't be migrated atomically with a release.
+    #[serde(default, deserialize_with = "deserialize_recent_events")]
     recent_events: VecDeque<ActivityEvent>,
     #[serde(default)]
     current_streak: u32,
@@ -780,6 +802,8 @@ mod tests {
             transforms_applied: vec!["kompress".into()],
             workspace: None,
             turn_id: None,
+            request_messages: None,
+            response_content: None,
         }
     }
 
@@ -944,6 +968,8 @@ mod tests {
                     transforms_applied: vec!["kompress".into()],
                     workspace: None,
                     turn_id: None,
+                    request_messages: None,
+                    response_content: None,
                 })
             })
             .collect();

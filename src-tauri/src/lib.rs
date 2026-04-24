@@ -3968,6 +3968,8 @@ mod tests {
             transforms_applied: vec!["interceptor:ast-grep".into()],
             workspace: None,
             turn_id: None,
+            request_messages: None,
+            response_content: None,
         }
     }
 

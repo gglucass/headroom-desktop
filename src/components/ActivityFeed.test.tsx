@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { ActivityFeed, groupTransforms } from "./ActivityFeed";
+import { ActivityFeed, formatRequestMessages, groupTransforms } from "./ActivityFeed";
 import type {
   ActivityEvent,
   ActivityFeedResponse,
@@ -178,6 +178,57 @@ describe("ActivityFeed", () => {
     // Chip row still collapses to per-label count regardless of target count.
     expect(markup).toContain("Stale Read × 2");
     expect(markup).toContain("Crushed 2 tools");
+  });
+
+  it("makes the row expandable when request/response messages are logged, and skips it when null", () => {
+    // Static markup keeps the detail pane collapsed, so we can't assert on
+    // the <pre> contents here. But the row gains `activity-feed__item--clickable`
+    // iff any detail field is populated — that's the signal the row is
+    // render-wise aware of the extra data. Per-field rendering is covered by
+    // the formatRequestMessages unit tests below.
+    const withMessages = renderToStaticMarkup(
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          events: [
+            transformation({
+              // Strip every other detail-triggering field so clickability
+              // can only come from request/response.
+              requestId: null,
+              workspace: null,
+              transformsApplied: [],
+              tokensSaved: 0,
+              model: null,
+              requestMessages: [{ role: "user", content: "hi" }]
+            })
+          ]
+        }}
+        error={null}
+      />
+    );
+    expect(withMessages).toContain("activity-feed__item--clickable");
+
+    const withoutMessages = renderToStaticMarkup(
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          logFullMessages: false,
+          events: [
+            transformation({
+              requestId: null,
+              workspace: null,
+              transformsApplied: [],
+              tokensSaved: 0,
+              model: null,
+              requestMessages: null,
+              responseContent: null
+            })
+          ]
+        }}
+        error={null}
+      />
+    );
+    expect(withoutMessages).not.toContain("activity-feed__item--clickable");
   });
 
   it("falls back to the raw transform string when unknown", () => {
@@ -771,5 +822,53 @@ describe("groupTransforms", () => {
     const result = groupTransforms(["tool_crush:5"]);
     expect(result[0].label).toBe("Crushed 5 tools");
     expect(result[0].targets).toEqual([]);
+  });
+});
+
+describe("formatRequestMessages", () => {
+  it("emits role + plain string content (OpenAI shape)", () => {
+    expect(
+      formatRequestMessages([
+        { role: "user", content: "please refactor parseFoo" },
+        { role: "assistant", content: "ok — reading it now" }
+      ])
+    ).toBe("user:\nplease refactor parseFoo\n\nassistant:\nok — reading it now");
+  });
+
+  it("flattens Anthropic content-block lists, keeping text verbatim", () => {
+    expect(
+      formatRequestMessages([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "text", text: "reading the file" }
+          ]
+        }
+      ])
+    ).toBe("assistant:\nlet me check\nreading the file");
+  });
+
+  it("marks non-text blocks with [type] so they are not silently dropped", () => {
+    // A tool_use or tool_result block has no surfaced `text` — rather than
+    // show nothing, the formatter inserts a `[tool_use]` marker so the
+    // reader knows something non-text was in the message.
+    expect(
+      formatRequestMessages([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "done, running it:" },
+            { type: "tool_use", name: "Bash" }
+          ]
+        }
+      ])
+    ).toBe("assistant:\ndone, running it:\n[tool_use]");
+  });
+
+  it("labels a missing role as (unknown) instead of rendering a bare newline", () => {
+    expect(formatRequestMessages([{ content: "orphan content" }])).toBe(
+      "(unknown):\norphan content"
+    );
   });
 });
