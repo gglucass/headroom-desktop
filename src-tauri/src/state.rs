@@ -59,7 +59,6 @@ enum RuntimeMaintenancePlan {
 #[derive(Debug, Default, Clone)]
 pub struct PendingMilestones {
     pub token: Vec<u64>,
-    pub usd: Vec<u64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1264,23 +1263,6 @@ impl AppState {
         event
     }
 
-    /// Update today's memory-flush running totals from the latest memory.db
-    /// snapshot. Returns the current MemoryFlush event (today's totals) when
-    /// non-zero, or None on bootstrap / empty days. The caller dispatches it
-    /// alongside other observation-cycle events.
-    pub fn observe_memory_flush(
-        &self,
-        memory_md_total: u32,
-        claude_md_total: u32,
-    ) -> Option<ActivityEvent> {
-        let local_day = Local::now().format("%Y-%m-%d").to_string();
-        let mut facts = self.activity_facts.lock();
-        let event =
-            facts.observe_memory_flush(memory_md_total, claude_md_total, local_day, Utc::now());
-        let _ = facts.save_if_dirty();
-        event
-    }
-
     /// Scan the Claude Code project list for candidates that should be
     /// prompted to run Train. Delegates the decision logic and bookkeeping
     /// (fire-once for never-trained, 7-day cooldown for stale) to
@@ -1297,20 +1279,6 @@ impl AppState {
     /// observation runs on a backend timer and is the sole writer.
     pub fn recent_activity_events(&self) -> Vec<ActivityEvent> {
         self.activity_facts.lock().recent_events()
-    }
-
-    /// Record USD savings milestones into ActivityFacts so they appear in the
-    /// next activity feed poll. Token milestones still feed analytics + the
-    /// desktop notification via `notification_for_token_milestone` in lib.rs,
-    /// but they no longer surface in the Activity tab.
-    pub fn record_activity_milestones(&self, milestones: &PendingMilestones) {
-        if milestones.usd.is_empty() {
-            return;
-        }
-        let mut facts = self.activity_facts.lock();
-        let observed_at = Utc::now();
-        facts.record_savings_milestones(&milestones.usd, observed_at);
-        let _ = facts.save_if_dirty();
     }
 
     /// On Monday, emit a weekly recap rolling up the previous 7 days of
@@ -1687,7 +1655,6 @@ impl AppState {
         let milestones = if drain_pending_milestones {
             PendingMilestones {
                 token: tracker.take_pending_lifetime_token_milestones(),
-                usd: tracker.take_pending_lifetime_usd_milestones(),
             }
         } else {
             PendingMilestones::default()
@@ -2515,6 +2482,7 @@ impl SavingsTracker {
         std::mem::take(&mut self.pending_lifetime_token_milestones)
     }
 
+    #[cfg(test)]
     fn take_pending_lifetime_usd_milestones(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.pending_lifetime_usd_milestones)
     }
@@ -4436,7 +4404,7 @@ mod tests {
             workspace: Some("/Users/u/Code/demo".into()),
             turn_id: None,
             request_messages: None,
-            response_content: None,
+            compressed_messages: None,
         };
 
         let first = state.observe_activity_from_transformations(&[transformation.clone()]);
@@ -4638,7 +4606,6 @@ mod tests {
             read_only.token.is_empty(),
             "read-only path must not surface milestones"
         );
-        assert!(read_only.usd.is_empty());
 
         let (_, _, _, drained) = state
             .record_savings_snapshot(&stats, true)
@@ -4656,7 +4623,6 @@ mod tests {
             drained_again.token.is_empty(),
             "second drain finds nothing: milestones fire exactly once"
         );
-        assert!(drained_again.usd.is_empty());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

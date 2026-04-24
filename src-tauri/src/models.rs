@@ -343,8 +343,12 @@ pub struct TransformationFeedEvent {
     // does not need to re-parse it.
     #[serde(default, alias = "request_messages")]
     pub request_messages: Option<serde_json::Value>,
-    #[serde(default, alias = "response_content")]
-    pub response_content: Option<String>,
+    // Post-compression message list — what was actually sent upstream after
+    // Headroom's pipeline ran. Present only on proxies that carry this field
+    // (compressed_messages was added after request_messages was already in
+    // use, so older proxies will emit `None` here).
+    #[serde(default, alias = "compressed_messages")]
+    pub compressed_messages: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,36 +357,6 @@ pub struct TransformationFeedResponse {
     pub log_full_messages: bool,
     pub transformations: Vec<TransformationFeedEvent>,
     pub proxy_reachable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryFeedEvent {
-    pub id: String,
-    pub created_at: String,
-    pub scope: String,
-    pub content: String,
-    pub importance: f64,
-    pub evidence_count: u32,
-    // Pulled from the row's metadata. Routes a flushed pattern to the right
-    // file: `environment` / `architecture` → CLAUDE.md (context_file),
-    // `preference` / `error_recovery` → MEMORY.md (memory_file). Other
-    // values are uncategorised — they go nowhere.
-    #[serde(default)]
-    pub category: Option<String>,
-}
-
-/// Snapshot of how many evidence>=2 patterns headroom has flushed today,
-/// partitioned by destination file. Built daily-aggregated on the backend
-/// so the Activity tile can show a simple "X memories / Y learnings written
-/// today" summary that resets at local midnight.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryFlushEvent {
-    pub observed_at: DateTime<Utc>,
-    pub day: String,
-    pub memory_md_count: u32,
-    pub claude_md_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,27 +418,12 @@ pub struct RecordEvent {
     pub workspace: Option<String>,
     // Carried forward from the source transformation so the record row can
     // show what the record-setting compression was actually about. Populated
-    // only when the proxy's `log_full_messages` is enabled.
+    // only when the proxy's `log_full_messages` is enabled. `compressed_messages`
+    // is only populated by proxies that carry the field (see struct doc above).
     #[serde(default)]
     pub request_messages: Option<serde_json::Value>,
     #[serde(default)]
-    pub response_content: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreakEvent {
-    pub observed_at: DateTime<Utc>,
-    pub days: u32,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavingsMilestoneEvent {
-    pub observed_at: DateTime<Utc>,
-    pub milestone_usd: u64,
-    pub kind: String,
+    pub compressed_messages: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,18 +466,12 @@ pub enum ActivityEvent {
     RtkBatch(RtkBatchEvent),
     #[serde(rename = "record")]
     Record(RecordEvent),
-    #[serde(rename = "streak")]
-    Streak(StreakEvent),
-    #[serde(rename = "savingsMilestone")]
-    SavingsMilestone(SavingsMilestoneEvent),
     #[serde(rename = "weeklyRecap")]
     WeeklyRecap(WeeklyRecapEvent),
     #[serde(rename = "learningsMilestone")]
     LearningsMilestone(LearningsMilestoneEvent),
     #[serde(rename = "trainSuggestion")]
     TrainSuggestion(TrainSuggestionEvent),
-    #[serde(rename = "memoryFlush")]
-    MemoryFlush(MemoryFlushEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

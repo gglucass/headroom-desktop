@@ -76,11 +76,6 @@ pub fn notification_for_event(event: &ActivityEvent) -> Option<NotificationPaylo
                 None
             }
         }
-        ActivityEvent::Streak(s) if s.kind == "new_record" => Some(NotificationPayload {
-            title: "New longest streak".into(),
-            body: format!("You're on a {}-day run with Headroom. Keep it up.", s.days),
-            action: Some("activity".into()),
-        }),
         ActivityEvent::WeeklyRecap(r) => Some(NotificationPayload {
             title: "Your week with Headroom".into(),
             body: format!(
@@ -130,9 +125,8 @@ fn format_with_commas(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        LearningsMilestoneEvent, MemoryFlushEvent, RecordEvent, RecordTag, RtkBatchEvent,
-        SavingsMilestoneEvent, StreakEvent, TrainSuggestionEvent, TransformationFeedEvent,
-        WeeklyRecapEvent,
+        LearningsMilestoneEvent, RecordEvent, RecordTag, RtkBatchEvent, TrainSuggestionEvent,
+        TransformationFeedEvent, WeeklyRecapEvent,
     };
     use chrono::{TimeZone, Utc};
 
@@ -191,7 +185,7 @@ mod tests {
             day: None,
             workspace: None,
             request_messages: None,
-            response_content: None,
+            compressed_messages: None,
         });
         let p = notification_for_event(&ev).expect("should notify");
         assert!(p.title.contains("New record"));
@@ -212,26 +206,9 @@ mod tests {
             day: Some("2026-04-22".into()),
             workspace: None,
             request_messages: None,
-            response_content: None,
+            compressed_messages: None,
         });
         assert!(notification_for_event(&ev).is_none());
-    }
-
-    #[test]
-    fn notifies_for_new_record_streak_only() {
-        let record = ActivityEvent::Streak(StreakEvent {
-            observed_at: ts(),
-            days: 7,
-            kind: "new_record".into(),
-        });
-        assert!(notification_for_event(&record).is_some());
-
-        let threshold = ActivityEvent::Streak(StreakEvent {
-            observed_at: ts(),
-            days: 7,
-            kind: "threshold".into(),
-        });
-        assert!(notification_for_event(&threshold).is_none());
     }
 
     #[test]
@@ -263,26 +240,31 @@ mod tests {
     #[test]
     fn collect_payloads_filters_and_preserves_order() {
         let events = vec![
-            ActivityEvent::Streak(StreakEvent {
+            ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: ts(),
-                days: 3,
-                kind: "threshold".into(), // dropped
+                commands_delta: 1,
+                tokens_saved_delta: 1,
+                total_commands: 1,
+                total_saved: 1,
             }),
             ActivityEvent::LearningsMilestone(LearningsMilestoneEvent {
                 observed_at: ts(),
                 count: 3,
                 kind: "first_3".into(), // kept
             }),
-            ActivityEvent::Streak(StreakEvent {
+            ActivityEvent::WeeklyRecap(WeeklyRecapEvent {
                 observed_at: ts(),
-                days: 10,
-                kind: "new_record".into(), // kept
+                week_start: "2026-04-20".into(),
+                week_end: "2026-04-26".into(),
+                total_tokens_saved: 100,
+                total_savings_usd: 1.0,
+                active_days: 3,
             }),
         ];
         let payloads = collect_notification_payloads(&events);
         assert_eq!(payloads.len(), 2);
         assert!(payloads[0].title.contains("Headroom is learning"));
-        assert!(payloads[1].title.contains("New longest streak"));
+        assert!(payloads[1].title.contains("Your week with Headroom"));
     }
 
     #[test]
@@ -305,12 +287,7 @@ mod tests {
                 day: Some("2026-04-22".into()),
                 workspace: None,
                 request_messages: None,
-                response_content: None,
-            }),
-            ActivityEvent::SavingsMilestone(SavingsMilestoneEvent {
-                observed_at: ts(),
-                milestone_usd: 10,
-                kind: "first_10".into(),
+                compressed_messages: None,
             }),
             ActivityEvent::RtkBatch(RtkBatchEvent {
                 observed_at: ts(),
@@ -332,13 +309,7 @@ mod tests {
                 workspace: None,
                 turn_id: None,
                 request_messages: None,
-                response_content: None,
-            }),
-            ActivityEvent::MemoryFlush(MemoryFlushEvent {
-                observed_at: ts(),
-                day: "2026-04-22".into(),
-                memory_md_count: 3,
-                claude_md_count: 1,
+                compressed_messages: None,
             }),
         ];
         for ev in candidates.iter() {

@@ -5,22 +5,12 @@ import type {
   ActivityEvent,
   ActivityFeedResponse,
   LearningsMilestoneEvent,
-  MemoryFlushEvent,
   RecordEvent,
   RtkBatchEvent,
-  SavingsMilestoneEvent,
-  StreakEvent,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
 } from "../lib/types";
-
-function todayKey(now: Date = new Date()): string {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
 
 const baseFeed: ActivityFeedResponse = {
   events: [],
@@ -42,19 +32,6 @@ function transformation(event: Partial<TransformationFeedEvent> = {}): ActivityE
       tokensSaved: 750,
       savingsPercent: 75,
       transformsApplied: ["interceptor:ast-grep"],
-      ...event
-    }
-  };
-}
-
-function memoryFlush(event: Partial<MemoryFlushEvent> = {}): ActivityEvent {
-  return {
-    kind: "memoryFlush",
-    data: {
-      observedAt: "2026-04-21T10:01:00Z",
-      day: todayKey(),
-      memoryMdCount: 0,
-      claudeMdCount: 0,
       ...event
     }
   };
@@ -95,15 +72,12 @@ describe("ActivityFeed", () => {
     expect(markup).not.toContain("No requests yet");
     expect(markup).toContain("activity-feed__list");
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
-    expect(emptyClassCount).toBe(9);
+    expect(emptyClassCount).toBe(6);
     for (const cls of [
       "activity-feed__item--train",
       "activity-feed__item--transformation",
-      "activity-feed__item--memory",
       "activity-feed__item--rtk",
       "activity-feed__item--record",
-      "activity-feed__item--streak",
-      "activity-feed__item--savings-milestone",
       "activity-feed__item--learnings-milestone",
       "activity-feed__item--weekly-recap"
     ]) {
@@ -118,7 +92,7 @@ describe("ActivityFeed", () => {
     const feed: ActivityFeedResponse = { ...baseFeed, events: [transformation()] };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
-    expect(emptyClassCount).toBe(8);
+    expect(emptyClassCount).toBe(5);
     expect(markup).toContain("Recent large compression");
     expect(markup).not.toContain("No compressions yet");
     expect(markup).toContain("No RTK commands observed yet.");
@@ -277,8 +251,7 @@ describe("ActivityFeed", () => {
               transformsApplied: [],
               tokensSaved: 0,
               model: null,
-              requestMessages: null,
-              responseContent: null
+              requestMessages: null
             })
           ]
         }}
@@ -286,6 +259,32 @@ describe("ActivityFeed", () => {
       />
     );
     expect(withoutMessages).not.toContain("activity-feed__item--clickable");
+  });
+
+  it("treats compressedMessages alone as enough to make the row expandable (forward compat)", () => {
+    // Future-compat: a proxy that populates `compressedMessages` without
+    // `requestMessages` should still get an expandable row. Mirrors the
+    // legacy-only path above but for the new field.
+    const markup = renderToStaticMarkup(
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          events: [
+            transformation({
+              requestId: null,
+              workspace: null,
+              transformsApplied: [],
+              tokensSaved: 0,
+              model: null,
+              requestMessages: null,
+              compressedMessages: [{ role: "user", content: "hi" }]
+            })
+          ]
+        }}
+        error={null}
+      />
+    );
+    expect(markup).toContain("activity-feed__item--clickable");
   });
 
   it("falls back to the raw transform string when unknown", () => {
@@ -318,53 +317,6 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Stale Read × 70");
     expect(markup).toContain("Tool result excluded × 42");
     expect(markup).toContain(">Cache aligned<");
-  });
-
-  it("renders a memoryFlush tile with today's split MEMORY.md / CLAUDE.md counts", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [memoryFlush({ memoryMdCount: 3, claudeMdCount: 2 })]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("3 new memories written to MEMORY.md");
-    expect(markup).toContain("2 new learnings written to CLAUDE.md");
-  });
-
-  it("singularises MEMORY.md and CLAUDE.md copy when count is 1", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [memoryFlush({ memoryMdCount: 1, claudeMdCount: 1 })]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("1 new memory written to MEMORY.md");
-    expect(markup).toContain("1 new learning written to CLAUDE.md");
-  });
-
-  it("omits the MEMORY.md half when only CLAUDE.md got writes today", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [memoryFlush({ memoryMdCount: 0, claudeMdCount: 4 })]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("4 new learnings written to CLAUDE.md");
-    expect(markup).not.toContain("MEMORY.md");
-  });
-
-  it("drops memoryFlush events from prior days (today filter)", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        memoryFlush({
-          day: "2020-01-01",
-          memoryMdCount: 9,
-          claudeMdCount: 9
-        })
-      ]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).not.toContain("written to MEMORY.md");
-    expect(markup).not.toContain("written to CLAUDE.md");
-    expect(markup).toContain("No learnings written today.");
   });
 
   it("surfaces only the most recent compression in the transformation tile", () => {
@@ -427,21 +379,24 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
-  it("renders both kinds in the fixed tile order (transformation before memoryFlush)", () => {
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [
-        memoryFlush({ memoryMdCount: 1, claudeMdCount: 0 }),
-        transformation({ requestId: "req-2", provider: "openai" })
-      ]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const memoryIdx = markup.indexOf("written to MEMORY.md");
-    const transformationIdx = markup.indexOf("openai");
-    expect(memoryIdx).toBeGreaterThan(-1);
-    expect(transformationIdx).toBeGreaterThan(-1);
-    // Tiles render in TILE_ORDER: transformation before memoryFlush.
-    expect(transformationIdx).toBeLessThan(memoryIdx);
+  it("renders tiles in the fixed TILE_ORDER (trainSuggestion → transformation → rtkBatch → record → learningsMilestone → weeklyRecap)", () => {
+    // With all kinds as empty placeholders on an empty feed, the TILE_ORDER
+    // dictates DOM order: the trainSuggestion card lands before transformation,
+    // transformation before rtkBatch, etc. Asserts the contract that tile
+    // positions never reshuffle based on event arrival.
+    const markup = renderToStaticMarkup(<ActivityFeed feed={baseFeed} error={null} />);
+    const order = [
+      "activity-feed__item--train",
+      "activity-feed__item--transformation",
+      "activity-feed__item--rtk",
+      "activity-feed__item--record",
+      "activity-feed__item--learnings-milestone",
+      "activity-feed__item--weekly-recap"
+    ];
+    const positions = order.map((cls) => markup.indexOf(cls));
+    for (let i = 1; i < positions.length; i++) {
+      expect(positions[i]).toBeGreaterThan(positions[i - 1]);
+    }
   });
 
   it("renders an RTK batch row with deltas and cumulative totals", () => {
@@ -535,12 +490,12 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("previous record 10,000");
   });
 
-  it("makes a record row expandable when request/response messages came through from the source compression", () => {
-    // The record row now carries forward the same requestMessages /
-    // responseContent as the transformation that set it, so the user can
-    // see what the record-setting compression was about. Static markup
-    // keeps the detail pane collapsed; the signal the row is render-wise
-    // aware of the data is the `activity-feed__item--clickable` class.
+  it("makes a record row expandable when request messages came through from the source compression", () => {
+    // The record row carries forward the same requestMessages as the
+    // transformation that set it, so the user can see what the record-setting
+    // compression was about. Static markup keeps the detail pane collapsed;
+    // the signal the row is render-wise aware of the data is the
+    // `activity-feed__item--clickable` class.
     const withMessages: RecordEvent = {
       observedAt: "2026-04-21T09:00:00Z",
       tags: ["daily"],
@@ -551,10 +506,9 @@ describe("ActivityFeed", () => {
       requestId: "r-9",
       previousRecord: null,
       day: "2026-04-21",
-      requestMessages: [{ role: "user", content: "refactor this" }],
-      responseContent: "done"
+      requestMessages: [{ role: "user", content: "refactor this" }]
     };
-    const withoutMessages: RecordEvent = { ...withMessages, requestMessages: null, responseContent: null };
+    const withoutMessages: RecordEvent = { ...withMessages, requestMessages: null };
     const markupWith = renderToStaticMarkup(
       <ActivityFeed
         feed={{ ...baseFeed, events: [{ kind: "record", data: withMessages }] }}
@@ -571,52 +525,6 @@ describe("ActivityFeed", () => {
     expect(markupWith).toContain("activity-feed__item--clickable");
     expect(markupWithout).toContain("activity-feed__item--record");
     expect(markupWithout).not.toContain("activity-feed__item--clickable");
-  });
-
-  it("renders a streak row without the new-record tag on a threshold event", () => {
-    const data: StreakEvent = {
-      observedAt: "2026-04-22T10:00:00Z",
-      days: 7,
-      kind: "threshold"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "streak", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain(">Streak<");
-    expect(markup).toContain("7-day active streak");
-    expect(markup).not.toContain("new longest");
-  });
-
-  it("renders a streak row with the new-record tag on a new_record event", () => {
-    const data: StreakEvent = {
-      observedAt: "2026-04-22T10:00:00Z",
-      days: 12,
-      kind: "new_record"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "streak", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("new longest");
-    expect(markup).toContain("new personal best");
-  });
-
-  it("renders a savings milestone row with the dollar amount", () => {
-    const data: SavingsMilestoneEvent = {
-      observedAt: "2026-04-22T10:00:00Z",
-      milestoneUsd: 100,
-      kind: "first_100"
-    };
-    const feed: ActivityFeedResponse = {
-      ...baseFeed,
-      events: [{ kind: "savingsMilestone", data }]
-    };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Savings milestone");
-    expect(markup).toContain("$100");
   });
 
   it("renders a weekly recap row with the week range and totals", () => {
@@ -652,7 +560,7 @@ describe("ActivityFeed", () => {
       events: [{ kind: "learningsMilestone", data }]
     };
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    expect(markup).toContain("Learning milestone");
+    expect(markup).toContain(">Learnings<");
     expect(markup).toContain("3 patterns extracted");
   });
 
@@ -771,29 +679,6 @@ describe("ActivityFeed", () => {
     expect(markup).toContain("Saved 0 tokens (0.0%)");
     expect(markup).not.toContain("activity-feed__delta");
     expect(markup).not.toContain("activity-feed__transforms");
-  });
-
-  it("renders only one Learning tile when multiple memoryFlush events are present (latest wins)", () => {
-    // Backend already debounces to one MemoryFlush per kind, but the latest-
-    // by-kind selector should be defensive against duplicates anyway.
-    const events: ActivityEvent[] = [
-      memoryFlush({
-        observedAt: "2026-04-21T10:00:00Z",
-        memoryMdCount: 1,
-        claudeMdCount: 1
-      }),
-      memoryFlush({
-        observedAt: "2026-04-21T11:00:00Z",
-        memoryMdCount: 5,
-        claudeMdCount: 4
-      })
-    ];
-    const feed: ActivityFeedResponse = { ...baseFeed, events };
-    const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    const liveLearningCount = (markup.match(/written to MEMORY\.md/g) ?? []).length;
-    expect(liveLearningCount).toBe(1);
-    expect(markup).toContain("5 new memories written to MEMORY.md");
-    expect(markup).toContain("4 new learnings written to CLAUDE.md");
   });
 
 });

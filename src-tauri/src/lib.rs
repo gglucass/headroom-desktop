@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{Local, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -40,9 +40,8 @@ use crate::models::{
     ActivityEvent, ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, MemoryFeedEvent,
-    ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress,
-    TransformationFeedResponse,
+    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, ResearchCandidate,
+    RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -176,8 +175,6 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         let state: State<'_, AppState> = app.state();
         let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
 
-        state.record_activity_milestones(&pending_milestones);
-
         for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
                 &app,
@@ -198,20 +195,6 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
             {
                 let _ = show_notification_impl(&app, &payload.title, &payload.body, payload.action);
             }
-        }
-
-        for milestone_usd in &pending_milestones.usd {
-            analytics::track_event(
-                &app,
-                "lifetime_usd_savings_milestone_reached",
-                Some(json!({
-                    "milestone_usd": *milestone_usd,
-                    "lifetime_estimated_savings_usd": dashboard.lifetime_estimated_savings_usd,
-                    "lifetime_requests": dashboard.lifetime_requests,
-                    "launch_count": state.launch_count(),
-                    "launch_experience": state.launch_experience_label()
-                })),
-            );
         }
 
         check_zero_spend_anomaly(&dashboard);
@@ -960,24 +943,8 @@ fn get_activity_feed(state: State<'_, AppState>, limit: Option<u32>) -> Activity
     // first new compression lands; acceptable in exchange for a tiny facts
     // file and an unblocked IPC hot path.
     let transformations = fetch_transformations_feed(limit).ok();
-
-    // Refresh today's memory-flush snapshot opportunistically on every feed
-    // poll so the tile updates between observer ticks (frontend polls every
-    // 4s; observer runs every 20s). The observe_memory_flush call only marks
-    // state dirty when totals actually changed, so the steady-state path
-    // does no disk writes.
-    let memory_path = headroom_memory_db_path();
-    if memory_path.exists() {
-        if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
-            if let Ok(memories) = parse_memory_export(&stdout, limit as usize) {
-                let (memory_md, claude_md) = count_flush_targets(&memories);
-                let _ = state.observe_memory_flush(memory_md, claude_md);
-            }
-        }
-    }
-
     let recent_synthetic = state.recent_activity_events();
-    let memory_available = memory_path.exists();
+    let memory_available = headroom_memory_db_path().exists();
     build_activity_feed_response(transformations, recent_synthetic, memory_available)
 }
 
@@ -1038,14 +1005,8 @@ fn run_activity_observation(app: &AppHandle) {
     let memory_path = headroom_memory_db_path();
     if memory_path.exists() {
         if let Ok(stdout) = memory_export_cached(&state, &memory_path) {
-            if let Ok(memories) = parse_memory_export(&stdout, ACTIVITY_OBSERVER_LIMIT as usize) {
-                if let Some(event) = state.observe_learnings_count(memories.len()) {
-                    fresh_events.push(event);
-                }
-                // Today's memory-flush snapshot. Re-emitted on every observer
-                // tick so the tile always carries the freshest counts.
-                let (memory_md, claude_md) = count_flush_targets(&memories);
-                if let Some(event) = state.observe_memory_flush(memory_md, claude_md) {
+            if let Ok(count) = count_memories_with_created_at(&stdout) {
+                if let Some(event) = state.observe_learnings_count(count) {
                     fresh_events.push(event);
                 }
             }
@@ -1997,99 +1958,20 @@ fn check_headroom_learn_prereqs(
     Ok(())
 }
 
-fn parse_memory_export(json: &str, limit: usize) -> Result<Vec<MemoryFeedEvent>, String> {
-    #[derive(serde::Deserialize)]
-    struct RawMemory {
-        id: String,
-        #[serde(default)]
-        content: String,
-        #[serde(default, alias = "scope_level")]
-        scope: Option<String>,
-        #[serde(default)]
-        created_at: Option<String>,
-        #[serde(default)]
-        importance: Option<f64>,
-        // Top-level `category` is preferred (matches the proxy's export shape);
-        // fall back to `metadata.category` for older payloads. Routes a flushed
-        // pattern to the right destination file (CLAUDE.md vs MEMORY.md).
-        #[serde(default)]
-        category: Option<String>,
-        #[serde(default)]
-        metadata: serde_json::Value,
-    }
-    let raw: Vec<RawMemory> = serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
-    let mut events: Vec<MemoryFeedEvent> = raw
+/// Count entries in a `headroom memory export` JSON payload that have a
+/// non-null `created_at`. Mirrors the filter `parse_memory_export` used to
+/// apply — just without building an intermediate struct, since the only
+/// caller wants the count for the learnings-milestone threshold.
+fn count_memories_with_created_at(json: &str) -> Result<usize, String> {
+    let raw: Vec<serde_json::Value> =
+        serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    Ok(raw
         .into_iter()
-        .filter_map(|m| {
-            let evidence_count = m
-                .metadata
-                .get("evidence_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-            let category = m.category.or_else(|| {
-                m.metadata
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
-            Some(MemoryFeedEvent {
-                id: m.id,
-                created_at: normalize_utc_timestamp(&m.created_at?)?,
-                scope: m.scope.unwrap_or_else(|| "unknown".into()),
-                content: m.content,
-                importance: m.importance.unwrap_or(0.0),
-                evidence_count,
-                category,
-            })
+        .filter(|v| {
+            v.get("created_at")
+                .is_some_and(|c| !c.is_null() && c.as_str().is_some_and(|s| !s.is_empty()))
         })
-        .collect();
-    events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    events.truncate(limit);
-    Ok(events)
-}
-
-/// Categories that traffic_learner routes to CLAUDE.md (context_file).
-/// Mirrors `_CATEGORY_TO_TARGET` in the upstream Python (traffic_learner.py).
-const CLAUDE_MD_CATEGORIES: &[&str] = &["environment", "architecture"];
-/// Categories that traffic_learner routes to MEMORY.md (memory_file).
-const MEMORY_MD_CATEGORIES: &[&str] = &["preference", "error_recovery"];
-
-/// Count evidence>=2 memories partitioned by destination file (CLAUDE.md vs
-/// MEMORY.md). Patterns with no/unknown category are skipped — only the
-/// categories the upstream traffic_learner knows how to flush are counted.
-fn count_flush_targets(memories: &[MemoryFeedEvent]) -> (u32, u32) {
-    let mut memory_md = 0u32;
-    let mut claude_md = 0u32;
-    for m in memories {
-        if m.evidence_count < 2 {
-            continue;
-        }
-        let Some(cat) = m.category.as_deref() else {
-            continue;
-        };
-        if MEMORY_MD_CATEGORIES.contains(&cat) {
-            memory_md = memory_md.saturating_add(1);
-        } else if CLAUDE_MD_CATEGORIES.contains(&cat) {
-            claude_md = claude_md.saturating_add(1);
-        }
-    }
-    (memory_md, claude_md)
-}
-
-/// Normalize an ISO-8601 timestamp string to RFC3339 UTC (`...Z`).
-///
-/// Headroom's memory DB stores naive ISO strings (no offset). JS `Date` parses
-/// those as local time, so downstream display would be off by the local tz
-/// offset. Treat naive strings as UTC and emit `Z`-suffixed output so both the
-/// feed sort and the frontend render match system time.
-fn normalize_utc_timestamp(raw: &str) -> Option<String> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return Some(dt.with_timezone(&Utc).to_rfc3339());
-    }
-    NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-        .map(|naive| naive.and_utc().to_rfc3339())
+        .count())
 }
 
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
@@ -3105,8 +2987,8 @@ mod tests {
         build_activity_feed_response, build_release_updater_config, check_headroom_learn_prereqs,
         compute_tray_window_position, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
-        is_prerelease_version, lifetime_token_milestone_kind, normalize_utc_timestamp,
-        parse_live_learnings, parse_memory_export, parse_updater_endpoint_list,
+        count_memories_with_created_at, is_prerelease_version, lifetime_token_milestone_kind,
+        parse_live_learnings, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
         PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
@@ -3116,7 +2998,7 @@ mod tests {
         ActivityEvent, RecordEvent, RecordTag,
         RtkBatchEvent, TransformationFeedEvent, TransformationFeedResponse,
     };
-    use chrono::{DateTime, TimeZone, Timelike, Utc};
+    use chrono::{TimeZone, Utc};
     use parking_lot::Mutex;
     use serde_json::json;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
@@ -3595,108 +3477,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_memory_export_decodes_recent_entries_sorted_descending() {
+    fn count_memories_with_created_at_counts_valid_entries() {
         let json = r#"[
-            {"id":"a","content":"oldest","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.5},
-            {"id":"b","content":"newest","scope_level":"session","created_at":"2026-04-21T12:00:00","importance":0.9},
-            {"id":"c","content":"middle","scope_level":"agent","created_at":"2026-04-21T11:00:00","importance":0.3}
+            {"id":"a","created_at":"2026-04-21T10:00:00"},
+            {"id":"b","created_at":"2026-04-21T11:00:00"},
+            {"id":"c","created_at":"2026-04-21T12:00:00"}
         ]"#;
-        let events = parse_memory_export(json, 10).unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].id, "b");
-        assert_eq!(events[0].content, "newest");
-        assert_eq!(events[0].scope, "session");
-        assert_eq!(events[1].id, "c");
-        assert_eq!(events[2].id, "a");
+        assert_eq!(count_memories_with_created_at(json).unwrap(), 3);
     }
 
     #[test]
-    fn parse_memory_export_caps_to_limit() {
+    fn count_memories_with_created_at_skips_missing_and_empty() {
         let json = r#"[
-            {"id":"1","content":"a","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.1},
-            {"id":"2","content":"b","scope_level":"user","created_at":"2026-04-21T11:00:00","importance":0.1},
-            {"id":"3","content":"c","scope_level":"user","created_at":"2026-04-21T12:00:00","importance":0.1}
+            {"id":"a","created_at":"2026-04-21T10:00:00"},
+            {"id":"b","created_at":null},
+            {"id":"c"},
+            {"id":"d","created_at":""}
         ]"#;
-        let events = parse_memory_export(json, 2).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].id, "3");
-        assert_eq!(events[1].id, "2");
+        assert_eq!(count_memories_with_created_at(json).unwrap(), 1);
     }
 
     #[test]
-    fn parse_memory_export_handles_empty_array() {
-        let events = parse_memory_export("[]", 10).unwrap();
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn parse_memory_export_skips_entries_without_created_at() {
-        let json = r#"[
-            {"id":"1","content":"valid","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.5},
-            {"id":"2","content":"missing","scope_level":"user","importance":0.1}
-        ]"#;
-        let events = parse_memory_export(json, 10).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "1");
-    }
-
-    #[test]
-    fn parse_memory_export_returns_error_on_malformed_json() {
-        let err = parse_memory_export("not json", 10).unwrap_err();
-        assert!(!err.is_empty());
-    }
-
-    #[test]
-    fn parse_memory_export_normalizes_naive_created_at_to_utc_rfc3339() {
-        let json = r#"[
-            {"id":"a","content":"x","scope_level":"user","created_at":"2026-04-21T10:00:00","importance":0.1}
-        ]"#;
-        let events = parse_memory_export(json, 10).unwrap();
-        assert_eq!(events.len(), 1);
-        // Naive timestamp must be treated as UTC and emitted with an offset so
-        // JS `new Date(...)` parses it as UTC rather than local.
-        assert!(
-            events[0].created_at.ends_with("+00:00") || events[0].created_at.ends_with("Z"),
-            "expected UTC offset suffix, got {}",
-            events[0].created_at
-        );
-    }
-
-    #[test]
-    fn parse_memory_export_preserves_existing_offset() {
-        let json = r#"[
-            {"id":"a","content":"x","scope_level":"user","created_at":"2026-04-21T10:00:00-07:00","importance":0.1}
-        ]"#;
-        let events = parse_memory_export(json, 10).unwrap();
-        assert_eq!(events.len(), 1);
-        // -07:00 wall-clock 10:00 == UTC 17:00.
-        let dt = DateTime::parse_from_rfc3339(&events[0].created_at).unwrap();
-        assert_eq!(dt.with_timezone(&Utc).hour(), 17);
-    }
-
-    #[test]
-    fn normalize_utc_timestamp_handles_naive_and_rfc3339() {
-        let naive = normalize_utc_timestamp("2026-04-21T10:00:00").unwrap();
-        let parsed = DateTime::parse_from_rfc3339(&naive).unwrap();
-        assert_eq!(
-            parsed.with_timezone(&Utc).to_rfc3339(),
-            "2026-04-21T10:00:00+00:00"
-        );
-
-        let fractional = normalize_utc_timestamp("2026-04-21T10:00:00.123").unwrap();
-        assert!(DateTime::parse_from_rfc3339(&fractional).is_ok());
-
-        let with_z = normalize_utc_timestamp("2026-04-21T10:00:00Z").unwrap();
-        assert_eq!(
-            DateTime::parse_from_rfc3339(&with_z)
-                .unwrap()
-                .with_timezone(&Utc),
-            DateTime::parse_from_rfc3339("2026-04-21T10:00:00+00:00")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
-
-        assert!(normalize_utc_timestamp("not a date").is_none());
+    fn count_memories_with_created_at_handles_empty_and_errors() {
+        assert_eq!(count_memories_with_created_at("[]").unwrap(), 0);
+        assert!(count_memories_with_created_at("not json").is_err());
     }
 
     #[test]
@@ -3839,21 +3643,7 @@ mod tests {
             workspace: None,
             turn_id: None,
             request_messages: None,
-            response_content: None,
-        }
-    }
-
-    fn timestamp_of(event: &ActivityEvent) -> String {
-        match event {
-            ActivityEvent::Transformation(t) => t.timestamp.clone().unwrap_or_default(),
-            ActivityEvent::RtkBatch(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::Record(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::Streak(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::SavingsMilestone(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::WeeklyRecap(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::LearningsMilestone(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::TrainSuggestion(e) => e.observed_at.to_rfc3339(),
-            ActivityEvent::MemoryFlush(e) => e.observed_at.to_rfc3339(),
+            compressed_messages: None,
         }
     }
 
@@ -3913,7 +3703,7 @@ mod tests {
                 day: None,
                 workspace: None,
                 request_messages: None,
-                response_content: None,
+                compressed_messages: None,
             }),
         ];
 

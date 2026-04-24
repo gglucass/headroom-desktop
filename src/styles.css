@@ -52,6 +52,12 @@
   --danger:             #c14b24;
   --danger-tint:        rgba(193, 75, 36, 0.12);
 
+  /* Activity feed badge accents — one hue per event kind */
+  --activity-train-strong:     #2a5e80;
+  --activity-train-tint:       rgba(56, 120, 160, 0.18);
+  --activity-learnings-strong: #3a4480;
+  --activity-learnings-tint:   rgba(76, 90, 160, 0.18);
+
   /* Chips / badges */
   --chip-bg:            rgba(36, 31, 29, 0.08);
   --chip-text:          #655c56;
@@ -85,6 +91,11 @@
     --warning-tint:       rgba(220, 143, 26, 0.2);
     --danger:             #e76d3d;
     --danger-tint:        rgba(193, 75, 36, 0.2);
+
+    --activity-train-strong:     #8ac0e0;
+    --activity-train-tint:       rgba(80, 150, 200, 0.22);
+    --activity-learnings-strong: #b0bce0;
+    --activity-learnings-tint:   rgba(130, 145, 210, 0.22);
 
     --chip-bg:            rgba(255, 255, 255, 0.1);
     --chip-text:          rgba(242, 237, 232, 0.8);
@@ -4409,11 +4420,6 @@ html.window-hiding {
   color: #4a6b3f;
 }
 
-.activity-feed__badge--memory {
-  background: rgba(108, 90, 165, 0.15);
-  color: #5a4990;
-}
-
 .activity-feed__badge--rtk {
   background: rgba(190, 95, 55, 0.15);
   color: #9a4a2b;
@@ -4453,24 +4459,6 @@ html.window-hiding {
   color: #2e6b52;
 }
 
-.activity-feed__badge--streak {
-  background: rgba(160, 100, 200, 0.15);
-  color: #5a3480;
-}
-
-.activity-feed__streak-record {
-  text-transform: uppercase;
-  font-size: var(--text-xxs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  color: #8a2546;
-}
-
-.activity-feed__badge--savings-milestone {
-  background: rgba(220, 165, 60, 0.18);
-  color: #6e4a10;
-}
-
 .activity-feed__badge--weekly-recap {
   background: rgba(90, 130, 170, 0.15);
   color: #2d4a6e;
@@ -4492,13 +4480,13 @@ html.window-hiding {
 }
 
 .activity-feed__badge--learnings-milestone {
-  background: rgba(108, 90, 165, 0.2);
-  color: #4a3a82;
+  background: var(--activity-learnings-tint);
+  color: var(--activity-learnings-strong);
 }
 
 .activity-feed__badge--train {
-  background: var(--accent-tint-strong);
-  color: var(--accent-strong);
+  background: var(--activity-train-tint);
+  color: var(--activity-train-strong);
 }
 
 .activity-feed__scope {

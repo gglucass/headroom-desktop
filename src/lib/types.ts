@@ -269,38 +269,22 @@ export interface TransformationFeedEvent {
   turnId?: string | null;
   // Populated only when the proxy was started with `--log-messages` (or
   // `HEADROOM_LOG_MESSAGES=1`), reflected in
-  // `TransformationFeedResponse.logFullMessages`. Both fields are pass-through
-  // from the proxy's `RequestLogger` — the desktop renders them, it does not
-  // reinterpret them.
+  // `TransformationFeedResponse.logFullMessages`. Both fields are
+  // pass-through from the proxy's `RequestLogger` — the desktop renders
+  // them, it does not reinterpret them.
+  //
+  // `compressedMessages` is the post-compression message list that was
+  // actually sent upstream; paired with `requestMessages` it lets consumers
+  // see what Headroom's pipeline stripped, replaced, or kept. Absent on
+  // proxies that predate the field.
   requestMessages?: TransformationRequestMessage[] | null;
-  responseContent?: string | null;
+  compressedMessages?: TransformationRequestMessage[] | null;
 }
 
 export interface TransformationFeedResponse {
   logFullMessages: boolean;
   proxyReachable: boolean;
   transformations: TransformationFeedEvent[];
-}
-
-export interface MemoryFeedEvent {
-  id: string;
-  createdAt: string;
-  scope: string;
-  content: string;
-  importance: number;
-  evidenceCount: number;
-  category?: string | null;
-}
-
-// Today's running totals of evidence>=2 patterns headroom has flushed to file.
-// Resets at local midnight (the `day` field is the local YYYY-MM-DD the
-// counts apply to). The activity tile uses this snapshot to render
-// "X memories written to MEMORY.md and Y learnings written to CLAUDE.md".
-export interface MemoryFlushEvent {
-  observedAt: string;
-  day: string;
-  memoryMdCount: number;
-  claudeMdCount: number;
 }
 
 export interface LiveLearning {
@@ -344,22 +328,12 @@ export interface RecordEvent {
   day: string | null;
   workspace?: string | null;
   // Carried forward from the record-setting transformation so the record row
-  // can surface the same request/response detail as the compression card.
-  // Populated only when the proxy's `log_full_messages` is enabled.
+  // can surface the same request/compressed detail as the compression card.
+  // Populated only when the proxy's `log_full_messages` is enabled;
+  // `compressedMessages` additionally requires a proxy that carries the
+  // field (see TransformationFeedEvent above).
   requestMessages?: TransformationRequestMessage[] | null;
-  responseContent?: string | null;
-}
-
-export interface StreakEvent {
-  observedAt: string;
-  days: number;
-  kind: string;
-}
-
-export interface SavingsMilestoneEvent {
-  observedAt: string;
-  milestoneUsd: number;
-  kind: string;
+  compressedMessages?: TransformationRequestMessage[] | null;
 }
 
 export interface WeeklyRecapEvent {
@@ -391,12 +365,9 @@ export type ActivityEvent =
   | { kind: "transformation"; data: TransformationFeedEvent }
   | { kind: "rtkBatch"; data: RtkBatchEvent }
   | { kind: "record"; data: RecordEvent }
-  | { kind: "streak"; data: StreakEvent }
-  | { kind: "savingsMilestone"; data: SavingsMilestoneEvent }
   | { kind: "weeklyRecap"; data: WeeklyRecapEvent }
   | { kind: "learningsMilestone"; data: LearningsMilestoneEvent }
-  | { kind: "trainSuggestion"; data: TrainSuggestionEvent }
-  | { kind: "memoryFlush"; data: MemoryFlushEvent };
+  | { kind: "trainSuggestion"; data: TrainSuggestionEvent };
 
 export interface ActivityFeedResponse {
   events: ActivityEvent[];

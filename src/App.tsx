@@ -352,12 +352,8 @@ function activityFeedSignature(feed: ActivityFeedResponse): string {
         return `t:${event.data.requestId ?? event.data.timestamp ?? ""}`;
       case "weeklyRecap":
         return `wr:${event.data.weekStart}`;
-      case "memoryFlush":
-        return `mf:${event.data.day}:${event.data.memoryMdCount}:${event.data.claudeMdCount}`;
       case "rtkBatch":
       case "record":
-      case "streak":
-      case "savingsMilestone":
       case "learningsMilestone":
         return `${event.kind[0]}:${event.data.observedAt}`;
       case "trainSuggestion":

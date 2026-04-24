@@ -7,12 +7,9 @@ import type {
   ActivityEvent,
   ActivityFeedResponse,
   LearningsMilestoneEvent,
-  MemoryFlushEvent,
   RecordEvent,
   RecordTag,
   RtkBatchEvent,
-  SavingsMilestoneEvent,
-  StreakEvent,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   TransformationRequestMessage,
@@ -39,11 +36,8 @@ interface ActivityFeedProps {
 const TILE_ORDER: ActivityEvent["kind"][] = [
   "trainSuggestion",
   "transformation",
-  "memoryFlush",
   "rtkBatch",
   "record",
-  "streak",
-  "savingsMilestone",
   "learningsMilestone",
   "weeklyRecap"
 ];
@@ -62,11 +56,6 @@ const EMPTY_TILE_COPY: Record<
     badgeLabel: "Compression",
     copy: "No compressions yet — send a message through Claude Code."
   },
-  memoryFlush: {
-    badgeClass: "activity-feed__badge--memory",
-    badgeLabel: "Learning",
-    copy: "No learnings written today."
-  },
   rtkBatch: {
     badgeClass: "activity-feed__badge--rtk",
     badgeLabel: "RTK",
@@ -77,20 +66,10 @@ const EMPTY_TILE_COPY: Record<
     badgeLabel: "Record",
     copy: "No new records yet."
   },
-  streak: {
-    badgeClass: "activity-feed__badge--streak",
-    badgeLabel: "Streak",
-    copy: "No streak milestones yet."
-  },
-  savingsMilestone: {
-    badgeClass: "activity-feed__badge--savings-milestone",
-    badgeLabel: "Savings milestone",
-    copy: "No savings milestones yet."
-  },
   learningsMilestone: {
     badgeClass: "activity-feed__badge--learnings-milestone",
-    badgeLabel: "Learning milestone",
-    copy: "No learning milestones yet."
+    badgeLabel: "Learnings",
+    copy: "No learnings yet."
   },
   weeklyRecap: {
     badgeClass: "activity-feed__badge--weekly-recap",
@@ -102,21 +81,11 @@ const EMPTY_TILE_COPY: Record<
 const KIND_ITEM_MODIFIER: Record<ActivityEvent["kind"], string> = {
   trainSuggestion: "activity-feed__item--train",
   transformation: "activity-feed__item--transformation",
-  memoryFlush: "activity-feed__item--memory",
   rtkBatch: "activity-feed__item--rtk",
   record: "activity-feed__item--record",
-  streak: "activity-feed__item--streak",
-  savingsMilestone: "activity-feed__item--savings-milestone",
   learningsMilestone: "activity-feed__item--learnings-milestone",
   weeklyRecap: "activity-feed__item--weekly-recap"
 };
-
-function localDayKey(now: Date = new Date()): string {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
 
 export function ActivityFeed({
   feed,
@@ -124,10 +93,9 @@ export function ActivityFeed({
   loaded = true,
   onNavigateToOptimize
 }: ActivityFeedProps) {
-  const today = localDayKey();
   const latestByKind = useMemo(
-    () => selectLatestByKind(feed.events, today),
-    [feed.events, today]
+    () => selectLatestByKind(feed.events),
+    [feed.events]
   );
   const tiles = TILE_ORDER.map((kind) => ({
     kind,
@@ -185,18 +153,11 @@ export function ActivityFeed({
 }
 
 function selectLatestByKind(
-  events: ActivityEvent[],
-  today: string
+  events: ActivityEvent[]
 ): Map<ActivityEvent["kind"], ActivityEvent> {
   const latest = new Map<ActivityEvent["kind"], ActivityEvent>();
   const latestTs = new Map<ActivityEvent["kind"], number>();
   for (const event of events) {
-    // Memory-flush counts are scoped to a calendar day. Yesterday's snapshot
-    // would still be in the feed window after midnight; drop it so the tile
-    // disappears until today gets its first flush.
-    if (event.kind === "memoryFlush" && event.data.day !== today) {
-      continue;
-    }
     const ts = eventTimestampMs(event);
     const prevTs = latestTs.get(event.kind) ?? -1;
     if (ts > prevTs) {
@@ -217,16 +178,10 @@ function TileItem({
   switch (event.kind) {
     case "transformation":
       return <TransformationRow event={event.data} />;
-    case "memoryFlush":
-      return <MemoryFlushRow event={event.data} />;
     case "rtkBatch":
       return <RtkBatchRow event={event.data} />;
     case "record":
       return <RecordRow event={event.data} />;
-    case "streak":
-      return <StreakRow event={event.data} />;
-    case "savingsMilestone":
-      return <SavingsMilestoneRow event={event.data} />;
     case "weeklyRecap":
       return <WeeklyRecapRow event={event.data} />;
     case "learningsMilestone":
@@ -287,11 +242,8 @@ function eventTimestampMs(event: ActivityEvent): number {
       return Date.parse(event.data.timestamp ?? "") || 0;
     case "rtkBatch":
     case "record":
-    case "streak":
-    case "savingsMilestone":
     case "learningsMilestone":
     case "trainSuggestion":
-    case "memoryFlush":
       return Date.parse(event.data.observedAt) || 0;
     case "weeklyRecap":
       return Date.parse(event.data.observedAt ?? event.data.weekStart) || 0;
@@ -406,14 +358,15 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const groupsWithTargets = groups.filter((g) => g.targets.length > 0);
   const estimatedUsd = estimateCostSavingsUsd(event.model, saved);
   const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
-  const hasResponseContent = !!event.responseContent && event.responseContent.length > 0;
+  const hasCompressedMessages =
+    !!event.compressedMessages && event.compressedMessages.length > 0;
   const hasExtra =
     hasRequestId ||
     hasRawTransforms ||
     event.workspace != null ||
     estimatedUsd != null ||
     hasRequestMessages ||
-    hasResponseContent;
+    hasCompressedMessages;
   const detail = hasExtra ? (
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
@@ -460,21 +413,47 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
         </>
       ) : null}
-      {hasRequestMessages ? (
+      {hasRequestMessages && hasCompressedMessages ? (
+        // New proxy shape: both sides present. Render the pre/post pair with
+        // token counts so the N → M savings on the headline become legible
+        // in terms of the actual message content below.
+        <>
+          <dt>
+            Request (original
+            {event.inputTokensOriginal != null
+              ? `, ${event.inputTokensOriginal.toLocaleString()} tokens`
+              : ""}
+            )
+          </dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.requestMessages!)}
+            </pre>
+          </dd>
+          <dt>
+            Request (compressed
+            {event.inputTokensOptimized != null
+              ? `, ${event.inputTokensOptimized.toLocaleString()} tokens`
+              : ""}
+            )
+          </dt>
+          <dd>
+            <pre className="activity-feed__message-dump">
+              {formatRequestMessages(event.compressedMessages!)}
+            </pre>
+          </dd>
+        </>
+      ) : hasRequestMessages ? (
+        // Legacy proxy shape: only `requestMessages` exists. Its content may
+        // actually be the post-compression list (field was inconsistent
+        // across sites before the upstream split) — we can't tell, so label
+        // it neutrally and keep today's behaviour.
         <>
           <dt>Request</dt>
           <dd>
             <pre className="activity-feed__message-dump">
               {formatRequestMessages(event.requestMessages!)}
             </pre>
-          </dd>
-        </>
-      ) : null}
-      {hasResponseContent ? (
-        <>
-          <dt>Response</dt>
-          <dd>
-            <pre className="activity-feed__message-dump">{event.responseContent}</pre>
           </dd>
         </>
       ) : null}
@@ -703,30 +682,6 @@ function splitColonN(s: string, parts: number): string[] {
   return result;
 }
 
-function MemoryFlushRow({ event }: { event: MemoryFlushEvent }) {
-  const memCount = event.memoryMdCount;
-  const claudeCount = event.claudeMdCount;
-  const parts: string[] = [];
-  if (memCount > 0) {
-    parts.push(`${memCount} new ${memCount === 1 ? "memory" : "memories"} written to MEMORY.md`);
-  }
-  if (claudeCount > 0) {
-    parts.push(
-      `${claudeCount} new ${claudeCount === 1 ? "learning" : "learnings"} written to CLAUDE.md`
-    );
-  }
-  return (
-    <li className="activity-feed__item activity-feed__item--memory">
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--memory">Learning</span>
-        <TimeChip iso={event.observedAt} />
-        <span className="activity-feed__week-range">today</span>
-      </div>
-      <p className="activity-feed__content">{parts.join(" and ")}.</p>
-    </li>
-  );
-}
-
 function RtkBatchRow({ event }: { event: RtkBatchEvent }) {
   const detail = (
     <dl className="activity-feed__detail-grid">
@@ -775,25 +730,33 @@ function RecordRow({ event }: { event: RecordEvent }) {
   const pct = event.savingsPercent;
   const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
   const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
-  const hasResponseContent = !!event.responseContent && event.responseContent.length > 0;
+  const hasCompressedMessages =
+    !!event.compressedMessages && event.compressedMessages.length > 0;
   const detail =
-    hasRequestMessages || hasResponseContent ? (
+    hasRequestMessages || hasCompressedMessages ? (
       <dl className="activity-feed__detail-grid">
-        {hasRequestMessages ? (
+        {hasRequestMessages && hasCompressedMessages ? (
+          <>
+            <dt>Request (original)</dt>
+            <dd>
+              <pre className="activity-feed__message-dump">
+                {formatRequestMessages(event.requestMessages!)}
+              </pre>
+            </dd>
+            <dt>Request (compressed)</dt>
+            <dd>
+              <pre className="activity-feed__message-dump">
+                {formatRequestMessages(event.compressedMessages!)}
+              </pre>
+            </dd>
+          </>
+        ) : hasRequestMessages ? (
           <>
             <dt>Request</dt>
             <dd>
               <pre className="activity-feed__message-dump">
                 {formatRequestMessages(event.requestMessages!)}
               </pre>
-            </dd>
-          </>
-        ) : null}
-        {hasResponseContent ? (
-          <>
-            <dt>Response</dt>
-            <dd>
-              <pre className="activity-feed__message-dump">{event.responseContent}</pre>
             </dd>
           </>
         ) : null}
@@ -883,47 +846,12 @@ function LearningsMilestoneRow({ event }: { event: LearningsMilestoneEvent }) {
     <li className="activity-feed__item activity-feed__item--learnings-milestone">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--learnings-milestone">
-          Learning milestone
+          Learnings
         </span>
         <TimeChip iso={event.observedAt} />
       </div>
       <p className="activity-feed__content">
         {event.count} patterns extracted from your work so far.
-      </p>
-    </li>
-  );
-}
-
-function StreakRow({ event }: { event: StreakEvent }) {
-  const isRecord = event.kind === "new_record";
-  return (
-    <li className="activity-feed__item activity-feed__item--streak">
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--streak">Streak</span>
-        <TimeChip iso={event.observedAt} />
-        {isRecord ? (
-          <span className="activity-feed__streak-record">new longest</span>
-        ) : null}
-      </div>
-      <p className="activity-feed__content">
-        {event.days}-day active streak
-        {isRecord ? " — new personal best!" : "!"}
-      </p>
-    </li>
-  );
-}
-
-function SavingsMilestoneRow({ event }: { event: SavingsMilestoneEvent }) {
-  return (
-    <li className="activity-feed__item activity-feed__item--savings-milestone">
-      <div className="activity-feed__row activity-feed__row--meta">
-        <span className="activity-feed__badge activity-feed__badge--savings-milestone">
-          Savings milestone
-        </span>
-        <TimeChip iso={event.observedAt} />
-      </div>
-      <p className="activity-feed__content">
-        Lifetime savings crossed ${event.milestoneUsd.toLocaleString()}.
       </p>
     </li>
   );

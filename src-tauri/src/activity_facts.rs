@@ -6,17 +6,16 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, MemoryFlushEvent, RecordEvent,
-    RecordTag, RtkBatchEvent, SavingsMilestoneEvent, StreakEvent, TransformationFeedEvent,
-    TrainSuggestionEvent, WeeklyRecapEvent,
+    ActivityEvent, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent, RecordTag,
+    RtkBatchEvent, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 use crate::tool_manager::RtkGainSummary;
 
-// Bumped from 1 → 2 when we replaced the recent_events / transformation_history
-// queues with latest-of-kind slots. Old persisted state can't be carried
-// forward usefully — there are no users on a prior release that would notice.
-const SCHEMA_VERSION: u8 = 2;
+// Bumped from 2 → 3 when streak, savings-milestone, and memory-flush bookkeeping
+// were removed from the Activity tab. Old persisted state still carries those
+// fields; the mismatch handler drops the file and starts fresh.
+const SCHEMA_VERSION: u8 = 3;
 // Hard cap on how big a facts file we'll even attempt to deserialize at boot.
 // The pre-v2 schema embedded full request/response bodies into queues that
 // could grow past 100MB; loading those synchronously hangs the boot path and
@@ -32,37 +31,6 @@ pub(crate) const NEVER_TRAINED_MIN_SESSIONS: usize = 5;
 // at least once, we only remind them weekly at most so the Activity feed
 // doesn't turn into a nag screen.
 pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 7;
-
-const FIRST_STREAKS: [u32; 4] = [3, 7, 14, 30];
-const REPEATING_STREAK_STEP: u32 = 30;
-
-fn savings_milestone_kind(milestone_usd: u64) -> &'static str {
-    match milestone_usd {
-        10 => "first_10",
-        50 => "first_50",
-        100 => "first_100",
-        _ => "repeating_100",
-    }
-}
-
-fn streaks_crossed(previous: u32, current: u32) -> Vec<u32> {
-    if current <= previous {
-        return Vec::new();
-    }
-    let mut thresholds = FIRST_STREAKS
-        .into_iter()
-        .filter(|t| previous < *t && current >= *t)
-        .collect::<Vec<_>>();
-    let first_repeating = previous / REPEATING_STREAK_STEP + 1;
-    let last_repeating = current / REPEATING_STREAK_STEP;
-    for index in first_repeating..=last_repeating {
-        let days = index.saturating_mul(REPEATING_STREAK_STEP);
-        if !thresholds.contains(&days) {
-            thresholds.push(days);
-        }
-    }
-    thresholds
-}
 
 pub struct WeeklyTotals {
     pub total_tokens_saved: u64,
@@ -108,7 +76,7 @@ pub struct DailyRecordFact {
 #[serde(rename_all = "camelCase")]
 struct PersistedActivityFacts {
     schema_version: u8,
-    // -- record / streak / RTK delta bookkeeping --
+    // -- record / RTK delta bookkeeping --
     #[serde(default)]
     all_time_record_tokens: u64,
     #[serde(default)]
@@ -117,12 +85,6 @@ struct PersistedActivityFacts {
     last_rtk_total_commands: u64,
     #[serde(default)]
     last_rtk_total_saved: u64,
-    #[serde(default)]
-    current_streak: u32,
-    #[serde(default)]
-    longest_streak: u32,
-    #[serde(default)]
-    last_active_day: Option<String>,
     #[serde(default)]
     last_weekly_recap_week_key: Option<String>,
     #[serde(default)]
@@ -141,35 +103,14 @@ struct PersistedActivityFacts {
     #[serde(default)]
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
 
-    // -- memory-flush bookkeeping (today's running counts; reset at midnight) --
-    #[serde(default)]
-    last_total_memory_md: u32,
-    #[serde(default)]
-    last_total_claude_md: u32,
-    #[serde(default)]
-    memory_flush_initialized: bool,
-    #[serde(default)]
-    today_flush_day: Option<String>,
-    #[serde(default)]
-    today_memory_md_count: u32,
-    #[serde(default)]
-    today_claude_md_count: u32,
-    #[serde(default)]
-    today_flush_observed_at: Option<DateTime<Utc>>,
-
     // -- latest-of-kind tile slots --
     // The Activity tab shows one tile per kind, populated by the most recent
     // event of that kind. Rather than persist a queue of every event ever, we
-    // store only the freshest event for each tile. The MemoryFlush tile is
-    // synthesised on read from the today_* counters above.
+    // store only the freshest event for each tile.
     #[serde(default)]
     last_record: Option<RecordEvent>,
     #[serde(default)]
-    last_streak: Option<StreakEvent>,
-    #[serde(default)]
     last_rtk_batch: Option<RtkBatchEvent>,
-    #[serde(default)]
-    last_savings_milestone: Option<SavingsMilestoneEvent>,
     #[serde(default)]
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     #[serde(default)]
@@ -184,28 +125,16 @@ pub struct ActivityFacts {
     daily_record: Option<DailyRecordFact>,
     last_rtk_total_commands: u64,
     last_rtk_total_saved: u64,
-    current_streak: u32,
-    longest_streak: u32,
-    last_active_day: Option<String>,
     last_weekly_recap_week_key: Option<String>,
     learnings_milestones_fired: BTreeSet<u32>,
     all_time_record_emitted_at: Option<DateTime<Utc>>,
     daily_record_emitted_at: Option<DateTime<Utc>>,
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
-    last_total_memory_md: u32,
-    last_total_claude_md: u32,
-    memory_flush_initialized: bool,
-    today_flush_day: Option<String>,
-    today_memory_md_count: u32,
-    today_claude_md_count: u32,
-    today_flush_observed_at: Option<DateTime<Utc>>,
     // Latest-of-kind tile slots. Each observe_* writes to its slot; the slot
     // is what `recent_activity_events` returns to the frontend.
     last_record: Option<RecordEvent>,
-    last_streak: Option<StreakEvent>,
     last_rtk_batch: Option<RtkBatchEvent>,
-    last_savings_milestone: Option<SavingsMilestoneEvent>,
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
@@ -247,26 +176,14 @@ impl ActivityFacts {
             daily_record: persisted.daily_record,
             last_rtk_total_commands: persisted.last_rtk_total_commands,
             last_rtk_total_saved: persisted.last_rtk_total_saved,
-            current_streak: persisted.current_streak,
-            longest_streak: persisted.longest_streak,
-            last_active_day: persisted.last_active_day,
             last_weekly_recap_week_key: persisted.last_weekly_recap_week_key,
             learnings_milestones_fired: persisted.learnings_milestones_fired,
             all_time_record_emitted_at: persisted.all_time_record_emitted_at,
             daily_record_emitted_at: persisted.daily_record_emitted_at,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
-            last_total_memory_md: persisted.last_total_memory_md,
-            last_total_claude_md: persisted.last_total_claude_md,
-            memory_flush_initialized: persisted.memory_flush_initialized,
-            today_flush_day: persisted.today_flush_day,
-            today_memory_md_count: persisted.today_memory_md_count,
-            today_claude_md_count: persisted.today_claude_md_count,
-            today_flush_observed_at: persisted.today_flush_observed_at,
             last_record: persisted.last_record,
-            last_streak: persisted.last_streak,
             last_rtk_batch: persisted.last_rtk_batch,
-            last_savings_milestone: persisted.last_savings_milestone,
             last_learnings_milestone: persisted.last_learnings_milestone,
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
@@ -282,26 +199,14 @@ impl ActivityFacts {
             daily_record: None,
             last_rtk_total_commands: 0,
             last_rtk_total_saved: 0,
-            current_streak: 0,
-            longest_streak: 0,
-            last_active_day: None,
             last_weekly_recap_week_key: None,
             learnings_milestones_fired: BTreeSet::new(),
             all_time_record_emitted_at: None,
             daily_record_emitted_at: None,
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: BTreeMap::new(),
-            last_total_memory_md: 0,
-            last_total_claude_md: 0,
-            memory_flush_initialized: false,
-            today_flush_day: None,
-            today_memory_md_count: 0,
-            today_claude_md_count: 0,
-            today_flush_observed_at: None,
             last_record: None,
-            last_streak: None,
             last_rtk_batch: None,
-            last_savings_milestone: None,
             last_learnings_milestone: None,
             last_weekly_recap: None,
             last_train_suggestion: None,
@@ -310,23 +215,16 @@ impl ActivityFacts {
         }
     }
 
-    /// Build the per-tile event list from the latest-of-kind slots plus the
-    /// synthesised MemoryFlush. Order is not sorted; the frontend's tile
-    /// picker keys by `kind`, not by position. Callers should expect at most
-    /// one event per ActivityEvent variant.
+    /// Build the per-tile event list from the latest-of-kind slots. Order is
+    /// not sorted; the frontend's tile picker keys by `kind`, not by position.
+    /// Callers should expect at most one event per ActivityEvent variant.
     pub fn recent_events(&self) -> Vec<ActivityEvent> {
-        let mut events: Vec<ActivityEvent> = Vec::with_capacity(8);
+        let mut events: Vec<ActivityEvent> = Vec::with_capacity(5);
         if let Some(e) = &self.last_record {
             events.push(ActivityEvent::Record(e.clone()));
         }
-        if let Some(e) = &self.last_streak {
-            events.push(ActivityEvent::Streak(e.clone()));
-        }
         if let Some(e) = &self.last_rtk_batch {
             events.push(ActivityEvent::RtkBatch(e.clone()));
-        }
-        if let Some(e) = &self.last_savings_milestone {
-            events.push(ActivityEvent::SavingsMilestone(e.clone()));
         }
         if let Some(e) = &self.last_learnings_milestone {
             events.push(ActivityEvent::LearningsMilestone(e.clone()));
@@ -337,23 +235,7 @@ impl ActivityFacts {
         if let Some(e) = &self.last_train_suggestion {
             events.push(ActivityEvent::TrainSuggestion(e.clone()));
         }
-        if let Some(flush) = self.synthesised_memory_flush() {
-            events.push(ActivityEvent::MemoryFlush(flush));
-        }
         events
-    }
-
-    fn synthesised_memory_flush(&self) -> Option<MemoryFlushEvent> {
-        let day = self.today_flush_day.as_ref()?;
-        if self.today_memory_md_count == 0 && self.today_claude_md_count == 0 {
-            return None;
-        }
-        Some(MemoryFlushEvent {
-            observed_at: self.today_flush_observed_at.unwrap_or_else(Utc::now),
-            day: day.clone(),
-            memory_md_count: self.today_memory_md_count,
-            claude_md_count: self.today_claude_md_count,
-        })
     }
 
     pub fn observe_transformation(
@@ -448,7 +330,7 @@ impl ActivityFacts {
                     day,
                     workspace: event.workspace.clone(),
                     request_messages: event.request_messages.clone(),
-                    response_content: event.response_content.clone(),
+                    compressed_messages: event.compressed_messages.clone(),
                 };
                 self.last_record = Some(record.clone());
                 self.dirty = true;
@@ -456,78 +338,7 @@ impl ActivityFacts {
             }
         }
 
-        let streak_events = self.process_streak(observed_at);
-        if !streak_events.is_empty() {
-            // Multiple streak events can fire in one observation (a threshold
-            // crossing plus a new-record). The tile only shows one, so latch
-            // the latest by observed_at; older threshold events still flow
-            // through `emitted` so notification dispatch fires for each.
-            if let Some(latest) = streak_events
-                .iter()
-                .filter_map(|e| match e {
-                    ActivityEvent::Streak(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .max_by_key(|s| s.observed_at)
-            {
-                self.last_streak = Some(latest);
-                self.dirty = true;
-            }
-            emitted.extend(streak_events);
-        }
-
         emitted
-    }
-
-    fn process_streak(&mut self, observed_at: DateTime<Utc>) -> Vec<ActivityEvent> {
-        let today = observed_at.date_naive();
-        let today_key = today.format("%Y-%m-%d").to_string();
-        let prev_day = self
-            .last_active_day
-            .as_deref()
-            .and_then(|key| NaiveDate::parse_from_str(key, "%Y-%m-%d").ok());
-
-        if let Some(prev) = prev_day {
-            if today <= prev {
-                return Vec::new();
-            }
-        }
-
-        let previous_streak = self.current_streak;
-        let previous_longest = self.longest_streak;
-
-        let new_streak = match prev_day {
-            Some(prev) if today == prev.succ_opt().unwrap_or(prev) => previous_streak + 1,
-            Some(_) => 1,
-            None => 1,
-        };
-
-        self.current_streak = new_streak;
-        self.last_active_day = Some(today_key);
-        if new_streak > self.longest_streak {
-            self.longest_streak = new_streak;
-        }
-
-        let mut events: Vec<ActivityEvent> = streaks_crossed(previous_streak, new_streak)
-            .into_iter()
-            .map(|days| {
-                ActivityEvent::Streak(StreakEvent {
-                    observed_at,
-                    days,
-                    kind: "threshold".into(),
-                })
-            })
-            .collect();
-
-        if new_streak > previous_longest && previous_longest > 0 {
-            events.push(ActivityEvent::Streak(StreakEvent {
-                observed_at,
-                days: new_streak,
-                kind: "new_record".into(),
-            }));
-        }
-
-        events
     }
 
     pub fn observe_rtk(
@@ -577,34 +388,6 @@ impl ActivityFacts {
         Some(ActivityEvent::RtkBatch(batch))
     }
 
-    pub fn record_savings_milestones(
-        &mut self,
-        milestones: &[u64],
-        observed_at: DateTime<Utc>,
-    ) -> Vec<ActivityEvent> {
-        if milestones.is_empty() {
-            return Vec::new();
-        }
-        let events: Vec<SavingsMilestoneEvent> = milestones
-            .iter()
-            .map(|usd| SavingsMilestoneEvent {
-                observed_at,
-                milestone_usd: *usd,
-                kind: savings_milestone_kind(*usd).to_string(),
-            })
-            .collect();
-        // Tile only shows one — latch the largest milestone in this batch
-        // (most impressive number wins). Notification path still sees each.
-        if let Some(latest) = events.iter().max_by_key(|e| e.milestone_usd) {
-            self.last_savings_milestone = Some(latest.clone());
-            self.dirty = true;
-        }
-        events
-            .into_iter()
-            .map(ActivityEvent::SavingsMilestone)
-            .collect()
-    }
-
     pub fn observe_learnings_count(
         &mut self,
         count: usize,
@@ -626,84 +409,6 @@ impl ActivityFacts {
         self.last_learnings_milestone = Some(milestone.clone());
         self.dirty = true;
         Some(ActivityEvent::LearningsMilestone(milestone))
-    }
-
-    /// Observe the current totals of evidence>=2 patterns in memory.db,
-    /// partitioned by destination file (MEMORY.md vs CLAUDE.md). Maintains a
-    /// per-day running tally so the tile can show "X memories / Y learnings
-    /// written today" — resets when `local_day` rolls over. Today's totals
-    /// are persisted as plain scalars; the MemoryFlush event itself is
-    /// synthesised on read by `recent_events`.
-    ///
-    /// Returns `Some(MemoryFlush)` only when today's totals actually changed
-    /// in this call (delta detected, day rollover that left non-zero counts,
-    /// or a defensive shrink rebaseline). The notification path uses the
-    /// return value to decide whether to dispatch — so steady-state polls
-    /// where nothing moved must return None to avoid notification spam *and*
-    /// to keep `dirty` clean so the file doesn't re-save on every poll.
-    ///
-    /// On first call ever (post fresh install / wiped state), the high-water
-    /// marks are baselined silently — pre-existing patterns don't get
-    /// retroactively counted as today's flushes.
-    pub fn observe_memory_flush(
-        &mut self,
-        memory_md_total: u32,
-        claude_md_total: u32,
-        local_day: String,
-        observed_at: DateTime<Utc>,
-    ) -> Option<ActivityEvent> {
-        // Bootstrap: silently baseline on the first observation so existing
-        // memory.db rows from prior runs don't all show up as "today's".
-        if !self.memory_flush_initialized {
-            self.last_total_memory_md = memory_md_total;
-            self.last_total_claude_md = claude_md_total;
-            self.memory_flush_initialized = true;
-            self.dirty = true;
-            return None;
-        }
-
-        // Day rollover: reset today's running totals. A reset alone doesn't
-        // emit — we wait for the next actual flush so the tile naturally
-        // disappears at midnight and reappears on the day's first flush.
-        let day_rolled = self.today_flush_day.as_deref() != Some(local_day.as_str());
-        if day_rolled {
-            self.today_flush_day = Some(local_day.clone());
-            self.today_memory_md_count = 0;
-            self.today_claude_md_count = 0;
-            self.today_flush_observed_at = None;
-            self.dirty = true;
-        }
-
-        // Defensive: if the totals shrank (memory.db rebuilt, user wiped data)
-        // re-baseline rather than emit phantom counts.
-        let shrank = memory_md_total < self.last_total_memory_md
-            || claude_md_total < self.last_total_claude_md;
-        if shrank {
-            self.last_total_memory_md = memory_md_total;
-            self.last_total_claude_md = claude_md_total;
-            self.dirty = true;
-            return self.synthesised_memory_flush().map(ActivityEvent::MemoryFlush);
-        }
-
-        let memory_md_delta = memory_md_total.saturating_sub(self.last_total_memory_md);
-        let claude_md_delta = claude_md_total.saturating_sub(self.last_total_claude_md);
-
-        if memory_md_delta == 0 && claude_md_delta == 0 {
-            // Nothing new since last observation. Don't touch state, don't
-            // dirty — this is the steady-state path and must be cheap.
-            return None;
-        }
-
-        self.today_memory_md_count =
-            self.today_memory_md_count.saturating_add(memory_md_delta);
-        self.today_claude_md_count =
-            self.today_claude_md_count.saturating_add(claude_md_delta);
-        self.last_total_memory_md = memory_md_total;
-        self.last_total_claude_md = claude_md_total;
-        self.today_flush_observed_at = Some(observed_at);
-        self.dirty = true;
-
-        self.synthesised_memory_flush().map(ActivityEvent::MemoryFlush)
     }
 
     /// Scan project metadata and emit a `TrainSuggestion` for any project that
@@ -834,26 +539,14 @@ impl ActivityFacts {
             daily_record: self.daily_record.clone(),
             last_rtk_total_commands: self.last_rtk_total_commands,
             last_rtk_total_saved: self.last_rtk_total_saved,
-            current_streak: self.current_streak,
-            longest_streak: self.longest_streak,
-            last_active_day: self.last_active_day.clone(),
             last_weekly_recap_week_key: self.last_weekly_recap_week_key.clone(),
             learnings_milestones_fired: self.learnings_milestones_fired.clone(),
             all_time_record_emitted_at: self.all_time_record_emitted_at,
             daily_record_emitted_at: self.daily_record_emitted_at,
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
-            last_total_memory_md: self.last_total_memory_md,
-            last_total_claude_md: self.last_total_claude_md,
-            memory_flush_initialized: self.memory_flush_initialized,
-            today_flush_day: self.today_flush_day.clone(),
-            today_memory_md_count: self.today_memory_md_count,
-            today_claude_md_count: self.today_claude_md_count,
-            today_flush_observed_at: self.today_flush_observed_at,
             last_record: self.last_record.clone(),
-            last_streak: self.last_streak.clone(),
             last_rtk_batch: self.last_rtk_batch.clone(),
-            last_savings_milestone: self.last_savings_milestone.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),
             last_weekly_recap: self.last_weekly_recap.clone(),
             last_train_suggestion: self.last_train_suggestion.clone(),
@@ -890,7 +583,7 @@ mod tests {
             workspace: None,
             turn_id: None,
             request_messages: None,
-            response_content: None,
+            compressed_messages: None,
         }
     }
 
@@ -1210,134 +903,6 @@ mod tests {
         );
         assert!(events.is_empty(), "no new events after reload");
         assert_eq!(reloaded.all_time_record_tokens, 1000);
-    }
-
-    fn day_at(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn streak_advances_on_consecutive_days() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), Some(10.0)),
-            day_at(2026, 4, 20, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), Some(10.0)),
-            day_at(2026, 4, 21, 10),
-        );
-        let events = facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), Some(10.0)),
-            day_at(2026, 4, 22, 10),
-        );
-        assert_eq!(facts.current_streak, 3);
-        assert!(events.iter().any(
-            |e| matches!(e, ActivityEvent::Streak(s) if s.days == 3 && s.kind == "threshold")
-        ));
-    }
-
-    #[test]
-    fn streak_resets_on_gap() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 20, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 21, 10),
-        );
-        // Skip 22nd, next activity on 23rd.
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 23, 10),
-        );
-        assert_eq!(facts.current_streak, 1);
-        assert_eq!(facts.longest_streak, 2);
-    }
-
-    #[test]
-    fn streak_is_idempotent_on_same_day_replay() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 22, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(200), None),
-            day_at(2026, 4, 22, 11),
-        );
-        assert_eq!(facts.current_streak, 1);
-    }
-
-    #[test]
-    fn streak_noop_on_historical_replay() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 22, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 21, 10),
-        );
-        assert_eq!(facts.current_streak, 1);
-        assert_eq!(facts.last_active_day.as_deref(), Some("2026-04-22"));
-    }
-
-    #[test]
-    fn streak_new_record_emits_when_surpassing_longest() {
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        // Build a streak of 2, break, then streak of 3.
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 1, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 2, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 10, 10),
-        );
-        facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 11, 10),
-        );
-        let events = facts.observe_transformation(
-            &mk_transformation(Some("m"), Some(100), None),
-            day_at(2026, 4, 12, 10),
-        );
-        assert_eq!(facts.current_streak, 3);
-        assert_eq!(facts.longest_streak, 3);
-        assert!(events.iter().any(
-            |e| matches!(e, ActivityEvent::Streak(s) if s.kind == "new_record" && s.days == 3)
-        ));
-    }
-
-    #[test]
-    fn streaks_crossed_emits_once_per_threshold() {
-        assert_eq!(streaks_crossed(0, 2), Vec::<u32>::new());
-        assert_eq!(streaks_crossed(2, 3), vec![3]);
-        assert_eq!(streaks_crossed(3, 7), vec![7]);
-        assert_eq!(streaks_crossed(0, 30), vec![3, 7, 14, 30]);
-        assert_eq!(streaks_crossed(30, 60), vec![60]);
-        assert_eq!(streaks_crossed(60, 120), vec![90, 120]);
-    }
-
-    #[test]
-    fn savings_milestone_kind_labels_first_and_repeating_thresholds() {
-        assert_eq!(savings_milestone_kind(10), "first_10");
-        assert_eq!(savings_milestone_kind(50), "first_50");
-        assert_eq!(savings_milestone_kind(100), "first_100");
-        assert_eq!(savings_milestone_kind(200), "repeating_100");
     }
 
     #[test]
