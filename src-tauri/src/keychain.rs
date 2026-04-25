@@ -294,3 +294,93 @@ pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), St
 pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
     platform::delete_secret(service, account)
 }
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// Snapshot HOME / XDG_DATA_HOME, point them at a fresh tempdir, and
+    /// restore on drop. Mirrors the helper in client_adapters' tests so debug
+    /// keychain reads/writes don't bleed into the developer's real profile.
+    struct TestHome {
+        _tmp: tempfile::TempDir,
+        prev_home: Option<OsString>,
+        prev_xdg: Option<OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("create temp home");
+            let home: PathBuf = tmp.path().to_path_buf();
+            let prev_home = std::env::var_os("HOME");
+            let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+            crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
+                .expect("ensure_data_dirs in test home");
+            TestHome {
+                _tmp: tmp,
+                prev_home,
+                prev_xdg,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_xdg.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_then_read_round_trips_value() {
+        let _home = TestHome::new();
+        super::write_secret("test-svc", "acct-a", "s3cret").expect("write");
+        let value = super::read_secret("test-svc", "acct-a").expect("read");
+        assert_eq!(value.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_returns_none_when_missing() {
+        let _home = TestHome::new();
+        let value = super::read_secret("test-svc", "never-written").expect("read");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_removes_secret() {
+        let _home = TestHome::new();
+        super::write_secret("test-svc", "acct-b", "to-be-deleted").expect("write");
+        super::delete_secret("test-svc", "acct-b").expect("delete");
+        let value = super::read_secret("test-svc", "acct-b").expect("read after delete");
+        assert!(value.is_none(), "deleted secret should be gone");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_is_idempotent_when_secret_missing() {
+        let _home = TestHome::new();
+        super::delete_secret("test-svc", "never-existed").expect("delete on missing");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn overwrite_replaces_existing_secret() {
+        let _home = TestHome::new();
+        super::write_secret("test-svc", "acct-c", "first").expect("first write");
+        super::write_secret("test-svc", "acct-c", "second").expect("second write");
+        let value = super::read_secret("test-svc", "acct-c").expect("read");
+        assert_eq!(value.as_deref(), Some("second"));
+    }
+}

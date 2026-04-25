@@ -1231,7 +1231,12 @@ fn upsert_managed_block(
             rebuilt.push_str(&existing[..start_idx]);
             rebuilt.push_str(&block);
             if end_with_marker < existing.len() {
-                rebuilt.push_str(&existing[end_with_marker..]);
+                // `block` already ends in `\n`; if the surviving suffix also
+                // starts with `\n`, drop one to avoid blank-line padding
+                // accumulating between managed blocks on repeat applies.
+                let suffix = &existing[end_with_marker..];
+                let suffix = suffix.strip_prefix('\n').unwrap_or(suffix);
+                rebuilt.push_str(suffix);
             }
             rebuilt
         } else if existing.trim().is_empty() {
@@ -2692,5 +2697,288 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ── Lifecycle integration tests ──────────────────────────────────────────
+    //
+    // These tests drive `apply_client_setup` / `verify_client_setup` /
+    // `disable_client_setup` / `clear_client_setups` against a temp $HOME so we
+    // catch regressions in the user-visible setup-then-teardown flow. Tests are
+    // serialized via `serial_test` because they mutate process-wide env vars
+    // (HOME, XDG_DATA_HOME, SHELL).
+
+    /// RAII-style guard that snapshots HOME / XDG_DATA_HOME / SHELL, points
+    /// them at a fresh tempdir, and restores them on drop. Used to keep
+    /// lifecycle tests from touching the developer's real profile.
+    struct TestHome {
+        _tmp: tempfile::TempDir,
+        home: PathBuf,
+        prev_home: Option<std::ffi::OsString>,
+        prev_xdg: Option<std::ffi::OsString>,
+        prev_shell: Option<std::ffi::OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("create temp home");
+            let home = tmp.path().to_path_buf();
+            let prev_home = std::env::var_os("HOME");
+            let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            let prev_shell = std::env::var_os("SHELL");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
+            // Force a deterministic shell family so tests don't depend on the
+            // dev's login shell.
+            std::env::set_var("SHELL", "/bin/zsh");
+            // Mirror what the app does at startup so write_setup_state has a
+            // config dir to land in.
+            crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
+                .expect("ensure_data_dirs in test home");
+            TestHome {
+                _tmp: tmp,
+                home,
+                prev_home,
+                prev_xdg,
+                prev_shell,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.home
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_xdg.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            match self.prev_shell.take() {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+    }
+
+    fn read_settings_json(path: &Path) -> serde_json::Value {
+        let raw = fs::read_to_string(path).expect("read settings.json");
+        serde_json::from_str(&raw).expect("parse settings.json")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_then_verify_claude_code_writes_expected_files() {
+        let home = TestHome::new();
+        // Seed an empty zshrc/zshenv so the shell-block writers have files to
+        // edit and don't depend on the dev's real shell config layout.
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+
+        let result =
+            super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+        assert!(result.applied);
+        assert_eq!(result.client_id, "claude_code");
+
+        // Hook script and settings.json hook entry must be present.
+        let hook_path = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-rtk-rewrite.sh");
+        assert!(hook_path.exists(), "hook script written to disk");
+        let hook_contents = fs::read_to_string(&hook_path).unwrap();
+        assert!(
+            hook_contents.starts_with("#!/usr/bin/env bash"),
+            "hook has expected shebang"
+        );
+
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767"),
+            "claude settings.json points env at headroom proxy"
+        );
+        let pre_tool_use = &settings["hooks"]["PreToolUse"];
+        assert!(
+            pre_tool_use.is_array() && !pre_tool_use.as_array().unwrap().is_empty(),
+            "PreToolUse hook entry exists, got: {settings}"
+        );
+
+        // Shell block in zshenv (or whichever profile the writer chose) should
+        // export ANTHROPIC_BASE_URL pointing at the loopback proxy.
+        let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let combined = format!("{zshrc}\n{zshenv}");
+        assert!(
+            combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
+            "ANTHROPIC_BASE_URL exported from a managed shell block, got:\n{combined}"
+        );
+
+        // verify_client_setup should report all the configured checks. The
+        // proxy itself isn't running in the test environment, so verified=false
+        // is expected — but checks should reflect what we wrote.
+        let verification =
+            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+        assert_eq!(verification.client_id, "claude_code");
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|c| c.contains("ANTHROPIC_BASE_URL")),
+            "verification reports the env check, got: {:?}",
+            verification.checks
+        );
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|c| c.contains("RTK Claude hook")),
+            "verification reports the hook check, got: {:?}",
+            verification.checks
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_claude_code_is_byte_idempotent() {
+        // Regression: a second apply used to add blank-line padding between
+        // managed blocks, so byte-exact idempotency now holds and is
+        // asserted here.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("first apply");
+        let zshrc_after_first = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv_after_first = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let settings_after_first = fs::read_to_string(
+            home.path().join(".claude").join("settings.json"),
+        )
+        .unwrap();
+        let hook_after_first = fs::read_to_string(
+            home.path()
+                .join(".claude")
+                .join("hooks")
+                .join("headroom-rtk-rewrite.sh"),
+        )
+        .unwrap();
+
+        super::apply_client_setup("claude_code").expect("second apply");
+        let zshrc_after_second = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv_after_second = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let settings_after_second = fs::read_to_string(
+            home.path().join(".claude").join("settings.json"),
+        )
+        .unwrap();
+        let hook_after_second = fs::read_to_string(
+            home.path()
+                .join(".claude")
+                .join("hooks")
+                .join("headroom-rtk-rewrite.sh"),
+        )
+        .unwrap();
+
+        assert_eq!(zshrc_after_first, zshrc_after_second, "zshrc byte-stable");
+        assert_eq!(
+            zshenv_after_first, zshenv_after_second,
+            "zshenv byte-stable"
+        );
+        assert_eq!(
+            settings_after_first, settings_after_second,
+            "settings.json byte-stable"
+        );
+        assert_eq!(
+            hook_after_first, hook_after_second,
+            "hook script byte-stable"
+        );
+
+        // Sanity: each managed block still appears exactly once.
+        let combined = format!("{zshrc_after_second}\n{zshenv_after_second}");
+        assert_eq!(
+            combined.matches("# >>> headroom:claude_code >>>").count(),
+            1
+        );
+        assert_eq!(
+            combined.matches("# >>> headroom:managed_rtk >>>").count(),
+            1
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disable_then_clear_claude_code_removes_traces() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        let hook_path = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-rtk-rewrite.sh");
+        assert!(hook_path.exists(), "hook present after apply");
+
+        super::disable_client_setup("claude_code").expect("disable");
+
+        // Hook script removed.
+        assert!(!hook_path.exists(), "hook removed after disable");
+
+        // Shell blocks removed.
+        let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
+        let combined = format!("{zshrc}\n{zshenv}");
+        assert!(
+            !combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
+            "ANTHROPIC_BASE_URL export removed, got:\n{combined}"
+        );
+
+        // settings.json no longer points env at the proxy and no longer carries
+        // the Headroom hook entry.
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        assert!(
+            settings["env"]["ANTHROPIC_BASE_URL"].is_null(),
+            "ANTHROPIC_BASE_URL stripped from settings.json env, got: {settings}"
+        );
+        let still_has_headroom_hook = claude_hook_present_in_value(
+            &settings,
+            "headroom-rtk-rewrite.sh",
+        );
+        assert!(
+            !still_has_headroom_hook,
+            "Headroom hook entry stripped from settings.json, got: {settings}"
+        );
+
+        // clear_client_setups runs disable across all clients without error,
+        // and the setup state file is left without a `claude_code` entry.
+        super::clear_client_setups().expect("clear");
+        let post = super::load_setup_state();
+        assert!(
+            post.configured_clients.get("claude_code").is_none(),
+            "claude_code dropped from configured_clients, got: {:?}",
+            post.configured_clients
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_client_setup_rejects_codex() {
+        let _home = TestHome::new();
+        let err = super::apply_client_setup("codex").expect_err("codex disabled");
+        assert!(
+            err.to_string().contains("Codex integration has been disabled"),
+            "unexpected error message: {err}"
+        );
     }
 }

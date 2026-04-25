@@ -5,15 +5,14 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   test: {
+    environment: "jsdom",
+    setupFiles: ["src/test/setup.ts"],
     coverage: {
       provider: "v8",
       include: ["src/components/**/*.tsx", "src/lib/**/*.ts"],
       exclude: [
         "src/lib/types.ts",
-        "src/**/*.test.{ts,tsx}",
-        // Integration-heavy: Tauri `invoke` inside useEffect, untestable under
-        // the project's SSR-only setup. Revisit if jsdom/testing-library lands.
-        "src/components/OptimizePanel.tsx"
+        "src/**/*.test.{ts,tsx}"
       ],
       reporter: ["text", "json-summary", "html"],
       thresholds: {

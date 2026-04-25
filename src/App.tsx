@@ -104,8 +104,12 @@ import {
   buildInitialProxyVerificationRows,
   getClaudeConnector,
   getContactRequestValidationError,
+  getInitialLauncherStage,
   getLauncherAutoConfigureDecision,
-  isValidEmailAddress
+  isValidEmailAddress,
+  nextAutoConfigureStep,
+  nextAutoConfigureStepAfterApply,
+  type LauncherStage
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
@@ -232,11 +236,6 @@ const CONTACT_FORM_URL = (
 ).trim();
 
 type StartupPhase = "window" | "dashboard" | "bootstrap" | "runtime" | "ready";
-
-// Which onboarding screen the launcher is currently showing. Linear flow:
-// install → client_setup → proxy_verify → post_install. Back buttons can
-// jump backwards. The install step doubles as the pre-install landing.
-type LauncherStage = "install" | "client_setup" | "proxy_verify" | "post_install";
 
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
@@ -1017,12 +1016,14 @@ export default function App() {
       if (bootstrapResult.running) {
         setBootstrapping(true);
       }
-      if (label === "launcher" && (bootstrapResult.complete || dashboardResult.bootstrapComplete)) {
-        if (dashboardResult.launchExperience === "first_run") {
-          setLauncherStage("install");
-        } else {
-          setLauncherStage("post_install");
-        }
+      const initialStage = getInitialLauncherStage(
+        label,
+        bootstrapResult.complete,
+        dashboardResult.bootstrapComplete,
+        dashboardResult.launchExperience
+      );
+      if (initialStage) {
+        setLauncherStage(initialStage);
       }
 
       updateStartup("runtime", 80, "Preparing Headroom runtime…");
@@ -2186,27 +2187,30 @@ export default function App() {
       let latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
       applyConnectorsIfChanged(latestConnectors);
 
-      if (getLauncherAutoConfigureDecision(latestConnectors) === "show_client_setup") {
+      const step = nextAutoConfigureStep(
+        getLauncherAutoConfigureDecision(latestConnectors),
+        getClaudeConnector(latestConnectors)
+      );
+
+      if (step.kind === "show_client_setup") {
         setLauncherStage("client_setup");
         return;
       }
 
-      if (getLauncherAutoConfigureDecision(latestConnectors) === "apply_client_setup") {
-        const detectedClaudeConnector = getClaudeConnector(latestConnectors);
-        if (!detectedClaudeConnector) {
-          setLauncherStage("client_setup");
-          return;
-        }
+      if (step.kind === "apply") {
         await invoke<ClientSetupResult>("apply_client_setup", {
-          clientId: detectedClaudeConnector.clientId
+          clientId: step.clientId
         });
         latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
         applyConnectorsIfChanged(latestConnectors);
-      }
 
-      if (getLauncherAutoConfigureDecision(latestConnectors) !== "begin_proxy_verification") {
-        setLauncherStage("client_setup");
-        return;
+        const postApplyStep = nextAutoConfigureStepAfterApply(
+          getLauncherAutoConfigureDecision(latestConnectors)
+        );
+        if (postApplyStep.kind !== "begin_proxy_verification") {
+          setLauncherStage("client_setup");
+          return;
+        }
       }
 
       await beginProxyVerificationStep();

@@ -28,6 +28,13 @@
 - State what you found, where, and the fix. One pass.
 - If cause is unclear: say so. Do not guess.
 
+## Testing Rules
+- After any code change, run the relevant tests/checks before declaring the task done. Do not ask the user to verify.
+- Rust changes: `cargo test --manifest-path src-tauri/Cargo.toml --lib <filter>` for the affected module, plus `cargo check --manifest-path src-tauri/Cargo.toml` if the change crosses module boundaries.
+- Frontend changes: `npx tsc --noEmit` and any relevant Vitest suite. For visual changes, see Styling Rules.
+- If a test cannot be run in this environment, say so explicitly rather than skipping silently.
+- When fixing a failing test, re-run only that test first, then the full module to confirm no regressions.
+
 ## Simple Formatting
 - No em dashes, smart quotes, or decorative Unicode symbols.
 - Plain hyphens and straight quotes only.

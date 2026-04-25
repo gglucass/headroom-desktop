@@ -22,7 +22,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.10.12";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.10.12";
 const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ae/cf/f6dea48d72bc62c88a593df2b44398315e38c8680acbc77d27ff5191207f/headroom_ai-0.10.12-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
     "30e622ad0f9609ef65b90f5d2367c9d3e9a4863a3a3fb2f1fe9d513e6c24aaff";
@@ -3308,6 +3308,12 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
     }
 
     for line in block.lines() {
+        // Skip the end-of-block marker so the section-flush truncation
+        // can never drop it. We re-append it during reassembly below.
+        if line.trim_end() == end_marker {
+            continue;
+        }
+
         let trimmed = line.trim_start();
         if let Some(title) = trimmed.strip_prefix("### ") {
             flush(
@@ -3358,9 +3364,17 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
         return rewritten;
     }
 
+    // Drop trailing blank lines so removing the last bullet of the last
+    // section doesn't leave a `\n\n<!-- end -->` gap behind.
+    while out_lines.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
+        out_lines.pop();
+    }
+
     let mut rewritten = String::with_capacity(file_content.len());
     rewritten.push_str(before);
     rewritten.push_str(&out_lines.join("\n"));
+    rewritten.push('\n');
+    rewritten.push_str(end_marker);
     rewritten.push_str(after);
     rewritten
 }
@@ -4343,6 +4357,34 @@ after
         assert!(!out.contains("### Foo"));
         assert!(out.contains("### Bar"));
         assert!(out.contains("- keep"));
+    }
+
+    #[test]
+    fn delete_applied_bullet_drops_last_section_and_keeps_end_marker() {
+        // Regression: previously the final flush truncated the trailing
+        // `<!-- headroom:learn:end -->` marker when the last section was
+        // emptied, which left the block unparseable on the next read.
+        let content = "\
+<!-- headroom:learn:start -->
+### Foo
+- keep
+### Bar
+- removeme
+<!-- headroom:learn:end -->
+";
+        let out = super::delete_applied_bullet(content, "Bar", "removeme");
+        assert!(out.contains("### Foo"), "earlier section preserved");
+        assert!(out.contains("- keep"), "earlier bullet preserved");
+        assert!(!out.contains("### Bar"), "emptied last section dropped");
+        assert!(!out.contains("- removeme"), "removed bullet absent");
+        assert!(
+            out.contains("<!-- headroom:learn:end -->"),
+            "end marker preserved, got:\n{out}"
+        );
+        assert!(
+            !super::parse_headroom_learn_block(&out).is_empty(),
+            "block still parseable after deletion"
+        );
     }
 
     #[test]

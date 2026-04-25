@@ -4,8 +4,11 @@ import {
   buildInitialProxyVerificationRows,
   getClaudeConnector,
   getContactRequestValidationError,
+  getInitialLauncherStage,
   getLauncherAutoConfigureDecision,
-  isValidEmailAddress
+  isValidEmailAddress,
+  nextAutoConfigureStep,
+  nextAutoConfigureStepAfterApply
 } from "./launcherHelpers";
 import type { ClientConnectorStatus } from "./types";
 
@@ -96,5 +99,83 @@ describe("launcher helpers", () => {
         message: "Waiting for a Claude Code prompt..."
       }
     ]);
+  });
+
+  describe("getInitialLauncherStage", () => {
+    it("returns null in non-launcher windows regardless of bootstrap state", () => {
+      expect(getInitialLauncherStage("dashboard", true, true, "first_run")).toBeNull();
+      expect(getInitialLauncherStage("tray", true, true, "resume")).toBeNull();
+    });
+
+    it("returns null in the launcher window until bootstrap is complete", () => {
+      expect(getInitialLauncherStage("launcher", false, false, "first_run")).toBeNull();
+    });
+
+    it("lands first-run users on install when bootstrap completed during startup", () => {
+      expect(getInitialLauncherStage("launcher", true, false, "first_run")).toBe("install");
+    });
+
+    it("lands first-run users on install when bootstrap was already complete", () => {
+      expect(getInitialLauncherStage("launcher", false, true, "first_run")).toBe("install");
+    });
+
+    it("lands returning users on post_install once bootstrap is complete", () => {
+      expect(getInitialLauncherStage("launcher", true, true, "resume")).toBe("post_install");
+      expect(getInitialLauncherStage("launcher", false, true, "dashboard")).toBe(
+        "post_install"
+      );
+    });
+  });
+
+  describe("nextAutoConfigureStep", () => {
+    const claude: ClientConnectorStatus = {
+      clientId: "claude_code",
+      name: "Claude Code",
+      installed: true,
+      enabled: false,
+      verified: false
+    };
+
+    it("routes show_client_setup decisions to manual setup", () => {
+      expect(nextAutoConfigureStep("show_client_setup", claude)).toEqual({
+        kind: "show_client_setup"
+      });
+    });
+
+    it("routes apply_client_setup to an apply step using the connector's clientId", () => {
+      expect(nextAutoConfigureStep("apply_client_setup", claude)).toEqual({
+        kind: "apply",
+        clientId: "claude_code"
+      });
+    });
+
+    it("falls back to manual setup when apply_client_setup has no detected connector", () => {
+      expect(nextAutoConfigureStep("apply_client_setup", null)).toEqual({
+        kind: "show_client_setup"
+      });
+    });
+
+    it("routes begin_proxy_verification straight to proxy verification", () => {
+      expect(nextAutoConfigureStep("begin_proxy_verification", null)).toEqual({
+        kind: "begin_proxy_verification"
+      });
+    });
+  });
+
+  describe("nextAutoConfigureStepAfterApply", () => {
+    it("advances to proxy verification when apply produced a verified setup", () => {
+      expect(nextAutoConfigureStepAfterApply("begin_proxy_verification")).toEqual({
+        kind: "begin_proxy_verification"
+      });
+    });
+
+    it("falls back to manual setup when post-apply state still needs attention", () => {
+      expect(nextAutoConfigureStepAfterApply("show_client_setup")).toEqual({
+        kind: "show_client_setup"
+      });
+      expect(nextAutoConfigureStepAfterApply("apply_client_setup")).toEqual({
+        kind: "show_client_setup"
+      });
+    });
   });
 });

@@ -5,6 +5,7 @@
 /// As each request passes through, any `Authorization: Bearer …` header is
 /// captured into `AppState::claude_bearer_token` so the usage-stats feature
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,9 @@ pub fn spawn(token_slot: SharedToken) {
                 .build()
                 .expect("proxy intercept runtime");
             rt.block_on(async move {
-                match run(token_slot).await {
+                let bind_addr: SocketAddr = ([127, 0, 0, 1], INTERCEPT_PORT).into();
+                let backend_addr: SocketAddr = ([127, 0, 0, 1], HEADROOM_BACKEND_PORT).into();
+                match run(bind_addr, backend_addr, token_slot).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                         // Port is already bound. If /health responds over HTTP, an
@@ -77,14 +80,18 @@ pub fn spawn(token_slot: SharedToken) {
         .expect("spawn proxy intercept thread");
 }
 
-async fn run(token_slot: SharedToken) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", INTERCEPT_PORT)).await?;
+async fn run(
+    bind_addr: SocketAddr,
+    backend_addr: SocketAddr,
+    token_slot: SharedToken,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(bind_addr).await?;
 
     loop {
         match listener.accept().await {
             Ok((client, _)) => {
                 let slot = token_slot.clone();
-                tokio::spawn(handle(client, slot));
+                tokio::spawn(handle(client, backend_addr, slot));
             }
             Err(e) => {
                 // EMFILE/ENFILE/ECONNABORTED are transient — log and keep serving
@@ -96,7 +103,7 @@ async fn run(token_slot: SharedToken) -> std::io::Result<()> {
     }
 }
 
-async fn handle(mut client: TcpStream, token_slot: SharedToken) {
+async fn handle(mut client: TcpStream, backend_addr: SocketAddr, token_slot: SharedToken) {
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
     // `Expect: 100-continue` request flows.
@@ -129,7 +136,7 @@ async fn handle(mut client: TcpStream, token_slot: SharedToken) {
     }
 
     // Forward to the headroom backend.
-    let Ok(mut backend) = TcpStream::connect(("127.0.0.1", HEADROOM_BACKEND_PORT)).await else {
+    let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
         // headroom not up yet — send a 502 so the client gets a clean error.
         let _ = client
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -258,8 +265,15 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_bearer, find_header_end, read_http_headers, request_is_loopback_safe};
-    use tokio::io::{duplex, AsyncWriteExt};
+    use super::{
+        extract_bearer, find_header_end, read_http_headers, request_is_loopback_safe, run,
+        SharedToken,
+    };
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use parking_lot::Mutex;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
 
     #[test]
@@ -329,5 +343,168 @@ mod tests {
 
         assert!(buf.windows(4).any(|window| window == b"\r\n\r\n"));
         writer.await.expect("writer task");
+    }
+
+    /// Bind a fresh `TcpListener` on an ephemeral port and return its address.
+    async fn bind_ephemeral() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        (listener, addr)
+    }
+
+    /// Read header bytes from `stream` up through (and including) the `\r\n\r\n`
+    /// boundary so the test can assert what the intercept forwarded.
+    async fn read_until_header_end(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        for _ in 0..32 {
+            let n = stream.read(&mut tmp).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn intercept_captures_bearer_and_forwards_headers_to_backend() {
+        // Fake backend: accept one connection, read its header block, hold the
+        // connection open long enough for the test to inspect what arrived.
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let received = read_until_header_end(&mut sock).await;
+            // Send a stub response so the client side of copy_bidirectional has
+            // something to consume.
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            received
+        });
+
+        // Run the intercept on its own ephemeral port.
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener); // free the port; run() rebinds the same one
+        let slot_for_run = token_slot.clone();
+        let run_task = tokio::spawn(async move {
+            // run() loops forever; the test cancels it via abort below.
+            let _ = run(intercept_addr, backend_addr, slot_for_run).await;
+        });
+
+        // Give run() a moment to bind. A brief retry loop on connect is more
+        // reliable than a fixed sleep, since CI can be slow.
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-token-123\r\nContent-Length: 0\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let received = timeout(Duration::from_secs(2), backend_task)
+            .await
+            .expect("backend forwarded request in time")
+            .expect("backend task ok");
+
+        // Headers should have been forwarded verbatim — including the Bearer.
+        let received_str = std::str::from_utf8(&received).expect("utf8");
+        assert!(
+            received_str.contains("POST /v1/messages HTTP/1.1"),
+            "request line forwarded: {received_str:?}"
+        );
+        assert!(
+            received_str.contains("Authorization: Bearer test-token-123"),
+            "bearer header forwarded: {received_str:?}"
+        );
+
+        // The bearer token should have been captured into the shared slot.
+        let captured = token_slot.lock().clone();
+        let bearer = captured.expect("bearer captured");
+        // BearerToken stores its value but doesn't expose it directly — verify
+        // via value_if_fresh with a generous TTL.
+        assert_eq!(
+            bearer
+                .value_if_fresh(Duration::from_secs(60))
+                .map(|s| s.to_string()),
+            Some("test-token-123".to_string())
+        );
+
+        run_task.abort();
+    }
+
+    #[tokio::test]
+    async fn intercept_returns_502_when_backend_is_unreachable() {
+        // Pick a backend port that nothing is listening on. Bind+immediately
+        // drop a listener to grab a free port, then connect attempts will fail.
+        let (probe, dead_backend_addr) = bind_ephemeral().await;
+        drop(probe);
+
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let slot_for_run = token_slot.clone();
+        let run_task = tokio::spawn(async move {
+            let _ = run(intercept_addr, dead_backend_addr, slot_for_run).await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 256];
+        let _ = timeout(Duration::from_secs(2), async {
+            loop {
+                let n = client.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&tmp[..n]);
+                if response.len() >= 16 {
+                    break;
+                }
+            }
+        })
+        .await;
+        let response_str = std::str::from_utf8(&response).unwrap_or("");
+        assert!(
+            response_str.starts_with("HTTP/1.1 502"),
+            "expected 502 Bad Gateway, got: {response_str:?}"
+        );
+
+        run_task.abort();
     }
 }
