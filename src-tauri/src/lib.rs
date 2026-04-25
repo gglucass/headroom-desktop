@@ -7,6 +7,7 @@ mod device;
 mod insights;
 mod keychain;
 mod models;
+mod port_conflict;
 mod pricing;
 mod proxy_intercept;
 mod research;
@@ -51,6 +52,8 @@ const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
+const BETA_CHANNEL_ENV: &str = "HEADROOM_BETA_CHANNEL";
+const BETA_CHANNEL_SENTINEL: &str = "beta_channel";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
@@ -122,6 +125,7 @@ struct AppUpdateConfiguration {
     current_version: String,
     endpoint_count: usize,
     configuration_error: Option<String>,
+    beta_channel_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -202,18 +206,21 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
 #[tauri::command]
 fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
     let current_version = app.package_info().version.to_string();
-    match release_updater_config(&current_version) {
+    let beta_channel_enabled = beta_channel_enabled();
+    match release_updater_config(&current_version, beta_channel_enabled) {
         Ok(Some(config)) => AppUpdateConfiguration {
             enabled: true,
             current_version,
             endpoint_count: config.endpoints.len(),
             configuration_error: None,
+            beta_channel_enabled,
         },
         Ok(None) => AppUpdateConfiguration {
             enabled: false,
             current_version,
             endpoint_count: 0,
             configuration_error: None,
+            beta_channel_enabled,
         },
         Err(ref err) => {
             sentry::capture_message(
@@ -225,6 +232,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
                 current_version,
                 endpoint_count: 0,
                 configuration_error: Some(err.clone()),
+                beta_channel_enabled,
             }
         }
     }
@@ -236,7 +244,7 @@ async fn check_for_app_update(
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<Option<AvailableAppUpdate>, String> {
     let current_version = app.package_info().version.to_string();
-    let config = release_updater_config(&current_version)?
+    let config = release_updater_config(&current_version, beta_channel_enabled())?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
 
     let updater = app
@@ -497,10 +505,16 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
 
         if let Err(err) = ensure_result {
             eprintln!("headroom auto-start failed after bootstrap: {err}");
-            capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
+            // Bootstrap finishes and immediately tries to start the proxy;
+            // a port conflict here counts as a "fresh launch" stuck case.
+            let handled = port_conflict::note_proxy_failed(&app_handle, &err, true);
+            if !handled {
+                capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
+            }
             // Fall through so the user is not stuck on the install loader
             // indefinitely. The test screen will show a retry option.
         } else {
+            port_conflict::note_proxy_started(&app_handle);
             // The intercept layer on 6767 is always bound by the Rust app, so
             // reachability really means "headroom's backend on 6768 is up".
             // We probe it by hitting 6767/health — the intercept forwards to
@@ -635,6 +649,18 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
 /// before failing to bind the port.
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
+
+    // Environmental failures: another process holds port 6768, or a stale
+    // headroom proxy is still bound. The user gets an actionable hint via
+    // `state::classify_startup_error` and the persistent-conflict case is
+    // surfaced separately by `port_conflict::note_proxy_failed`. Skip Sentry
+    // here so the dashboard isn't drowned in non-actionable events.
+    if port_conflict::is_port_conflict(&technical_err)
+        || technical_err.contains("headroom proxy already running on port")
+    {
+        return;
+    }
+
     let startup_failure = err
         .chain()
         .find_map(|e| e.downcast_ref::<tool_manager::HeadroomStartupFailure>());
@@ -1907,23 +1933,71 @@ fn is_prerelease_version(version: &str) -> bool {
     version.contains('-')
 }
 
-fn release_updater_config(current_version: &str) -> Result<Option<ReleaseUpdaterConfig>, String> {
-    let configured_pubkey = UPDATER_PUBLIC_KEY
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let configured_stable = UPDATER_ENDPOINTS
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let configured_staging = UPDATER_STAGING_ENDPOINTS
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+fn beta_channel_enabled_from(env: Option<&str>, sentinel_exists: bool) -> bool {
+    let env_yes = matches!(
+        env.map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    env_yes || sentinel_exists
+}
 
-    let prefer_staging = is_prerelease_version(current_version);
-    let configured_endpoints = if prefer_staging {
+fn beta_channel_enabled() -> bool {
+    let env = std::env::var(BETA_CHANNEL_ENV).ok();
+    let sentinel_exists = crate::storage::app_data_dir()
+        .join(BETA_CHANNEL_SENTINEL)
+        .exists();
+    beta_channel_enabled_from(env.as_deref(), sentinel_exists)
+}
+
+fn select_updater_endpoints<'a>(
+    configured_stable: Option<&'a str>,
+    configured_staging: Option<&'a str>,
+    prefer_staging: bool,
+) -> Option<&'a str> {
+    if prefer_staging {
         configured_staging.or(configured_stable)
     } else {
         configured_stable
-    };
+    }
+}
+
+fn release_updater_config(
+    current_version: &str,
+    beta_channel_enabled: bool,
+) -> Result<Option<ReleaseUpdaterConfig>, String> {
+    resolve_release_updater_config(
+        current_version,
+        beta_channel_enabled,
+        UPDATER_PUBLIC_KEY,
+        UPDATER_ENDPOINTS,
+        UPDATER_STAGING_ENDPOINTS,
+        cfg!(debug_assertions),
+    )
+}
+
+fn resolve_release_updater_config(
+    current_version: &str,
+    beta_channel_enabled: bool,
+    configured_pubkey: Option<&str>,
+    configured_stable: Option<&str>,
+    configured_staging: Option<&str>,
+    debug_assertions: bool,
+) -> Result<Option<ReleaseUpdaterConfig>, String> {
+    let configured_pubkey = configured_pubkey
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let configured_stable = configured_stable
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let configured_staging = configured_staging
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let prefer_staging = is_prerelease_version(current_version) || beta_channel_enabled;
+    let configured_endpoints =
+        select_updater_endpoints(configured_stable, configured_staging, prefer_staging);
 
     match (configured_pubkey, configured_endpoints) {
         (Some(pubkey), Some(endpoint_spec)) => {
@@ -1938,7 +2012,7 @@ fn release_updater_config(current_version: &str) -> Result<Option<ReleaseUpdater
                 .to_string(),
         ),
         (None, None) => {
-            if cfg!(debug_assertions) {
+            if debug_assertions {
                 Ok(None)
             } else {
                 build_release_updater_config(DEFAULT_UPDATER_PUBLIC_KEY, DEFAULT_UPDATER_ENDPOINT)
@@ -2607,8 +2681,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             }
 
             // Otherwise try to bring it back.
-            if let Err(err) = state.ensure_headroom_running() {
-                eprintln!("watchdog: ensure_headroom_running failed: {err:#}");
+            match state.ensure_headroom_running() {
+                Ok(()) => port_conflict::note_proxy_started(&app),
+                Err(err) => {
+                    eprintln!("watchdog: ensure_headroom_running failed: {err:#}");
+                    // In-session retry: don't bump the launch counter.
+                    port_conflict::note_proxy_failed(&app, &err, false);
+                }
             }
         }
     });
@@ -2886,9 +2965,17 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     if state.runtime_is_paused() {
         return;
     }
-    if let Err(err) = state.ensure_headroom_running() {
-        eprintln!("failed to ensure headroom runtime for tray: {err}");
-        capture_headroom_start_failure("ensure_runtime_ready_for_tray failed", &err);
+    match state.ensure_headroom_running() {
+        Ok(()) => port_conflict::note_proxy_started(app),
+        Err(err) => {
+            eprintln!("failed to ensure headroom runtime for tray: {err}");
+            // Tray open is in-session (not a fresh launch); pass false so the
+            // launch counter is preserved instead of double-counting clicks.
+            let handled = port_conflict::note_proxy_failed(app, &err, false);
+            if !handled {
+                capture_headroom_start_failure("ensure_runtime_ready_for_tray failed", &err);
+            }
+        }
     }
 }
 
@@ -3084,12 +3171,13 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        build_release_updater_config, check_headroom_learn_prereqs, classify_bootstrap_failure,
-        compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
-        delete_applied_pattern, empty_live_learnings_for_projects, fetch_transformations_feed_from,
-        install_pending_update, is_prerelease_version, lifetime_token_milestone_kind,
-        parse_live_learnings, parse_updater_endpoint_list, pattern_matches_project,
-        physical_rect_from_rect, read_applied_patterns_for_project, store_checked_update,
+        beta_channel_enabled_from, build_release_updater_config, check_headroom_learn_prereqs,
+        classify_bootstrap_failure, compute_tray_window_position, count_memories_created_today,
+        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
+        fetch_transformations_feed_from, install_pending_update, is_prerelease_version,
+        lifetime_token_milestone_kind, parse_live_learnings, parse_updater_endpoint_list,
+        pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
+        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
         AvailableAppUpdate, BootstrapFailureKind, HeadroomLearnPrereqStatus,
         InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
         TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
@@ -3234,6 +3322,180 @@ mod tests {
         assert!(is_prerelease_version("0.2.44-staging"));
         assert!(!is_prerelease_version("0.2.44"));
         assert!(!is_prerelease_version("1.0.0"));
+    }
+
+    #[test]
+    fn beta_channel_enabled_from_recognises_truthy_env_values() {
+        assert!(beta_channel_enabled_from(Some("1"), false));
+        assert!(beta_channel_enabled_from(Some("true"), false));
+        assert!(beta_channel_enabled_from(Some("TRUE"), false));
+        assert!(beta_channel_enabled_from(Some(" yes "), false));
+    }
+
+    #[test]
+    fn beta_channel_enabled_from_rejects_other_env_values() {
+        assert!(!beta_channel_enabled_from(None, false));
+        assert!(!beta_channel_enabled_from(Some(""), false));
+        assert!(!beta_channel_enabled_from(Some("0"), false));
+        assert!(!beta_channel_enabled_from(Some("false"), false));
+        assert!(!beta_channel_enabled_from(Some("no"), false));
+    }
+
+    #[test]
+    fn beta_channel_enabled_from_honours_sentinel_file() {
+        assert!(beta_channel_enabled_from(None, true));
+        assert!(beta_channel_enabled_from(Some("0"), true));
+    }
+
+    #[test]
+    fn select_updater_endpoints_uses_stable_when_not_preferring_staging() {
+        assert_eq!(
+            select_updater_endpoints(Some("https://stable"), Some("https://staging"), false),
+            Some("https://stable")
+        );
+        assert_eq!(
+            select_updater_endpoints(Some("https://stable"), None, false),
+            Some("https://stable")
+        );
+        assert_eq!(select_updater_endpoints(None, Some("https://staging"), false), None);
+    }
+
+    #[test]
+    fn select_updater_endpoints_prefers_staging_when_available() {
+        assert_eq!(
+            select_updater_endpoints(Some("https://stable"), Some("https://staging"), true),
+            Some("https://staging")
+        );
+    }
+
+    #[test]
+    fn select_updater_endpoints_falls_back_to_stable_when_staging_missing() {
+        assert_eq!(
+            select_updater_endpoints(Some("https://stable"), None, true),
+            Some("https://stable")
+        );
+        assert_eq!(select_updater_endpoints(None, None, true), None);
+    }
+
+    #[test]
+    fn resolve_release_updater_config_picks_stable_for_stable_version_with_beta_off() {
+        let config = resolve_release_updater_config(
+            "0.3.0",
+            false,
+            Some(DEFAULT_UPDATER_PUBLIC_KEY),
+            Some("https://stable.example.com/latest.json"),
+            Some("https://staging.example.com/latest.json"),
+            false,
+        )
+        .expect("config")
+        .expect("Some(config)");
+
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://stable.example.com/latest.json"
+        );
+    }
+
+    #[test]
+    fn resolve_release_updater_config_picks_staging_when_beta_channel_on() {
+        let config = resolve_release_updater_config(
+            "0.3.0",
+            true,
+            Some(DEFAULT_UPDATER_PUBLIC_KEY),
+            Some("https://stable.example.com/latest.json"),
+            Some("https://staging.example.com/latest.json"),
+            false,
+        )
+        .expect("config")
+        .expect("Some(config)");
+
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://staging.example.com/latest.json"
+        );
+    }
+
+    #[test]
+    fn resolve_release_updater_config_picks_staging_for_prerelease_even_with_beta_off() {
+        let config = resolve_release_updater_config(
+            "0.3.1-rc.2",
+            false,
+            Some(DEFAULT_UPDATER_PUBLIC_KEY),
+            Some("https://stable.example.com/latest.json"),
+            Some("https://staging.example.com/latest.json"),
+            false,
+        )
+        .expect("config")
+        .expect("Some(config)");
+
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://staging.example.com/latest.json"
+        );
+    }
+
+    #[test]
+    fn resolve_release_updater_config_falls_back_to_stable_when_staging_unconfigured() {
+        let config = resolve_release_updater_config(
+            "0.3.0",
+            true,
+            Some(DEFAULT_UPDATER_PUBLIC_KEY),
+            Some("https://stable.example.com/latest.json"),
+            None,
+            false,
+        )
+        .expect("config")
+        .expect("Some(config)");
+
+        assert_eq!(
+            config.endpoints[0].as_str(),
+            "https://stable.example.com/latest.json"
+        );
+    }
+
+    #[test]
+    fn resolve_release_updater_config_returns_default_feed_when_nothing_configured_in_release() {
+        let config = resolve_release_updater_config("0.3.0", false, None, None, None, false)
+            .expect("config")
+            .expect("Some(config)");
+
+        assert_eq!(config.endpoints[0].as_str(), DEFAULT_UPDATER_ENDPOINT);
+    }
+
+    #[test]
+    fn resolve_release_updater_config_disables_updates_in_debug_when_unconfigured() {
+        let result = resolve_release_updater_config("0.3.0", true, None, None, None, true)
+            .expect("debug config resolves to None");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_release_updater_config_errors_when_pubkey_missing() {
+        let err = resolve_release_updater_config(
+            "0.3.0",
+            false,
+            None,
+            Some("https://stable.example.com/latest.json"),
+            None,
+            false,
+        )
+        .expect_err("missing pubkey error");
+        assert!(err.contains("HEADROOM_UPDATER_PUBLIC_KEY"));
+    }
+
+    #[test]
+    fn resolve_release_updater_config_errors_when_endpoints_missing() {
+        let err = resolve_release_updater_config(
+            "0.3.0",
+            false,
+            Some(DEFAULT_UPDATER_PUBLIC_KEY),
+            None,
+            None,
+            false,
+        )
+        .expect_err("missing endpoints error");
+        assert!(err.contains("HEADROOM_UPDATER_ENDPOINTS"));
     }
 
     #[test]

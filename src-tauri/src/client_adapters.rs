@@ -468,6 +468,61 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     remove_known_keychain_entries();
 
+    // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
+    // siblings created by `backup_if_exists` for every file we ever mutated.
+    // Without this, stale backups remain in ~/.claude, ~/.claude/hooks,
+    // ~/.codex, ~/Library/Application Support/Code/User, and the user's
+    // shell rc directory after uninstall.
+    let mut backup_targets: Vec<PathBuf> = claude_settings_candidates();
+    backup_targets.push(headroom_rtk_hook_path());
+    backup_targets.push(codex_config_toml_path());
+    backup_targets.push(
+        home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("settings.json"),
+    );
+    backup_targets.extend(all_shell_paths());
+    for target in backup_targets {
+        removed.extend(sweep_managed_backups(&target));
+    }
+
+    removed
+}
+
+/// Remove sibling backup files that `backup_if_exists` (or its predecessor
+/// "nommer") created next to `target`. Filenames look like
+/// `<basename>.headroom-backup-<timestamp>` and `<basename>.nommer-backup-<timestamp>`.
+/// Returns the paths removed.
+fn sweep_managed_backups(target: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Some(parent) = target.parent() else {
+        return removed;
+    };
+    let Some(file_name) = target.file_name().and_then(|n| n.to_str()) else {
+        return removed;
+    };
+    let headroom_prefix = format!("{}.headroom-backup-", file_name);
+    let nommer_prefix = format!("{}.nommer-backup-", file_name);
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&headroom_prefix) && !name.starts_with(&nommer_prefix) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+        }
+    }
     removed
 }
 
@@ -613,6 +668,7 @@ fn remove_macos_caches() -> Vec<String> {
 fn remove_known_keychain_entries() {
     const ENTRIES: &[(&str, &str)] = &[
         ("com.extraheadroom.headroom.account", "session-token"),
+        ("com.extraheadroom.headroom.device", "machine-id-digest"),
         ("com.extraheadroom.headroom.headroom-learn", "openai"),
         ("com.extraheadroom.headroom.headroom-learn", "anthropic"),
         ("com.extraheadroom.headroom.headroom-learn", "gemini"),
@@ -2980,5 +3036,43 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             err.to_string().contains("Codex integration has been disabled"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn sweep_managed_backups_removes_headroom_and_nommer_siblings_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("settings.json");
+        fs::write(&target, "{}").unwrap();
+
+        let headroom_backup = tmp.path().join("settings.json.headroom-backup-20260101000000");
+        let nommer_backup = tmp.path().join("settings.json.nommer-backup-20250101000000");
+        let unrelated = tmp.path().join("settings.json.bak");
+        let other_target_backup = tmp
+            .path()
+            .join("config.toml.headroom-backup-20260101000000");
+        fs::write(&headroom_backup, "old").unwrap();
+        fs::write(&nommer_backup, "older").unwrap();
+        fs::write(&unrelated, "user-owned").unwrap();
+        fs::write(&other_target_backup, "different file's backup").unwrap();
+
+        let removed = super::sweep_managed_backups(&target);
+
+        assert_eq!(removed.len(), 2, "removed: {removed:?}");
+        assert!(!headroom_backup.exists(), "headroom backup should be gone");
+        assert!(!nommer_backup.exists(), "nommer backup should be gone");
+        assert!(unrelated.exists(), "unrelated .bak should survive");
+        assert!(
+            other_target_backup.exists(),
+            "another file's backup should survive"
+        );
+        assert!(target.exists(), "target file itself should survive");
+    }
+
+    #[test]
+    fn sweep_managed_backups_is_quiet_when_parent_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist").join("settings.json");
+        let removed = super::sweep_managed_backups(&missing);
+        assert!(removed.is_empty());
     }
 }

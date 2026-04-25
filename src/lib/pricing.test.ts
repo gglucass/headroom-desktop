@@ -1,12 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   authMethodLabel,
   cachePricingStatus,
   claudePlanLabel,
   formatPercentValue,
   formatRemainingDays,
+  PRICING_CACHE_KEY,
   pricingTone,
+  readCachedPricing,
   subscriptionTierLabel,
+  writeCachedPricing,
 } from "./pricing";
 import type { HeadroomPricingStatus } from "./types";
 
@@ -144,5 +147,65 @@ describe("pricing cache snapshot", () => {
       recommendedSubscriptionTier: "max5x",
       subscriptionTier: "pro",
     });
+  });
+});
+
+describe("pricing cache localStorage round-trip", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("returns an empty object when nothing has been cached", () => {
+    expect(readCachedPricing()).toEqual({});
+  });
+
+  it("round-trips a cached pricing snapshot through localStorage", () => {
+    writeCachedPricing({
+      planTier: "max5x",
+      recommendedSubscriptionTier: "max20x",
+      subscriptionTier: "pro",
+    });
+
+    expect(readCachedPricing()).toEqual({
+      planTier: "max5x",
+      recommendedSubscriptionTier: "max20x",
+      subscriptionTier: "pro",
+    });
+  });
+
+  it("returns an empty object when the stored value is not valid JSON", () => {
+    localStorage.setItem(PRICING_CACHE_KEY, "{not json");
+    expect(readCachedPricing()).toEqual({});
+  });
+
+  it("swallows write failures silently when localStorage throws", () => {
+    const setItemSpy = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new Error("QuotaExceededError");
+      });
+
+    // Should not throw — write is best-effort.
+    expect(() =>
+      writeCachedPricing({
+        planTier: "pro",
+        recommendedSubscriptionTier: undefined,
+        subscriptionTier: undefined,
+      })
+    ).not.toThrow();
+
+    setItemSpy.mockRestore();
+  });
+
+  it("returns an empty object when localStorage.getItem itself throws", () => {
+    const getItemSpy = vi
+      .spyOn(Storage.prototype, "getItem")
+      .mockImplementation(() => {
+        throw new Error("storage disabled");
+      });
+
+    expect(readCachedPricing()).toEqual({});
+
+    getItemSpy.mockRestore();
   });
 });

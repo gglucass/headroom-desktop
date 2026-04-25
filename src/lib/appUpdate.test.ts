@@ -35,6 +35,7 @@ const disabledConfig: AppUpdateConfiguration = {
   currentVersion: "0.2.9",
   endpointCount: 0,
   configurationError: null,
+  betaChannelEnabled: false,
 };
 
 const brokenConfig: AppUpdateConfiguration = {
@@ -42,6 +43,7 @@ const brokenConfig: AppUpdateConfiguration = {
   currentVersion: "0.2.9",
   endpointCount: 0,
   configurationError: "HEADROOM_UPDATER_PUBLIC_KEY is missing.",
+  betaChannelEnabled: false,
 };
 
 const availableUpdate: AvailableAppUpdate = {

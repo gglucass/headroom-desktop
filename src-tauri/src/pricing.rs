@@ -257,13 +257,23 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
 }
 
 pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCodeRequest, String> {
+    request_auth_code_with_base_url(state, email, &api_base_url())
+}
+
+/// Test-only seam: `request_auth_code` against a parameterized base URL so a
+/// canned-response test server can stand in for headroom-web.
+pub(crate) fn request_auth_code_with_base_url(
+    state: &AppState,
+    email: &str,
+    base_url: &str,
+) -> Result<HeadroomAuthCodeRequest, String> {
     let trimmed = email.trim().to_ascii_lowercase();
     if trimmed.is_empty() || !trimmed.contains('@') {
         return Err("Enter a valid email address.".into());
     }
 
     let response = http_client()?
-        .post(api_url("desktop/auth/request_code"))
+        .post(join_url(base_url, "desktop/auth/request_code"))
         .json(&RequestCodePayload {
             email: &trimmed,
             identity: IdentityPayload::for_state(state),
@@ -302,6 +312,18 @@ pub fn verify_auth_code(
     code: &str,
     invite_code: Option<&str>,
 ) -> Result<HeadroomPricingStatus, String> {
+    verify_auth_code_with_base_url(state, email, code, invite_code, &api_base_url())
+}
+
+/// Test-only seam: `verify_auth_code` against a parameterized base URL so a
+/// canned-response test server can stand in for headroom-web.
+pub(crate) fn verify_auth_code_with_base_url(
+    state: &AppState,
+    email: &str,
+    code: &str,
+    invite_code: Option<&str>,
+    base_url: &str,
+) -> Result<HeadroomPricingStatus, String> {
     let trimmed_email = email.trim().to_ascii_lowercase();
     let trimmed_code = code.trim();
     if trimmed_email.is_empty() || !trimmed_email.contains('@') {
@@ -312,7 +334,7 @@ pub fn verify_auth_code(
     }
 
     let response = http_client()?
-        .post(api_url("desktop/auth/verify_code"))
+        .post(join_url(base_url, "desktop/auth/verify_code"))
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
@@ -502,8 +524,6 @@ pub fn get_billing_portal_url() -> Result<String, String> {
 }
 
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
-    use chrono::DateTime;
-
     let access_token = state.current_bearer_token().ok_or_else(|| {
         "No Claude AI token captured yet — make sure Claude Code is running and authenticated via Claude AI (not an API key), then try again after the first request passes through the proxy.".to_string()
     })?;
@@ -519,6 +539,14 @@ pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
     let body: serde_json::Value = resp
         .json()
         .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    parse_claude_usage_response(&body)
+}
+
+/// Pure parser for the Anthropic OAuth usage endpoint response. Extracted so
+/// schema-drift tests don't need a live HTTP server.
+fn parse_claude_usage_response(body: &serde_json::Value) -> Result<ClaudeUsage, String> {
+    use chrono::DateTime;
 
     if let Some(err) = body.get("error") {
         return Err(format!(
@@ -1161,6 +1189,10 @@ fn http_client() -> Result<Client, String> {
 }
 
 fn api_url(path: &str) -> String {
+    join_url(&api_base_url(), path)
+}
+
+fn api_base_url() -> String {
     // Runtime override is only honored in debug builds. In release builds an
     // attacker with persistence on the user's machine (e.g. a launchd plist)
     // could otherwise redirect every billing/auth call to a rogue host.
@@ -1169,8 +1201,10 @@ fn api_url(path: &str) -> String {
     #[cfg(not(debug_assertions))]
     let runtime_env: Option<String> = None;
 
-    let base =
-        resolve_account_api_base_url(runtime_env, option_env!("HEADROOM_ACCOUNT_API_BASE_URL"));
+    resolve_account_api_base_url(runtime_env, option_env!("HEADROOM_ACCOUNT_API_BASE_URL"))
+}
+
+fn join_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
@@ -1825,5 +1859,292 @@ mod tests {
             invite_bonus_percent: -10.0,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
+    }
+
+    // ── Anthropic OAuth usage parser ────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_usage_response_decodes_full_payload() {
+        let body = serde_json::json!({
+            "five_hour": {
+                "utilization": 42.5,
+                "resets_at": "2026-04-25T15:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 18.75,
+                "resets_at": "2026-04-30T00:00:00Z"
+            },
+            "extra_usage": {
+                "is_enabled": true,
+                "monthly_limit": 50.0,
+                "used_credits": 12.5,
+                "utilization": 25.0
+            }
+        });
+        let usage = super::parse_claude_usage_response(&body).expect("parse usage");
+
+        let five = usage.five_hour.expect("five-hour window");
+        assert!((five.utilization - 42.5).abs() < f64::EPSILON);
+
+        let seven = usage.seven_day.expect("seven-day window");
+        assert!((seven.utilization - 18.75).abs() < f64::EPSILON);
+
+        let extra = usage.extra_usage.expect("extra-usage block");
+        assert!(extra.is_enabled);
+        assert_eq!(extra.monthly_limit, Some(50.0));
+        assert_eq!(extra.used_credits, Some(12.5));
+        assert_eq!(extra.utilization, Some(25.0));
+    }
+
+    #[test]
+    fn parse_claude_usage_response_returns_error_on_api_error_envelope() {
+        let body = serde_json::json!({
+            "error": { "message": "rate limit exceeded" }
+        });
+        let err = super::parse_claude_usage_response(&body).expect_err("api error");
+        assert!(
+            err.contains("rate limit exceeded"),
+            "expected rate-limit message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_claude_usage_response_returns_error_with_unknown_message_when_message_missing() {
+        let body = serde_json::json!({ "error": {} });
+        let err = super::parse_claude_usage_response(&body).expect_err("api error");
+        assert!(err.contains("unknown"));
+    }
+
+    #[test]
+    fn parse_claude_usage_response_skips_windows_missing_required_fields() {
+        // Schema-drift smoke: a window object missing `resets_at` should be
+        // dropped rather than producing a panic.
+        let body = serde_json::json!({
+            "five_hour": { "utilization": 10.0 },
+            "seven_day": { "resets_at": "2026-04-30T00:00:00Z" },
+            "extra_usage": null
+        });
+        let usage = super::parse_claude_usage_response(&body).expect("parse usage");
+        assert!(usage.five_hour.is_none(), "no resets_at → window dropped");
+        assert!(usage.seven_day.is_none(), "no utilization → window dropped");
+        assert!(usage.extra_usage.is_none());
+    }
+
+    #[test]
+    fn parse_claude_usage_response_skips_extra_usage_missing_required_field() {
+        let body = serde_json::json!({
+            "extra_usage": { "monthly_limit": 50.0 }  // missing is_enabled
+        });
+        let usage = super::parse_claude_usage_response(&body).expect("parse");
+        assert!(
+            usage.extra_usage.is_none(),
+            "extra_usage without is_enabled should be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_claude_usage_response_skips_window_with_malformed_resets_at() {
+        let body = serde_json::json!({
+            "five_hour": { "utilization": 10.0, "resets_at": "not-a-date" }
+        });
+        let usage = super::parse_claude_usage_response(&body).expect("parse");
+        assert!(usage.five_hour.is_none());
+    }
+
+    // ── headroom-web auth contract tests ────────────────────────────────────
+
+    fn temp_app_state() -> (crate::state::AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-pricing-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = crate::state::AppState::new_in(dir.clone()).expect("app state");
+        (state, dir)
+    }
+
+    fn drop_state(dir: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn spawn_canned_response_server(
+        body: serde_json::Value,
+        status_line: &'static str,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned server");
+        let port = listener.local_addr().unwrap().port();
+        let body_bytes = body.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_bytes.len(),
+                body_bytes
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn request_auth_code_decodes_headroom_web_response() {
+        let body = serde_json::json!({
+            "email": "user@example.com",
+            "expiresInSeconds": 600
+        });
+        let (port, server) = spawn_canned_response_server(body, "HTTP/1.1 200 OK");
+        let (state, dir) = temp_app_state();
+
+        let result = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("request_auth_code succeeds");
+
+        server.join().unwrap();
+        assert_eq!(result.email, "user@example.com");
+        assert_eq!(result.expires_in_seconds, 600);
+        drop_state(dir);
+    }
+
+    #[test]
+    fn request_auth_code_clamps_expiry_to_documented_maximum() {
+        let body = serde_json::json!({
+            "email": "user@example.com",
+            "expiresInSeconds": 99999
+        });
+        let (port, server) = spawn_canned_response_server(body, "HTTP/1.1 200 OK");
+        let (state, dir) = temp_app_state();
+
+        let result = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("request_auth_code succeeds");
+
+        server.join().unwrap();
+        assert_eq!(
+            result.expires_in_seconds,
+            super::AUTH_CODE_EXPIRY_SECONDS,
+            "expiry clamped to documented maximum"
+        );
+        drop_state(dir);
+    }
+
+    #[test]
+    fn request_auth_code_rejects_invalid_email_before_calling_server() {
+        let (state, dir) = temp_app_state();
+        let result = super::request_auth_code_with_base_url(
+            &state,
+            "  ",
+            "http://127.0.0.1:1", // would fail if reached
+        );
+        assert!(matches!(result, Err(msg) if msg.contains("valid email")));
+        drop_state(dir);
+    }
+
+    #[test]
+    fn request_auth_code_returns_error_on_5xx_response() {
+        let body = serde_json::json!({"error": "internal"});
+        let (port, server) = spawn_canned_response_server(body, "HTTP/1.1 500 Internal Server Error");
+        let (state, dir) = temp_app_state();
+
+        let err = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("5xx surfaces as error");
+
+        server.join().unwrap();
+        assert!(err.contains("status 500"));
+        drop_state(dir);
+    }
+
+    #[test]
+    fn verify_auth_code_decodes_and_writes_session_token() {
+        // Override HOME / XDG_DATA_HOME so the keychain debug store and
+        // app_data_dir live in a fresh tempdir, not the dev's real profile.
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        std::env::set_var("HOME", scratch.path());
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            scratch.path().join(".local").join("share"),
+        );
+        crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
+            .expect("ensure_data_dirs in scratch");
+
+        let body = serde_json::json!({
+            "sessionToken": "session-xyz",
+            "account": {
+                "email": "user@example.com",
+                "trialStartedAt": "2026-04-01T00:00:00Z",
+                "trialEndsAt": "2026-04-15T00:00:00Z",
+                "trialActive": true,
+                "subscriptionActive": false,
+                "subscriptionTier": null,
+                "inviteCode": null,
+                "acceptedInvitesCount": 0,
+                "inviteBonusPercent": 0
+            },
+            "launchDiscountActive": false
+        });
+        let (port, server) = spawn_canned_response_server(body, "HTTP/1.1 200 OK");
+        let (state, dir) = temp_app_state();
+
+        let result = super::verify_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            "123456",
+            None,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("verify_auth_code succeeds");
+
+        server.join().unwrap();
+        assert!(result.authenticated);
+        let account = result.account.expect("account profile populated");
+        assert_eq!(account.email, "user@example.com");
+        assert!(account.trial_active);
+
+        // Session token should have been written to the (debug) keychain.
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .expect("read session token");
+        assert_eq!(stored.as_deref(), Some("session-xyz"));
+
+        drop_state(dir);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    #[test]
+    fn verify_auth_code_rejects_blank_code_before_hitting_server() {
+        let (state, dir) = temp_app_state();
+        let err = super::verify_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            "   ",
+            None,
+            "http://127.0.0.1:1",
+        )
+        .expect_err("blank code rejected");
+        assert!(err.contains("authentication code"));
+        drop_state(dir);
     }
 }

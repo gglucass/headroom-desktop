@@ -2995,6 +2995,20 @@ details[open] .optimize-minimal__details summary::after {
   font-weight: 400;
 }
 
+.runtime-status__channel-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  vertical-align: baseline;
+}
+
 .runtime-status__item {
   display: inline-flex;
   align-items: center;

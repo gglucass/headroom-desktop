@@ -204,6 +204,7 @@ export interface AppUpdateConfiguration {
   currentVersion: string;
   endpointCount: number;
   configurationError?: string | null;
+  betaChannelEnabled: boolean;
 }
 
 export interface AvailableAppUpdate {

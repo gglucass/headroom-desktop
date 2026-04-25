@@ -117,10 +117,19 @@ import {
   type CachedPricing,
   formatPercentValue,
   formatRemainingDays,
-  subscriptionTierLabel
+  readCachedPricing,
+  subscriptionTierLabel,
+  writeCachedPricing
 } from "./lib/pricing";
+import {
+  activityFeedSignature,
+  notificationActionView,
+  serializeState,
+  type TrayView
+} from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { LauncherShell } from "./components/LauncherShell";
 import { OptimizePanel } from "./components/OptimizePanel";
 import type {
   AppUpdateConfiguration,
@@ -142,15 +151,6 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeProgress,
 } from "./lib/types";
-
-type TrayView =
-  | "home"
-  | "optimization"
-  | "health"
-  | "notifications"
-  | "upgrade"
-  | "upgradeAuth"
-  | "settings";
 
 interface NavItem {
   id: TrayView;
@@ -307,71 +307,10 @@ function SavingsChartTooltip({
   );
 }
 
-function notificationActionView(action: string | null): TrayView | null {
-  switch (action) {
-    case "signin":
-    case "billing":
-    case "signup":
-      return "upgradeAuth";
-    case "runtime":
-    case "connectors":
-      return "settings";
-    case "optimize":
-      return "optimization";
-    case "activity":
-      return "notifications";
-    default:
-      return null;
-  }
-}
-
 function delay(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
   });
-}
-
-/**
- * O(1) structural fingerprint of an activity feed response. Used by the
- * polling effect to skip `setActivityFeed` when the snapshot is identical two
- * polls in a row (the common case between compressions). Each tile contributes
- * a stable id for its slot — `null` when absent — so any slot flip shows up in
- * the signature.
- */
-function activityFeedSignature(feed: ActivityFeedResponse): string {
-  const { tiles } = feed;
-  const parts = [
-    feed.proxyReachable ? 1 : 0,
-    tiles.transformation
-      ? `t:${tiles.transformation.requestId ?? tiles.transformation.timestamp ?? ""}`
-      : "t:-",
-    tiles.record ? `r:${tiles.record.observedAt}` : "r:-",
-    tiles.rtkToday ? `b:${tiles.rtkToday.date}:${tiles.rtkToday.savedTokens}` : "b:-",
-    tiles.learningsMilestone ? `l:${tiles.learningsMilestone.observedAt}` : "l:-",
-    tiles.weeklyRecap ? `wr:${tiles.weeklyRecap.weekStart}` : "wr:-",
-    tiles.trainSuggestion
-      ? `ts:${tiles.trainSuggestion.projectPath}:${tiles.trainSuggestion.observedAt}`
-      : "ts:-"
-  ];
-  return parts.join("|");
-}
-
-const PRICING_CACHE_KEY = "headroom.cachedPricing";
-function readCachedPricing(): CachedPricing {
-  try {
-    const raw = localStorage.getItem(PRICING_CACHE_KEY);
-    if (raw) return JSON.parse(raw) as CachedPricing;
-  } catch {}
-  return {};
-}
-function writeCachedPricing(pricing: CachedPricing) {
-  try {
-    localStorage.setItem(PRICING_CACHE_KEY, JSON.stringify(pricing));
-  } catch {}
-}
-
-function serializeState(value: unknown): string {
-  return JSON.stringify(value);
 }
 
 type SavingsChartView = "month" | "day";
@@ -616,56 +555,11 @@ function renderConnectorLogo(clientId: string) {
   return <Sparkle className="client-logo__glyph" size={20} weight="duotone" />;
 }
 
-interface LauncherShellProps {
-  shellClassName: string;
-  spinnerClassName: string;
-  copyClassName: string;
-  onMouseDown: (event: MouseEvent<HTMLElement>) => void;
-  version: string;
-  children: ReactNode;
-  showSpinner?: boolean;
-}
-
 interface ProxyVerificationRow {
   clientId: string;
   name: string;
   state: "processing" | "waiting" | "verified";
   message: string;
-}
-
-function LauncherShell({
-  shellClassName,
-  spinnerClassName,
-  copyClassName,
-  onMouseDown,
-  version,
-  children,
-  showSpinner = true,
-}: LauncherShellProps) {
-  return (
-    <main className="app-shell app-shell--launcher">
-      <section
-        className={shellClassName}
-        onMouseDown={onMouseDown}
-      >
-        <div className="hero__badge hero__badge--launcher">
-          <img src={headroomLogo} alt="" aria-hidden="true" />
-          <span>v{version}</span>
-        </div>
-        {showSpinner && (
-          <img
-            className={spinnerClassName}
-            src={headroomLogo}
-            alt=""
-            aria-hidden="true"
-          />
-        )}
-        <div className="intro-shell__content">
-          <div className={copyClassName}>{children}</div>
-        </div>
-      </section>
-    </main>
-  );
 }
 
 
@@ -4482,6 +4376,9 @@ export default function App() {
                   <div className="runtime-status__topline">
                     <span className="runtime-status__section-title">
                       Headroom app ({appSemver})
+                      {appUpdateConfig?.betaChannelEnabled ? (
+                        <span className="runtime-status__channel-pill">beta channel</span>
+                      ) : null}
                     </span>
                   </div>
                   <div className="runtime-status__section-action-row">

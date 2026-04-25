@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
@@ -11,10 +11,19 @@ use crate::models::{
 };
 use crate::storage::config_file;
 
-// Bumped from 4 → 5 when the learnings tile moved from a one-shot milestone
-// (count, kind) to a daily diff shape (patterns/reminders/learnings today +
-// project attribution). Old persisted state can't be reused since the event
-// fields changed, so the mismatch handler drops the file and starts fresh.
+// Reserve bumps for fundamental outer-struct changes (e.g., the v1→v2 move
+// from event queues to latest-of-kind slots). Field-level evolution of the
+// nested event structs (`TransformationFeedEvent`, `RecordEvent`, etc.) does
+// NOT require a bump anymore: each `last_*` slot is deserialized via
+// `de_or_none`, so a reshape just empties that one slot and the rest of the
+// file (record counters, fire-once sets, learnings snapshots) survives.
+//
+// Historical bump record:
+//   1 → 2: queues replaced by single-slot tiles.
+//   2 → 3, 3 → 4: tile-slot field shape changes that today would be
+//                 absorbed by `de_or_none` and not need a bump.
+//   4 → 5: learnings tile moved from {count, kind} to {patternsToday,
+//          remindersToday, learningsToday, projectPath, ...}; same as above.
 const SCHEMA_VERSION: u8 = 5;
 // Hard cap on how big a facts file we'll even attempt to deserialize at boot.
 // The pre-v2 schema embedded full request/response bodies into queues that
@@ -63,6 +72,25 @@ pub struct WeeklyTotals {
     pub total_tokens_saved: u64,
     pub total_savings_usd: f64,
     pub active_days: u32,
+}
+
+/// Tolerant deserializer for `Option<T>` fields whose inner struct may have
+/// reshaped between releases. Reads the value as raw JSON first, then tries
+/// to coerce it into `T`; on any failure (missing required field, wrong
+/// type, enum variant gone, etc.) returns `None` instead of bubbling the
+/// error up and failing the whole outer parse. Sibling fields keep their
+/// values, the affected slot just goes empty until the next live observation
+/// repaints it.
+fn de_or_none<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value(value).ok())
 }
 
 // Shared debounce for Daily and AllTime record tags. Once we've emitted a
@@ -143,7 +171,7 @@ struct PersistedActivityFacts {
     // -- record bookkeeping --
     #[serde(default)]
     all_time_record_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_none")]
     daily_record: Option<DailyRecordFact>,
     #[serde(default)]
     last_weekly_recap_week_key: Option<String>,
@@ -176,16 +204,18 @@ struct PersistedActivityFacts {
     // -- latest-of-kind tile slots --
     // The Activity tab shows one tile per kind, populated by the most recent
     // event of that kind. Rather than persist a queue of every event ever, we
-    // store only the freshest event for each tile.
-    #[serde(default)]
+    // store only the freshest event for each tile. Each slot is loaded via
+    // `de_or_none` so a reshape of the inner struct empties just that slot
+    // instead of failing the whole file load (see SCHEMA_VERSION comment).
+    #[serde(default, deserialize_with = "de_or_none")]
     last_transformation: Option<TransformationFeedEvent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_none")]
     last_record: Option<RecordEvent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_none")]
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_none")]
     last_weekly_recap: Option<WeeklyRecapEvent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_none")]
     last_train_suggestion: Option<TrainSuggestionEvent>,
 }
 
@@ -1154,6 +1184,149 @@ mod tests {
         let reloaded = ActivityFacts::load_or_create(&base).unwrap();
         let record = reloaded.last_record.as_ref().expect("record persisted");
         assert_eq!(record.request_messages, Some(small));
+    }
+
+    /// Bring every `de_or_none`-decorated slot into a populated state by
+    /// running each kind of observation once. Returns the project path used
+    /// for learnings/train so the assertion side can reference it.
+    fn populate_all_de_or_none_slots(facts: &mut ActivityFacts, project_path: &str) {
+        // daily_record + last_transformation + last_record.
+        facts.observe_transformation_at(
+            &mk_transformation(Some("claude-x"), Some(5_000), Some(70.0)),
+            at(10, 0),
+            at(10, 0),
+        );
+        // last_learnings_milestone.
+        facts.observe_learnings_today(
+            2,
+            vec![mk_learn_input(project_path, "demo", &["a"], &["b"])],
+            Some(project_path),
+            at(10, 0),
+        );
+        // last_train_suggestion. The project path must exist on disk or the
+        // observe call un-latches the slot it just set (see latch-clearing
+        // block in observe_train_suggestions).
+        facts.observe_train_suggestions(
+            &[mk_project(project_path, 5, None, 0, "2026-04-22T10:00:00Z")],
+            at(10, 0),
+        );
+        // last_weekly_recap.
+        let monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        facts.maybe_record_weekly_recap(
+            monday,
+            WeeklyTotals {
+                total_tokens_saved: 100,
+                total_savings_usd: 1.0,
+                active_days: 1,
+            },
+            at(10, 0),
+        );
+    }
+
+    /// Snapshot of which slots are populated. Used by the per-field sweep so
+    /// the body of one field's test reads as "this field empty, the other
+    /// five still full" against a single struct.
+    struct SlotPresence {
+        daily_record: bool,
+        last_transformation: bool,
+        last_record: bool,
+        last_learnings_milestone: bool,
+        last_weekly_recap: bool,
+        last_train_suggestion: bool,
+    }
+
+    impl SlotPresence {
+        fn of(facts: &ActivityFacts) -> Self {
+            Self {
+                daily_record: facts.daily_record.is_some(),
+                last_transformation: facts.last_transformation.is_some(),
+                last_record: facts.last_record.is_some(),
+                last_learnings_milestone: facts.last_learnings_milestone.is_some(),
+                last_weekly_recap: facts.last_weekly_recap.is_some(),
+                last_train_suggestion: facts.last_train_suggestion.is_some(),
+            }
+        }
+    }
+
+    /// Corrupt one camelCase field on disk and assert that load drops only
+    /// that slot, leaves every other slot intact, and preserves scalars.
+    fn assert_only_the_named_slot_drops(field: &'static str) {
+        let (_tmp, base) = base_dir();
+        let project_path = base.to_str().expect("utf-8 path").to_string();
+
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        populate_all_de_or_none_slots(&mut facts, &project_path);
+        facts.save_if_dirty().unwrap();
+        let pre = SlotPresence::of(&facts);
+        assert!(
+            pre.daily_record
+                && pre.last_transformation
+                && pre.last_record
+                && pre.last_learnings_milestone
+                && pre.last_weekly_recap
+                && pre.last_train_suggestion,
+            "setup: every slot must be populated before corrupting one"
+        );
+
+        let path = base.join("config").join("activity-facts.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // A bare string is rejected by every event struct's deserializer.
+        value[field] = serde_json::json!("not-a-valid-event");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let reloaded = ActivityFacts::load_or_create(&base).unwrap();
+        let post = SlotPresence::of(&reloaded);
+        assert_eq!(
+            reloaded.all_time_record_tokens, 5_000,
+            "scalar all_time_record_tokens survives corruption of {field}",
+        );
+
+        let want_dropped = match field {
+            "dailyRecord" => &post.daily_record,
+            "lastTransformation" => &post.last_transformation,
+            "lastRecord" => &post.last_record,
+            "lastLearningsMilestone" => &post.last_learnings_milestone,
+            "lastWeeklyRecap" => &post.last_weekly_recap,
+            "lastTrainSuggestion" => &post.last_train_suggestion,
+            other => panic!("unknown field {other}"),
+        };
+        assert!(!want_dropped, "{field} should drop to None after corruption");
+
+        // All siblings must still be present.
+        for (name, present) in [
+            ("dailyRecord", post.daily_record),
+            ("lastTransformation", post.last_transformation),
+            ("lastRecord", post.last_record),
+            ("lastLearningsMilestone", post.last_learnings_milestone),
+            ("lastWeeklyRecap", post.last_weekly_recap),
+            ("lastTrainSuggestion", post.last_train_suggestion),
+        ] {
+            if name != field {
+                assert!(
+                    present,
+                    "sibling {name} should survive corruption of {field}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_de_or_none_slot_is_independently_fault_tolerant() {
+        // Sweep every field decorated with `deserialize_with = "de_or_none"`
+        // so we catch the failure mode where the attribute was omitted on
+        // one of them — that bug would silently break load for any user
+        // whose corresponding event struct ever reshapes.
+        for field in [
+            "dailyRecord",
+            "lastTransformation",
+            "lastRecord",
+            "lastLearningsMilestone",
+            "lastWeeklyRecap",
+            "lastTrainSuggestion",
+        ] {
+            assert_only_the_named_slot_drops(field);
+        }
     }
 
     #[test]

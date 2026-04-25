@@ -275,7 +275,7 @@ impl AppState {
         Self::new_in(app_data_dir())
     }
 
-    fn new_in(base_dir: PathBuf) -> Result<Self> {
+    pub(crate) fn new_in(base_dir: PathBuf) -> Result<Self> {
         ensure_data_dirs(&base_dir)?;
 
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
@@ -385,9 +385,20 @@ impl AppState {
             );
         }
 
-        if let Err(err) = self.ensure_headroom_running() {
-            eprintln!("failed to auto-start headroom during app launch: {err}");
-            crate::capture_headroom_start_failure("headroom auto-start failed during launch", &err);
+        match self.ensure_headroom_running() {
+            Ok(()) => {
+                crate::port_conflict::note_proxy_started(app);
+            }
+            Err(err) => {
+                eprintln!("failed to auto-start headroom during app launch: {err}");
+                let handled = crate::port_conflict::note_proxy_failed(app, &err, true);
+                if !handled {
+                    crate::capture_headroom_start_failure(
+                        "headroom auto-start failed during launch",
+                        &err,
+                    );
+                }
+            }
         }
 
         // Hold `starting` until the probe `runtime_status()` uses

@@ -93,3 +93,24 @@ export function cachePricingStatus(status: HeadroomPricingStatus): CachedPricing
     subscriptionTier: status.account?.subscriptionTier ?? undefined,
   };
 }
+
+export const PRICING_CACHE_KEY = "headroom.cachedPricing";
+
+/// Read the cached pricing snapshot used to render the tray before the
+/// pricing IPC has resolved. Tolerates missing storage and corrupt JSON.
+export function readCachedPricing(): CachedPricing {
+  try {
+    const raw = localStorage.getItem(PRICING_CACHE_KEY);
+    if (raw) return JSON.parse(raw) as CachedPricing;
+  } catch {}
+  return {};
+}
+
+/// Persist the latest pricing snapshot. Best-effort: silently swallows
+/// storage failures (private mode, quota exceeded) so a launcher render can't
+/// fail just because localStorage is unavailable.
+export function writeCachedPricing(pricing: CachedPricing) {
+  try {
+    localStorage.setItem(PRICING_CACHE_KEY, JSON.stringify(pricing));
+  } catch {}
+}
