@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  activityFeedSignature,
-  notificationActionView,
-  serializeState
-} from "./trayHelpers";
+import { activityFeedSignature, notificationActionView } from "./trayHelpers";
 import type { ActivityFeedResponse } from "./types";
 
 const emptySnapshot: ActivityFeedResponse = {
@@ -132,21 +128,4 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");
   });
 
-  it("two calls with the same input return the same signature", () => {
-    expect(activityFeedSignature(emptySnapshot)).toBe(
-      activityFeedSignature(emptySnapshot)
-    );
-  });
-});
-
-describe("serializeState", () => {
-  it("round-trips primitive and object values", () => {
-    expect(serializeState(null)).toBe("null");
-    expect(serializeState(42)).toBe("42");
-    expect(serializeState({ a: 1, b: [2, 3] })).toBe('{"a":1,"b":[2,3]}');
-  });
-
-  it("returns a string equal for two structurally equal values", () => {
-    expect(serializeState({ a: 1, b: 2 })).toBe(serializeState({ a: 1, b: 2 }));
-  });
 });

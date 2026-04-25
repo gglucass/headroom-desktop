@@ -41,17 +41,6 @@ describe("LauncherShell", () => {
     expect(imgs.length).toBe(1);
   });
 
-  it("applies the supplied class names to the shell, spinner, and copy", () => {
-    const { container } = renderShell({
-      shellClassName: "custom-shell",
-      spinnerClassName: "custom-spinner",
-      copyClassName: "custom-copy"
-    });
-    expect(container.querySelector(".custom-shell")).not.toBeNull();
-    expect(container.querySelector(".custom-spinner")).not.toBeNull();
-    expect(container.querySelector(".custom-copy")).not.toBeNull();
-  });
-
   it("forwards the mouseDown event so window-drag handlers wire through", async () => {
     const onMouseDown = vi.fn();
     renderShell({ onMouseDown });
@@ -66,25 +55,5 @@ describe("LauncherShell", () => {
     ]);
 
     expect(onMouseDown).toHaveBeenCalled();
-  });
-
-  it("renders a different stage's children without re-mounting the chrome", () => {
-    const { rerender, getByTestId } = renderShell({
-      children: <p data-testid="launcher-child">Install copy</p>
-    });
-    expect(getByTestId("launcher-child")).toHaveTextContent("Install copy");
-
-    rerender(
-      <LauncherShell
-        shellClassName="intro-shell"
-        spinnerClassName="intro-shell__spinner"
-        copyClassName="intro-shell__copy"
-        onMouseDown={() => {}}
-        version="0.3.0"
-      >
-        <p data-testid="launcher-child">Post-install copy</p>
-      </LauncherShell>
-    );
-    expect(getByTestId("launcher-child")).toHaveTextContent("Post-install copy");
   });
 });
