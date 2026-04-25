@@ -663,18 +663,70 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
 
 /// Report a runtime upgrade failure to Sentry. `phase` is "install" for
 /// pip/smoke-test failures, "boot_validation" for "installed but didn't boot".
-pub(crate) fn capture_upgrade_failure(err: &anyhow::Error, restored: bool, phase: &str) {
+/// `outcome` is the BootValidationOutcome label when phase is boot_validation.
+pub(crate) fn capture_upgrade_failure(
+    err: &anyhow::Error,
+    restored: bool,
+    phase: &str,
+    outcome: Option<&str>,
+    duration_ms: Option<u64>,
+    target_version: Option<&str>,
+    fallback_version: Option<&str>,
+    log_tail: Option<&str>,
+) {
     let technical_err = format!("{err:#}");
     let cmd_failure = err
         .chain()
         .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>());
 
+    // Sentry drops extras larger than ~16KB. Cap the tail aggressively so the
+    // tail's tail (where the panic/error usually lives) survives.
+    let log_tail_capped = log_tail.map(|s| {
+        if s.len() > 12_000 {
+            let cut = s.len() - 12_000;
+            format!("[truncated {cut} bytes]\n...{}", &s[cut..])
+        } else {
+            s.to_string()
+        }
+    });
+
+    let outcome_for_fingerprint = outcome.unwrap_or("none");
+    let fingerprint: [&str; 3] = ["runtime_upgrade", phase, outcome_for_fingerprint];
+
+    // Bake diagnostic fields into the message so they appear in the issue
+    // title/preview without requiring a drill-down into tags. The first ~400
+    // chars of the err chain are usually enough to disambiguate.
+    let mut summary = format!("runtime_upgrade_failed ({phase})");
+    if let Some(o) = outcome {
+        summary.push_str(&format!(" outcome={o}"));
+    }
+    if let Some(d) = duration_ms {
+        summary.push_str(&format!(" duration_ms={d}"));
+    }
+    let err_capped: String = technical_err.chars().take(400).collect();
+    summary.push_str(&format!(" err={err_capped}"));
+
     sentry::with_scope(
         |scope| {
             scope.set_tag("flow", "runtime_upgrade");
             scope.set_tag("upgrade_phase", phase);
+            if let Some(o) = outcome {
+                scope.set_tag("outcome", o);
+            }
+            if let Some(t) = target_version {
+                scope.set_tag("target_version", t);
+            }
+            if let Some(f) = fallback_version {
+                scope.set_tag("fallback_version", f);
+            }
             scope.set_extra("rollback_restored", restored.into());
             scope.set_extra("error_chain", technical_err.clone().into());
+            if let Some(d) = duration_ms {
+                scope.set_extra("duration_ms", d.into());
+            }
+            if let Some(tail) = log_tail_capped.as_deref() {
+                scope.set_extra("log_tail", tail.into());
+            }
             if let Some(failure) = cmd_failure {
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
@@ -689,12 +741,31 @@ pub(crate) fn capture_upgrade_failure(err: &anyhow::Error, restored: bool, phase
                 scope.set_extra("stdout", failure.stdout.clone().into());
                 scope.set_extra("stderr", failure.stderr.clone().into());
             }
+            scope.set_fingerprint(Some(fingerprint.as_slice()));
         },
         || {
-            sentry::capture_message(
-                &format!("runtime_upgrade_failed ({phase})"),
-                sentry::Level::Error,
-            );
+            // Build the anyhow chain as exception values. With at least one
+            // exception present, the AttachStacktraceIntegration attaches the
+            // stacktrace to the exception rather than emitting a synthetic
+            // thread frame full of sentry/backtrace internals.
+            let mut exception_values: Vec<sentry::protocol::Exception> = err
+                .chain()
+                .map(|e| sentry::protocol::Exception {
+                    ty: "anyhow::Error".to_string(),
+                    value: Some(e.to_string()),
+                    ..Default::default()
+                })
+                .collect();
+            // Sentry convention: innermost cause first.
+            exception_values.reverse();
+
+            let event = sentry::protocol::Event {
+                message: Some(summary.clone()),
+                level: sentry::protocol::Level::Error,
+                exception: exception_values.into(),
+                ..Default::default()
+            };
+            sentry::capture_event(event);
         },
     );
 }
@@ -1651,6 +1722,15 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
 }
 
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    {
+        let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+        if !has_display {
+            eprintln!("Headroom requires a graphical display. Set DISPLAY or WAYLAND_DISPLAY before launching.");
+            std::process::exit(1);
+        }
+    }
+
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
@@ -3004,15 +3084,14 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        build_release_updater_config, check_headroom_learn_prereqs,
-        compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
+        build_release_updater_config, check_headroom_learn_prereqs, compute_tray_window_position,
+        count_memories_created_today, debounced_tray_runtime_visual,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
-        is_prerelease_version, lifetime_token_milestone_kind,
-        parse_live_learnings, parse_updater_endpoint_list,
-        pattern_matches_project, physical_rect_from_rect, store_checked_update, AvailableAppUpdate,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
-        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        is_prerelease_version, lifetime_token_milestone_kind, parse_live_learnings,
+        parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
+        store_checked_update, AvailableAppUpdate, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -3649,5 +3728,4 @@ mod tests {
             fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50).unwrap_err();
         assert!(!err.is_empty(), "expected a non-empty error message");
     }
-
 }

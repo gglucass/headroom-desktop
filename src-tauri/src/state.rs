@@ -598,7 +598,16 @@ impl AppState {
                     error_hint: hint.or(fallback_hint),
                     rollback_restored: restored || restarted,
                 });
-                crate::capture_upgrade_failure(&error, restored, "install");
+                crate::capture_upgrade_failure(
+                    &error,
+                    restored,
+                    "install",
+                    None,
+                    Some(duration_ms),
+                    Some(target_version.as_str()),
+                    installed_version.as_deref(),
+                    None,
+                );
                 analytics::track_event(
                     app,
                     "runtime_upgrade_failed",
@@ -827,6 +836,11 @@ impl AppState {
             } else {
                 "requirements_repair_boot_validation"
             },
+            Some(outcome_label),
+            Some(duration_ms),
+            Some(target_version.as_str()),
+            installed_version.as_deref(),
+            log_tail.as_deref(),
         );
         analytics::track_event(
             app,
@@ -2952,7 +2966,8 @@ impl SavingsTracker {
 /// ending the day before this Monday.
 fn most_recent_monday(d: chrono::NaiveDate) -> chrono::NaiveDate {
     let days_past = d.weekday().num_days_from_monday() as u64;
-    d.checked_sub_days(chrono::Days::new(days_past)).unwrap_or(d)
+    d.checked_sub_days(chrono::Days::new(days_past))
+        .unwrap_or(d)
 }
 
 fn aggregate_weekly_totals(

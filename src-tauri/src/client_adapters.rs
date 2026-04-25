@@ -155,6 +155,15 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         "Client configuration updated to route through Headroom.".to_string()
     };
 
+    // The user can hit "connect" before the runtime's background warm-up
+    // has the Python backend on 6768 ready, which makes /readyz on 6767
+    // return false and trips a spurious verification failure. Give the
+    // proxy a brief window to come up before probing.
+    let proxy_deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    while std::time::Instant::now() < proxy_deadline && !is_headroom_proxy_reachable() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     let verification = verify_client_setup(client_id)?;
 
     Ok(ClientSetupResult {

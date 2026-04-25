@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{
     ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
-    RecordTag, TransformationFeedEvent, TrainSuggestionEvent, WeeklyRecapEvent,
+    RecordTag, TrainSuggestionEvent, TransformationFeedEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 
@@ -343,9 +343,7 @@ impl ActivityFacts {
                                 .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
                                 .map(|prev_ts| {
                                     now.signed_duration_since(prev_ts.with_timezone(&Utc))
-                                        > Duration::minutes(
-                                            TRANSFORMATION_TILE_STALE_AFTER_MINUTES,
-                                        )
+                                        > Duration::minutes(TRANSFORMATION_TILE_STALE_AFTER_MINUTES)
                                 })
                                 .unwrap_or(true)
                         }
@@ -393,7 +391,12 @@ impl ActivityFacts {
                     });
                     beats_day_today = true;
                     tile_tags.push(RecordTag::Daily);
-                    if !debounce_suppress(previous_same_day, self.daily_record_emitted_at, tokens, now) {
+                    if !debounce_suppress(
+                        previous_same_day,
+                        self.daily_record_emitted_at,
+                        tokens,
+                        now,
+                    ) {
                         self.daily_record_emitted_at = Some(now);
                         emit_tags.push(RecordTag::Daily);
                     }
@@ -423,7 +426,11 @@ impl ActivityFacts {
             // behind after a burst of small beats and users see an outdated
             // number while "Recent large compression" shows a bigger one.
             if beats_day_today || beats_all_time {
-                let day = if beats_day_today { Some(today.clone()) } else { None };
+                let day = if beats_day_today {
+                    Some(today.clone())
+                } else {
+                    None
+                };
                 let tile_record = RecordEvent {
                     observed_at,
                     tags: tile_tags,
@@ -1364,12 +1371,7 @@ mod tests {
         let day2 = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
         let before_add = facts.observe_learnings_today(
             0,
-            vec![mk_learn_input(
-                "/x/demo",
-                "demo",
-                &["a", "b", "c"],
-                &[],
-            )],
+            vec![mk_learn_input("/x/demo", "demo", &["a", "b", "c"], &[])],
             Some("/x/demo"),
             day2,
         );
@@ -1499,7 +1501,10 @@ mod tests {
             _ => panic!("expected TrainSuggestion"),
         }
         let second = facts.observe_train_suggestions(&projects, at(11, 0));
-        assert!(second.is_empty(), "never-trained must fire once per project");
+        assert!(
+            second.is_empty(),
+            "never-trained must fire once per project"
+        );
     }
 
     #[test]
@@ -1549,8 +1554,7 @@ mod tests {
             "within cooldown must not re-fire"
         );
         let day8 = day0 + Duration::days(8);
-        let third =
-            facts.observe_train_suggestions(&mk("2026-04-30T10:00:00Z"), day8);
+        let third = facts.observe_train_suggestions(&mk("2026-04-30T10:00:00Z"), day8);
         assert_eq!(third.len(), 1, "after cooldown, stale must re-fire");
     }
 
@@ -1607,7 +1611,9 @@ mod tests {
             "2026-04-19T10:00:00Z",
         )];
         assert!(
-            facts.observe_train_suggestions(&stale, at(10, 0)).is_empty(),
+            facts
+                .observe_train_suggestions(&stale, at(10, 0))
+                .is_empty(),
             "stale must not fire for idle projects"
         );
     }
@@ -1630,7 +1636,12 @@ mod tests {
         assert_eq!(slot.request_id.as_deref(), Some("req-persist"));
     }
 
-    fn mk_tile_event(request_id: &str, timestamp: &str, tokens: i64, pct: f64) -> TransformationFeedEvent {
+    fn mk_tile_event(
+        request_id: &str,
+        timestamp: &str,
+        tokens: i64,
+        pct: f64,
+    ) -> TransformationFeedEvent {
         let mut ev = mk_transformation(Some("m"), Some(tokens), Some(pct));
         ev.request_id = Some(request_id.into());
         ev.timestamp = Some(timestamp.into());
@@ -1722,5 +1733,4 @@ mod tests {
             .expect("transformation slot");
         assert_eq!(slot.request_id.as_deref(), Some("req-fresh"));
     }
-
 }

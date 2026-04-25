@@ -22,10 +22,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-const HEADROOM_PINNED_VERSION: &str = "0.10.8";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/cd/e8/47c8c19857de3eb5eeefe408955bcd0114df666a2d401bcc89950b681e71/headroom_ai-0.10.8-py3-none-any.whl";
+const HEADROOM_PINNED_VERSION: &str = "0.10.12";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ae/cf/f6dea48d72bc62c88a593df2b44398315e38c8680acbc77d27ff5191207f/headroom_ai-0.10.12-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "5e9df6b33af3d238355ab2045b2f28dda45fae8ab0ae5eb703b30870227f9764";
+    "30e622ad0f9609ef65b90f5d2367c9d3e9a4863a3a3fb2f1fe9d513e6c24aaff";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -36,11 +36,13 @@ const HEADROOM_PROXY_PORT: &str = "6768";
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
 const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
+const MCP_METHOD_DIRECT_CLAUDE_JSON: &str = "direct_claude_json";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum McpInstallMethod {
     ClaudeCli,
     FallbackJson,
+    DirectClaudeJson,
 }
 
 impl McpInstallMethod {
@@ -48,6 +50,7 @@ impl McpInstallMethod {
         match self {
             McpInstallMethod::ClaudeCli => MCP_METHOD_CLAUDE_CLI,
             McpInstallMethod::FallbackJson => MCP_METHOD_FALLBACK_JSON,
+            McpInstallMethod::DirectClaudeJson => MCP_METHOD_DIRECT_CLAUDE_JSON,
         }
     }
 }
@@ -368,176 +371,206 @@ impl ToolManager {
     }
 
     pub fn start_headroom_background(&self) -> Result<Child> {
-        let python = self.managed_python();
-        if !python.exists() {
-            bail!("headroom managed python not found at {}", python.display());
-        }
+        let mut allow_repair = true;
+        'attempt: loop {
+            let python = self.managed_python();
+            if !python.exists() {
+                bail!("headroom managed python not found at {}", python.display());
+            }
 
-        // Use the console_scripts entrypoint when available to avoid the Python
-        // -m double-import RuntimeWarning. Fall back to -m if missing.
-        let entrypoint = self.headroom_entrypoint();
-        let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
-            vec![
-                (entrypoint, headroom_entrypoint_startup_args()),
-                (python.clone(), headroom_python_startup_args()),
-            ]
-        } else {
-            vec![(python.clone(), headroom_python_startup_args())]
-        };
+            // Use the console_scripts entrypoint when available to avoid the Python
+            // -m double-import RuntimeWarning. Fall back to -m if missing.
+            let entrypoint = self.headroom_entrypoint();
+            let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
+                vec![
+                    (entrypoint, headroom_entrypoint_startup_args()),
+                    (python.clone(), headroom_python_startup_args()),
+                ]
+            } else {
+                vec![(python.clone(), headroom_python_startup_args())]
+            };
 
-        let mut failures: Vec<HeadroomStartupFailure> = Vec::new();
-        let logs_dir = self.runtime.logs_dir();
-        std::fs::create_dir_all(&logs_dir)
-            .with_context(|| format!("creating {}", logs_dir.display()))?;
+            let mut failures: Vec<HeadroomStartupFailure> = Vec::new();
+            let logs_dir = self.runtime.logs_dir();
+            std::fs::create_dir_all(&logs_dir)
+                .with_context(|| format!("creating {}", logs_dir.display()))?;
 
-        // Pre-flight: if port 6768 is already bound, the subprocess will
-        // immediately exit with status 1 when it fails to bind. Distinguish
-        // "ours" (a prior headroom proxy still running, which we can reuse) from
-        // "foreign" (something else is holding the port).
-        match diagnose_proxy_port() {
-            PortState::Free => {}
-            PortState::HeadroomRunning => {
-                bail!(
+            // Pre-flight: if port 6768 is already bound, the subprocess will
+            // immediately exit with status 1 when it fails to bind. Distinguish
+            // "ours" (a prior headroom proxy still running, which we can reuse) from
+            // "foreign" (something else is holding the port).
+            match diagnose_proxy_port() {
+                PortState::Free => {}
+                PortState::HeadroomRunning => {
+                    bail!(
                     "headroom proxy already running on port {} (likely a stale process from a prior session). \
                      Run `lsof -iTCP:{} -sTCP:LISTEN` to find and kill it, then retry.",
                     HEADROOM_PROXY_PORT,
                     HEADROOM_PROXY_PORT
                 );
-            }
-            PortState::ForeignOccupant(detail) => {
-                bail!(
-                    "port {} is occupied by a non-headroom process ({}); cannot start proxy. \
+                }
+                PortState::ForeignOccupant(detail) => {
+                    bail!(
+                        "port {} is occupied by a non-headroom process ({}); cannot start proxy. \
                      Run `lsof -iTCP:{} -sTCP:LISTEN` to identify it.",
-                    HEADROOM_PROXY_PORT,
-                    detail,
-                    HEADROOM_PROXY_PORT
-                );
+                        HEADROOM_PROXY_PORT,
+                        detail,
+                        HEADROOM_PROXY_PORT
+                    );
+                }
             }
-        }
 
-        for (executable, args) in &startup_variants {
-            let variant = if args.is_empty() {
-                "default".to_string()
-            } else {
-                sanitize_log_variant(&args.join("-"))
-            };
-            let log_path = logs_dir.join(format!("headroom-{variant}.log"));
-            let log_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .with_context(|| format!("opening {}", log_path.display()))?;
+            for (executable, args) in &startup_variants {
+                let variant = if args.is_empty() {
+                    "default".to_string()
+                } else {
+                    sanitize_log_variant(&args.join("-"))
+                };
+                let log_path = logs_dir.join(format!("headroom-{variant}.log"));
+                let log_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .with_context(|| format!("opening {}", log_path.display()))?;
 
-            // Wrap with `nice` so headroom yields CPU to foreground apps
-            // (Claude Code, terminal, etc.) when the machine is contended.
-            // On idle systems headroom still runs at full speed.
-            let mut child = Command::new("/usr/bin/nice")
-                .arg("-n")
-                .arg("5")
-                .arg(executable)
-                .args(args)
-                .current_dir(&self.runtime.root_dir)
-                .process_group(0)
-                .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONUNBUFFERED", "1")
-                .env("PYTHONFAULTHANDLER", "1")
-                .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-                .env("PIP_NO_INPUT", "1")
-                .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                .env("HEADROOM_HTTP2", "false")
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(
-                    log_file
-                        .try_clone()
-                        .with_context(|| format!("cloning {}", log_path.display()))?,
-                ))
-                .stderr(Stdio::from(log_file))
-                .spawn()
-                .with_context(|| {
+                // Wrap with `nice` so headroom yields CPU to foreground apps
+                // (Claude Code, terminal, etc.) when the machine is contended.
+                // On idle systems headroom still runs at full speed.
+                let mut child = Command::new("/usr/bin/nice")
+                    .arg("-n")
+                    .arg("5")
+                    .arg(executable)
+                    .args(args)
+                    .current_dir(&self.runtime.root_dir)
+                    .process_group(0)
+                    .env("PYTHONNOUSERSITE", "1")
+                    .env("PYTHONUNBUFFERED", "1")
+                    .env("PYTHONFAULTHANDLER", "1")
+                    .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+                    .env("PIP_NO_INPUT", "1")
+                    .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                    .env("HEADROOM_HTTP2", "false")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(
+                        log_file
+                            .try_clone()
+                            .with_context(|| format!("cloning {}", log_path.display()))?,
+                    ))
+                    .stderr(Stdio::from(log_file))
+                    .spawn()
+                    .with_context(|| {
+                        format!(
+                            "starting headroom background process: {} {}",
+                            executable.display(),
+                            args.join(" ")
+                        )
+                    })?;
+
+                let mut startup_ok = false;
+                let mut reason: Option<String> = None;
+
+                let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
+                for _ in 0..startup_polls {
+                    thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
+                    if is_local_proxy_reachable() {
+                        startup_ok = true;
+                        break;
+                    }
+
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            reason = Some(format!(
+                                "exited with status {} before opening port {}",
+                                status, HEADROOM_PROXY_PORT
+                            ));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            reason = Some(format!("wait check failed: {}", err));
+                            break;
+                        }
+                    }
+                }
+
+                if startup_ok {
+                    return Ok(child);
+                }
+
+                // Timeout path (process still alive, port never opened): send SIGABRT
+                // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
+                // before the process dies. Skip if the process already exited on its own.
+                if reason.is_none() {
+                    let _ = Command::new("/bin/kill")
+                        .arg("-ABRT")
+                        .arg(child.id().to_string())
+                        .status();
+                    thread::sleep(Duration::from_millis(500));
+                }
+
+                let _ = child.kill();
+                let _ = child.wait();
+
+                let reason = reason.unwrap_or_else(|| {
                     format!(
-                        "starting headroom background process: {} {}",
-                        executable.display(),
-                        args.join(" ")
+                        "never opened port {} within {}ms",
+                        HEADROOM_PROXY_PORT, HEADROOM_STARTUP_TIMEOUT_MS
                     )
-                })?;
+                });
+                failures.push(HeadroomStartupFailure {
+                    program: executable.display().to_string(),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    log_path: log_path.display().to_string(),
+                    log_tail: tail_log_file(&log_path, 80),
+                    reason,
+                });
+            }
 
-            let mut startup_ok = false;
-            let mut reason: Option<String> = None;
-
-            let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
-            for _ in 0..startup_polls {
-                thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
-                if is_local_proxy_reachable() {
-                    startup_ok = true;
-                    break;
-                }
-
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        reason = Some(format!(
-                            "exited with status {} before opening port {}",
-                            status, HEADROOM_PROXY_PORT
-                        ));
-                        break;
+            // All variants failed. If the proxy crashed because the venv has a
+            // pydantic / pydantic-core skew (e.g. a partial upgrade left
+            // pydantic-core ahead of pydantic), pin pydantic-core back to the
+            // version pydantic asks for and retry once. The error message itself
+            // tells us the required version — see extract_required_pydantic_core_version.
+            if allow_repair {
+                if let Some(target) = failures
+                    .iter()
+                    .find_map(|f| extract_required_pydantic_core_version(&f.log_tail))
+                {
+                    eprintln!(
+                        "headroom proxy failed with pydantic-core/pydantic skew; \
+                     reinstalling pydantic-core=={target} and retrying"
+                    );
+                    match self.repair_pydantic_core(&target) {
+                        Ok(()) => {
+                            eprintln!("pydantic-core repair succeeded; retrying headroom startup");
+                            allow_repair = false;
+                            continue 'attempt;
+                        }
+                        Err(repair_err) => {
+                            eprintln!("pydantic-core repair failed: {repair_err:#}");
+                        }
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        reason = Some(format!("wait check failed: {}", err));
-                        break;
-                    }
                 }
             }
 
-            if startup_ok {
-                return Ok(child);
-            }
-
-            // Timeout path (process still alive, port never opened): send SIGABRT
-            // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
-            // before the process dies. Skip if the process already exited on its own.
-            if reason.is_none() {
-                let _ = Command::new("/bin/kill")
-                    .arg("-ABRT")
-                    .arg(child.id().to_string())
-                    .status();
-                thread::sleep(Duration::from_millis(500));
-            }
-
-            let _ = child.kill();
-            let _ = child.wait();
-
-            let reason = reason.unwrap_or_else(|| {
-                format!(
-                    "never opened port {} within {}ms",
-                    HEADROOM_PROXY_PORT, HEADROOM_STARTUP_TIMEOUT_MS
-                )
-            });
-            failures.push(HeadroomStartupFailure {
-                program: executable.display().to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                log_path: log_path.display().to_string(),
-                log_tail: tail_log_file(&log_path, 80),
-                reason,
-            });
+            let last = failures
+                .pop()
+                .expect("at least one startup variant attempted");
+            let prior_summary = if failures.is_empty() {
+                String::new()
+            } else {
+                let joined = failures
+                    .iter()
+                    .map(|f| format!("{} {} {}", f.program, f.args.join(" "), f.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(" (prior attempts: {})", joined)
+            };
+            return Err(anyhow::Error::from(last).context(format!(
+                "unable to keep headroom running in background{}",
+                prior_summary
+            )));
         }
-
-        let last = failures
-            .pop()
-            .expect("at least one startup variant attempted");
-        let prior_summary = if failures.is_empty() {
-            String::new()
-        } else {
-            let joined = failures
-                .iter()
-                .map(|f| format!("{} {} {}", f.program, f.args.join(" "), f.reason))
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!(" (prior attempts: {})", joined)
-        };
-        Err(anyhow::Error::from(last).context(format!(
-            "unable to keep headroom running in background{}",
-            prior_summary
-        )))
     }
 
     pub fn latest_tool_log_path(&self, tool_id: &str) -> Option<PathBuf> {
@@ -1900,7 +1933,10 @@ impl ToolManager {
                 Ok(p) => p,
                 Err(err) => {
                     let restored = self.rollback_in_place_upgrade_inner(&ctx);
-                    return UpgradeOutcome::InstallFailed { restored, error: err };
+                    return UpgradeOutcome::InstallFailed {
+                        restored,
+                        error: err,
+                    };
                 }
             };
 
@@ -2018,7 +2054,10 @@ impl ToolManager {
 
         if let Err(err) = self.smoke_test_headroom() {
             let restored = self.rollback_in_place_upgrade_inner(&ctx);
-            return UpgradeOutcome::InstallFailed { restored, error: err };
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err,
+            };
         }
 
         progress(BootstrapStepUpdate {
@@ -2047,7 +2086,10 @@ impl ToolManager {
         if let Err(err) = self.update_headroom_receipt_after_in_place_upgrade(release, mcp_install)
         {
             let restored = self.rollback_in_place_upgrade_inner(&ctx);
-            return UpgradeOutcome::InstallFailed { restored, error: err };
+            return UpgradeOutcome::InstallFailed {
+                restored,
+                error: err,
+            };
         }
 
         progress(BootstrapStepUpdate {
@@ -2081,6 +2123,33 @@ impl ToolManager {
             &self.runtime.root_dir,
         )
         .with_context(|| format!("reinstalling Headroom version {version}"))
+    }
+
+    /// Recover from a pydantic / pydantic-core version skew by reinstalling
+    /// pydantic-core at the version pydantic wants. Triggered when the proxy
+    /// log shows the SystemError pydantic raises during import. `--no-deps`
+    /// keeps the rest of the venv untouched.
+    fn repair_pydantic_core(&self, target_version: &str) -> Result<()> {
+        let spec = format!("pydantic-core=={target_version}");
+        run_pip_install_with_retries(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--no-deps",
+                "--force-reinstall",
+                &spec,
+            ],
+            &self.runtime.root_dir,
+        )
+        .with_context(|| format!("reinstalling pydantic-core=={target_version}"))
     }
 
     /// Restore deps from `previous_lock_backup` via
@@ -2251,10 +2320,13 @@ impl ToolManager {
     /// Runs MCP install if the receipt shows it is not configured, or was
     /// configured via the legacy `~/.claude/mcp.json` fallback (which Claude
     /// Code ≥2.x ignores). Safe to call at every launch — no-ops when the
-    /// server is already registered via `claude mcp add`.
+    /// server is already registered via `claude mcp add` or direct json write.
     pub fn ensure_mcp_configured(&self) -> Result<()> {
         if self.headroom_mcp_configured() == Some(true)
-            && self.headroom_mcp_install_method().as_deref() == Some(MCP_METHOD_CLAUDE_CLI)
+            && matches!(
+                self.headroom_mcp_install_method().as_deref(),
+                Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+            )
         {
             return Ok(());
         }
@@ -2317,39 +2389,46 @@ impl ToolManager {
         // Claude Code ≥2.x) and exits 0, so the subprocess succeeding is not
         // a reliable proxy for "integration works". Read the file Claude Code
         // actually reads and confirm the registration landed there.
-        let method = if claude_code_has_headroom_mcp_server() {
-            McpInstallMethod::ClaudeCli
-        } else {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detected = detected_claude
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<not detected>".into());
-            sentry::with_scope(
-                |scope| {
-                    scope.set_extra("claude_cli_detected", detected.clone().into());
-                    scope.set_extra(
-                        "stdout_tail",
-                        stdout.chars().rev().take(512).collect::<String>().into(),
-                    );
-                    scope.set_extra(
-                        "stderr_tail",
-                        stderr.chars().rev().take(512).collect::<String>().into(),
-                    );
-                },
-                || {
-                    sentry::capture_message(
-                        "Headroom MCP install exited 0 but Claude Code does not see the server \
-                         (fell back to ~/.claude/mcp.json which Claude Code ≥2.x ignores).",
-                        sentry::Level::Warning,
-                    );
-                },
-            );
-            McpInstallMethod::FallbackJson
-        };
+        if claude_code_has_headroom_mcp_server() {
+            return Ok(McpInstallMethod::ClaudeCli);
+        }
 
-        Ok(method)
+        // The Python CLI couldn't find `claude` (e.g. GUI launch with bare
+        // PATH) and wrote ~/.claude/mcp.json instead. Write the entry
+        // directly to ~/.claude.json, which is what Claude Code ≥2.x reads.
+        if let Ok(()) = write_headroom_to_claude_json(&entrypoint, HEADROOM_PROXY_URL) {
+            if claude_code_has_headroom_mcp_server() {
+                return Ok(McpInstallMethod::DirectClaudeJson);
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detected = detected_claude
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<not detected>".into());
+        sentry::with_scope(
+            |scope| {
+                scope.set_extra("claude_cli_detected", detected.clone().into());
+                scope.set_extra(
+                    "stdout_tail",
+                    stdout[stdout.char_indices().rev().nth(511).map_or(0, |(i, _)| i)..].into(),
+                );
+                scope.set_extra(
+                    "stderr_tail",
+                    stderr[stderr.char_indices().rev().nth(511).map_or(0, |(i, _)| i)..].into(),
+                );
+            },
+            || {
+                sentry::capture_message(
+                    "Headroom MCP install exited 0 but Claude Code does not see the server \
+                     (fell back to ~/.claude/mcp.json which Claude Code ≥2.x ignores).",
+                    sentry::Level::Warning,
+                );
+            },
+        );
+        Ok(McpInstallMethod::FallbackJson)
     }
 
     fn install_rtk(&self) -> Result<()> {
@@ -2506,6 +2585,45 @@ fn claude_code_has_headroom_mcp_server() -> bool {
         .get("mcpServers")
         .and_then(|v| v.get("headroom"))
         .is_some()
+}
+
+/// Writes the headroom MCP server entry directly to `~/.claude.json`.
+/// Used when `claude mcp add` is unavailable (e.g. bare GUI PATH). Preserves
+/// all existing keys; only merges `mcpServers.headroom`.
+fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        anyhow::bail!("home directory not available");
+    };
+    let path = home.join(".claude.json");
+
+    let mut config: Value = if path.exists() {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+
+    let root = config
+        .as_object_mut()
+        .context("~/.claude.json root is not a JSON object")?;
+
+    root.entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("~/.claude.json mcpServers is not a JSON object")?
+        .insert(
+            "headroom".into(),
+            json!({
+                "command": entrypoint,
+                "args": ["mcp", "serve"],
+                "env": { "HEADROOM_PROXY_URL": proxy_url },
+            }),
+        );
+
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -2716,6 +2834,33 @@ fn ps_command(pid: u32) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+/// If `log_tail` shows pydantic refusing to import because the installed
+/// `pydantic-core` doesn't match what the bundled pydantic wants, return the
+/// version pydantic wants. The error message is the source of truth — pydantic
+/// prints the exact pinned version it expects.
+///
+/// Example line we match:
+///     SystemError: The installed pydantic-core version (2.46.3) is
+///     incompatible with the current pydantic version, which requires 2.41.5.
+fn extract_required_pydantic_core_version(log_tail: &str) -> Option<String> {
+    if !log_tail.contains("pydantic-core") {
+        return None;
+    }
+    let marker = "which requires ";
+    let idx = log_tail.find(marker)?;
+    let after = &log_tail[idx + marker.len()..];
+    let version: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let trimmed = version.trim_end_matches('.');
+    if trimmed.is_empty() || !trimmed.contains('.') {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -3654,12 +3799,12 @@ mod tests {
     use chrono::Local;
 
     use super::{
-        bootstrap_requirements_lock_for_target, headroom_entrypoint_startup_args,
-        headroom_python_startup_args, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, sha256_bytes, verify_sha256_file, CommandFailure,
-        HeadroomRelease, ManagedRuntime, ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT,
-        RTK_VERSION,
+        bootstrap_requirements_lock_for_target, extract_required_pydantic_core_version,
+        headroom_entrypoint_startup_args, headroom_python_startup_args,
+        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime,
+        ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT, RTK_VERSION,
     };
 
     #[test]
@@ -3988,6 +4133,29 @@ mod tests {
         let raw = "proxy---port-6768---log-messages---learn";
         let cleaned = sanitize_log_variant(raw);
         assert_eq!(cleaned, raw);
+    }
+
+    #[test]
+    fn extract_required_pydantic_core_version_pulls_pin_from_systemerror() {
+        let log = "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 189, in _run_module_as_main\n  ...\nSystemError: The installed pydantic-core version (2.46.3) is incompatible with the current pydantic version, which requires 2.41.5. If you encounter this error, make sure that you haven't upgraded pydantic-core manually.\n";
+        assert_eq!(
+            extract_required_pydantic_core_version(log),
+            Some("2.41.5".into())
+        );
+    }
+
+    #[test]
+    fn extract_required_pydantic_core_version_returns_none_on_unrelated_traceback() {
+        let log = "Traceback (most recent call last):\n  File \"x.py\", line 1, in <module>\nImportError: No module named 'foo'\n";
+        assert!(extract_required_pydantic_core_version(log).is_none());
+    }
+
+    #[test]
+    fn extract_required_pydantic_core_version_returns_none_when_marker_missing_version() {
+        // Future-proof: if pydantic ever changes the message format and there's
+        // no version after "which requires ", we must not return an empty pin.
+        let log = "pydantic-core mismatch: which requires nothing useful here";
+        assert!(extract_required_pydantic_core_version(log).is_none());
     }
 
     #[test]
