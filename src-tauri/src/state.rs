@@ -43,13 +43,18 @@ pub const MAX_UPGRADE_AUTO_RETRIES: u32 = 2;
 pub const RUNTIME_UPGRADE_BOOT_MAX_SECS: u64 = 600;
 
 /// Once this much wall-time has elapsed without /livez success, start
-/// checking the proxy log's mtime for progress. Before this, we stay quiet
-/// — most fast boots finish well under this threshold.
+/// checking the proxy log's mtime (and the HF cache size) for progress.
+/// Before this, we stay quiet — most fast boots finish well under this
+/// threshold.
 pub const RUNTIME_UPGRADE_STALL_GRACE_SECS: u64 = 60;
 
-/// If the proxy log hasn't been written to in this long (AND we're past
-/// the grace period), the proxy is considered stalled and we roll back.
-pub const RUNTIME_UPGRADE_STALL_SILENCE_SECS: u64 = 45;
+/// If neither the proxy log nor the HF cache has grown in this long
+/// (AND we're past the grace period), the proxy is considered stalled
+/// and we roll back. Bumped from 45s → 90s after a real first-run upgrade
+/// failed: the python process printed its banner, then went silent for
+/// ~50s while loading multi-GB ONNX models from the freshly-downloaded
+/// HF cache. The log was idle but the proxy was making progress.
+pub const RUNTIME_UPGRADE_STALL_SILENCE_SECS: u64 = 90;
 
 enum RuntimeMaintenancePlan {
     Upgrade(HeadroomRelease),
@@ -108,6 +113,69 @@ fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
         }
     }
     false
+}
+
+/// HuggingFace hub cache path — where transformers/huggingface_hub write
+/// downloaded model weights. HF respects ``$HF_HOME`` but we set neither
+/// in the bundled runtime, so the default ``$HOME/.cache/huggingface/hub``
+/// is what we observe. Returns None if we can't resolve a home dir or the
+/// path doesn't exist yet (first-run pre-download).
+fn hf_hub_cache_dir() -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".cache").join("huggingface").join("hub");
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Total byte size of every regular file under ``path``. Used as a
+/// "is the proxy downloading models right now" signal: HF model
+/// downloads land in this tree and grow it monotonically, even when
+/// the python process is otherwise quiet (no log writes). Errors
+/// during the walk are swallowed — a partial sum is still a useful
+/// signal, and a zero sum just means we miss this tick of evidence.
+///
+/// Bounded by ``max_entries`` to keep cost predictable on a warm
+/// cache that already has tens of thousands of files.
+fn total_dir_size_bytes(path: &std::path::Path, max_entries: usize) -> u64 {
+    let mut total: u64 = 0;
+    let mut visited: usize = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if visited >= max_entries {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited >= max_entries {
+                break;
+            }
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                // HF cache uses symlinks under ``snapshots/`` pointing into
+                // ``blobs/``. Counting the blobs is enough; following the
+                // symlink would double-count.
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Newest mtime of any `headroom-proxy*.log` file in the logs directory, as
@@ -957,6 +1025,14 @@ impl AppState {
     /// proxy responds, the proxy process exits, the log goes silent past the
     /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
     /// pass through the loop, emits a progress update via `on_progress`.
+    ///
+    /// "Activity" is the union of two signals: (1) a write to any
+    /// ``headroom-proxy*.log`` file, and (2) growth in the HuggingFace hub
+    /// cache. Either one resets the silence timer. The HF signal is what
+    /// keeps slow-but-progressing first-run downloads from being killed —
+    /// when transformers/huggingface_hub is silently pulling multi-GB
+    /// model weights, the python process writes nothing to its log, but
+    /// the cache directory grows monotonically.
     fn wait_for_boot_validation<F>(&self, mut on_progress: F) -> BootValidationOutcome
     where
         F: FnMut(std::time::Duration, bool),
@@ -976,9 +1052,18 @@ impl AppState {
         };
 
         let logs_dir = self.tool_manager.logs_dir();
+        let hf_cache = hf_hub_cache_dir();
+        // Cap the walk so a warm cache (post-install: ~3-5 GB across tens
+        // of thousands of files) doesn't dominate the 500ms loop tick.
+        // 50k entries is well above any healthy first-run install.
+        const HF_CACHE_WALK_CAP: usize = 50_000;
+
         let start = Instant::now();
         let mut last_log_activity = start;
         let mut last_seen_mtime = newest_proxy_log_mtime(&logs_dir);
+        let mut last_hf_size = hf_cache
+            .as_deref()
+            .map(|p| total_dir_size_bytes(p, HF_CACHE_WALK_CAP));
         let mut last_progress = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
@@ -1011,10 +1096,28 @@ impl AppState {
                 last_seen_mtime = current_mtime;
                 last_log_activity = Instant::now();
             }
-            let activity_age = last_log_activity.elapsed();
-            let has_recent_activity = current_mtime.is_some() && activity_age < silence;
 
-            // Past grace period and no recent log writes → treat as stalled.
+            // Refresh HF cache observation. Growth in this tree means the
+            // proxy is downloading model weights — the most common
+            // not-actually-stuck cause of log silence on first-run installs.
+            if let Some(cache_path) = hf_cache.as_deref() {
+                let current_size = total_dir_size_bytes(cache_path, HF_CACHE_WALK_CAP);
+                let grew = match last_hf_size {
+                    Some(prev) => current_size > prev,
+                    None => current_size > 0, // first observation after dir appeared
+                };
+                if grew {
+                    last_log_activity = Instant::now();
+                }
+                last_hf_size = Some(current_size);
+            }
+
+            let activity_age = last_log_activity.elapsed();
+            let has_recent_activity = activity_age < silence
+                && (current_mtime.is_some() || last_hf_size.unwrap_or(0) > 0);
+
+            // Past grace period and nothing has moved in either signal
+            // for the silence window → treat as stalled.
             if elapsed > grace && activity_age > silence {
                 return BootValidationOutcome::Stalled;
             }
@@ -4191,10 +4294,70 @@ mod tests {
         bootstrap_complete_state, bootstrap_failed_state, classify_startup_error,
         lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, AppState, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
-        SavingsObservation, SavingsTracker,
+        parse_headroom_stats_history_from_json, total_dir_size_bytes, AppState, ClaudeProjectScan,
+        DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
+
+    #[test]
+    fn total_dir_size_bytes_returns_zero_for_missing_path() {
+        let missing = std::env::temp_dir().join(format!("headroom-no-such-{}", uuid::Uuid::new_v4()));
+        assert_eq!(total_dir_size_bytes(&missing, 1000), 0);
+    }
+
+    #[test]
+    fn total_dir_size_bytes_sums_files_recursively() {
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("headroom-hf-test-{id}"));
+        fs::create_dir_all(root.join("subdir/deeper")).expect("mkdir");
+        fs::write(root.join("a.bin"), vec![0u8; 100]).expect("write a");
+        fs::write(root.join("subdir/b.bin"), vec![0u8; 200]).expect("write b");
+        fs::write(root.join("subdir/deeper/c.bin"), vec![0u8; 50]).expect("write c");
+
+        assert_eq!(total_dir_size_bytes(&root, 1000), 350);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn total_dir_size_bytes_skips_symlinks_to_avoid_double_count() {
+        // HF hub layout: snapshots/<rev>/<file> is a symlink into blobs/<sha>.
+        // Counting both would overstate. We count only real files.
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("headroom-hf-symlink-test-{id}"));
+        fs::create_dir_all(root.join("blobs")).expect("mkdir blobs");
+        fs::create_dir_all(root.join("snapshots")).expect("mkdir snapshots");
+        fs::write(root.join("blobs/file1"), vec![0u8; 500]).expect("write blob");
+
+        let symlink_target = root.join("blobs/file1");
+        let symlink_path = root.join("snapshots/file1");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&symlink_target, &symlink_path).expect("symlink");
+
+        // 500 bytes (the blob), not 1000 (blob + symlink content).
+        assert_eq!(total_dir_size_bytes(&root, 1000), 500);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn total_dir_size_bytes_respects_max_entries_cap() {
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("headroom-hf-cap-test-{id}"));
+        fs::create_dir_all(&root).expect("mkdir");
+        for i in 0..20 {
+            fs::write(root.join(format!("f{i}")), vec![0u8; 10]).expect("write");
+        }
+        // With a tight cap, we may visit fewer than all 20 files. The
+        // exact early-stop count depends on read_dir's iteration order;
+        // assert only that we sum at most ``cap * file_size``.
+        let total_capped = total_dir_size_bytes(&root, 5);
+        assert!(total_capped <= 50, "got {total_capped}");
+        let total_full = total_dir_size_bytes(&root, 1000);
+        assert_eq!(total_full, 200);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn classify_startup_error_port_timeout() {
