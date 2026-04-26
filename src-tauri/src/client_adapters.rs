@@ -155,15 +155,6 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         "Client configuration updated to route through Headroom.".to_string()
     };
 
-    // The user can hit "connect" before the runtime's background warm-up
-    // has the Python backend on 6768 ready, which makes /readyz on 6767
-    // return false and trips a spurious verification failure. Give the
-    // proxy a brief window to come up before probing.
-    let proxy_deadline = std::time::Instant::now() + Duration::from_millis(1500);
-    while std::time::Instant::now() < proxy_deadline && !is_headroom_proxy_reachable() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
     let verification = verify_client_setup(client_id)?;
 
     Ok(ClientSetupResult {
@@ -252,11 +243,13 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
 
+    // Proxy reachability is transient runtime state — the runtime warm-up
+    // can finish after this verification runs. Surface it via the
+    // `proxy_reachable` field, but don't fail `verified` on it. `verified`
+    // attests only to "we wrote everything we needed to write".
     let proxy_reachable = is_headroom_proxy_reachable();
     if proxy_reachable {
         checks.push("Headroom proxy is reachable on 127.0.0.1:6767.".into());
-    } else {
-        failures.push("Headroom proxy is not reachable on 127.0.0.1:6767.".into());
     }
 
     Ok(ClientSetupVerification {
@@ -2881,9 +2874,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "ANTHROPIC_BASE_URL exported from a managed shell block, got:\n{combined}"
         );
 
-        // verify_client_setup should report all the configured checks. The
-        // proxy itself isn't running in the test environment, so verified=false
-        // is expected — but checks should reflect what we wrote.
+        // verify_client_setup should report all the configured checks.
+        // Proxy reachability is reported via `proxy_reachable` only, so a
+        // missing proxy in the test environment no longer flips `verified`.
         let verification =
             super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
         assert_eq!(verification.client_id, "claude_code");

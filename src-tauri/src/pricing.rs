@@ -381,11 +381,21 @@ pub fn activate_account(
     state: &AppState,
     lifetime_tokens_saved: u64,
 ) -> Result<HeadroomPricingStatus, String> {
+    activate_account_with_base_url(state, lifetime_tokens_saved, &api_base_url())
+}
+
+/// Test-only seam: `activate_account` against a parameterized base URL so a
+/// canned-response test server can stand in for headroom-web.
+pub(crate) fn activate_account_with_base_url(
+    state: &AppState,
+    lifetime_tokens_saved: u64,
+    base_url: &str,
+) -> Result<HeadroomPricingStatus, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before activating desktop access.".to_string())?;
     let identity = IdentityPayload::for_state(state);
     let builder = http_client()?
-        .post(api_url("desktop/account/activate"))
+        .post(join_url(base_url, "desktop/account/activate"))
         .header("Authorization", format!("Bearer {token}"));
     let response = identity
         .apply_headers(builder)
@@ -458,10 +468,19 @@ pub fn create_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<String, String> {
+    create_checkout_session_with_base_url(subscription_tier, billing_period, &api_base_url())
+}
+
+/// Test-only seam: `create_checkout_session` against a parameterized base URL.
+pub(crate) fn create_checkout_session_with_base_url(
+    subscription_tier: HeadroomSubscriptionTier,
+    billing_period: BillingPeriod,
+    base_url: &str,
+) -> Result<String, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before starting checkout.".to_string())?;
     let response = http_client()?
-        .post(api_url("desktop/checkout"))
+        .post(join_url(base_url, "desktop/checkout"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&CheckoutSessionPayload {
             subscription_tier,
@@ -493,10 +512,15 @@ pub fn create_checkout_session(
 }
 
 pub fn get_billing_portal_url() -> Result<String, String> {
+    get_billing_portal_url_with_base_url(&api_base_url())
+}
+
+/// Test-only seam: `get_billing_portal_url` against a parameterized base URL.
+pub(crate) fn get_billing_portal_url_with_base_url(base_url: &str) -> Result<String, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before accessing billing.".to_string())?;
     let response = http_client()?
-        .get(api_url("desktop/billing_portal"))
+        .get(join_url(base_url, "desktop/billing_portal"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .map_err(|err| format!("Could not reach billing portal: {err}"))?;
@@ -820,12 +844,6 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, String> {
                  We'll try again shortly."
             )
         };
-        if status >= 500 {
-            sentry::capture_message(
-                &format!("Could not fetch Claude OAuth profile (status {status})."),
-                sentry::Level::Error,
-            );
-        }
         return Err(user_msg);
     }
 
@@ -1276,8 +1294,8 @@ mod tests {
         RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
-        ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, HeadroomAccountProfile,
-        PricingGateReason,
+        BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier,
+        HeadroomAccountProfile, PricingGateReason,
     };
 
     fn sample_remote_account() -> RemoteAccountResponse {
@@ -2067,6 +2085,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn verify_auth_code_decodes_and_writes_session_token() {
         // Override HOME / XDG_DATA_HOME so the keychain debug store and
         // app_data_dir live in a fresh tempdir, not the dev's real profile.
@@ -2146,5 +2165,273 @@ mod tests {
         .expect_err("blank code rejected");
         assert!(err.contains("authentication code"));
         drop_state(dir);
+    }
+
+    // ── activate_account / create_checkout_session / get_billing_portal_url ─
+
+    /// Snapshot HOME / XDG_DATA_HOME, redirect them at a fresh tempdir,
+    /// ensure_data_dirs, and seed a session token in the (debug) keychain
+    /// so authenticated functions don't bail at the read_session_token step.
+    /// Returns a guard whose Drop restores the original env vars.
+    struct AuthedTestEnv {
+        _scratch: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+        prev_xdg: Option<std::ffi::OsString>,
+    }
+
+    impl AuthedTestEnv {
+        fn new(session_token: &str) -> Self {
+            let scratch = tempfile::tempdir().expect("scratch tempdir");
+            let prev_home = std::env::var_os("HOME");
+            let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("HOME", scratch.path());
+            std::env::set_var(
+                "XDG_DATA_HOME",
+                scratch.path().join(".local").join("share"),
+            );
+            crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
+                .expect("ensure_data_dirs in scratch");
+            crate::keychain::write_secret(
+                super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+                super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+                session_token,
+            )
+            .expect("seed session token");
+            AuthedTestEnv {
+                _scratch: scratch,
+                prev_home,
+                prev_xdg,
+            }
+        }
+    }
+
+    impl Drop for AuthedTestEnv {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_xdg.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    fn sample_account_envelope_body() -> serde_json::Value {
+        serde_json::json!({
+            "account": {
+                "email": "user@example.com",
+                "trialStartedAt": "2026-04-01T00:00:00Z",
+                "trialEndsAt": "2026-04-15T00:00:00Z",
+                "trialActive": true,
+                "subscriptionActive": false,
+                "subscriptionTier": null,
+                "inviteCode": null,
+                "acceptedInvitesCount": 0,
+                "inviteBonusPercent": 0
+            },
+            "launchDiscountActive": false
+        })
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_decodes_remote_envelope_and_returns_pricing_status() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            sample_account_envelope_body(),
+            "HTTP/1.1 200 OK",
+        );
+        let (state, dir) = temp_app_state();
+
+        let result = super::activate_account_with_base_url(
+            &state,
+            42,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("activate_account succeeds");
+
+        server.join().unwrap();
+        assert!(result.authenticated);
+        let account = result.account.expect("account profile populated");
+        assert_eq!(account.email, "user@example.com");
+        assert!(account.trial_active);
+        drop_state(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_clears_session_and_returns_expired_error_on_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
+        let (state, dir) = temp_app_state();
+
+        let err = super::activate_account_with_base_url(
+            &state,
+            0,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("401 surfaces as expired session");
+        server.join().unwrap();
+        assert!(err.contains("session expired"));
+
+        // Session token should be cleared after 401.
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .expect("read after 401");
+        assert!(stored.is_none(), "session token cleared after 401");
+
+        drop_state(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_requires_session_token() {
+        // No AuthedTestEnv → no token in keychain. Override HOME so any
+        // keychain read still goes to a tempdir, not the dev profile.
+        let scratch = tempfile::tempdir().expect("scratch");
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("HOME", scratch.path());
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            scratch.path().join(".local").join("share"),
+        );
+        crate::storage::ensure_data_dirs(&crate::storage::app_data_dir()).unwrap();
+        let (state, dir) = temp_app_state();
+
+        let err = super::activate_account_with_base_url(&state, 0, "http://127.0.0.1:1")
+            .expect_err("no session → error");
+        assert!(err.contains("Sign in"));
+
+        drop_state(dir);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_checkout_session_returns_url_from_response() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "url": "https://buy.polar.sh/abc123" }),
+            "HTTP/1.1 200 OK",
+        );
+
+        let url = super::create_checkout_session_with_base_url(
+            HeadroomSubscriptionTier::Pro,
+            BillingPeriod::Annual,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("checkout session succeeds");
+        server.join().unwrap();
+
+        assert_eq!(url, "https://buy.polar.sh/abc123");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_checkout_session_surfaces_api_error_message() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "Plan unavailable in your region" }),
+            "HTTP/1.1 400 Bad Request",
+        );
+
+        let err = super::create_checkout_session_with_base_url(
+            HeadroomSubscriptionTier::Pro,
+            BillingPeriod::Annual,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("4xx surfaces as error");
+        server.join().unwrap();
+
+        assert_eq!(err, "Plan unavailable in your region");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_checkout_session_falls_back_to_status_message_when_no_api_error() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 502 Bad Gateway");
+
+        let err = super::create_checkout_session_with_base_url(
+            HeadroomSubscriptionTier::Pro,
+            BillingPeriod::Annual,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("error");
+        server.join().unwrap();
+
+        assert!(err.contains("status 502"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_checkout_session_clears_session_on_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
+
+        let err = super::create_checkout_session_with_base_url(
+            HeadroomSubscriptionTier::Pro,
+            BillingPeriod::Annual,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("401");
+        server.join().unwrap();
+        assert!(err.contains("session expired"));
+
+        let stored = crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_billing_portal_url_returns_url_from_response() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "url": "https://billing.polar.sh/customer/abc" }),
+            "HTTP/1.1 200 OK",
+        );
+
+        let url =
+            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"))
+                .expect("billing portal succeeds");
+        server.join().unwrap();
+
+        assert_eq!(url, "https://billing.polar.sh/customer/abc");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_billing_portal_url_surfaces_api_error_message() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "Customer not found" }),
+            "HTTP/1.1 404 Not Found",
+        );
+
+        let err =
+            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"))
+                .expect_err("404 surfaces as error");
+        server.join().unwrap();
+
+        assert_eq!(err, "Customer not found");
     }
 }
