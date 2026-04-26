@@ -178,6 +178,47 @@ fn total_dir_size_bytes(path: &std::path::Path, max_entries: usize) -> u64 {
     total
 }
 
+/// Whether log mtime advanced since the last poll. Counts the
+/// transition None → Some(t) (first observation after the proxy
+/// began writing) as advancement; a Some → None transition does not
+/// (logs don't disappear during a healthy boot).
+fn log_mtime_advanced(
+    prev: Option<std::time::SystemTime>,
+    current: Option<std::time::SystemTime>,
+) -> bool {
+    current.is_some() && current != prev
+}
+
+/// Whether the HF cache grew since the last poll. The first
+/// observation (no prev) counts as growth iff the directory has
+/// any content — that handles the "cache appeared partway through
+/// boot" case where the dir didn't exist when we started but does
+/// now. A shrink (which can happen if HF prunes its cache during
+/// boot — rare but possible) is *not* growth.
+fn hf_cache_grew(prev: Option<u64>, current: u64) -> bool {
+    match prev {
+        Some(p) => current > p,
+        None => current > 0,
+    }
+}
+
+/// Pure decision function for the boot-validation stall guard.
+/// Extracted from the polling loop so it can be tested without
+/// mocking the filesystem, the network, and a clock.
+///
+/// Returns true iff we have waited past the grace window AND
+/// nothing has refreshed the activity timer for the silence window.
+/// Boundaries are strict (>) so consts read intuitively as
+/// "starts checking after grace, fires after silence."
+fn boot_validation_stalled(
+    elapsed: std::time::Duration,
+    activity_age: std::time::Duration,
+    grace: std::time::Duration,
+    silence: std::time::Duration,
+) -> bool {
+    elapsed > grace && activity_age > silence
+}
+
 /// Newest mtime of any `headroom-proxy*.log` file in the logs directory, as
 /// a "is the proxy doing anything" signal. Returns None if no logs yet.
 fn newest_proxy_log_mtime(logs_dir: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -1092,7 +1133,7 @@ impl AppState {
 
             // Refresh log activity observation.
             let current_mtime = newest_proxy_log_mtime(&logs_dir);
-            if current_mtime.is_some() && current_mtime != last_seen_mtime {
+            if log_mtime_advanced(last_seen_mtime, current_mtime) {
                 last_seen_mtime = current_mtime;
                 last_log_activity = Instant::now();
             }
@@ -1102,11 +1143,7 @@ impl AppState {
             // not-actually-stuck cause of log silence on first-run installs.
             if let Some(cache_path) = hf_cache.as_deref() {
                 let current_size = total_dir_size_bytes(cache_path, HF_CACHE_WALK_CAP);
-                let grew = match last_hf_size {
-                    Some(prev) => current_size > prev,
-                    None => current_size > 0, // first observation after dir appeared
-                };
-                if grew {
+                if hf_cache_grew(last_hf_size, current_size) {
                     last_log_activity = Instant::now();
                 }
                 last_hf_size = Some(current_size);
@@ -1118,7 +1155,7 @@ impl AppState {
 
             // Past grace period and nothing has moved in either signal
             // for the silence window → treat as stalled.
-            if elapsed > grace && activity_age > silence {
+            if boot_validation_stalled(elapsed, activity_age, grace, silence) {
                 return BootValidationOutcome::Stalled;
             }
 
@@ -4291,13 +4328,123 @@ mod tests {
 
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
-        bootstrap_complete_state, bootstrap_failed_state, classify_startup_error,
-        lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, merge_daily_savings,
+        boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
+        classify_startup_error, hf_cache_grew, lifetime_token_milestones_crossed,
+        lifetime_usd_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, total_dir_size_bytes, AppState, ClaudeProjectScan,
         DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
+
+    #[test]
+    fn boot_validation_stalled_within_grace_window_is_never_stalled() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(60);
+        let silence = Duration::from_secs(90);
+        // Inside grace, ignore activity_age entirely.
+        assert!(!boot_validation_stalled(
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+            grace,
+            silence,
+        ));
+        // Boundary: elapsed == grace is NOT past grace (strict >).
+        assert!(!boot_validation_stalled(
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            grace,
+            silence,
+        ));
+    }
+
+    #[test]
+    fn boot_validation_stalled_past_grace_with_recent_activity_is_not_stalled() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(60);
+        let silence = Duration::from_secs(90);
+        // Past grace but log/HF moved within the silence window.
+        assert!(!boot_validation_stalled(
+            Duration::from_secs(120),
+            Duration::from_secs(30),
+            grace,
+            silence,
+        ));
+        // Boundary: activity_age == silence is NOT past silence.
+        assert!(!boot_validation_stalled(
+            Duration::from_secs(120),
+            Duration::from_secs(90),
+            grace,
+            silence,
+        ));
+    }
+
+    #[test]
+    fn boot_validation_stalled_past_grace_and_silence_fires() {
+        use std::time::Duration;
+        let grace = Duration::from_secs(60);
+        let silence = Duration::from_secs(90);
+        // Past grace, activity stale → stalled.
+        assert!(boot_validation_stalled(
+            Duration::from_secs(120),
+            Duration::from_secs(91),
+            grace,
+            silence,
+        ));
+        // Reproduces the original Sentry trace shape (with old 45s
+        // silence): 64.7s elapsed, ~50s of silence past mtime → stall.
+        assert!(boot_validation_stalled(
+            Duration::from_secs(64),
+            Duration::from_secs(50),
+            Duration::from_secs(60),
+            Duration::from_secs(45),
+        ));
+        // Same trace with the new 90s silence and (no) HF growth signal:
+        // would still stall, but only after another 40s. Without HF
+        // growth refreshing activity_age, this is the worst-case bound.
+        assert!(!boot_validation_stalled(
+            Duration::from_secs(64),
+            Duration::from_secs(50),
+            Duration::from_secs(60),
+            Duration::from_secs(90),
+        ));
+    }
+
+    #[test]
+    fn log_mtime_advanced_detects_first_observation_and_new_writes() {
+        use std::time::{Duration, SystemTime};
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t2 = t1 + Duration::from_secs(1);
+
+        // First time we see a log file.
+        assert!(log_mtime_advanced(None, Some(t1)));
+        // Newer write after a previous observation.
+        assert!(log_mtime_advanced(Some(t1), Some(t2)));
+        // No change.
+        assert!(!log_mtime_advanced(Some(t1), Some(t1)));
+        // Log "vanished" (shouldn't happen on a healthy boot, but the
+        // function must not declare activity in that case).
+        assert!(!log_mtime_advanced(Some(t1), None));
+        // Both None — pre-first-write state, no activity.
+        assert!(!log_mtime_advanced(None, None));
+    }
+
+    #[test]
+    fn hf_cache_grew_returns_true_only_on_growth() {
+        // First observation after the cache dir appeared. Empty dir
+        // doesn't count as activity (HF created the dir but hasn't
+        // started downloading yet).
+        assert!(!hf_cache_grew(None, 0));
+        // First observation with content — counts as growth.
+        assert!(hf_cache_grew(None, 100));
+        // Strictly grew.
+        assert!(hf_cache_grew(Some(100), 200));
+        // Unchanged.
+        assert!(!hf_cache_grew(Some(100), 100));
+        // Shrunk (HF cache pruning during boot — rare, but the function
+        // shouldn't lie and call this growth).
+        assert!(!hf_cache_grew(Some(200), 100));
+    }
 
     #[test]
     fn total_dir_size_bytes_returns_zero_for_missing_path() {
