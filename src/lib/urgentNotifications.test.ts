@@ -45,13 +45,14 @@ function makePricing(
     needsAuthentication: false,
     optimizationAllowed: true,
     shouldNudge: false,
+    nudgeLevel: 0,
     gateReason: null,
     gateMessage: "",
     nudgeThresholdPercent: null,
+    effectiveNudgeThresholdsPercent: null,
     disableThresholdPercent: null,
     effectiveDisableThresholdPercent: null,
     recommendedSubscriptionTier: null,
-    recommendedSubscriptionPriceUsd: null,
     claude: {
       authMethod: "claude_ai_oauth",
       email: null,
@@ -222,6 +223,94 @@ describe("maybeFireUrgentPricingNotifications", () => {
     installStorage();
 
     await maybeFireUrgentPricingNotifications(makePricing());
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("fires the level-1 nudge when the user crosses 25%", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        shouldNudge: true,
+        nudgeLevel: 1,
+        gateMessage: "You're at 27.0% of weekly Claude usage.",
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Heads up: 25% of your weekly Claude usage",
+      body: "You're at 27.0% of weekly Claude usage.",
+      action: "billing",
+    });
+  });
+
+  it("fires distinct notifications for each nudge level within the same week", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: true, nudgeLevel: 1, gateMessage: "25%" })
+    );
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: true, nudgeLevel: 2, gateMessage: "35%" })
+    );
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: true, nudgeLevel: 3, gateMessage: "45%" })
+    );
+
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+    const titles = invokeMock.mock.calls.map((c) => c[1].title);
+    expect(titles).toEqual([
+      "Heads up: 25% of your weekly Claude usage",
+      "Halfway there: 35% of your weekly Claude usage",
+      "Almost paused: 45% of your weekly Claude usage",
+    ]);
+  });
+
+  it("does not repeat a nudge level already fired this week", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: true, nudgeLevel: 2, gateMessage: "35%" })
+    );
+    invokeMock.mockClear();
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: true, nudgeLevel: 2, gateMessage: "36%" })
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("prefers the optimization-blocked notification over a nudge when both apply", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        optimizationAllowed: false,
+        shouldNudge: true,
+        nudgeLevel: 3,
+        gateMessage: "Headroom is paused.",
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_notification",
+      expect.objectContaining({ action: "billing", title: "Headroom optimization is off" })
+    );
+  });
+
+  it("does not fire a nudge when shouldNudge is false even if level > 0", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({ shouldNudge: false, nudgeLevel: 2 })
+    );
 
     expect(invokeMock).not.toHaveBeenCalled();
   });

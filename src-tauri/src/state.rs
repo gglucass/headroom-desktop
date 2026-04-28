@@ -1952,6 +1952,18 @@ impl AppState {
             return Ok(());
         }
 
+        // When the pricing gate has flipped on `proxy_bypass`, Python is
+        // intentionally down — the Rust intercept is routing direct to
+        // Anthropic. Don't restart Python here; that would just defeat the
+        // gate and (via the watchdog's failure path) eventually auto-pause
+        // the runtime.
+        if self
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         if !self.pricing_allows_optimization() {
             self.enforce_pricing_gate();
             self.stop_python_if_gated();
@@ -2222,6 +2234,40 @@ impl AppState {
     fn stop_python_if_gated(&self) {
         if !self.pricing_allows_optimization() {
             self.stop_headroom();
+        }
+    }
+
+    /// Reconcile the runtime against a freshly evaluated pricing status.
+    /// Detects gated→ungated and ungated→gated transitions and runs the
+    /// matching side-effects (start/stop the Python proxy, restore/teardown
+    /// Claude Code's env var). Idempotent on no-op cases — safe to call from
+    /// every pricing poll.
+    ///
+    /// Acquires `lifecycle_lock` (via `stop_headroom` / `ensure_headroom_running`),
+    /// so callers MUST NOT already hold it.
+    pub fn apply_pricing_gate_status(&self, status: &crate::models::HeadroomPricingStatus) {
+        let was_bypassed = self
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire);
+        let should_bypass = !status.optimization_allowed;
+
+        if should_bypass && !was_bypassed {
+            // Transition: ungated → gated. Mirror what enforce_pricing_gate
+            // does, plus the lock-acquiring stop.
+            self.proxy_bypass
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.stop_headroom();
+            let _ = crate::client_adapters::disable_client_setup("claude_code");
+        } else if !should_bypass && was_bypassed {
+            // Transition: gated → ungated (e.g., user just upgraded or
+            // weekly usage rolled over). Restore CC's env var, clear the
+            // bypass flag, and bring Python back online.
+            self.proxy_bypass
+                .store(false, std::sync::atomic::Ordering::Release);
+            crate::client_adapters::restore_client_setups();
+            if let Err(err) = self.ensure_headroom_running() {
+                eprintln!("apply_pricing_gate_status: ensure_headroom_running failed: {err:#}");
+            }
         }
     }
 }
@@ -4967,6 +5013,116 @@ mod tests {
             "fresh AppState must default to bypass=off so the intercept routes through the Python proxy"
         );
         fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    fn pricing_status_with_optimization(allowed: bool) -> crate::models::HeadroomPricingStatus {
+        use crate::models::{
+            ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, HeadroomPricingStatus,
+        };
+        let now = chrono::Utc::now();
+        HeadroomPricingStatus {
+            authenticated: true,
+            local_grace_started_at: now,
+            local_grace_ends_at: now,
+            local_grace_active: false,
+            account_sync_error: None,
+            needs_authentication: false,
+            optimization_allowed: allowed,
+            should_nudge: false,
+            nudge_level: 0,
+            gate_reason: None,
+            gate_message: String::new(),
+            nudge_threshold_percent: None,
+            effective_nudge_thresholds_percent: None,
+            disable_threshold_percent: None,
+            effective_disable_threshold_percent: None,
+            recommended_subscription_tier: None,
+            claude: ClaudeAccountProfile {
+                auth_method: ClaudeAuthMethod::Unknown,
+                email: None,
+                display_name: None,
+                account_uuid: None,
+                organization_uuid: None,
+                billing_type: None,
+                account_created_at: None,
+                subscription_created_at: None,
+                has_extra_usage_enabled: false,
+                plan_tier: ClaudePlanTier::Unknown,
+                plan_detection_source: None,
+                weekly_utilization_pct: None,
+                five_hour_utilization_pct: None,
+                extra_usage_monthly_limit: None,
+                profile_fetch_error: None,
+            },
+            account: None,
+            launch_discount_active: false,
+        }
+    }
+
+    #[test]
+    fn apply_pricing_gate_status_flips_bypass_on_for_gated_status() {
+        let base_dir = temp_test_dir("headroom-bypass-on");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Sanity: starts off.
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+
+        assert!(
+            state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "gated status must flip bypass=true"
+        );
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn apply_pricing_gate_status_clears_bypass_for_ungated_status() {
+        let base_dir = temp_test_dir("headroom-bypass-off");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Pre-set the flag, simulating that the gate fired earlier.
+        state
+            .proxy_bypass
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true));
+
+        assert!(
+            !state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "ungated status must clear bypass — this is the upgrade-recovery path"
+        );
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn apply_pricing_gate_status_is_idempotent_when_state_already_matches() {
+        let base_dir = temp_test_dir("headroom-bypass-noop");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // Already off + ungated status → still off (no transition triggered).
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true));
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // Flip to gated, observe transition.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        assert!(state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // Already on + gated status → still on.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        assert!(state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        fs::remove_dir_all(base_dir).ok();
     }
 
     #[test]

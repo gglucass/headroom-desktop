@@ -662,6 +662,7 @@ export default function App() {
   const [authFlowSuccess, setAuthFlowSuccess] = useState<string | null>(null);
   const [pendingUpgradePlanId, setPendingUpgradePlanId] = useState<UpgradePlanId | null>(null);
   const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
+  const [checkoutPollingDeadline, setCheckoutPollingDeadline] = useState<number | null>(null);
   const desktopActivationSentRef = useRef(false);
   const [learnInstallCopyNotice, setLearnInstallCopyNotice] = useState<string | null>(null);
 
@@ -1692,6 +1693,51 @@ export default function App() {
     };
   }, [trayWindowFocused]);
 
+  // headroom:// deep links from the backend trigger an immediate pricing
+  // refresh — the typical case is Polar's checkout success page redirecting
+  // to headroom://upgraded. Backend has already reconciled the runtime; this
+  // just pulls the new status into UI state without waiting for the next
+  // poll tick.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("pricing-refreshed", () => {
+      void refreshPricingStatus();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  // After the user opens a Polar checkout URL, poll pricing status every 5s
+  // for up to 5 minutes so we can flip the UI back to "active" within seconds
+  // of payment confirmation, instead of waiting out the 60s baseline cadence.
+  // Auto-stops once subscription_active is observed or the window expires.
+  useEffect(() => {
+    if (checkoutPollingDeadline === null) return;
+    if (Date.now() > checkoutPollingDeadline) {
+      setCheckoutPollingDeadline(null);
+      return;
+    }
+    const interval = window.setInterval(() => {
+      if (Date.now() > checkoutPollingDeadline) {
+        setCheckoutPollingDeadline(null);
+        return;
+      }
+      void refreshPricingStatus();
+    }, 5_000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [checkoutPollingDeadline]);
+
+  // Stop the aggressive checkout poll the moment we observe a live
+  // subscription. Saves traffic and stops competing with the 60s cadence.
+  useEffect(() => {
+    if (checkoutPollingDeadline !== null && pricingStatus?.account?.subscriptionActive) {
+      setCheckoutPollingDeadline(null);
+    }
+  }, [checkoutPollingDeadline, pricingStatus?.account?.subscriptionActive]);
+
   useEffect(() => {
     const claudeConnector = getClaudeConnector(connectors);
     if (!pricingStatus || pricingStatus.optimizationAllowed || !claudeConnector?.enabled) {
@@ -2362,9 +2408,10 @@ export default function App() {
           billingPeriod
         });
         await openExternalLink(url);
-        window.setTimeout(() => {
-          void refreshPricingStatus();
-        }, 5_000);
+        // Aggressive poll for the next 5 minutes so the moment Polar marks
+        // the subscription active we surface "Headroom is back online" without
+        // making the user wait out the normal 60s pricing-refresh cadence.
+        setCheckoutPollingDeadline(Date.now() + 5 * 60_000);
       } catch (error) {
         setUpgradeActionError(
           error instanceof Error ? error.message : typeof error === "string" ? error : "Could not start checkout."

@@ -434,13 +434,14 @@ export interface HeadroomPricingStatus {
   needsAuthentication: boolean;
   optimizationAllowed: boolean;
   shouldNudge: boolean;
+  nudgeLevel: number;
   gateReason?: PricingGateReason | null;
   gateMessage: string;
   nudgeThresholdPercent?: number | null;
+  effectiveNudgeThresholdsPercent?: number[] | null;
   disableThresholdPercent?: number | null;
   effectiveDisableThresholdPercent?: number | null;
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
-  recommendedSubscriptionPriceUsd?: number | null;
   claude: ClaudeAccountProfile;
   account?: HeadroomAccountProfile | null;
   launchDiscountActive: boolean;

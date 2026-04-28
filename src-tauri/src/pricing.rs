@@ -43,6 +43,18 @@ struct IdentityPayload {
     claude_account_uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_plan_tier: Option<ClaudePlanTier>,
+}
+
+fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
+    match tier {
+        ClaudePlanTier::Free => "free",
+        ClaudePlanTier::Pro => "pro",
+        ClaudePlanTier::Max5x => "max5x",
+        ClaudePlanTier::Max20x => "max20x",
+        ClaudePlanTier::Unknown => "unknown",
+    }
 }
 
 impl IdentityPayload {
@@ -62,6 +74,7 @@ impl IdentityPayload {
             chopratejas_instance_id: device.chopratejas_instance_id,
             claude_account_uuid: claude.and_then(|p| p.account_uuid.clone()),
             claude_email: claude.and_then(|p| p.email.clone()),
+            claude_plan_tier: claude.map(|p| p.plan_tier.clone()),
         }
     }
 
@@ -78,6 +91,9 @@ impl IdentityPayload {
         }
         if let Some(value) = self.claude_email.as_deref() {
             builder = builder.header("X-Headroom-Claude-Email", value);
+        }
+        if let Some(tier) = self.claude_plan_tier.as_ref() {
+            builder = builder.header("X-Headroom-Claude-Plan", plan_tier_header_value(tier));
         }
         builder
     }
@@ -627,13 +643,14 @@ fn evaluate_pricing_status(
     let needs_authentication = !authenticated && !local_grace_active;
     let mut optimization_allowed = true;
     let mut should_nudge = false;
+    let mut nudge_level: u8 = 0;
     let mut gate_reason = None;
     let gate_message: String;
     let mut nudge_threshold_percent = None;
+    let mut effective_nudge_thresholds_percent: Option<Vec<f64>> = None;
     let mut disable_threshold_percent = None;
     let mut effective_disable_threshold_percent = None;
     let mut recommended_subscription_tier = None;
-    let mut recommended_subscription_price_usd = None;
 
     if needs_authentication {
         optimization_allowed = false;
@@ -649,9 +666,17 @@ fn evaluate_pricing_status(
                 "Your 14-day Headroom trial is active with unlimited optimization.".into();
         } else {
             let pricing = pricing_policy_for_plan(&claude.plan_tier);
+            let bonus = account.invite_bonus_percent.clamp(0.0, 50.0);
             nudge_threshold_percent = pricing
                 .as_ref()
-                .map(|policy| policy.nudge_threshold_percent);
+                .map(|policy| policy.nudge_thresholds_percent[0]);
+            effective_nudge_thresholds_percent = pricing.as_ref().map(|policy| {
+                policy
+                    .nudge_thresholds_percent
+                    .iter()
+                    .map(|n| n + bonus)
+                    .collect()
+            });
             disable_threshold_percent = pricing
                 .as_ref()
                 .map(|policy| policy.disable_threshold_percent);
@@ -662,8 +687,6 @@ fn evaluate_pricing_status(
             recommended_subscription_tier = pricing
                 .as_ref()
                 .map(|policy| policy.recommended_tier.clone());
-            recommended_subscription_price_usd =
-                pricing.as_ref().map(|policy| policy.monthly_price_usd);
 
             match claude.plan_tier {
                 ClaudePlanTier::Free => {
@@ -675,9 +698,9 @@ fn evaluate_pricing_status(
                     gate_message = "Send a Claude Code message through Headroom so we can detect your current Claude usage and apply the right pricing thresholds.".into();
                 }
                 _ => {
-                    if let (Some(weekly_usage), Some(nudge), Some(disable)) = (
+                    if let (Some(weekly_usage), Some(nudges), Some(disable)) = (
                         claude.weekly_utilization_pct,
-                        nudge_threshold_percent,
+                        effective_nudge_thresholds_percent.as_ref(),
                         effective_disable_threshold_percent,
                     ) {
                         if weekly_usage >= disable {
@@ -687,17 +710,18 @@ fn evaluate_pricing_status(
                                 "Headroom is paused because you've reached {:.1}% of weekly Claude usage. Upgrade to raise your limit.",
                                 weekly_usage
                             );
-                        } else if weekly_usage >= nudge {
-                            should_nudge = true;
-                            gate_message = format!(
-                                "You've reached {:.1}% of weekly Claude usage. Upgrade soon or invite others before Headroom pauses at {:.1}%.",
-                                weekly_usage, disable
-                            );
                         } else {
-                            gate_message = format!(
-                                "Headroom is active. It will start nudging at {:.1}% and pause at {:.1}% of weekly Claude usage for your detected plan.",
-                                nudge, disable
-                            );
+                            nudge_level =
+                                nudges.iter().filter(|t| weekly_usage >= **t).count() as u8;
+                            should_nudge = nudge_level > 0;
+                            gate_message = if should_nudge {
+                                format_nudge_message(weekly_usage, disable, nudge_level)
+                            } else {
+                                format!(
+                                    "Headroom is active. It will start nudging at {:.1}% and pause at {:.1}% of weekly Claude usage for your detected plan.",
+                                    nudges[0], disable
+                                )
+                            };
                         }
                     } else {
                         gate_message = "Headroom is active. Send a Claude Code message through Headroom to sync your current weekly usage and pricing threshold.".into();
@@ -724,16 +748,34 @@ fn evaluate_pricing_status(
         needs_authentication,
         optimization_allowed,
         should_nudge,
+        nudge_level,
         gate_reason,
         gate_message,
         nudge_threshold_percent,
+        effective_nudge_thresholds_percent,
         disable_threshold_percent,
         effective_disable_threshold_percent,
         recommended_subscription_tier,
-        recommended_subscription_price_usd,
         claude,
         account,
         launch_discount_active,
+    }
+}
+
+fn format_nudge_message(weekly_usage: f64, disable: f64, level: u8) -> String {
+    match level {
+        1 => format!(
+            "You're at {:.1}% of weekly Claude usage. Upgrade Headroom to keep optimization through {:.1}% — invites also raise your limit.",
+            weekly_usage, disable
+        ),
+        2 => format!(
+            "You're at {:.1}% of weekly Claude usage. Headroom pauses at {:.1}% on the free plan — upgrade now to keep going.",
+            weekly_usage, disable
+        ),
+        _ => format!(
+            "You're at {:.1}% of weekly Claude usage. Headroom will pause at {:.1}% — upgrade now to avoid losing optimization.",
+            weekly_usage, disable
+        ),
     }
 }
 
@@ -1249,34 +1291,32 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
+const NUDGE_THRESHOLDS_PERCENT: [f64; 3] = [25.0, 35.0, 45.0];
+
 #[derive(Debug, Clone)]
 struct PricingPolicy {
-    nudge_threshold_percent: f64,
+    nudge_thresholds_percent: [f64; 3],
     disable_threshold_percent: f64,
     recommended_tier: HeadroomSubscriptionTier,
-    monthly_price_usd: f64,
 }
 
 fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
     match plan {
         ClaudePlanTier::Free => None,
         ClaudePlanTier::Pro => Some(PricingPolicy {
-            nudge_threshold_percent: 10.0,
+            nudge_thresholds_percent: NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Pro,
-            monthly_price_usd: 2.5,
         }),
         ClaudePlanTier::Max5x => Some(PricingPolicy {
-            nudge_threshold_percent: 10.0,
+            nudge_thresholds_percent: NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Max5x,
-            monthly_price_usd: 12.5,
         }),
         ClaudePlanTier::Max20x => Some(PricingPolicy {
-            nudge_threshold_percent: 10.0,
+            nudge_thresholds_percent: NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
-            monthly_price_usd: 25.0,
         }),
         ClaudePlanTier::Unknown => None,
     }
@@ -1288,10 +1328,11 @@ mod tests {
 
     use super::{
         detect_plan_tier_from_profile, evaluate_pricing_status, merge_background_account_sync,
-        pricing_policy_for_plan, remote_account_to_profile, resolve_account_api_base_url,
-        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
-        HeadroomSubscriptionTier, IdentityPayload, LocalPricingState, RemoteAccountResponse,
-        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        plan_tier_header_value, pricing_policy_for_plan, remote_account_to_profile,
+        resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
+        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityPayload,
+        LocalPricingState, RemoteAccountResponse, RemoteAccountSyncError,
+        DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier,
@@ -1325,12 +1366,73 @@ mod tests {
             chopratejas_instance_id: None,
             claude_account_uuid: Some("claude-uuid".into()),
             claude_email: None,
+            claude_plan_tier: Some(ClaudePlanTier::Pro),
         };
         let json = serde_json::to_value(&identity).unwrap();
         assert_eq!(json["deviceId"], "abc123");
         assert_eq!(json["claudeAccountUuid"], "claude-uuid");
+        assert_eq!(json["claudePlanTier"], "pro");
         assert!(json.get("chopratejasInstanceId").is_none());
         assert!(json.get("claudeEmail").is_none());
+    }
+
+    #[test]
+    fn identity_payload_skips_plan_when_none() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            chopratejas_instance_id: None,
+            claude_account_uuid: None,
+            claude_email: None,
+            claude_plan_tier: None,
+        };
+        let json = serde_json::to_value(&identity).unwrap();
+        assert!(json.get("claudePlanTier").is_none());
+    }
+
+    #[test]
+    fn plan_tier_header_value_covers_all_variants() {
+        assert_eq!(plan_tier_header_value(&ClaudePlanTier::Free), "free");
+        assert_eq!(plan_tier_header_value(&ClaudePlanTier::Pro), "pro");
+        assert_eq!(plan_tier_header_value(&ClaudePlanTier::Max5x), "max5x");
+        assert_eq!(plan_tier_header_value(&ClaudePlanTier::Max20x), "max20x");
+        assert_eq!(plan_tier_header_value(&ClaudePlanTier::Unknown), "unknown");
+    }
+
+    #[test]
+    fn apply_headers_sets_plan_when_present() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            chopratejas_instance_id: None,
+            claude_account_uuid: None,
+            claude_email: None,
+            claude_plan_tier: Some(ClaudePlanTier::Max20x),
+        };
+        let client = reqwest::blocking::Client::new();
+        let req = identity
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("X-Headroom-Claude-Plan").unwrap(),
+            "max20x"
+        );
+    }
+
+    #[test]
+    fn apply_headers_omits_plan_when_none() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            chopratejas_instance_id: None,
+            claude_account_uuid: None,
+            claude_email: None,
+            claude_plan_tier: None,
+        };
+        let client = reqwest::blocking::Client::new();
+        let req = identity
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        assert!(req.headers().get("X-Headroom-Claude-Plan").is_none());
     }
 
     #[test]
@@ -1405,22 +1507,6 @@ mod tests {
                 .and_then(|value| value.subscription_tier.clone()),
             Some(HeadroomSubscriptionTier::Pro)
         ));
-    }
-
-    #[test]
-    fn pricing_policy_uses_the_reduced_monthly_prices() {
-        assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Pro).map(|policy| policy.monthly_price_usd),
-            Some(2.5)
-        );
-        assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Max5x).map(|policy| policy.monthly_price_usd),
-            Some(12.5)
-        );
-        assert_eq!(
-            pricing_policy_for_plan(&ClaudePlanTier::Max20x).map(|policy| policy.monthly_price_usd),
-            Some(25.0)
-        );
     }
 
     #[test]
@@ -1588,15 +1674,16 @@ mod tests {
             false,
             None,
             Some(expired_account(0.0)),
-            pro_profile_with_weekly(5.0),
+            pro_profile_with_weekly(20.0),
             false,
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
+        assert_eq!(status.nudge_level, 0);
     }
 
     #[test]
-    fn pro_between_nudge_and_disable_nudges() {
+    fn pro_at_first_nudge_threshold_fires_level_one() {
         let (start, end) = grace();
         let status = evaluate_pricing_status(
             true,
@@ -1605,11 +1692,71 @@ mod tests {
             false,
             None,
             Some(expired_account(0.0)),
-            pro_profile_with_weekly(15.0),
+            pro_profile_with_weekly(25.0),
             false,
         );
         assert!(status.optimization_allowed);
         assert!(status.should_nudge);
+        assert_eq!(status.nudge_level, 1);
+    }
+
+    #[test]
+    fn pro_at_second_nudge_threshold_fires_level_two() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(36.0),
+            false,
+        );
+        assert!(status.optimization_allowed);
+        assert_eq!(status.nudge_level, 2);
+    }
+
+    #[test]
+    fn pro_at_third_nudge_threshold_fires_level_three() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(0.0)),
+            pro_profile_with_weekly(46.0),
+            false,
+        );
+        assert!(status.optimization_allowed);
+        assert_eq!(status.nudge_level, 3);
+        // Each level uses distinct copy.
+        assert!(status.gate_message.contains("upgrade"));
+    }
+
+    #[test]
+    fn invite_bonus_shifts_nudge_thresholds() {
+        let (start, end) = grace();
+        // Pro nudges = 25/35/45; with +10 bonus -> 35/45/55. Usage 30% should
+        // be silent (below shifted level 1) and disable shifts to 60%.
+        let status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(expired_account(10.0)),
+            pro_profile_with_weekly(30.0),
+            false,
+        );
+        assert!(status.optimization_allowed);
+        assert_eq!(status.nudge_level, 0);
+        assert_eq!(
+            status.effective_nudge_thresholds_percent,
+            Some(vec![35.0, 45.0, 55.0])
+        );
     }
 
     #[test]

@@ -872,6 +872,11 @@ fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool
     if on {
         state.stop_headroom();
     } else {
+        // Recover from any auto-pause / client teardown that may have run
+        // while bypass was active (the watchdog's give-up path or the
+        // pricing gate's `disable_client_setup` call).
+        client_adapters::restore_client_setups();
+        state.set_runtime_paused(false);
         state
             .ensure_headroom_running()
             .map_err(|err| err.to_string())?;
@@ -937,7 +942,14 @@ fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
 fn get_headroom_pricing_status(
     state: State<'_, AppState>,
 ) -> Result<HeadroomPricingStatus, String> {
-    pricing::get_pricing_status(&state)
+    let status = pricing::get_pricing_status(&state)?;
+    // Reconcile the runtime with the freshly evaluated status. Bridges the
+    // gap between "user just upgraded" (subscription_active flips on) and
+    // "Headroom optimization actually resumes" — without this, the pricing
+    // gate's bypass flag would stay set and Python would stay down until
+    // the next app launch.
+    state.apply_pricing_gate_status(&status);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1799,7 +1811,8 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_notification::init());
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init());
 
     builder
         .setup(|app| {
@@ -1854,6 +1867,38 @@ pub fn run() {
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
                 client_adapters::restore_client_setups();
+            });
+
+            // headroom:// deep link — Polar's checkout success page redirects
+            // here. Triggers an immediate pricing refresh so the gate releases
+            // within seconds of payment instead of waiting for the 5s poll.
+            use tauri_plugin_deep_link::DeepLinkExt;
+            let deep_link_app = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    if url.scheme() == "headroom" {
+                        eprintln!("deep link received: {url}");
+                        let app_handle = deep_link_app.clone();
+                        let _ = show_launcher_window(&app_handle);
+                        // Run the reconciliation on a worker thread — the
+                        // deep-link callback is on the main thread and we
+                        // don't want pricing's blocking HTTP call there.
+                        std::thread::spawn(move || {
+                            let state: tauri::State<'_, AppState> = app_handle.state();
+                            match pricing::get_pricing_status(&state) {
+                                Ok(status) => {
+                                    state.apply_pricing_gate_status(&status);
+                                    let _ = app_handle.emit("pricing-refreshed", &status);
+                                }
+                                Err(err) => eprintln!(
+                                    "deep link pricing refresh failed: {err}"
+                                ),
+                            }
+                        });
+                        // Only handle the first headroom:// URL in the batch.
+                        break;
+                    }
+                }
             });
             Ok(())
         })
@@ -2363,10 +2408,9 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
-    let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &separator, &pause, &quit])?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &separator, &quit])?;
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -2413,12 +2457,6 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
-            }
-            "pause" => {
-                let state: tauri::State<'_, AppState> = app.state();
-                state.set_runtime_paused(true);
-                state.stop_headroom();
-                let _ = client_adapters::clear_client_setups();
             }
             _ => {}
         });
@@ -2664,12 +2702,19 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             let runtime = state.runtime_status();
 
             // Only care when the runtime is supposed to be up: installed,
-            // not paused by the user, not mid-boot, and not mid-upgrade.
-            // Anything else and we reset the counter and keep watching.
+            // not paused by the user, not mid-boot, not mid-upgrade, and not
+            // intentionally bypassed. When `proxy_bypass` is set the pricing
+            // gate has stopped Python on purpose; the Rust intercept is
+            // routing direct to api.anthropic.com, so trying to restart the
+            // backend would just thrash and eventually trip the auto-pause
+            // path below.
             let should_be_up = runtime.installed
                 && !runtime.paused
                 && !runtime.starting
-                && !state.runtime_upgrade_in_progress();
+                && !state.runtime_upgrade_in_progress()
+                && !state
+                    .proxy_bypass
+                    .load(std::sync::atomic::Ordering::Acquire);
             if !should_be_up {
                 consecutive_failures = 0;
                 continue;

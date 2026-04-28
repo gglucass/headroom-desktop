@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.3.3-rc.2"
+version = "0.3.3-rc.3"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -33,6 +33,7 @@ sys-locale = "0.3"
 tar = "0.4"
 tauri = { version = "=2.10.3", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
+tauri-plugin-deep-link = "2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2.10.0"
