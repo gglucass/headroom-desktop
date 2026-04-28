@@ -1961,6 +1961,7 @@ impl AppState {
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            eprintln!("ensure_headroom_running: short-circuit (proxy_bypass active)");
             return Ok(());
         }
 

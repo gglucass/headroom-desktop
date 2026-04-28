@@ -866,11 +866,19 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 #[cfg(debug_assertions)]
 #[tauri::command]
 fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool, String> {
+    eprintln!("[debug_force_proxy_bypass] requested on={on}");
     state
         .proxy_bypass
         .store(on, std::sync::atomic::Ordering::Release);
+    eprintln!(
+        "[debug_force_proxy_bypass] stored bypass={}",
+        state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     if on {
         state.stop_headroom();
+        eprintln!("[debug_force_proxy_bypass] stop_headroom complete");
     } else {
         // Recover from any auto-pause / client teardown that may have run
         // while bypass was active (the watchdog's give-up path or the
@@ -2708,14 +2716,25 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // routing direct to api.anthropic.com, so trying to restart the
             // backend would just thrash and eventually trip the auto-pause
             // path below.
+            let bypass_active = state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire);
             let should_be_up = runtime.installed
                 && !runtime.paused
                 && !runtime.starting
                 && !state.runtime_upgrade_in_progress()
-                && !state
-                    .proxy_bypass
-                    .load(std::sync::atomic::Ordering::Acquire);
+                && !bypass_active;
             if !should_be_up {
+                if consecutive_failures > 0 {
+                    eprintln!(
+                        "watchdog: skip restart (installed={}, paused={}, starting={}, upgrading={}, bypass={}); resetting failure counter",
+                        runtime.installed,
+                        runtime.paused,
+                        runtime.starting,
+                        state.runtime_upgrade_in_progress(),
+                        bypass_active
+                    );
+                }
                 consecutive_failures = 0;
                 continue;
             }
@@ -2727,7 +2746,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             consecutive_failures = consecutive_failures.saturating_add(1);
             eprintln!(
-                "watchdog: proxy unreachable (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}), attempting restart"
+                "watchdog: proxy unreachable (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}, bypass={bypass_active}), attempting restart"
             );
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
