@@ -859,6 +859,26 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     state.runtime_status()
 }
 
+/// Debug-only: force the proxy intercept's bypass flag on/off so a developer
+/// can manually exercise the gated path (Python proxy stopped, traffic routed
+/// direct to api.anthropic.com) without crossing the real disable threshold.
+/// Compiled out of release builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool, String> {
+    state
+        .proxy_bypass
+        .store(on, std::sync::atomic::Ordering::Release);
+    if on {
+        state.stop_headroom();
+    } else {
+        state
+            .ensure_headroom_running()
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(state.proxy_bypass.load(std::sync::atomic::Ordering::Acquire))
+}
+
 #[tauri::command]
 fn get_headroom_logs(
     state: State<'_, AppState>,
@@ -1817,7 +1837,10 @@ pub fn run() {
                 })),
             );
             // Start the intercept layer before anything else touches port 6767.
-            proxy_intercept::spawn(std::sync::Arc::clone(&state.claude_bearer_token));
+            proxy_intercept::spawn(
+                std::sync::Arc::clone(&state.claude_bearer_token),
+                std::sync::Arc::clone(&state.proxy_bypass),
+            );
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());
             }
@@ -1894,7 +1917,9 @@ pub fn run() {
             get_autostart_enabled,
             set_autostart_enabled,
             uninstall_and_quit,
-            quit_headroom
+            quit_headroom,
+            #[cfg(debug_assertions)]
+            debug_force_proxy_bypass
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

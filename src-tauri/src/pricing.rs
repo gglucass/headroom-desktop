@@ -1262,19 +1262,19 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
         ClaudePlanTier::Free => None,
         ClaudePlanTier::Pro => Some(PricingPolicy {
             nudge_threshold_percent: 10.0,
-            disable_threshold_percent: 25.0,
+            disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Pro,
             monthly_price_usd: 2.5,
         }),
         ClaudePlanTier::Max5x => Some(PricingPolicy {
             nudge_threshold_percent: 10.0,
-            disable_threshold_percent: 25.0,
+            disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Max5x,
             monthly_price_usd: 12.5,
         }),
         ClaudePlanTier::Max20x => Some(PricingPolicy {
             nudge_threshold_percent: 10.0,
-            disable_threshold_percent: 25.0,
+            disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
             monthly_price_usd: 25.0,
         }),
@@ -1622,7 +1622,7 @@ mod tests {
             false,
             None,
             Some(expired_account(0.0)),
-            pro_profile_with_weekly(25.0),
+            pro_profile_with_weekly(50.0),
             false,
         );
         assert!(!status.optimization_allowed);
@@ -1635,7 +1635,7 @@ mod tests {
     #[test]
     fn invite_bonus_raises_disable_threshold() {
         let (start, end) = grace();
-        // Pro disable=25; with +10 bonus -> 35. Usage=30 should not gate.
+        // Pro disable=50; with +10 bonus -> 60. Usage=55 should not gate.
         let status = evaluate_pricing_status(
             true,
             start,
@@ -1643,18 +1643,18 @@ mod tests {
             false,
             None,
             Some(expired_account(10.0)),
-            pro_profile_with_weekly(30.0),
+            pro_profile_with_weekly(55.0),
             false,
         );
         assert!(status.optimization_allowed);
         assert!(status.should_nudge);
-        assert_eq!(status.effective_disable_threshold_percent, Some(35.0));
+        assert_eq!(status.effective_disable_threshold_percent, Some(60.0));
     }
 
     #[test]
     fn invite_bonus_is_capped_at_50_percentage_points() {
         let (start, end) = grace();
-        // Even if the backend sent 200, the effective cap is +50.
+        // Even if the backend sent 200, the effective cap is +50 (so 50 + 50 = 100).
         let status = evaluate_pricing_status(
             true,
             start,
@@ -1665,7 +1665,7 @@ mod tests {
             pro_profile_with_weekly(0.0),
             false,
         );
-        assert_eq!(status.effective_disable_threshold_percent, Some(75.0));
+        assert_eq!(status.effective_disable_threshold_percent, Some(100.0));
     }
 
     #[test]

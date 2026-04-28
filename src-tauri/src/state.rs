@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -355,6 +356,12 @@ pub struct AppState {
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
     /// Wrapped in Arc so the proxy_intercept task can share it without going through AppState.
     pub claude_bearer_token: Arc<Mutex<Option<BearerToken>>>,
+    /// When true, the Rust intercept on :6767 forwards traffic directly to
+    /// api.anthropic.com instead of the Python proxy on :6768. Flipped on by
+    /// `enforce_pricing_gate` once a Pro/Max user crosses the disable threshold
+    /// without a Headroom subscription, so existing CC sessions stay alive
+    /// while optimization is genuinely off.
+    pub proxy_bypass: Arc<AtomicBool>,
     launch_profile: Mutex<LaunchProfile>,
     launch_profile_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
@@ -443,6 +450,7 @@ impl AppState {
                 overall_percent: 0,
             }),
             claude_bearer_token: Arc::new(Mutex::new(None)),
+            proxy_bypass: Arc::new(AtomicBool::new(false)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
                 running: false,
                 project_path: None,
@@ -486,6 +494,7 @@ impl AppState {
 
         self.set_runtime_starting(true);
         self.enforce_pricing_gate();
+        self.stop_python_if_gated();
 
         if let Err(err) = ensure_rtk_integrations(
             &self.tool_manager.rtk_entrypoint(),
@@ -1945,6 +1954,7 @@ impl AppState {
 
         if !self.pricing_allows_optimization() {
             self.enforce_pricing_gate();
+            self.stop_python_if_gated();
             return Ok(());
         }
 
@@ -2188,12 +2198,30 @@ impl AppState {
             .unwrap_or(true)
     }
 
+    /// Flip the bypass flag and run client-side teardown based on current
+    /// pricing. Safe to call while holding `lifecycle_lock` — this never tries
+    /// to acquire it. Stopping the Python proxy is `stop_python_if_gated`'s
+    /// job (it does take the lock) and must be invoked separately.
     fn enforce_pricing_gate(&self) {
         match pricing::get_pricing_status(self) {
             Ok(status) if !status.optimization_allowed => {
+                self.proxy_bypass
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let _ = crate::client_adapters::disable_client_setup("claude_code");
             }
-            _ => {}
+            Ok(_) => {
+                self.proxy_bypass
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Stop the Python proxy when pricing currently disallows optimization.
+    /// Acquires `lifecycle_lock`, so callers MUST NOT already hold it.
+    fn stop_python_if_gated(&self) {
+        if !self.pricing_allows_optimization() {
+            self.stop_headroom();
         }
     }
 }
@@ -4925,6 +4953,19 @@ mod tests {
             .iter()
             .any(|insight| !insight.title.is_empty()));
 
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn proxy_bypass_initialises_to_false() {
+        let base_dir = temp_test_dir("headroom-bypass-init");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(
+            !state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "fresh AppState must default to bypass=off so the intercept routes through the Python proxy"
+        );
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 
