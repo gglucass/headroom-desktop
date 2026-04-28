@@ -623,6 +623,12 @@ pub struct ClaudeAccountProfile {
     pub has_extra_usage_enabled: bool,
     pub plan_tier: ClaudePlanTier,
     pub plan_detection_source: Option<String>,
+    /// Raw `organization_type` from the OAuth profile, kept verbatim so the
+    /// server can audit which taxonomy strings we haven't enumerated yet
+    /// (specifically when `plan_tier` ends up `Unknown`).
+    pub organization_type: Option<String>,
+    /// Raw `rate_limit_tier` — same purpose as `organization_type`.
+    pub rate_limit_tier: Option<String>,
     pub weekly_utilization_pct: Option<f64>,
     pub five_hour_utilization_pct: Option<f64>,
     pub extra_usage_monthly_limit: Option<f64>,

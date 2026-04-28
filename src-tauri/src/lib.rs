@@ -546,6 +546,12 @@ enum BootstrapFailureKind {
     /// verify pypi.org or github.com. Not our bug, but users here are stuck
     /// until they configure `REQUESTS_CA_BUNDLE` or disable TLS inspection.
     SslInterception,
+    /// Python's `tempfile` couldn't create a directory in any candidate
+    /// location (TMPDIR, /tmp, /var/tmp, /usr/tmp, cwd). Disk full, TCC
+    /// blocking writes, or a stale macOS per-user temp dir. Not our bug,
+    /// but the default "couldn't download a file" message is misleading
+    /// because pip never even got to the network.
+    NoUsableTempDir,
     Other,
 }
 
@@ -553,6 +559,7 @@ impl BootstrapFailureKind {
     fn as_str(self) -> &'static str {
         match self {
             BootstrapFailureKind::SslInterception => "ssl_interception",
+            BootstrapFailureKind::NoUsableTempDir => "no_usable_tempdir",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -571,6 +578,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         || haystack.contains("self signed certificate in certificate chain")
     {
         BootstrapFailureKind::SslInterception
+    } else if haystack.contains("No usable temporary directory found") {
+        BootstrapFailureKind::NoUsableTempDir
     } else {
         BootstrapFailureKind::Other
     }
@@ -586,6 +595,13 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              environment variable to your organization's CA bundle, or disable TLS \
              inspection for pypi.org, files.pythonhosted.org, and github.com, then \
              restart the app. Contact support@extraheadroom.com if you need help."
+        }
+        BootstrapFailureKind::NoUsableTempDir => {
+            "Installation failed: Headroom can't create temporary files on this Mac. \
+             This usually means your disk is full, or security software (like an MDM \
+             profile or endpoint protection) is blocking writes to /tmp and \
+             /var/folders. Free up disk space, restart your Mac, and try again. \
+             If it still fails, contact support@extraheadroom.com."
         }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
@@ -2689,6 +2705,25 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     });
 }
 
+/// Should the watchdog expect the Python proxy to be reachable right now?
+///
+/// All five inputs are required to be in their "ready" state for the proxy
+/// to be supposed-up. Pulled out as a pure function so the truth table is
+/// trivially testable — every clause is load-bearing and removing one
+/// silently turns the watchdog into a thrash loop. Specifically `bypass`
+/// being false matters: when the pricing gate has flipped on `proxy_bypass`
+/// the Rust intercept is routing direct to api.anthropic.com, so a missing
+/// Python is intentional, not a failure.
+fn watchdog_should_be_up(
+    installed: bool,
+    paused: bool,
+    starting: bool,
+    upgrading: bool,
+    bypass: bool,
+) -> bool {
+    installed && !paused && !starting && !upgrading && !bypass
+}
+
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
@@ -2719,11 +2754,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             let bypass_active = state
                 .proxy_bypass
                 .load(std::sync::atomic::Ordering::Acquire);
-            let should_be_up = runtime.installed
-                && !runtime.paused
-                && !runtime.starting
-                && !state.runtime_upgrade_in_progress()
-                && !bypass_active;
+            let should_be_up = watchdog_should_be_up(
+                runtime.installed,
+                runtime.paused,
+                runtime.starting,
+                state.runtime_upgrade_in_progress(),
+                bypass_active,
+            );
             if !should_be_up {
                 if consecutive_failures > 0 {
                     eprintln!(
@@ -3267,9 +3304,10 @@ mod tests {
         lifetime_token_milestone_kind, parse_live_learnings, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
-        AvailableAppUpdate, BootstrapFailureKind, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        watchdog_should_be_up, AvailableAppUpdate, BootstrapFailureKind,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
+        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -4130,6 +4168,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_no_usable_temporary_directory() {
+        let err: anyhow::Error = make_command_failure(
+            "FileNotFoundError: [Errno 2] No usable temporary directory found in \
+             ['/var/folders/lp/.../T/', '/tmp', '/var/tmp', '/usr/tmp', \
+             '/Users/x/Library/Application Support/Headroom/headroom']",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::NoUsableTempDir
+        ));
+    }
+
+    #[test]
     fn classify_bootstrap_failure_returns_other_for_unrelated_command_errors() {
         let err: anyhow::Error =
             make_command_failure("ConnectionResetError: [Errno 54] Connection reset by peer")
@@ -4302,5 +4354,44 @@ Some unrelated content.
             err.contains("Unknown file_kind"),
             "expected Unknown file_kind error, got: {err}"
         );
+    }
+
+    #[test]
+    fn watchdog_should_be_up_requires_runtime_installed() {
+        // Even if every other gate is "ready", a missing runtime means the
+        // watchdog should not expect Python to be reachable yet.
+        assert!(!watchdog_should_be_up(false, false, false, false, false));
+    }
+
+    #[test]
+    fn watchdog_should_be_up_when_all_gates_clear() {
+        // Installed, not paused, not booting, not upgrading, not bypassed —
+        // this is the one input combination that must return true.
+        assert!(watchdog_should_be_up(true, false, false, false, false));
+    }
+
+    #[test]
+    fn watchdog_should_be_up_respects_user_pause() {
+        assert!(!watchdog_should_be_up(true, true, false, false, false));
+    }
+
+    #[test]
+    fn watchdog_should_be_up_skips_during_boot() {
+        assert!(!watchdog_should_be_up(true, false, true, false, false));
+    }
+
+    #[test]
+    fn watchdog_should_be_up_skips_during_runtime_upgrade() {
+        assert!(!watchdog_should_be_up(true, false, false, true, false));
+    }
+
+    /// Critical regression guard. Removing the bypass clause from
+    /// `watchdog_should_be_up` would silently turn the watchdog into a thrash
+    /// loop the moment the pricing gate fires — it would keep restarting
+    /// Python while the bypass forwarder is doing its job, eventually
+    /// tripping the auto-pause path that strips Claude Code's env var.
+    #[test]
+    fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
+        assert!(!watchdog_should_be_up(true, false, false, false, true));
     }
 }
