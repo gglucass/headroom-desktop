@@ -5050,6 +5050,8 @@ mod tests {
                 has_extra_usage_enabled: false,
                 plan_tier: ClaudePlanTier::Unknown,
                 plan_detection_source: None,
+                organization_type: None,
+                rate_limit_tier: None,
                 weekly_utilization_pct: None,
                 five_hour_utilization_pct: None,
                 extra_usage_monthly_limit: None,

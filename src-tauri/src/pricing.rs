@@ -45,6 +45,15 @@ struct IdentityPayload {
     claude_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_plan_tier: Option<ClaudePlanTier>,
+    /// Raw OAuth fields, forwarded verbatim so the server can audit which
+    /// taxonomy strings we haven't enumerated yet (especially when the
+    /// classified `claude_plan_tier` ends up `unknown`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_organization_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_rate_limit_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_billing_type: Option<String>,
 }
 
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
@@ -75,6 +84,9 @@ impl IdentityPayload {
             claude_account_uuid: claude.and_then(|p| p.account_uuid.clone()),
             claude_email: claude.and_then(|p| p.email.clone()),
             claude_plan_tier: claude.map(|p| p.plan_tier.clone()),
+            claude_organization_type: claude.and_then(|p| p.organization_type.clone()),
+            claude_rate_limit_tier: claude.and_then(|p| p.rate_limit_tier.clone()),
+            claude_billing_type: claude.and_then(|p| p.billing_type.clone()),
         }
     }
 
@@ -94,6 +106,15 @@ impl IdentityPayload {
         }
         if let Some(tier) = self.claude_plan_tier.as_ref() {
             builder = builder.header("X-Headroom-Claude-Plan", plan_tier_header_value(tier));
+        }
+        if let Some(value) = self.claude_organization_type.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Organization-Type", value);
+        }
+        if let Some(value) = self.claude_rate_limit_tier.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Rate-Limit-Tier", value);
+        }
+        if let Some(value) = self.claude_billing_type.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Billing-Type", value);
         }
         builder
     }
@@ -799,6 +820,8 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile 
             has_extra_usage_enabled: false,
             plan_tier: ClaudePlanTier::Unknown,
             plan_detection_source: None,
+            organization_type: None,
+            rate_limit_tier: None,
             weekly_utilization_pct: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
@@ -843,6 +866,12 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ClaudeAccountProfile 
             .unwrap_or(false),
         plan_tier,
         plan_detection_source,
+        organization_type: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().and_then(|o| o.organization_type.clone())),
+        rate_limit_tier: profile
+            .as_ref()
+            .and_then(|p| p.organization.as_ref().and_then(|o| o.rate_limit_tier.clone())),
         weekly_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
@@ -1013,10 +1042,66 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
         );
     }
 
+    log_unknown_plan_tier_once(profile);
     (
         ClaudePlanTier::Unknown,
         Some("oauth_profile.organization".into()),
     )
+}
+
+/// Capture the raw classification fields whenever `detect_plan_tier_from_profile`
+/// falls into the `Unknown` branch — i.e., the user has an Anthropic
+/// organization with `subscription_created_at` set but neither
+/// `organization_type` nor `rate_limit_tier` matches our enum. Almost
+/// certainly Team/Workspace/Enterprise plans we haven't enumerated.
+///
+/// Currently those users bypass the pricing gate entirely, which means
+/// paying Anthropic customers get Headroom for free. Goal of this telemetry
+/// is to learn which taxonomy strings to add to the detection (or to a new
+/// "treat as Pro" fallback) before changing the gate policy.
+///
+/// Deduped on content — Sentry sees one event per distinct
+/// (organization_type, rate_limit_tier, has_subscription, billing_type)
+/// combo across the lifetime of the desktop process.
+fn log_unknown_plan_tier_once(profile: &ClaudeOauthProfile) {
+    use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::sync::OnceLock;
+
+    static SEEN: OnceLock<parking_lot::Mutex<HashSet<u64>>> = OnceLock::new();
+
+    let org = profile.organization.as_ref();
+    let organization_type = org
+        .and_then(|o| o.organization_type.as_deref())
+        .unwrap_or("");
+    let rate_limit_tier = org.and_then(|o| o.rate_limit_tier.as_deref()).unwrap_or("");
+    let billing_type = org.and_then(|o| o.billing_type.as_deref()).unwrap_or("");
+    let has_subscription_created_at = org
+        .and_then(|o| o.subscription_created_at.as_ref())
+        .is_some();
+
+    let mut hasher = DefaultHasher::new();
+    organization_type.hash(&mut hasher);
+    rate_limit_tier.hash(&mut hasher);
+    billing_type.hash(&mut hasher);
+    has_subscription_created_at.hash(&mut hasher);
+    let key = hasher.finish();
+
+    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(HashSet::new()));
+    if !seen.lock().insert(key) {
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "organization_type": organization_type,
+        "rate_limit_tier": rate_limit_tier,
+        "billing_type": billing_type,
+        "has_subscription_created_at": has_subscription_created_at,
+    });
+    sentry::capture_message(
+        &format!("plan_tier_unknown: {payload}"),
+        sentry::Level::Warning,
+    );
 }
 
 fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1363,10 +1448,9 @@ mod tests {
     fn identity_payload_serializes_with_camelcase_keys_and_skips_nulls() {
         let identity = IdentityPayload {
             device_id: "abc123".into(),
-            chopratejas_instance_id: None,
             claude_account_uuid: Some("claude-uuid".into()),
-            claude_email: None,
             claude_plan_tier: Some(ClaudePlanTier::Pro),
+            ..Default::default()
         };
         let json = serde_json::to_value(&identity).unwrap();
         assert_eq!(json["deviceId"], "abc123");
@@ -1380,10 +1464,7 @@ mod tests {
     fn identity_payload_skips_plan_when_none() {
         let identity = IdentityPayload {
             device_id: "abc123".into(),
-            chopratejas_instance_id: None,
-            claude_account_uuid: None,
-            claude_email: None,
-            claude_plan_tier: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&identity).unwrap();
         assert!(json.get("claudePlanTier").is_none());
@@ -1402,10 +1483,8 @@ mod tests {
     fn apply_headers_sets_plan_when_present() {
         let identity = IdentityPayload {
             device_id: "abc123".into(),
-            chopratejas_instance_id: None,
-            claude_account_uuid: None,
-            claude_email: None,
             claude_plan_tier: Some(ClaudePlanTier::Max20x),
+            ..Default::default()
         };
         let client = reqwest::blocking::Client::new();
         let req = identity
@@ -1422,10 +1501,7 @@ mod tests {
     fn apply_headers_omits_plan_when_none() {
         let identity = IdentityPayload {
             device_id: "abc123".into(),
-            chopratejas_instance_id: None,
-            claude_account_uuid: None,
-            claude_email: None,
-            claude_plan_tier: None,
+            ..Default::default()
         };
         let client = reqwest::blocking::Client::new();
         let req = identity
@@ -1531,6 +1607,8 @@ mod tests {
             has_extra_usage_enabled: false,
             plan_tier,
             plan_detection_source: None,
+            organization_type: None,
+            rate_limit_tier: None,
             weekly_utilization_pct: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
