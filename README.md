@@ -1,6 +1,6 @@
 # Headroom Desktop
 
-**Cut your LLM API bills by 60–90% without changing how you code.**
+**Cut your LLM API bills by ~50% without changing how you code.**
 
 > **Pricing:** Headroom has a free tier and paid plans — see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed; account features and paid plans are opt-in.
 

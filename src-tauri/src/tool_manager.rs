@@ -1399,8 +1399,35 @@ impl ToolManager {
     /// headroom package and its proxy entrypoint? Catches import errors, syntax
     /// errors, and missing transitive dependencies introduced by a new version
     /// before we try to actually boot the proxy.
+    ///
+    /// If the failure is a pydantic / pydantic-core skew (pip's `--upgrade -r
+    /// lock` left the two out of sync), reinstall pydantic-core at the version
+    /// pydantic asks for and retry the smoke test once. Mirrors the
+    /// proxy-startup repair in `start_headroom_proxy_with_repair` so the same
+    /// recoverable failure doesn't fail an in-flight upgrade and force a
+    /// rollback.
     pub fn smoke_test_headroom(&self) -> Result<()> {
-        self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
+        match self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let target = err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+                    .and_then(|f| extract_required_pydantic_core_version(&f.stderr));
+                let Some(target) = target else {
+                    return Err(err);
+                };
+                eprintln!(
+                    "smoke test failed with pydantic-core/pydantic skew; \
+                     reinstalling pydantic-core=={target} and retrying"
+                );
+                if let Err(repair_err) = self.repair_pydantic_core(&target) {
+                    eprintln!("pydantic-core repair failed: {repair_err:#}");
+                    return Err(err);
+                }
+                self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
+            }
+        }
     }
 
     fn smoke_test_headroom_with_timeout(&self, timeout: Duration) -> Result<()> {
@@ -2130,6 +2157,33 @@ impl ToolManager {
     /// log shows the SystemError pydantic raises during import. `--no-deps`
     /// keeps the rest of the venv untouched.
     fn repair_pydantic_core(&self, target_version: &str) -> Result<()> {
+        // Reinstall pydantic itself first (no version pin) to rewrite its
+        // dist-info. A failed prior upgrade can leave two `pydantic-X.Y.dist-info`
+        // dirs in site-packages; `importlib.metadata.metadata('pydantic')` then
+        // returns either one non-deterministically, producing flip-flopping
+        // "requires N.N.N" errors across attempts. Force-reinstalling pydantic
+        // collapses the duplicates so the next pin we apply actually matches
+        // what pydantic asks for.
+        run_pip_install_with_retries(
+            &self.runtime.managed_python(),
+            &[
+                "-m",
+                "pip",
+                "install",
+                "--timeout",
+                "180",
+                "--retries",
+                "10",
+                "--extra-index-url",
+                "https://pypi.org/simple",
+                "--no-deps",
+                "--force-reinstall",
+                "pydantic",
+            ],
+            &self.runtime.root_dir,
+        )
+        .with_context(|| "reinstalling pydantic to clear duplicate dist-info")?;
+
         let spec = format!("pydantic-core=={target_version}");
         run_pip_install_with_retries(
             &self.runtime.managed_python(),
@@ -5080,6 +5134,93 @@ after
         assert_eq!(failure.exit_code, Some(7));
         assert!(failure.stdout.contains("failure-stdout"));
         assert!(failure.stderr.contains("failure-stderr"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_headroom_repairs_pydantic_core_skew_and_retries() {
+        let (root, runtime, manager) = seed_test_runtime("smoke-pydantic-skew");
+        let state_file = root.join("smoke-attempts");
+        let pip_log = root.join("pip-args");
+        let script = format!(
+            r#"#!/bin/sh
+case "$1" in
+  -c)
+    if [ -f '{state}' ]; then
+      exit 0
+    fi
+    touch '{state}'
+    cat >&2 <<'EOF'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+SystemError: The installed pydantic-core version (2.41.5) is incompatible with the current pydantic version, which requires 2.46.3. If you encounter this error, make sure that you haven't upgraded pydantic-core manually.
+EOF
+    exit 1
+    ;;
+  -m)
+    echo "$@" >> '{pip_log}'
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            state = state_file.display(),
+            pip_log = pip_log.display(),
+        );
+        write_executable(&runtime.managed_python(), &script);
+
+        manager
+            .smoke_test_headroom()
+            .expect("repair should let smoke retry succeed");
+
+        let pip_args = fs::read_to_string(&pip_log).expect("pip log written");
+        assert!(
+            pip_args.contains("pydantic-core==2.46.3"),
+            "expected repair to install pydantic-core==2.46.3, got: {pip_args}"
+        );
+        // pydantic itself must also be force-reinstalled to collapse any
+        // duplicate dist-info dirs that cause the flip-flop skew.
+        let pydantic_invocations = pip_args
+            .lines()
+            .filter(|line| {
+                line.contains("--force-reinstall")
+                    && line.split_whitespace().any(|tok| tok == "pydantic")
+            })
+            .count();
+        assert_eq!(
+            pydantic_invocations, 1,
+            "expected exactly one force-reinstall of pydantic, got: {pip_args}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_headroom_does_not_repair_unrelated_failures() {
+        let (root, runtime, manager) = seed_test_runtime("smoke-unrelated-fail");
+        let state_file = root.join("attempts");
+        let script = format!(
+            "#!/bin/sh\necho >> '{state}'\necho boom >&2\nexit 1\n",
+            state = state_file.display(),
+        );
+        write_executable(&runtime.managed_python(), &script);
+
+        let err = manager
+            .smoke_test_headroom()
+            .expect_err("smoke should fail without retry");
+        let failure = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CommandFailure>())
+            .expect("command failure");
+        assert_eq!(failure.exit_code, Some(1));
+
+        let attempts = fs::read_to_string(&state_file).expect("attempts log");
+        assert_eq!(
+            attempts.lines().count(),
+            1,
+            "non-skew failures should not retry"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -202,6 +202,26 @@ fn hf_cache_grew(prev: Option<u64>, current: u64) -> bool {
     }
 }
 
+/// Whether the proxy is bound to its loopback port. Activity-only
+/// signal — does NOT imply reachability. The kernel still completes
+/// `accept()` even when uvicorn's event loop is held by an in-flight
+/// upstream call (e.g. a forwarded `POST /v1/messages` retrying
+/// against a 429-ing Anthropic), so a successful TCP connect proves
+/// the python process is alive and bound, even when no HTTP endpoint
+/// (`/livez`, `/health`, `/stats`) answers within the probe window.
+/// 1s timeout is enough for a localhost SYN/SYN-ACK and short enough
+/// not to dominate the 500ms loop tick if the OS is mid-bind.
+fn tcp_port_accepts_connection(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+/// Probe the proxy's loopback port (6768) with a 1s timeout. See
+/// [`tcp_port_accepts_connection`] for semantics.
+fn proxy_port_accepts_connection() -> bool {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], 6768).into();
+    tcp_port_accepts_connection(addr, std::time::Duration::from_secs(1))
+}
+
 /// Pure decision function for the boot-validation stall guard.
 /// Extracted from the polling loop so it can be tested without
 /// mocking the filesystem, the network, and a clock.
@@ -1067,13 +1087,21 @@ impl AppState {
     /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
     /// pass through the loop, emits a progress update via `on_progress`.
     ///
-    /// "Activity" is the union of two signals: (1) a write to any
-    /// ``headroom-proxy*.log`` file, and (2) growth in the HuggingFace hub
-    /// cache. Either one resets the silence timer. The HF signal is what
-    /// keeps slow-but-progressing first-run downloads from being killed —
+    /// "Activity" is the union of three signals: (1) a write to any
+    /// ``headroom-proxy*.log`` file, (2) growth in the HuggingFace hub
+    /// cache, and (3) a successful TCP connect to ``127.0.0.1:6768``.
+    /// Any one resets the silence timer. The HF signal is what keeps
+    /// slow-but-progressing first-run downloads from being killed —
     /// when transformers/huggingface_hub is silently pulling multi-GB
-    /// model weights, the python process writes nothing to its log, but
-    /// the cache directory grows monotonically.
+    /// model weights, the python process writes nothing to its log,
+    /// but the cache directory grows monotonically. The TCP signal
+    /// covers the case where the proxy is alive and bound but its
+    /// asyncio event loop is held by an in-flight forwarded request
+    /// (e.g. a `POST /v1/messages` retrying against a 429-ing
+    /// upstream) — the kernel still completes ``accept()`` even when
+    /// uvicorn isn't draining the socket, so a successful connect
+    /// proves the python process is alive even though no HTTP
+    /// endpoint answers.
     fn wait_for_boot_validation<F>(&self, mut on_progress: F) -> BootValidationOutcome
     where
         F: FnMut(std::time::Duration, bool),
@@ -1149,9 +1177,20 @@ impl AppState {
                 last_hf_size = Some(current_size);
             }
 
+            // Refresh TCP-bound observation. If the kernel accepts a
+            // connection on :6768, the python process is alive and
+            // listening — even if the asyncio loop is currently held
+            // by an in-flight forwarded request and no HTTP endpoint
+            // answers. This is the load-bearing signal that keeps a
+            // busy-but-alive proxy from being killed as "stalled".
+            let port_bound = proxy_port_accepts_connection();
+            if port_bound {
+                last_log_activity = Instant::now();
+            }
+
             let activity_age = last_log_activity.elapsed();
             let has_recent_activity = activity_age < silence
-                && (current_mtime.is_some() || last_hf_size.unwrap_or(0) > 0);
+                && (current_mtime.is_some() || last_hf_size.unwrap_or(0) > 0 || port_bound);
 
             // Past grace period and nothing has moved in either signal
             // for the silence window → treat as stalled.
@@ -4332,7 +4371,8 @@ mod tests {
         classify_startup_error, hf_cache_grew, lifetime_token_milestones_crossed,
         lifetime_usd_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, total_dir_size_bytes, AppState, ClaudeProjectScan,
+        parse_headroom_stats_history_from_json, tcp_port_accepts_connection,
+        total_dir_size_bytes, AppState, ClaudeProjectScan,
         DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
@@ -4444,6 +4484,39 @@ mod tests {
         // Shrunk (HF cache pruning during boot — rare, but the function
         // shouldn't lie and call this growth).
         assert!(!hf_cache_grew(Some(200), 100));
+    }
+
+    #[test]
+    fn tcp_port_accepts_connection_true_when_listener_bound() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        // Bind to an ephemeral port; OS picks an unused one.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+
+        assert!(tcp_port_accepts_connection(addr, Duration::from_secs(1)));
+
+        // The listener never accept()s — but the kernel still completes
+        // the connect, which is the whole point: an alive-but-busy
+        // proxy whose event loop is held still passes this check.
+        drop(listener);
+    }
+
+    #[test]
+    fn tcp_port_accepts_connection_false_when_no_listener() {
+        use std::net::{SocketAddr, TcpListener};
+        use std::time::Duration;
+
+        // Bind to grab a port, then drop the listener so nothing is
+        // listening on it. There's a race window where the OS could
+        // hand the port to another process, but in practice this is
+        // reliable for the test's lifetime.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        assert!(!tcp_port_accepts_connection(addr, Duration::from_millis(200)));
     }
 
     #[test]
