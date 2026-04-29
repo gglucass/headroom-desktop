@@ -143,10 +143,10 @@ Use `./scripts/bump-version.sh <version>` to update all four version files at on
 
 Two release channels are wired into CI:
 
-- **`main`** — stable channel. Users on the default download get updates from here. Version must be plain `X.Y.Z`.
+- **`main`** — stable channel. Users on the default download get updates from here. Version must be plain `X.Y.Z`. Branch-protected: direct pushes are rejected; changes land via PR only.
 - **`staging`** — release candidate channel. Installs via a separate build pointing at the rolling `staging` GitHub release. Version must be `X.Y.Z-rc.N`.
 
-Work happens on `feature/*` branches, which merge into `staging` for testing, which merges into `main` for promotion. `main` is fast-forward only from `staging`.
+Work happens on `feature/*` branches, which merge into `staging` for testing. Stable promotions land on `main` via a release PR (see below).
 
 **Release candidate flow:**
 
@@ -157,14 +157,21 @@ Work happens on `feature/*` branches, which merge into `staging` for testing, wh
 
 **Promoting to stable:**
 
-1. Fast-forward merge `staging` → `main`.
-2. Bump version to plain `X.Y.Z` (strip `-rc.N`) and push. `.github/workflows/release-macos.yml` publishes the stable release.
-3. The main workflow **enforces** that a `vX.Y.Z-rc.N` prerelease exists whose commit is an ancestor of the stable commit. If not, the build fails. This guarantees stable only ships code that was tested via the staging channel.
-4. After the stable build is published, the main workflow re-points the rolling `staging` release at the stable DMG. The staging machine receives that as an update, installs it, and — because the new version is plain `X.Y.Z` — automatically switches to the stable endpoint for all future checks.
+`main` is branch-protected, so promotions go through a release PR. The merge **must** be a merge commit (not squash, not rebase) so the staging commits — including the rc tag's commit — remain in `main`'s history and the rc-ancestor check passes.
+
+1. From the verified `staging` tip, cut a release branch: `git checkout -b release/X.Y.Z staging`.
+2. On that branch, run `./scripts/bump-version.sh X.Y.Z` (strips `-rc.N`), commit, push.
+3. Open a PR from `release/X.Y.Z` into `main`.
+4. Merge with **"Create a merge commit"**. `.github/workflows/release-macos.yml` triggers on the push to `main` and publishes the stable release.
+5. The main workflow **enforces** that a `vX.Y.Z-rc.N` prerelease exists whose commit is an ancestor of the stable (merge) commit. If not, the build fails. This guarantees stable only ships code that was tested via the staging channel.
+6. After the stable build is published, the main workflow re-points the rolling `staging` release at the stable DMG. The staging machine receives that as an update, installs it, and — because the new version is plain `X.Y.Z` — automatically switches to the stable endpoint for all future checks.
+7. Delete the `release/X.Y.Z` branch.
+
+> Recommended: in **Settings → General → Pull Requests**, leave only "Allow merge commits" enabled and disable squash and rebase merges. The rc-ancestor check already rejects squashed/rebased promotions at build time, but disabling them at the repo level prevents an accidental click that lands a broken bump on `main`.
 
 **Bypassing the rc check:**
 
-For hotfixes where a staging cycle is impractical, include `[skip-rc-check]` in the commit message that bumps the version on `main`. Use sparingly — the guard exists to prevent untested stable releases.
+For hotfixes where a staging cycle is impractical, include `[skip-rc-check]` in the **PR merge commit message** (the workflow reads the merge commit's message, not the bump commit's). Easiest path: put `[skip-rc-check]` in the PR title or first body line so GitHub includes it in the auto-generated merge commit. Use sparingly — the guard exists to prevent untested stable releases.
 
 ## Development
 

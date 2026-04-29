@@ -218,6 +218,19 @@ async fn forward_direct_to_anthropic(
         return;
     };
 
+    // These paths are served by the local Python proxy, not Anthropic. In
+    // bypass mode the proxy is intentionally down, so reply 503 instead of
+    // forwarding upstream (which would either fail noisily or, worse, hit a
+    // real Anthropic endpoint that happens to share the path).
+    // Denylist (not allowlist) so future Anthropic API versions like /v2/*
+    // continue to forward automatically without requiring a desktop update.
+    if is_local_proxy_path(&parsed.path) {
+        let _ = client
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
     let body = match parsed.content_length {
         Some(total) if total > leftover_body.len() => {
             let mut body = Vec::with_capacity(total);
@@ -439,6 +452,30 @@ where
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Paths served by the local Python proxy (not Anthropic). Matches the prefix
+/// so sub-paths (e.g. `/transformations/feed`) and query strings are covered,
+/// while preventing partial matches (e.g. `/healthcheck` does not match
+/// `/health`).
+fn is_local_proxy_path(path: &str) -> bool {
+    const LOCAL_PREFIXES: &[&str] = &[
+        "/readyz",
+        "/livez",
+        "/health",
+        "/stats",
+        "/transformations",
+        "/dashboard",
+        "/debug",
+        "/subscription-window",
+        "/quota",
+        "/metrics",
+        "/cache",
+    ];
+    LOCAL_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('?'))
+    })
 }
 
 /// Return true if the request's Host header targets the loopback listener
