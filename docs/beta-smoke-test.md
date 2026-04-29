@@ -22,33 +22,27 @@ Expect: the `-rc.N` version you just installed.
 ### 2. Proxy is intercepting this conversation
 Send a trivial prompt ("say hi"), then:
 ```bash
-/usr/bin/python3 -c "import json; d=json.load(open('/Users/garmlucassen/Library/Application Support/Headroom/config/activity-facts.json')); print(d['lastTransformation']['observedAt'])"
-```
-Expect: a UTC timestamp within the last minute. (The proxy log file mtime is not a reliable signal — it can lag by minutes between heartbeats.)
-
-### 3. Activity facts updated
-```bash
 stat -f '%Sm' ~/Library/Application\ Support/Headroom/config/activity-facts.json
 ```
-Expect: mtime within the last minute (after step 2).
+Expect: mtime within the last minute. `lastTransformation` inside the file is a "Recent large compression" tile pick (gated on >=1000 tokens saved and >20% savings, see `activity_facts.rs`), not a per-request heartbeat — don't use it as a liveness signal.
 
-### 4. RTK is on PATH and reports savings
+### 3. RTK is on PATH and reports savings
 ```bash
 rtk --version && rtk gain | head -5
 ```
 Expect: a version line and a gain summary, no "command not found".
 
-### 5. MCP retrieve tool is available (only if memory tools are enabled)
+### 4. MCP retrieve tool is available (only if memory tools are enabled)
 First check whether the proxy was started with memory tools:
 ```bash
 ls ~/Library/Application\ Support/Headroom/headroom/logs/ | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
 ```
 If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a tool result (not "No such tool available").
 
-### 6. Tray → Dashboard renders
+### 5. Tray → Dashboard renders
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
-### 7. Pause / resume cleanly strips and restores interception
+### 6. Pause / resume cleanly strips and restores interception
 In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`.
 
 ## Inspecting the proxy directly

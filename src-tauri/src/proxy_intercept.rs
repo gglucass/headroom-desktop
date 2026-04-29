@@ -62,11 +62,11 @@ pub fn spawn(token_slot: SharedToken, bypass: BypassFlag) {
                         // that as benign. Otherwise the port is foreign and we
                         // escalate to Sentry.
                         if probe_existing_intercept().await {
-                            eprintln!(
+                            log::info!(
                                 "[proxy_intercept] port {INTERCEPT_PORT} already owned by existing Headroom proxy; exiting thread"
                             );
                         } else {
-                            eprintln!(
+                            log::debug!(
                                 "[proxy_intercept] fatal: {e} (port {INTERCEPT_PORT} held by foreign process)"
                             );
                             sentry::capture_message(
@@ -78,7 +78,7 @@ pub fn spawn(token_slot: SharedToken, bypass: BypassFlag) {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[proxy_intercept] fatal: {e}");
+                        log::debug!("[proxy_intercept] fatal: {e}");
                         sentry::capture_message(
                             &format!("proxy_intercept fatal error: {e}"),
                             sentry::Level::Fatal,
@@ -110,7 +110,7 @@ async fn run(
             Err(e) => {
                 // EMFILE/ENFILE/ECONNABORTED are transient — log and keep serving
                 // so the proxy self-heals once FDs free up, instead of dying.
-                eprintln!("[proxy_intercept] accept error: {e}");
+                log::warn!("[proxy_intercept] accept error: {e}");
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
@@ -271,11 +271,7 @@ async fn forward_direct_to_anthropic(
     let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[proxy_intercept] bypass forward failed: {e}");
-            sentry::capture_message(
-                &format!("proxy_intercept bypass forward failed: {e}"),
-                sentry::Level::Warning,
-            );
+            log::warn!("proxy_intercept bypass forward failed: {e}");
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
@@ -318,7 +314,7 @@ async fn forward_direct_to_anthropic(
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
-                eprintln!("[proxy_intercept] bypass body stream error: {e}");
+                log::debug!("[proxy_intercept] bypass body stream error: {e}");
                 return;
             }
         }

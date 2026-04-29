@@ -6,6 +6,7 @@ mod client_adapters;
 mod device;
 mod insights;
 mod keychain;
+mod logging;
 mod models;
 mod port_conflict;
 mod pricing;
@@ -413,11 +414,7 @@ fn bootstrap_runtime(state: State<'_, AppState>) -> Result<DashboardState, Strin
         &state.tool_manager.rtk_entrypoint(),
         &state.tool_manager.managed_python(),
     ) {
-        eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
-        sentry::capture_message(
-            &format!("RTK integrations failed after bootstrap_runtime: {err}"),
-            sentry::Level::Warning,
-        );
+        log::warn!("RTK integrations failed after bootstrap_runtime: {err}");
     }
     state
         .ensure_headroom_running()
@@ -476,11 +473,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 &state.tool_manager.rtk_entrypoint(),
                 &state.tool_manager.managed_python(),
             ) {
-                eprintln!("failed to ensure RTK integrations after bootstrap: {err}");
-                sentry::capture_message(
-                    &format!("RTK integrations failed after start_bootstrap thread: {err}"),
-                    sentry::Level::Warning,
-                );
+                log::warn!("RTK integrations failed after start_bootstrap thread: {err}");
             }
         }
 
@@ -504,7 +497,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.set_runtime_starting(true);
 
         if let Err(err) = ensure_result {
-            eprintln!("headroom auto-start failed after bootstrap: {err}");
+            log::debug!("headroom auto-start failed after bootstrap: {err}");
             // Bootstrap finishes and immediately tries to start the proxy;
             // a port conflict here counts as a "fresh launch" stuck case.
             let handled = port_conflict::note_proxy_failed(&app_handle, &err, true);
@@ -909,11 +902,11 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 #[cfg(debug_assertions)]
 #[tauri::command]
 fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool, String> {
-    eprintln!("[debug_force_proxy_bypass] requested on={on}");
+    log::debug!("[debug_force_proxy_bypass] requested on={on}");
     state
         .proxy_bypass
         .store(on, std::sync::atomic::Ordering::Release);
-    eprintln!(
+    log::debug!(
         "[debug_force_proxy_bypass] stored bypass={}",
         state
             .proxy_bypass
@@ -921,7 +914,7 @@ fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool
     );
     if on {
         state.stop_headroom();
-        eprintln!("[debug_force_proxy_bypass] stop_headroom complete");
+        log::debug!("[debug_force_proxy_bypass] stop_headroom complete");
     } else {
         // Recover from any auto-pause / client teardown that may have run
         // while bypass was active (the watchdog's give-up path or the
@@ -1831,15 +1824,6 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
 }
 
 pub fn run() {
-    #[cfg(target_os = "linux")]
-    {
-        let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
-        if !has_display {
-            eprintln!("Headroom requires a graphical display. Set DISPLAY or WAYLAND_DISPLAY before launching.");
-            std::process::exit(1);
-        }
-    }
-
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
@@ -1848,6 +1832,21 @@ pub fn run() {
             ..Default::default()
         },
     ));
+
+    // Initialize the panic-safe file logger after Sentry so warn!/error!
+    // records flow into Sentry too. Failure here cannot abort startup.
+    let _ = logging::init();
+
+    #[cfg(target_os = "linux")]
+    {
+        let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+        if !has_display {
+            log::error!(
+                "Headroom requires a graphical display. Set DISPLAY or WAYLAND_DISPLAY before launching."
+            );
+            std::process::exit(1);
+        }
+    }
 
     let state = AppState::new().expect("failed to create app state");
 
@@ -1926,9 +1925,10 @@ pub fn run() {
             use tauri_plugin_deep_link::DeepLinkExt;
             let deep_link_app = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
-                // NOTE: do NOT use `eprintln!`/`println!` here. When macOS
+                // NOTE: never call `eprintln!`/`println!` here. When macOS
                 // launches the app fresh via a URL scheme, stderr is not
-                // connected to a valid fd and any write panics with EIO.
+                // connected to a valid fd and any stdio write panics with
+                // EIO. Use `log::*` (panic-safe file logger) instead.
                 //
                 // This callback is invoked synchronously from tao's
                 // `application:openURLs:` handler, which is `extern "C"` —
@@ -2760,7 +2760,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
                 if icon_changed || tooltip_changed {
                     if let Err(err) = tray.set_tooltip(Some(tooltip)) {
-                        eprintln!("tray: set_tooltip failed: {err}");
+                        log::warn!("tray: set_tooltip failed: {err}");
                     }
                     last_tooltip = Some(tooltip.to_string());
                 }
@@ -2839,7 +2839,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             );
             if !should_be_up {
                 if consecutive_failures > 0 {
-                    eprintln!(
+                    log::debug!(
                         "watchdog: skip restart (installed={}, paused={}, starting={}, upgrading={}, bypass={}); resetting failure counter",
                         runtime.installed,
                         runtime.paused,
@@ -2858,18 +2858,18 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             }
 
             consecutive_failures = consecutive_failures.saturating_add(1);
-            eprintln!(
+            log::warn!(
                 "watchdog: proxy unreachable (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}, bypass={bypass_active}), attempting restart"
             );
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                eprintln!(
+                log::error!(
                     "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; disabling interception"
                 );
                 state.set_runtime_paused(true);
                 state.stop_headroom();
                 if let Err(err) = client_adapters::clear_client_setups() {
-                    eprintln!("watchdog: clear_client_setups failed: {err}");
+                    log::warn!("watchdog: clear_client_setups failed: {err}");
                 }
                 analytics::track_event(&app, "runtime_auto_paused", None);
                 let _ = show_notification_impl(
@@ -2886,7 +2886,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             match state.ensure_headroom_running() {
                 Ok(()) => port_conflict::note_proxy_started(&app),
                 Err(err) => {
-                    eprintln!("watchdog: ensure_headroom_running failed: {err:#}");
+                    log::warn!("watchdog: ensure_headroom_running failed: {err:#}");
                     // In-session retry: don't bump the launch counter.
                     port_conflict::note_proxy_failed(&app, &err, false);
                 }

@@ -536,18 +536,18 @@ impl ToolManager {
                     .iter()
                     .find_map(|f| extract_required_pydantic_core_version(&f.log_tail))
                 {
-                    eprintln!(
+                    log::warn!(
                         "headroom proxy failed with pydantic-core/pydantic skew; \
                      reinstalling pydantic-core=={target} and retrying"
                     );
                     match self.repair_pydantic_core(&target) {
                         Ok(()) => {
-                            eprintln!("pydantic-core repair succeeded; retrying headroom startup");
+                            log::warn!("pydantic-core repair succeeded; retrying headroom startup");
                             allow_repair = false;
                             continue 'attempt;
                         }
                         Err(repair_err) => {
-                            eprintln!("pydantic-core repair failed: {repair_err:#}");
+                            log::error!("pydantic-core repair failed: {repair_err:#}");
                         }
                     }
                 }
@@ -885,7 +885,7 @@ impl ToolManager {
         }
         if LEGACY_REQUIREMENTS_LOCK_SHAS.contains(&stored.as_str()) {
             if let Err(err) = self.write_requirements_lock_sha_to_receipt(&current) {
-                eprintln!("failed to migrate legacy requirementsLockSha256: {err}");
+                log::warn!("failed to migrate legacy requirementsLockSha256: {err}");
             }
             return false;
         }
@@ -975,7 +975,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                eprintln!("headroom MCP setup skipped during repair: {err}");
+                log::warn!("headroom MCP setup skipped during repair: {err}");
                 json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
             }
         };
@@ -1233,9 +1233,9 @@ impl ToolManager {
             match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
                 Ok(()) => true,
                 Err(download_err) => {
-                    eprintln!(
-                    "headroom wheel download failed (will fall back to pip index): {download_err}"
-                );
+                    log::warn!(
+                        "headroom wheel download failed (will fall back to pip index): {download_err}"
+                    );
                     false
                 }
             };
@@ -1337,7 +1337,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                eprintln!("headroom MCP setup skipped: {err}");
+                log::warn!("headroom MCP setup skipped: {err}");
                 json!({
                     "configured": false,
                     "proxyUrl": HEADROOM_PROXY_URL,
@@ -1417,12 +1417,12 @@ impl ToolManager {
                 let Some(target) = target else {
                     return Err(err);
                 };
-                eprintln!(
+                log::warn!(
                     "smoke test failed with pydantic-core/pydantic skew; \
                      reinstalling pydantic-core=={target} and retrying"
                 );
                 if let Err(repair_err) = self.repair_pydantic_core(&target) {
-                    eprintln!("pydantic-core repair failed: {repair_err:#}");
+                    log::error!("pydantic-core repair failed: {repair_err:#}");
                     return Err(err);
                 }
                 self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
@@ -1555,7 +1555,7 @@ impl ToolManager {
         // `check_headroom_upgrade` will then retry the swap fresh.
         if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
         {
-            eprintln!(
+            log::warn!(
                 "recover_from_interrupted_upgrade: in-place upgrade was in progress; \
                  reinstalling previous headroom-ai {previous_version}"
             );
@@ -1580,7 +1580,7 @@ impl ToolManager {
         let receipt_backup = self.headroom_receipt_backup_path();
         let receipt_path = self.headroom_receipt_path();
 
-        eprintln!(
+        log::warn!(
             "recover_from_interrupted_upgrade: found stale marker at {}; restoring backup",
             marker.display()
         );
@@ -1590,7 +1590,7 @@ impl ToolManager {
             // Blow it away and put the backup back in its place.
             if venv_dir.exists() {
                 if let Err(err) = std::fs::remove_dir_all(venv_dir) {
-                    eprintln!(
+                    log::error!(
                         "recover_from_interrupted_upgrade: failed to remove partial venv at {}: {err}",
                         venv_dir.display()
                     );
@@ -1600,7 +1600,7 @@ impl ToolManager {
                 }
             }
             if let Err(err) = std::fs::rename(&backup_dir, venv_dir) {
-                eprintln!(
+                log::error!(
                     "recover_from_interrupted_upgrade: failed to restore venv from {}: {err}",
                     backup_dir.display()
                 );
@@ -1614,7 +1614,7 @@ impl ToolManager {
             // No backup to restore from. Rare — the user (or a script) deleted
             // the backup dir while the marker was still live. Best we can do
             // is clear the marker so we don't loop on this state.
-            eprintln!(
+            log::warn!(
                 "recover_from_interrupted_upgrade: no backup at {}; clearing marker",
                 backup_dir.display()
             );
@@ -2022,9 +2022,9 @@ impl ToolManager {
             match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
                 Ok(()) => true,
                 Err(download_err) => {
-                    eprintln!(
-                    "headroom wheel download failed (will fall back to pip index): {download_err}"
-                );
+                    log::warn!(
+                        "headroom wheel download failed (will fall back to pip index): {download_err}"
+                    );
                     false
                 }
             };
@@ -2101,7 +2101,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                eprintln!("headroom MCP setup skipped: {err}");
+                log::warn!("headroom MCP setup skipped: {err}");
                 json!({
                     "configured": false,
                     "proxyUrl": HEADROOM_PROXY_URL,
@@ -2299,7 +2299,7 @@ impl ToolManager {
         let backup_dir = self.venv_backup_dir();
         if backup_dir.exists() {
             if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
-                eprintln!(
+                log::warn!(
                     "commit_headroom_upgrade: non-fatal: failed to remove {}: {err}",
                     backup_dir.display()
                 );
@@ -2322,7 +2322,7 @@ impl ToolManager {
         // Remove any partial new venv.
         if self.runtime.venv_dir.exists() {
             if let Err(err) = std::fs::remove_dir_all(&self.runtime.venv_dir) {
-                eprintln!(
+                log::error!(
                     "rollback: failed to remove partial venv at {}: {err}",
                     self.runtime.venv_dir.display()
                 );
@@ -2337,7 +2337,7 @@ impl ToolManager {
             let receipt_path = self.headroom_receipt_path();
             let receipt_backup = self.headroom_receipt_backup_path();
             if let Err(err) = std::fs::copy(&receipt_backup, &receipt_path) {
-                eprintln!(
+                log::error!(
                     "rollback: failed to restore {}: {err}",
                     receipt_path.display()
                 );
@@ -2362,7 +2362,7 @@ impl ToolManager {
         match std::fs::rename(&backup_dir, &self.runtime.venv_dir) {
             Ok(()) => true,
             Err(err) => {
-                eprintln!(
+                log::error!(
                     "rollback: failed to restore venv from {}: {err}",
                     backup_dir.display()
                 );
@@ -3591,7 +3591,7 @@ where
         match run_command_streaming(python, args, cwd, &mut on_line) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                eprintln!(
+                log::warn!(
                     "pip install attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, err
                 );
