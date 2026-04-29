@@ -1633,7 +1633,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "headroom-desktop"
-version = "0.3.5-rc.2"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "chrono",
