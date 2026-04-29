@@ -154,7 +154,9 @@ struct ClaudeOauthProfileOrganization {
     has_extra_usage_enabled: bool,
     /// e.g. "claude_pro", "claude_max", "claude_enterprise"
     organization_type: Option<String>,
-    /// e.g. "default_claude_ai", "claude_max_5x", "claude_max_20x"
+    /// e.g. "default_claude_ai", "claude_max_5x", "claude_max_20x",
+    /// "default_claude_max_x5", "default_claude_max_x20" (Anthropic ships both
+    /// the `_5x`/`_20x` and `_x5`/`_x20` orderings in the wild)
     rate_limit_tier: Option<String>,
 }
 
@@ -982,13 +984,15 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
 
     if let Some(rate_limit_tier) = org.rate_limit_tier.as_deref() {
         let normalized = rate_limit_tier.trim().to_ascii_lowercase();
-        if normalized.contains("20x") {
+        // Anthropic ships both orderings in the wild: "claude_max_20x" and
+        // "default_claude_max_x20" (same for 5x/x5). Match either.
+        if normalized.contains("20x") || normalized.contains("x20") {
             return (
                 ClaudePlanTier::Max20x,
                 Some("oauth_profile.organization.rateLimitTier".into()),
             );
         }
-        if normalized.contains("5x") {
+        if normalized.contains("5x") || normalized.contains("x5") {
             return (
                 ClaudePlanTier::Max5x,
                 Some("oauth_profile.organization.rateLimitTier".into()),
@@ -1987,6 +1991,32 @@ mod tests {
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_rate_limit_x5_variant_is_max5x() {
+        let p = oauth_profile(
+            Some("default_claude_max_x5"),
+            Some("default_claude"),
+            Some(Utc::now()),
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max5x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_rate_limit_x20_variant_is_max20x() {
+        let p = oauth_profile(
+            Some("default_claude_max_x20"),
+            Some("default_claude"),
+            Some(Utc::now()),
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
         ));
     }
 
