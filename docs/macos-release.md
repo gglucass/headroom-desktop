@@ -216,7 +216,7 @@ There are two channels with separate GitHub Actions workflows:
 
 - Feature work happens on `feature/*` branches.
 - Feature branches merge into `staging` for release-candidate builds.
-- `staging` fast-forwards into `main` for stable promotion.
+- `main` is branch-protected (no direct pushes). Stable promotion goes through a release PR from a `release/X.Y.Z` branch (cut from the verified `staging` tip, with the version bumped to plain `X.Y.Z`) into `main`. Merge with **"Create a merge commit"** — squash and rebase merges rewrite the staging SHAs and break the rc-ancestor check below. See the README for the full step-by-step.
 
 ### Staging workflow
 
@@ -242,7 +242,7 @@ The stable workflow refuses to run unless:
 1. The version is plain `X.Y.Z` (no `-rc` suffix).
 2. A `vX.Y.Z-rc.N` prerelease exists on GitHub whose tagged commit is an ancestor of the commit being released. This enforces that stable only ships code that was tested via the staging channel.
 
-To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the commit message that bumps the version on `main`.
+To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the **PR merge commit message** (the workflow reads the merge commit on `main`, not the bump commit on the release branch). Putting `[skip-rc-check]` in the PR title or first body line is the easiest way — GitHub copies it into the auto-generated merge commit.
 
 ### Final update-flow verification
 

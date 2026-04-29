@@ -223,6 +223,63 @@ fn proxy_port_accepts_connection() -> bool {
     tcp_port_accepts_connection(addr, std::time::Duration::from_secs(1))
 }
 
+/// Parse the `ps -p PID -o time=` accumulated CPU time format.
+/// macOS `ps` emits this as `MM:SS.ss`, `HH:MM:SS`, or `D-HH:MM:SS`
+/// depending on duration. Returns whole seconds; sub-second precision
+/// is dropped (we only care about per-tick advancement, which is
+/// always >=1s of CPU work to register).
+fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (days, rest) = match trimmed.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0u64, trimmed),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, s_raw) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, *s),
+        [m, s] => (0u64, m.parse::<u64>().ok()?, *s),
+        _ => return None,
+    };
+    // Drop fractional seconds.
+    let s_whole = s_raw.split('.').next()?.parse::<u64>().ok()?;
+    Some(days * 86400 + h * 3600 + m * 60 + s_whole)
+}
+
+/// Read accumulated CPU time (seconds) for ``pid`` via macOS `ps`.
+/// Returns None if the process is gone or `ps` fails. Cheap enough
+/// to call on a 500ms boot-validation tick — fork+exec of a tiny
+/// system binary, no I/O beyond the kernel proc table.
+fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "time="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_cpu_time(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether the tracked process's accumulated CPU time advanced since
+/// the previous observation. Catches the "alive but silent" case —
+/// e.g. ONNX graph compile, model load, any synchronous CPU-bound
+/// work in the proxy's lifespan startup that produces no log writes,
+/// no HF cache growth, and doesn't yet bind :6768. Treats the first
+/// observation (None → Some(>0)) as growth so a process that's
+/// already burned cycles before we started polling counts as active;
+/// None → Some(0) is "just spawned, not yet doing work" and is NOT
+/// growth (matches `hf_cache_grew` semantics).
+fn cpu_time_advanced(prev: Option<u64>, current: Option<u64>) -> bool {
+    match (prev, current) {
+        (Some(p), Some(c)) => c > p,
+        (None, Some(c)) => c > 0,
+        _ => false,
+    }
+}
+
 /// Pure decision function for the boot-validation stall guard.
 /// Extracted from the polling loop so it can be tested without
 /// mocking the filesystem, the network, and a clock.
@@ -646,6 +703,13 @@ impl AppState {
         // an implementation detail tracked in the failure record only.
         let previous_app_version = self.launch_profile.lock().last_launched_app_version.clone();
 
+        // Snapshot the newest proxy log mtime BEFORE we stop the old proxy and
+        // install the new one. At failure time we compare against this to tell
+        // "the new proxy wrote some logs (so it at least started python)" from
+        // "the new proxy never produced any log activity (likely failed to
+        // spawn or crashed pre-import)".
+        let pre_upgrade_log_mtime = newest_proxy_log_mtime(&self.tool_manager.logs_dir());
+
         *self.runtime_upgrade_in_progress.lock() = true;
         self.invalidate_runtime_status_cache();
 
@@ -755,6 +819,7 @@ impl AppState {
                     Some(duration_ms),
                     Some(target_version.as_str()),
                     installed_version.as_deref(),
+                    None,
                     None,
                 );
                 analytics::track_event(
@@ -911,6 +976,23 @@ impl AppState {
         let log_tail = crate::tool_manager::newest_proxy_log_path(&self.tool_manager.logs_dir())
             .map(|path| crate::tool_manager::tail_log_file(&path, 30))
             .filter(|s| !s.is_empty());
+
+        // Diagnostics for Sentry — capture before stop_headroom() tears down
+        // the tracked child and the proxy port. These three booleans
+        // distinguish the failure modes that all surface as "Stalled":
+        //   tracked_child=false → ensure_headroom_running silently no-op'd
+        //   new_proxy_log_written=false → spawn happened but python never
+        //                                 reached the logging setup
+        //   proxy_port_bound=false → uvicorn never reached its bind() call
+        let boot_diagnostics = crate::UpgradeBootDiagnostics {
+            tracked_child: self.headroom_process.lock().is_some(),
+            new_proxy_log_written: log_mtime_advanced(
+                pre_upgrade_log_mtime,
+                newest_proxy_log_mtime(&self.tool_manager.logs_dir()),
+            ),
+            proxy_port_bound: proxy_port_accepts_connection(),
+        };
+
         self.stop_headroom();
         let rollback_result = if needs_commit_or_rollback {
             self.tool_manager.rollback_headroom_upgrade()
@@ -990,6 +1072,7 @@ impl AppState {
             Some(target_version.as_str()),
             installed_version.as_deref(),
             log_tail.as_deref(),
+            Some(boot_diagnostics),
         );
         analytics::track_event(
             app,
@@ -1096,9 +1179,10 @@ impl AppState {
     /// stall threshold, or `RUNTIME_UPGRADE_BOOT_MAX_SECS` elapses. On each
     /// pass through the loop, emits a progress update via `on_progress`.
     ///
-    /// "Activity" is the union of three signals: (1) a write to any
+    /// "Activity" is the union of four signals: (1) a write to any
     /// ``headroom-proxy*.log`` file, (2) growth in the HuggingFace hub
-    /// cache, and (3) a successful TCP connect to ``127.0.0.1:6768``.
+    /// cache, (3) a successful TCP connect to ``127.0.0.1:6768``, and
+    /// (4) advancement of the tracked child's accumulated CPU time.
     /// Any one resets the silence timer. The HF signal is what keeps
     /// slow-but-progressing first-run downloads from being killed —
     /// when transformers/huggingface_hub is silently pulling multi-GB
@@ -1110,7 +1194,12 @@ impl AppState {
     /// upstream) — the kernel still completes ``accept()`` even when
     /// uvicorn isn't draining the socket, so a successful connect
     /// proves the python process is alive even though no HTTP
-    /// endpoint answers.
+    /// endpoint answers. The CPU-time signal covers a fourth case
+    /// that all three above miss: lifespan-phase work that's neither
+    /// writing logs nor downloading models nor yet bound to the port,
+    /// e.g. ONNX graph compilation or eager-loading already-cached
+    /// models. As long as the python process is burning CPU, it's
+    /// not deadlocked.
     fn wait_for_boot_validation<F>(&self, mut on_progress: F) -> BootValidationOutcome
     where
         F: FnMut(std::time::Duration, bool),
@@ -1136,12 +1225,19 @@ impl AppState {
         // 50k entries is well above any healthy first-run install.
         const HF_CACHE_WALK_CAP: usize = 50_000;
 
+        // Capture the tracked PID once at loop entry. If `headroom_process`
+        // is None now (e.g. ensure_headroom_running short-circuited or the
+        // spawn errored), it stays None for the duration — capturing once
+        // avoids re-acquiring the lock every 500ms.
+        let tracked_pid: Option<u32> = self.headroom_process.lock().as_ref().map(|c| c.id());
+
         let start = Instant::now();
         let mut last_log_activity = start;
         let mut last_seen_mtime = newest_proxy_log_mtime(&logs_dir);
         let mut last_hf_size = hf_cache
             .as_deref()
             .map(|p| total_dir_size_bytes(p, HF_CACHE_WALK_CAP));
+        let mut last_cpu_secs: Option<u64> = tracked_pid.and_then(tracked_process_cpu_time_secs);
         let mut last_progress = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
@@ -1197,9 +1293,30 @@ impl AppState {
                 last_log_activity = Instant::now();
             }
 
+            // Refresh CPU-time observation. Catches lifespan-phase work
+            // that's invisible to the three signals above — e.g. ONNX
+            // graph compile or eager-loading pre-cached models, which
+            // can sit silent for >90s while the python process is hot
+            // on a CPU. Only fires for the tracked child; if we don't
+            // own a Child handle (rare — ensure_headroom_running
+            // short-circuited or errored), this signal is unavailable
+            // and we lean on the other three.
+            let mut cpu_advanced = false;
+            if let Some(pid) = tracked_pid {
+                let current_cpu_secs = tracked_process_cpu_time_secs(pid);
+                if cpu_time_advanced(last_cpu_secs, current_cpu_secs) {
+                    last_log_activity = Instant::now();
+                    cpu_advanced = true;
+                }
+                last_cpu_secs = current_cpu_secs;
+            }
+
             let activity_age = last_log_activity.elapsed();
             let has_recent_activity = activity_age < silence
-                && (current_mtime.is_some() || last_hf_size.unwrap_or(0) > 0 || port_bound);
+                && (current_mtime.is_some()
+                    || last_hf_size.unwrap_or(0) > 0
+                    || port_bound
+                    || cpu_advanced);
 
             // Past grace period and nothing has moved in either signal
             // for the silence window → treat as stalled.
@@ -4443,10 +4560,10 @@ mod tests {
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
-        classify_startup_error, hf_cache_grew, lifetime_token_milestones_crossed,
-        lifetime_usd_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, tcp_port_accepts_connection,
+        classify_startup_error, cpu_time_advanced, hf_cache_grew,
+        lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, log_mtime_advanced,
+        merge_daily_savings, merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time, tcp_port_accepts_connection,
         total_dir_size_bytes, AppState, ClaudeProjectScan,
         DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
@@ -4559,6 +4676,47 @@ mod tests {
         // Shrunk (HF cache pruning during boot — rare, but the function
         // shouldn't lie and call this growth).
         assert!(!hf_cache_grew(Some(200), 100));
+    }
+
+    #[test]
+    fn parse_ps_cpu_time_handles_macos_formats() {
+        // MM:SS.ss (most common — processes under an hour of CPU)
+        assert_eq!(parse_ps_cpu_time("0:00.05"), Some(0));
+        assert_eq!(parse_ps_cpu_time("0:42.13"), Some(42));
+        assert_eq!(parse_ps_cpu_time("12:34.99"), Some(12 * 60 + 34));
+        // HH:MM:SS (longer-lived processes)
+        assert_eq!(parse_ps_cpu_time("1:23:45"), Some(3600 + 23 * 60 + 45));
+        // D-HH:MM:SS (multi-day uptime)
+        assert_eq!(
+            parse_ps_cpu_time("2-01:23:45"),
+            Some(2 * 86400 + 3600 + 23 * 60 + 45)
+        );
+        // Whitespace tolerated (ps emits a trailing newline)
+        assert_eq!(parse_ps_cpu_time("  0:42.13\n"), Some(42));
+        // Bad input returns None rather than panicking.
+        assert_eq!(parse_ps_cpu_time(""), None);
+        assert_eq!(parse_ps_cpu_time("   "), None);
+        assert_eq!(parse_ps_cpu_time("not-a-time"), None);
+        assert_eq!(parse_ps_cpu_time("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn cpu_time_advanced_detects_growth_only() {
+        // Strictly grew → activity.
+        assert!(cpu_time_advanced(Some(3), Some(5)));
+        // First observation with non-zero CPU → activity (process was
+        // already burning cycles before we started polling).
+        assert!(cpu_time_advanced(None, Some(5)));
+        // First observation with zero CPU → not yet doing work.
+        assert!(!cpu_time_advanced(None, Some(0)));
+        // Unchanged (whole-second resolution; sub-second growth is
+        // dropped by the parser, so equal seconds means "no second
+        // elapsed of CPU time").
+        assert!(!cpu_time_advanced(Some(5), Some(5)));
+        // ps stopped reporting (process gone) — not activity.
+        assert!(!cpu_time_advanced(Some(5), None));
+        // Both None — process never tracked or never observed.
+        assert!(!cpu_time_advanced(None, None));
     }
 
     #[test]

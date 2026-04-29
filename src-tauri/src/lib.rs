@@ -703,6 +703,18 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     }
 }
 
+/// Diagnostic snapshot taken at the moment a boot-validation failure is
+/// captured. Distinguishes "the new proxy never spawned" (tracked_child=false)
+/// from "spawned but crashed before writing logs" (no new log) from "spawned
+/// and bound but unreachable" (port_bound=true, log written, /livez never
+/// answered). None for install-phase failures where no proxy launch happened.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct UpgradeBootDiagnostics {
+    pub tracked_child: bool,
+    pub new_proxy_log_written: bool,
+    pub proxy_port_bound: bool,
+}
+
 /// Report a runtime upgrade failure to Sentry. `phase` is "install" for
 /// pip/smoke-test failures, "boot_validation" for "installed but didn't boot".
 /// `outcome` is the BootValidationOutcome label when phase is boot_validation.
@@ -715,6 +727,7 @@ pub(crate) fn capture_upgrade_failure(
     target_version: Option<&str>,
     fallback_version: Option<&str>,
     log_tail: Option<&str>,
+    boot_diagnostics: Option<UpgradeBootDiagnostics>,
 ) {
     let technical_err = format!("{err:#}");
     let cmd_failure = err
@@ -768,6 +781,20 @@ pub(crate) fn capture_upgrade_failure(
             }
             if let Some(tail) = log_tail_capped.as_deref() {
                 scope.set_extra("log_tail", tail.into());
+            }
+            if let Some(diag) = boot_diagnostics {
+                scope.set_tag("tracked_child", if diag.tracked_child { "true" } else { "false" });
+                scope.set_tag(
+                    "new_proxy_log_written",
+                    if diag.new_proxy_log_written { "true" } else { "false" },
+                );
+                scope.set_tag(
+                    "proxy_port_bound",
+                    if diag.proxy_port_bound { "true" } else { "false" },
+                );
+                scope.set_extra("tracked_child", diag.tracked_child.into());
+                scope.set_extra("new_proxy_log_written", diag.new_proxy_log_written.into());
+                scope.set_extra("proxy_port_bound", diag.proxy_port_bound.into());
             }
             if let Some(failure) = cmd_failure {
                 scope.set_extra("program", failure.program.clone().into());
@@ -1899,29 +1926,49 @@ pub fn run() {
             use tauri_plugin_deep_link::DeepLinkExt;
             let deep_link_app = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
-                for url in event.urls() {
-                    if url.scheme() == "headroom" {
-                        eprintln!("deep link received: {url}");
-                        let app_handle = deep_link_app.clone();
-                        let _ = show_launcher_window(&app_handle);
-                        // Run the reconciliation on a worker thread — the
-                        // deep-link callback is on the main thread and we
-                        // don't want pricing's blocking HTTP call there.
-                        std::thread::spawn(move || {
-                            let state: tauri::State<'_, AppState> = app_handle.state();
-                            match pricing::get_pricing_status(&state) {
-                                Ok(status) => {
-                                    state.apply_pricing_gate_status(&status);
-                                    let _ = app_handle.emit("pricing-refreshed", &status);
+                // NOTE: do NOT use `eprintln!`/`println!` here. When macOS
+                // launches the app fresh via a URL scheme, stderr is not
+                // connected to a valid fd and any write panics with EIO.
+                //
+                // This callback is invoked synchronously from tao's
+                // `application:openURLs:` handler, which is `extern "C"` —
+                // any panic that escapes here aborts the whole process via
+                // `panic_cannot_unwind`. Wrap the body in `catch_unwind` so
+                // an internal failure degrades gracefully instead.
+                let deep_link_app = deep_link_app.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for url in event.urls() {
+                        if url.scheme() == "headroom" {
+                            let app_handle = deep_link_app.clone();
+                            let _ = show_launcher_window(&app_handle);
+                            // Run the reconciliation on a worker thread — the
+                            // deep-link callback is on the main thread and we
+                            // don't want pricing's blocking HTTP call there.
+                            std::thread::spawn(move || {
+                                let state: tauri::State<'_, AppState> = app_handle.state();
+                                match pricing::get_pricing_status(&state) {
+                                    Ok(status) => {
+                                        state.apply_pricing_gate_status(&status);
+                                        let _ = app_handle.emit("pricing-refreshed", &status);
+                                    }
+                                    Err(err) => {
+                                        sentry::capture_message(
+                                            &format!("deep link pricing refresh failed: {err}"),
+                                            sentry::Level::Warning,
+                                        );
+                                    }
                                 }
-                                Err(err) => eprintln!(
-                                    "deep link pricing refresh failed: {err}"
-                                ),
-                            }
-                        });
-                        // Only handle the first headroom:// URL in the batch.
-                        break;
+                            });
+                            // Only handle the first headroom:// URL in the batch.
+                            break;
+                        }
                     }
+                }));
+                if result.is_err() {
+                    sentry::capture_message(
+                        "deep link callback panicked",
+                        sentry::Level::Error,
+                    );
                 }
             });
             Ok(())
@@ -2356,25 +2403,51 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 } else {
                     output_tail.join("\n")
                 };
+                let exit_code_str = output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into());
+                // First non-empty line of stderr (or stdout if stderr empty),
+                // truncated, used both in the message and the fingerprint so
+                // events group by failure mode instead of the capture-site stack.
+                let signature_source = if !stderr.trim().is_empty() {
+                    stderr.as_str()
+                } else {
+                    stdout.as_str()
+                };
+                let signature: String = signature_source
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no output")
+                    .chars()
+                    .take(160)
+                    .collect();
+                let stderr_head: String = stderr.chars().take(2000).collect();
+                let stdout_head: String = stdout.chars().take(2000).collect();
+                let claude_cli_path = claude_cli::detect_claude_cli()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "not_found".into());
+                let summary_msg = format!(
+                    "headroom learn failed (exit={exit_code_str}) {signature}"
+                );
+                let fingerprint: [&str; 3] =
+                    ["headroom_learn", exit_code_str.as_str(), signature.as_str()];
                 sentry::with_scope(
                     |scope| {
                         scope.set_tag("flow", "headroom_learn");
-                        scope.set_context(
-                            "learn",
-                            sentry::protocol::Context::Other(
-                                [
-                                    ("exit_status".into(), output.status.to_string().into()),
-                                    ("output_tail".into(), fail_tail.clone().into()),
-                                ]
-                                .into(),
-                            ),
-                        );
+                        scope.set_tag("exit_code", &exit_code_str);
+                        scope.set_extra("exit_status", output.status.to_string().into());
+                        scope.set_extra("output_tail", fail_tail.clone().into());
+                        scope.set_extra("stderr_head", stderr_head.into());
+                        scope.set_extra("stdout_head", stdout_head.into());
+                        scope.set_extra("claude_cli_path", claude_cli_path.into());
+                        scope.set_extra("project_name", project_name.to_string().into());
+                        scope.set_fingerprint(Some(fingerprint.as_slice()));
                     },
                     || {
-                        sentry::capture_message(
-                            "headroom learn exited with non-zero status",
-                            sentry::Level::Error,
-                        )
+                        sentry::capture_message(&summary_msg, sentry::Level::Error);
                     },
                 );
                 (
@@ -2540,7 +2613,10 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     let icons = match build_tray_runtime_icons() {
         Ok(icons) => icons,
         Err(err) => {
-            eprintln!("failed to build runtime tray icons: {err}");
+            sentry::capture_message(
+                &format!("failed to build runtime tray icons: {err}"),
+                sentry::Level::Warning,
+            );
             return;
         }
     };
@@ -3070,9 +3146,9 @@ fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Resu
 
     hide_launcher_window(app)?;
 
-    let window = app
-        .get_webview_window("main")
-        .expect("main window should exist");
+    let Some(window) = app.get_webview_window("main") else {
+        return Err(tauri::Error::WebviewNotFound);
+    };
 
     if window.is_visible()? {
         window.hide()?;
@@ -3094,7 +3170,6 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
     match state.ensure_headroom_running() {
         Ok(()) => port_conflict::note_proxy_started(app),
         Err(err) => {
-            eprintln!("failed to ensure headroom runtime for tray: {err}");
             // Tray open is in-session (not a fresh launch); pass false so the
             // launch counter is preserved instead of double-counting clicks.
             let handled = port_conflict::note_proxy_failed(app, &err, false);
@@ -3121,9 +3196,9 @@ fn complete_setup_wizard(state: tauri::State<'_, AppState>) {
 }
 
 fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
-    let window = app
-        .get_webview_window("main")
-        .expect("main window should exist");
+    let Some(window) = app.get_webview_window("main") else {
+        return Err(tauri::Error::WebviewNotFound);
+    };
 
     if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
@@ -3136,9 +3211,9 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
-    let window = app
-        .get_webview_window("launcher")
-        .expect("launcher window should exist");
+    let Some(window) = app.get_webview_window("launcher") else {
+        return Err(tauri::Error::WebviewNotFound);
+    };
 
     let _ = window.center();
     window.show()?;
