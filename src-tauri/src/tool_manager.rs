@@ -22,10 +22,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.10.12";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ae/cf/f6dea48d72bc62c88a593df2b44398315e38c8680acbc77d27ff5191207f/headroom_ai-0.10.12-py3-none-any.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.19.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/ca/69/01718d4ff39e3e33128bcb58d7f5f905e37e5814d74e3fcad8f193d7dcfb/headroom_ai-0.19.0-py3-none-any.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "30e622ad0f9609ef65b90f5d2367c9d3e9a4863a3a3fb2f1fe9d513e6c24aaff";
+    "3bf6a7c2bcbe509388adaa0352e66d9857d8c7e1bef03e3d5925f4104337abf6";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -72,8 +72,11 @@ const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
 /// lock. Drop any entry that no longer matches — those users need a real
 /// reinstall.
 const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
-    // v0.2.50, v0.2.50-rc.1, v0.2.50-rc.2, v0.2.50-rc.3 all shipped this lock.
-    "7f214ecb1cfb305bcc2676ef32379bb7cbd8a522f8274bc19897cc4c04e74bae",
+    // 0.19.0 freeze diverges from every prior shipment (headroom-ai[all]==0.19.0
+    // pulls in fastembed, loguru, mmh3, py_rust_stemmers and bumps anthropic,
+    // cryptography, opentelemetry-*, transformers, uvicorn, etc.). Users on any
+    // older receipt must do a real reinstall, so the legacy migration list is
+    // empty until the next no-op cosmetic change.
 ];
 const RTK_VERSION: &str = "0.37.2";
 const RTK_SHA256_MACOS_AARCH64: &str =
@@ -4671,6 +4674,13 @@ after
 
     #[test]
     fn update_headroom_receipt_after_in_place_upgrade_rewrites_artifact() {
+        // Guards the legacy-sha migration path. When LEGACY_REQUIREMENTS_LOCK_SHAS
+        // is empty (current state after the 0.19.0 lock regen), there is no
+        // legacy fixture to inject — re-enable when a future cosmetic-only lock
+        // change re-populates the list.
+        if super::LEGACY_REQUIREMENTS_LOCK_SHAS.is_empty() {
+            return;
+        }
         let (root, runtime, manager) = seed_test_runtime("receipt-rewrite");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
@@ -4942,6 +4952,9 @@ after
 
     #[test]
     fn requirements_are_stale_recognizes_legacy_sha_and_migrates_receipt() {
+        if super::LEGACY_REQUIREMENTS_LOCK_SHAS.is_empty() {
+            return;
+        }
         let (root, runtime, manager) = seed_test_runtime("legacy-sha-migrate");
         let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
         let receipt_path = runtime.tools_dir.join("headroom.json");
@@ -5018,6 +5031,9 @@ after
 
     #[test]
     fn prepare_in_place_skips_lock_snapshot_when_stored_sha_is_legacy() {
+        if super::LEGACY_REQUIREMENTS_LOCK_SHAS.is_empty() {
+            return;
+        }
         let (root, runtime, manager) = seed_test_runtime("in-place-legacy");
         let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
         fs::write(
