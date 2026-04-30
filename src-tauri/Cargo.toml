@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.3.5"
+version = "0.3.6"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -21,10 +21,12 @@ flate2 = "1.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 json5 = "=0.4.1"
 libc = "0.2"
+log = { version = "0.4", features = ["std"] }
 os_info = "3.10"
 parking_lot = "0.12"
 rand = "0.9"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"

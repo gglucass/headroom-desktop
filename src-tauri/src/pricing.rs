@@ -998,6 +998,14 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                 Some("oauth_profile.organization.rateLimitTier".into()),
             );
         }
+        // Anthropic's internal label for Team-plan rate limits. Show Max20x
+        // pricing rather than falling through to Pro.
+        if normalized.contains("raven") {
+            return (
+                ClaudePlanTier::Max20x,
+                Some("oauth_profile.organization.rateLimitTier".into()),
+            );
+        }
         if normalized == "default_claude_ai" {
             let organization_type = org.organization_type.as_deref().unwrap_or_default();
             if organization_type.eq_ignore_ascii_case("claude_max") {
@@ -2014,6 +2022,28 @@ mod tests {
             Some("default_claude"),
             Some(Utc::now()),
         );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_default_raven_is_max20x() {
+        let p = oauth_profile(
+            Some("default_raven"),
+            Some("claude_team"),
+            Some(Utc::now()),
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Max20x
+        ));
+    }
+
+    #[test]
+    fn detect_plan_tier_raven_substring_is_max20x() {
+        let p = oauth_profile(Some("default_raven_x"), Some("claude_team"), Some(Utc::now()));
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max20x

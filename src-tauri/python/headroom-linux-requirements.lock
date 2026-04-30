@@ -3,21 +3,21 @@
 # because packages such as hnswlib do not ship broadly compatible Linux wheels
 # and cause bootstrap to fail on fresh machines.
 ast-grep-cli==0.42.1
-click==8.3.2
-fastapi==0.136.0
+click==8.3.3
+fastapi==0.136.1
 httpx[http2]==0.28.1
 litellm==1.82.3
 magika==1.0.2
 mcp==1.27.0
-onnxruntime==1.24.4
-opentelemetry-api==1.41.0
-openai==2.32.0
+onnxruntime==1.25.1
+opentelemetry-api==1.41.1
+openai==2.33.0
 pydantic==2.13.3
 rich==15.0.0
 sqlite-vec==0.1.9
 tiktoken==0.12.0
-transformers==5.5.4
-uvicorn==0.45.0
+transformers==5.7.0
+uvicorn==0.46.0
 watchdog==6.0.0
 websockets==16.0
 zstandard==0.25.0

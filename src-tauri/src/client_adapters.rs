@@ -404,7 +404,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     // Reverse settings.json mutations and shell blocks for every known client.
     if let Err(err) = clear_client_setups() {
-        eprintln!("cleanup: clear_client_setups failed: {err}");
+        log::warn!("cleanup: clear_client_setups failed: {err}");
     }
 
     // Strip the Headroom hook entry from both ~/.claude/settings.json and
@@ -415,7 +415,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
         match strip_headroom_hook_from_settings(&settings_path) {
             Ok(true) => removed.push(settings_path.display().to_string()),
             Ok(false) => {}
-            Err(err) => eprintln!(
+            Err(err) => log::warn!(
                 "cleanup: stripping hook from {} failed: {err}",
                 settings_path.display()
             ),
@@ -426,7 +426,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     if hook_path.exists() {
         match std::fs::remove_file(&hook_path) {
             Ok(_) => removed.push(hook_path.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", hook_path.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", hook_path.display()),
         }
     }
 
@@ -440,7 +440,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     if app_dir.exists() {
         match std::fs::remove_dir_all(&app_dir) {
             Ok(_) => removed.push(app_dir.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", app_dir.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", app_dir.display()),
         }
     }
 
@@ -448,7 +448,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     if dot_headroom.exists() {
         match std::fs::remove_dir_all(&dot_headroom) {
             Ok(_) => removed.push(dot_headroom.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", dot_headroom.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", dot_headroom.display()),
         }
     }
 
@@ -513,7 +513,7 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
         let path = entry.path();
         match std::fs::remove_file(&path) {
             Ok(_) => removed.push(path.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
     removed
@@ -605,7 +605,7 @@ fn remove_macos_launch_agents() -> Vec<String> {
             .output();
         match std::fs::remove_file(&path) {
             Ok(_) => removed.push(path.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
 
@@ -634,7 +634,7 @@ fn remove_macos_preferences() -> Vec<String> {
         };
         match result {
             Ok(_) => removed.push(path.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", path.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
     removed
@@ -650,7 +650,7 @@ fn remove_macos_caches() -> Vec<String> {
     if caches_dir.exists() {
         match std::fs::remove_dir_all(&caches_dir) {
             Ok(_) => removed.push(caches_dir.display().to_string()),
-            Err(err) => eprintln!("cleanup: removing {} failed: {err}", caches_dir.display()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", caches_dir.display()),
         }
     }
     removed
@@ -668,7 +668,7 @@ fn remove_known_keychain_entries() {
     ];
     for (service, account) in ENTRIES {
         if let Err(err) = crate::keychain::delete_secret(service, account) {
-            eprintln!("cleanup: deleting keychain {service}/{account} failed: {err}");
+            log::warn!("cleanup: deleting keychain {service}/{account} failed: {err}");
         }
     }
 }

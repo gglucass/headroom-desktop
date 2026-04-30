@@ -557,11 +557,7 @@ impl AppState {
             &self.tool_manager.rtk_entrypoint(),
             &self.tool_manager.managed_python(),
         ) {
-            eprintln!("failed to ensure RTK integrations during app launch: {err}");
-            sentry::capture_message(
-                &format!("RTK integrations failed during warm_runtime_on_launch: {err}"),
-                sentry::Level::Warning,
-            );
+            log::warn!("RTK integrations failed during warm_runtime_on_launch: {err}");
         }
 
         // App-version-triggered atomic runtime upgrade. Replaces the old
@@ -573,11 +569,10 @@ impl AppState {
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
         if let Err(err) = self.tool_manager.ensure_mcp_configured() {
-            eprintln!("failed to configure headroom MCP: {err}");
-            sentry::capture_message(
-                &format!("headroom MCP configuration failed: {err}"),
-                sentry::Level::Warning,
-            );
+            // install_headroom_mcp captures rich structured data to Sentry
+            // at the failure site; log to file only to avoid a duplicate
+            // (and stripped) Sentry event from the FileLogger forwarder.
+            log::info!("headroom MCP configuration failed: {err:#}");
         }
 
         match self.ensure_headroom_running() {
@@ -585,7 +580,7 @@ impl AppState {
                 crate::port_conflict::note_proxy_started(app);
             }
             Err(err) => {
-                eprintln!("failed to auto-start headroom during app launch: {err}");
+                log::debug!("failed to auto-start headroom during app launch: {err}");
                 let handled = crate::port_conflict::note_proxy_failed(app, &err, true);
                 if !handled {
                     crate::capture_headroom_start_failure(
@@ -619,7 +614,7 @@ impl AppState {
         current_app_version: &str,
     ) -> Option<RuntimeMaintenancePlan> {
         if runtime_upgrade_disabled_by_env() {
-            eprintln!("HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check.");
+            log::debug!("HEADROOM_SKIP_RUNTIME_UPGRADE is set — skipping runtime upgrade check.");
             return None;
         }
         let profile = self.launch_profile.lock();
@@ -668,7 +663,7 @@ impl AppState {
         let _guard = match self.upgrade_lock.try_lock() {
             Some(g) => g,
             None => {
-                eprintln!("run_upgrade_with_ui: upgrade already running; skipping");
+                log::debug!("run_upgrade_with_ui: upgrade already running; skipping");
                 return;
             }
         };
@@ -777,7 +772,7 @@ impl AppState {
         match install_result {
             Err((restored, error)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                eprintln!(
+                log::warn!(
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
                 let restarted = self.ensure_headroom_running().is_ok();
@@ -880,7 +875,7 @@ impl AppState {
         emit_runtime_upgrade_progress(app, self);
 
         if let Err(err) = self.ensure_headroom_running() {
-            eprintln!("run_upgrade_with_ui: new proxy failed to spawn: {err:#}");
+            log::warn!("run_upgrade_with_ui: new proxy failed to spawn: {err:#}");
         }
         // Diagnostic: confirm we actually have a tracked child. If this is
         // false, something about ensure_headroom_running short-circuited
@@ -888,7 +883,7 @@ impl AppState {
         // was missing, pricing gate fired, runtime paused).
         {
             let has_tracked = self.headroom_process.lock().is_some();
-            eprintln!(
+            log::debug!(
                 "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={}",
                 has_tracked,
                 self.tool_manager.python_runtime_installed()
@@ -916,7 +911,7 @@ impl AppState {
         let boot_ok = outcome.is_ok();
         let outcome_label = outcome.label();
         let duration_ms = start.elapsed().as_millis() as u64;
-        eprintln!(
+        log::debug!(
             "run_upgrade_with_ui: boot validation {outcome_label} after {}s",
             duration_ms / 1000
         );
@@ -924,7 +919,7 @@ impl AppState {
         if boot_ok {
             if needs_commit_or_rollback {
                 if let Err(err) = self.tool_manager.commit_headroom_upgrade() {
-                    eprintln!("commit_headroom_upgrade: non-fatal: {err:#}");
+                    log::warn!("commit_headroom_upgrade: non-fatal: {err:#}");
                 }
             }
             self.stamp_app_version(&current_app_version);
@@ -966,7 +961,7 @@ impl AppState {
         // Boot validation failed — roll back to the previous venv when we have
         // one, otherwise leave the repaired runtime in place and surface the
         // failure so the next launch can retry.
-        eprintln!(
+        log::warn!(
             "run_upgrade_with_ui: boot validation failed ({}); rolling back to {:?}",
             outcome_label, installed_version
         );
@@ -1001,7 +996,7 @@ impl AppState {
         };
         let rollback_restored = needs_commit_or_rollback && rollback_result.is_ok();
         if let Err(err) = rollback_result {
-            eprintln!("run_upgrade_with_ui: rollback failed: {err:#}");
+            log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
         let restarted = self.ensure_headroom_running().is_ok();
 
@@ -1024,7 +1019,7 @@ impl AppState {
                 installed_version
             ),
         };
-        eprintln!("run_upgrade_with_ui: {err_msg}");
+        log::warn!("run_upgrade_with_ui: {err_msg}");
         let err = anyhow::anyhow!("{}", err_msg);
         let previous_app_label = previous_app_version
             .clone()
@@ -1165,7 +1160,7 @@ impl AppState {
                 Ok(Some(status)) => Some(format!("{status}")),
                 Ok(None) => None,
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "headroom_process_exited: try_wait returned Err (treating as still alive): {err}"
                     );
                     None
@@ -1253,7 +1248,7 @@ impl AppState {
             }
 
             if let Some(exit_status) = self.headroom_process_exited() {
-                eprintln!(
+                log::warn!(
                     "wait_for_boot_validation: tracked proxy child exited with status {exit_status}"
                 );
                 return BootValidationOutcome::ProcessExited;
@@ -2078,7 +2073,7 @@ impl AppState {
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            eprintln!("ensure_headroom_running: short-circuit (proxy_bypass active)");
+            log::debug!("ensure_headroom_running: short-circuit (proxy_bypass active)");
             return Ok(());
         }
 
@@ -2100,7 +2095,7 @@ impl AppState {
         if is_headroom_proxy_reachable()
             && !crate::tool_manager::running_proxy_matches_expected_args()
         {
-            eprintln!(
+            log::debug!(
                 "headroom proxy is reachable but its argv predates this build; restarting it"
             );
             self.stop_headroom();
@@ -2317,7 +2312,7 @@ impl AppState {
         ];
         for pattern in command_patterns {
             if let Err(err) = kill_processes_by_command_pattern(&pattern) {
-                eprintln!("failed to clean detached headroom proxy processes: {err}");
+                log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
     }
@@ -2384,7 +2379,7 @@ impl AppState {
                 .store(false, std::sync::atomic::Ordering::Release);
             crate::client_adapters::restore_client_setups();
             if let Err(err) = self.ensure_headroom_running() {
-                eprintln!("apply_pricing_gate_status: ensure_headroom_running failed: {err:#}");
+                log::warn!("apply_pricing_gate_status: ensure_headroom_running failed: {err:#}");
             }
         }
     }
@@ -4547,7 +4542,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use chrono::{Datelike, Local, TimeZone, Utc};
+    use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
@@ -4742,14 +4737,23 @@ mod tests {
         use std::time::Duration;
 
         // Bind to grab a port, then drop the listener so nothing is
-        // listening on it. There's a race window where the OS could
-        // hand the port to another process, but in practice this is
-        // reliable for the test's lifetime.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-        let addr: SocketAddr = listener.local_addr().expect("local_addr");
-        drop(listener);
+        // listening on it. The OS can hand that freed port to another
+        // process between drop() and connect_timeout(), so retry with
+        // fresh ephemeral ports until one stays closed long enough to
+        // observe. If every attempt across N tries shows accepted, the
+        // function is genuinely broken.
+        for _ in 0..16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let addr: SocketAddr = listener.local_addr().expect("local_addr");
+            drop(listener);
 
-        assert!(!tcp_port_accepts_connection(addr, Duration::from_millis(200)));
+            if !tcp_port_accepts_connection(addr, Duration::from_millis(200)) {
+                return;
+            }
+        }
+        panic!(
+            "tcp_port_accepts_connection returned true on 16 freshly-released ephemeral ports"
+        );
     }
 
     #[test]
@@ -5597,6 +5601,21 @@ mod tests {
         let mut tracker = make_tracker();
         let today = Local::now().date_naive();
 
+        // Pick three local-time hours today and convert to UTC components for
+        // history_point_at. Feeding the local date directly into UTC builders
+        // breaks in any TZ where local-hour-N maps to a different UTC date.
+        let to_utc_components = |local_hour: u32| -> (i32, u32, u32, u32) {
+            let utc = Local
+                .with_ymd_and_hms(today.year(), today.month(), today.day(), local_hour, 0, 0)
+                .single()
+                .expect("unambiguous local time")
+                .with_timezone(&Utc);
+            (utc.year(), utc.month(), utc.day(), utc.hour())
+        };
+        let (y0, m0, d0, h0) = to_utc_components(8);
+        let (y1, m1, d1, h1) = to_utc_components(9);
+        let (y2, m2, d2, h2) = to_utc_components(15);
+
         tracker
             .observe(&HeadroomDashboardStats {
                 session_requests: Some(4),
@@ -5606,9 +5625,9 @@ mod tests {
                 session_actual_cost_usd: Some(0.3),
                 session_total_tokens_sent: Some(3_000),
                 savings_history: vec![
-                    history_point_at(today.year(), today.month(), today.day(), 8, 0),
-                    history_point_at(today.year(), today.month(), today.day(), 9, 400),
-                    history_point_at(today.year(), today.month(), today.day(), 15, 1_000),
+                    history_point_at(y0, m0, d0, h0, 0),
+                    history_point_at(y1, m1, d1, h1, 400),
+                    history_point_at(y2, m2, d2, h2, 1_000),
                 ],
             })
             .expect("snapshot");
@@ -5619,20 +5638,8 @@ mod tests {
             .into_iter()
             .filter(|point| point.hour.starts_with(&format!("{today_key}T")))
             .collect::<Vec<_>>();
-        let expected_first_hour = Utc
-            .with_ymd_and_hms(today.year(), today.month(), today.day(), 9, 0, 0)
-            .single()
-            .expect("first hour")
-            .with_timezone(&Local)
-            .format("%Y-%m-%dT%H:00")
-            .to_string();
-        let expected_second_hour = Utc
-            .with_ymd_and_hms(today.year(), today.month(), today.day(), 15, 0, 0)
-            .single()
-            .expect("second hour")
-            .with_timezone(&Local)
-            .format("%Y-%m-%dT%H:00")
-            .to_string();
+        let expected_first_hour = format!("{today_key}T09:00");
+        let expected_second_hour = format!("{today_key}T15:00");
         assert_eq!(hourly.len(), 2);
         assert_eq!(hourly[0].hour, expected_first_hour);
         assert_eq!(hourly[0].estimated_tokens_saved, 400);
