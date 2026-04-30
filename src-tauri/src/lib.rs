@@ -7,6 +7,7 @@ mod device;
 mod insights;
 mod keychain;
 mod logging;
+mod memory_scrubber;
 mod models;
 mod port_conflict;
 mod pricing;
@@ -1910,6 +1911,11 @@ pub fn run() {
             if state.tool_manager.python_runtime_installed() {
                 state.set_runtime_starting(true);
             }
+            // Strip noisy traffic_learner error_recovery patterns before the
+            // proxy starts re-flushing them. See memory_scrubber for context.
+            std::thread::spawn(|| {
+                memory_scrubber::scrub_all(&headroom_memory_db_path());
+            });
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch(&app_handle);

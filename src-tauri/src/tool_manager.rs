@@ -975,7 +975,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                log::warn!("headroom MCP setup skipped during repair: {err}");
+                log::info!("headroom MCP setup skipped during repair: {err:#}");
                 json!({ "configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string() })
             }
         };
@@ -1337,7 +1337,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                log::warn!("headroom MCP setup skipped: {err}");
+                log::info!("headroom MCP setup skipped: {err:#}");
                 json!({
                     "configured": false,
                     "proxyUrl": HEADROOM_PROXY_URL,
@@ -2101,7 +2101,7 @@ impl ToolManager {
                 "installMethod": method.as_str(),
             }),
             Err(err) => {
-                log::warn!("headroom MCP setup skipped: {err}");
+                log::info!("headroom MCP setup skipped: {err:#}");
                 json!({
                     "configured": false,
                     "proxyUrl": HEADROOM_PROXY_URL,
@@ -2428,12 +2428,39 @@ impl ToolManager {
             .context("configuring Headroom MCP integration")?;
 
         if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let exit_code = output.status.code();
+            let detected = detected_claude
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<not detected>".into());
+            sentry::with_scope(
+                |scope| {
+                    scope.set_extra("claude_cli_detected", detected.clone().into());
+                    scope.set_extra("exit_code", exit_code.map(|c| c.into()).unwrap_or(serde_json::Value::Null));
+                    scope.set_extra(
+                        "stdout_tail",
+                        stdout[stdout.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                    );
+                    scope.set_extra(
+                        "stderr_tail",
+                        stderr[stderr.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                    );
+                },
+                || {
+                    sentry::capture_message(
+                        "Headroom MCP install exited non-zero",
+                        sentry::Level::Warning,
+                    );
+                },
+            );
             return Err(anyhow::Error::new(CommandFailure {
                 program: entrypoint.display().to_string(),
                 args: args.iter().map(|s| s.to_string()).collect(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                exit_code: output.status.code(),
+                stdout,
+                stderr,
+                exit_code,
             }))
             .context("configuring Headroom MCP integration");
         }

@@ -569,7 +569,10 @@ impl AppState {
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
         if let Err(err) = self.tool_manager.ensure_mcp_configured() {
-            log::warn!("headroom MCP configuration failed: {err}");
+            // install_headroom_mcp captures rich structured data to Sentry
+            // at the failure site; log to file only to avoid a duplicate
+            // (and stripped) Sentry event from the FileLogger forwarder.
+            log::info!("headroom MCP configuration failed: {err:#}");
         }
 
         match self.ensure_headroom_running() {
@@ -4539,7 +4542,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use chrono::{Datelike, Local, TimeZone, Utc};
+    use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
@@ -5598,6 +5601,21 @@ mod tests {
         let mut tracker = make_tracker();
         let today = Local::now().date_naive();
 
+        // Pick three local-time hours today and convert to UTC components for
+        // history_point_at. Feeding the local date directly into UTC builders
+        // breaks in any TZ where local-hour-N maps to a different UTC date.
+        let to_utc_components = |local_hour: u32| -> (i32, u32, u32, u32) {
+            let utc = Local
+                .with_ymd_and_hms(today.year(), today.month(), today.day(), local_hour, 0, 0)
+                .single()
+                .expect("unambiguous local time")
+                .with_timezone(&Utc);
+            (utc.year(), utc.month(), utc.day(), utc.hour())
+        };
+        let (y0, m0, d0, h0) = to_utc_components(8);
+        let (y1, m1, d1, h1) = to_utc_components(9);
+        let (y2, m2, d2, h2) = to_utc_components(15);
+
         tracker
             .observe(&HeadroomDashboardStats {
                 session_requests: Some(4),
@@ -5607,9 +5625,9 @@ mod tests {
                 session_actual_cost_usd: Some(0.3),
                 session_total_tokens_sent: Some(3_000),
                 savings_history: vec![
-                    history_point_at(today.year(), today.month(), today.day(), 8, 0),
-                    history_point_at(today.year(), today.month(), today.day(), 9, 400),
-                    history_point_at(today.year(), today.month(), today.day(), 15, 1_000),
+                    history_point_at(y0, m0, d0, h0, 0),
+                    history_point_at(y1, m1, d1, h1, 400),
+                    history_point_at(y2, m2, d2, h2, 1_000),
                 ],
             })
             .expect("snapshot");
@@ -5620,20 +5638,8 @@ mod tests {
             .into_iter()
             .filter(|point| point.hour.starts_with(&format!("{today_key}T")))
             .collect::<Vec<_>>();
-        let expected_first_hour = Utc
-            .with_ymd_and_hms(today.year(), today.month(), today.day(), 9, 0, 0)
-            .single()
-            .expect("first hour")
-            .with_timezone(&Local)
-            .format("%Y-%m-%dT%H:00")
-            .to_string();
-        let expected_second_hour = Utc
-            .with_ymd_and_hms(today.year(), today.month(), today.day(), 15, 0, 0)
-            .single()
-            .expect("second hour")
-            .with_timezone(&Local)
-            .format("%Y-%m-%dT%H:00")
-            .to_string();
+        let expected_first_hour = format!("{today_key}T09:00");
+        let expected_second_hour = format!("{today_key}T15:00");
         assert_eq!(hourly.len(), 2);
         assert_eq!(hourly[0].hour, expected_first_hour);
         assert_eq!(hourly[0].estimated_tokens_saved, 400);
