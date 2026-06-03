@@ -1657,6 +1657,13 @@ impl AppState {
         persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
+    pub fn reset_setup_wizard(&self) {
+        let mut profile = self.launch_profile.lock();
+        profile.setup_wizard_complete = false;
+        profile.launch_experience = crate::models::LaunchExperience::FirstRun;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
     pub fn external_headroom_config(&self) -> crate::models::ExternalHeadroomConfig {
         let profile = self.launch_profile.lock();
         crate::models::ExternalHeadroomConfig {
@@ -2092,8 +2099,16 @@ impl AppState {
             DashboardState {
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 launch_experience: self.launch_profile.lock().launch_experience.clone(),
-                bootstrap_complete: self.tool_manager.python_runtime_installed(),
-                python_runtime_installed: self.tool_manager.python_runtime_installed(),
+                bootstrap_complete: if self.launch_profile.lock().external_headroom_enabled {
+                    true
+                } else {
+                    self.tool_manager.python_runtime_installed()
+                },
+                python_runtime_installed: if self.launch_profile.lock().external_headroom_enabled {
+                    true
+                } else {
+                    self.tool_manager.python_runtime_installed()
+                },
                 lifetime_requests: snapshot.lifetime_requests,
                 lifetime_estimated_savings_usd: snapshot.lifetime_estimated_savings_usd,
                 lifetime_estimated_tokens_saved: snapshot.lifetime_estimated_tokens_saved,

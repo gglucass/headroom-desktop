@@ -1536,9 +1536,23 @@ fn detect_installed_headroom(
     }
 
     if binary_path.is_none() {
+        if let Ok(output) = std::process::Command::new("rtk")
+            .arg("--version")
+            .output()
+        {
+            if output.status.success() {
+                in_path = true;
+                binary_path = Some("rtk".to_string());
+            }
+        }
+    }
+
+    if binary_path.is_none() {
         let common_paths = [
             "/opt/homebrew/bin/headroom",
             "/usr/local/bin/headroom",
+            "/opt/homebrew/bin/rtk",
+            "/usr/local/bin/rtk",
         ];
         for path in &common_paths {
             if std::path::Path::new(path).exists() {
@@ -1550,9 +1564,12 @@ fn detect_installed_headroom(
 
     if binary_path.is_none() {
         if let Some(home) = dirs::home_dir() {
-            let user_local_path = home.join(".local").join("bin").join("headroom");
-            if user_local_path.exists() {
-                binary_path = Some(user_local_path.to_string_lossy().to_string());
+            for name in &["headroom", "rtk"] {
+                let user_local_path = home.join(".local").join("bin").join(name);
+                if user_local_path.exists() {
+                    binary_path = Some(user_local_path.to_string_lossy().to_string());
+                    break;
+                }
             }
         }
     }
@@ -2962,6 +2979,7 @@ pub fn run() {
             submit_contact_request,
             hide_launcher_animated,
             complete_setup_wizard,
+            reset_setup_wizard,
             get_autostart_enabled,
             set_autostart_enabled,
             uninstall_and_quit,
@@ -3500,9 +3518,10 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
+    let settings = tauri::menu::MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &separator, &quit])?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &settings, &separator, &quit])?;
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
@@ -3546,6 +3565,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 } else {
                     let _ = show_launcher_window(app);
                 }
+            }
+            "settings" => {
+                let _ = hide_launcher_window(app);
+                let _ = show_main_window(app, None);
+                let _ = app.emit("open-settings", &());
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
@@ -4275,7 +4299,11 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
 
 fn onboarding_complete(app: &AppHandle) -> bool {
     let state: tauri::State<'_, AppState> = app.state();
-    if !state.tool_manager.python_runtime_installed() {
+    let is_external = {
+        let config = state.external_headroom_config();
+        config.enabled
+    };
+    if !is_external && !state.tool_manager.python_runtime_installed() {
         return false;
     }
     // Only require wizard completion on the very first launch. Existing users
@@ -4286,6 +4314,19 @@ fn onboarding_complete(app: &AppHandle) -> bool {
 #[tauri::command]
 fn complete_setup_wizard(state: tauri::State<'_, AppState>) {
     state.mark_setup_wizard_complete();
+}
+
+#[tauri::command]
+fn reset_setup_wizard(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    state.reset_setup_wizard();
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    if let Some(launcher) = app.get_webview_window("launcher") {
+        let _ = show_launcher_window(&app);
+        let _ = launcher.eval("window.location.reload()");
+    }
+    Ok(())
 }
 
 fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {

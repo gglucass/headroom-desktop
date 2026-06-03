@@ -1871,6 +1871,16 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("open-settings", () => {
+      setActiveView("settings");
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
   // After the user opens a Polar checkout URL, poll pricing status every 5s
   // for up to 5 minutes so we can flip the UI back to "active" within seconds
   // of payment confirmation, instead of waiting out the 60s baseline cadence.
