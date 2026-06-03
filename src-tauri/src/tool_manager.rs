@@ -395,7 +395,7 @@ impl ToolManager {
     }
 
     pub fn rtk_entrypoint(&self) -> PathBuf {
-        self.runtime.bin_dir.join("rtk")
+        find_rtk_on_path().unwrap_or_else(|| self.runtime.bin_dir.join("rtk"))
     }
 
     pub fn headroom_learn_log_path(&self, project_path: &str) -> PathBuf {
@@ -967,17 +967,34 @@ impl ToolManager {
     }
 
     pub fn rtk_installed(&self) -> bool {
-        self.rtk_entrypoint().exists() && self.runtime.tools_dir.join("rtk.json").exists()
+        self.rtk_entrypoint().exists()
+            && (find_rtk_on_path().is_some() || self.runtime.tools_dir.join("rtk.json").exists())
     }
 
     pub fn installed_rtk_version(&self) -> Option<String> {
-        self.read_rtk_receipt()?
-            .get("version")?
-            .as_str()
-            .map(|v| v.to_string())
+        if let Some(r) = self.read_rtk_receipt() {
+            if let Some(v) = r.get("version").and_then(|v| v.as_str()) {
+                return Some(v.to_string());
+            }
+        }
+        if let Some(rtk_path) = find_rtk_on_path() {
+            if let Ok(output) = Command::new(rtk_path).arg("--version").output() {
+                if output.status.success() {
+                    let out_str = String::from_utf8_lossy(&output.stdout);
+                    let version = out_str.trim().trim_start_matches("rtk").trim().to_string();
+                    if !version.is_empty() {
+                        return Some(version);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn rtk_needs_install(&self) -> bool {
+        if find_rtk_on_path().is_some() {
+            return false;
+        }
         !self.rtk_entrypoint().exists()
             || self.installed_rtk_version().as_deref() != Some(RTK_VERSION)
     }
@@ -4456,6 +4473,37 @@ impl std::fmt::Display for HeadroomStartupFailure {
 }
 
 impl std::error::Error for HeadroomStartupFailure {}
+
+pub(crate) fn find_rtk_on_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("rtk");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return metadata.is_file();
+        }
+    }
+    false
+}
 
 #[cfg(test)]
 mod tests {

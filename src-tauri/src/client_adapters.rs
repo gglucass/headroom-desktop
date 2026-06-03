@@ -90,11 +90,12 @@ fn ensure_rtk_integrations_for_targets(
 }
 
 pub fn rtk_integration_status() -> Result<(bool, bool)> {
-    let path_configured = shell_block_contains_text_in_files(
-        &resolve_default_shell_targets(),
-        "managed_rtk",
-        "export PATH=",
-    )?;
+    let path_configured = crate::tool_manager::find_rtk_on_path().is_some()
+        || shell_block_contains_text_in_files(
+            &resolve_default_shell_targets(),
+            "managed_rtk",
+            "export PATH=",
+        )?;
     let hook_configured = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
         && headroom_rtk_hook_path().exists();
     Ok((path_configured, hook_configured))
@@ -1748,9 +1749,25 @@ fn shell_double_quote(value: &str) -> String {
         .replace('`', "\\`")
 }
 
+fn which_python() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("python3");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
-    let python = shell_double_quote(&managed_python_path.to_string_lossy());
+    let python_path = if cfg!(test) || managed_python_path.exists() {
+        managed_python_path.to_path_buf()
+    } else {
+        which_python().unwrap_or_else(|| PathBuf::from("/usr/bin/python3"))
+    };
+    let python = shell_double_quote(&python_path.to_string_lossy());
 
     format!(
         r#"#!/usr/bin/env bash
