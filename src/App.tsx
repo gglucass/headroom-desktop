@@ -714,6 +714,8 @@ export default function App() {
   const [detectionResult, setDetectionResult] = useState<string | null>(null);
   const [detectedRunningPort, setDetectedRunningPort] = useState<number | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
+  const [showExternalSetup, setShowExternalSetup] = useState(false);
+  const [wizardExternalError, setWizardExternalError] = useState<string | null>(null);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
@@ -1525,9 +1527,13 @@ export default function App() {
         if (result.runningLocally && result.runningPort) {
           setDetectedRunningPort(result.runningPort);
           msg += `Found running headroom instance. `;
-        }
-        if (result.binaryPath) {
-          msg += `Headroom binary found at ${result.binaryPath}.`;
+          if (result.binaryPath) {
+            msg += `Headroom binary found at ${result.binaryPath}.`;
+          } else {
+            msg += `(CLI binary not found on system PATH).`;
+          }
+        } else if (result.binaryPath) {
+          msg += `Headroom binary found at ${result.binaryPath} (not currently running).`;
         } else {
           msg += `Headroom is not installed on this system.`;
         }
@@ -2365,6 +2371,60 @@ export default function App() {
   async function handleFirstLaunchContinue() {
     await autoConfigureClaudeCodeForLauncher();
   }
+  
+  async function handleWizardSaveExternalConfig() {
+    setSaveBusy(true);
+    setWizardExternalError(null);
+    try {
+      await invoke("set_external_headroom_config", {
+        config: {
+          enabled: true,
+          host: externalHost,
+          port: externalPort
+        }
+      });
+      const runtime = await invoke<RuntimeStatus>("get_runtime_status");
+      applyRuntimeStatusIfChanged(runtime);
+      if (runtime.running) {
+        await invoke("complete_setup_wizard");
+        setShowExternalSetup(false);
+        await handleFirstLaunchContinue();
+      } else {
+        setWizardExternalError(`Could not connect to headroom at ${externalHost}:${externalPort}. Make sure the instance is running and reachable.`);
+      }
+    } catch (e: any) {
+      setWizardExternalError(`Failed to save config: ${e.message || e}`);
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  async function handleWizardApplyDetected(port: number) {
+    setSaveBusy(true);
+    setWizardExternalError(null);
+    try {
+      await invoke("set_external_headroom_config", {
+        config: {
+          enabled: true,
+          host: "127.0.0.1",
+          port: port
+        }
+      });
+      const runtime = await invoke<RuntimeStatus>("get_runtime_status");
+      applyRuntimeStatusIfChanged(runtime);
+      if (runtime.running) {
+        await invoke("complete_setup_wizard");
+        setShowExternalSetup(false);
+        await handleFirstLaunchContinue();
+      } else {
+        setWizardExternalError(`Could not connect to headroom at 127.0.0.1:${port}.`);
+      }
+    } catch (e: any) {
+      setWizardExternalError(`Failed to save config: ${e.message || e}`);
+    } finally {
+      setSaveBusy(false);
+    }
+  }
 
   async function runHeadroomLearn(projectPath: string) {
     if (runtimeStatus?.headroomLearnSupported === false) {
@@ -3187,33 +3247,139 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <h1>
-          Headroom cuts Claude Code costs
-          <br />
-           ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
+          {showExternalSetup ? (
+            "Configure External Headroom"
+          ) : (
+            <>
+              Headroom cuts Claude Code costs
+              <br />
+               ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
+            </>
+          )}
         </h1>
-        <div className="intro-shell__checklist">
-          <article>
-            <strong>Privacy first</strong>
-            <p>
-              Your prompts never touch our servers — everything runs locally on your machine.
+        {!showExternalSetup && (
+          <div className="intro-shell__checklist">
+            <article>
+              <strong>Privacy first</strong>
+              <p>
+                Your prompts never touch our servers — everything runs locally on your machine.
+              </p>
+            </article>
+            <article>
+              <strong>Self-contained</strong>
+              <p>
+                Keeps your runtime clean, never interfering with packages your
+                projects depend on.
+              </p>
+            </article>
+            <article>
+              <strong>Less tokens, no impact</strong>
+              <p>
+                Smart optimization cuts noise before Claude Code sees it, with
+                no impact on the output.
+              </p>
+            </article>
+          </div>
+        )}
+        {showExternalSetup ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "16px", background: "var(--surface-sunken, rgba(0,0,0,0.02))", borderRadius: "8px", border: "1px solid var(--border-subtle, rgba(0,0,0,0.05))", width: "100%", boxSizing: "border-box" }}>
+            <p style={{ fontSize: "13px", color: "var(--text-subtle)", margin: 0 }}>
+              Specify the host and port of an existing headroom instance (e.g. CLI or another machine).
             </p>
-          </article>
-          <article>
-            <strong>Self-contained</strong>
-            <p>
-              Keeps your runtime clean, never interfering with packages your
-              projects depend on.
-            </p>
-          </article>
-          <article>
-            <strong>Less tokens, no impact</strong>
-            <p>
-              Smart optimization cuts noise before Claude Code sees it, with
-              no impact on the output.
-            </p>
-          </article>
-        </div>
-        {installComplete ? (
+            
+            <div style={{ display: "flex", gap: "12px" }}>
+              <label className="pricing-auth-field" style={{ flex: "2" }}>
+                <span style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-subtle)", display: "block", marginBottom: "4px" }}>Host / IP</span>
+                <div className="pricing-auth-field__input">
+                  <input
+                    type="text"
+                    value={externalHost}
+                    onChange={(e) => setExternalHost(e.target.value)}
+                    placeholder="127.0.0.1"
+                    disabled={saveBusy}
+                  />
+                </div>
+              </label>
+              
+              <label className="pricing-auth-field" style={{ flex: "1" }}>
+                <span style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-subtle)", display: "block", marginBottom: "4px" }}>Port</span>
+                <div className="pricing-auth-field__input">
+                  <input
+                    type="number"
+                    value={externalPort || ""}
+                    onChange={(e) => setExternalPort(parseInt(e.target.value) || 0)}
+                    placeholder="6768"
+                    disabled={saveBusy}
+                  />
+                </div>
+              </label>
+            </div>
+
+            {wizardExternalError && (
+              <p style={{ fontSize: "12px", color: "var(--danger-text, #c92a2a)", margin: 0 }}>
+                ⚠️ {wizardExternalError}
+              </p>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "4px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <button
+                  className="secondary-button secondary-button--small"
+                  onClick={() => {
+                    setWizardExternalError(null);
+                    setShowExternalSetup(false);
+                  }}
+                  disabled={saveBusy}
+                  type="button"
+                >
+                  Back
+                </button>
+                <button
+                  className="primary-button"
+                  style={{ padding: "6px 16px", fontSize: "12px" }}
+                  onClick={() => void handleWizardSaveExternalConfig()}
+                  disabled={saveBusy || !externalHost || !externalPort}
+                  type="button"
+                >
+                  {saveBusy ? "Connecting..." : "Save & Connect"}
+                </button>
+              </div>
+              
+              <div style={{ borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.05))", paddingTop: "8px", marginTop: "4px" }}>
+                <button
+                  className="secondary-button secondary-button--small"
+                  style={{ width: "100%", justifyContent: "center" }}
+                  onClick={() => void handleDetectHeadroom()}
+                  disabled={detectBusy || saveBusy}
+                  type="button"
+                >
+                  {detectBusy ? "Detecting..." : "Detect headroom install"}
+                </button>
+                
+                {detectionResult && (
+                  <p style={{ fontSize: "11px", color: "var(--text-subtle)", marginTop: "6px", marginBottom: 0, textAlign: "center" }}>
+                    {detectionResult}
+                  </p>
+                )}
+                
+                {detectedRunningPort && (
+                  <div style={{ fontSize: "11px", marginTop: "6px", color: "var(--text-subtle)", textAlign: "center" }}>
+                    💡 Found headroom running on port {detectedRunningPort}.{" "}
+                    <button
+                      className="link-button"
+                      style={{ fontSize: "11px", padding: 0 }}
+                      onClick={() => void handleWizardApplyDetected(detectedRunningPort)}
+                      disabled={saveBusy}
+                      type="button"
+                    >
+                      Use this connection
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : installComplete ? (
           <>
             {runtimeStatus?.running !== true ? (
               <>
@@ -3272,6 +3438,23 @@ export default function App() {
                     Headroom. A timestamped backup is written before any edit.
                   </li>
                 </ul>
+              </div>
+            )}
+            {!bootstrapping && (
+              <div style={{ marginTop: "16px", textAlign: "center" }}>
+                <button
+                  className="link-button"
+                  style={{ fontSize: "12px", color: "var(--text-subtle)", cursor: "pointer" }}
+                  onClick={() => {
+                    setWizardExternalError(null);
+                    setDetectionResult(null);
+                    setDetectedRunningPort(null);
+                    setShowExternalSetup(true);
+                  }}
+                  type="button"
+                >
+                  Already have Headroom installed? Use external headroom.
+                </button>
               </div>
             )}
           </>
