@@ -707,6 +707,13 @@ export default function App() {
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
   const [uninstallBusy, setUninstallBusy] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
+  const [externalEnabled, setExternalEnabled] = useState(false);
+  const [externalHost, setExternalHost] = useState("127.0.0.1");
+  const [externalPort, setExternalPort] = useState(6768);
+  const [detectBusy, setDetectBusy] = useState(false);
+  const [detectionResult, setDetectionResult] = useState<string | null>(null);
+  const [detectedRunningPort, setDetectedRunningPort] = useState<number | null>(null);
+  const [saveBusy, setSaveBusy] = useState(false);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
@@ -1428,6 +1435,13 @@ export default function App() {
     void invoke<boolean>("get_autostart_enabled")
       .then((enabled) => setAutostartEnabled(enabled))
       .catch(() => setAutostartEnabled(false));
+    void invoke<{ enabled: boolean; host: string; port: number }>("get_external_headroom_config")
+      .then((config) => {
+        setExternalEnabled(config.enabled);
+        setExternalHost(config.host);
+        setExternalPort(config.port);
+      })
+      .catch((e) => console.error("Failed to load external config:", e));
   }, [activeView]);
 
   async function handleAutostartToggle(nextEnabled: boolean) {
@@ -1452,6 +1466,98 @@ export default function App() {
         typeof error === "string" ? error : "Uninstall failed. Please try again."
       );
       setUninstallBusy(false);
+    }
+  }
+
+  async function handleToggleExternal(nextEnabled: boolean) {
+    setExternalEnabled(nextEnabled);
+    setSaveBusy(true);
+    try {
+      await invoke("set_external_headroom_config", {
+        config: {
+          enabled: nextEnabled,
+          host: externalHost,
+          port: externalPort
+        }
+      });
+      await refreshRuntimeStatus();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  async function handleSaveExternalConfig() {
+    setSaveBusy(true);
+    try {
+      await invoke("set_external_headroom_config", {
+        config: {
+          enabled: externalEnabled,
+          host: externalHost,
+          port: externalPort
+        }
+      });
+      await refreshRuntimeStatus();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
+  async function handleDetectHeadroom() {
+    setDetectBusy(true);
+    setDetectionResult(null);
+    setDetectedRunningPort(null);
+    try {
+      const result = await invoke<{
+        binaryPath?: string;
+        inPath: boolean;
+        runningLocally: boolean;
+        runningPort?: number;
+      } | null>("detect_installed_headroom");
+
+      if (!result) {
+        setDetectionResult("No headroom installation detected.");
+      } else {
+        let msg = "";
+        if (result.runningLocally && result.runningPort) {
+          setDetectedRunningPort(result.runningPort);
+          msg += `Found running headroom instance. `;
+        }
+        if (result.binaryPath) {
+          msg += `Headroom binary found at ${result.binaryPath}.`;
+        } else {
+          msg += `Headroom is not installed on this system.`;
+        }
+        setDetectionResult(msg);
+      }
+    } catch (e: any) {
+      setDetectionResult(`Detection failed: ${e.message || e}`);
+    } finally {
+      setDetectBusy(false);
+    }
+  }
+
+  async function handleApplyDetected(port: number) {
+    setExternalEnabled(true);
+    setExternalHost("127.0.0.1");
+    setExternalPort(port);
+    setSaveBusy(true);
+    try {
+      await invoke("set_external_headroom_config", {
+        config: {
+          enabled: true,
+          host: "127.0.0.1",
+          port: port
+        }
+      });
+      await refreshRuntimeStatus();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSaveBusy(false);
     }
   }
 
@@ -4607,6 +4713,110 @@ export default function App() {
                     {pricingStatus.claude.profileFetchError}
                   </p>
                 ) : null}
+              </article>
+
+              <article className="soft-card panel-card">
+                <div className="panel-card__header">
+                  <div>
+                    <h3>Headroom connection</h3>
+                  </div>
+                  <div>
+                    <p>
+                      Configure headroom to connect to an existing install on this machine or another device on the local network.
+                    </p>
+                  </div>
+                </div>
+                <div className="connector-list" style={{ borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.05))" }}>
+                  <article className="connector-item">
+                    <div>
+                      <h3>Use external headroom</h3>
+                      <p className="connector-item__reason">
+                        Interface with a headroom instance running outside this app (e.g. CLI or another machine).
+                      </p>
+                    </div>
+                    <div className="connector-item__controls">
+                      <button
+                        aria-checked={externalEnabled}
+                        className={`connector-switch${externalEnabled ? " is-on" : ""}`}
+                        disabled={saveBusy}
+                        onClick={() => void handleToggleExternal(!externalEnabled)}
+                        role="switch"
+                        type="button"
+                      >
+                        <span className="connector-switch__thumb" />
+                      </button>
+                    </div>
+                  </article>
+                </div>
+                
+                {externalEnabled && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", padding: "16px", borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.05))" }}>
+                    <label className="pricing-auth-field" style={{ flex: "1 1 200px" }}>
+                      <span>Host / IP</span>
+                      <div className="pricing-auth-field__input">
+                        <input
+                          type="text"
+                          value={externalHost}
+                          onChange={(e) => setExternalHost(e.target.value)}
+                          placeholder="127.0.0.1"
+                        />
+                      </div>
+                    </label>
+                    <label className="pricing-auth-field" style={{ flex: "1 1 100px" }}>
+                      <span>Port</span>
+                      <div className="pricing-auth-field__input">
+                        <input
+                          type="number"
+                          value={externalPort || ""}
+                          onChange={(e) => setExternalPort(parseInt(e.target.value) || 0)}
+                          placeholder="6768"
+                        />
+                      </div>
+                    </label>
+                    <div style={{ display: "flex", width: "100%", justifyContent: "flex-end", marginTop: "4px" }}>
+                      <button
+                        className="primary-button"
+                        style={{ padding: "6px 12px", fontSize: "12px" }}
+                        onClick={() => void handleSaveExternalConfig()}
+                        disabled={saveBusy || !externalHost || !externalPort}
+                        type="button"
+                      >
+                        {saveBusy ? "Connecting..." : "Save & Connect"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "16px", borderTop: "1px solid var(--border-subtle, rgba(0,0,0,0.05))" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                    <button
+                      className="secondary-button secondary-button--small"
+                      onClick={() => void handleDetectHeadroom()}
+                      disabled={detectBusy}
+                      type="button"
+                    >
+                      {detectBusy ? "Detecting..." : "Detect headroom install"}
+                    </button>
+                    {detectionResult && (
+                      <span style={{ fontSize: "12px", color: "var(--text-subtle)" }}>
+                        {detectionResult}
+                      </span>
+                    )}
+                  </div>
+                  {detectedRunningPort && (
+                    <div style={{ fontSize: "12px", marginTop: "4px", color: "var(--text-subtle)" }}>
+                      💡 Found headroom running on port {detectedRunningPort}.{" "}
+                      <button
+                        className="link-button"
+                        style={{ fontSize: "12px", padding: 0 }}
+                        onClick={() => void handleApplyDetected(detectedRunningPort)}
+                        type="button"
+                      >
+                        Use this connection
+                      </button>
+                    </div>
+                  )}
+                </div>
               </article>
 
               <article className="soft-card panel-card">

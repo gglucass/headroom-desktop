@@ -1502,10 +1502,140 @@ fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool
 }
 
 #[tauri::command]
+fn get_external_headroom_config(
+    state: State<'_, AppState>,
+) -> crate::models::ExternalHeadroomConfig {
+    state.external_headroom_config()
+}
+
+#[tauri::command]
+fn set_external_headroom_config(
+    state: State<'_, AppState>,
+    config: crate::models::ExternalHeadroomConfig,
+) -> Result<(), String> {
+    state
+        .set_external_headroom_config(config)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn detect_installed_headroom(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::models::DetectedHeadroom>, String> {
+    let mut in_path = false;
+    let mut binary_path = None;
+
+    if let Ok(output) = std::process::Command::new("headroom")
+        .arg("--version")
+        .output()
+    {
+        if output.status.success() {
+            in_path = true;
+            binary_path = Some("headroom".to_string());
+        }
+    }
+
+    if binary_path.is_none() {
+        let common_paths = [
+            "/opt/homebrew/bin/headroom",
+            "/usr/local/bin/headroom",
+        ];
+        for path in &common_paths {
+            if std::path::Path::new(path).exists() {
+                binary_path = Some(path.to_string());
+                break;
+            }
+        }
+    }
+
+    if binary_path.is_none() {
+        if let Some(home) = dirs::home_dir() {
+            let user_local_path = home.join(".local").join("bin").join("headroom");
+            if user_local_path.exists() {
+                binary_path = Some(user_local_path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let mut running_locally = false;
+    let mut running_port = None;
+    let ports_to_check = [8787, 6768];
+
+    let current_port = crate::backend_port::get();
+    let check_ports = if ports_to_check.contains(&current_port) {
+        vec![8787, 6768]
+    } else {
+        vec![8787, 6768, current_port]
+    };
+
+    for port in check_ports {
+        if probe_headroom_on_port("127.0.0.1", port) {
+            running_locally = true;
+            running_port = Some(port);
+            break;
+        }
+    }
+
+    if !running_locally {
+        let config = state.external_headroom_config();
+        if config.enabled && probe_headroom_on_port(&config.host, config.port) {
+            running_locally = true;
+            running_port = Some(config.port);
+        }
+    }
+
+    if binary_path.is_none() && !running_locally {
+        Ok(None)
+    } else {
+        Ok(Some(crate::models::DetectedHeadroom {
+            binary_path,
+            in_path,
+            running_locally,
+            running_port,
+        }))
+    }
+}
+
+fn probe_headroom_on_port(host: &str, port: u16) -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    
+    let url = format!("http://{host}:{port}/stats");
+    if let Ok(res) = client.get(&url).send() {
+        if res.status().is_success() {
+            return true;
+        }
+    }
+    
+    for path in &["/readyz", "/livez", "/health"] {
+        let url = format!("http://{host}:{port}{path}");
+        if let Ok(res) = client.get(&url).send() {
+            if res.status().is_success() {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
+#[tauri::command]
 fn get_headroom_logs(
     state: State<'_, AppState>,
     max_lines: Option<usize>,
 ) -> Result<Vec<String>, String> {
+    if state.external_headroom_config().enabled {
+        let config = state.external_headroom_config();
+        return Ok(vec![format!(
+            "Connected to external headroom at {}:{}. Local logs are not written.",
+            config.host, config.port
+        )]);
+    }
     let limit = max_lines.unwrap_or(120).clamp(20, 500);
     state
         .tool_manager
@@ -1955,11 +2085,39 @@ fn aggregate_live_learnings(
     Ok(out)
 }
 
+fn resolve_headroom_binary(state: &AppState) -> std::path::PathBuf {
+    if state.external_headroom_config().enabled {
+        if let Ok(output) = std::process::Command::new("headroom").arg("--version").output() {
+            if output.status.success() {
+                return std::path::PathBuf::from("headroom");
+            }
+        }
+        
+        for path in &["/opt/homebrew/bin/headroom", "/usr/local/bin/headroom"] {
+            let p = std::path::PathBuf::from(path);
+            if p.exists() {
+                return p;
+            }
+        }
+        
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".local").join("bin").join("headroom");
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    state.tool_manager.headroom_entrypoint()
+}
+
 fn memory_export_cached(state: &State<'_, AppState>, memory_path: &Path) -> Result<String, String> {
     if let Some(cached) = state.cached_memory_export() {
         return Ok(cached);
     }
-    let entrypoint = state.tool_manager.headroom_entrypoint();
+    let entrypoint = resolve_headroom_binary(state);
+    if !entrypoint.exists() && entrypoint.to_string_lossy() != "headroom" {
+        return Err("Headroom binary not found. Please make sure headroom is installed on your system.".into());
+    }
     let stdout = run_memory_export(&entrypoint, memory_path)?;
     state.store_memory_export(stdout.clone());
     Ok(stdout)
@@ -1971,7 +2129,10 @@ fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> Result
     if !memory_path.exists() {
         return Err("Memory database does not exist.".into());
     }
-    let entrypoint = state.tool_manager.headroom_entrypoint();
+    let entrypoint = resolve_headroom_binary(&state);
+    if !entrypoint.exists() && entrypoint.to_string_lossy() != "headroom" {
+        return Err("Headroom binary not found. Please make sure headroom is installed on your system.".into());
+    }
     let output = Command::new(&entrypoint)
         .arg("memory")
         .arg("delete")
@@ -2805,6 +2966,9 @@ pub fn run() {
             set_autostart_enabled,
             uninstall_and_quit,
             quit_headroom,
+            get_external_headroom_config,
+            set_external_headroom_config,
+            detect_installed_headroom,
             #[cfg(debug_assertions)]
             debug_force_proxy_bypass
         ])

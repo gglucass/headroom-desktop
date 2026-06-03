@@ -16,11 +16,13 @@
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
+pub const DEFAULT_BACKEND_HOST: &str = "127.0.0.1";
 pub const DEFAULT_BACKEND_PORT: u16 = 6768;
 pub const FALLBACK_RANGE_START: u16 = 6769;
 pub const FALLBACK_RANGE_END: u16 = 6790;
 
 static BACKEND_PORT: AtomicU16 = AtomicU16::new(DEFAULT_BACKEND_PORT);
+static BACKEND_HOST: parking_lot::RwLock<String> = parking_lot::RwLock::new(String::new());
 
 pub fn get() -> u16 {
     BACKEND_PORT.load(Ordering::Acquire)
@@ -30,11 +32,25 @@ pub fn set(port: u16) {
     BACKEND_PORT.store(port, Ordering::Release);
 }
 
-/// Test-only: reset the atomic to [`DEFAULT_BACKEND_PORT`] so test cases that
-/// mutate it don't leak state into other tests in the same binary.
-#[cfg(test)]
+pub fn get_host() -> String {
+    let host = BACKEND_HOST.read();
+    if host.is_empty() {
+        DEFAULT_BACKEND_HOST.to_string()
+    } else {
+        host.clone()
+    }
+}
+
+pub fn set_host(host: String) {
+    *BACKEND_HOST.write() = host;
+}
+
+/// Test-only: reset the static variables so test cases that
+/// mutate them don't leak state into other tests in the same binary.
+#[allow(dead_code)]
 pub fn reset_for_tests() {
     BACKEND_PORT.store(DEFAULT_BACKEND_PORT, Ordering::Release);
+    *BACKEND_HOST.write() = String::new();
 }
 
 /// Successful selection of a port from the fallback range when the default

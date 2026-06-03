@@ -97,10 +97,11 @@ pub fn runtime_upgrade_disabled_by_env() -> bool {
 /// if the proxy is alive but too CPU-saturated to answer a direct probe
 /// quickly, since the intercept has its own retry + longer timeout path.
 fn probe_proxy_livez(client: &reqwest::blocking::Client) -> bool {
+    let backend_host = crate::backend_port::get_host();
     let backend = crate::backend_port::get();
     let urls = [
-        format!("http://127.0.0.1:{backend}/livez"),
-        format!("http://127.0.0.1:{backend}/health"),
+        format!("http://{backend_host}:{backend}/livez"),
+        format!("http://{backend_host}:{backend}/health"),
         "http://127.0.0.1:6767/livez".to_string(),
         "http://127.0.0.1:6767/health".to_string(),
     ];
@@ -221,8 +222,15 @@ fn tcp_port_accepts_connection(addr: std::net::SocketAddr, timeout: std::time::D
 /// [`tcp_port_accepts_connection`] for semantics. The backend port is
 /// normally 6768 but may have been switched to a fallback by `backend_port`.
 pub(crate) fn proxy_port_accepts_connection() -> bool {
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], crate::backend_port::get()).into();
-    tcp_port_accepts_connection(addr, std::time::Duration::from_secs(1))
+    use std::net::ToSocketAddrs;
+    let host = crate::backend_port::get_host();
+    let port = crate::backend_port::get();
+    if let Ok(mut addrs) = format!("{host}:{port}").to_socket_addrs() {
+        if let Some(addr) = addrs.next() {
+            return tcp_port_accepts_connection(addr, std::time::Duration::from_secs(1));
+        }
+    }
+    false
 }
 
 /// Parse the `ps -p PID -o time=` accumulated CPU time format.
@@ -517,6 +525,10 @@ impl AppState {
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
         let tool_manager = ToolManager::new(runtime);
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
+        if launch_profile.external_headroom_enabled {
+            crate::backend_port::set_host(launch_profile.external_headroom_host.clone());
+            crate::backend_port::set(launch_profile.external_headroom_port);
+        }
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
         let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
@@ -592,6 +604,34 @@ impl AppState {
         // dir holds the real working environment and the live venv is a
         // partial install. Restore before doing anything else.
         let _ = self.tool_manager.recover_from_interrupted_upgrade();
+
+        let is_external = {
+            let profile = self.launch_profile.lock();
+            profile.external_headroom_enabled
+        };
+
+        if is_external {
+            let (host, port) = {
+                let profile = self.launch_profile.lock();
+                (profile.external_headroom_host.clone(), profile.external_headroom_port)
+            };
+            crate::backend_port::set_host(host);
+            crate::backend_port::set(port);
+
+            self.set_runtime_starting(true);
+            let _ = self.ensure_headroom_running();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if is_headroom_proxy_reachable() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
+            self.set_runtime_starting(false);
+            return;
+        }
 
         if !self.tool_manager.python_runtime_installed() {
             // First-run; start_bootstrap (wizard) handles install.
@@ -1617,6 +1657,46 @@ impl AppState {
         persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
+    pub fn external_headroom_config(&self) -> crate::models::ExternalHeadroomConfig {
+        let profile = self.launch_profile.lock();
+        crate::models::ExternalHeadroomConfig {
+            enabled: profile.external_headroom_enabled,
+            host: profile.external_headroom_host.clone(),
+            port: profile.external_headroom_port,
+        }
+    }
+
+    pub fn set_external_headroom_config(&self, config: crate::models::ExternalHeadroomConfig) -> Result<()> {
+        let was_enabled = self.launch_profile.lock().external_headroom_enabled;
+
+        {
+            let mut profile = self.launch_profile.lock();
+            profile.external_headroom_enabled = config.enabled;
+            profile.external_headroom_host = config.host.clone();
+            profile.external_headroom_port = config.port;
+            persist_launch_profile(&self.launch_profile_path, &profile);
+        }
+
+        if config.enabled {
+            crate::backend_port::set_host(config.host);
+            crate::backend_port::set(config.port);
+
+            if !was_enabled {
+                self.stop_headroom();
+            }
+        } else {
+            crate::backend_port::set_host(String::new());
+            crate::backend_port::set(crate::backend_port::DEFAULT_BACKEND_PORT);
+
+            if was_enabled {
+                let _ = self.ensure_headroom_running();
+            }
+        }
+
+        self.invalidate_runtime_status_cache();
+        Ok(())
+    }
+
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
         const TTL: Duration = Duration::from_secs(8);
         let mut cache = self.cached_clients.lock();
@@ -2349,6 +2429,29 @@ impl AppState {
     }
 
     pub fn ensure_headroom_running(&self) -> Result<()> {
+        let is_external = {
+            let profile = self.launch_profile.lock();
+            profile.external_headroom_enabled
+        };
+
+        if is_external {
+            let (host, port) = {
+                let profile = self.launch_profile.lock();
+                (profile.external_headroom_host.clone(), profile.external_headroom_port)
+            };
+            crate::backend_port::set_host(host);
+            crate::backend_port::set(port);
+
+            if is_headroom_proxy_reachable() {
+                *self.last_startup_error.lock() = None;
+                return Ok(());
+            } else {
+                let err_msg = format!("External headroom is not reachable at {}:{}", crate::backend_port::get_host(), crate::backend_port::get());
+                *self.last_startup_error.lock() = Some(err_msg.clone());
+                return Err(anyhow::anyhow!(err_msg));
+            }
+        }
+
         if !self.tool_manager.python_runtime_installed() {
             return Ok(());
         }
@@ -2488,7 +2591,12 @@ impl AppState {
     }
 
     fn compute_runtime_status(&self) -> RuntimeStatus {
-        let installed = self.tool_manager.python_runtime_installed();
+        let is_external = self.launch_profile.lock().external_headroom_enabled;
+        let installed = if is_external {
+            true
+        } else {
+            self.tool_manager.python_runtime_installed()
+        };
         let paused = self.runtime_is_paused();
         let proxy_reachable = is_headroom_proxy_reachable();
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
@@ -2958,6 +3066,14 @@ pub fn tail_lines(text: &str, max_lines: usize) -> Vec<String> {
     lines
 }
 
+fn default_external_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_external_port() -> u16 {
+    6768
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LaunchProfile {
     launch_count: u64,
@@ -2971,6 +3087,12 @@ struct LaunchProfile {
     last_launched_app_version: Option<String>,
     #[serde(default)]
     last_runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
+    #[serde(default)]
+    external_headroom_enabled: bool,
+    #[serde(default = "default_external_host")]
+    external_headroom_host: String,
+    #[serde(default = "default_external_port")]
+    external_headroom_port: u16,
 }
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
@@ -2998,6 +3120,9 @@ impl LaunchProfile {
                 setup_wizard_complete: false,
                 last_launched_app_version: None,
                 last_runtime_upgrade_failure: None,
+                external_headroom_enabled: false,
+                external_headroom_host: default_external_host(),
+                external_headroom_port: default_external_port(),
             }
         };
 
@@ -5402,6 +5527,9 @@ mod tests {
                 error_hint: Some("Reverted to 0.6.5".into()),
                 rollback_restored: true,
             }),
+            external_headroom_enabled: false,
+            external_headroom_host: super::default_external_host(),
+            external_headroom_port: super::default_external_port(),
         };
         super::persist_launch_profile(&path, &profile);
 
@@ -6407,7 +6535,14 @@ mod tests {
 
         let daily_points = parsed.daily_savings();
         assert_eq!(daily_points.len(), 1);
-        assert_eq!(daily_points[0].date, "2026-03-27");
+        let expected_date = Utc
+            .with_ymd_and_hms(2026, 3, 27, 0, 0, 0)
+            .single()
+            .expect("date")
+            .with_timezone(&Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(daily_points[0].date, expected_date);
         assert_eq!(daily_points[0].estimated_tokens_saved, 175);
         assert!((daily_points[0].estimated_savings_usd - 0.175).abs() < 1e-9);
         assert_eq!(daily_points[0].actual_cost_usd, 0.0);

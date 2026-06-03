@@ -149,11 +149,12 @@ async fn handle(
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
 ) {
-    // Re-read the backend port on each connection. `tool_manager` selects the
+    // Re-read the backend host and port on each connection. `tool_manager` selects the
     // port (and may switch to a fallback) when the proxy spawn runs, which
     // happens after this thread is already accepting; reading per-connection
     // means existing clients pick up the chosen port without restarting.
-    let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
+    let backend_host = backend_port::get_host();
+    let backend_port_val = backend_port::get();
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
     // `Expect: 100-continue` request flows.
@@ -203,7 +204,7 @@ async fn handle(
     }
 
     // Forward to the headroom backend.
-    let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
+    let Ok(mut backend) = TcpStream::connect((backend_host.as_str(), backend_port_val)).await else {
         // headroom not up yet — send a 502 so the client gets a clean error.
         let _ = client
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")

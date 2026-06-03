@@ -723,3 +723,20 @@ pub struct HeadroomAuthCodeRequest {
     pub email: String,
     pub expires_in_seconds: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalHeadroomConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedHeadroom {
+    pub binary_path: Option<String>,
+    pub in_path: bool,
+    pub running_locally: bool,
+    pub running_port: Option<u16>,
+}
