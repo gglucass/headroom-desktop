@@ -5141,7 +5141,10 @@ export default function App() {
                       {
                         name: "Proxy",
                         ok: runtimeStatus?.proxyReachable === true,
-                        suffix: "6767",
+                        suffix: externalEnabled ? `6767 ➔ ${externalPort}` : "6767",
+                        title: externalEnabled
+                          ? `Local intercept proxy (6767) forwarding to external headroom (${externalPort})`
+                          : "Local intercept proxy (6767) forwarding to headroom backend",
                         onClick: () => void invoke("open_headroom_dashboard"),
                       },
                       {
@@ -5162,7 +5165,7 @@ export default function App() {
                               ? false
                               : null,
                       },
-                    ] as { name: string; ok: boolean | null; suffix?: string; onClick?: () => void }[]).map((s) => {
+                    ] as { name: string; ok: boolean | null; suffix?: string; title?: string; onClick?: () => void }[]).map((s) => {
                       const indicatorClass =
                         s.ok === true
                           ? "runtime-status__indicator--ok"
@@ -5175,7 +5178,7 @@ export default function App() {
                           key={s.name}
                           className={`runtime-status__item${s.onClick ? " runtime-status__item--clickable" : ""}`}
                           onClick={s.onClick}
-                          title={s.ok === null ? `${s.name} status unknown` : undefined}
+                          title={s.title || (s.ok === null ? `${s.name} status unknown` : undefined)}
                         >
                           <span className="runtime-status__label">{s.name}:</span>
                           <span className={`runtime-status__indicator ${indicatorClass}`}>
