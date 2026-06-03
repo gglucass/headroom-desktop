@@ -2033,6 +2033,10 @@ impl AppState {
         &self,
         drain_pending_milestones: bool,
     ) -> (DashboardState, PendingMilestones) {
+        let (external_enabled, launch_experience) = {
+            let profile = self.launch_profile.lock();
+            (profile.external_headroom_enabled, profile.launch_experience.clone())
+        };
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
         let recent_usage = self.recent_usage.lock().clone();
@@ -2098,13 +2102,13 @@ impl AppState {
         (
             DashboardState {
                 app_version: env!("CARGO_PKG_VERSION").into(),
-                launch_experience: self.launch_profile.lock().launch_experience.clone(),
-                bootstrap_complete: if self.launch_profile.lock().external_headroom_enabled {
+                launch_experience,
+                bootstrap_complete: if external_enabled {
                     true
                 } else {
                     self.tool_manager.python_runtime_installed()
                 },
-                python_runtime_installed: if self.launch_profile.lock().external_headroom_enabled {
+                python_runtime_installed: if external_enabled {
                     true
                 } else {
                     self.tool_manager.python_runtime_installed()
