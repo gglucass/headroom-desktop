@@ -71,6 +71,7 @@ function makeRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     platform: "darwin",
     supportTier: "supported",
     installed: true,
+    localRuntimeInstalled: true,
     running: true,
     starting: false,
     paused: false,

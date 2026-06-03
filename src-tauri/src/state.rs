@@ -2649,6 +2649,8 @@ impl AppState {
             }
         };
 
+        let local_runtime_installed = self.tool_manager.python_runtime_installed();
+
         let effective_running = installed && !paused && proxy_reachable;
 
         let startup_error = self.last_startup_error.lock().clone();
@@ -2658,6 +2660,7 @@ impl AppState {
             platform: platform.into(),
             support_tier: support_tier.into(),
             installed,
+            local_runtime_installed,
             running: effective_running,
             starting: self.runtime_is_starting() && !effective_running,
             paused,

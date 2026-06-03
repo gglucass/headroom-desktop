@@ -5296,27 +5296,29 @@ export default function App() {
                 </div>
               </article>
 
-              <article className="soft-card panel-card">
-                <div className="panel-card__header">
-                  <div>
-                    <h3>Uninstall</h3>
+              {!externalEnabled && runtimeStatus?.localRuntimeInstalled ? (
+                <article className="soft-card panel-card">
+                  <div className="panel-card__header">
+                    <div>
+                      <h3>Uninstall</h3>
+                    </div>
                   </div>
-                </div>
-                <p>
-                  Reverses every change Headroom made: removes the managed Python runtime, the Claude Code
-                  hook, and restores <code>~/.claude/settings.json</code> changes. Headroom will quit when done.
-                </p>
-                <button
-                  className="secondary-button secondary-button--small"
-                  onClick={() => {
-                    setUninstallError(null);
-                    setShowUninstallDialog(true);
-                  }}
-                  type="button"
-                >
-                  Uninstall Headroom
-                </button>
-              </article>
+                  <p>
+                    Reverses every change Headroom made: removes the managed Python runtime, the Claude Code
+                    hook, and restores <code>~/.claude/settings.json</code> changes. Headroom will quit when done.
+                  </p>
+                  <button
+                    className="secondary-button secondary-button--small"
+                    onClick={() => {
+                      setUninstallError(null);
+                      setShowUninstallDialog(true);
+                    }}
+                    type="button"
+                  >
+                    Uninstall Headroom
+                  </button>
+                </article>
+              ) : null}
 
               <button
                 className="contact-link"

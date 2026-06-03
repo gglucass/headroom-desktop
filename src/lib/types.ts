@@ -148,6 +148,7 @@ export interface RuntimeStatus {
   platform: string;
   supportTier: string;
   installed: boolean;
+  localRuntimeInstalled: boolean;
   running: boolean;
   starting: boolean;
   paused: boolean;

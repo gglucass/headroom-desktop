@@ -221,6 +221,7 @@ pub struct RuntimeStatus {
     pub platform: String,
     pub support_tier: String,
     pub installed: bool,
+    pub local_runtime_installed: bool,
     pub running: bool,
     pub starting: bool,
     pub paused: bool,
