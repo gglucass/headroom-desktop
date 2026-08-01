@@ -3,8 +3,8 @@ cask "headroom-desktop" do
   sha256 :no_check
 
   url "https://github.com/gglucass/headroom-desktop/releases/latest/download/Headroom.dmg"
-  name "Headroom"
-  desc "Cut Claude Code and Codex token costs by ~50%"
+  name "Headroom Desktop"
+  desc "Reduce token usage for Claude Code and Codex"
   homepage "https://extraheadroom.com/"
 
   depends_on :macos
