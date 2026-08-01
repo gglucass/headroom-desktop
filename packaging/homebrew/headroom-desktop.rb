@@ -1,4 +1,4 @@
-cask "headroom" do
+cask "headroom-desktop" do
   version :latest
   sha256 :no_check
 

@@ -254,7 +254,7 @@ After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging`
 Homebrew users can install the latest signed release with:
 
 ```bash
-brew install --cask headroom
+brew install --cask headroom-desktop
 ```
 
 The cask uses `version :latest`, so it always points at the newest stable DMG;
@@ -271,10 +271,10 @@ prereleases and are ignored by GitHub's `/releases/latest/` redirect.
 
 ### Maintaining the cask
 
-The cask source of truth lives at `packaging/homebrew/headroom.rb` in this repo.
+The cask source of truth lives at `packaging/homebrew/headroom-desktop.rb` in this repo.
 To ship it in the official tap, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
-file at `Casks/h/headroom.rb`. Because the cask is `version :latest`, it never
+file at `Casks/h/headroom-desktop.rb`. Because the cask is `version :latest`, it never
 needs per-release updates.
 
 > Post-release check: after the next stable release, confirm

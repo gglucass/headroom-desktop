@@ -12,7 +12,7 @@
 
 ### Install
 
-1. **Homebrew:** `brew install --cask headroom`
+1. **Homebrew:** `brew install --cask headroom-desktop`
 2. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
 3. On macOS, download the `.dmg` file (for example `Headroom_0.2.9.dmg`)
 4. Open the DMG, drag **Headroom** to Applications
