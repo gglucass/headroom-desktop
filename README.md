@@ -12,12 +12,13 @@
 
 ### Install
 
-1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. On macOS, download the `.dmg` file (for example `Headroom_0.2.9.dmg`)
-3. Open the DMG, drag **Headroom** to Applications
-4. Launch Headroom — it appears in your menu bar and walks you through setup
+1. **Homebrew:** `brew install --cask headroom`
+2. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
+3. On macOS, download the `.dmg` file (for example `Headroom_0.2.9.dmg`)
+4. Open the DMG, drag **Headroom** to Applications
+5. Launch Headroom — it appears in your menu bar and walks you through setup
 
-Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings.
+Headroom is signed and notarized, so macOS will open it without Gatekeeper warnings. The Homebrew cask always installs the latest signed release and self-updates via the app's built-in updater.
 
 Linux preview artifacts are published on the same release page. Today they are best treated as a preview for the core Headroom proxy, Claude Code routing, and RTK flow. `Headroom Learn` is not supported yet on Linux preview builds.
 
