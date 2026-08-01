@@ -138,7 +138,8 @@ For each mac release:
 2. Code-sign the app with your Apple Developer ID Application certificate.
 3. Notarize the build with Apple.
 4. Publish the signed updater artifacts and `latest.json`.
-5. Create or update the GitHub Release that hosts those files.
+5. Publish a stable-named copy of the DMG (`Headroom.dmg`) on the same release so the Homebrew cask can always resolve the latest build. The release workflow does this automatically via the "Publish stable-named DMG for Homebrew" step.
+6. Create or update the GitHub Release that hosts those files.
 
 The app is already configured with `"createUpdaterArtifacts": true`, so Tauri will emit updater-friendly release artifacts during bundling.
 
@@ -247,3 +248,35 @@ To bypass the guard for emergency hotfixes, include `[skip-rc-check]` in the **P
 ### Final update-flow verification
 
 After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging` release at the stable artifacts. The staging test machine receives `X.Y.Z` as an update via the staging endpoint (since `X.Y.Z > X.Y.Z-rc.N` in semver). Once installed, its version is plain `X.Y.Z` and the app automatically switches to the stable endpoint for all future update checks.
+
+## Homebrew (cask)
+
+Homebrew users can install the latest signed release with:
+
+```bash
+brew install --cask headroom
+```
+
+The cask uses `version :latest`, so it always points at the newest stable DMG;
+the app self-updates through its built-in updater, so no per-release cask bumps
+are needed.
+
+### How it works
+
+Each stable release publishes a copy of its DMG under the fixed name
+`Headroom.dmg` on the versioned release. The cask's URL
+`https://github.com/gglucass/headroom-desktop/releases/latest/download/Headroom.dmg`
+resolves to the newest stable release's asset. Staging (`-rc.N`) builds are
+prereleases and are ignored by GitHub's `/releases/latest/` redirect.
+
+### Maintaining the cask
+
+The cask source of truth lives at `packaging/homebrew/headroom.rb` in this repo.
+To ship it in the official tap, open a PR against
+[`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
+file at `Casks/h/headroom.rb`. Because the cask is `version :latest`, it never
+needs per-release updates.
+
+> Post-release check: after the next stable release, confirm
+> `https://github.com/gglucass/headroom-desktop/releases/latest/download/Headroom.dmg`
+> downloads the newest DMG.
