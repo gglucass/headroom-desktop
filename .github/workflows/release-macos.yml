@@ -292,23 +292,6 @@ jobs:
           includeUpdaterJson: true
           args: --target aarch64-apple-darwin
 
-      - name: Publish stable-named DMG for Homebrew
-        if: steps.release_guard.outputs.should_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STABLE_TAG: v${{ steps.release_guard.outputs.package_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          workdir="$(mktemp -d)"
-          gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'Headroom_*_mac.dmg' --dir "$workdir"
-          dmg="$(find "$workdir" -maxdepth 1 -name 'Headroom_*_mac.dmg' -print -quit)"
-          if [[ -z "$dmg" ]]; then
-            echo "No DMG found to publish as the stable Homebrew asset." >&2
-            exit 1
-          fi
-          gh release upload "$STABLE_TAG" "${dmg}#Headroom.dmg" --clobber --repo "$GITHUB_REPOSITORY"
-
       - name: Mirror stable artifacts to rolling staging release
         if: steps.release_guard.outputs.should_release == 'true'
         env:

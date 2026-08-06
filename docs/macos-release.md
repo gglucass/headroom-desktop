@@ -138,8 +138,7 @@ For each mac release:
 2. Code-sign the app with your Apple Developer ID Application certificate.
 3. Notarize the build with Apple.
 4. Publish the signed updater artifacts and `latest.json`.
-5. Publish a stable-named copy of the DMG (`Headroom.dmg`) on the same release so the Homebrew cask can always resolve the latest build. The release workflow does this automatically via the "Publish stable-named DMG for Homebrew" step.
-6. Create or update the GitHub Release that hosts those files.
+5. Create or update the GitHub Release that hosts those files.
 
 The app is already configured with `"createUpdaterArtifacts": true`, so Tauri will emit updater-friendly release artifacts during bundling.
 
@@ -257,26 +256,18 @@ Homebrew users can install the latest signed release with:
 brew install --cask headroom-desktop
 ```
 
-The cask uses `version :latest`, so it always points at the newest stable DMG;
-the app self-updates through its built-in updater, so no per-release cask bumps
-are needed.
-
-### How it works
-
-Each stable release publishes a copy of its DMG under the fixed name
-`Headroom.dmg` on the versioned release. The cask's URL
-`https://github.com/gglucass/headroom-desktop/releases/latest/download/Headroom.dmg`
-resolves to the newest stable release's asset. Staging (`-rc.N`) builds are
-prereleases and are ignored by GitHub's `/releases/latest/` redirect.
+The cask is versioned (`version "X.Y.Z"`, not `version :latest`) and points at
+the tagged release's `Headroom_X.Y.Z_mac.dmg` asset directly, since each stable
+release already publishes a versioned URL. A `livecheck` block using
+`strategy :github_latest` lets BrewTestBot autobump the cask on every release,
+and `auto_updates true` is accurate since the app also self-updates through its
+built-in updater between cask bumps.
 
 ### Maintaining the cask
 
 The cask source of truth lives at `packaging/homebrew/headroom-desktop.rb` in this repo.
-To ship it in the official tap, open a PR against
+On each stable release, bump `version` and `sha256` to match the new
+`Headroom_X.Y.Z_mac.dmg` asset. To ship it in the official tap, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
-file at `Casks/h/headroom-desktop.rb`. Because the cask is `version :latest`, it never
-needs per-release updates.
-
-> Post-release check: after the next stable release, confirm
-> `https://github.com/gglucass/headroom-desktop/releases/latest/download/Headroom.dmg`
-> downloads the newest DMG.
+file at `Casks/h/headroom-desktop.rb`; once merged there, BrewTestBot keeps it
+current automatically via `livecheck`.
