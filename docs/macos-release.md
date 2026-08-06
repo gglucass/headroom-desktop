@@ -265,9 +265,12 @@ built-in updater between cask bumps.
 
 ### Maintaining the cask
 
-The cask source of truth lives at `packaging/homebrew/headroom-desktop.rb` in this repo.
-On each stable release, bump `version` and `sha256` to match the new
-`Headroom_X.Y.Z_mac.dmg` asset. To ship it in the official tap, open a PR against
+The cask source at `packaging/homebrew/headroom-desktop.rb` in this repo is a
+submission template, not a maintained artifact: `scripts/bump-version.sh` only
+touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
+can't be filled in until CI has built and notarized the DMG, so it goes stale
+on the next release. To ship it, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
-file at `Casks/h/headroom-desktop.rb`; once merged there, BrewTestBot keeps it
-current automatically via `livecheck`.
+file at `Casks/h/headroom-desktop.rb`. Once merged there, the tap becomes the
+source of truth and BrewTestBot maintains `version` and `sha256` automatically
+via `livecheck`.

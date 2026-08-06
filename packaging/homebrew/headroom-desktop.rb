@@ -14,7 +14,7 @@ cask "headroom-desktop" do
   end
 
   auto_updates true
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
   depends_on arch: :arm64
 
   app "Headroom.app"
@@ -23,12 +23,12 @@ cask "headroom-desktop" do
             quit:      "com.extraheadroom.headroom"
 
   zap trash: [
+    "~/.headroom",
     "~/Library/Application Support/Headroom",
     "~/Library/Caches/com.extraheadroom.headroom",
-    "~/Library/LaunchAgents/Headroom.plist",
     "~/Library/LaunchAgents/com.extraheadroom.headroom.plist",
+    "~/Library/LaunchAgents/Headroom.plist",
     "~/Library/Preferences/com.extraheadroom.headroom.plist",
     "~/Library/Saved Application State/com.extraheadroom.headroom.savedState",
-    "~/.headroom",
   ]
 end
