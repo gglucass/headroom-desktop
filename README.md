@@ -15,7 +15,7 @@
 **Option A — Homebrew:**
 
 ```bash
-brew install --cask headroom-desktop
+brew install --cask headroom
 ```
 
 **Option B — manual download:**

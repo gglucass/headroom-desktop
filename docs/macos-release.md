@@ -253,8 +253,13 @@ After the stable workflow publishes `vX.Y.Z`, it re-points the rolling `staging`
 Homebrew users can install the latest signed release with:
 
 ```bash
-brew install --cask headroom-desktop
+brew install --cask headroom
 ```
+
+The cask token is `headroom`, not `headroom-desktop`. Homebrew's new-cask audit
+rejects any token ending in `desktop` (also `mac`, `osx`, `macos`, `launcher`),
+and the rule is `--new`-only so a plain `brew audit --cask --strict` run will not
+catch a rename back. Verify with `brew audit --cask --new --strict headroom`.
 
 The cask is versioned (`version "X.Y.Z"`, not `version :latest`) and points at
 the tagged release's `Headroom_X.Y.Z_mac.dmg` asset directly, since each stable
@@ -265,12 +270,12 @@ built-in updater between cask bumps.
 
 ### Maintaining the cask
 
-The cask source at `packaging/homebrew/headroom-desktop.rb` in this repo is a
+The cask source at `packaging/homebrew/headroom.rb` in this repo is a
 submission template, not a maintained artifact: `scripts/bump-version.sh` only
 touches `package.json`, `tauri.conf.json`, and `Cargo.toml`, and the `sha256`
 can't be filled in until CI has built and notarized the DMG, so it goes stale
 on the next release. To ship it, open a PR against
 [`homebrew/homebrew-cask`](https://github.com/homebrew/homebrew-cask) adding the
-file at `Casks/h/headroom-desktop.rb`. Once merged there, the tap becomes the
+file at `Casks/h/headroom.rb`. Once merged there, the tap becomes the
 source of truth and BrewTestBot maintains `version` and `sha256` automatically
 via `livecheck`.

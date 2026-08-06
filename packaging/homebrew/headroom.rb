@@ -1,10 +1,10 @@
-cask "headroom-desktop" do
-  version "0.7.4"
-  sha256 "ca58f2b017395c352a6961bb43a53d375827f5e43694b542d60576b86be05734"
+cask "headroom" do
+  version "0.7.5"
+  sha256 "6c31a0511430e2a7b235ca290c4ada1b7de2f8051ccad35c84bc18ecb46abad2"
 
   url "https://github.com/gglucass/headroom-desktop/releases/download/v#{version}/Headroom_#{version}_mac.dmg",
       verified: "github.com/gglucass/headroom-desktop/"
-  name "Headroom Desktop"
+  name "Headroom"
   desc "Reduce token usage for Claude Code and Codex"
   homepage "https://extraheadroom.com/"
 
