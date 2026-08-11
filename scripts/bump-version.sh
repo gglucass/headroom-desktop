@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 usage() {
   echo "Usage: $0 <version>" >&2
-  echo "  version: e.g. 1.2.3, 1.2.3-rc.1, or v1.2.3 (v prefix is stripped)" >&2
+  echo "  version: e.g. 1.2.3, 1.2.3-rc.1, 1.2.3-win.1, or v1.2.3 (v prefix is stripped)" >&2
   exit 1
 }
 
@@ -25,9 +25,12 @@ fi
 # Strip leading 'v'
 VERSION="${VERSION#v}"
 
-# Validate semver format
-if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
-  echo "Invalid version: '${VERSION}' (expected x.y.z or x.y.z-rc.N)" >&2
+# Validate semver format. `-win.N` is the windows-preview channel
+# (windows-preview.yml): it must sort above the last stable so the preview
+# updater offers it, and below the next stable so a promoted release
+# supersedes it.
+if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|win)\.[0-9]+)?$ ]]; then
+  echo "Invalid version: '${VERSION}' (expected x.y.z, x.y.z-rc.N, or x.y.z-win.N)" >&2
   exit 1
 fi
 
