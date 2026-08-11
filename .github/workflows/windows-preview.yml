@@ -59,7 +59,11 @@ jobs:
 
       - name: Build NSIS installer
         shell: bash
-        run: npx tauri build --target x86_64-pc-windows-msvc
+        # NSIS only: bundle.targets is "all", which also builds an MSI this
+        # workflow never publishes. Beyond the wasted minutes, the MSI target
+        # rejects any non-numeric pre-release identifier ("must be numeric-only
+        # ... for msi target"), so it alone blocked the -win.N preview versions.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Publish to windows-preview prerelease
         shell: bash
