@@ -1,0 +1,175 @@
+name: Release Windows (download only)
+
+# Publishes a Windows installer for a version that `releases/latest` does NOT
+# point at. The release is a prerelease and carries no latest.json, so the
+# stable updater manifest is untouched and no install on any platform is offered
+# an update. New Windows downloads get the newer installer; everyone already
+# installed stays put until the next full release converges every platform.
+#
+# Why not narrow latest.json to windows-x86_64 instead (the `[platforms:]`
+# marker in release-macos.yml): measured 2026-08-24, 65% of the active fleet
+# predates 0.8.4, and those builds surface a missing platform entry as an
+# update-check *error*, not a no-op, at one Sentry event per install-hour --
+# 1-5x the org's entire event volume for the length of the split. Reach for the
+# marker only once 0.8.4+ is the overwhelming majority of the fleet.
+#
+# The version is bumped in-tree and never committed, so the branch keeps its
+# -rc version and merging it to main cannot fire a full stable release of this
+# same number. The converging release is the next one (bump normally, ship to
+# every platform).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Plain X.Y.Z version to build and publish as a Windows-only download"
+        required: true
+
+concurrency:
+  group: windows-download-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 (download only)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      # The stable endpoint on purpose: a fresh install of this build polls the
+      # normal manifest, reads an older version there, and gets a clean no-op
+      # (tauri only offers strictly-newer) until the converging release lands.
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate target version
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Download-only releases use a plain X.Y.Z version (got: ${version}). Pre-release versions ship via the staging workflow." >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+
+          # Never touch a release that stable installs already trust: clobbering
+          # its installer would break every updater whose latest.json holds a
+          # signature for the old bytes.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease 2>/dev/null | grep -qx false; then
+            echo "${tag} is already a published (non-prerelease) release. Refusing to replace its assets." >&2
+            exit 1
+          fi
+
+          for key in HEADROOM_UPDATER_PUBLIC_KEY TAURI_SIGNING_PRIVATE_KEY AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET HEADROOM_SENTRY_DSN; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret or variable: ${key}" >&2
+              exit 1
+            fi
+          done
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Apply the version in-tree
+        shell: bash
+        run: ./scripts/bump-version.sh "${{ steps.guard.outputs.version }}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Azure Artifact Signing CLI
+        run: cargo install artifact-signing-cli --locked
+
+      - name: Build NSIS installer
+        shell: bash
+        # NSIS only, same as the stable workflow: bundle.targets is "all", which
+        # also builds an MSI nothing publishes. signCommand signs both the inner
+        # .exe and the installer.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Publish the installer as a prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(ls "$bundle_dir"/*-setup.exe)"
+          sig="${setup}.sig"
+          [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom $TAG (Windows download)" \
+              --notes "Windows-only download build. Not an update: no install on any platform is offered this version, and the stable updater manifest still points at the previous release. The next full release ships to every platform." \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+
+          # The .sig is uploaded but referenced by no manifest. It is the only
+          # way to attest these exact bytes later (a rebuild does not reproduce
+          # them), so keep it even though nothing reads it today.
+          gh release upload "$TAG" "$setup" "$sig" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify the stable channel is untouched
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        # The whole point of this workflow is that `releases/latest` keeps
+        # serving the previous version's manifest. If this build somehow became
+        # `latest`, its release has no latest.json and every install on every
+        # platform would 404 its update check -- silently, because the updater
+        # suppresses exactly those 404s.
+        run: |
+          set -euo pipefail
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [[ "$latest_tag" == "$TAG" ]]; then
+            echo "${TAG} became releases/latest, which would strand every platform's update check." >&2
+            exit 1
+          fi
+          manifest_version="$(curl -sfL --max-time 30 "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json" | jq -r .version)"
+          echo "releases/latest is ${latest_tag}, serving manifest version ${manifest_version}. Windows download build ${TAG} published alongside it."
