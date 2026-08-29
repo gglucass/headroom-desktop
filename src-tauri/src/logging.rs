@@ -297,6 +297,18 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The zero-savings canary reaches Sentry via the fixed-fingerprint capture
+    // at the emit site (savings_canary::observe), whose whole design is that
+    // every affected machine lands in ONE issue so the event count is the blast
+    // radius. This warn fires at the same instant with no fingerprint, so it
+    // grouped separately (RUST-A4 alongside RUST-A5, same millisecond) -- and
+    // because its text embeds the sample counts, models and strata, a real
+    // fleet-wide regression would shatter into a different issue per machine,
+    // destroying exactly the graph the canary exists to draw. Same split as the
+    // backend_port line above.
+    if target.starts_with("headroom_desktop_lib::savings_canary") {
+        return true;
+    }
     // A host with no usable Secret Service (headless VM, xrdp session with no
     // login keyring) is the case this fallback exists FOR: the 0600 file is the
     // designed path, sign-in works, nothing is broken. It fired once per process
@@ -802,6 +814,30 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::tool_manager",
             "caveman smoke test failed after upgrade: stale receipt removed"
+        ));
+    }
+
+    #[test]
+    fn skips_bridged_zero_savings_canary_warn() {
+        // RUST-A4/RUST-A5: one detection on one machine opened two issues in
+        // the same millisecond. Sentry's path is the fixed-fingerprint capture
+        // in savings_canary::observe; the bridged warn carries no fingerprint
+        // and would group by its text, which embeds the counts and models.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero-savings canary: 32/32 requests over 10000 tokens saved nothing \
+             (models: anthropic/glm-5.3; strata: other|new_user_ask|xl|tools)"
+        ));
+        // A different machine's numbers must not sneak back in as a new issue.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero-savings canary: 148/150 requests over 10000 tokens saved nothing \
+             (models: openai/gpt-5.4; strata: gpt|new_user_ask|m|notools)"
+        ));
+        // Unrelated targets are untouched.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "zero-savings canary: 32/32 requests over 10000 tokens saved nothing"
         ));
     }
 
