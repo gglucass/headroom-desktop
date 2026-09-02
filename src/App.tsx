@@ -7847,12 +7847,6 @@ export default function App() {
                 ) : null}
               </article>
 
-              {/* Provider settings ship dark for now: the backend default is
-                  Off and explicitly-configured setups keep working, but the
-                  panel stays hidden until the provider work is finished.
-                  Flip to true to restore Settings -> Provider. */}
-              <UpstreamPanel />
-
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
@@ -8001,6 +7995,16 @@ export default function App() {
                   </div>
                 </div>
               </article>
+
+              {/* Power-user settings almost nobody needs, collapsed so they do
+                  not crowd out the ones people came here for. New ones go
+                  inside; the disclosure state is the browser's own. */}
+              <details className="advanced-section">
+                <summary>Advanced</summary>
+                <div className="advanced-section__body">
+                  <UpstreamPanel />
+                </div>
+              </details>
 
               <article className="soft-card panel-card">
                 <div className="panel-card__header">

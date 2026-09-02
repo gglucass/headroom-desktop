@@ -6368,6 +6368,24 @@ html.window-hiding {
   text-align: center;
 }
 
+/* Power-user settings, collapsed by default. Same disclosure idiom as
+   .savings-breakdown__models. */
+.advanced-section summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--text-secondary);
+  padding: 4px 0;
+}
+
+/* Contents wrapped rather than laid out on the <details> itself: WebKit is
+   unreliable about grid applied directly to a disclosure element. */
+.advanced-section__body {
+  display: grid;
+  gap: 14px;
+  margin-top: 10px;
+}
+
 .upstream-panel {
   display: grid;
   gap: 14px;
