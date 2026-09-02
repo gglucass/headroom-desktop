@@ -13,7 +13,7 @@ file="${1:-src/styles.css}"
 # the count is only allowed to shrink. Lower this number as you migrate rules.
 # ponytail: a stale baseline lets offenders regrow up to it after a migration;
 # tighten by failing on count < BASELINE if that ever actually happens.
-BASELINE="${CHECK_COLORS_BASELINE:-480}"
+BASELINE="${CHECK_COLORS_BASELINE:-478}"
 
 # Use awk to track whether we are inside a :root block or a @media (prefers-color-scheme) block.
 # Raw colors inside those blocks are the token definitions themselves — allowed.

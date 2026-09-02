@@ -4101,7 +4101,7 @@ details[open] .optimize-minimal__details summary::after {
 .link-button {
   border: 0;
   background: transparent;
-  color: #59514a;
+  color: var(--text-secondary);
   font-size: var(--text-sm);
   text-decoration: underline;
   cursor: pointer;
@@ -4110,7 +4110,7 @@ details[open] .optimize-minimal__details summary::after {
 }
 
 .link-button:hover {
-  color: #2e2824;
+  color: var(--text-primary);
 }
 
 .connector-switch {
@@ -6296,6 +6296,17 @@ html.window-hiding {
   font-size: var(--text-xs);
   margin: 0;
   text-align: center;
+}
+
+.tray-footnote {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  margin: 0;
+  text-align: center;
+}
+
+.tray-footnote .link-button {
+  margin-left: 0;
 }
 
 .paywall__sale-banner {
