@@ -36,7 +36,6 @@ describe("UpstreamPanel", () => {
     render(<UpstreamPanel />);
 
     await screen.findByLabelText("Provider base URL");
-    await user.click(screen.getByRole("radio", { name: /Override/ }));
     await user.type(screen.getByLabelText("Provider base URL"), "https://api.z.ai/api/anthropic");
     await user.type(screen.getByLabelText("Provider auth token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
@@ -102,7 +101,6 @@ describe("UpstreamPanel", () => {
     render(<UpstreamPanel />);
 
     await screen.findByLabelText("Provider base URL");
-    await user.click(screen.getByRole("radio", { name: /Fallback/ }));
     await user.type(screen.getByLabelText("Provider base URL"), "api.z.ai");
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
 
@@ -110,13 +108,24 @@ describe("UpstreamPanel", () => {
     expect(screen.queryByText(/restarted/)).not.toBeInTheDocument();
   });
 
-  it("disables the fields until a provider mode is chosen", async () => {
-    respond(off);
+  /// Clearing the URL is the only way to turn the provider back off, so it has
+  /// to reach the backend as "off" -- that is what drops the stored token too.
+  it("turns the provider off when the URL is emptied", async () => {
+    respond(configured, off);
+    const user = userEvent.setup();
     render(<UpstreamPanel />);
 
+    await screen.findByDisplayValue("https://api.z.ai/api/anthropic");
+    await user.clear(screen.getByLabelText("Provider base URL"));
+    await user.click(screen.getByRole("button", { name: "Save and restart" }));
+
     await waitFor(() => {
-      expect(screen.getByLabelText("Provider base URL")).toBeDisabled();
-      expect(screen.getByLabelText("Provider auth token")).toBeDisabled();
+      expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
+        mode: "off",
+        baseUrl: "",
+        token: null
+      });
     });
+    expect(await screen.findByText(/restarted on Anthropic/)).toBeInTheDocument();
   });
 });

@@ -6375,39 +6375,6 @@ html.window-hiding {
   margin-top: 12px;
 }
 
-.upstream-panel__modes {
-  display: grid;
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.upstream-panel__legend {
-  padding: 0;
-  font-size: var(--text-sm);
-  font-weight: 700;
-  color: var(--text-secondary);
-}
-
-.upstream-panel__mode {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  font-size: var(--text-sm);
-  color: var(--text-primary);
-}
-
-.upstream-panel__mode > span {
-  display: grid;
-  gap: 2px;
-}
-
-.upstream-panel__mode-help {
-  font-size: var(--text-xs);
-  color: var(--text-secondary);
-}
-
 .upstream-field {
   display: grid;
   gap: 8px;

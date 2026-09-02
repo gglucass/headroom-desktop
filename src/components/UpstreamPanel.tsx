@@ -1,31 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-import type { UpstreamMode, UpstreamOverrideView } from "../lib/types";
-
-const MODES: { id: UpstreamMode; label: string; help: string }[] = [
-  {
-    id: "off",
-    label: "Off",
-    help: "Use Anthropic, or whatever provider cc-switch selects.",
-  },
-  {
-    id: "fallback",
-    label: "Fallback",
-    help: "Start on this provider, but let a cc-switch provider switch take over.",
-  },
-  {
-    id: "override",
-    label: "Override",
-    help: "Always use this provider, even after a cc-switch provider switch.",
-  },
-];
+import type { UpstreamOverrideView } from "../lib/types";
 
 /// Settings for an Anthropic-compatible provider (GLM, Kimi, DeepSeek) that
-/// Headroom should route to. Saving restarts the proxy: the upstream is read
-/// at boot, so a running proxy keeps serving the previous one.
+/// Headroom should route to. The base URL is the whole switch: empty is
+/// Anthropic, anything else wins over a cc-switch provider change. Saving
+/// restarts the proxy -- the upstream is read at boot, so a running proxy
+/// keeps serving the previous one.
 export function UpstreamPanel() {
-  const [mode, setMode] = useState<UpstreamMode>("off");
   const [baseUrl, setBaseUrl] = useState("");
   const [hasToken, setHasToken] = useState(false);
   // Empty means "leave the stored token alone", which is why the field starts
@@ -38,7 +21,6 @@ export function UpstreamPanel() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const apply = useCallback((next: UpstreamOverrideView) => {
-    setMode(next.mode);
     setBaseUrl(next.baseUrl);
     setHasToken(next.hasToken);
     setToken("");
@@ -68,20 +50,24 @@ export function UpstreamPanel() {
     };
   }, [apply]);
 
+  const configured = baseUrl.trim() !== "";
+
   const save = useCallback(async () => {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
       const saved = await invoke<UpstreamOverrideView>("save_upstream_override", {
-        mode,
+        // Off clears the stored URL and token backend-side, so an emptied
+        // field is how the user turns the provider back off.
+        mode: configured ? "override" : "off",
         baseUrl,
         token: tokenTouched ? token : null,
       });
       apply(saved);
       setNotice(
         saved.mode === "off"
-          ? "Provider override removed. Headroom restarted on the default upstream."
+          ? "Provider removed. Headroom restarted on Anthropic."
           : "Saved. Headroom restarted on this provider.",
       );
     } catch (err) {
@@ -89,9 +75,7 @@ export function UpstreamPanel() {
     } finally {
       setBusy(false);
     }
-  }, [apply, baseUrl, mode, token, tokenTouched]);
-
-  const fieldsDisabled = busy || mode === "off";
+  }, [apply, baseUrl, configured, token, tokenTouched]);
 
   return (
     <article className="soft-card panel-card">
@@ -100,6 +84,7 @@ export function UpstreamPanel() {
           <h3>Provider</h3>
           <p className="panel-card__subtitle">
             Route Headroom at an Anthropic-compatible endpoint instead of Anthropic.
+            Leave the URL empty to use Anthropic.
           </p>
         </div>
       </div>
@@ -108,32 +93,13 @@ export function UpstreamPanel() {
         <p className="upstream-panel__meta">Loading…</p>
       ) : (
         <div className="upstream-panel">
-          <fieldset className="upstream-panel__modes" disabled={busy}>
-            <legend className="upstream-panel__legend">When cc-switch changes provider</legend>
-            {MODES.map((option) => (
-              <label className="upstream-panel__mode" key={option.id}>
-                <input
-                  checked={mode === option.id}
-                  name="upstream-mode"
-                  onChange={() => setMode(option.id)}
-                  type="radio"
-                  value={option.id}
-                />
-                <span>
-                  <strong>{option.label}</strong>
-                  <span className="upstream-panel__mode-help">{option.help}</span>
-                </span>
-              </label>
-            ))}
-          </fieldset>
-
           <label className="upstream-field">
             <span>Base URL</span>
             <span className="upstream-field__input">
               <input
                 aria-label="Provider base URL"
                 autoComplete="off"
-                disabled={fieldsDisabled}
+                disabled={busy}
                 onChange={(event) => setBaseUrl(event.target.value)}
                 placeholder="https://api.z.ai/api/anthropic"
                 spellCheck={false}
@@ -149,7 +115,7 @@ export function UpstreamPanel() {
               <input
                 aria-label="Provider auth token"
                 autoComplete="off"
-                disabled={fieldsDisabled}
+                disabled={busy}
                 onChange={(event) => {
                   setToken(event.target.value);
                   setTokenTouched(true);
@@ -176,7 +142,7 @@ export function UpstreamPanel() {
             >
               {busy ? "Saving…" : "Save and restart"}
             </button>
-            {hasToken && mode !== "off" ? (
+            {hasToken && configured ? (
               <button
                 className="addon-card__link"
                 disabled={busy}
@@ -191,7 +157,7 @@ export function UpstreamPanel() {
             ) : null}
           </div>
 
-          {mode !== "off" ? (
+          {configured ? (
             <p className="upstream-panel__meta">
               Third-party endpoints run lossless compaction only, so payloads stay close
               to what your client sent.
