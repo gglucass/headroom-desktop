@@ -1222,7 +1222,7 @@ impl AppState {
             // here for nothing — bail with a distinct outcome so the
             // failure path knows it's a non-start, not a hang.
             log::warn!(
-                "run_upgrade_with_ui: skipping boot validation — no tracked child and no reachable proxy"
+                "run_upgrade_with_ui: skipping boot validation: no tracked child and no reachable proxy"
             );
             BootValidationOutcome::NotStarted
         } else {
@@ -1408,20 +1408,27 @@ impl AppState {
         let fallback_pkg_label = installed_version
             .clone()
             .unwrap_or_else(|| "the previous version".into());
-        let error_hint = match maintenance_kind {
-            RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
-                "Reverted to headroom-ai {} and restarted it.",
-                fallback_pkg_label
-            )),
-            RuntimeMaintenanceKind::Upgrade if rollback_restored => {
-                Some(format!("Reverted to headroom-ai {}.", fallback_pkg_label))
-            }
-            RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
-                "Headroom restarted with the repaired runtime, but validation still failed.".into(),
-            ),
-            RuntimeMaintenanceKind::RequirementsRepair => None,
-            _ => None,
+        // When the fallback did not come back either, the new venv's spawn
+        // error is the best explanation we have of why: a host that refuses
+        // every runtime (RUST-2Z's regression was a WinError 10013 socket
+        // verdict that failed 0.35.0 exactly as it failed 0.37.0) otherwise
+        // reads "Reverted to headroom-ai 0.35.0." under a banner while
+        // nothing is running.
+        let startup_hint = if restarted {
+            None
+        } else {
+            post_spawn
+                .ensure_error
+                .as_deref()
+                .and_then(classify_startup_error)
         };
+        let error_hint = boot_validation_error_hint(
+            maintenance_kind,
+            rollback_restored,
+            restarted,
+            &fallback_pkg_label,
+            startup_hint.as_deref(),
+        );
         self.record_upgrade_failure(RuntimeUpgradeFailure {
             app_version: current_app_version.clone(),
             target_headroom_version: target_version.clone(),
@@ -3212,7 +3219,31 @@ impl AppState {
         // If the proxy is already live (e.g. started externally, or by us under
         // the lifecycle lock just above), treat runtime as healthy without
         // forcing another launcher.
-        if is_headroom_proxy_reachable() {
+        //
+        // `is_headroom_proxy_reachable` probes 6767, the INTERCEPT, but the
+        // question here is whether the BACKEND needs spawning. Those come apart
+        // when the intercept is wedged over a healthy backend (a Windows
+        // failure mode, see the 6767 bind history): the intercept probe says
+        // "down", we fall through to spawn, 6768 is still held by that healthy
+        // backend, and `reclaim_orphan_proxy` refuses to kill a healthy
+        // occupant and bails -- every launch, until reboot. Three of those in a
+        // row auto-pauses the runtime, which BYPASSES it, so the user keeps
+        // coding and silently saves nothing. That is Sentry RUST-6J into
+        // RUST-5C, and the largest Windows cluster we have.
+        //
+        // Asking the backend directly closes it. The argv check is what keeps
+        // this safe: adopting a backend from an OLDER app build would silently
+        // run a mismatched wheel and, worse, quietly disable the exact-pin
+        // prefix-floor vendor. A mismatched argv fails this test and falls
+        // through to the existing teardown-and-respawn path unchanged.
+        let backend_serving =
+            crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        if runtime_already_serving(
+            is_headroom_proxy_reachable(),
+            backend_serving,
+            // Only consult argv when it can change the answer: it shells out.
+            backend_serving && crate::tool_manager::running_proxy_matches_expected_args(),
+        ) {
             *self.last_startup_error.lock() = None;
             return Ok(());
         }
@@ -7607,6 +7638,35 @@ pub(crate) fn headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_secs(5))
 }
 
+/// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
+/// `classify_startup_error`'s reading of the new runtime's spawn error and is
+/// only passed when the fallback did not restart either, so the banner can
+/// say why nothing is running instead of just what was reverted.
+pub(crate) fn boot_validation_error_hint(
+    kind: RuntimeMaintenanceKind,
+    rollback_restored: bool,
+    restarted: bool,
+    fallback_pkg_label: &str,
+    startup_hint: Option<&str>,
+) -> Option<String> {
+    match kind {
+        RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
+            "Reverted to headroom-ai {fallback_pkg_label} and restarted it."
+        )),
+        RuntimeMaintenanceKind::Upgrade if rollback_restored => Some(match startup_hint {
+            Some(hint) => format!(
+                "Reverted to headroom-ai {fallback_pkg_label}, but it didn't start either. {hint}"
+            ),
+            None => format!("Reverted to headroom-ai {fallback_pkg_label}."),
+        }),
+        RuntimeMaintenanceKind::Upgrade => startup_hint.map(str::to_string),
+        RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
+            "Headroom restarted with the repaired runtime, but validation still failed.".into(),
+        ),
+        RuntimeMaintenanceKind::RequirementsRepair => startup_hint.map(str::to_string),
+    }
+}
+
 /// Turn a raw `last_startup_error` string (the anyhow chain from
 /// `start_headroom_background`) into a short user-friendly explanation plus a
 /// suggested next step. Returns `None` for shapes we don't recognize, in which
@@ -7618,6 +7678,13 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // doesn't drift from the install-time classifier.
     if crate::is_endpoint_protection_signal(raw) {
         return Some(crate::endpoint_protection_hint_runtime());
+    }
+    // WSAEACCES on the loopback socket asyncio needs before anything else
+    // runs (RUST-CY): the chain also matches the generic exited-before-port
+    // branch below, which would send the user to a traceback whose last line
+    // is localized Windows prose. Two causes, two checks; the hint names both.
+    if crate::is_loopback_socket_denied_signal(raw) {
+        return Some(crate::loopback_socket_denied_hint());
     }
     if raw.contains("is occupied by a non-headroom process") {
         // Only reaches here when even the fallback port range was unavailable
@@ -7722,6 +7789,21 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
 
 fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_millis(1500))
+}
+
+/// Whether the runtime is already serving, so `ensure_headroom_running` can
+/// return without spawning. Split out from the probes so the decision itself is
+/// testable: the probes hit the network and shell out, this does not.
+///
+/// A reachable intercept is sufficient (the pre-existing rule). A healthy
+/// backend alone is NOT: it must also be running this build's argv, or we would
+/// adopt an older build's proxy and silently run a mismatched wheel.
+fn runtime_already_serving(
+    intercept_reachable: bool,
+    backend_serving: bool,
+    backend_argv_is_current: bool,
+) -> bool {
+    intercept_reachable || (backend_serving && backend_argv_is_current)
 }
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
@@ -9462,6 +9544,96 @@ mod tests {
         );
     }
 
+    /// RUST-CY verbatim shape: asyncio's socketpair fallback refused a
+    /// loopback listen on a Russian-locale Windows 11 host, exit 1 with the
+    /// banner printed and the port never opened, identically on 0.37.0 and
+    /// the 0.35.0 rollback. Only the code survives localization.
+    #[test]
+    fn classify_startup_error_recognises_a_denied_loopback_socket_on_windows() {
+        let raw = "unable to keep headroom running in background (prior attempts: headroom.exe: \
+                   exited with status exit code: 1 before opening port 6768): exited with status \
+                   exit code: 1 before opening port 6768 (~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe \
+                   -m headroom.proxy.server --port 6768 --no-http2 --log-messages; log: ...)\n\
+                   --- log tail ---\n  File \"...\\Lib\\socket.py\", line 616, in _fallback_socketpair\n    \
+                   lsock.listen()\nPermissionError: [WinError 10013] Сделана попытка доступа к сокету \
+                   методом, запрещенным правами доступа\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("denied loopback socket should classify");
+        assert!(hint.contains("10013"), "hint should name the code: {hint}");
+        assert!(
+            hint.contains("excludedportrange"),
+            "hint should hand over the reserved-range check: {hint}"
+        );
+        assert!(
+            !hint.contains("see the traceback"),
+            "generic branch won: {hint}"
+        );
+        assert!(
+            !hint.contains("endpoint protection"),
+            "must not assert a cause the code does not prove: {hint}"
+        );
+    }
+
+    #[test]
+    fn boot_validation_error_hint_explains_a_fallback_that_did_not_start_either() {
+        use crate::tool_manager::RuntimeMaintenanceKind as Kind;
+        let hint = super::boot_validation_error_hint(
+            Kind::Upgrade,
+            true,
+            false,
+            "0.35.0",
+            Some("Windows refused a socket. Then click Retry."),
+        )
+        .expect("restored fallback always has a hint");
+        assert_eq!(
+            hint,
+            "Reverted to headroom-ai 0.35.0, but it didn't start either. \
+             Windows refused a socket. Then click Retry."
+        );
+        // Restarted fine: the startup hint is never passed, wording unchanged.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, true, true, "0.35.0", None).as_deref(),
+            Some("Reverted to headroom-ai 0.35.0 and restarted it.")
+        );
+        // Restored but unclassified: the pre-existing wording.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, true, false, "0.35.0", None)
+                .as_deref(),
+            Some("Reverted to headroom-ai 0.35.0.")
+        );
+        // Nothing restored: the classification is all there is to say.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, false, false, "0.35.0", Some("x"))
+                .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, false, false, "0.35.0", None),
+            None
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(
+                Kind::RequirementsRepair,
+                false,
+                true,
+                "0.35.0",
+                None
+            )
+            .as_deref(),
+            Some("Headroom restarted with the repaired runtime, but validation still failed.")
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(
+                Kind::RequirementsRepair,
+                false,
+                false,
+                "0.35.0",
+                Some("x")
+            )
+            .as_deref(),
+            Some("x")
+        );
+    }
+
     #[test]
     fn classify_startup_error_endpoint_protection_takes_priority_over_port_path() {
         // SIGKILL while waiting on the port could surface as both a
@@ -9575,6 +9747,32 @@ mod tests {
 
         profile.setup_wizard_complete = true;
         assert!(super::setup_wizard_satisfied_for_profile(&profile, false));
+    }
+
+    /// The deadlock this exists for: a wedged 6767 intercept over a healthy
+    /// 6768 backend used to fall through to the spawn path, where reclaim
+    /// refuses to kill a healthy occupant and bails, every launch, until three
+    /// failures auto-paused (and therefore BYPASSED) the runtime. Sentry
+    /// RUST-6J -> RUST-5C, the largest Windows cluster.
+    #[test]
+    fn runtime_already_serving_accepts_a_healthy_backend_behind_a_wedged_intercept() {
+        use super::runtime_already_serving as serving;
+
+        // The pre-existing rule is untouched: a reachable intercept is enough.
+        assert!(serving(true, false, false));
+        assert!(serving(true, true, true));
+
+        // The fix: intercept down, backend healthy and running this build.
+        assert!(serving(false, true, true));
+
+        // A healthy backend from an OLDER build must NOT be adopted. Doing so
+        // would silently run a mismatched wheel and disable the exact-pin
+        // prefix-floor vendor, so this has to fall through to respawn.
+        assert!(!serving(false, true, false));
+
+        // Nothing serving at all still spawns.
+        assert!(!serving(false, false, false));
+        assert!(!serving(false, false, true));
     }
 
     #[test]

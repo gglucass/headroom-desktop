@@ -2983,11 +2983,15 @@ fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
 /// of life: RUST-BS); the bare root draws the backend's 421 unrouted-path gate
 /// (RUST-BY: 25 events across 7 hosts in 12h, every one on "/"); /v1/settings
 /// is grok-build's startup config fetch, which api.x.ai answers 404 text/plain
-/// with or without us (RUST-CG: 4 same-second events on one host). Deliberately
-/// NOT folded into is_local_proxy_path: bypass mode must keep forwarding these
-/// upstream (where /api/hello 200s), not answer 503.
+/// with or without us (RUST-CG: 4 same-second events on one host). /mcp is not
+/// a provider path at all: no client we support reaches a provider through it,
+/// the backend has no route for it, and the one time it arrived (RUST-CV,
+/// opencode, a JSON-RPC-shaped 405) it was an MCP client aimed at Headroom's
+/// base URL, which nothing we ship answers. Deliberately NOT folded into
+/// is_local_proxy_path: bypass mode must keep forwarding these upstream (where
+/// /api/hello 200s), not answer 503.
 fn is_client_probe_path(path: &str) -> bool {
-    matches!(path, "/" | "/api/hello" | "/v1/settings")
+    matches!(path, "/" | "/api/hello" | "/v1/settings" | "/mcp")
 }
 
 fn is_local_proxy_path(path: &str) -> bool {
@@ -4123,7 +4127,7 @@ mod tests {
 
     #[test]
     fn client_probe_paths_are_excluded_from_error_capture_but_not_local() {
-        for probe in ["/", "/api/hello", "/v1/settings"] {
+        for probe in ["/", "/api/hello", "/v1/settings", "/mcp"] {
             assert!(is_client_probe_path(probe), "{probe}");
             assert!(
                 !is_local_proxy_path(probe),

@@ -256,6 +256,18 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Two more warns from the same incident: the new venv's spawn error and
+    // the not-started short-circuit that follows it. Both already ride in the
+    // tagged capture (`ensure_headroom_running_error`, outcome=not_started).
+    // Bridged, the spawn warn grouped on its message, which embeds the venv
+    // path and the prior-attempts wording, so one host filed RUST-CW and
+    // RUST-CZ a minute apart with RUST-CX beside them.
+    if target.starts_with("headroom_desktop_lib::state")
+        && (msg.starts_with("run_upgrade_with_ui: new proxy failed to spawn")
+            || msg.starts_with("run_upgrade_with_ui: skipping boot validation"))
+    {
+        return true;
+    }
     // The retag summary's "unreadable" variant: when any candidate DB failed
     // to open, "no `threads` table found" proves nothing about a rename
     // (RUST-95 false-fired the rename canary on a machine whose sqlite files
@@ -1118,6 +1130,28 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "run_upgrade_with_ui: boot validation failed (timed_out); rolling back to Some(\"0.30.0\")"
+        ));
+    }
+
+    #[test]
+    fn skips_upgrade_spawn_failure_and_not_started_warns() {
+        // RUST-CZ: the spawn error, message-grouped on the venv path.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "run_upgrade_with_ui: new proxy failed to spawn: unable to keep headroom running in \
+             background (prior attempts: headroom.exe: exited with status exit code: 1 before \
+             opening port 6768): exited with status exit code: 1 before opening port 6768 \
+             (~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe -m headroom.proxy.server)"
+        ));
+        // RUST-CX: the short-circuit that follows it.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "run_upgrade_with_ui: skipping boot validation: no tracked child and no reachable proxy"
+        ));
+        // Same prefix from another module is not ours to drop.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "run_upgrade_with_ui: new proxy failed to spawn: x"
         ));
     }
 
