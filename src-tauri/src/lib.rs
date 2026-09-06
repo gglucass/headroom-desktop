@@ -2533,10 +2533,6 @@ pub(crate) fn startup_error_fingerprint_key(
         Some("startup_loopback_socket_denied")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
-    } else if err.contains("WinError 10013") {
-        // RUST-CS: the OS refused Python's loopback socketpair; the remedy is
-        // a firewall rule or port range, see `state::classify_startup_error`.
-        Some("startup_socket_forbidden")
     } else {
         None
     }
@@ -12010,7 +12006,7 @@ Some unrelated content.
                 "python.exe -m headroom.proxy.server exited with status exit code: 1 \
                  before opening port 6768\n--- log tail ---\nPermissionError: [WinError 10013]"
             )),
-            Some("startup_socket_forbidden")
+            Some("startup_loopback_socket_denied")
         );
     }
 
