@@ -1745,6 +1745,70 @@ if _hd_tsr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # own repair unchanged. Worst case is the pre-vendor behavior (server-side
         # shape only), never a new failure mode.
         pass
+
+
+# --- Tool-reference 400: append a "start a new session" hint (vendor) ----------
+# When an MCP server disconnects mid-session (Claude Code does not auto-reconnect
+# stdio MCP servers), its tools vanish while the transcript still references them,
+# and upstream 400s "Tool reference 'X' not found in available tools". The repair
+# strips most of these on the wire; for the residual that still reaches the user,
+# append a Headroom hint with the actionable remedy (a fresh session re-spawns the
+# MCP server). The streaming handler buffers the upstream error via aread() and
+# returns a plain Response, so we post-process that Response only: a raw substring
+# insert inside the message (valid whether the body is JSON or an SSE error event),
+# guarded so it never touches a StreamingResponse, a non-400, or an already-hinted
+# body. Fail-open: any error returns the original response untouched.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
+_hd_hint_flag = _hd_os.environ.get("HEADROOM_TOOL_REF_HINT", "1")
+if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_hint_meta
+
+        if _hd_hint_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy.handlers import streaming as _hd_hint_mod
+
+            _hd_hint_sig = b"not found in available tools"
+            _hd_hint_add = (
+                b"not found in available tools. Headroom: this tool comes from an MCP "
+                b"server that is no longer connected; start a new session to clear this."
+            )
+            _hd_hint_orig = _hd_hint_mod.StreamingMixin._stream_response
+
+            def _hd_hint_apply(result):
+                # Only a buffered 400 Response carrying the signature; never a
+                # StreamingResponse (no .body), never double-hinted.
+                body = getattr(result, "body", None)
+                if (
+                    getattr(result, "status_code", 200) == 400
+                    and isinstance(body, (bytes, bytearray))
+                    and _hd_hint_sig in body
+                    and b"Headroom:" not in body
+                ):
+                    from starlette.responses import Response as _hd_hint_resp
+
+                    new_body = bytes(body).replace(_hd_hint_sig, _hd_hint_add, 1)
+                    headers = dict(result.headers)
+                    headers.pop("content-length", None)
+                    return _hd_hint_resp(
+                        content=new_body,
+                        status_code=result.status_code,
+                        headers=headers,
+                        media_type=getattr(result, "media_type", None),
+                    )
+                return result
+
+            async def _hd_hint_wrapped(self, *args, **kwargs):
+                result = await _hd_hint_orig(self, *args, **kwargs)
+                try:
+                    return _hd_hint_apply(result)
+                except Exception:
+                    return result
+
+            _hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped
+    except Exception:
+        # Response-shaping only: on any binding failure the client sees the
+        # upstream error verbatim (the pre-vendor behavior), never a new failure.
+        pass
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -12340,6 +12404,20 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_tool_ref_hint() {
+        // The residual tool_reference 400 gets a "start a new session" hint.
+        // Behaviour is proven by tool_ref_hint_behaves_against_the_installed_wheel;
+        // this pins the shape.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_TOOL_REF_HINT"));
+        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.37.0""#));
+        // Wraps the buffered-error seam and post-processes its Response.
+        assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
+        assert!(py.contains("def _hd_hint_apply(result):"));
+        assert!(py.contains("start a new session to clear this"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -12520,6 +12598,50 @@ mod tests {
              If a client-side absent reference survived, the tool_reference 400 is\n\
              back; if a deferred+present reference was dropped, rc.5's regression\n\
              is back.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn tool_ref_hint_behaves_against_the_installed_wheel() {
+        // The residual tool_reference 400 that reaches the user gets a Headroom
+        // "start a new session" hint appended. Runs the shipped sitecustomize
+        // against the installed wheel's starlette and asserts the transform is
+        // valid, content-length-correct, idempotent, and scoped to 400s carrying
+        // the signature.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-tool-ref-hint.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-tool-ref-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run tool-ref-hint probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("FAIL hint bound") && stderr.is_empty() {
+            eprintln!("skipping: tool-ref hint vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK tool-ref hint"),
+            "tool-ref hint vendor misbehaved against the installed wheel.\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 

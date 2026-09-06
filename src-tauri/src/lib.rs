@@ -5401,6 +5401,64 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
     })
 }
 
+/// Tauri's build error is fatal either way, but on Windows the usual cause is a
+/// missing WebView2 runtime and the old `.expect` panicked before any window
+/// existed, so the user saw literally nothing (Sentry RUST-8J: 8 machines in 14
+/// days, every one blocked on first run). Explain it, offer the download, then
+/// panic as before so the event still reaches Sentry.
+fn fatal_build_error(err: tauri::Error) -> ! {
+    let message = err.to_string();
+    #[cfg(target_os = "windows")]
+    if is_missing_webview_runtime(&message) {
+        show_webview2_missing_dialog();
+    }
+    panic!("error while building tauri application: {message}");
+}
+
+/// Matches `tauri_runtime::Error::WebviewRuntimeNotInstalled` by its Display
+/// text, which is cheaper than taking a direct tauri-runtime dependency just to
+/// name the variant.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_missing_webview_runtime(message: &str) -> bool {
+    message.contains("webview runtime")
+}
+
+/// MessageBoxW rather than a Tauri dialog: there is no webview left to render
+/// one in, which is the whole problem.
+#[cfg(target_os = "windows")]
+fn show_webview2_missing_dialog() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONERROR, MB_SETFOREGROUND, MB_YESNO,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let text = wide(concat!(
+        "Headroom needs the Microsoft Edge WebView2 runtime, ",
+        "which is not installed on this PC.\n\n",
+        "Open the download page? Install the Evergreen Runtime, ",
+        "then start Headroom again."
+    ));
+    let caption = wide("Headroom cannot start");
+    let choice = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNO | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+    if choice == IDYES {
+        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
+    }
+}
+
 pub fn run() {
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
@@ -5926,7 +5984,7 @@ pub fn run() {
             debug_force_proxy_bypass
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .unwrap_or_else(|err| fatal_build_error(err))
         .run(|app, event| {
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
@@ -11803,6 +11861,20 @@ Some unrelated content.
             "Could not resolve host: pypi.org"
         ));
         assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+    }
+
+    #[test]
+    fn missing_webview_runtime_is_recognised_from_tauris_own_message() {
+        // Verbatim Display text of tauri_runtime::Error::WebviewRuntimeNotInstalled
+        // (tauri-runtime 2.11.3), which is what Sentry RUST-8J reports.
+        assert!(super::is_missing_webview_runtime(
+            "Could not find the webview runtime, make sure it is installed"
+        ));
+        // Any other build failure must keep the plain panic, no dialog.
+        assert!(!super::is_missing_webview_runtime("window not found"));
+        assert!(!super::is_missing_webview_runtime(
+            "the event loop has been closed"
+        ));
     }
 
     #[test]
