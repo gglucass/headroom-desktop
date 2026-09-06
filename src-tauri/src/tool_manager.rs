@@ -1769,8 +1769,8 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
             _hd_hint_sig = b"not found in available tools"
             _hd_hint_add = (
-                b"not found in available tools. Headroom: this tool comes from an MCP "
-                b"server that is no longer connected; start a new session to clear this."
+                b"not found in available tools. Headroom: this error is caused by a "
+                b"disconnected MCP server. Close this session and start a new one to fix it."
             )
             _hd_hint_orig = _hd_hint_mod.StreamingMixin._stream_response
 
