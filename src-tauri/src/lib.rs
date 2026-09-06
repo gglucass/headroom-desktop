@@ -2365,7 +2365,11 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
                 // `context` is a bounded set of call sites and keeps the
                 // launch/tray lifecycles apart; `category` is the cause class.
                 // Neither can fragment, unlike the argv in the message text.
-                scope.set_fingerprint(Some(&["headroom-start-failed", context, &category]));
+                let mut fp = vec!["headroom-start-failed", context, category.as_str()];
+                // A cause with its own remedy (RUST-CS: WinError 10013) gets
+                // its own issue instead of sharing the exit-class bucket.
+                fp.extend(startup_error_fingerprint_key(Some(technical_err.as_str())));
+                scope.set_fingerprint(Some(fp.as_slice()));
                 // Who signalled a child that died before binding: our own
                 // recent kills, oldest first, or empty when we sent none.
                 scope.set_extra(
@@ -2482,6 +2486,10 @@ pub(crate) fn startup_error_fingerprint_key(
         Some("startup_endpoint_protection")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
+    } else if err.contains("WinError 10013") {
+        // RUST-CS: the OS refused Python's loopback socketpair; the remedy is
+        // a firewall rule or port range, see `state::classify_startup_error`.
+        Some("startup_socket_forbidden")
     } else {
         None
     }
@@ -11833,6 +11841,13 @@ Some unrelated content.
                  non-headroom process"
             )),
             Some("startup_port_conflict")
+        );
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "python.exe -m headroom.proxy.server exited with status exit code: 1 \
+                 before opening port 6768\n--- log tail ---\nPermissionError: [WinError 10013]"
+            )),
+            Some("startup_socket_forbidden")
         );
     }
 

@@ -5439,12 +5439,21 @@ fn report_unparseable_guard_command(command: &str) {
             .stderr(std::process::Stdio::null())
             .status();
         if let Ok(status) = status {
-            if !status.success() {
+            // bash reports a syntax error as exit 2. Any other failure is the
+            // resolved `bash.exe` not being a bash at all -- the WSL launcher
+            // on a box without Git for Windows exits 1 without parsing
+            // (RUST-C6, two hosts) -- and says nothing about the command.
+            if status.code() == Some(2) {
                 log::warn!(
                     "claude guard command does not parse under bash (exit {:?}, call_operator={}); \
                      SessionStart hooks will fail until the command form is fixed",
                     status.code(),
                     command.starts_with('&')
+                );
+            } else if !status.success() {
+                log::info!(
+                    "claude guard bash canary skipped: bash exited {:?} without parsing",
+                    status.code()
                 );
             }
         }

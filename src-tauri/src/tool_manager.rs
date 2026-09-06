@@ -9819,6 +9819,51 @@ fn is_checksum_mismatch(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("checksum mismatch")
 }
 
+static ARTIFACT_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `(url, downloaded, total)` of the download holding `ARTIFACT_DOWNLOAD_LOCK`,
+/// for a waiter on the same URL to mirror. RUST-CR: bootstrap was consented
+/// while the pre-consent prefetch was mid-way through the Python tarball,
+/// blocked on the lock behind a frozen "Downloading Python 18%" frame for
+/// minutes on a slow link, and the user quit. The bytes were arriving the
+/// whole time; only the bar was static. Never cleared: a stale entry can only
+/// be read by a same-URL waiter, whose own attempt then finds the file.
+static INFLIGHT_ARTIFACT_DOWNLOAD: std::sync::Mutex<Option<(String, u64, Option<u64>)>> =
+    std::sync::Mutex::new(None);
+
+fn publish_inflight_download(url: &str, downloaded: u64, total: Option<u64>) {
+    if let Ok(mut slot) = INFLIGHT_ARTIFACT_DOWNLOAD.lock() {
+        *slot = Some((url.to_string(), downloaded, total));
+    }
+}
+
+/// Take the artifact lock, relaying the holder's progress for `url` into
+/// `on_progress` every 250ms until it is free.
+fn acquire_artifact_download_lock<F>(
+    url: &str,
+    on_progress: &mut F,
+) -> std::sync::MutexGuard<'static, ()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    loop {
+        match ARTIFACT_DOWNLOAD_LOCK.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let mirrored = INFLIGHT_ARTIFACT_DOWNLOAD.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .filter(|(inflight_url, _, _)| inflight_url == url)
+                .map(|(_, downloaded, total)| (*downloaded, *total))
+        });
+        if let Some((downloaded, total)) = mirrored {
+            on_progress(downloaded, total);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Download `url` to `destination` with an optional progress callback.
 ///
 /// The callback receives `(downloaded_bytes, total_bytes)` and is called at
@@ -9836,14 +9881,10 @@ where
     // One artifact download at a time, process-wide. The pre-consent prefetch
     // and the consented bootstrap can otherwise race the same `.partial`
     // file; holding the lock across the exists+sha check below means
-    // whichever caller runs second sees the finished file and skips.
-    // ponytail: a bootstrap that starts mid-prefetch blocks on a static
-    // progress frame until the in-flight artifact completes; cancellation is
-    // the upgrade path if that stall ever matters.
-    static ARTIFACT_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _download_guard = ARTIFACT_DOWNLOAD_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // whichever caller runs second sees the finished file and skips. While
+    // waiting, the holder's progress for the same URL is relayed into
+    // `on_progress`, so a bootstrap that joins a prefetch keeps its bar moving.
+    let _download_guard = acquire_artifact_download_lock(url, &mut on_progress);
 
     if destination.exists() {
         if let Some(expected_sha256) = expected_sha256 {
@@ -9893,6 +9934,7 @@ where
             let mut buf = vec![0u8; 64 * 1024];
             let mut downloaded: u64 = 0;
             on_progress(0, total_bytes);
+            publish_inflight_download(url, 0, total_bytes);
             let mut last_emit = Instant::now();
 
             loop {
@@ -9906,12 +9948,14 @@ where
                 downloaded += n as u64;
                 if last_emit.elapsed() >= Duration::from_millis(250) {
                     on_progress(downloaded, total_bytes);
+                    publish_inflight_download(url, downloaded, total_bytes);
                     last_emit = Instant::now();
                 }
             }
             file.flush().context("flushing download")?;
             drop(file);
             on_progress(downloaded, total_bytes);
+            publish_inflight_download(url, downloaded, total_bytes);
 
             if let Some(expected_sha256) = expected_sha256 {
                 let actual_checksum = format!("{:x}", hasher.finalize());
@@ -12030,6 +12074,9 @@ mod tests {
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::stalled_prefetch_cause;
+    use super::{
+        acquire_artifact_download_lock, publish_inflight_download, ARTIFACT_DOWNLOAD_LOCK,
+    };
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
@@ -14212,6 +14259,37 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no-op prefetch must not write into downloads: {leftovers:?}"
+        );
+    }
+
+    /// RUST-CR: a bootstrap that joins an in-flight prefetch must see that
+    /// download's progress while it waits for the lock, not a frozen frame.
+    #[test]
+    fn artifact_lock_waiter_mirrors_the_holders_progress_for_its_url() {
+        let held = ARTIFACT_DOWNLOAD_LOCK.lock().expect("lock");
+        publish_inflight_download("https://example/python.tar.gz", 5, Some(10));
+        let same = std::thread::spawn(|| {
+            let mut seen = Vec::new();
+            let _guard =
+                acquire_artifact_download_lock("https://example/python.tar.gz", &mut |d, t| {
+                    seen.push((d, t))
+                });
+            seen
+        });
+        let other = std::thread::spawn(|| {
+            let mut seen = Vec::new();
+            let _guard =
+                acquire_artifact_download_lock("https://example/wheel.whl", &mut |d, t| {
+                    seen.push((d, t))
+                });
+            seen
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        drop(held);
+        assert!(same.join().expect("join").contains(&(5, Some(10))));
+        assert!(
+            other.join().expect("join").is_empty(),
+            "a different URL must not inherit progress"
         );
     }
 

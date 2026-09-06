@@ -7683,6 +7683,24 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
                 .into(),
         );
     }
+    // WSAEACCES on asyncio's self-pipe: `socket.socketpair()` on Windows is
+    // a loopback listener on an ephemeral port, and the OS refused it
+    // (RUST-CS, log tail `_fallback_socketpair ... lsock.listen()
+    // PermissionError: [WinError 10013]`, last line localized). None of our
+    // ports are involved, so the port-conflict hints would be wrong. As in
+    // `intercept_bind_hint`, name what happened and the two checks rather
+    // than assert a cause: a firewall/security product rule against
+    // python.exe and a reserved range over the dynamic ports both do this.
+    if raw.contains("WinError 10013") {
+        return Some(
+            "Windows refused to let Headroom's Python runtime open a local socket \
+             (WinError 10013), so it cannot start. A firewall or security product blocking \
+             python.exe is the usual cause; a reserved port range is the other. Allow \
+             python.exe through the firewall, or check `netsh int ipv4 show \
+             excludedportrange protocol=tcp`, then reboot and relaunch Headroom."
+                .into(),
+        );
+    }
     if raw.contains("exited with status") && raw.contains("before opening port") {
         return Some(
             "The Headroom Python runtime crashed at startup. \
@@ -9351,6 +9369,23 @@ mod tests {
             hint.contains("missing some of its own files"),
             "got: {hint}"
         );
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
+    }
+
+    /// RUST-CS: Windows refused asyncio's self-pipe socketpair. Must not fall
+    /// through to the generic crash branch, which sends the user to a
+    /// traceback whose last line is localized.
+    #[test]
+    fn classify_startup_error_socket_forbidden_win10013() {
+        let raw = "unable to keep headroom running in background: \
+            ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe -m \
+            headroom.proxy.server --port 6768 exited with status exit code: 1 before opening \
+            port 6768\n--- log tail ---\n  File socket.py, line 616, in _fallback_socketpair\n    \
+            lsock.listen()\nPermissionError: [WinError 10013] Сделана попытка доступа к сокету \
+            методом, запрещенным правами доступа\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("10013 should classify");
+        assert!(hint.contains("WinError 10013"), "got: {hint}");
+        assert!(hint.contains("firewall"), "got: {hint}");
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 
