@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { needsTermsAcceptance } from "./launcherHelpers";
 import { formatDayKey } from "./dashboardHelpers";
-import type { ClientConnectorStatus, DashboardState } from "./types";
+import type { ClientConnectorStatus, DashboardState, UnroutedClient } from "./types";
 
 // Nothing at all has come through. This is the weaker of the two signals:
 // uptime is not the same as time spent coding (Headroom can autostart at
@@ -325,17 +325,60 @@ export async function maybeFireSetupStallAlert(
   return alert;
 }
 
-function readDayKey(): string | null {
+const UNROUTED_ALERT_DAY_KEY = "headroom_unrouted_alert_date";
+
+/// Title and per-agent line for the agent-ran-without-Headroom alert. An
+/// enabled agent had its connection re-applied before this shows, so the ask
+/// is only a restart; a switched-off one needs the user's say-so.
+export function unroutedTitle(clients: UnroutedClient[]): string {
+  return `${clients.map((client) => client.name).join(" and ")} ran without Headroom`;
+}
+
+export function unroutedBody(client: UnroutedClient): string {
+  return client.enabled
+    ? `${client.name} was used on this machine, but none of its requests reached Headroom. Its connection was just re-applied. Quit and reopen ${client.name} so it picks the settings up.`
+    : `${client.name} was used on this machine, but its Headroom connection is switched off, so nothing was optimized. Turn the connection back on to resume saving.`;
+}
+
+/// Once per local day, on its own slot so this and the stall alert cannot
+/// starve each other. Native notification only when the window is hidden;
+/// the modal is the in-app surface either way.
+export async function maybeFireUnroutedAlert(
+  clients: UnroutedClient[]
+): Promise<UnroutedClient[] | null> {
+  if (clients.length === 0) {
+    return null;
+  }
+  const today = formatDayKey(new Date());
+  if (readDayKey(UNROUTED_ALERT_DAY_KEY) === today) {
+    return null;
+  }
+  writeDayKey(today, UNROUTED_ALERT_DAY_KEY);
+  if (!(await isWindowVisible())) {
+    try {
+      await invoke("show_notification", {
+        title: unroutedTitle(clients),
+        body: unroutedBody(clients[0]),
+        action: "setup",
+      });
+    } catch {
+      // Best effort. The modal still carries the message.
+    }
+  }
+  return clients;
+}
+
+function readDayKey(key: string = SETUP_STALL_DAY_KEY): string | null {
   try {
-    return localStorage.getItem(SETUP_STALL_DAY_KEY);
+    return localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function writeDayKey(day: string): void {
+function writeDayKey(day: string, key: string = SETUP_STALL_DAY_KEY): void {
   try {
-    localStorage.setItem(SETUP_STALL_DAY_KEY, day);
+    localStorage.setItem(key, day);
   } catch {
     // Private-mode / quota failures shouldn't suppress the alert itself.
   }

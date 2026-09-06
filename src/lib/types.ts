@@ -274,6 +274,16 @@ export interface ClientConnectorStatus {
   verification?: ClientSetupVerification | null;
 }
 
+/// An agent that ran on this machine while Headroom saw nothing from it
+/// (Rust `detect_unrouted_clients`).
+export interface UnroutedClient {
+  clientId: string;
+  name: string;
+  enabled: boolean;
+  reapplied: boolean;
+  activeAt: string;
+}
+
 export interface RuntimeStatus {
   platform: string;
   supportTier: string;

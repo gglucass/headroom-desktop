@@ -74,8 +74,10 @@ import {
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
   type SetupStallKind,
+  maybeFireUnroutedAlert,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
+import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
   authCodeSentMessage,
@@ -87,6 +89,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  higherSubscriptionTier,
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -198,6 +201,7 @@ import type {
   LaunchFlags,
   ClaudeCodeProject,
   ClientConnectorStatus,
+  UnroutedClient,
   ClientSetupResult,
   DailySavingsPoint,
   DashboardState,
@@ -1611,7 +1615,11 @@ export default function App() {
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
   // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
   // badge points at. A subscriber's own period overrides this once it loads.
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // Monthly by default: since the 2026-08-13 intro launch, annual-first
+  // checkouts converted 13 of 74 and monthly-first 25 of 44, and 20 of the 24
+  // lost annual starters never opened a monthly checkout. Subscribers still
+  // open on the period they bought (effect below).
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1633,6 +1641,7 @@ export default function App() {
   // record. Held in state (not rendered immediately) so the modal is waiting
   // whenever the user next opens the tray, rather than stealing focus.
   const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
+  const [unroutedClients, setUnroutedClients] = useState<UnroutedClient[] | null>(null);
   // Same signals as the modal above, but for the always-on Home banner, whose
   // default copy tells a user with zero savings to check back later.
   const [stallBannerLine, setStallBannerLine] = useState<string | null>(null);
@@ -1880,7 +1889,10 @@ export default function App() {
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-    pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
+    higherSubscriptionTier(
+      pricingStatus?.recommendedSubscriptionTier,
+      pricingStatus?.codex?.recommendedSubscriptionTier
+    ) ?? cachedPricing.recommendedSubscriptionTier,
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false,
     pricingStatus?.launchDiscountActive ?? false,
@@ -2019,7 +2031,7 @@ export default function App() {
 
   useEffect(() => {
     setShowAllUpgradePlans(false);
-    if (pricingAudience !== "individual") setBillingPeriod("annual");
+    if (pricingAudience !== "individual") setBillingPeriod("monthly");
   }, [pricingAudience]);
 
   // Open on the plan the subscriber actually has, not the monthly default:
@@ -2700,6 +2712,22 @@ export default function App() {
       // vanished). Rust throttles the scan to once per hour and skips it
       // while paused/bypassed; failures are logged there, not surfaced here.
       void invoke("repair_client_setups").catch(() => undefined);
+      // Then the case repair cannot see: an agent that ran while its config
+      // verified fine, yet nothing reached Headroom. Skipped behind the
+      // account gate, which tears connections down on purpose. Rust throttles
+      // the scan to once an hour and re-applies an enabled connection itself.
+      if (!optimizationBlockedRef.current) {
+        const unrouted = await invoke<UnroutedClient[]>("detect_unrouted_clients", {
+          appStartedAtMs: appStartedAtMsRef.current,
+        }).catch(() => [] as UnroutedClient[]);
+        if (active && unrouted.length > 0) {
+          const alert = await maybeFireUnroutedAlert(unrouted);
+          if (active && alert) {
+            setUnroutedClients(alert);
+            void refreshConnectors();
+          }
+        }
+      }
       const latest = await loadDashboard().catch(() => null);
       if (!active || !latest) {
         return;
@@ -6341,8 +6369,10 @@ export default function App() {
   })();
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
-      ? (pricingStatus?.recommendedSubscriptionTier ??
-          pricingStatus?.codex?.recommendedSubscriptionTier ??
+      ? (higherSubscriptionTier(
+          pricingStatus?.recommendedSubscriptionTier,
+          pricingStatus?.codex?.recommendedSubscriptionTier
+        ) ??
           cachedPricing.recommendedSubscriptionTier ??
           upgradePlansState.featuredPlanId)
       : "enterprise";
@@ -8237,6 +8267,30 @@ export default function App() {
                     connectors
                   })
                 });
+              }}
+            />
+          )}
+
+          {unroutedClients && (
+            <ReconnectModal
+              clients={unroutedClients}
+              onClose={() => setUnroutedClients(null)}
+              onOpenSettings={() => {
+                setUnroutedClients(null);
+                setActiveView("settings");
+              }}
+              onReconnect={(client) => {
+                setUnroutedClients(null);
+                const connector = connectorsRef.current?.find(
+                  (item) => item.clientId === client.clientId
+                );
+                // Land on Settings either way: once the toggle lands, the
+                // connector row shows "Quit and reopen X if it was running
+                // when you enabled this" - the one step the button can't do.
+                setActiveView("settings");
+                if (connector) {
+                  void toggleConnector(connector, true);
+                }
               }}
             />
           )}

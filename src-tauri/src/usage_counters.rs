@@ -147,6 +147,26 @@ pub fn record_429(client: &str) {
     });
 }
 
+/// Provider-bound requests seen from `client` today and yesterday (local
+/// days). Two buckets so a request just before midnight still reads as
+/// recent at 00:05.
+pub fn requests_since_yesterday(client: &str) -> u64 {
+    let now = chrono::Local::now();
+    let keys = [
+        crate::storage::user_day_key(now),
+        crate::storage::user_day_key(now - chrono::Duration::days(1)),
+    ];
+    let mut total = 0;
+    with_store(|store| {
+        for key in &keys {
+            if let Some(day) = store.days.get(key) {
+                total += day.client_requests.get(client).copied().unwrap_or(0);
+            }
+        }
+    });
+    total
+}
+
 /// Snapshot of all retained days, for joining into the savings payload.
 pub fn recent_days() -> BTreeMap<String, DayCounters> {
     let mut out = BTreeMap::new();

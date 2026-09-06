@@ -1628,34 +1628,35 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
-# ─── Tool-search history repair: deferred tools are not available (vendor) ───
-# With ENABLE_TOOL_SEARCH=true the Claude Code client runs its OWN tool search:
-# it sends the full tools array with most tools marked defer_loading=true, plus
-# a tool_search_tool_* mechanism tool, and persists tool_search_tool_result
-# blocks (each carrying tool_reference entries) into the transcript as tools
-# load on demand. Headroom's wire deferral stands down in this case, so the
-# client's array reaches the upstream with its defer markers intact.
+# --- Tool-search history repair: both block shapes, keyed on absence (vendor) --
+# With ENABLE_TOOL_SEARCH=true the Claude Code client runs its OWN tool search and
+# persists discovered-tool references into the transcript. Upstream validates every
+# tool_reference in history against THIS request's tools array and 400s ("Tool
+# reference 'X' not found in available tools") when the referenced tool is ABSENT
+# from the array -- e.g. an MCP server that did not start, or a side-request (Stop
+# hook / compact) carrying a smaller tools array. Per Anthropic's docs a referenced
+# tool is normally defer_loading=true, so DEFERRED IS VALID; only ABSENCE is the
+# fault. Claude Code writes references in two shapes:
+#   * server-side: a `tool_search_tool_result` block (nested tool_references)
+#   * client-side: a plain `tool_result` whose content is a list of tool_reference
+#     blocks (this is how MCP tools like mcp__headroom__* come through)
+# The wheel's strip_unsupported_tool_search_blocks only scans the FIRST shape, so a
+# stale client-side reference sails through and 400s even though the repair "fired"
+# (confirmed 2026-09-06 on Windows: dropped 4 server-side blocks, still 400 on
+# mcp__headroom__headroom_compress carried in a client-side block).
 #
-# Anthropic rejects a historical tool_reference whose target is currently
-# deferred: "400 Tool reference 'CronCreate' not found in available tools". The
-# wheel's strip_unsupported_tool_search_blocks is meant to drop exactly those
-# stale blocks, but it builds `available` from every named non-search tool
-# REGARDLESS of defer_loading, so it counts a still-deferred tool as available,
-# keeps the block, and the request 400s. This bricked heavy-MCP users the moment
-# 0.9.8-rc.3 planted ENABLE_TOOL_SEARCH=true.
-#
-# Fix: hand the repair a tools view with defer_loading=true entries removed, so
-# `available` matches Anthropic's own availability semantics. The function only
-# READS tools (to compute `available` and `has_search_tool`) and returns
-# (messages, removed) -- it never returns or mutates tools -- so the forwarded
-# body["tools"] is untouched and only the keep/drop decision changes. The
-# tool_search_tool_* mechanism tool is never defer_loading, so has_search_tool
-# stays true and healthy loaded/absent transcripts behave exactly as before.
-# Self-heals a session poisoned before this shipped, on its next request. The
-# handler late-imports this symbol per request, so a module-level reassign here
-# is picked up. Upstream fix owed; drop this section when a wheel ships it.
-# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_SEARCH_DEFER_REPAIR=0.
-_hd_tsr_flag = _hd_os.environ.get("HEADROOM_TOOL_SEARCH_DEFER_REPAIR", "1")
+# This vendor (a) adds a client-side pass that neutralizes tool_reference entries
+# whose tool is absent -- keeping present (incl. deferred) ones, and replacing an
+# emptied search result with a text note so its tool_use pairing stays intact --
+# and (b) delegates the server-side shape to the wheel's own repair with tools
+# UNFILTERED (this reverts 0.9.8-rc.5, which wrongly hid defer_loading tools from
+# the availability check: it dropped healthy blocks AND missed the real cause).
+# Only body["messages"] is rewritten; body["tools"] is untouched. Self-heals a
+# session poisoned before this shipped, on its next request. The handler
+# late-imports this symbol per request, so a module-level reassign is picked up.
+# Upstream fix owed; drop this section when a wheel ships it.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_SEARCH_REPAIR=0.
+_hd_tsr_flag = _hd_os.environ.get("HEADROOM_TOOL_SEARCH_REPAIR", "1")
 if _hd_tsr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_tsr_meta
@@ -1665,25 +1666,148 @@ if _hd_tsr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
             _hd_tsr_orig = _hd_tsr_helpers.strip_unsupported_tool_search_blocks
 
-            def _hd_tsr_wrapped(messages, tools):
-                # A deferred tool is not loaded, so a historical tool_reference
-                # to it is unsupportable on THIS request; hide deferred tools
-                # from the availability check so the repair drops the stale
-                # block instead of forwarding a 400. `tools` itself is untouched.
-                filtered = tools
+            def _hd_tsr_client_side(messages, tools):
+                # Neutralize client-side tool_result+tool_reference blocks whose
+                # referenced tool is absent from `tools`. Present tools stay,
+                # deferred or not. Returns the ORIGINAL messages object when
+                # nothing changed so the caller's identity check still skips the
+                # write-back.
+                if not isinstance(messages, list):
+                    return messages, 0
                 if isinstance(tools, list):
-                    filtered = [
-                        t
+                    available = {
+                        str(t["name"])
                         for t in tools
-                        if not (isinstance(t, dict) and t.get("defer_loading"))
-                    ]
-                return _hd_tsr_orig(messages, filtered)
+                        if isinstance(t, dict) and t.get("name")
+                    }
+                else:
+                    available = set()
+                removed = 0
+                changed = False
+                out = []
+                for msg in messages:
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if not isinstance(content, list):
+                        out.append(msg)
+                        continue
+                    new_content = []
+                    msg_changed = False
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                            and isinstance(block.get("content"), list)
+                            and any(
+                                isinstance(b, dict)
+                                and b.get("type") == "tool_reference"
+                                for b in block["content"]
+                            )
+                        ):
+                            kept = []
+                            dropped = 0
+                            for b in block["content"]:
+                                if (
+                                    isinstance(b, dict)
+                                    and b.get("type") == "tool_reference"
+                                ):
+                                    name = b.get("tool_name") or b.get("name")
+                                    if name is not None and str(name) not in available:
+                                        dropped += 1
+                                        continue
+                                kept.append(b)
+                            if dropped:
+                                removed += dropped
+                                msg_changed = True
+                                nb = dict(block)
+                                nb["content"] = kept or (
+                                    "[headroom: referenced tool(s) no longer available]"
+                                )
+                                new_content.append(nb)
+                                continue
+                        new_content.append(block)
+                    if msg_changed:
+                        changed = True
+                        nm = dict(msg)
+                        nm["content"] = new_content
+                        out.append(nm)
+                    else:
+                        out.append(msg)
+                return (out, removed) if changed else (messages, 0)
+
+            def _hd_tsr_wrapped(messages, tools):
+                messages, removed_client = _hd_tsr_client_side(messages, tools)
+                repaired, removed_server = _hd_tsr_orig(messages, tools)
+                return repaired, removed_client + removed_server
 
             _hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped
     except Exception:
         # Request-path wrapper: on any binding failure fall back to the wheel's
-        # own repair unchanged. The wrapper only narrows the availability input,
-        # so the worst case is the pre-fix behavior, never a new failure mode.
+        # own repair unchanged. Worst case is the pre-vendor behavior (server-side
+        # shape only), never a new failure mode.
+        pass
+
+
+# --- Tool-reference 400: append a "start a new session" hint (vendor) ----------
+# When an MCP server disconnects mid-session (Claude Code does not auto-reconnect
+# stdio MCP servers), its tools vanish while the transcript still references them,
+# and upstream 400s "Tool reference 'X' not found in available tools". The repair
+# strips most of these on the wire; for the residual that still reaches the user,
+# append a Headroom hint with the actionable remedy (a fresh session re-spawns the
+# MCP server). The streaming handler buffers the upstream error via aread() and
+# returns a plain Response, so we post-process that Response only: a raw substring
+# insert inside the message (valid whether the body is JSON or an SSE error event),
+# guarded so it never touches a StreamingResponse, a non-400, or an already-hinted
+# body. Fail-open: any error returns the original response untouched.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
+_hd_hint_flag = _hd_os.environ.get("HEADROOM_TOOL_REF_HINT", "1")
+if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_hint_meta
+
+        if _hd_hint_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy.handlers import streaming as _hd_hint_mod
+
+            _hd_hint_sig = b"not found in available tools"
+            _hd_hint_add = (
+                b"not found in available tools. Headroom: this error is caused by a "
+                b"disconnected MCP server. Close this session and start a new one to fix it."
+            )
+            _hd_hint_orig = _hd_hint_mod.StreamingMixin._stream_response
+
+            def _hd_hint_apply(result):
+                # Only a buffered 400 Response carrying the signature; never a
+                # StreamingResponse (no .body), never double-hinted.
+                body = getattr(result, "body", None)
+                if (
+                    getattr(result, "status_code", 200) == 400
+                    and isinstance(body, (bytes, bytearray))
+                    and _hd_hint_sig in body
+                    and b"Headroom:" not in body
+                ):
+                    from starlette.responses import Response as _hd_hint_resp
+
+                    new_body = bytes(body).replace(_hd_hint_sig, _hd_hint_add, 1)
+                    headers = dict(result.headers)
+                    headers.pop("content-length", None)
+                    return _hd_hint_resp(
+                        content=new_body,
+                        status_code=result.status_code,
+                        headers=headers,
+                        media_type=getattr(result, "media_type", None),
+                    )
+                return result
+
+            async def _hd_hint_wrapped(self, *args, **kwargs):
+                result = await _hd_hint_orig(self, *args, **kwargs)
+                try:
+                    return _hd_hint_apply(result)
+                except Exception:
+                    return result
+
+            _hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped
+    except Exception:
+        # Response-shaping only: on any binding failure the client sees the
+        # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
@@ -8698,6 +8822,9 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
             scope.set_tag("flow", "orphan_proxy_reclaimed");
             scope.set_extra("port", port.into());
             scope.set_extra("occupant_pid", pid.into());
+            // Fixed fingerprint: the pid and port in the message opened one
+            // issue per reclaim (RUST-88, RUST-CQ) for a single condition.
+            scope.set_fingerprint(Some(&["orphan_proxy_reclaimed"]));
         },
         || {
             sentry::capture_message(
@@ -9840,12 +9967,7 @@ struct HeadroomLearnMetadataCandidate {
 
 fn read_headroom_learn_metadata_from_path(path: &Path) -> Option<HeadroomLearnMetadataCandidate> {
     let content = std::fs::read_to_string(path).ok()?;
-    let start = content.find("<!-- headroom:learn:start -->")?;
-    let end = content.find("<!-- headroom:learn:end -->")?;
-    if end <= start {
-        return None;
-    }
-
+    let (start, end, _) = headroom_learn_block_bounds(&content)?;
     let block = &content[start..end];
     let pattern_count = count_headroom_learn_patterns(block);
     let learned_at = parse_headroom_learn_timestamp(block);
@@ -9904,17 +10026,104 @@ fn parse_headroom_learn_timestamp(block: &str) -> Option<DateTime<Utc>> {
     })
 }
 
+const LEARN_START: &str = "<!-- headroom:learn:start -->";
+const LEARN_END: &str = "<!-- headroom:learn:end -->";
+const LEARN_BLOCK_TITLE: &str = "## Headroom Learned Patterns";
+
+/// Byte range of the managed learn block (start marker inclusive, end marker
+/// exclusive) plus whether the end marker was actually present. A block with
+/// no end marker runs to the next `## ` heading (other than the block's own
+/// title) or EOF. That shape is real: on 2026-09-02 the headroom-desktop
+/// MEMORY.md lost its end marker (cause never found), every reader here
+/// treated it as "no block", and the wheel's writer - which only replaces
+/// start..end - silently wrote nothing until the marker was restored by hand.
+fn headroom_learn_block_bounds(content: &str) -> Option<(usize, usize, bool)> {
+    let start = content.find(LEARN_START)?;
+    if let Some(rel) = content[start..].find(LEARN_END) {
+        return Some((start, start + rel, true));
+    }
+    let mut from = start + LEARN_START.len();
+    let end = loop {
+        match content[from..].find("\n## ") {
+            None => break content.len(),
+            Some(rel) => {
+                let heading = from + rel + 1;
+                if content[heading..].starts_with(LEARN_BLOCK_TITLE) {
+                    from = heading + LEARN_BLOCK_TITLE.len();
+                    continue;
+                }
+                break heading;
+            }
+        }
+    };
+    Some((start, end, false))
+}
+
+/// Re-insert a missing end marker. `None` when the content has no block or
+/// the block is already intact, so callers can treat `Some` as "changed".
+pub fn repair_headroom_learn_block(content: &str) -> Option<String> {
+    let (_, end, has_end) = headroom_learn_block_bounds(content)?;
+    if has_end {
+        return None;
+    }
+    let head = content[..end].trim_end_matches('\n');
+    let tail = content[end..].trim_start_matches('\n');
+    let mut out = String::with_capacity(content.len() + LEARN_END.len() + 3);
+    out.push_str(head);
+    out.push('\n');
+    out.push_str(LEARN_END);
+    out.push('\n');
+    if !tail.is_empty() {
+        out.push('\n');
+        out.push_str(tail);
+    }
+    Some(out)
+}
+
+/// Heal a start-only block on disk. Runs before `headroom learn --apply` so
+/// the wheel's writer has a start..end span to replace. Warns (Sentry, via
+/// the log bridge) with the file's mtime: the 2026-09-02 loss was never
+/// dated, and the mtime plus a fleet count is what separates a code bug
+/// (many hosts) from a local hand edit (one host).
+pub fn repair_headroom_learn_block_file(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(repaired) = repair_headroom_learn_block(&content) else {
+        return false;
+    };
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|m| DateTime::<Utc>::from(m).to_rfc3339())
+        .unwrap_or_default();
+    match crate::client_adapters::atomic_write(path, repaired.as_bytes()) {
+        Ok(()) => {
+            log::warn!(
+                "learn block in {} had no end marker (file mtime {modified}, {} bytes); end marker restored",
+                path.display(),
+                content.len()
+            );
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "learn block in {} has no end marker and repair failed: {err:#}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 /// Parse sections and bullets inside the managed `<!-- headroom:learn -->`
 /// block. Returns an empty Vec if no block is present.
 pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::AppliedSection> {
     use crate::models::AppliedSection;
-    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+    let Some((start, end, _)) = headroom_learn_block_bounds(file_content) else {
         return Vec::new();
     };
-    let Some(end_rel) = file_content[start..].find("<!-- headroom:learn:end -->") else {
-        return Vec::new();
-    };
-    let block = &file_content[start..start + end_rel];
+    let block = &file_content[start..end];
 
     let mut sections: Vec<AppliedSection> = Vec::new();
     let mut current: Option<AppliedSection> = None;
@@ -9951,10 +10160,20 @@ pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::Appl
 /// dropped. If the entire managed block becomes empty, the whole block
 /// including its markers is removed.
 pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_text: &str) -> String {
-    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+    // A start-only block (see `headroom_learn_block_bounds`) is healed first
+    // so the rewrite below always has a real end marker to anchor on.
+    let repaired;
+    let file_content: &str = match repair_headroom_learn_block(file_content) {
+        Some(fixed) => {
+            repaired = fixed;
+            &repaired
+        }
+        None => file_content,
+    };
+    let Some(start) = file_content.find(LEARN_START) else {
         return file_content.to_string();
     };
-    let end_marker = "<!-- headroom:learn:end -->";
+    let end_marker = LEARN_END;
     let Some(end_rel) = file_content[start..].find(end_marker) else {
         return file_content.to_string();
     };
@@ -12250,24 +12469,46 @@ mod tests {
     }
 
     #[test]
-    fn sitecustomize_vendors_tool_search_deferred_repair() {
-        // The rc.3 "Tool reference 'CronCreate' not found in available tools"
-        // 400 came from the wheel's strip_unsupported_tool_search_blocks
-        // counting a defer_loading=true tool as available. The vendor narrows
-        // the availability input to drop deferred tools. Behaviour is proven by
-        // tool_search_deferred_repair_behaves_against_the_installed_wheel; this
+    fn sitecustomize_vendors_tool_search_history_repair() {
+        // The tool_reference 400 ("... not found in available tools") is caused
+        // by a referenced tool being ABSENT from the request's tools array; a
+        // deferred-but-present tool is valid. The vendor keys on absence and
+        // covers the client-side tool_result+tool_reference shape the wheel
+        // repair does not scan, delegating the server-side shape to the wheel
+        // with tools UNFILTERED (reverting rc.5's defer_loading filter).
+        // Behaviour is proven by
+        // tool_search_history_repair_behaves_against_the_installed_wheel; this
         // pins the shape.
         let py = super::SITECUSTOMIZE_PY;
-        assert!(py.contains("HEADROOM_TOOL_SEARCH_DEFER_REPAIR"));
+        assert!(py.contains("HEADROOM_TOOL_SEARCH_REPAIR"));
+        // rc.5's wrong defer_loading filter must be gone.
+        assert!(!py.contains("HEADROOM_TOOL_SEARCH_DEFER_REPAIR"));
+        assert!(!py.contains("_hd_tsr_orig(messages, filtered)"));
         // Exact-pin gated: any other wheel keeps its own repair.
         assert!(py.contains(r#"_hd_tsr_meta.version("headroom-ai") == "0.37.0""#));
-        // The wrapper filters defer_loading and delegates to the wheel's repair.
-        assert!(py.contains(r#"t.get("defer_loading")"#));
-        assert!(py.contains("_hd_tsr_orig(messages, filtered)"));
+        // Client-side pass keyed on absence, delegating server-side unfiltered.
+        assert!(py.contains("def _hd_tsr_client_side(messages, tools):"));
+        assert!(py.contains("removed_client + removed_server"));
         // It must reassign the module symbol the handler late-imports.
         assert!(
             py.contains("_hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped")
         );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_tool_ref_hint() {
+        // The residual tool_reference 400 gets a "start a new session" hint.
+        // Behaviour is proven by tool_ref_hint_behaves_against_the_installed_wheel;
+        // this pins the shape.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_TOOL_REF_HINT"));
+        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.37.0""#));
+        // Wraps the buffered-error seam and post-processes its Response.
+        assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
+        assert!(py.contains("def _hd_hint_apply(result):"));
+        // Assert the load-bearing marker the idempotency guard keys on, not the
+        // user-facing copy (which is free to change without breaking this test).
+        assert!(py.contains(r#"b"Headroom:" not in body"#));
     }
 
     #[test]
@@ -12405,12 +12646,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_search_deferred_repair_behaves_against_the_installed_wheel() {
-        // The rc.3 400 regression ("Tool reference 'CronCreate' not found in
-        // available tools") lived in the WHEEL's history repair, not the string
-        // blob. This runs the shipped sitecustomize against the installed wheel
-        // and asserts a deferred tool is hidden from the availability check
-        // (deferred reference dropped, loaded kept, kill switch reverts).
+    fn tool_search_history_repair_behaves_against_the_installed_wheel() {
+        // The tool_reference 400 ("... not found in available tools") lived in
+        // the WHEEL's history repair, not the string blob. This runs the shipped
+        // sitecustomize against the installed wheel and asserts absence-keyed
+        // handling across BOTH block shapes: client-side absent neutralized,
+        // deferred-but-present kept (both shapes), server-side absent dropped,
+        // kill switch reverts client-side coverage.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12446,9 +12688,54 @@ mod tests {
         }
         assert!(
             out.status.success() && stdout.contains("OK tool-search repair"),
-            "tool-search deferred-availability repair misbehaved against the\n\
-             installed wheel. If the deferred reference was kept, the rc.3 400\n\
-             regression is back.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "tool-search history repair misbehaved against the installed wheel.\n\
+             If a client-side absent reference survived, the tool_reference 400 is\n\
+             back; if a deferred+present reference was dropped, rc.5's regression\n\
+             is back.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn tool_ref_hint_behaves_against_the_installed_wheel() {
+        // The residual tool_reference 400 that reaches the user gets a Headroom
+        // "start a new session" hint appended. Runs the shipped sitecustomize
+        // against the installed wheel's starlette and asserts the transform is
+        // valid, content-length-correct, idempotent, and scoped to 400s carrying
+        // the signature.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-tool-ref-hint.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-tool-ref-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run tool-ref-hint probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("FAIL hint bound") && stderr.is_empty() {
+            eprintln!("skipping: tool-ref hint vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK tool-ref hint"),
+            "tool-ref hint vendor misbehaved against the installed wheel.\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
@@ -14988,6 +15275,73 @@ after
             "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
         let out = super::delete_applied_bullet(content, "Foo", "not-there");
         assert_eq!(out, content);
+    }
+
+    const START_ONLY: &str = "<!-- headroom:learn:start -->\n\
+## Headroom Learned Patterns\n\
+*Auto-generated by `headroom learn` on 2026-09-02 - do not edit manually*\n\
+\n\
+### Foo\n\
+- alpha\n\
+- beta\n\
+\n\
+## Manual memory index\n\
+\n\
+- [x](y.md)\n";
+
+    #[test]
+    fn learn_block_parse_tolerates_missing_end_marker() {
+        let sections = super::parse_headroom_learn_block(START_ONLY);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Foo");
+        assert_eq!(sections[0].bullets, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn learn_block_repair_inserts_end_marker_and_is_idempotent() {
+        let fixed = super::repair_headroom_learn_block(START_ONLY).expect("repaired");
+        assert!(fixed.contains("- beta\n<!-- headroom:learn:end -->\n\n## Manual memory index\n"));
+        assert!(fixed.ends_with("- [x](y.md)\n"));
+        assert_eq!(
+            super::parse_headroom_learn_block(&fixed),
+            super::parse_headroom_learn_block(START_ONLY)
+        );
+        assert!(super::repair_headroom_learn_block(&fixed).is_none());
+        // EOF case: no heading after the block.
+        let eof =
+            super::repair_headroom_learn_block("<!-- headroom:learn:start -->\n### Foo\n- a\n")
+                .expect("repaired");
+        assert_eq!(
+            eof,
+            "<!-- headroom:learn:start -->\n### Foo\n- a\n<!-- headroom:learn:end -->\n"
+        );
+        assert!(super::repair_headroom_learn_block("no block here\n").is_none());
+    }
+
+    #[test]
+    fn learn_block_delete_heals_start_only_block() {
+        let out = super::delete_applied_bullet(START_ONLY, "Foo", "alpha");
+        assert!(out.contains("<!-- headroom:learn:end -->"));
+        assert!(out.contains("## Manual memory index"));
+        let sections = super::parse_headroom_learn_block(&out);
+        assert_eq!(sections[0].bullets, vec!["beta"]);
+    }
+
+    #[test]
+    fn learn_block_repair_file_writes_once() {
+        let root = unique_temp_dir("headroom-learn-repair");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("MEMORY.md");
+        fs::write(&path, START_ONLY).expect("write");
+        assert!(super::repair_headroom_learn_block_file(&path));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("<!-- headroom:learn:end -->"));
+        assert!(!super::repair_headroom_learn_block_file(&path));
+        assert!(!super::repair_headroom_learn_block_file(
+            &root.join("missing.md")
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

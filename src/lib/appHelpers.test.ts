@@ -9,6 +9,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  higherSubscriptionTier,
   introPercentOff,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -108,6 +109,22 @@ describe("app helpers", () => {
       "pro",
       "max20x",
     ]);
+  });
+
+  it("pitches the higher of the Claude-implied tier and the recommendation", () => {
+    // Claude Max x5 routed next to ChatGPT Pro (Codex -> Max x20).
+    expect(getUpgradePlans("individual", "max5x", "max20x").featuredPlanId).toBe("max20x");
+    // Claude Max x20 routed next to ChatGPT Pro Lite (Codex -> Max x5).
+    const result = getUpgradePlans("individual", "max20x", "max5x");
+    expect(result.featuredPlanId).toBe("max20x");
+    expect(result.plans.map((plan) => plan.id)).toEqual(["max20x", "pro", "max5x"]);
+    // Lapsed subscriber with neither signal keeps their last paid tier.
+    expect(getUpgradePlans("individual", "unknown", null, "pro").featuredPlanId).toBe("pro");
+
+    expect(higherSubscriptionTier(undefined, "max5x")).toBe("max5x");
+    expect(higherSubscriptionTier("pro", null)).toBe("pro");
+    expect(higherSubscriptionTier("max5x", "pro")).toBe("max5x");
+    expect(higherSubscriptionTier(null, undefined)).toBeNull();
   });
 
   it("defaults unknown individual plans toward max x5 guidance", () => {

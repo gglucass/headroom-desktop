@@ -394,6 +394,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // tauri-utils warns when APPDIR/APPIMAGE is set but the executable is not
+    // under an AppImage mount. A .deb/.rpm install inherits those variables
+    // from whatever AppImage the user launched us from (RUST-CN: 6 events in
+    // 2 minutes on one CachyOS host, one per resource-dir lookup). A property
+    // of the launching shell, not of anything we ship; keep the local log.
+    if target.starts_with("tauri_utils") && msg.contains("not detected as an AppImage") {
+        return true;
+    }
     // The canary captures its own fully-scoped event at the emit site (flow
     // tag, sample/zero/strata/models extras, and the fixed `zero_savings_canary`
     // fingerprint that makes the fleet-wide event count the blast radius). This
@@ -1035,6 +1043,20 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "kompress prefetch download error: [network] Max retries exceeded"
+        ));
+    }
+
+    #[test]
+    fn skips_tauri_utils_appimage_env_warning() {
+        // RUST-CN: APPDIR leaked from the launching shell into a .deb install.
+        assert!(skip_sentry(
+            "tauri_utils",
+            "`APPDIR` or `APPIMAGE` environment variable found but this application was not \
+             detected as an AppImage; this might be a security issue."
+        ));
+        assert!(!skip_sentry(
+            "tauri_utils",
+            "some other tauri_utils warning"
         ));
     }
 

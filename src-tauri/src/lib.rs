@@ -4759,6 +4759,95 @@ async fn repair_client_setups(app: AppHandle) -> Result<Vec<String>, String> {
     .map_err(|err| err.to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnroutedClient {
+    client_id: String,
+    name: String,
+    /// Connection toggle is on (config present) yet the agent bypassed it.
+    enabled: bool,
+    /// Connection was re-applied just now; the agent needs a restart to pick
+    /// it up. Only ever true when `enabled`.
+    reapplied: bool,
+    active_at: String,
+}
+
+/// Agents that ran on this machine while Headroom, up the whole time, saw
+/// nothing from them: local session artifacts newer than any proxied request.
+/// The hourly self-heal above cannot see this case, because the config files
+/// verify fine - the agent just isn't reading them (connection switched off,
+/// launched from a stale environment). An enabled connection is re-applied
+/// on the spot; a disabled one is only reported, so the UI can ask before
+/// turning it back on.
+#[tauri::command]
+async fn detect_unrouted_clients(
+    app: AppHandle,
+    app_started_at_ms: i64,
+) -> Result<Vec<UnroutedClient>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        let state: State<'_, AppState> = app.state();
+        // Paused or bypassed: the agent going direct is the intended state.
+        if state.runtime_is_paused()
+            || state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        // ponytail: process-wide hourly throttle, same shape as
+        // repair_client_setups; the artifact walk stats up to 20k entries.
+        static LAST_SCAN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        {
+            let mut last = LAST_SCAN.get_or_init(|| Mutex::new(None)).lock().unwrap();
+            if last.is_some_and(|at| at.elapsed() < Duration::from_secs(3600)) {
+                return Vec::new();
+            }
+            *last = Some(Instant::now());
+        }
+        let app_started_at = UNIX_EPOCH + Duration::from_millis(app_started_at_ms.max(0) as u64);
+        let now = SystemTime::now();
+        let mut found = Vec::new();
+        for (client_id, name, counter_key) in [
+            ("codex", "ChatGPT", "codex"),
+            ("claude_code", "Claude Code", "claude-code"),
+        ] {
+            let activity = client_adapters::client_local_activity_at(client_id);
+            let requests = usage_counters::requests_since_yesterday(counter_key);
+            if !client_adapters::client_ran_unrouted(activity, requests, app_started_at, now) {
+                continue;
+            }
+            let enabled = match client_id {
+                "codex" => client_adapters::is_codex_enabled(),
+                _ => client_adapters::is_claude_code_enabled(),
+            };
+            let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
+            let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
+            // warn: the log bridge forwards it to Sentry, the only fleet-wide
+            // trace of an agent silently running outside Headroom.
+            log::warn!(
+                "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
+            );
+            analytics::track_event(
+                &app,
+                "client_unrouted_detected",
+                Some(json!({ "client": client_id, "enabled": enabled, "reapplied": reapplied })),
+            );
+            found.push(UnroutedClient {
+                client_id: client_id.into(),
+                name: name.into(),
+                enabled,
+                reapplied,
+                active_at: active_at.to_rfc3339(),
+            });
+        }
+        found
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 async fn detect_oss_remnants() -> Result<Vec<String>, String> {
     Ok(client_adapters::detect_oss_remnants())
@@ -5312,6 +5401,64 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
     })
 }
 
+/// Tauri's build error is fatal either way, but on Windows the usual cause is a
+/// missing WebView2 runtime and the old `.expect` panicked before any window
+/// existed, so the user saw literally nothing (Sentry RUST-8J: 8 machines in 14
+/// days, every one blocked on first run). Explain it, offer the download, then
+/// panic as before so the event still reaches Sentry.
+fn fatal_build_error(err: tauri::Error) -> ! {
+    let message = err.to_string();
+    #[cfg(target_os = "windows")]
+    if is_missing_webview_runtime(&message) {
+        show_webview2_missing_dialog();
+    }
+    panic!("error while building tauri application: {message}");
+}
+
+/// Matches `tauri_runtime::Error::WebviewRuntimeNotInstalled` by its Display
+/// text, which is cheaper than taking a direct tauri-runtime dependency just to
+/// name the variant.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_missing_webview_runtime(message: &str) -> bool {
+    message.contains("webview runtime")
+}
+
+/// MessageBoxW rather than a Tauri dialog: there is no webview left to render
+/// one in, which is the whole problem.
+#[cfg(target_os = "windows")]
+fn show_webview2_missing_dialog() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONERROR, MB_SETFOREGROUND, MB_YESNO,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let text = wide(concat!(
+        "Headroom needs the Microsoft Edge WebView2 runtime, ",
+        "which is not installed on this PC.\n\n",
+        "Open the download page? Install the Evergreen Runtime, ",
+        "then start Headroom again."
+    ));
+    let caption = wide("Headroom cannot start");
+    let choice = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNO | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+    if choice == IDYES {
+        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
+    }
+}
+
 pub fn run() {
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
@@ -5807,6 +5954,7 @@ pub fn run() {
             apply_client_setup,
             verify_client_setup,
             repair_client_setups,
+            detect_unrouted_clients,
             detect_oss_remnants,
             get_client_connectors,
             disable_client_setup,
@@ -5836,7 +5984,7 @@ pub fn run() {
             debug_force_proxy_bypass
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .unwrap_or_else(|err| fatal_build_error(err))
         .run(|app, event| {
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
@@ -6675,6 +6823,19 @@ fn execute_headroom_learn_run(
                 )),
                 output_tail: Vec::new(),
             };
+        }
+    }
+
+    // Heal a start-only learn block before the wheel's writer runs: it only
+    // replaces start..end and silently writes nothing otherwise. Personal
+    // files only; the team-shared CLAUDE.md is git-tracked and never touched.
+    if let LearnAgent::Claude = agent {
+        let path = project_path.unwrap_or_default();
+        for file in [
+            Path::new(path).join("CLAUDE.local.md"),
+            crate::tool_manager::claude_project_memory_file(path),
+        ] {
+            crate::tool_manager::repair_headroom_learn_block_file(&file);
         }
     }
 
@@ -11713,6 +11874,20 @@ Some unrelated content.
             "Could not resolve host: pypi.org"
         ));
         assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+    }
+
+    #[test]
+    fn missing_webview_runtime_is_recognised_from_tauris_own_message() {
+        // Verbatim Display text of tauri_runtime::Error::WebviewRuntimeNotInstalled
+        // (tauri-runtime 2.11.3), which is what Sentry RUST-8J reports.
+        assert!(super::is_missing_webview_runtime(
+            "Could not find the webview runtime, make sure it is installed"
+        ));
+        // Any other build failure must keep the plain panic, no dialog.
+        assert!(!super::is_missing_webview_runtime("window not found"));
+        assert!(!super::is_missing_webview_runtime(
+            "the event loop has been closed"
+        ));
     }
 
     #[test]
