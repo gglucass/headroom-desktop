@@ -8748,7 +8748,7 @@ fn find_listener_command(port: u16) -> String {
 /// genuinely healthy headroom proxy is serving there. Used to avoid killing a
 /// live backend during port reclaim. Short timeout: a hung orphan won't answer
 /// in time and a healthy one answers in milliseconds.
-fn probe_backend_readyz_ok(port: u16) -> bool {
+pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(800))
         .build()

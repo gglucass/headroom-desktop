@@ -3219,7 +3219,31 @@ impl AppState {
         // If the proxy is already live (e.g. started externally, or by us under
         // the lifecycle lock just above), treat runtime as healthy without
         // forcing another launcher.
-        if is_headroom_proxy_reachable() {
+        //
+        // `is_headroom_proxy_reachable` probes 6767, the INTERCEPT, but the
+        // question here is whether the BACKEND needs spawning. Those come apart
+        // when the intercept is wedged over a healthy backend (a Windows
+        // failure mode, see the 6767 bind history): the intercept probe says
+        // "down", we fall through to spawn, 6768 is still held by that healthy
+        // backend, and `reclaim_orphan_proxy` refuses to kill a healthy
+        // occupant and bails -- every launch, until reboot. Three of those in a
+        // row auto-pauses the runtime, which BYPASSES it, so the user keeps
+        // coding and silently saves nothing. That is Sentry RUST-6J into
+        // RUST-5C, and the largest Windows cluster we have.
+        //
+        // Asking the backend directly closes it. The argv check is what keeps
+        // this safe: adopting a backend from an OLDER app build would silently
+        // run a mismatched wheel and, worse, quietly disable the exact-pin
+        // prefix-floor vendor. A mismatched argv fails this test and falls
+        // through to the existing teardown-and-respawn path unchanged.
+        let backend_serving =
+            crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        if runtime_already_serving(
+            is_headroom_proxy_reachable(),
+            backend_serving,
+            // Only consult argv when it can change the answer: it shells out.
+            backend_serving && crate::tool_manager::running_proxy_matches_expected_args(),
+        ) {
             *self.last_startup_error.lock() = None;
             return Ok(());
         }
@@ -7767,6 +7791,21 @@ fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_millis(1500))
 }
 
+/// Whether the runtime is already serving, so `ensure_headroom_running` can
+/// return without spawning. Split out from the probes so the decision itself is
+/// testable: the probes hit the network and shell out, this does not.
+///
+/// A reachable intercept is sufficient (the pre-existing rule). A healthy
+/// backend alone is NOT: it must also be running this build's argv, or we would
+/// adopt an older build's proxy and silently run a mismatched wheel.
+fn runtime_already_serving(
+    intercept_reachable: bool,
+    backend_serving: bool,
+    backend_argv_is_current: bool,
+) -> bool {
+    intercept_reachable || (backend_serving && backend_argv_is_current)
+}
+
 fn probe_proxy_readyz(timeout: Duration) -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -9708,6 +9747,32 @@ mod tests {
 
         profile.setup_wizard_complete = true;
         assert!(super::setup_wizard_satisfied_for_profile(&profile, false));
+    }
+
+    /// The deadlock this exists for: a wedged 6767 intercept over a healthy
+    /// 6768 backend used to fall through to the spawn path, where reclaim
+    /// refuses to kill a healthy occupant and bails, every launch, until three
+    /// failures auto-paused (and therefore BYPASSED) the runtime. Sentry
+    /// RUST-6J -> RUST-5C, the largest Windows cluster.
+    #[test]
+    fn runtime_already_serving_accepts_a_healthy_backend_behind_a_wedged_intercept() {
+        use super::runtime_already_serving as serving;
+
+        // The pre-existing rule is untouched: a reachable intercept is enough.
+        assert!(serving(true, false, false));
+        assert!(serving(true, true, true));
+
+        // The fix: intercept down, backend healthy and running this build.
+        assert!(serving(false, true, true));
+
+        // A healthy backend from an OLDER build must NOT be adopted. Doing so
+        // would silently run a mismatched wheel and disable the exact-pin
+        // prefix-floor vendor, so this has to fall through to respawn.
+        assert!(!serving(false, true, false));
+
+        // Nothing serving at all still spawns.
+        assert!(!serving(false, false, false));
+        assert!(!serving(false, false, true));
     }
 
     #[test]
