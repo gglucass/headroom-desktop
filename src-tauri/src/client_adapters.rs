@@ -222,14 +222,43 @@ pub fn set_rtk_enabled(
     Ok(())
 }
 
-/// True when the error chain contains a filesystem PermissionDenied (os error 13),
-/// i.e. an unwritable target -- an environment issue, not an app bug.
+/// Raw OS codes anywhere in the chain: from `io::Error` sources, and from the
+/// "(os error N)" suffix `atomic_write` bakes into its message text instead of
+/// carrying a source (see there, RUST-77). Without the text half, nothing an
+/// `atomic_write` caller returns ever downcasts, so a Windows ERROR_ACCESS_DENIED
+/// on a shell-profile tmp write reached Sentry as an Error (RUST-D2) past the
+/// `is_permission_denied` exclusion built for exactly that.
+fn os_error_codes(err: &anyhow::Error) -> Vec<i32> {
+    err.chain()
+        .flat_map(|cause| {
+            let from_io = cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.raw_os_error());
+            let from_text = cause
+                .to_string()
+                .rsplit_once("(os error ")
+                .and_then(|(_, rest)| rest.trim_end_matches(')').trim().parse().ok());
+            from_io.into_iter().chain(from_text)
+        })
+        .collect()
+}
+
+/// EPERM (1) and EACCES (13) on unix; ERROR_ACCESS_DENIED (5) on Windows.
+#[cfg(unix)]
+const PERMISSION_DENIED_OS_ERRORS: &[i32] = &[1, 13];
+#[cfg(windows)]
+const PERMISSION_DENIED_OS_ERRORS: &[i32] = &[5];
+
+/// True when the error chain carries a filesystem permission denial, i.e. an
+/// unwritable target -- an environment issue, not an app bug.
 pub fn is_permission_denied(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
-    })
+    }) || os_error_codes(err)
+        .iter()
+        .any(|code| PERMISSION_DENIED_OS_ERRORS.contains(code))
 }
 
 /// Raw OS codes for a full disk. ErrorKind::StorageFull isn't stable, so match
@@ -244,12 +273,9 @@ const NO_SPACE_OS_ERRORS: &[i32] = &[39, 112];
 /// a full disk, an environment issue not an app bug, same class as
 /// `is_permission_denied`.
 pub fn is_no_space(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            io.raw_os_error()
-                .is_some_and(|code| NO_SPACE_OS_ERRORS.contains(&code))
-        })
-    })
+    os_error_codes(err)
+        .iter()
+        .any(|code| NO_SPACE_OS_ERRORS.contains(code))
 }
 
 /// True when the error chain contains an io InvalidData -- in practice a
@@ -7159,7 +7185,7 @@ mod tests {
         retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
+        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -7260,6 +7286,33 @@ mod tests {
         assert!(!is_permission_denied(&not_found));
 
         assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
+    }
+
+    /// RUST-D2: `atomic_write` bakes the io cause into its message and carries
+    /// no source, so the classifiers must read the "(os error N)" text too.
+    #[test]
+    fn environment_classifiers_read_atomic_write_message_text() {
+        let denied_code = *PERMISSION_DENIED_OS_ERRORS.last().unwrap();
+        let denied = anyhow::anyhow!(
+            "writing ~/.bash_profile.tmp.9156.2330: {}",
+            std::io::Error::from_raw_os_error(denied_code)
+        )
+        .context("client setup failed for codex");
+        assert!(is_permission_denied(&denied), "{denied:#}");
+        assert!(!is_no_space(&denied));
+
+        let full = anyhow::anyhow!(
+            "writing ~/.zshrc.tmp.1.2: {}",
+            std::io::Error::from_raw_os_error(NO_SPACE_OS_ERRORS[0])
+        );
+        assert!(is_no_space(&full), "{full:#}");
+        assert!(!is_permission_denied(&full));
+
+        // A code in prose that is not the io Display suffix stays unclassified.
+        assert!(!is_permission_denied(&anyhow::anyhow!(
+            "os error 5 happened"
+        )));
+        assert!(!is_no_space(&anyhow::anyhow!("exit code 28")));
     }
 
     #[test]

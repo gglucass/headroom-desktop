@@ -6637,21 +6637,38 @@ impl ToolManager {
         // The Python CLI couldn't find `claude` (e.g. GUI launch with bare
         // PATH) and wrote ~/.claude/mcp.json instead. Write the entry
         // directly to ~/.claude.json, which is what Claude Code ≥2.x reads.
-        if let Ok(()) = write_headroom_to_claude_json(&entrypoint, HEADROOM_PROXY_URL) {
-            if claude_code_has_headroom_mcp_server() {
-                return Ok(McpInstallMethod::DirectClaudeJson);
-            }
+        let direct_write = write_headroom_to_claude_json(&entrypoint, HEADROOM_PROXY_URL);
+        if direct_write.is_ok() && claude_code_has_headroom_mcp_server() {
+            return Ok(McpInstallMethod::DirectClaudeJson);
         }
+
+        // Neither we nor the Python CLI found a `claude` anywhere: Claude Code
+        // is not installed on this machine (RUST-D1: a Codex-only Windows
+        // host), so "does not see the server" is the expected state, not a
+        // registration that silently missed. The ~/.claude.json entry above
+        // still waits for a later install. Only a detected CLI that still
+        // cannot see the server is worth a report.
+        let Some(detected) = detected_claude.as_ref().map(|p| p.display().to_string()) else {
+            log::info!(
+                "Headroom MCP install: claude CLI not detected on this machine; \
+                 Claude Code registration left in ~/.claude.json"
+            );
+            return Ok(McpInstallMethod::FallbackJson);
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let detected = detected_claude
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<not detected>".into());
+        let claude_json_write_error = direct_write
+            .err()
+            .map(|err| format!("{err:#}"))
+            .unwrap_or_default();
         sentry::with_scope(
             |scope| {
                 scope.set_extra("claude_cli_detected", detected.clone().into());
+                scope.set_extra(
+                    "claude_json_write_error",
+                    claude_json_write_error.clone().into(),
+                );
                 scope.set_extra(
                     "stdout_tail",
                     stdout[stdout.char_indices().rev().nth(511).map_or(0, |(i, _)| i)..].into(),
