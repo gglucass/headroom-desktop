@@ -1222,7 +1222,7 @@ impl AppState {
             // here for nothing — bail with a distinct outcome so the
             // failure path knows it's a non-start, not a hang.
             log::warn!(
-                "run_upgrade_with_ui: skipping boot validation — no tracked child and no reachable proxy"
+                "run_upgrade_with_ui: skipping boot validation: no tracked child and no reachable proxy"
             );
             BootValidationOutcome::NotStarted
         } else {
@@ -1408,20 +1408,27 @@ impl AppState {
         let fallback_pkg_label = installed_version
             .clone()
             .unwrap_or_else(|| "the previous version".into());
-        let error_hint = match maintenance_kind {
-            RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
-                "Reverted to headroom-ai {} and restarted it.",
-                fallback_pkg_label
-            )),
-            RuntimeMaintenanceKind::Upgrade if rollback_restored => {
-                Some(format!("Reverted to headroom-ai {}.", fallback_pkg_label))
-            }
-            RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
-                "Headroom restarted with the repaired runtime, but validation still failed.".into(),
-            ),
-            RuntimeMaintenanceKind::RequirementsRepair => None,
-            _ => None,
+        // When the fallback did not come back either, the new venv's spawn
+        // error is the best explanation we have of why: a host that refuses
+        // every runtime (RUST-2Z's regression was a WinError 10013 socket
+        // verdict that failed 0.35.0 exactly as it failed 0.37.0) otherwise
+        // reads "Reverted to headroom-ai 0.35.0." under a banner while
+        // nothing is running.
+        let startup_hint = if restarted {
+            None
+        } else {
+            post_spawn
+                .ensure_error
+                .as_deref()
+                .and_then(classify_startup_error)
         };
+        let error_hint = boot_validation_error_hint(
+            maintenance_kind,
+            rollback_restored,
+            restarted,
+            &fallback_pkg_label,
+            startup_hint.as_deref(),
+        );
         self.record_upgrade_failure(RuntimeUpgradeFailure {
             app_version: current_app_version.clone(),
             target_headroom_version: target_version.clone(),
@@ -7607,6 +7614,35 @@ pub(crate) fn headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_secs(5))
 }
 
+/// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
+/// `classify_startup_error`'s reading of the new runtime's spawn error and is
+/// only passed when the fallback did not restart either, so the banner can
+/// say why nothing is running instead of just what was reverted.
+pub(crate) fn boot_validation_error_hint(
+    kind: RuntimeMaintenanceKind,
+    rollback_restored: bool,
+    restarted: bool,
+    fallback_pkg_label: &str,
+    startup_hint: Option<&str>,
+) -> Option<String> {
+    match kind {
+        RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
+            "Reverted to headroom-ai {fallback_pkg_label} and restarted it."
+        )),
+        RuntimeMaintenanceKind::Upgrade if rollback_restored => Some(match startup_hint {
+            Some(hint) => format!(
+                "Reverted to headroom-ai {fallback_pkg_label}, but it didn't start either. {hint}"
+            ),
+            None => format!("Reverted to headroom-ai {fallback_pkg_label}."),
+        }),
+        RuntimeMaintenanceKind::Upgrade => startup_hint.map(str::to_string),
+        RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
+            "Headroom restarted with the repaired runtime, but validation still failed.".into(),
+        ),
+        RuntimeMaintenanceKind::RequirementsRepair => startup_hint.map(str::to_string),
+    }
+}
+
 /// Turn a raw `last_startup_error` string (the anyhow chain from
 /// `start_headroom_background`) into a short user-friendly explanation plus a
 /// suggested next step. Returns `None` for shapes we don't recognize, in which
@@ -7618,6 +7654,13 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // doesn't drift from the install-time classifier.
     if crate::is_endpoint_protection_signal(raw) {
         return Some(crate::endpoint_protection_hint_runtime());
+    }
+    // WSAEACCES on the loopback socket asyncio needs before anything else
+    // runs (RUST-CY): the chain also matches the generic exited-before-port
+    // branch below, which would send the user to a traceback whose last line
+    // is localized Windows prose. Two causes, two checks; the hint names both.
+    if crate::is_loopback_socket_denied_signal(raw) {
+        return Some(crate::loopback_socket_denied_hint());
     }
     if raw.contains("is occupied by a non-headroom process") {
         // Only reaches here when even the fallback port range was unavailable
@@ -9459,6 +9502,96 @@ mod tests {
         assert!(
             !hint.contains("see the traceback"),
             "generic branch won: {hint}"
+        );
+    }
+
+    /// RUST-CY verbatim shape: asyncio's socketpair fallback refused a
+    /// loopback listen on a Russian-locale Windows 11 host, exit 1 with the
+    /// banner printed and the port never opened, identically on 0.37.0 and
+    /// the 0.35.0 rollback. Only the code survives localization.
+    #[test]
+    fn classify_startup_error_recognises_a_denied_loopback_socket_on_windows() {
+        let raw = "unable to keep headroom running in background (prior attempts: headroom.exe: \
+                   exited with status exit code: 1 before opening port 6768): exited with status \
+                   exit code: 1 before opening port 6768 (~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe \
+                   -m headroom.proxy.server --port 6768 --no-http2 --log-messages; log: ...)\n\
+                   --- log tail ---\n  File \"...\\Lib\\socket.py\", line 616, in _fallback_socketpair\n    \
+                   lsock.listen()\nPermissionError: [WinError 10013] Сделана попытка доступа к сокету \
+                   методом, запрещенным правами доступа\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("denied loopback socket should classify");
+        assert!(hint.contains("10013"), "hint should name the code: {hint}");
+        assert!(
+            hint.contains("excludedportrange"),
+            "hint should hand over the reserved-range check: {hint}"
+        );
+        assert!(
+            !hint.contains("see the traceback"),
+            "generic branch won: {hint}"
+        );
+        assert!(
+            !hint.contains("endpoint protection"),
+            "must not assert a cause the code does not prove: {hint}"
+        );
+    }
+
+    #[test]
+    fn boot_validation_error_hint_explains_a_fallback_that_did_not_start_either() {
+        use crate::tool_manager::RuntimeMaintenanceKind as Kind;
+        let hint = super::boot_validation_error_hint(
+            Kind::Upgrade,
+            true,
+            false,
+            "0.35.0",
+            Some("Windows refused a socket. Then click Retry."),
+        )
+        .expect("restored fallback always has a hint");
+        assert_eq!(
+            hint,
+            "Reverted to headroom-ai 0.35.0, but it didn't start either. \
+             Windows refused a socket. Then click Retry."
+        );
+        // Restarted fine: the startup hint is never passed, wording unchanged.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, true, true, "0.35.0", None).as_deref(),
+            Some("Reverted to headroom-ai 0.35.0 and restarted it.")
+        );
+        // Restored but unclassified: the pre-existing wording.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, true, false, "0.35.0", None)
+                .as_deref(),
+            Some("Reverted to headroom-ai 0.35.0.")
+        );
+        // Nothing restored: the classification is all there is to say.
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, false, false, "0.35.0", Some("x"))
+                .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(Kind::Upgrade, false, false, "0.35.0", None),
+            None
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(
+                Kind::RequirementsRepair,
+                false,
+                true,
+                "0.35.0",
+                None
+            )
+            .as_deref(),
+            Some("Headroom restarted with the repaired runtime, but validation still failed.")
+        );
+        assert_eq!(
+            super::boot_validation_error_hint(
+                Kind::RequirementsRepair,
+                false,
+                false,
+                "0.35.0",
+                Some("x")
+            )
+            .as_deref(),
+            Some("x")
         );
     }
 

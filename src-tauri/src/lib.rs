@@ -248,6 +248,10 @@ static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 // `capture_headroom_start_failure`.
 static ENDPOINT_PROTECTION_CAPTURED: AtomicBool = AtomicBool::new(false);
 
+// Same shape again, for a Windows host that refuses the runtime a loopback
+// socket (WSAEACCES, WinError 10013). See `capture_headroom_start_failure`.
+static LOOPBACK_SOCKET_DENIED_CAPTURED: AtomicBool = AtomicBool::new(false);
+
 // Guards the quit-time `clear_client_setups()` so it runs at most once per
 // process. The exit handler fires for both `ExitRequested` and `Exit`, and a
 // second `clear_client_setups()` call is destructive: its `disable_client_setup`
@@ -2358,6 +2362,47 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
         return;
     }
 
+    // Windows refusing the runtime a loopback socket (WSAEACCES, WinError
+    // 10013). Python's asyncio cannot even build its self-pipe, so the proxy
+    // dies before bind() on every wheel we could install; the 0.35.0 rollback
+    // failed identically to the 0.37.0 target (RUST-CY/CZ/CW/CX, and the same
+    // host's RUST-5C and RUST-2Z events). No release changes a host's socket
+    // policy, and `classify_startup_error` already hands the user the two
+    // things to check, so this gets the same once-per-session Warning under a
+    // stable fingerprint that the two environmental classes above get.
+    // Without it the message-grouped Error opened one issue per call-site
+    // prefix and per prior-attempts wording (RUST-CW and RUST-CZ were one
+    // machine one minute apart).
+    if is_loopback_socket_denied_signal(&technical_err) {
+        if LOOPBACK_SOCKET_DENIED_CAPTURED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        sentry::with_scope(
+            |scope| {
+                let fp: &[&str] = &["proxy_start_loopback_socket_denied"];
+                scope.set_fingerprint(Some(fp));
+                if let Some(failure) = startup_failure {
+                    scope.set_extra("program", failure.program.clone().into());
+                    scope.set_extra("args", failure.args.join(" ").into());
+                    scope.set_extra("log_path", failure.log_path.clone().into());
+                    scope.set_extra("log_tail", failure.log_tail.clone().into());
+                    scope.set_extra("reason", failure.reason.clone().into());
+                }
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(
+                    "headroom runtime denied a loopback socket at start (WinError 10013)",
+                    sentry::Level::Warning,
+                );
+            },
+        );
+        return;
+    }
+
     if let Some(failure) = startup_failure {
         let category = headroom_start_failure_category(&failure.reason);
         sentry::with_scope(
@@ -2480,6 +2525,8 @@ pub(crate) fn startup_error_fingerprint_key(
     let err = last_startup_error?;
     if is_endpoint_protection_signal(err) {
         Some("startup_endpoint_protection")
+    } else if is_loopback_socket_denied_signal(err) {
+        Some("startup_loopback_socket_denied")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
     } else {
@@ -2762,13 +2809,14 @@ fn capture_watchdog_give_up(
     // (RUST-5C's latest events were one Spanish Windows host whose `_sqlite3`
     // was blocked, escalated to Error three times over).
     let startup_key = startup_error_fingerprint_key(report.last_startup_error.as_deref());
-    let startup_is_policy = startup_key == Some("startup_endpoint_protection");
-    let level =
-        if (report.last_startup_error.is_some() && !startup_is_policy) || cpu_deadlock_signal {
-            sentry::Level::Error
-        } else {
-            sentry::Level::Warning
-        };
+    let startup_is_environmental = is_environmental_startup_key(startup_key);
+    let level = if (report.last_startup_error.is_some() && !startup_is_environmental)
+        || cpu_deadlock_signal
+    {
+        sentry::Level::Error
+    } else {
+        sentry::Level::Warning
+    };
 
     sentry::with_scope(
         |scope| {
@@ -2924,6 +2972,25 @@ pub(crate) fn capture_upgrade_failure(
     summary.push_str(&format!(" err={err_capped}"));
 
     let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err);
+    // The boot-validation chain carries the proxy log tail, and the spawn
+    // error from the new venv rides along in the boot diagnostics; either can
+    // hold the socket verdict.
+    let loopback_socket_denied = is_loopback_socket_denied_signal(&technical_err)
+        || boot_diagnostics
+            .as_ref()
+            .and_then(|d| d.ensure_error.as_deref())
+            .is_some_and(is_loopback_socket_denied_signal);
+    // A verdict of the machine's own configuration is not a defect in the
+    // wheel we installed: the same host failed the 0.35.0 rollback exactly as
+    // it failed the 0.37.0 target (RUST-2Z's regression). It is already
+    // reported once per session with a remedy by
+    // `capture_headroom_start_failure`; the upgrade event keeps its fingerprint
+    // and diagnostics but at Warning, as the watchdog give-up already does.
+    let level = if endpoint_protection_suspected || loopback_socket_denied {
+        sentry::protocol::Level::Warning
+    } else {
+        sentry::protocol::Level::Error
+    };
 
     sentry::with_scope(
         |scope| {
@@ -2932,6 +2999,14 @@ pub(crate) fn capture_upgrade_failure(
             scope.set_tag(
                 "endpoint_protection_suspected",
                 if endpoint_protection_suspected {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            scope.set_tag(
+                "loopback_socket_denied",
+                if loopback_socket_denied {
                     "true"
                 } else {
                     "false"
@@ -3051,7 +3126,7 @@ pub(crate) fn capture_upgrade_failure(
 
             let event = sentry::protocol::Event {
                 message: Some(summary.clone()),
-                level: sentry::protocol::Level::Error,
+                level,
                 exception: exception_values.into(),
                 ..Default::default()
             };
@@ -3126,6 +3201,46 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
         return true;
     }
     false
+}
+
+/// A Windows host refusing the runtime a loopback socket: WSAEACCES, which
+/// CPython surfaces as `PermissionError: [WinError 10013]` and Rust as
+/// `os error 10013`. The prose after the code is localized (RUST-CY carried
+/// it in Russian), so only the code is matched. First seen from asyncio's
+/// `socket.socketpair()` fallback, which binds and listens on an ephemeral
+/// loopback port to build the event loop's self-pipe: nothing in the proxy
+/// runs before that, so the process exits 1 with its banner printed and the
+/// port never opened, on every wheel.
+///
+/// Deliberately NOT part of `is_endpoint_protection_signal`: the code has two
+/// common causes with different remedies (security software filtering
+/// loopback, or a Hyper-V / WSL2 / Docker excluded port range covering the
+/// dynamic range), and that matcher's promise is a hint that names the cause.
+/// `loopback_socket_denied_hint` names both and the command that tells them
+/// apart.
+pub(crate) fn is_loopback_socket_denied_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("winerror 10013") || lower.contains("os error 10013")
+}
+
+/// True for a `startup_error_fingerprint_key` that names a verdict of the
+/// machine's own configuration rather than anything we ship: reported once per
+/// session by `capture_headroom_start_failure` with a user-facing remedy, so
+/// the give-up and upgrade events that follow it stay at Warning.
+pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
+    matches!(
+        key,
+        Some("startup_endpoint_protection") | Some("startup_loopback_socket_denied")
+    )
+}
+
+/// Names both causes of WinError 10013 and how to tell them apart, without
+/// asserting either (same discipline as `state::intercept_bind_hint`).
+const LOOPBACK_SOCKET_DENIED_HINT: &str =
+    "Windows refused to let Headroom's runtime open a local network socket (WinError 10013),      so it exits before it can start listening. This is usually security software filtering      loopback connections, or a reserved port range (Hyper-V, WSL2, Docker) covering the ports      Windows hands out. Allow Headroom in your antivirus or firewall's network protection, and      run `netsh int ipv4 show excludedportrange protocol=tcp` in PowerShell to see reserved      ranges. Then click Retry.";
+
+pub(crate) fn loopback_socket_denied_hint() -> String {
+    LOOPBACK_SOCKET_DENIED_HINT.to_string()
 }
 
 /// True when an install/upgrade failure was caused by the user's disk
@@ -8729,7 +8844,8 @@ mod tests {
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
-        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_endpoint_protection_signal, is_environmental_startup_key,
+        is_loopback_socket_denied_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
         learn_failure_agent_limit_line, learn_failure_is_agent_auth,
         learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
@@ -11813,6 +11929,53 @@ Some unrelated content.
         ] {
             assert!(!is_blocked_runtime_dll_signal(raw), "for: {raw}");
             assert!(!is_endpoint_protection_signal(raw), "for: {raw}");
+        }
+    }
+
+    /// RUST-CY verbatim: asyncio's `socket.socketpair()` fallback refused a
+    /// loopback listen (WSAEACCES) on a Russian-locale Windows 11 host, so the
+    /// proxy exited 1 before bind() on 0.37.0 and on the 0.35.0 rollback
+    /// alike. One machine filed RUST-CW, CX, CY, CZ, a RUST-5C regression and
+    /// a RUST-2Z regression in three minutes, all at Error, none classified.
+    #[test]
+    fn a_denied_loopback_socket_is_recognised_by_code_alone() {
+        let chain = "unable to keep headroom running in background (prior attempts: headroom.exe: \
+                     exited with status exit code: 1 before opening port 6768): exited with status \
+                     exit code: 1 before opening port 6768 (python.exe -m headroom.proxy.server \
+                     --port 6768; log: ...)\n--- log tail ---\n  File \"...\\Lib\\socket.py\", line \
+                     616, in _fallback_socketpair\n    lsock.listen()\nPermissionError: [WinError \
+                     10013] Сделана попытка доступа к сокету методом, запрещенным правами доступа\n\
+                     --- end log ---";
+        assert!(is_loopback_socket_denied_signal(chain));
+        // The Rust spelling, should the intercept or a probe ever hit it.
+        assert!(is_loopback_socket_denied_signal(
+            "bind 127.0.0.1:6767: An attempt was made to access a socket in a way forbidden by \
+             its access permissions. (os error 10013)"
+        ));
+        // Its own bucket, not the endpoint-protection one: the code does not
+        // prove which of its two causes applies, and that hint names one.
+        assert!(!is_endpoint_protection_signal(chain));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(chain)),
+            Some("startup_loopback_socket_denied")
+        );
+        assert!(is_environmental_startup_key(Some(
+            "startup_loopback_socket_denied"
+        )));
+        assert!(is_environmental_startup_key(Some(
+            "startup_endpoint_protection"
+        )));
+        assert!(!is_environmental_startup_key(Some("startup_port_conflict")));
+        assert!(!is_environmental_startup_key(None));
+
+        // Neighbouring Winsock codes are other conditions with other hints.
+        for other in [
+            "bind failed (os error 10048)",
+            "python.exe -m headroom.proxy.server exited with status exit code: 1 before \
+             opening port 6768",
+            "PermissionError: [Errno 13] Permission denied: '/tmp/x'",
+        ] {
+            assert!(!is_loopback_socket_denied_signal(other), "for: {other}");
         }
     }
 
