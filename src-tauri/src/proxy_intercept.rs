@@ -1719,14 +1719,17 @@ fn parse_response_status(head: &[u8]) -> Option<u16> {
 }
 
 /// Whether an upstream status is worth peeking the error body for a possible
-/// Sentry event. 429 (rate limit) is routine and excluded outright. 401 gets
+/// Sentry event. 429 (rate limit) is routine and excluded outright, as is 402:
+/// the provider's billing state (no credits, no payment method) is a property
+/// of the user's account, never of the request we built, and no release of
+/// ours changes it (RUST-CP: opencode 402 on /v1/chat/completions). 401 gets
 /// the peek but is only reported when the body says NO auth header was sent at
 /// all (a setup bug on our side: the 2026-09-03 Windows case, where a Codex
 /// provider block written before `codex login` omitted `requires_openai_auth`
 /// and every request 401'd invisibly) -- an invalid/expired key 401 stays
 /// unreported (RUST-46), see [`report_upstream_error`].
 fn is_reportable_upstream_error(status: &u16) -> bool {
-    *status >= 400 && *status != 429
+    *status >= 400 && !matches!(status, 402 | 429)
 }
 
 /// True when a 401 body says the request carried no credentials at all. That
@@ -1827,12 +1830,25 @@ fn report_upstream_error(
     // All values are bounded and content-free, so they stay aggregatable.
     let shape = codex_error_shape_tag(&body);
     let content_type = response_content_type(head);
+    // Default vs user-configured Anthropic upstream, never the URL itself. A
+    // relay that lacks a route answers with a bare 405 (RUST-C4: 64 empty-body
+    // 405s on /v1/messages/count_tokens from two hosts) and nothing on the
+    // event said whether api.anthropic.com or the user's relay sent it.
+    let upstream_base = if crate::upstream_override::get()
+        .configured_upstream()
+        .is_some()
+    {
+        "custom"
+    } else {
+        "default"
+    };
     sentry::with_scope(
         |scope| {
             scope.set_tag("upstream_client", client);
             scope.set_tag("upstream_status", status);
             scope.set_tag("upstream_request_path", &path);
             scope.set_tag("upstream_error_shape", &shape);
+            scope.set_tag("upstream_base", upstream_base);
             if let Some(content_type) = content_type.as_deref() {
                 scope.set_tag("upstream_response_content_type", content_type);
             }
@@ -4131,11 +4147,14 @@ mod tests {
     }
 
     #[test]
-    fn is_reportable_upstream_error_excludes_2xx_and_429() {
+    fn is_reportable_upstream_error_excludes_2xx_402_and_429() {
         assert!(is_reportable_upstream_error(&400));
         assert!(is_reportable_upstream_error(&500));
         assert!(!is_reportable_upstream_error(&200));
         assert!(!is_reportable_upstream_error(&429));
+        // RUST-CP: 402 is the user's provider billing state, not our request.
+        assert!(!is_reportable_upstream_error(&402));
+        assert!(is_reportable_upstream_error(&403));
         // 401 gets the body peek; report_upstream_error drops the
         // invalid-key kind and keeps only the missing-auth-header kind.
         assert!(is_reportable_upstream_error(&401));

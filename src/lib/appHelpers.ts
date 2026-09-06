@@ -64,6 +64,18 @@ function discountedPriceLabel(fullCents: number, percentOff: number): string {
 }
 const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3 };
 
+/// The higher-ranked of two optional tiers: the known one when only one is
+/// present, null when neither is. Used to pitch a user routing both Claude and
+/// Codex the plan that covers their bigger account.
+export function higherSubscriptionTier(
+  a: HeadroomSubscriptionTier | null | undefined,
+  b: HeadroomSubscriptionTier | null | undefined
+): HeadroomSubscriptionTier | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return TIER_RANK[b] > TIER_RANK[a] ? b : a;
+}
+
 /// Whether the billing-period tab being viewed is the one the subscriber
 /// actually bought. An unknown/absent server value means "can't tell" - treat
 /// it as a match so the active-plan chrome never vanishes on older servers.
@@ -642,7 +654,14 @@ export function getUpgradePlans(
       };
     }
 
-    const activePaidPlanId = (() => {
+    // Pitch the higher of the Claude-implied tier and the recommendation (the
+    // caller folds the Codex-implied tier into it). A user routing both clients
+    // needs the plan that covers the bigger account - the same rule as the
+    // server's recommended_headroom_tier and pricing::detect_tier_mismatch.
+    // Claude Max x20 + ChatGPT Pro Lite used to be pitched Max x5 and landed in
+    // the tier-mismatch clamp two weeks after paying. A lapsed subscriber with
+    // neither signal is pitched their last paid tier.
+    const claudePlanId = (() => {
       switch (claudePlanTier) {
         case "pro":
           return "pro" as const;
@@ -651,33 +670,24 @@ export function getUpgradePlans(
         case "max20x":
           return "max20x" as const;
         default:
-          return headroomSubscriptionTier ?? null;
+          return null;
       }
     })();
+    const pitchedPlanId =
+      higherSubscriptionTier(claudePlanId, recommendedSubscriptionTier) ??
+      headroomSubscriptionTier ??
+      null;
 
-    if (activePaidPlanId) {
+    if (pitchedPlanId) {
       const orderedPaidPlans = [
-        paidPlans[activePaidPlanId],
+        paidPlans[pitchedPlanId],
         ...(["pro", "max5x", "max20x"] as const)
-          .filter((planId) => planId !== activePaidPlanId)
+          .filter((planId) => planId !== pitchedPlanId)
           .map((planId) => paidPlans[planId])
       ];
       return {
         plans: orderedPaidPlans,
-        featuredPlanId: activePaidPlanId
-      };
-    }
-
-    if (recommendedSubscriptionTier) {
-      const orderedPaidPlans = [
-        paidPlans[recommendedSubscriptionTier],
-        ...(["pro", "max5x", "max20x"] as const)
-          .filter((planId) => planId !== recommendedSubscriptionTier)
-          .map((planId) => paidPlans[planId])
-      ];
-      return {
-        plans: orderedPaidPlans,
-        featuredPlanId: recommendedSubscriptionTier
+        featuredPlanId: pitchedPlanId
       };
     }
 

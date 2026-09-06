@@ -87,6 +87,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  higherSubscriptionTier,
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -1611,7 +1612,11 @@ export default function App() {
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
   // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
   // badge points at. A subscriber's own period overrides this once it loads.
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // Monthly by default: since the 2026-08-13 intro launch, annual-first
+  // checkouts converted 13 of 74 and monthly-first 25 of 44, and 20 of the 24
+  // lost annual starters never opened a monthly checkout. Subscribers still
+  // open on the period they bought (effect below).
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1880,7 +1885,10 @@ export default function App() {
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-    pricingStatus?.recommendedSubscriptionTier ?? cachedPricing.recommendedSubscriptionTier,
+    higherSubscriptionTier(
+      pricingStatus?.recommendedSubscriptionTier,
+      pricingStatus?.codex?.recommendedSubscriptionTier
+    ) ?? cachedPricing.recommendedSubscriptionTier,
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false,
     pricingStatus?.launchDiscountActive ?? false,
@@ -2019,7 +2027,7 @@ export default function App() {
 
   useEffect(() => {
     setShowAllUpgradePlans(false);
-    if (pricingAudience !== "individual") setBillingPeriod("annual");
+    if (pricingAudience !== "individual") setBillingPeriod("monthly");
   }, [pricingAudience]);
 
   // Open on the plan the subscriber actually has, not the monthly default:
@@ -6341,8 +6349,10 @@ export default function App() {
   })();
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
-      ? (pricingStatus?.recommendedSubscriptionTier ??
-          pricingStatus?.codex?.recommendedSubscriptionTier ??
+      ? (higherSubscriptionTier(
+          pricingStatus?.recommendedSubscriptionTier,
+          pricingStatus?.codex?.recommendedSubscriptionTier
+        ) ??
           cachedPricing.recommendedSubscriptionTier ??
           upgradePlansState.featuredPlanId)
       : "enterprise";

@@ -8698,6 +8698,9 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
             scope.set_tag("flow", "orphan_proxy_reclaimed");
             scope.set_extra("port", port.into());
             scope.set_extra("occupant_pid", pid.into());
+            // Fixed fingerprint: the pid and port in the message opened one
+            // issue per reclaim (RUST-88, RUST-CQ) for a single condition.
+            scope.set_fingerprint(Some(&["orphan_proxy_reclaimed"]));
         },
         || {
             sentry::capture_message(
