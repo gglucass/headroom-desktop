@@ -10108,10 +10108,12 @@ const LEARN_BLOCK_TITLE: &str = "## Headroom Learned Patterns";
 /// Byte range of the managed learn block (start marker inclusive, end marker
 /// exclusive) plus whether the end marker was actually present. A block with
 /// no end marker runs to the next `## ` heading (other than the block's own
-/// title) or EOF. That shape is real: on 2026-09-02 the headroom-desktop
-/// MEMORY.md lost its end marker (cause never found), every reader here
-/// treated it as "no block", and the wheel's writer - which only replaces
-/// start..end - silently wrote nothing until the marker was restored by hand.
+/// title) or EOF. That shape is real: on 2026-09-02 and 2026-09-06 the
+/// headroom-desktop MEMORY.md lost its end marker (our own `memory_scrubber`
+/// ate it along with a trailing error-recovery subsection; fixed there),
+/// every reader here treated it as "no block", and the wheel's writer - which
+/// only replaces start..end - silently wrote nothing until the marker was
+/// restored by hand. Kept as belt-and-braces for files scrubbed by older builds.
 fn headroom_learn_block_bounds(content: &str) -> Option<(usize, usize, bool)> {
     let start = content.find(LEARN_START)?;
     if let Some(rel) = content[start..].find(LEARN_END) {
