@@ -74,8 +74,10 @@ import {
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
   type SetupStallKind,
+  maybeFireUnroutedAlert,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
+import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
   authCodeSentMessage,
@@ -199,6 +201,7 @@ import type {
   LaunchFlags,
   ClaudeCodeProject,
   ClientConnectorStatus,
+  UnroutedClient,
   ClientSetupResult,
   DailySavingsPoint,
   DashboardState,
@@ -1638,6 +1641,7 @@ export default function App() {
   // record. Held in state (not rendered immediately) so the modal is waiting
   // whenever the user next opens the tray, rather than stealing focus.
   const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
+  const [unroutedClients, setUnroutedClients] = useState<UnroutedClient[] | null>(null);
   // Same signals as the modal above, but for the always-on Home banner, whose
   // default copy tells a user with zero savings to check back later.
   const [stallBannerLine, setStallBannerLine] = useState<string | null>(null);
@@ -2708,6 +2712,22 @@ export default function App() {
       // vanished). Rust throttles the scan to once per hour and skips it
       // while paused/bypassed; failures are logged there, not surfaced here.
       void invoke("repair_client_setups").catch(() => undefined);
+      // Then the case repair cannot see: an agent that ran while its config
+      // verified fine, yet nothing reached Headroom. Skipped behind the
+      // account gate, which tears connections down on purpose. Rust throttles
+      // the scan to once an hour and re-applies an enabled connection itself.
+      if (!optimizationBlockedRef.current) {
+        const unrouted = await invoke<UnroutedClient[]>("detect_unrouted_clients", {
+          appStartedAtMs: appStartedAtMsRef.current,
+        }).catch(() => [] as UnroutedClient[]);
+        if (active && unrouted.length > 0) {
+          const alert = await maybeFireUnroutedAlert(unrouted);
+          if (active && alert) {
+            setUnroutedClients(alert);
+            void refreshConnectors();
+          }
+        }
+      }
       const latest = await loadDashboard().catch(() => null);
       if (!active || !latest) {
         return;
@@ -8247,6 +8267,30 @@ export default function App() {
                     connectors
                   })
                 });
+              }}
+            />
+          )}
+
+          {unroutedClients && (
+            <ReconnectModal
+              clients={unroutedClients}
+              onClose={() => setUnroutedClients(null)}
+              onOpenSettings={() => {
+                setUnroutedClients(null);
+                setActiveView("settings");
+              }}
+              onReconnect={(client) => {
+                setUnroutedClients(null);
+                const connector = connectorsRef.current?.find(
+                  (item) => item.clientId === client.clientId
+                );
+                // Land on Settings either way: once the toggle lands, the
+                // connector row shows "Quit and reopen X if it was running
+                // when you enabled this" - the one step the button can't do.
+                setActiveView("settings");
+                if (connector) {
+                  void toggleConnector(connector, true);
+                }
               }}
             />
           )}

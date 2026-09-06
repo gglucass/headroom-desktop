@@ -1828,7 +1828,15 @@ fn report_upstream_error(
     // Tags, not extras: an extra can only be read one event at a time, so the
     // shape RUST-4V's 578 events shared was never visible from the issue view.
     // All values are bounded and content-free, so they stay aggregatable.
-    let shape = codex_error_shape_tag(&body);
+    // Anthropic's tool-search 400s stream as SSE (event: error\ndata: {...}), so
+    // codex_error_shape_tag's JSON parse yields "non-json" and the RUST-BT bucket
+    // ("claude-code 400 on /v1/messages?beta=true") can't tell a tool_reference
+    // 400 from any other. Classify by signature first so we can measure what the
+    // ENABLE_TOOL_SEARCH rollout is actually costing (the tag value is a fixed
+    // classification string, never the tool name).
+    let shape = anthropic_error_shape(&body)
+        .map(str::to_string)
+        .unwrap_or_else(|| codex_error_shape_tag(&body));
     let content_type = response_content_type(head);
     // Default vs user-configured Anthropic upstream, never the URL itself. A
     // relay that lacks a route answers with a bare 405 (RUST-C4: 64 empty-body
@@ -1971,6 +1979,24 @@ fn codex_error_shape_tag(body: &[u8]) -> String {
         Ok(json) => codex_error_body_shape(&json),
         Err(_) if body.is_empty() => "empty".to_string(),
         Err(_) => "non-json".to_string(),
+    }
+}
+
+/// Classify an Anthropic invalid_request 400 by signature, so the tool-search
+/// history 400s stop hiding inside the generic RUST-BT bucket. Substring match
+/// on the raw bytes because these stream as SSE (JSON parse fails). Returns a
+/// fixed, content-free classification (never the offending tool name), or None
+/// when the body is not one of these shapes (fall back to the codex classifier).
+fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    if contains(body, b"not found in available tools") {
+        Some("tool_reference_not_found")
+    } else if contains(body, b"All tools cannot be deferred") {
+        Some("all_tools_deferred")
+    } else {
+        None
     }
 }
 
@@ -5268,6 +5294,33 @@ mod tests {
         let tag = codex_error_shape_tag(leaky);
         assert_eq!(tag, "object{detail}");
         assert!(!tag.contains("hunter2"), "{tag}");
+    }
+
+    #[test]
+    fn anthropic_error_shape_classifies_tool_search_400s_content_free() {
+        // Streams as SSE, so it must match on the raw framed bytes.
+        let sse = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Tool reference 'mcp__headroom__headroom_compress' not found in available tools\"}}\n\n";
+        assert_eq!(
+            super::anthropic_error_shape(sse),
+            Some("tool_reference_not_found")
+        );
+        // The classification never carries the offending tool name.
+        assert!(!super::anthropic_error_shape(sse)
+            .unwrap()
+            .contains("headroom"));
+
+        let deferred = br#"{"error":{"message":"At least one tool must have defer_loading=false. All tools cannot be deferred."}}"#;
+        assert_eq!(
+            super::anthropic_error_shape(deferred),
+            Some("all_tools_deferred")
+        );
+
+        // Unrelated bodies fall through to the codex classifier.
+        assert_eq!(
+            super::anthropic_error_shape(br#"{"error":"overloaded"}"#),
+            None
+        );
+        assert_eq!(super::anthropic_error_shape(b""), None);
     }
 
     #[test]

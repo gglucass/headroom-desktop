@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -782,6 +782,106 @@ pub fn repair_client_setups() -> Vec<String> {
         }
     }
     repaired
+}
+
+/// The agent must have run this recently for its silence to mean anything.
+pub const UNROUTED_ACTIVITY_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// Headroom must have been up this long: an agent used before Headroom came
+/// back had nowhere to route, which is not a broken hookup.
+pub const UNROUTED_MIN_UPTIME: Duration = Duration::from_secs(2 * 3600);
+/// Entry cap for the artifact walk; Codex keeps years of session rollouts.
+const LOCAL_ACTIVITY_WALK_CAP: usize = 20_000;
+
+/// Newest modification time of anything under `root`, visiting at most `cap`
+/// entries. A missing or unreadable root is simply "never".
+pub(crate) fn newest_mtime_under(root: &Path, cap: usize) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > cap {
+                return newest;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if let Ok(modified) = meta.modified() {
+                if Some(modified) > newest {
+                    newest = Some(modified);
+                }
+            }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    newest
+}
+
+/// When the agent last wrote its own session artifacts on this machine:
+/// evidence it ran, independent of whether Headroom saw any of it.
+pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
+    match normalized_setup_id(client_id) {
+        "codex_cli" => {
+            let mut newest =
+                newest_mtime_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP);
+            // GUI/TUI thread store: state_<N>.sqlite and its -wal/-shm siblings.
+            for dir in codex_state_dirs() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if !entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("state_"))
+                    {
+                        continue;
+                    }
+                    if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                        if Some(modified) > newest {
+                            newest = Some(modified);
+                        }
+                    }
+                }
+            }
+            newest
+        }
+        "claude_code" => newest_mtime_under(
+            &home_dir().join(".claude").join("projects"),
+            LOCAL_ACTIVITY_WALK_CAP,
+        ),
+        _ => None,
+    }
+}
+
+/// Pure decision: the agent ran on this machine while Headroom, up the whole
+/// time, saw nothing from it. `requests_recent` is the agent's proxied request
+/// count over today and yesterday (usage_counters::requests_since_yesterday).
+pub(crate) fn client_ran_unrouted(
+    activity_at: Option<SystemTime>,
+    requests_recent: u64,
+    app_started_at: SystemTime,
+    now: SystemTime,
+) -> bool {
+    let Some(activity_at) = activity_at else {
+        return false;
+    };
+    if requests_recent > 0 {
+        return false;
+    }
+    let uptime_ok = now
+        .duration_since(app_started_at)
+        .is_ok_and(|uptime| uptime >= UNROUTED_MIN_UPTIME);
+    let recent = now
+        .duration_since(activity_at)
+        .is_ok_and(|age| age <= UNROUTED_ACTIVITY_WINDOW);
+    uptime_ok && recent && activity_at > app_started_at
 }
 
 pub fn is_claude_code_enabled() -> bool {
@@ -10773,6 +10873,52 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             rendered.contains("[model_providers.gateway]"),
             "user provider table preserved, got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn newest_mtime_under_walks_nested_dirs_and_respects_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        fs::create_dir_all(root.join("2026/09/06")).unwrap();
+        fs::write(root.join("2026/09/06/rollout.jsonl"), b"x").unwrap();
+        let newest = super::newest_mtime_under(&root, 1_000).expect("some mtime");
+        assert!(newest <= SystemTime::now());
+        assert!(super::newest_mtime_under(&root.join("missing"), 1_000).is_none());
+        // Cap of 1 visits only the first entry (the year dir) and stops.
+        assert!(super::newest_mtime_under(&root, 1).is_some());
+    }
+
+    #[test]
+    fn client_ran_unrouted_needs_fresh_activity_long_uptime_and_no_requests() {
+        let hour = std::time::Duration::from_secs(3600);
+        let now = SystemTime::now();
+        let started = now - 3 * hour;
+        let active = now - hour;
+        assert!(super::client_ran_unrouted(Some(active), 0, started, now));
+        // Headroom saw the agent: routed.
+        assert!(!super::client_ran_unrouted(Some(active), 1, started, now));
+        // Activity predates this app run: it had no proxy to reach.
+        assert!(!super::client_ran_unrouted(
+            Some(now - 4 * hour),
+            0,
+            started,
+            now
+        ));
+        // App only just came up.
+        assert!(!super::client_ran_unrouted(
+            Some(active),
+            0,
+            now - hour / 2,
+            now
+        ));
+        // Days-old activity says nothing about today's routing.
+        assert!(!super::client_ran_unrouted(
+            Some(now - 40 * hour),
+            0,
+            now - 50 * hour,
+            now
+        ));
+        assert!(!super::client_ran_unrouted(None, 0, started, now));
     }
 
     // NOTE: keep this the only test that calls repair_client_setups: the
