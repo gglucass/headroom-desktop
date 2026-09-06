@@ -6826,6 +6826,19 @@ fn execute_headroom_learn_run(
         }
     }
 
+    // Heal a start-only learn block before the wheel's writer runs: it only
+    // replaces start..end and silently writes nothing otherwise. Personal
+    // files only; the team-shared CLAUDE.md is git-tracked and never touched.
+    if let LearnAgent::Claude = agent {
+        let path = project_path.unwrap_or_default();
+        for file in [
+            Path::new(path).join("CLAUDE.local.md"),
+            crate::tool_manager::claude_project_memory_file(path),
+        ] {
+            crate::tool_manager::repair_headroom_learn_block_file(&file);
+        }
+    }
+
     let cli_path = match agent {
         LearnAgent::Claude => claude_cli::detect_claude_cli(),
         LearnAgent::Codex => client_adapters::detect_codex_cli(),

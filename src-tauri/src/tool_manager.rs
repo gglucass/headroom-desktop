@@ -9967,12 +9967,7 @@ struct HeadroomLearnMetadataCandidate {
 
 fn read_headroom_learn_metadata_from_path(path: &Path) -> Option<HeadroomLearnMetadataCandidate> {
     let content = std::fs::read_to_string(path).ok()?;
-    let start = content.find("<!-- headroom:learn:start -->")?;
-    let end = content.find("<!-- headroom:learn:end -->")?;
-    if end <= start {
-        return None;
-    }
-
+    let (start, end, _) = headroom_learn_block_bounds(&content)?;
     let block = &content[start..end];
     let pattern_count = count_headroom_learn_patterns(block);
     let learned_at = parse_headroom_learn_timestamp(block);
@@ -10031,17 +10026,104 @@ fn parse_headroom_learn_timestamp(block: &str) -> Option<DateTime<Utc>> {
     })
 }
 
+const LEARN_START: &str = "<!-- headroom:learn:start -->";
+const LEARN_END: &str = "<!-- headroom:learn:end -->";
+const LEARN_BLOCK_TITLE: &str = "## Headroom Learned Patterns";
+
+/// Byte range of the managed learn block (start marker inclusive, end marker
+/// exclusive) plus whether the end marker was actually present. A block with
+/// no end marker runs to the next `## ` heading (other than the block's own
+/// title) or EOF. That shape is real: on 2026-09-02 the headroom-desktop
+/// MEMORY.md lost its end marker (cause never found), every reader here
+/// treated it as "no block", and the wheel's writer - which only replaces
+/// start..end - silently wrote nothing until the marker was restored by hand.
+fn headroom_learn_block_bounds(content: &str) -> Option<(usize, usize, bool)> {
+    let start = content.find(LEARN_START)?;
+    if let Some(rel) = content[start..].find(LEARN_END) {
+        return Some((start, start + rel, true));
+    }
+    let mut from = start + LEARN_START.len();
+    let end = loop {
+        match content[from..].find("\n## ") {
+            None => break content.len(),
+            Some(rel) => {
+                let heading = from + rel + 1;
+                if content[heading..].starts_with(LEARN_BLOCK_TITLE) {
+                    from = heading + LEARN_BLOCK_TITLE.len();
+                    continue;
+                }
+                break heading;
+            }
+        }
+    };
+    Some((start, end, false))
+}
+
+/// Re-insert a missing end marker. `None` when the content has no block or
+/// the block is already intact, so callers can treat `Some` as "changed".
+pub fn repair_headroom_learn_block(content: &str) -> Option<String> {
+    let (_, end, has_end) = headroom_learn_block_bounds(content)?;
+    if has_end {
+        return None;
+    }
+    let head = content[..end].trim_end_matches('\n');
+    let tail = content[end..].trim_start_matches('\n');
+    let mut out = String::with_capacity(content.len() + LEARN_END.len() + 3);
+    out.push_str(head);
+    out.push('\n');
+    out.push_str(LEARN_END);
+    out.push('\n');
+    if !tail.is_empty() {
+        out.push('\n');
+        out.push_str(tail);
+    }
+    Some(out)
+}
+
+/// Heal a start-only block on disk. Runs before `headroom learn --apply` so
+/// the wheel's writer has a start..end span to replace. Warns (Sentry, via
+/// the log bridge) with the file's mtime: the 2026-09-02 loss was never
+/// dated, and the mtime plus a fleet count is what separates a code bug
+/// (many hosts) from a local hand edit (one host).
+pub fn repair_headroom_learn_block_file(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(repaired) = repair_headroom_learn_block(&content) else {
+        return false;
+    };
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|m| DateTime::<Utc>::from(m).to_rfc3339())
+        .unwrap_or_default();
+    match crate::client_adapters::atomic_write(path, repaired.as_bytes()) {
+        Ok(()) => {
+            log::warn!(
+                "learn block in {} had no end marker (file mtime {modified}, {} bytes); end marker restored",
+                path.display(),
+                content.len()
+            );
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "learn block in {} has no end marker and repair failed: {err:#}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 /// Parse sections and bullets inside the managed `<!-- headroom:learn -->`
 /// block. Returns an empty Vec if no block is present.
 pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::AppliedSection> {
     use crate::models::AppliedSection;
-    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+    let Some((start, end, _)) = headroom_learn_block_bounds(file_content) else {
         return Vec::new();
     };
-    let Some(end_rel) = file_content[start..].find("<!-- headroom:learn:end -->") else {
-        return Vec::new();
-    };
-    let block = &file_content[start..start + end_rel];
+    let block = &file_content[start..end];
 
     let mut sections: Vec<AppliedSection> = Vec::new();
     let mut current: Option<AppliedSection> = None;
@@ -10078,10 +10160,20 @@ pub fn parse_headroom_learn_block(file_content: &str) -> Vec<crate::models::Appl
 /// dropped. If the entire managed block becomes empty, the whole block
 /// including its markers is removed.
 pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_text: &str) -> String {
-    let Some(start) = file_content.find("<!-- headroom:learn:start -->") else {
+    // A start-only block (see `headroom_learn_block_bounds`) is healed first
+    // so the rewrite below always has a real end marker to anchor on.
+    let repaired;
+    let file_content: &str = match repair_headroom_learn_block(file_content) {
+        Some(fixed) => {
+            repaired = fixed;
+            &repaired
+        }
+        None => file_content,
+    };
+    let Some(start) = file_content.find(LEARN_START) else {
         return file_content.to_string();
     };
-    let end_marker = "<!-- headroom:learn:end -->";
+    let end_marker = LEARN_END;
     let Some(end_rel) = file_content[start..].find(end_marker) else {
         return file_content.to_string();
     };
@@ -12414,7 +12506,9 @@ mod tests {
         // Wraps the buffered-error seam and post-processes its Response.
         assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
         assert!(py.contains("def _hd_hint_apply(result):"));
-        assert!(py.contains("start a new session to clear this"));
+        // Assert the load-bearing marker the idempotency guard keys on, not the
+        // user-facing copy (which is free to change without breaking this test).
+        assert!(py.contains(r#"b"Headroom:" not in body"#));
     }
 
     #[test]
@@ -15181,6 +15275,73 @@ after
             "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
         let out = super::delete_applied_bullet(content, "Foo", "not-there");
         assert_eq!(out, content);
+    }
+
+    const START_ONLY: &str = "<!-- headroom:learn:start -->\n\
+## Headroom Learned Patterns\n\
+*Auto-generated by `headroom learn` on 2026-09-02 - do not edit manually*\n\
+\n\
+### Foo\n\
+- alpha\n\
+- beta\n\
+\n\
+## Manual memory index\n\
+\n\
+- [x](y.md)\n";
+
+    #[test]
+    fn learn_block_parse_tolerates_missing_end_marker() {
+        let sections = super::parse_headroom_learn_block(START_ONLY);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Foo");
+        assert_eq!(sections[0].bullets, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn learn_block_repair_inserts_end_marker_and_is_idempotent() {
+        let fixed = super::repair_headroom_learn_block(START_ONLY).expect("repaired");
+        assert!(fixed.contains("- beta\n<!-- headroom:learn:end -->\n\n## Manual memory index\n"));
+        assert!(fixed.ends_with("- [x](y.md)\n"));
+        assert_eq!(
+            super::parse_headroom_learn_block(&fixed),
+            super::parse_headroom_learn_block(START_ONLY)
+        );
+        assert!(super::repair_headroom_learn_block(&fixed).is_none());
+        // EOF case: no heading after the block.
+        let eof =
+            super::repair_headroom_learn_block("<!-- headroom:learn:start -->\n### Foo\n- a\n")
+                .expect("repaired");
+        assert_eq!(
+            eof,
+            "<!-- headroom:learn:start -->\n### Foo\n- a\n<!-- headroom:learn:end -->\n"
+        );
+        assert!(super::repair_headroom_learn_block("no block here\n").is_none());
+    }
+
+    #[test]
+    fn learn_block_delete_heals_start_only_block() {
+        let out = super::delete_applied_bullet(START_ONLY, "Foo", "alpha");
+        assert!(out.contains("<!-- headroom:learn:end -->"));
+        assert!(out.contains("## Manual memory index"));
+        let sections = super::parse_headroom_learn_block(&out);
+        assert_eq!(sections[0].bullets, vec!["beta"]);
+    }
+
+    #[test]
+    fn learn_block_repair_file_writes_once() {
+        let root = unique_temp_dir("headroom-learn-repair");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("MEMORY.md");
+        fs::write(&path, START_ONLY).expect("write");
+        assert!(super::repair_headroom_learn_block_file(&path));
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("<!-- headroom:learn:end -->"));
+        assert!(!super::repair_headroom_learn_block_file(&path));
+        assert!(!super::repair_headroom_learn_block_file(
+            &root.join("missing.md")
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

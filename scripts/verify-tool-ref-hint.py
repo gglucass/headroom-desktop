@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Functional probe for the tool-reference-400 "start a new session" hint vendor.
+"""Functional probe for the tool-reference-400 hint vendor.
 
 Run with the managed venv's python and PYTHONPATH pointing at a directory holding
 the desktop's sitecustomize.py. Exercises the transform (`_hd_hint_apply`) the
@@ -46,8 +46,10 @@ def main() -> int:
         print("FAIL hint not appended")
         return 1
     data = json.loads(ob.decode())
-    if "start a new session" not in data["error"]["message"]:
-        print("FAIL hint not inside the message:", data["error"]["message"][:120])
+    # Assert the marker landed inside the message field (valid JSON, hint in the
+    # right place) without pinning the user-facing copy.
+    if "Headroom:" not in data["error"]["message"]:
+        print("FAIL hint marker not inside the message:", data["error"]["message"][:120])
         return 1
     if out.headers.get("content-length") != str(len(ob)):
         print("FAIL content-length", out.headers.get("content-length"), "vs", len(ob))
