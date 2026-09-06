@@ -8726,8 +8726,22 @@ fn parse_pid_from_lsof_detail(detail: &str) -> Option<u32> {
 fn format_already_running_bail(port: u16) -> String {
     format!(
         "headroom proxy already running on port {port} (likely a stale process from a prior session). \
-         Run `lsof -iTCP:{port} -sTCP:LISTEN` to find and kill it, then retry."
+         Run `{}` to find and kill it, then retry.",
+        find_listener_command(port)
     )
+}
+
+/// Diagnostic the reader should actually be able to run. This string lands in
+/// Sentry titles, and `lsof` was printed unconditionally -- so every Windows
+/// report of this bail (RUST-6J, the largest Windows cluster) carried a command
+/// that does not exist there. `netstat` over `Get-NetTCPConnection` because it
+/// works from cmd.exe as well as PowerShell.
+fn find_listener_command(port: u16) -> String {
+    if cfg!(windows) {
+        format!("netstat -ano | findstr :{port}")
+    } else {
+        format!("lsof -iTCP:{port} -sTCP:LISTEN")
+    }
 }
 
 /// True when `/readyz` on the backend `port` answers with a 2xx — i.e. a
@@ -14670,6 +14684,26 @@ mod tests {
         // But the lib.rs port-conflict-failure classifier (which fingerprints
         // both shapes the same way) still catches it via its second condition.
         assert!(crate::is_port_conflict_failure(&bail));
+    }
+
+    /// The bail names a command the reader can run on THEIR platform. `lsof`
+    /// shipped to Windows users for the life of the largest Windows Sentry
+    /// cluster (RUST-6J) and is not a command there.
+    #[test]
+    fn already_running_bail_names_a_command_for_this_platform() {
+        let bail = format_already_running_bail(6768);
+        if cfg!(windows) {
+            assert!(bail.contains("netstat -ano | findstr :6768"), "got: {bail}");
+            assert!(
+                !bail.contains("lsof"),
+                "unix-only command on windows: {bail}"
+            );
+        } else {
+            assert!(bail.contains("lsof -iTCP:6768 -sTCP:LISTEN"), "got: {bail}");
+        }
+        // The prefix is what state::classify_startup_error and the Sentry
+        // fingerprints key on, so it must survive any wording change.
+        assert!(bail.starts_with("headroom proxy already running on port"));
     }
 
     #[test]
