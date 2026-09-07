@@ -1,0 +1,244 @@
+From aa1b48b27b115e6c18d3b2c8fdd33026afacbdb9 Mon Sep 17 00:00:00 2001
+From: Garm Lucassen <garm.lucassen@gmail.com>
+Date: Mon, 7 Sep 2026 20:53:25 +0000
+Subject: [PATCH] fix(stats): derive the layer-active state from effective
+ steering
+
+Review follow-up: the gate read OutputShaperSettings.enabled -- the config
+gate -- and set active before the steering level was resolved. With the shaper
+enabled and the level resolving to 0, shape_request() returns changed=False and
+emits no output_shaper:verbosity: label, so the deployment shapes nothing and
+records nothing, yet /stats still published the persisted ledger as
+active=true, method=measured, reduction_percent=20.
+
+/stats now resolves the shaper exactly as the request handlers do, passing
+steering_enabled=steering_allowed_for(config) into OutputShaperSettings and
+taking the layer active only when the resolved level is above 0. That closes
+all four ways the level reaches 0 while enabled stays true: an explicit
+HEADROOM_VERBOSITY_LEVEL=0, a learned profile of 0, an autotune controller
+that backed off to 0, and cache mode, where steering_allowed_for denies the one
+lever that writes into the prefix-cache key and outranks the explicit level.
+
+The unit tests could not have caught this: they pin _output_reduction_payload
+given a boolean, and the bug was the endpoint passing the wrong one. Added
+endpoint-level regressions that drive the real route through create_app with a
+ledger already holding a measured claim, one per zero path, plus a positive
+control so the gate cannot pass by being vacuously off. All four fail on the
+previous commit.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C3Ji21R3c2Gw3whxM18hq3
+---
+ headroom/proxy/server.py                  |  28 ++++-
+ tests/test_stats_output_reduction_gate.py | 142 ++++++++++++++++++++++
+ 2 files changed, 165 insertions(+), 5 deletions(-)
+
+diff --git a/headroom/proxy/server.py b/headroom/proxy/server.py
+index e09bd8e..e4f92ca 100644
+--- a/headroom/proxy/server.py
++++ b/headroom/proxy/server.py
+@@ -479,9 +479,12 @@ logger = logging.getLogger("headroom.proxy")
+ def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
+     """/stats payload for the output-shaping layer.
+ 
+-    A deployment whose shaper is off (rollout-blocked channel, kill switch,
+-    disabled config) is shaping nothing, so /stats must not publish the
+-    persisted ledger's estimate as this deployment's live layer: the ledger
++    A deployment whose shaper is off is shaping nothing, so /stats must not
++    publish the persisted ledger's estimate as this deployment's live layer.
++    "Off" is the caller's effective-steering answer, not just the config gate:
++    a rollout-blocked channel, a kill switch, a disabled config, and equally a
++    steering level that resolves to 0 (explicit, learned, controller, or forced
++    by cache mode) all shape nothing. The ledger
+     survives restarts and can span periods or key schemas where arms
+     accumulated unshaped traffic — which is how a rollout-blocked stable
+     install came to advertise a "measured" -147.9% output reduction it never
+@@ -4355,21 +4358,36 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
+                 OutputShaperSettings,
+                 resolve_verbosity_level,
+                 shaper_enabled_for,
++                steering_allowed_for,
+             )
+ 
+             # The active steering level enables the modelled fallback, which is
+             # what a deployment with no holdout and no learned baseline has --
+             # i.e. every fresh install, since `learn --verbosity` needs history
+             # that predates the shaper.
++            #
++            # Both inputs are resolved exactly as the request handlers resolve
++            # them (see the shaper blocks in handlers/anthropic.py and
++            # handlers/openai.py), because "is this deployment shaping?" has to
++            # be the same question in both places. `enabled` alone is not that
++            # question: it is the config gate, and steering can still resolve
++            # to level 0 underneath it -- explicitly, from a learned profile or
++            # the autotune controller, or because `steering_allowed_for` denies
++            # it in prefix-freezing cache mode. At level 0 `shape_request`
++            # returns changed=False and emits no `output_shaper:verbosity:`
++            # label, so nothing is shaped and nothing is recorded, and
++            # publishing the persisted ledger's estimate would advertise
++            # shaping this deployment is not doing.
+             _shaper_active = False
+             _olevel: int | None = None
+             try:
+                 _osettings = OutputShaperSettings.from_env(
+-                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
++                    enabled=shaper_enabled_for(getattr(proxy, "config", None)),
++                    steering_enabled=steering_allowed_for(getattr(proxy, "config", None)),
+                 )
+                 if _osettings.enabled:
+-                    _shaper_active = True
+                     _olevel = resolve_verbosity_level(_osettings)[0]
++                    _shaper_active = _olevel > 0
+             except Exception:  # pragma: no cover - defensive
+                 _shaper_active = False
+                 _olevel = None
+diff --git a/tests/test_stats_output_reduction_gate.py b/tests/test_stats_output_reduction_gate.py
+index 729f979..a6361d6 100644
+--- a/tests/test_stats_output_reduction_gate.py
++++ b/tests/test_stats_output_reduction_gate.py
+@@ -129,3 +129,145 @@ def test_ledger_written_before_the_rule_drops_its_arms_but_keeps_the_baseline():
+     assert ledger.baseline.lookup("opus|chat|m|tools")[2] == 40
+     # Round-tripping now carries the marker, so it is kept next time.
+     assert SavingsLedger.from_dict(ledger.to_dict()).baseline.lookup("opus|chat|m|tools")[2] == 40
++
++
++# ---------------------------------------------------------------------------
++# Endpoint-level regressions.
++#
++# The unit tests above pin _output_reduction_payload given a boolean. They
++# cannot catch the endpoint handing it the WRONG boolean, which is exactly what
++# happened: /stats derived "active" from OutputShaperSettings.enabled -- the
++# config gate -- and never looked at the steering level underneath it. With the
++# shaper enabled and the level resolving to 0, shape_request() returns
++# changed=False and emits no output_shaper:verbosity: label, so the deployment
++# shapes nothing and records nothing; /stats still published the persisted
++# ledger as active=true, method=measured, reduction_percent=20.
++#
++# So these drive the real route, through create_app, with a ledger already
++# holding a measured claim -- one case per way the level can reach 0.
++# ---------------------------------------------------------------------------
++
++import json  # noqa: E402
++
++import pytest  # noqa: E402
++
++fastapi = pytest.importorskip("fastapi")
++
++from fastapi.testclient import TestClient  # noqa: E402
++
++from headroom.proxy import output_savings as _output_savings  # noqa: E402
++from headroom.proxy.output_shaper import (  # noqa: E402
++    OutputShaperSettings,
++    resolve_verbosity_level,
++    shape_request,
++)
++from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
++
++
++@pytest.fixture
++def stats_layer(monkeypatch, tmp_path):
++    """GET /stats and return its output_shaping layer.
++
++    Seeds the process-wide recorder with a ledger that already carries a
++    "measured" claim, so a gate that fails open is loud: 1,000-token control
++    against 800-token treatment is a clean 20% reduction.
++    """
++
++    def _run(config: ProxyConfig) -> dict:
++        recorder = _output_savings.SavingsRecorder(tmp_path / "ledger.json", flush_every=1)
++        for _ in range(6):
++            recorder.record_from_labels(["output_shaper:control:opus|a|s|tools"], 1_000)
++            recorder.record_from_labels(
++                ["output_shaper:stratum:opus|a|s|tools", "output_shaper:verbosity:L2"], 800
++            )
++        monkeypatch.setattr(_output_savings, "_RECORDER", recorder)
++        with TestClient(create_app(config)) as client:
++            body = client.get("/stats").json()
++        return body["savings"]["by_layer"]["output_shaping"]
++
++    return _run
++
++
++@pytest.fixture(autouse=True)
++def _shaper_enabled(monkeypatch, tmp_path):
++    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
++    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
++
++
++def _config(**kw) -> ProxyConfig:
++    return ProxyConfig(
++        optimize=True,
++        cache_enabled=False,
++        rate_limit_enabled=False,
++        cost_tracking_enabled=False,
++        log_requests=False,
++        **kw,
++    )
++
++
++def _assert_shapes_nothing(config: ProxyConfig) -> None:
++    """The premise: at this configuration a request handler shapes nothing."""
++    settings = OutputShaperSettings.from_env(
++        enabled=True, steering_enabled=getattr(config, "mode", None) != "cache"
++    )
++    level, _src = resolve_verbosity_level(settings)
++    body = {"model": "claude-haiku-4-5", "system": "s", "messages": [{"role": "user", "x": 1}]}
++    assert level == 0
++    assert shape_request(body, settings, level_override=level).changed is False
++
++
++def _assert_claims_nothing(layer: dict) -> None:
++    assert layer["active"] is False
++    assert layer["method"] == "inactive"
++    assert layer["tokens_saved"] == 0
++    assert layer["reduction_percent"] == 0.0
++    assert layer["requests"] == 0
++
++
++def test_stats_publishes_nothing_at_an_explicit_zero_level(monkeypatch, stats_layer):
++    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "0")
++    config = _config()
++    _assert_shapes_nothing(config)
++    _assert_claims_nothing(stats_layer(config))
++
++
++def test_stats_publishes_nothing_at_a_learned_zero_level(tmp_path, stats_layer):
++    # `learn --verbosity` can land on 0 for a user whose responses are already
++    # terse. Nothing in the environment says so; only the profile does.
++    (tmp_path / "verbosity.json").write_text(json.dumps({"verbosity_level": 0}))
++    config = _config()
++    _assert_shapes_nothing(config)
++    _assert_claims_nothing(stats_layer(config))
++
++
++def test_stats_publishes_nothing_at_a_controller_zero_level(monkeypatch, tmp_path, stats_layer):
++    # The AIMD controller can back off to 0 on its own, at runtime, long after
++    # the config that /stats reads was resolved.
++    monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
++    (tmp_path / "verbosity_controller.json").write_text(json.dumps({"level": 0}))
++    config = _config()
++    _assert_shapes_nothing(config)
++    _assert_claims_nothing(stats_layer(config))
++
++
++def test_stats_publishes_nothing_in_cache_mode_with_an_existing_ledger(monkeypatch, stats_layer):
++    # mode="cache" freezes the prefix, so steering_allowed_for() denies the one
++    # lever that writes into the cache key and resolve_verbosity_level() returns
++    # (0, "cache_mode") -- outranking the explicit level set here. /stats must
++    # consult the same restriction the handlers do, or a cache-mode install
++    # republishes a ledger accumulated before the switch.
++    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
++    config = _config(mode="cache")
++    _assert_shapes_nothing(config)
++    _assert_claims_nothing(stats_layer(config))
++
++
++def test_stats_still_publishes_when_the_shaper_is_really_shaping(monkeypatch, stats_layer):
++    """The gate must not be vacuously off -- an active deployment reports."""
++    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
++    layer = stats_layer(_config())
++    assert layer["active"] is True
++    assert layer["available"] is True
++    assert layer["method"] == "measured"
++    assert layer["reduction_percent"] == pytest.approx(20.0)
++    assert layer["requests"] == 6

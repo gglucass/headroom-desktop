@@ -1,0 +1,408 @@
+From d1d6a47c223875ed031e723365e8d58a3a281705 Mon Sep 17 00:00:00 2001
+From: Garm Lucassen <garm.lucassen@gmail.com>
+Date: Mon, 7 Sep 2026 20:49:18 +0000
+Subject: [PATCH] fix(output-savings): measure only provenance-qualified
+ observations
+
+Review follow-up: the cluster gate was a per-stratum admission test, so the
+five conversations that cleared it also admitted every legacy request already
+sitting in that stratum's mean and variance. Loading an old stratum of 2,500
+unattributed requests per arm and then recording five matched conversations
+per arm flipped the estimate from None to "measured -99.80% over 2,505
+treatment requests", while the labelled conversations underneath showed no
+difference at all.
+
+Split each arm accumulator into two views instead of gating one. The totals
+(n/sum/sumsq) keep every observation and keep feeding the estimated tier,
+which is reported as an estimate and never claimed to be causal. A separate
+`qualified` sub-accumulator holds only observations that arrived with a
+conversation label, carries the cluster set, and is the only view
+estimate_from_holdout reads.
+
+That makes provenance structural rather than a check: unattributed traffic has
+nowhere to land in the measured path, so it cannot ride in behind a stratum
+that later qualifies, and it cannot be added to one that already has. Clusters
+are now counted over exactly the observations whose mean and variance they
+vouch for. Ledgers written before provenance existed deserialize with
+qualified=None and stay out of the measured estimate permanently, since their
+sums cannot be split after the fact.
+
+Covers the upgrade path end to end: legacy load reaching the five-conversation
+threshold, unlabelled traffic arriving after a stratum qualifies, save/load of
+a mixed ledger, the same path through the live label channel, and merge.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C3Ji21R3c2Gw3whxM18hq3
+---
+ headroom/proxy/output_savings.py | 107 +++++++++++++++++----
+ tests/test_output_savings.py     | 158 ++++++++++++++++++++++++++++++-
+ 2 files changed, 241 insertions(+), 24 deletions(-)
+
+diff --git a/headroom/proxy/output_savings.py b/headroom/proxy/output_savings.py
+index 4c82b1a..91e1c2e 100644
+--- a/headroom/proxy/output_savings.py
++++ b/headroom/proxy/output_savings.py
+@@ -93,28 +93,64 @@ _CLUSTER_CAP = 32
+ 
+ @dataclass
+ class _Accum:
+-    """Running count / sum / sum-of-squares for online mean & variance."""
++    """Running count / sum / sum-of-squares for online mean & variance.
++
++    Two views live in one accumulator. ``n`` / ``sum`` / ``sumsq`` are the
++    TOTALS: every observation this arm ever recorded, including requests
++    carrying no conversation provenance -- a ledger written before
++    conversation labels existed, or a client path that has not adopted them.
++    Totals keep feeding the estimated (synthetic-control) tier, which is
++    reported as an estimate and never claimed to be causal.
++
++    :attr:`qualified` is the subset of those observations that arrived WITH a
++    conversation label, and it is the only view
++    :meth:`SavingsLedger.estimate_from_holdout` reads. Keeping it a separate
++    accumulator rather than a flag on the totals is what makes provenance
++    structural: unattributed traffic has nowhere to land in the measured path,
++    so it cannot ride into an estimate on the back of a stratum that later
++    qualifies, and the cluster count is always counted over exactly the
++    observations whose mean and variance it is vouching for.
++    """
+ 
+     n: int = 0
+     sum: float = 0.0
+     sumsq: float = 0.0
+     #: Distinct conversation ids behind ``n``, capped at ``_CLUSTER_CAP``.
++    #: Only ever populated on a :attr:`qualified` accumulator.
+     clusters: set[str] = field(default_factory=set)
++    #: Provenance-qualified subset, created on the first labelled observation.
++    #: ``None`` means nothing here is attributable to a conversation, which is
++    #: the permanent state of every accumulator loaded from a pre-upgrade
++    #: ledger: those sums cannot be split after the fact.
++    qualified: _Accum | None = None
+ 
+-    def add(self, x: float, cluster: str | None = None) -> None:
++    def _observe(self, x: float) -> None:
+         self.n += 1
+         self.sum += x
+         self.sumsq += x * x
+-        if cluster is not None and len(self.clusters) < _CLUSTER_CAP:
+-            self.clusters.add(cluster)
++
++    def add(self, x: float, cluster: str | None = None) -> None:
++        self._observe(x)
++        if cluster is None:
++            # Totals only. An observation we cannot attribute to a
++            # conversation is not evidence about a conversation, so it never
++            # reaches the measured estimate -- not even in a stratum whose
++            # labelled traffic has already cleared the gate.
++            return
++        q = self.qualified
++        if q is None:
++            q = self.qualified = _Accum()
++        q._observe(x)
++        if len(q.clusters) < _CLUSTER_CAP:
++            q.clusters.add(cluster)
+ 
+     @property
+     def n_clusters(self) -> int:
+         """Distinct conversations observed, saturating at ``_CLUSTER_CAP``.
+ 
+-        0 for an accumulator written before conversations were tracked, which
+-        is why that data cannot clear :data:`MEASURED_MIN_CLUSTERS`: an
+-        unverifiable arm is treated as an unqualified one.
++        0 on a totals accumulator, whose observations are not attributed;
++        :meth:`SavingsLedger.estimate_from_holdout` reads it on the
++        :attr:`qualified` view, where every observation carried a label.
+         """
+         return len(self.clusters)
+ 
+@@ -134,18 +170,28 @@ class _Accum:
+ 
+         n / sum / sumsq are additive, so merging is element-wise addition and
+         is exactly equivalent to having ``add``-ed both observation streams.
++        The qualified subset merges the same way and only into itself, so a
++        merge cannot launder unattributed observations into the measured view.
+         """
+         self.n += other.n
+         self.sum += other.sum
+         self.sumsq += other.sumsq
+-        self.clusters |= set(list(other.clusters)[: _CLUSTER_CAP - len(self.clusters)])
++        room = max(0, _CLUSTER_CAP - len(self.clusters))
++        self.clusters |= set(sorted(other.clusters)[:room])
++        if other.qualified is not None:
++            if self.qualified is None:
++                self.qualified = _Accum()
++            self.qualified.merge(other.qualified)
+ 
+     def to_dict(self) -> dict[str, Any]:
+         d: dict[str, Any] = {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
+-        # Omitted when empty so a baseline model (which has no conversations to
+-        # track) serializes exactly as it did before.
++        # Both keys are omitted when there is nothing to say, so a baseline
++        # model (no conversations, no qualified subset) serializes exactly as
++        # it did before.
+         if self.clusters:
+             d["clusters"] = sorted(self.clusters)
++        if self.qualified is not None:
++            d["qualified"] = self.qualified.to_dict()
+         return d
+ 
+     @classmethod
+@@ -155,6 +201,12 @@ class _Accum:
+         a.sum = float(d.get("sum", 0.0))
+         a.sumsq = float(d.get("sumsq", 0.0))
+         a.clusters = {str(c) for c in (d.get("clusters") or ())}
++        # Absent on every ledger written before provenance was recorded. That
++        # arm keeps its totals for the estimated tier and stays out of the
++        # measured one until it re-accumulates labelled traffic of its own.
++        q = d.get("qualified")
++        if isinstance(q, dict):
++            a.qualified = cls.from_dict(q)
+         return a
+ 
+ 
+@@ -347,11 +399,21 @@ class SavingsLedger:
+     def estimate_from_holdout(self) -> SavingsEstimate | None:
+         """A/B measurement: per-stratum control mean minus treatment mean.
+ 
+-        Only strata with data in BOTH arms contribute, and only once both
+-        arms hold :data:`MEASURED_MIN_CLUSTERS` distinct conversations.
+-        Returns ``None`` if no such stratum exists (no holdout traffic yet, or
+-        none of it spread across enough conversations). Weighted by treatment
+-        volume; this is the unbiased causal number.
++        Reads ONLY the provenance-qualified subset of each arm
++        (:attr:`_Accum.qualified`) -- the observations that arrived carrying a
++        conversation label. Totals are deliberately not consulted here: an arm
++        can hold requests recorded before conversations were tracked, and
++        folding those into a stratum that five fresh conversations have just
++        qualified reports their contamination as a measurement (a legacy
++        stratum of 2,500 unattributed requests per arm flipped this estimate
++        from ``None`` to a "measured" -99.8% that way, while the labelled
++        conversations underneath showed no difference at all).
++
++        A stratum contributes once BOTH qualified arms hold
++        :data:`MEASURED_MIN_CLUSTERS` distinct conversations. Returns ``None``
++        if no stratum qualifies (no holdout traffic yet, or none of it spread
++        across enough conversations). Weighted by treatment volume; this is
++        the unbiased causal number.
+ 
+         The cluster gate is not a sample-size nicety. Assignment is
+         conversation-stable, so the requests inside one conversation are one
+@@ -366,9 +428,12 @@ class SavingsLedger:
+         var = 0.0
+         n_requests = 0
+         contributing = 0
+-        for key, t in self.treatment.items():
+-            c = self.control.get(key)
+-            if c is None or c.n == 0 or t.n == 0:
++        for key, t_all in self.treatment.items():
++            c_all = self.control.get(key)
++            if c_all is None:
++                continue
++            t, c = t_all.qualified, c_all.qualified
++            if t is None or c is None or c.n == 0 or t.n == 0:
+                 continue
+             if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
+                 continue
+@@ -554,8 +619,10 @@ class SavingsRecorder:
+         The conversation label may sit either side of the stratum label, so the
+         labels are scanned once for both before recording. A request that
+         carries no conversation label (an older client, or a path that has not
+-        adopted it) still records its output tokens; it just does not advance
+-        the stratum's cluster count.
++        adopted it) still records its output tokens into the arm's totals, so
++        the estimated tier keeps counting it -- but with no conversation to
++        attribute it to it stays out of the provenance-qualified subset, and
++        so out of the measured estimate entirely.
+         """
+         arm_key: tuple[str, str] | None = None
+         conversation: str | None = None
+diff --git a/tests/test_output_savings.py b/tests/test_output_savings.py
+index e452f09..c96fcfe 100644
+--- a/tests/test_output_savings.py
++++ b/tests/test_output_savings.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import json
++
+ import pytest
+ 
+ from headroom.proxy.output_savings import (
+@@ -9,6 +11,7 @@ from headroom.proxy.output_savings import (
+     BaselineModel,
+     SavingsLedger,
+     SavingsRecorder,
++    _Accum,
+     assign_arm,
+     conversation_key_from_body,
+     conversation_label,
+@@ -384,9 +387,12 @@ class TestHoldoutClusterGate:
+         for i in range(500):
+             ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+         # Bounded: the count is only ever compared against a threshold, so the
+-        # ledger does not grow a set entry per conversation forever.
+-        assert ledger.treatment["opus|a|s|tools"].n_clusters <= 32
+-        assert ledger.treatment["opus|a|s|tools"].n_clusters >= MEASURED_MIN_CLUSTERS
++        # ledger does not grow a set entry per conversation forever. Clusters
++        # live on the qualified subset, which is where the gate reads them.
++        qualified = ledger.treatment["opus|a|s|tools"].qualified
++        assert qualified is not None
++        assert qualified.n_clusters <= 32
++        assert qualified.n_clusters >= MEASURED_MIN_CLUSTERS
+ 
+     def test_conversation_survives_a_save_load_cycle(self, tmp_path):
+         ledger = SavingsLedger()
+@@ -419,8 +425,152 @@ class TestHoldoutClusterGate:
+         recorder = SavingsRecorder(tmp_path / "savings.json", flush_every=1)
+         assert recorder.record_from_labels([stratum_label("treatment", "opus|a|s|tools")], 800)
+         ledger = SavingsLedger.load(tmp_path / "savings.json")
++        # Counted in the totals (the estimated tier keeps it) but attributed to
++        # no conversation, so it never reaches the measured view.
+         assert ledger.treatment["opus|a|s|tools"].n == 1
+-        assert ledger.treatment["opus|a|s|tools"].n_clusters == 0
++        assert ledger.treatment["opus|a|s|tools"].qualified is None
++
++
++class TestMeasuredProvenanceQuarantine:
++    """Only observations we can attribute to a conversation may be measured.
++
++    The cluster gate alone is not enough. An arm's totals can hold requests
++    recorded before conversation labels existed, and the gate is a per-stratum
++    admission test: once five fresh conversations clear it, every legacy
++    request already sitting in that stratum's mean and variance rides in with
++    them. That is not a thin-sample problem, it is a provenance problem -- so
++    the qualified observations are accumulated separately and the measured
++    estimate reads nothing else.
++    """
++
++    #: One stratum's arms as a pre-upgrade ledger wrote them: request totals,
++    #: no conversation anywhere. Treatment output is double control's, so any
++    #: leak into the measured view is loud.
++    @staticmethod
++    def _legacy_dict(n=2_500, treat_tokens=1_000.0, control_tokens=500.0):
++        return {
++            "baseline": {"strata": {}},
++            "treatment": {"s": {"n": n, "sum": n * treat_tokens, "sumsq": n * treat_tokens**2}},
++            "control": {"s": {"n": n, "sum": n * control_tokens, "sumsq": n * control_tokens**2}},
++        }
++
++    @staticmethod
++    def _add_matched_conversations(ledger, count=MEASURED_MIN_CLUSTERS, tokens=500):
++        """``count`` conversations per arm, both arms identical: no real effect."""
++        for i in range(count):
++            ledger.record("treatment", "s", tokens, f"t{i}")
++            ledger.record("control", "s", tokens, f"c{i}")
++
++    def test_legacy_arms_alone_never_qualify(self):
++        assert SavingsLedger.from_dict(self._legacy_dict()).estimate_from_holdout() is None
++
++    def test_new_conversations_do_not_drag_legacy_totals_into_the_measurement(self):
++        """The reported regression, end to end.
++
++        Five labelled conversations an arm, showing no difference at all, used
++        to admit 2,500 unattributed legacy requests an arm and report
++        "measured -99.8% over 2,505 treatment requests".
++        """
++        ledger = SavingsLedger.from_dict(self._legacy_dict())
++        self._add_matched_conversations(ledger)
++
++        est = ledger.estimate_from_holdout()
++        assert est is not None, "the labelled conversations themselves do qualify"
++        assert est.kind == "measured"
++        # The labelled conversations are identical across arms, so the honest
++        # answer is zero -- not the -99.8% the legacy totals would produce.
++        assert est.pct == pytest.approx(0.0)
++        assert est.n_requests == MEASURED_MIN_CLUSTERS
++
++    def test_legacy_totals_are_preserved_for_the_estimated_tier(self):
++        """Quarantined from the measured number, not discarded."""
++        ledger = SavingsLedger.from_dict(self._legacy_dict())
++        self._add_matched_conversations(ledger)
++
++        arm = ledger.treatment["s"]
++        assert arm.n == 2_500 + MEASURED_MIN_CLUSTERS
++        assert arm.qualified is not None and arm.qualified.n == MEASURED_MIN_CLUSTERS
++
++        # And they still reach the estimated tier, which reads the totals.
++        for _ in range(40):
++            ledger.baseline.observe("s", 1_400.0)
++        estimated = ledger.estimate_from_baseline()
++        assert estimated.kind == "estimated"
++        assert estimated.n_requests == 2_500 + MEASURED_MIN_CLUSTERS
++
++    def test_unlabelled_traffic_cannot_join_an_already_qualified_stratum(self):
++        """The other direction: qualify first, then send unattributed traffic."""
++        ledger = SavingsLedger()
++        self._add_matched_conversations(ledger)
++        before = ledger.estimate_from_holdout()
++        assert before is not None
++
++        for _ in range(1_000):
++            ledger.record("treatment", "s", 99_999)
++
++        after = ledger.estimate_from_holdout()
++        assert after is not None
++        assert after.pct == pytest.approx(before.pct)
++        assert after.n_requests == before.n_requests
++        assert ledger.treatment["s"].n == MEASURED_MIN_CLUSTERS + 1_000, "totals still counted"
++
++    def test_the_split_survives_save_and_load(self, tmp_path):
++        """An upgraded ledger flushed and reloaded must not re-merge the arms."""
++        ledger = SavingsLedger.from_dict(self._legacy_dict())
++        self._add_matched_conversations(ledger)
++        path = tmp_path / "savings.json"
++        ledger.save(path)
++
++        reloaded = SavingsLedger.load(path)
++        est = reloaded.estimate_from_holdout()
++        assert est is not None
++        assert est.pct == pytest.approx(0.0)
++        assert est.n_requests == MEASURED_MIN_CLUSTERS
++        assert reloaded.treatment["s"].n == 2_500 + MEASURED_MIN_CLUSTERS
++
++    def test_a_legacy_ledger_on_disk_stays_unqualified_forever(self, tmp_path):
++        """Round-tripping legacy arms must not invent provenance for them."""
++        path = tmp_path / "savings.json"
++        path.write_text(json.dumps(self._legacy_dict()))
++
++        reloaded = SavingsLedger.load(path)
++        assert reloaded.treatment["s"].qualified is None
++        reloaded.save(path)
++        assert SavingsLedger.load(path).estimate_from_holdout() is None
++
++    def test_recorder_upgrade_path_reaches_the_threshold_cleanly(self, tmp_path):
++        """Same story through the live label channel rather than the ledger API."""
++        path = tmp_path / "savings.json"
++        path.write_text(json.dumps(self._legacy_dict()))
++        recorder = SavingsRecorder(path, flush_every=1)
++
++        for i in range(MEASURED_MIN_CLUSTERS):
++            for arm in ("treatment", "control"):
++                assert recorder.record_from_labels(
++                    [stratum_label(arm, "s"), conversation_label(f"{arm}{i}")], 500
++                )
++        # An old client on the same stratum, still sending no conversation.
++        assert recorder.record_from_labels([stratum_label("treatment", "s")], 99_999)
++
++        est = SavingsLedger.load(path).estimate_from_holdout()
++        assert est is not None
++        assert est.pct == pytest.approx(0.0)
++        assert est.n_requests == MEASURED_MIN_CLUSTERS
++
++    def test_merge_keeps_the_two_views_apart(self):
++        """``merge`` is how the offline baseline folds accumulators together."""
++        legacy = _Accum()
++        for _ in range(100):
++            legacy.add(1_000.0)
++        labelled = _Accum()
++        for i in range(3):
++            labelled.add(500.0, f"c{i}")
++
++        legacy.merge(labelled)
++        assert legacy.n == 103
++        assert legacy.qualified is not None
++        assert legacy.qualified.n == 3, "only the labelled observations carry over"
++        assert legacy.qualified.n_clusters == 3
+ 
+ 
+ # ---------------------------------------------------------------------------
