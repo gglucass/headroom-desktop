@@ -849,6 +849,38 @@ pub(crate) fn newest_mtime_under(root: &Path, cap: usize) -> Option<SystemTime> 
     newest
 }
 
+/// Newest Claude Code transcript, `<projects_root>/<project>/*.jsonl`: the
+/// one artifact only a running session writes. The whole-tree walk this
+/// replaced also counted `<project>/memory/MEMORY.md`, which Headroom's own
+/// learn writer, memory scrubber and end-marker repair touch -- so a launch
+/// that wrote one read as "Claude Code ran", and a machine that had not used
+/// it through the proxy for two days fired the unrouted alert hourly
+/// (RUST-2K: five hosts in the first day of 0.9.10).
+pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut visited = 0usize;
+    for project in std::fs::read_dir(projects_root).ok()?.flatten() {
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > LOCAL_ACTIVITY_WALK_CAP {
+                return newest;
+            }
+            if !entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                continue;
+            }
+            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                if Some(modified) > newest {
+                    newest = Some(modified);
+                }
+            }
+        }
+    }
+    newest
+}
+
 /// When the agent last wrote its own session artifacts on this machine:
 /// evidence it ran, independent of whether Headroom saw any of it.
 pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
@@ -856,20 +888,27 @@ pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
         "codex_cli" => {
             let mut newest =
                 newest_mtime_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP);
-            // GUI/TUI thread store: state_<N>.sqlite and its -wal/-shm siblings.
+            // GUI/TUI thread store: state_<N>.sqlite and its -wal. Not the -shm
+            // (touched by idle readers, e.g. a backgrounded Codex GUI), and not
+            // anything at or before Headroom's own provider retag: that rewrites
+            // the store on every launch and connect, and read as "Codex ran"
+            // it false-fired the unrouted alert on machines that never ran it.
+            let own_write = last_codex_retag_at().map(|at| at + Duration::from_secs(2));
             for dir in codex_state_dirs() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
                     continue;
                 };
                 for entry in entries.flatten() {
-                    if !entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with("state_"))
-                    {
+                    if !entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with("state_")
+                            && (name.ends_with(".sqlite") || name.ends_with(".sqlite-wal"))
+                    }) {
                         continue;
                     }
                     if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                        if own_write.is_some_and(|until| modified <= until) {
+                            continue;
+                        }
                         if Some(modified) > newest {
                             newest = Some(modified);
                         }
@@ -878,10 +917,9 @@ pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
             }
             newest
         }
-        "claude_code" => newest_mtime_under(
-            &home_dir().join(".claude").join("projects"),
-            LOCAL_ACTIVITY_WALK_CAP,
-        ),
+        "claude_code" => {
+            newest_claude_transcript_mtime(&home_dir().join(".claude").join("projects"))
+        }
         _ => None,
     }
 }
@@ -3363,6 +3401,14 @@ fn discover_codex_state_dbs() -> Vec<PathBuf> {
     out
 }
 
+/// When this process last rewrote the Codex thread store, so
+/// `client_local_activity_at` does not mistake our write for Codex running.
+static LAST_CODEX_RETAG: std::sync::Mutex<Option<SystemTime>> = std::sync::Mutex::new(None);
+
+fn last_codex_retag_at() -> Option<SystemTime> {
+    *LAST_CODEX_RETAG.lock().unwrap()
+}
+
 /// Best-effort retag of Codex thread provider tags so the history menu stays
 /// whole across the Headroom proxy boundary. Never fails the caller: a missing
 /// store, a missing `threads` table, or a DB locked by a running Codex is logged
@@ -3397,6 +3443,7 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
             }
         }
     }
+    *LAST_CODEX_RETAG.lock().unwrap() = Some(SystemTime::now());
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
     // the table itself (discovery already survives a file rename). Only flag when
     // the store-shaped name is present, so a clean or CLI-only / pre-sqlite
@@ -10951,6 +10998,19 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn newest_claude_transcript_mtime_ignores_headroom_written_memory_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("-Users-x-repo");
+        fs::create_dir_all(project.join("memory")).unwrap();
+        // Only Headroom's learn output exists: that is not Claude Code activity.
+        fs::write(project.join("memory").join("MEMORY.md"), b"x").unwrap();
+        assert!(super::newest_claude_transcript_mtime(tmp.path()).is_none());
+        fs::write(project.join("session.jsonl"), b"x").unwrap();
+        assert!(super::newest_claude_transcript_mtime(tmp.path()).is_some());
+        assert!(super::newest_claude_transcript_mtime(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
     fn client_ran_unrouted_needs_fresh_activity_long_uptime_and_no_requests() {
         let hour = std::time::Duration::from_secs(3600);
         let now = SystemTime::now();
@@ -11599,6 +11659,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "openai"), 0);
         // Third-party threads are untouched.
         assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_activity_ignores_headrooms_own_retag_write() {
+        // Every launch retags the thread store; that write must not read as
+        // "Codex ran" or the unrouted alert fires on machines that never ran it.
+        let home = TestHome::new();
+        let db = home.path().join(".codex").join("state_5.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        seed_codex_threads_db(&db, &[("a", "openai")]);
+
+        retag_codex_threads_to_headroom();
+        assert_eq!(super::client_local_activity_at("codex"), None);
+
+        // Codex itself writing the store afterwards does count.
+        std::fs::File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(super::client_local_activity_at("codex").is_some());
     }
 
     #[test]
