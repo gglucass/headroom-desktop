@@ -6857,7 +6857,7 @@ pub(crate) fn home_dir() -> PathBuf {
 /// proxy: honor `$CODEX_HOME` when set, else `~/.codex`. Staying in sync with
 /// the proxy matters — if the two layers disagree on where Codex lives, the
 /// provider retag rewrites a different store than the config it edited.
-fn codex_home() -> PathBuf {
+pub(crate) fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -6892,6 +6892,29 @@ pub(crate) fn claude_desktop_installed() -> bool {
         candidates.push(PathBuf::from(base).join("AnthropicClaude"));
     }
     candidates.iter().any(|path| path.exists())
+}
+
+/// Which Claude-Desktop bucket this machine is in, for the identity payload.
+/// `absent` | `only` (the app and nothing we can route) | `with_agent`.
+///
+/// The `only` bucket cannot be served at all -- its bundled Claude Code pins
+/// provider routing to the host -- so an activation funnel that counts it as a
+/// drop-off is measuring a user we were never able to reach. `with_agent`
+/// separates the other invisible case: a routable client is installed and
+/// configured, but the user only ever prompts inside the app, which today
+/// looks identical to "installed it and lost interest".
+///
+/// `detect_clients` only runs when the app is present, so the common answer
+/// costs three `exists()` calls.
+pub(crate) fn claude_desktop_verdict() -> &'static str {
+    if !claude_desktop_installed() {
+        return "absent";
+    }
+    if detect_clients().iter().any(|client| client.installed) {
+        "with_agent"
+    } else {
+        "only"
+    }
 }
 
 fn detect_claude_code_client(configured: bool) -> ClientStatus {

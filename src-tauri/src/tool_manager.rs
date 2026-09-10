@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -4587,6 +4588,40 @@ impl ToolManager {
                         }
                     }
                 }
+
+                // Same shape, our own wheel: an interrupted install leaves
+                // site-packages with `headroom` but not all of its submodules,
+                // and every later launch dies on the same import (RUST-CY).
+                // Force-reinstall the version the receipt says should be there
+                // -- not the pinned one, which would silently undo a rollback.
+                // Once per process: the tray retries a failed start every ~20s
+                // (three attempts in 65s in the RUST-C8 report), and a pip run
+                // per retry would pile force-reinstalls on top of each other.
+                // A repair that did not take will not take on the next poll
+                // either; the next app launch gets a fresh attempt.
+                if !WHEEL_REPAIR_ATTEMPTED.swap(true, Ordering::AcqRel)
+                    && failures
+                        .iter()
+                        .any(|f| crate::is_missing_headroom_module_signal(&f.log_tail))
+                {
+                    let version = self
+                        .installed_headroom_version()
+                        .unwrap_or_else(|| HEADROOM_PINNED_VERSION.to_string());
+                    log::warn!(
+                        "headroom proxy failed on a missing headroom module; \
+                         reinstalling headroom-ai=={version} and retrying"
+                    );
+                    match self.pip_force_reinstall_headroom_version(&version) {
+                        Ok(()) => {
+                            log::warn!("headroom wheel repair succeeded; retrying startup");
+                            allow_repair = false;
+                            continue 'attempt;
+                        }
+                        Err(repair_err) => {
+                            log::error!("headroom wheel repair failed: {repair_err:#}");
+                        }
+                    }
+                }
             }
 
             // Report the variant that actually captured a log tail (a traceback)
@@ -8411,7 +8446,10 @@ impl ToolManager {
                     None => err,
                 })?;
         }
-        if !host.plugin_present(plugin) {
+        // Only a registry we can read may declare failure: when it is absent or
+        // relocated we cannot tell, and failing a CLI that exited 0 turns a
+        // working install into a hard error (RUST-DQ, same shape as RUST-EV).
+        if host.plugin_registration(plugin) == Some(false) {
             bail!("install completed but the plugin was not registered");
         }
         Ok(())
@@ -8651,9 +8689,17 @@ impl PluginHost {
     }
 
     fn plugin_present(self, plugin: &PluginAddon) -> bool {
+        self.plugin_registration(plugin) == Some(true)
+    }
+
+    /// `None` when the host's registry cannot be read at all -- absent,
+    /// relocated ($CODEX_HOME, a redirected home), or a shape we do not know.
+    /// "not registered" and "cannot tell" are different answers and only the
+    /// first one means the install failed (RUST-DQ).
+    fn plugin_registration(self, plugin: &PluginAddon) -> Option<bool> {
         match self {
-            PluginHost::ClaudeCode => claude_plugin_present(plugin),
-            PluginHost::Codex => codex_plugin_present(plugin),
+            PluginHost::ClaudeCode => claude_plugin_registration(plugin),
+            PluginHost::Codex => codex_plugin_registration(plugin),
         }
     }
 }
@@ -8673,26 +8719,29 @@ pub(crate) fn claude_installed_plugins() -> Option<Value> {
 /// Claude Code records installs in `~/.claude/plugins/installed_plugins.json`
 /// under `plugins["<plugin>@<marketplace>"]` as a non-empty array of install
 /// records.
-fn claude_plugin_present(plugin: &PluginAddon) -> bool {
-    claude_installed_plugins()
-        .and_then(|v| v.get("plugins")?.get(plugin.plugin_ref).cloned())
-        .and_then(|entry| entry.as_array().map(|installs| !installs.is_empty()))
-        .unwrap_or(false)
+fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
+    let plugins = claude_installed_plugins()?;
+    let entries = plugins.get("plugins")?;
+    Some(
+        entries
+            .get(plugin.plugin_ref)
+            .and_then(|entry| entry.as_array())
+            .is_some_and(|installs| !installs.is_empty()),
+    )
 }
 
-/// Codex records installs in `~/.codex/config.toml` under a
+/// Codex records installs in `$CODEX_HOME/config.toml` under a
 /// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
 /// quoted, so a header substring match is reliable and avoids a TOML parse
 /// dependency (matching how client_adapters edits this file).
-fn codex_plugin_present(plugin: &PluginAddon) -> bool {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
+fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
+    // `client_adapters::codex_home()`, not `dirs::home_dir().join(".codex")`:
+    // Codex honors $CODEX_HOME, and on Windows the dirs crate reads the profile
+    // known folder and ignores a redirected $HOME.
+    let text =
+        std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
-    text.lines().any(|line| line.trim_start() == header)
+    Some(text.lines().any(|line| line.trim_start() == header))
 }
 
 /// One serena tool application logs exactly one line containing this marker
@@ -12611,6 +12660,17 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("errno 13")
     {
         "permission"
+    } else if lower.contains("was not registered") {
+        // Ours, not the CLI's: the CLI exited 0 but its registry never gained
+        // the plugin.
+        "not-registered"
+    } else if lower.contains("cannot find the file specified")
+        || lower.contains("no such file or directory")
+        || lower.contains("(os error 2)")
+    {
+        // The host CLI lost a file of its own mid-install (RUST-DQ: Codex
+        // `plugin add` failing "failed to copy plugin file" on Windows).
+        "host-file-missing"
     } else {
         "other"
     }
@@ -13101,6 +13161,10 @@ fn looks_like_corrupt_venv_error(err: &anyhow::Error) -> bool {
     stderr.contains("ModuleNotFoundError") || stderr.contains("ImportError")
 }
 
+/// Set the first time the startup path reinstalls the headroom wheel to repair
+/// a torn install, so the retry-driven start path cannot run pip repeatedly.
+static WHEEL_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
 /// Structured error emitted when the headroom proxy subprocess fails to open
 /// its port. Capture sites downcast to pull the log tail into Sentry `extra`
 /// fields, which are not subject to the 8KB message cap.
@@ -13189,7 +13253,7 @@ mod tests {
         looks_like_corrupt_venv_error, occupant_image, parse_lsof_listener,
         parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
         parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
-        pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        pinned_headroom_release, pip_failure_category, pip_line_to_progress, plugin_addon,
         plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
         proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
@@ -13198,11 +13262,11 @@ mod tests {
         savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PluginHost, PortState,
+        ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -19288,6 +19352,52 @@ exit 0
     }
 
     #[test]
+    fn plugin_registration_says_unknown_when_the_registry_is_unreadable() {
+        // RUST-DQ: an absent registry used to read as "not installed", so a CLI
+        // that exited 0 was reported as a failed install. Only a registry we can
+        // actually read may say no.
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::new(tmp.path());
+        let plugin = plugin_addon("ponytail").expect("ponytail addon");
+
+        assert_eq!(PluginHost::ClaudeCode.plugin_registration(plugin), None);
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), None);
+
+        let claude = tmp.path().join(".claude").join("plugins");
+        fs::create_dir_all(&claude).unwrap();
+        let registry = claude.join("installed_plugins.json");
+        fs::write(&registry, br#"{"version":2,"plugins":{}}"#).unwrap();
+        assert_eq!(
+            PluginHost::ClaudeCode.plugin_registration(plugin),
+            Some(false)
+        );
+        fs::write(
+            &registry,
+            format!(
+                r#"{{"version":2,"plugins":{{"{}":[{{"scope":"user"}}]}}}}"#,
+                plugin.plugin_ref
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            PluginHost::ClaudeCode.plugin_registration(plugin),
+            Some(true)
+        );
+
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(false));
+        fs::write(
+            &config,
+            format!("[plugins.\"{}\"]\nenabled = true\n", plugin.plugin_ref),
+        )
+        .unwrap();
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(true));
+    }
+
+    #[test]
     fn plugin_install_failure_category_splits_the_rust_6k_grab_bag() {
         // Every string below is a real RUST-6K event body. They arrived under ONE
         // fingerprint, which is why that issue could never be resolved: a resolve
@@ -19317,6 +19427,19 @@ exit 0
                  ~/.codex/config.toml:209:12: `wire_api = \"chat\"` is no longer supported.",
                 "cli-version-skew",
             ),
+            // RUST-DQ, both real: two unrelated causes that shared the "other"
+            // bucket -- our own post-install verification, and a Codex install
+            // that lost a file of its own halfway through.
+            (
+                "Claude Code: install completed but the plugin was not registered",
+                "not-registered",
+            ),
+            (
+                "Codex: command failed (exit 1): ~\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.EXE \
+                 plugin add caveman@caveman\nstdout:\n\nstderr:\nError: failed to copy plugin \
+                 file: The system cannot find the file specified. (os error 2)",
+                "host-file-missing",
+            ),
             ("Codex: something we have not seen", "other"),
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -19329,8 +19452,8 @@ exit 0
             seen.insert(expected);
         }
         assert!(
-            seen.len() >= 5,
-            "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
+            seen.len() >= 7,
+            "each known cause shape must land in its own bucket, got: {seen:?}"
         );
     }
 

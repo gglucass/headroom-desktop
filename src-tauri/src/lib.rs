@@ -2601,6 +2601,17 @@ pub(crate) fn startup_error_fingerprint_key(
         Some("startup_loopback_socket_denied")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
+    } else if err.contains("No module named 'encodings'") || err.contains("init_fs_encoding") {
+        // The base interpreter kept python.exe but lost its stdlib (RUST-C8,
+        // third shape). `headroom_installed` already routes the next launch
+        // back to bootstrap's re-download, so this is a distinct cause with a
+        // distinct remedy and does not belong in the exit-1 bucket.
+        Some("startup_runtime_missing_stdlib")
+    } else if is_missing_headroom_module_signal(err) {
+        // Ours to fix, unlike the three above: the in-startup repair
+        // force-reinstalls the pinned wheel, so an event here means that
+        // repair did not take. Its own issue, not the exit-1 grab-bag.
+        Some("startup_venv_missing_module")
     } else {
         None
     }
@@ -3302,6 +3313,17 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
 pub(crate) fn is_loopback_socket_denied_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("winerror 10013") || lower.contains("os error 10013")
+}
+
+/// Our own package is in site-packages but not all of it: a torn or partial
+/// wheel install leaves `headroom` importable while a submodule is missing, so
+/// the proxy dies on import before it can bind. No respawn fixes it and it is
+/// not the machine's doing -- the venv needs the wheel reinstalled (RUST-CY: a
+/// 0.9.15 mac lost `headroom/providers/claude`). Matched on our package name
+/// only, so a missing third-party dependency (a requirements problem) and a
+/// `DLL load failed` ImportError (RUST-7W/8V/8W) both stay out of it.
+pub(crate) fn is_missing_headroom_module_signal(text: &str) -> bool {
+    text.contains("ModuleNotFoundError: No module named 'headroom")
 }
 
 /// True for a `startup_error_fingerprint_key` that names a verdict of the
@@ -9360,14 +9382,15 @@ mod tests {
         fake_override, feed_failure_is_persistent, feed_pull_due, fetch_transformations_feed_from,
         first_savings_body, format_token_count, install_pending_update,
         is_blocked_runtime_dll_signal, is_disk_full_signal, is_endpoint_protection_signal,
-        is_environmental_startup_key, is_loopback_socket_denied_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, learn_agent_auth_hint,
-        learn_agent_limit_hint, learn_failure_agent_limit_line,
-        learn_failure_is_agent_api_unreachable, learn_failure_is_agent_auth,
-        learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
-        lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        is_environmental_startup_key, is_loopback_socket_denied_signal,
+        is_missing_headroom_module_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
+        learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
+        learn_failure_is_agent_auth, learn_failure_is_agent_model_rejected,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -12693,6 +12716,40 @@ Some unrelated content.
             "PermissionError: [Errno 13] Permission denied: '/tmp/x'",
         ] {
             assert!(!is_loopback_socket_denied_signal(other), "for: {other}");
+        }
+    }
+
+    #[test]
+    fn missing_headroom_module_signal_only_fires_for_our_own_package() {
+        // RUST-CY verbatim: the venv kept `headroom` but lost a submodule, so
+        // every launch died on the same import until the wheel was reinstalled.
+        let tail = "  File \"~/venv/lib/python3.12/site-packages/headroom/providers/registry.py\", \
+                    line 12, in <module>\n    from headroom.providers.claude import DEFAULT_API_URL\n\
+                    ModuleNotFoundError: No module named 'headroom.providers.claude'\n";
+        assert!(is_missing_headroom_module_signal(tail));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(tail)),
+            Some("startup_venv_missing_module")
+        );
+        // Third RUST-C8 shape: the base interpreter lost its stdlib. Its own
+        // bucket, and bootstrap re-downloads the runtime on the next launch.
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+                 Fatal Python error: init_fs_encoding: failed to get the Python codec of the \
+                 filesystem encoding\nModuleNotFoundError: No module named 'encodings'"
+            )),
+            Some("startup_runtime_missing_stdlib")
+        );
+        // A missing dependency is a requirements problem and a DLL load failure
+        // is the MSVC runtime one; reinstalling our wheel fixes neither.
+        for other in [
+            "ModuleNotFoundError: No module named 'opentelemetry'",
+            "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
+            "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: No module \
+             named 'onnxruntime')",
+        ] {
+            assert!(!is_missing_headroom_module_signal(other), "for: {other}");
         }
     }
 

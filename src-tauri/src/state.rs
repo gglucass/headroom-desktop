@@ -7982,8 +7982,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // the base runtime's `Lib` tree being gone while `python.exe` survived
     // (RUST-C8). Same remedy as a missing headroom.* module, and the
     // installed gate now routes the next launch to bootstrap's reinstall.
-    if raw.contains("ModuleNotFoundError: No module named 'headroom")
-        || raw.contains("No module named 'encodings'")
+    if crate::is_missing_headroom_module_signal(raw) || raw.contains("No module named 'encodings'")
     {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \

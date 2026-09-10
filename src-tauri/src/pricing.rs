@@ -129,6 +129,11 @@ struct IdentityPayload {
     /// probe finishes and on every other platform.
     #[serde(skip_serializing_if = "Option::is_none")]
     wsl_agents: Option<String>,
+    /// Claude Desktop bucket for this machine (`claude_desktop_verdict`).
+    /// Always sent, so the server can tell "reported absent" from "an app old
+    /// enough that it never reported" (which stays null).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_desktop: Option<&'static str>,
 }
 
 /// Reqwest errors caused by the user's environment (offline, captive portal,
@@ -347,6 +352,7 @@ impl IdentityPayload {
             tier_mismatch_since: None,
             accepted_terms_version: None,
             wsl_agents: crate::wsl_probe::result(),
+            claude_desktop: Some(crate::client_adapters::claude_desktop_verdict()),
         }
     }
 
@@ -4055,6 +4061,21 @@ mod tests {
         assert_eq!(json["claudePlanTier"], "pro");
         assert!(json.get("chopratejasInstanceId").is_none());
         assert!(json.get("claudeEmail").is_none());
+    }
+
+    #[test]
+    fn identity_payload_carries_the_claude_desktop_verdict() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            claude_desktop: Some(crate::client_adapters::claude_desktop_verdict()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&identity).unwrap();
+        assert!(
+            ["absent", "only", "with_agent"].contains(&json["claudeDesktop"].as_str().unwrap()),
+            "unexpected verdict: {}",
+            json["claudeDesktop"]
+        );
     }
 
     #[test]
