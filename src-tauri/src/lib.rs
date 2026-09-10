@@ -2612,6 +2612,13 @@ pub(crate) fn startup_error_fingerprint_key(
         // force-reinstalls the pinned wheel, so an event here means that
         // repair did not take. Its own issue, not the exit-1 grab-bag.
         Some("startup_venv_missing_module")
+    } else if crate::tool_manager::onnx_probe_crashed(err) {
+        // The machine's onnxruntime aborts the interpreter as it loads, so the
+        // proxy dies mid-import with no traceback (RUST-C7). The startup path
+        // now retries with Kompress off, so an event carrying this key means
+        // even that did not get the port open -- a distinct cause with a
+        // distinct remedy, not the exit-1 grab-bag.
+        Some("startup_onnx_native_crash")
     } else {
         None
     }
@@ -4247,6 +4254,17 @@ const ACTIVITY_OBSERVER_LIMIT: u32 = 100;
 /// moved, so a producer the intercept cannot see (anything reaching the backend
 /// on 6768 directly) is still observed within a few minutes.
 const ACTIVITY_OBSERVER_MAX_FEED_GAP: std::time::Duration = std::time::Duration::from_secs(300);
+/// Events to ask for beyond the intercept's own delta.
+///
+/// The delta is exact for what the intercept forwarded, but the backend only
+/// logs a request once its response has finished, so a stream counted by one
+/// tick can surface in the feed several ticks later. The margin keeps those
+/// late arrivals inside a delta-sized window.
+const ACTIVITY_OBSERVER_PULL_MARGIN: u32 = 10;
+/// Floor for a sized window. Below this the round trip costs more than the
+/// rows it saves, and it leaves room for a small backlog of late arrivals
+/// (measured p90 on a heavy machine is 8 requests per 20s tick).
+const ACTIVITY_OBSERVER_PULL_MIN: u32 = 20;
 
 fn spawn_activity_observer(app: AppHandle) {
     std::thread::spawn(move || {
@@ -4278,8 +4296,9 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
     });
 }
 
-/// Whether this tick should pull the transformations feed, given the intercept's
-/// forwarded-request total the last pull saw and how long ago that pull was.
+/// How wide a transformations-feed window this tick should pull, or `None` to
+/// skip it, given the intercept's forwarded-request total the last pull saw and
+/// how long ago that pull was.
 ///
 /// One pull costs far more than what is read off it: measured 2026-09-07,
 /// `limit=100` returns ~44 MB because every event carries `request_messages`
@@ -4294,13 +4313,31 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 /// Unchanged counters mean every event in the window has already been observed.
 /// The elapsed arm still forces a pull, so a producer the intercept cannot see
 /// (anything reaching the backend on 6768 directly) is not missed forever.
-fn feed_pull_due(last: Option<(u64, std::time::Duration)>, forwarded: u64) -> bool {
-    match last {
-        Some((seen, since)) => seen != forwarded || since >= ACTIVITY_OBSERVER_MAX_FEED_GAP,
-        // First tick of the process: the window holds requests from before
-        // launch that nothing here has observed yet.
-        None => true,
+fn feed_pull_limit(last: Option<(u64, std::time::Duration)>, forwarded: u64) -> Option<u32> {
+    // First tick of the process: the window holds requests from before launch
+    // that nothing here has observed yet, so take the whole of it.
+    let Some((seen, since)) = last else {
+        return Some(ACTIVITY_OBSERVER_LIMIT);
+    };
+    // Forced pull. The counters have not moved, so they cannot size the window
+    // either: anything that landed came in on 6768 without passing us.
+    if since >= ACTIVITY_OBSERVER_MAX_FEED_GAP {
+        return Some(ACTIVITY_OBSERVER_LIMIT);
     }
+    if seen == forwarded {
+        return None;
+    }
+    // Ask for what actually happened. The delta counts every request the
+    // intercept forwarded since the last pull, so a fixed 100 spent ~5x the
+    // bytes of a p50 tick (3 requests) for rows already observed on the
+    // previous one -- and it spent them at exactly the moment `/stats` is most
+    // likely to be starved, since a tick only pulls when traffic is flowing.
+    let fresh = u32::try_from(forwarded.saturating_sub(seen)).unwrap_or(ACTIVITY_OBSERVER_LIMIT);
+    Some(
+        fresh
+            .saturating_add(ACTIVITY_OBSERVER_PULL_MARGIN)
+            .clamp(ACTIVITY_OBSERVER_PULL_MIN, ACTIVITY_OBSERVER_LIMIT),
+    )
 }
 
 /// How long the feed fetch must keep failing before the canary reports it.
@@ -4322,20 +4359,20 @@ fn feed_failure_is_persistent(elapsed: std::time::Duration) -> bool {
     elapsed >= FEED_FETCH_FAILURE_GRACE
 }
 
-fn should_pull_transformations_feed() -> bool {
+fn transformations_feed_pull_limit() -> Option<u32> {
     static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
     let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
         .values()
         .sum();
     let mut last = LAST_PULL.lock();
-    let due = feed_pull_due(
+    let limit = feed_pull_limit(
         last.map(|(seen, at): (u64, std::time::Instant)| (seen, at.elapsed())),
         forwarded,
     );
-    if due {
+    if limit.is_some() {
         *last = Some((forwarded, std::time::Instant::now()));
     }
-    due
+    limit
 }
 
 fn run_activity_observation(app: &AppHandle) {
@@ -4367,8 +4404,8 @@ fn run_activity_observation(app: &AppHandle) {
         || intercept_bind_failed
     {
         *FEED_FAILING_SINCE.lock() = None;
-    } else if should_pull_transformations_feed() {
-        match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
+    } else if let Some(limit) = transformations_feed_pull_limit() {
+        match fetch_transformations_feed(limit) {
             Ok(feed) => {
                 *FEED_FAILING_SINCE.lock() = None;
                 let _ = state.observe_activity_from_transformations(&feed.transformations);
@@ -4415,7 +4452,7 @@ fn run_activity_observation(app: &AppHandle) {
                         |scope| {
                             scope.set_tag("flow", "transformations_feed_fetch");
                             scope.set_extra("error", err.clone().into());
-                            scope.set_extra("limit", u64::from(ACTIVITY_OBSERVER_LIMIT).into());
+                            scope.set_extra("limit", u64::from(limit).into());
                             scope.set_fingerprint(Some(&["transformations-feed-fetch", category]));
                         },
                         || {
@@ -7219,6 +7256,37 @@ fn learn_agent_api_unreachable_hint(agent: LearnAgent) -> String {
     )
 }
 
+/// The analysis model answered with something that is not the JSON document
+/// the analyzer asked it for, so upstream's `json.loads` rejected it and
+/// `headroom learn` exited 1 (RUST-B7).
+///
+/// Same user-environment class as the auth, limit and unreachable arms: the
+/// answer is the model's, no release of ours changes it, and re-running the
+/// scan is the remedy. Reporting it is actively harmful on top of that --
+/// upstream's error DUMPS the answer it could not parse, and that answer is
+/// the model's analysis of the user's own sessions, so every event carried
+/// project content (once a CLAUDE.md, once a set of database passwords) into
+/// `stderr_head_redacted` / `stderr_tail_redacted`. Redaction only covers what
+/// it can recognise, and there is nothing left to diagnose from the dump
+/// anyway: the parse failed, and that is the whole finding.
+fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
+    text.contains("returned unparseable output")
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_unparseable_output`].
+fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
+    let cli = match agent {
+        LearnAgent::Claude => "Claude Code",
+        LearnAgent::Codex => "Codex",
+        LearnAgent::Opencode => "opencode",
+        LearnAgent::Grok => "Grok",
+    };
+    format!(
+        "{cli} answered with something other than the analysis headroom learn asked for, so \
+         there was nothing to read from it. Start the scan again."
+    )
+}
+
 /// The text a learn failure is fingerprinted on.
 ///
 /// Upstream's first stderr line is a marker whose reason is EMPTY -- ``LLM
@@ -7585,7 +7653,13 @@ fn execute_headroom_learn_run(
                     // RUST-EW, third cause in the same class: the CLI never
                     // reached its own API.
                     let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
-                    if !agent_not_signed_in && agent_limit_line.is_none() && !agent_api_unreachable
+                    // RUST-B7, fourth: the model's answer was not the JSON the
+                    // analyzer asked for.
+                    let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
+                    if !agent_not_signed_in
+                        && agent_limit_line.is_none()
+                        && !agent_api_unreachable
+                        && !agent_unparseable
                     {
                         sentry::with_scope(
                             |scope| {
@@ -7788,11 +7862,13 @@ fn execute_headroom_learn_run(
                 // ejected external volume filed an event. Match the whole
                 // stderr, like the three siblings below.
                 let path_unreadable = stderr.contains("is not readable");
+                let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
                 let user_env_condition = path_unreadable
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_model_rejected
-                    || agent_api_unreachable;
+                    || agent_api_unreachable
+                    || agent_unparseable;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -7837,6 +7913,8 @@ fn execute_headroom_learn_run(
                     learn_agent_limit_hint(agent, line)
                 } else if agent_api_unreachable {
                     learn_agent_api_unreachable_hint(agent)
+                } else if agent_unparseable {
+                    learn_agent_unparseable_output_hint(agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -7847,6 +7925,8 @@ fn execute_headroom_learn_run(
                     format!("headroom learn needs a signed-in agent for {project_name}.")
                 } else if agent_limit_line.is_some() {
                     format!("headroom learn hit the agent's usage limit for {project_name}.")
+                } else if agent_unparseable {
+                    format!("headroom learn could not read the analysis for {project_name}.")
                 } else {
                     format!("headroom learn failed for {project_name}.")
                 };
@@ -9379,14 +9459,15 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, feed_failure_is_persistent, feed_pull_due, fetch_transformations_feed_from,
-        first_savings_body, format_token_count, install_pending_update,
-        is_blocked_runtime_dll_signal, is_disk_full_signal, is_endpoint_protection_signal,
-        is_environmental_startup_key, is_loopback_socket_denied_signal,
-        is_missing_headroom_module_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
-        learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
-        learn_failure_is_agent_auth, learn_failure_is_agent_model_rejected,
+        fake_override, feed_failure_is_persistent, feed_pull_limit,
+        fetch_transformations_feed_from, first_savings_body, format_token_count,
+        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
+        is_endpoint_protection_signal, is_environmental_startup_key,
+        is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
+        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
+        learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_limit_line,
+        learn_failure_is_agent_api_unreachable, learn_failure_is_agent_auth,
+        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, normalize_learn_failure_signature,
         onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
@@ -10692,24 +10773,46 @@ mod tests {
         );
     }
 
-    /// The feed pull is ~44 MB and the observer reads ~0.25% of it, so an idle
-    /// tick must not pay for it -- but an unseen producer must not be able to
-    /// hide behind unchanged counters forever either (RUST-86).
+    /// A full feed pull is ~44 MB and the observer reads ~0.25% of it, so an
+    /// idle tick must not pay for it and a busy one must pay only for what it
+    /// has not seen -- but an unseen producer must not be able to hide behind
+    /// unchanged counters forever either (RUST-86).
     #[test]
     fn feed_pull_skips_idle_ticks_but_never_stalls_past_the_gap() {
         use std::time::Duration;
-        // First tick of the process: the window predates us, always pull.
-        assert!(feed_pull_due(None, 0));
+        // First tick of the process: the window predates us, take all of it.
+        assert_eq!(
+            feed_pull_limit(None, 0),
+            Some(crate::ACTIVITY_OBSERVER_LIMIT)
+        );
         // Nothing forwarded since the last pull, and well inside the gap.
-        assert!(!feed_pull_due(Some((42, Duration::from_secs(20))), 42));
-        // New traffic; pull immediately rather than waiting out the gap.
-        assert!(feed_pull_due(Some((42, Duration::from_secs(20))), 43));
-        // Counters idle but the gap elapsed: pull anyway, in case something
-        // reached the backend without passing the intercept.
-        assert!(feed_pull_due(
-            Some((42, crate::ACTIVITY_OBSERVER_MAX_FEED_GAP)),
-            42
-        ));
+        assert_eq!(
+            feed_pull_limit(Some((42, Duration::from_secs(20))), 42),
+            None
+        );
+        // New traffic: pull immediately rather than waiting out the gap, and
+        // only wide enough for the delta plus the late-arrival margin. The
+        // floor holds for a delta this small.
+        assert_eq!(
+            feed_pull_limit(Some((42, Duration::from_secs(20))), 43),
+            Some(crate::ACTIVITY_OBSERVER_PULL_MIN)
+        );
+        // A burst sizes the window itself, still capped at what the backend
+        // will serve.
+        assert_eq!(
+            feed_pull_limit(Some((0, Duration::from_secs(20))), 30),
+            Some(30 + crate::ACTIVITY_OBSERVER_PULL_MARGIN)
+        );
+        assert_eq!(
+            feed_pull_limit(Some((0, Duration::from_secs(20))), 5_000),
+            Some(crate::ACTIVITY_OBSERVER_LIMIT)
+        );
+        // Counters idle but the gap elapsed: pull the full window, in case
+        // something reached the backend without passing the intercept.
+        assert_eq!(
+            feed_pull_limit(Some((42, crate::ACTIVITY_OBSERVER_MAX_FEED_GAP)), 42),
+            Some(crate::ACTIVITY_OBSERVER_LIMIT)
+        );
     }
 
     /// A backend restart 503s the feed for its whole down window, and every
@@ -12177,6 +12280,22 @@ Some unrelated content.
     }
 
     #[test]
+    fn learn_failure_unparseable_output_is_the_models_answer_not_ours() {
+        // RUST-B7, verbatim shape: upstream appends the answer it could not
+        // parse, which is the model's analysis of the user's own sessions.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` \
+                      returned unparseable output. First 2000 chars:\n```json\n{\n  \
+                      \"context_file_rules\": [";
+        assert!(learn_failure_is_agent_unparseable_output(stderr));
+        // A CLI that failed on its own terms still reports: its diagnosis is
+        // on stderr and there is something for us to act on.
+        assert!(!learn_failure_is_agent_unparseable_output(
+            "LLM analysis failed: `claude -p` failed (exit 1):\nAPI Error: 400 prompt too long"
+        ));
+        assert!(!learn_failure_is_agent_unparseable_output(""));
+    }
+
+    #[test]
     fn learn_failure_agent_limit_line_matches_the_cli_limit_messages() {
         // RUST-BF verbatim: the child CLI's diagnosis on the line after
         // upstream's marker.
@@ -12777,6 +12896,36 @@ Some unrelated content.
                  before opening port 6768\n--- log tail ---\nPermissionError: [WinError 10013]"
             )),
             Some("startup_loopback_socket_denied")
+        );
+    }
+
+    #[test]
+    fn onnx_native_crash_gets_its_own_startup_key() {
+        // RUST-C7: `<no Python frame>` is faulthandler reporting a native abort
+        // during the import -- nothing a retry or a reinstall changes.
+        let crashed = "unable to keep headroom running in background (onnx probe: import \
+                       onnxruntime failed (exit 1): <no Python frame>) (prior attempts: \
+                       python.exe: exited with status exit code: 1 before opening port 6768)";
+        assert_eq!(
+            startup_error_fingerprint_key(Some(crashed)),
+            Some("startup_onnx_native_crash")
+        );
+        // A missing or broken module is a venv problem, and it already has a
+        // key of its own -- the wheel repair, not the Kompress retry.
+        let missing = "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: \
+                       No module named 'onnxruntime')";
+        assert_eq!(startup_error_fingerprint_key(Some(missing)), None);
+        // A killed probe stays with the endpoint-protection verdict, which
+        // names the remedy.
+        let killed = "(onnx probe: import onnxruntime failed (killed))";
+        assert_eq!(
+            startup_error_fingerprint_key(Some(killed)),
+            Some("startup_endpoint_protection")
+        );
+        // A clean probe says nothing about the startup failure at all.
+        assert_eq!(
+            startup_error_fingerprint_key(Some("(onnx probe: onnxruntime imports cleanly)")),
+            None
         );
     }
 

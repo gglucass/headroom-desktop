@@ -777,12 +777,12 @@ pub fn repair_client_setups() -> Vec<String> {
         .collect();
     let mut repaired = Vec::new();
     for client_id in client_ids {
-        let failing = match verify_client_setup(&client_id) {
-            Ok(verification) => !verification.failures.is_empty(),
+        let broken = match verify_client_setup(&client_id) {
+            Ok(verification) => verification.failures,
             // Ids verification doesn't support are ids repair can't help.
-            Err(_) => false,
+            Err(_) => Vec::new(),
         };
-        if !failing {
+        if broken.is_empty() {
             continue;
         }
         if let Err(err) = apply_client_setup(&client_id) {
@@ -791,20 +791,37 @@ pub fn repair_client_setups() -> Vec<String> {
         }
         match verify_client_setup(&client_id) {
             Ok(verification) if verification.failures.is_empty() => {
-                // warn, not info: the log bridge forwards warns to Sentry, and
-                // a successful self-repair is the only fleet-visible trace of a
+                // A successful self-repair is the only fleet-visible trace of a
                 // config that was silently broken (e.g. the stale flagless
-                // Codex block, which 401'd every request until repaired).
+                // Codex block, which 401'd every request until repaired), so it
+                // is reported -- but from here, not through the log bridge.
                 // Info, not warn: the bridged warn carried no fingerprint,
                 // and Sentry grouped it on the SDK's stacktrace instead of the
                 // text -- so byte-identical "repaired codex_cli" lines opened
                 // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
                 // of them meant nothing. One issue per client, from here.
-                log::info!("repair_client_setups: repaired {client_id}");
+                log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
+                // WHICH check failed, in the fingerprint and in full as an
+                // extra. Grouping on the client alone said only "codex_cli
+                // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
+                // login that restamps its own config from a shell profile
+                // another installer rewrites, which are different bugs with
+                // different owners. The strings are fixed sentences from
+                // `verify_client_setup`, so they group across machines and
+                // carry nothing of the user's.
+                let cause: String = broken
+                    .first()
+                    .map(|f| f.chars().take(80).collect())
+                    .unwrap_or_else(|| "unknown".to_string());
                 sentry::with_scope(
                     |scope| {
                         scope.set_tag("flow", "repair_client_setups");
-                        scope.set_fingerprint(Some(&["repair_client_setups", client_id.as_str()]));
+                        scope.set_extra("failures", broken.clone().into());
+                        scope.set_fingerprint(Some(&[
+                            "repair_client_setups",
+                            client_id.as_str(),
+                            cause.as_str(),
+                        ]));
                     },
                     || {
                         sentry::capture_message(
@@ -2344,7 +2361,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // metadata can reach disk ahead of the data, so a crash/power loss leaves a
     // zero-length file where valid state used to be -- which is what the
     // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
-    let write_tmp = || -> std::io::Result<()> {
+    let mut write_tmp = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
         std::io::Write::write_all(&mut f, contents)?;
         f.sync_all()
@@ -2361,14 +2378,36 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
-    retry_transient_denied(|| std::fs::rename(&tmp_path, path)).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        anyhow!(
-            "renaming {} -> {}: {err}",
-            tmp_path.display(),
-            path.display()
-        )
-    })
+    rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
+        |err| {
+            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+            anyhow!(
+                "renaming {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            )
+        },
+    )
+}
+
+/// Renames a freshly written tmp into place, rewriting it once if it vanished.
+///
+/// `NotFound` from the rename means the tmp we just wrote and fsynced is gone:
+/// a scanner deleted or quarantined it between close and rename (RUST-EZ, os
+/// error 2 on Windows). Retrying the rename alone can only fail the same way,
+/// so the tmp is written again and that one is moved. Once -- a second loss is
+/// not a race, and this is the primitive every persisted file goes through.
+fn rename_recovering_lost_tmp(
+    rename: &mut impl FnMut() -> std::io::Result<()>,
+    write_tmp: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match retry_transient_denied(&mut *rename) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_tmp()?;
+            retry_transient_denied(rename)
+        }
+        other => other,
+    }
 }
 
 /// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
@@ -11546,6 +11585,60 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_rewrites_a_tmp_that_vanished_before_the_rename() {
+        // RUST-EZ: on Windows a scanner removed the tmp between fsync and
+        // rename, so the write was lost with "os error 2" and every caller of
+        // this primitive silently failed to persist.
+        let mut renames = 0;
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || {
+                renames += 1;
+                if renames == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert!(out.is_ok());
+        assert_eq!((renames, writes), (2, 1));
+
+        // A tmp that keeps vanishing is not a race: report it instead of
+        // looping.
+        let mut renames = 0;
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || {
+                renames += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!((renames, writes), (2, 1));
+
+        // Anything else is returned as-is, with no rewrite.
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(writes, 0);
     }
 
     #[test]

@@ -4486,6 +4486,17 @@ impl ToolManager {
                             .with_context(|| format!("cloning {}", log_path.display()))?,
                     ))
                     .stderr(Stdio::from(log_file));
+                // This machine's onnxruntime aborts the interpreter when it
+                // loads, and the startup path imports it to decide whether
+                // Kompress is available -- so the proxy dies before binding and
+                // nothing can start (RUST-C7). Kompress off skips that import;
+                // the host loses ML text compression and keeps a working proxy.
+                // ponytail: startup only. An image request can still reach
+                // `image/onnx_router`, which imports it too; wire the same flag
+                // there if a crash ever shows up past the port opening.
+                if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
+                    command.env("HEADROOM_DISABLE_KOMPRESS", "1");
+                }
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -4622,6 +4633,27 @@ impl ToolManager {
                         }
                     }
                 }
+
+                // A native onnxruntime abort leaves no traceback at all, so the
+                // only evidence is the exit code -- 0xffffffff on Windows, a
+                // signal on the others -- and the probe. Ask it once, and if
+                // the import really is fatal here, retry with Kompress off
+                // instead of reporting a start that can never succeed
+                // (RUST-C7). Not gated on `cfg!(windows)`: the crash is the
+                // library's, and macOS/Linux surface the same abort as a
+                // signal.
+                if !ONNX_CRASH_CHECKED.swap(true, Ordering::AcqRel)
+                    && failures.iter().any(|f| startup_exit_is_a_crash(&f.reason))
+                    && onnx_probe_crashed(&self.onnx_probe_verdict_once())
+                {
+                    log::warn!(
+                        "headroom proxy died importing onnxruntime; retrying with Kompress \
+                         disabled"
+                    );
+                    KOMPRESS_DISABLED_FOR_ONNX_CRASH.store(true, Ordering::Release);
+                    allow_repair = false;
+                    continue 'attempt;
+                }
             }
 
             // Report the variant that actually captured a log tail (a traceback)
@@ -4642,11 +4674,17 @@ impl ToolManager {
             // on 2026-08-27, so probe the prime suspect (onnxruntime's native
             // init, pulled in by the ml extras) in a bare interpreter and carry
             // the verdict in the error chain Sentry already captures.
-            let onnx_note = if cfg!(windows)
-                && (last.reason.contains("0xffffffff")
-                    || failures.iter().any(|f| f.reason.contains("0xffffffff")))
+            // Every platform, not just Windows: the retry above fires on any
+            // crash-shaped exit, and `startup_error_fingerprint_key` reads the
+            // verdict back out of this chain -- so a macOS abort that got the
+            // Kompress retry has to carry it too, or that key can never match
+            // there. Memoised, so this costs nothing once the retry has asked.
+            let onnx_note = if failures
+                .iter()
+                .chain(std::iter::once(&last))
+                .any(|f| startup_exit_is_a_crash(&f.reason))
             {
-                format!(" (onnx probe: {})", self.probe_onnx_import())
+                format!(" (onnx probe: {})", self.onnx_probe_verdict_once())
             } else {
                 String::new()
             };
@@ -4667,6 +4705,14 @@ impl ToolManager {
     /// crash or a missing module, IS the diagnosis. Only called on the
     /// already-failed startup path, so the extra subprocess costs nothing in
     /// the happy path.
+    /// [`Self::probe_onnx_import`], memoised for the process. The probe spawns
+    /// an interpreter and waits up to 15s for it, and both the retry decision
+    /// and the reported error chain want the same verdict.
+    fn onnx_probe_verdict_once(&self) -> String {
+        static VERDICT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERDICT.get_or_init(|| self.probe_onnx_import()).clone()
+    }
+
     fn probe_onnx_import(&self) -> String {
         let python = self.managed_python();
         if !python.exists() {
@@ -8438,13 +8484,33 @@ impl ToolManager {
                     .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
                     .err();
             }
-            self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin))
-                .map_err(|err| match marketplace_err {
-                    Some(add_err) => {
-                        err.context(format!("marketplace add failed first: {add_err:#}"))
-                    }
-                    None => err,
-                })?;
+            let mut installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+            // The host CLI installs by copying the plugin out of its own
+            // marketplace snapshot, and that copy failed for a file the
+            // snapshot should have had: "failed to copy plugin file: The
+            // system cannot find the file specified" (RUST-DQ, Codex on
+            // Windows). A snapshot with a file missing is missing it for every
+            // later add too, so re-register it from source and copy once more.
+            // Once: a second failure is not a torn snapshot.
+            if installed.as_ref().err().is_some_and(|err| {
+                plugin_install_failure_category(&format!("{err:#}")) == "host-file-missing"
+            }) {
+                log::info!(
+                    "{} [{}]: marketplace snapshot is missing a file; re-adding and retrying",
+                    plugin.id,
+                    host.label()
+                );
+                let _ =
+                    self.run_plugin_cmd(plugin, cli, host, &host.marketplace_remove_args(plugin));
+                marketplace_err = self
+                    .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
+                    .err();
+                installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+            }
+            installed.map_err(|err| match marketplace_err {
+                Some(add_err) => err.context(format!("marketplace add failed first: {add_err:#}")),
+                None => err,
+            })?;
         }
         // Only a registry we can read may declare failure: when it is absent or
         // relocated we cannot tell, and failing a CLI that exited 0 turns a
@@ -13165,6 +13231,45 @@ fn looks_like_corrupt_venv_error(err: &anyhow::Error) -> bool {
 /// a torn install, so the retry-driven start path cannot run pip repeatedly.
 static WHEEL_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+/// Set once the startup path has asked the onnx probe whether this machine's
+/// `import onnxruntime` is fatal, so the 15s probe runs at most once per
+/// process even though the tray retries a failed start every ~20s.
+static ONNX_CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
+/// Set when that probe crashed. Every later backend spawn in this process then
+/// carries `HEADROOM_DISABLE_KOMPRESS=1`.
+static KOMPRESS_DISABLED_FOR_ONNX_CRASH: AtomicBool = AtomicBool::new(false);
+
+/// True for a startup exit that means the process was taken down mid-flight
+/// rather than exiting on its own terms: Windows reports a native abort as
+/// 0xffffffff (and the 0xc00000xx family), unix as a signal.
+fn startup_exit_is_a_crash(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("0xffffffff") || lower.contains("0xc0000") || lower.contains("signal:")
+}
+
+/// True when the machine's `import onnxruntime` takes the interpreter down with
+/// it, rather than merely being absent or broken as a Python import.
+///
+/// `probe_onnx_import` reports the module's own diagnosis, and the two verdicts
+/// mean opposite things: an `ImportError` / `ModuleNotFoundError` is a venv we
+/// can reinstall, while a faulthandler marker (`<no Python frame>`, `Fatal
+/// Python error`) or a bare crash with nothing on stderr is the native library
+/// aborting during load -- which no try/except in the proxy can catch, so the
+/// process dies mid-import with the port never opened (RUST-C7).
+pub(crate) fn onnx_probe_crashed(verdict: &str) -> bool {
+    if !verdict.contains("import onnxruntime failed") {
+        return false;
+    }
+    let lower = verdict.to_ascii_lowercase();
+    if lower.contains("modulenotfounderror") || lower.contains("importerror") {
+        return false;
+    }
+    lower.contains("no python frame")
+        || lower.contains("fatal python error")
+        || lower.contains("no stderr")
+        || lower.contains("(killed)")
+}
+
 /// Structured error emitted when the headroom proxy subprocess fails to open
 /// its port. Capture sites downcast to pull the log tail into Sentry `extra`
 /// fields, which are not subject to the 8KB message cap.
@@ -14494,6 +14599,37 @@ mod tests {
             !head.contains("--memory-db-path"),
             "args must not lead: {head}"
         );
+    }
+
+    #[test]
+    fn onnx_crash_retry_fires_only_on_a_crash_shaped_exit_and_a_fatal_import() {
+        // RUST-C7: the retry costs a 15s probe and a launch, so it only runs
+        // for an exit that means the process was taken down.
+        assert!(super::startup_exit_is_a_crash(
+            "exited with status exit code: 0xffffffff before opening port 6768"
+        ));
+        assert!(super::startup_exit_is_a_crash("exit code: 0xc0000142"));
+        assert!(super::startup_exit_is_a_crash("signal: 6 (SIGABRT)"));
+        assert!(!super::startup_exit_is_a_crash(
+            "exited with status exit status: 1 before opening port 6768"
+        ));
+
+        // And only when the import is what took it down. A module that is
+        // merely absent or broken is the wheel repair's business.
+        assert!(super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): <no Python frame>"
+        ));
+        assert!(super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 0xffffffff): <no stderr>"
+        ));
+        assert!(!super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): ModuleNotFoundError: No module named \
+             'onnxruntime'"
+        ));
+        assert!(!super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): ImportError: DLL load failed"
+        ));
+        assert!(!super::onnx_probe_crashed("onnxruntime imports cleanly"));
     }
 
     #[test]

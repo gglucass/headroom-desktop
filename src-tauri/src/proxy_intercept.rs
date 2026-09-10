@@ -1047,9 +1047,26 @@ pub fn spawn(
                                             ]));
                                         },
                                         || {
+                                            // WSAEACCES is the machine's socket
+                                            // policy, not a fault of ours: no
+                                            // release changes it, the bind loop
+                                            // keeps retrying, and
+                                            // `intercept_bind_hint` already
+                                            // hands the user both causes and the
+                                            // command that tells them apart
+                                            // (RUST-EQ). Same Warning the
+                                            // runtime's own 10013 gets in
+                                            // `capture_headroom_start_failure`.
+                                            let level = if crate::is_loopback_socket_denied_signal(
+                                                &e.to_string(),
+                                            ) {
+                                                sentry::Level::Warning
+                                            } else {
+                                                sentry::Level::Error
+                                            };
                                             sentry::capture_message(
                                                 &format!("proxy_intercept error: {key} (retrying)"),
-                                                sentry::Level::Error,
+                                                level,
                                             );
                                         },
                                     );
