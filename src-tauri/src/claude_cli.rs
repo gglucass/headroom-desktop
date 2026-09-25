@@ -298,17 +298,9 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<ExitStatus> 
     }
 }
 
-/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
-/// resolves the profile via the known-folder API and ignores `HOME`, so an
-/// env override (TestHome in tests, Git Bash parity in production) would be
-/// silently bypassed and writes would land in the real profile. On Unix the
-/// two sources agree, so the order change is a no-op there.
+/// See `client_adapters::home_dir`: one resolver for every module.
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir)
+    crate::client_adapters::home_dir()
 }
 
 #[cfg(test)]

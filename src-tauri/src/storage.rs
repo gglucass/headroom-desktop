@@ -103,7 +103,12 @@ pub fn snapshot_state_on_version_change(base_dir: &Path, current_version: &str) 
         if !source.exists() {
             continue;
         }
-        if let Err(err) = std::fs::copy(&source, snapshot_dir.join(name)) {
+        // Retried: a scanner holding the source for a moment otherwise cost
+        // this version its snapshot for good (the version stamp is still
+        // written below, so the next launch never retakes it).
+        if let Err(err) = crate::client_adapters::retry_transient_denied(|| {
+            std::fs::copy(&source, snapshot_dir.join(name))
+        }) {
             log::warn!("pre-update snapshot: copying {name} failed: {err}");
         }
     }

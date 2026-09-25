@@ -1461,13 +1461,19 @@ fn kill_processes_under(dir: &Path) {
     let script = format!(
         "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
-    match crate::proc::command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => log::warn!("cleanup: process sweep exited {:?}", status.code()),
-        Err(err) => log::warn!("cleanup: process sweep failed to run: {err}"),
+    let mut command = crate::proc::command("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    // Bounded: uninstall must finish even when WMI is wedged; the removal
+    // below retries past whatever this sweep could not stop.
+    match crate::proc::output_with_timeout(command, Duration::from_secs(20)) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => log::warn!("cleanup: process sweep exited {:?}", output.status.code()),
+        Err(crate::proc::OutputError::TimedOut) => {
+            log::warn!("cleanup: process sweep timed out after 20s")
+        }
+        Err(crate::proc::OutputError::Spawn(err)) => {
+            log::warn!("cleanup: process sweep failed to run: {err}")
+        }
     }
     // Handles are released asynchronously after the process dies.
     std::thread::sleep(Duration::from_millis(300));
@@ -1689,7 +1695,11 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // Also wipe the per-client setup-state file so a reinstall starts clean.
     let setup_state = setup_state_path();
     if setup_state.exists() {
-        let _ = std::fs::remove_file(&setup_state);
+        // Retried and reported: a stale setup state left by one scanner hold
+        // made the reinstall think every client was already configured.
+        if let Err(err) = retry_transient_denied(|| std::fs::remove_file(&setup_state)) {
+            log::warn!("cleanup: removing {} failed: {err}", setup_state.display());
+        }
     }
 
     let app_dir = app_data_dir();
@@ -1713,7 +1723,9 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     let dot_headroom = home_dir().join(".headroom");
     if dot_headroom.exists() {
-        match std::fs::remove_dir_all(&dot_headroom) {
+        // Tolerant, like the app dir: one file a scanner (or a proxy that has
+        // not let go yet) still holds used to abort the whole removal.
+        match purge_dir_tolerantly(&dot_headroom) {
             Ok(_) => removed.push(dot_headroom.display().to_string()),
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", dot_headroom.display()),
         }
@@ -1752,7 +1764,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 continue;
             }
             let dir = entry.path();
-            match std::fs::remove_dir_all(&dir) {
+            match remove_dir_all_retry(&dir) {
                 Ok(_) => removed.push(dir.display().to_string()),
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", dir.display()),
             }
@@ -2696,13 +2708,17 @@ fn rename_recovering_lost_tmp(
 /// Retries `op` while it fails `PermissionDenied` (or, on Windows, a sharing
 /// violation: os error 32, which std maps to `Uncategorized`, raised when the
 /// client itself holds its config open mid-write - RUST-5X), sleeping
-/// 50/100/200ms between attempts (4 tries total). Any other error, or the
-/// final denial, is returned as-is.
+/// 50/100/200ms between attempts (4 tries total), and on Windows also 400 and
+/// 800ms (6 tries, ~1.5s): Defender and the search indexer hold a freshly
+/// written file for a second or more, longer than the old 350ms window, and
+/// every persisted write goes through here. On Unix a denial is nearly always
+/// a real permission problem, so it keeps the short window. Any other error,
+/// or the final denial, is returned as-is.
 pub(crate) fn retry_transient_denied<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let mut delay = std::time::Duration::from_millis(50);
-    for _ in 0..3 {
+    for _ in 0..TRANSIENT_DENIED_RETRIES {
         match op() {
             Err(err) if is_transient_denied(&err) => {
                 std::thread::sleep(delay);
@@ -2713,6 +2729,9 @@ pub(crate) fn retry_transient_denied<T>(
     }
     op()
 }
+
+/// Retries after the first attempt (see `retry_transient_denied`).
+const TRANSIENT_DENIED_RETRIES: u32 = if cfg!(windows) { 5 } else { 3 };
 
 fn is_transient_denied(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
@@ -6810,7 +6829,7 @@ fn remove_claude_remote_control_command() -> Result<()> {
         }
     }
     if hooks_removed && script.exists() {
-        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+        remove_owned_script(&script);
     }
     for command in [
         claude_remote_control_command_path(),
@@ -6818,8 +6837,7 @@ fn remove_claude_remote_control_command() -> Result<()> {
     ] {
         if let Ok(content) = std::fs::read_to_string(&command) {
             if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
-                std::fs::remove_file(&command)
-                    .with_context(|| format!("removing {}", command.display()))?;
+                remove_owned_script(&command);
             }
         }
     }
@@ -7027,12 +7045,24 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
+/// Remove a script we own once its settings entry is already gone. Claude Code
+/// may be executing it at that moment, which Windows refuses to delete; the
+/// entry is what mattered, so a file that survives the retries is logged and
+/// left for next time rather than failing a disable the user already got.
+fn remove_owned_script(path: &Path) {
+    match retry_transient_denied(|| std::fs::remove_file(path)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!("removing {} failed: {err}", path.display()),
+    }
+}
+
 /// Remove our `statusLine` entry (never a user's own) and the script.
 fn remove_claude_statusline() -> Result<()> {
     set_claude_statusline_setting(None)?;
     let script = claude_statusline_script_path();
     if script.exists() {
-        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+        remove_owned_script(&script);
     }
     Ok(())
 }
@@ -8241,17 +8271,34 @@ json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDe
     )
 }
 
-/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
-/// resolves the profile via the known-folder API and ignores `HOME`, so an
-/// env override (TestHome in tests, Git Bash parity in production) would be
-/// silently bypassed and writes would land in the real profile. On Unix the
-/// two sources agree, so the order change is a no-op there.
+/// The user's home, as the tools we configure see it. The one resolver every
+/// module goes through.
+///
+/// On Windows that is the profile folder (`dirs::home_dir`, the known-folder
+/// API), NOT `HOME`: Claude Code (Node's `os.homedir()`), Codex and the Python
+/// proxy (`Path.home()`) all ignore `HOME` there. A machine with a persistent
+/// `HOME` (a corporate `H:\`, some Git setups) had the desktop writing
+/// `~/.claude` settings and reading `~/.headroom` ledgers and logs in one
+/// place while every tool it configures used another.
+///
+/// `HOME` still comes first on Unix, where the two agree, and in test builds
+/// on every platform: TestHome redirects through it, and without that the
+/// Windows test job would write into the runner's real profile.
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir)
+    let from_env = || {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(windows) && !cfg!(test) {
+        dirs::home_dir()
+            .or_else(from_env)
+            .unwrap_or_else(std::env::temp_dir)
+    } else {
+        from_env()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir)
+    }
 }
 
 /// Codex's home directory. Mirrors the Codex CLI and the upstream Headroom
@@ -13076,7 +13123,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn retry_transient_denied_gives_up_and_passes_other_errors_through() {
-        // Persistent denial: 4 attempts total, then the error surfaces.
+        // Persistent denial: every attempt used (4, or 6 on Windows), then
+        // the error surfaces.
         let mut calls = 0;
         let out = super::retry_transient_denied(|| -> std::io::Result<()> {
             calls += 1;
@@ -13086,7 +13134,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             out.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        assert_eq!(calls, 4);
+        assert_eq!(calls, super::TRANSIENT_DENIED_RETRIES + 1);
         // A non-denied error is never retried.
         let mut calls = 0;
         let out = super::retry_transient_denied(|| -> std::io::Result<()> {

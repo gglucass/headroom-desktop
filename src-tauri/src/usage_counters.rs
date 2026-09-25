@@ -61,13 +61,28 @@ impl Store {
         let days = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<PersistedCounters>(&bytes) {
                 Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted.days,
-                Ok(_) => BTreeMap::new(),
+                Ok(persisted) => {
+                    // A version this build does not know is kept, not
+                    // overwritten on the next save: a downgrade used to wipe
+                    // the counters a newer build had written.
+                    log::warn!(
+                        "{FILE_NAME} has schema {} (expected {SCHEMA_VERSION}); backing up and starting fresh",
+                        persisted.schema_version
+                    );
+                    let _ = crate::client_adapters::move_aside(
+                        &path,
+                        &path.with_extension("json.schema-mismatch"),
+                    );
+                    BTreeMap::new()
+                }
                 Err(err) => {
                     // Never silently overwrite a file we failed to parse:
                     // back it up so a truncation bug stays diagnosable.
                     log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
-                    // direct-write: moves Headroom's own unparsable state aside, never a user file
-                    let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+                    // Retried with a copy fallback (see move_aside), so a
+                    // scanner hold cannot let the fresh save overwrite it.
+                    let _ =
+                        crate::client_adapters::move_aside(&path, &path.with_extension("json.bak"));
                     BTreeMap::new()
                 }
             },
@@ -217,6 +232,24 @@ mod tests {
         let parsed: PersistedCounters =
             serde_json::from_str(r#"{"schemaVersion":1,"days":{"2026-08-17":{}}}"#).unwrap();
         assert_eq!(parsed.days["2026-08-17"], DayCounters::default());
+    }
+
+    #[test]
+    fn schema_mismatch_is_backed_up_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = crate::storage::config_file(dir.path(), FILE_NAME);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        let newer = format!(r#"{{"schemaVersion":{},"days":{{}}}}"#, SCHEMA_VERSION + 1);
+        std::fs::write(&path, &newer).expect("seed");
+
+        let store = Store::load_or_create(dir.path());
+
+        assert!(store.days.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.schema-mismatch"))
+                .expect("backup kept"),
+            newer
+        );
     }
 
     #[test]

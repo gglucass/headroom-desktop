@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -179,8 +180,9 @@ fn describe_os() -> String {
 }
 
 fn read_chopratejas_instance_id() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let headroom_dir = PathBuf::from(home).join(".headroom");
+    // Their Python storage root is `Path.home()`: the profile folder on
+    // Windows, where `HOME` is usually unset and this used to bail.
+    let headroom_dir = crate::client_adapters::home_dir().join(".headroom");
     if !headroom_dir.exists() {
         return None;
     }
