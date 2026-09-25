@@ -4608,6 +4608,7 @@ impl LaunchProfile {
                         "launch profile at {} unreadable ({err}); backing up and starting fresh",
                         path.display()
                     );
+                    // direct-write: moves Headroom's own unparsable state aside, never a user file
                     let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
                     Self::fresh()
                 })
@@ -4986,6 +4987,7 @@ impl SavingsTracker {
             Ok(state) => state,
             Err(err) => {
                 log::warn!("savings-state.json unreadable ({err}); backing up");
+                // direct-write: moves Headroom's own unparsable state aside, never a user file
                 let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
                 None
             }
@@ -5846,6 +5848,7 @@ impl SavingsTracker {
             .unwrap_or(false)
         {
             let rotated = self.records_path.with_extension("jsonl.1");
+            // direct-write: rotates Headroom's own log; a rename, not a rewrite
             let _ = std::fs::rename(&self.records_path, rotated);
         }
         let mut file = std::fs::OpenOptions::new()
@@ -6193,6 +6196,7 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
             path.display(),
             persisted.schema_version
         );
+        // direct-write: moves Headroom's own unparsable state aside, never a user file
         let _ = std::fs::rename(path, path.with_extension("json.schema-mismatch"));
         Ok(None)
     }

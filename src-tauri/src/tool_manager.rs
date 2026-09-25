@@ -3806,6 +3806,7 @@ impl ToolManager {
                 let upstream_env = upstream_spawn_env(&crate::upstream_override::get());
                 let sitecustomize_injected =
                     match std::fs::create_dir_all(&inject_dir).and_then(|_| {
+                        // direct-write: Headroom's own runtime file, regenerated on every proxy spawn
                         std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
                     }) {
                         Ok(()) => true,
@@ -5503,6 +5504,7 @@ impl ToolManager {
             .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
         Self::retry_fs("publishing extracted python", || {
+            // direct-write: directory swap inside Headroom's managed runtime
             std::fs::rename(&extracted_root, &self.runtime.python_dir)
         })
         .with_context(|| {
@@ -6205,6 +6207,7 @@ impl ToolManager {
                     return false;
                 }
             }
+            // direct-write: directory swap inside Headroom's managed runtime
             if let Err(err) = std::fs::rename(&backup_dir, venv_dir) {
                 log::error!(
                     "recover_from_interrupted_upgrade: failed to restore venv from {}: {err}",
@@ -6330,6 +6333,7 @@ impl ToolManager {
                     error: err.context("writing upgrade-in-progress marker"),
                 };
             }
+            // direct-write: directory swap inside Headroom's managed runtime
             if let Err(err) = std::fs::rename(&venv_dir, &backup_dir) {
                 self.clear_upgrade_marker();
                 return UpgradeOutcome::InstallFailed {
@@ -7072,6 +7076,7 @@ impl ToolManager {
         if !backup_dir.exists() {
             return true;
         }
+        // direct-write: directory swap inside Headroom's managed runtime
         match std::fs::rename(&backup_dir, &self.runtime.venv_dir) {
             Ok(()) => true,
             Err(err) => {
@@ -7420,6 +7425,7 @@ impl ToolManager {
                 .with_context(|| format!("chmod {}", staged.display()))?;
         }
 
+        // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
         std::fs::rename(&staged, &destination)
             .with_context(|| format!("renaming {} into place", staged.display()))?;
 
@@ -8037,6 +8043,7 @@ impl ToolManager {
             s.push(".new");
             PathBuf::from(s)
         };
+        // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
         std::fs::rename(&extracted_binary, &staged)
             .with_context(|| format!("staging {}", staged.display()))?;
         #[cfg(unix)]
@@ -8049,6 +8056,7 @@ impl ToolManager {
             std::fs::set_permissions(&staged, permissions)
                 .with_context(|| format!("marking {} executable", staged.display()))?;
         }
+        // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
         std::fs::rename(&staged, &destination)
             .with_context(|| format!("installing {}", destination.display()))?;
 
@@ -9108,8 +9116,31 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
         let mut tmp = target.as_os_str().to_os_string();
         tmp.push(".headroom-tmp");
         let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        let payload = serde_json::to_vec_pretty(&config)?;
+        // This cannot be atomic_write (the mtime re-check below has to sit
+        // between the tmp write and the rename), so it repeats what that does:
+        // keep the file's mode (it holds OAuth state; a plain create is 0644,
+        // readable by every local account) and fsync before the rename, so a
+        // crash cannot publish a zero-length ~/.claude.json.
+        #[cfg(unix)]
+        let keep_mode = std::fs::metadata(&target).ok().map(|meta| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
+        });
+        let write_tmp = || -> std::io::Result<()> {
+            // direct-write: tmp half of a mtime-checked publish; see above
+            let mut f = std::fs::File::create(&tmp)?;
+            #[cfg(unix)]
+            if let Some(perms) = &keep_mode {
+                let _ = f.set_permissions(perms.clone());
+            }
+            f.write_all(&payload)?;
+            f.sync_all()
+        };
+        if let Err(err) = write_tmp() {
+            let _ = std::fs::remove_file(&tmp); // don't leak a partial tmp
+            return Err(err).with_context(|| format!("writing {}", tmp.display()));
+        }
 
         if modified_time(path) != seen_modified && attempt + 1 < MAX_ATTEMPTS {
             // Claude Code wrote while we worked — merge against the new
@@ -9117,6 +9148,7 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             let _ = std::fs::remove_file(&tmp);
             continue;
         }
+        // direct-write: rename half of the mtime-checked publish above
         return std::fs::rename(&tmp, &target)
             .with_context(|| format!("renaming {} into place", tmp.display()));
     }
@@ -10508,6 +10540,7 @@ fn rotate_log_if_large(path: &Path) {
     if too_big {
         let backup = path.with_extension("log.old");
         let _ = std::fs::remove_file(&backup);
+        // direct-write: rotates Headroom's own log; a rename, not a rewrite
         let _ = std::fs::rename(path, &backup);
     }
 }
@@ -10984,6 +11017,7 @@ where
                 .with_context(|| format!("downloading {}", url))?;
 
             let total_bytes = response.content_length();
+            // direct-write: download staging in Headroom's cache, sha256-verified before the rename
             let mut file = std::fs::File::create(&tmp_path)
                 .with_context(|| format!("creating {}", tmp_path.display()))?;
             let mut hasher = Sha256::new();
@@ -11025,6 +11059,7 @@ where
                 }
             }
 
+            // direct-write: download staging in Headroom's cache, sha256-verified before the rename
             std::fs::rename(&tmp_path, destination).with_context(|| {
                 format!(
                     "renaming {} to {}",
@@ -20020,7 +20055,6 @@ exit 0
         assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
     }
 
-    #[cfg(unix)]
     #[test]
     fn claude_json_write_keeps_a_symlinked_file_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
@@ -20029,7 +20063,12 @@ exit 0
         let real = dotfiles.join("claude.json");
         fs::write(&real, r#"{"oauthAccount":{"id":"abc"}}"#).unwrap();
         let link = dir.path().join(".claude.json");
-        std::os::unix::fs::symlink("dotfiles/claude.json", &link).unwrap();
+        if !crate::client_adapters::symlink_file_or_skip(
+            &Path::new("dotfiles").join("claude.json"),
+            &link,
+        ) {
+            return;
+        }
 
         super::write_headroom_to_claude_json_at(&link, Path::new("/bin/headroom"), "http://p")
             .unwrap();
@@ -20047,6 +20086,26 @@ exit 0
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(repo, vec!["claude.json".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_json_write_keeps_the_files_mode() {
+        // ~/.claude.json holds OAuth state: a rewrite must not widen a 0600
+        // file to the 0644 a plain create gets.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, r#"{"oauthAccount":{"id":"abc"}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
     }
 
     fn pip_failure(stderr: &str) -> anyhow::Error {

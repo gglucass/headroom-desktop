@@ -61,6 +61,7 @@ impl FileLogger {
         *guard = None;
         let backup = self.path.with_extension("log.old");
         let _ = fs::remove_file(&backup);
+        // direct-write: rotates Headroom's own log; a rename, not a rewrite
         let _ = fs::rename(&self.path, &backup);
         if let Ok(f) = OpenOptions::new()
             .create(true)

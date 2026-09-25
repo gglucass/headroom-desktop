@@ -39,7 +39,7 @@ The 0.9.4 prefix-replay regression cost every upgraded user ~17pp of their input
 
 ## Persistence Rules
 Most stability bugs in this codebase's history were violations of one of these five. Follow them for any new code; treat violations found in existing code as bugs.
-- Anything persisted uses `client_adapters::atomic_write` (tmp+rename), never plain `fs::write`. Crash mid-write must not truncate state.
+- Anything persisted uses `client_adapters::atomic_write` (tmp+rename), never plain `fs::write`. Crash mid-write must not truncate state, and a rewrite must keep the file's mode and write THROUGH a symlink (a hand-rolled rename replaced dotfiles-managed `~/.zprofile` and `~/.claude.json` links with regular files, silently). CI's `scripts/check-direct-writes.py` fails any other `fs::write`/`fs::rename`/`File::create` in non-test code unless it carries `// direct-write: <reason>`; only Headroom's own files qualify.
 - Anything versioned/deserialized carries `#[serde(default)]` (container-level where possible). One added required field must not wipe a user's history. On parse/schema failure: back the file up and log, never silently overwrite; salvage format-agnostic fields where possible.
 - Anything appended (logs, JSONL) has a size cap or rotation from day one.
 - Never kill a pid resolved from a port without verifying its identity (argv/process name) first.
