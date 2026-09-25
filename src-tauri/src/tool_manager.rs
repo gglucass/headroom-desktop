@@ -3804,18 +3804,33 @@ impl ToolManager {
                 // override, not three separate reads of a cache another thread
                 // could republish in between.
                 let upstream_env = upstream_spawn_env(&crate::upstream_override::get());
-                let sitecustomize_injected =
-                    match std::fs::create_dir_all(&inject_dir).and_then(|_| {
-                        std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
-                    }) {
-                        Ok(()) => true,
-                        Err(err) => {
-                            log::warn!(
-                                "[tool_manager] writing pyinject/sitecustomize.py failed: {err}"
-                            );
-                            false
+                // Unchanged content is left alone, and a change is published
+                // tmp+rename: a scanner holding the file (os error 32 on
+                // Windows) used to fail this write on every spawn, which
+                // dropped PYTHONPATH and with it every sitecustomize vendor,
+                // though the file on disk was already correct.
+                let sitecustomize_path = inject_dir.join("sitecustomize.py");
+                let sitecustomize_injected = match std::fs::create_dir_all(&inject_dir)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|_| {
+                        if std::fs::read(&sitecustomize_path).ok().as_deref()
+                            == Some(SITECUSTOMIZE_PY.as_bytes())
+                        {
+                            return Ok(());
                         }
-                    };
+                        crate::client_adapters::atomic_write(
+                            &sitecustomize_path,
+                            SITECUSTOMIZE_PY.as_bytes(),
+                        )
+                    }) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        log::warn!(
+                            "[tool_manager] writing pyinject/sitecustomize.py failed: {err}"
+                        );
+                        false
+                    }
+                };
 
                 // Drop control samples left by the abandoned 1% holdout before
                 // the 3% one starts filling the arm. One shot, stamped: from
@@ -5097,10 +5112,14 @@ impl ToolManager {
             percent: 40,
         });
 
+        // Both callers run with the proxy down (upgrade, launch self-heal),
+        // but Claude Code's `headroom mcp serve` servers hold .pyd files this
+        // `--upgrade` replaces, failing every retry on Windows.
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         let deps_start = Instant::now();
         let progress_ref = std::cell::RefCell::new(&mut progress);
         let mut dep_counter: u32 = 0;
-        run_pip_install_with_retries_streaming(
+        run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -5120,6 +5139,7 @@ impl ToolManager {
                 lock_path.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
             |line| {
                 if let Some(update) = pip_line_to_progress(
                     line,
@@ -6115,7 +6135,16 @@ impl ToolManager {
     }
 
     fn clear_upgrade_marker(&self) {
-        let _ = std::fs::remove_file(self.upgrade_marker_path());
+        // A marker that survives a committed upgrade is read at the next
+        // check as an interrupted one, and in-place recovery then force-
+        // reinstalls the PREVIOUS version: a silent downgrade. Retry the
+        // transient Windows denials a scanner causes.
+        let path = self.upgrade_marker_path();
+        match crate::client_adapters::retry_transient_denied(|| std::fs::remove_file(&path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => log::warn!("clearing upgrade marker {} failed: {err}", path.display()),
+        }
     }
 
     /// Inspect disk state for the signature of an interrupted previous upgrade
@@ -6292,7 +6321,9 @@ impl ToolManager {
         // previous upgrade. recover_from_interrupted_upgrade above has
         // already handled any backup that belongs to an in-flight upgrade.
         if backup_dir.exists() {
-            if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
+            if let Err(err) = Self::retry_fs("removing stale venv backup", || {
+                std::fs::remove_dir_all(&backup_dir)
+            }) {
                 return UpgradeOutcome::InstallFailed {
                     restored: false,
                     error: anyhow!(
@@ -6330,7 +6361,14 @@ impl ToolManager {
                     error: err.context("writing upgrade-in-progress marker"),
                 };
             }
-            if let Err(err) = std::fs::rename(&venv_dir, &backup_dir) {
+            // The sweep at the top of this function predates recovery and
+            // the stale-backup purge (seconds on a big venv); a Claude Code
+            // session started since holds files and fails the directory
+            // rename with os error 5 ("failed to move ... aside").
+            crate::state::kill_venv_lock_holders(&venv_dir);
+            if let Err(err) = Self::retry_fs("moving venv aside", || {
+                std::fs::rename(&venv_dir, &backup_dir)
+            }) {
                 self.clear_upgrade_marker();
                 return UpgradeOutcome::InstallFailed {
                     restored: false,
@@ -6867,7 +6905,7 @@ impl ToolManager {
         // "requires N.N.N" errors across attempts. Force-reinstalling pydantic
         // collapses the duplicates so the next pin we apply actually matches
         // what pydantic asks for.
-        run_pip_install_with_retries(
+        run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -6885,11 +6923,13 @@ impl ToolManager {
                 "pydantic",
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
+            |_| {},
         )
         .with_context(|| "reinstalling pydantic to clear duplicate dist-info")?;
 
         let spec = format!("pydantic-core=={target_version}");
-        run_pip_install_with_retries(
+        run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -6907,6 +6947,8 @@ impl ToolManager {
                 &spec,
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
+            |_| {},
         )
         .with_context(|| format!("reinstalling pydantic-core=={target_version}"))
     }
@@ -7032,9 +7074,16 @@ impl ToolManager {
     /// upgrade failure path and from the post-boot-validation rollback path.
     /// Returns true if the restore succeeded.
     fn rollback_partial_upgrade(&self, had_live_venv: bool, had_receipt: bool) -> bool {
-        // Remove any partial new venv.
+        // Remove any partial new venv. Sweep first: an MCP server a Claude
+        // Code session spawned off the NEW venv holds files in it, and the
+        // remove failing here is the restored=false that bricks the runtime.
+        // Retried: Windows releases a killed process's handles a beat late,
+        // and scanners hold freshly written .pyd files.
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         if self.runtime.venv_dir.exists() {
-            if let Err(err) = std::fs::remove_dir_all(&self.runtime.venv_dir) {
+            if let Err(err) = Self::retry_fs("removing partial venv", || {
+                std::fs::remove_dir_all(&self.runtime.venv_dir)
+            }) {
                 log::error!(
                     "rollback: failed to remove partial venv at {}: {err}",
                     self.runtime.venv_dir.display()
@@ -7072,7 +7121,9 @@ impl ToolManager {
         if !backup_dir.exists() {
             return true;
         }
-        match std::fs::rename(&backup_dir, &self.runtime.venv_dir) {
+        match Self::retry_fs("restoring venv from backup", || {
+            std::fs::rename(&backup_dir, &self.runtime.venv_dir)
+        }) {
             Ok(()) => true,
             Err(err) => {
                 log::error!(
@@ -7420,8 +7471,30 @@ impl ToolManager {
                 .with_context(|| format!("chmod {}", staged.display()))?;
         }
 
-        std::fs::rename(&staged, &destination)
-            .with_context(|| format!("renaming {} into place", staged.display()))?;
+        // Windows cannot replace a running exe (the PreToolUse hook runs rtk
+        // on nearly every agent Bash command), but it can rename one. Move the
+        // old binary aside first; the `.old` is reaped on the next upgrade
+        // (a still-running one just stays until then).
+        let mut aside = destination.as_os_str().to_os_string();
+        aside.push(".old");
+        let aside = PathBuf::from(aside);
+        let moved_aside = cfg!(windows) && destination.exists();
+        if moved_aside {
+            let _ = std::fs::remove_file(&aside);
+            crate::client_adapters::retry_transient_denied(|| {
+                std::fs::rename(&destination, &aside)
+            })
+            .with_context(|| format!("moving {} aside", destination.display()))?;
+        }
+        if let Err(err) = crate::client_adapters::retry_transient_denied(|| {
+            std::fs::rename(&staged, &destination)
+        }) {
+            // Never leave the hook without an rtk: put the old one back.
+            if moved_aside {
+                let _ = std::fs::rename(&aside, &destination);
+            }
+            return Err(anyhow!("renaming {} into place: {err}", staged.display()));
+        }
 
         self.write_tool_receipt(
             "rtk",
@@ -9117,8 +9190,14 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             let _ = std::fs::remove_file(&tmp);
             continue;
         }
-        return std::fs::rename(&tmp, &target)
-            .with_context(|| format!("renaming {} into place", tmp.display()));
+        // Same transient-denial retry as atomic_write: Claude Code rewrites
+        // this file constantly and scanners hold it, so on Windows a bare
+        // rename fails os error 5/32 and the MCP registration errors out.
+        return crate::client_adapters::retry_transient_denied(|| std::fs::rename(&tmp, &target))
+            .map_err(|err| {
+                let _ = std::fs::remove_file(&tmp);
+                anyhow!("renaming {} into place: {err}", tmp.display())
+            });
     }
     unreachable!("loop always returns")
 }
@@ -9268,6 +9347,18 @@ fn settle_unowned_port(
     last
 }
 
+/// Prefix for a powershell script whose stdout we read back as text. Windows
+/// PowerShell 5.1 writes piped output in the OEM code page, so a non-ASCII
+/// username (`C:\Users\Jöran`) came back mangled through `from_utf8_lossy`
+/// and every path identity check against it failed: port reclaim refused to
+/// kill our own orphan, and the proxy drifted to fallback ports. BOM-less on
+/// purpose: `[Text.Encoding]::UTF8` can prepend EF BB BF to piped output, which
+/// would break the same comparisons. If a locked-down host rejects the
+/// assignment, the statement after it still runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PS_UTF8_OUTPUT: &str =
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; ";
+
 /// True when `pid`'s full command line looks like Headroom's managed backend
 /// (venv python under the Headroom app-support tree, or anything
 /// headroom-branded). Guards port reclaim from killing an unrelated process
@@ -9284,7 +9375,9 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+                &format!(
+                    "{PS_UTF8_OUTPUT}(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"
+                ),
             ])
             .output()
         else {
@@ -9812,7 +9905,9 @@ fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+                &format!(
+                    "{PS_UTF8_OUTPUT}(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"
+                ),
             ])
             .output()
         else {
@@ -10433,7 +10528,9 @@ fn ps_command_uncached(pid: u32) -> Option<String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"),
+            &format!(
+                "{PS_UTF8_OUTPUT}(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
+            ),
         ])
         .output()
         .ok()?;
@@ -12128,6 +12225,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
 /// can fail the whole bootstrap (see Sentry bootstrap_failed reports). We
 /// retry the full invocation; pip's cachecontrol layer persists partial
 /// responses so retries resume cheaply instead of redownloading from zero.
+#[cfg(test)]
 fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     run_pip_install_with_retries_streaming(python, args, cwd, |_| {})
 }
