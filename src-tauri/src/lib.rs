@@ -7746,7 +7746,7 @@ fn execute_headroom_learn_run(
     // A learn run lasts up to 15 minutes off Scripts\headroom.exe; mid-upgrade
     // it would hold the files pip replaces and then be killed by the venv
     // sweep with nothing to show for it.
-    if let Err(message) = refuse_venv_cli_during_upgrade(&state) {
+    if let Err(message) = refuse_venv_cli_during_upgrade(state) {
         return HeadroomLearnRunResult {
             success: false,
             summary: format!("headroom learn skipped for {project_name}."),
