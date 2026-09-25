@@ -2582,6 +2582,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
     });
     let mut write_tmp = || -> std::io::Result<()> {
+        // direct-write: this is atomic_write
         let mut f = std::fs::File::create(&tmp_path)?;
         // Before any byte lands, so the contents never sit under a wider mode.
         // Best effort: a filesystem without Unix modes (vfat, some network
@@ -2606,6 +2607,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
+    // direct-write: this is atomic_write
     rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
         |err| {
             let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
@@ -2648,6 +2650,27 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> PathBuf {
         };
     }
     current
+}
+
+/// Test helper: creates a file symlink, or returns false where the OS refuses.
+/// Windows needs Developer Mode or an elevated shell to create one, so a local
+/// Windows run skips; CI must not, since a silent skip there would hide the
+/// only Windows coverage of `resolve_symlink_chain` (the runners can create
+/// links, so a refusal on CI is a failure).
+#[cfg(test)]
+pub(crate) fn symlink_file_or_skip(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(target, link);
+    match result {
+        Ok(()) => true,
+        Err(err) if cfg!(windows) && std::env::var_os("CI").is_none() => {
+            eprintln!("skipping: cannot create symlinks here ({err})");
+            false
+        }
+        Err(err) => panic!("creating symlink {}: {err}", link.display()),
+    }
 }
 
 /// Renames a freshly written tmp into place, rewriting it once if it vanished.
@@ -2702,6 +2725,7 @@ fn is_transient_denied(err: &std::io::Error) -> bool {
 /// Windows let the fresh default state persist over the only copy of a user's
 /// savings history, which is exactly what the backup exists to prevent.
 pub(crate) fn move_aside(path: &Path, dest: &Path) -> std::io::Result<()> {
+    // direct-write: moves Headroom's own unparsable state aside, never a user file
     match retry_transient_denied(|| std::fs::rename(path, dest)) {
         Ok(()) => Ok(()),
         Err(rename_err) => std::fs::copy(path, dest).map(|_| ()).map_err(|copy_err| {
@@ -14048,7 +14072,6 @@ sys.exit(3)
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn managed_block_writes_through_a_symlinked_profile() {
         // A dotfiles-managed `~/.zprofile -> dotfiles/zprofile` must stay a
@@ -14060,11 +14083,16 @@ sys.exit(3)
         std::fs::create_dir_all(real.parent().unwrap()).unwrap();
         std::fs::write(&real, "export FOO=1\n").unwrap();
         let hop = dir.path().join("hop");
-        std::os::unix::fs::symlink("dotfiles/zprofile", &hop).unwrap();
+        if !super::symlink_file_or_skip(&Path::new("dotfiles").join("zprofile"), &hop) {
+            return;
+        }
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let link = home.join(".zprofile");
-        std::os::unix::fs::symlink("../hop", &link).unwrap();
+        assert!(super::symlink_file_or_skip(
+            &Path::new("..").join("hop"),
+            &link
+        ));
 
         let (changed, _) = super::upsert_managed_block(&link, "test", "export BAR=2").unwrap();
         assert!(changed);
@@ -14095,13 +14123,14 @@ sys.exit(3)
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "export FOO=1\n");
     }
 
-    #[cfg(unix)]
     #[test]
     fn atomic_write_through_a_dangling_symlink_creates_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("missing");
         let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if !super::symlink_file_or_skip(&target, &link) {
+            return;
+        }
         super::atomic_write(&link, b"x").unwrap();
         assert!(std::fs::symlink_metadata(&link)
             .unwrap()
@@ -14110,7 +14139,6 @@ sys.exit(3)
         assert_eq!(std::fs::read(&target).unwrap(), b"x");
     }
 
-    #[cfg(unix)]
     #[test]
     fn atomic_write_on_a_symlink_cycle_still_writes() {
         // A cycle cannot be followed; fall back to replacing the link rather
@@ -14118,8 +14146,10 @@ sys.exit(3)
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
-        std::os::unix::fs::symlink(&b, &a).unwrap();
-        std::os::unix::fs::symlink(&a, &b).unwrap();
+        if !super::symlink_file_or_skip(&b, &a) {
+            return;
+        }
+        assert!(super::symlink_file_or_skip(&a, &b));
         super::atomic_write(&a, b"x").unwrap();
     }
 

@@ -66,6 +66,7 @@ impl Store {
                     // Never silently overwrite a file we failed to parse:
                     // back it up so a truncation bug stays diagnosable.
                     log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
+                    // direct-write: moves Headroom's own unparsable state aside, never a user file
                     let _ = std::fs::rename(&path, path.with_extension("json.bak"));
                     BTreeMap::new()
                 }

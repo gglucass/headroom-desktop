@@ -1188,6 +1188,7 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 #[cfg(target_os = "macos")]
 fn dir_is_read_only(dir: &std::path::Path) -> bool {
     let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
+    // direct-write: throwaway write probe, removed right after
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -8294,6 +8295,7 @@ fn execute_headroom_learn_run(
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // direct-write: Headroom's own per-run learn log, overwritten each run
     let _ = std::fs::write(log_path, log_content);
 
     HeadroomLearnRunResult {
@@ -8860,6 +8862,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         if marker.exists() {
                             log::info!("tiktoken prefetch failed (repeat): {err:#}");
                         } else {
+                            // direct-write: Headroom's own marker; only its existence matters
                             let _ = std::fs::write(&marker, b"1");
                             log::warn!("tiktoken prefetch failed: {err:#}");
                         }

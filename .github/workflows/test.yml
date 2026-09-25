@@ -42,6 +42,14 @@ jobs:
         # since we pipe stdio) console. See src-tauri/src/proc.rs.
         run: ./scripts/check-no-console.sh
 
+      - name: Persisted writes route through atomic_write
+        # A hand-rolled write/rename silently replaces a symlinked dotfile with
+        # a regular file (no error, so nothing reaches Sentry), and can widen a
+        # 0600 file or publish a truncated one on crash. atomic_write handles
+        # all three; any other direct write must say why. The check reads the
+        # code, not the OS, so this one job covers macOS and Windows too.
+        run: python scripts/check-direct-writes.py
+
       - name: No new raw colors in component CSS
         # Ratchet, not a clean gate: styles.css carries a token-migration
         # backlog, so the script fails only when the count grows. Dark mode is

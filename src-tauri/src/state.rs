@@ -5870,6 +5870,7 @@ impl SavingsTracker {
             .unwrap_or(false)
         {
             let rotated = self.records_path.with_extension("jsonl.1");
+            // direct-write: rotates Headroom's own log; a rename, not a rewrite
             let _ = std::fs::rename(&self.records_path, rotated);
         }
         let mut file = std::fs::OpenOptions::new()

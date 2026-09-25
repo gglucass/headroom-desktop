@@ -148,6 +148,7 @@ fn load_tracking() -> Tracking {
     };
     serde_json::from_slice(&bytes).unwrap_or_else(|err| {
         log::warn!("{TRACKING_FILE} is corrupt ({err}); backing up and starting fresh");
+        // direct-write: moves Headroom's own unparsable state aside, never a user file
         let _ = std::fs::rename(&path, path.with_extension("json.bak"));
         Tracking::default()
     })
@@ -223,7 +224,7 @@ fn run_cli(editor: &Editor, args: &[&std::ffi::OsStr]) -> Result<()> {
 
 fn install(editor: &Editor, state_path: &Path) -> Result<()> {
     let vsix = std::env::temp_dir().join(format!("headroom-status-{}.vsix", std::process::id()));
-    // A throwaway input for the CLI, deleted right after: not persisted state.
+    // direct-write: a throwaway CLI input, deleted right after; not persisted state.
     std::fs::write(&vsix, build_vsix(state_path)?)
         .with_context(|| format!("writing {}", vsix.display()))?;
     let result = run_cli(

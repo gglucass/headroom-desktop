@@ -87,11 +87,13 @@ fn load(path: &Path) -> BTreeMap<String, Session> {
                 "{FILE_NAME} has schema {} (expected {SCHEMA_VERSION}); backing up and starting fresh",
                 persisted.schema_version
             );
+            // direct-write: moves Headroom's own unparsable state aside, never a user file
             let _ = std::fs::rename(path, path.with_extension("json.bak"));
             BTreeMap::new()
         }
         Err(err) => {
             log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
+            // direct-write: moves Headroom's own unparsable state aside, never a user file
             let _ = std::fs::rename(path, path.with_extension("json.bak"));
             BTreeMap::new()
         }
