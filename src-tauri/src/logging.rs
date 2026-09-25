@@ -529,6 +529,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Same for a timed-out sweep: stop_headroom captures it once per stop
+    // under `proxy_sweep_timed_out`.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with(
+            "failed to clean detached headroom proxy processes: powershell sweep timed out",
+        )
+    {
+        return true;
+    }
     // Stopping without the lifecycle lock is the DESIGNED path, not a failure:
     // `stop_headroom` deliberately caps its wait so a quit racing a launch can
     // never hang the app with the window stuck on "Restarting...". The pkill
@@ -1186,6 +1195,11 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "failed to clean detached headroom proxy processes: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+        // Same for a timed-out sweep (captured as proxy_sweep_timed_out).
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell sweep timed out after 20s for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
         ));
     }
 

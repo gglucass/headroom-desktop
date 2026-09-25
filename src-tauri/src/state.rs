@@ -1051,6 +1051,12 @@ impl AppState {
         // Before the stop, so a spawn already queued on the lifecycle lock
         // re-reads it after the stop and stands down.
         let install_guard = UpgradeInstallGuard::engage(self);
+        // Barrier: wait out a start already inside ensure_headroom_running
+        // (tray click, watchdog restart). stop_headroom gives up on the lock
+        // after 2s and spares that start's child as a sibling's, and the
+        // start's own repair branch then ran a second pip into this venv
+        // beside ours. Every start after this sees the flag and stands down.
+        drop(self.lifecycle_lock.lock());
         self.stop_headroom();
 
         analytics::track_event(
@@ -1391,6 +1397,7 @@ impl AppState {
         };
 
         let rollback_guard = UpgradeInstallGuard::engage(self);
+        drop(self.lifecycle_lock.lock());
         self.stop_headroom();
         let rollback_result = if needs_commit_or_rollback {
             self.tool_manager.rollback_headroom_upgrade()
@@ -3741,6 +3748,23 @@ impl AppState {
                     );
                     break;
                 }
+                // A wedged WMI wedges every pattern's query alike: stop after
+                // the first timeout instead of paying it once per pattern on
+                // the quit path.
+                if detail.contains("powershell sweep timed out") {
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_fingerprint(Some(&["proxy_sweep_timed_out"]));
+                        },
+                        || {
+                            sentry::capture_message(
+                                "stop_headroom: powershell process sweep timed out; sweep skipped",
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
+                    break;
+                }
             }
         }
         log::info!("stop_headroom: done");
@@ -4608,8 +4632,7 @@ impl LaunchProfile {
                         "launch profile at {} unreadable ({err}); backing up and starting fresh",
                         path.display()
                     );
-                    // direct-write: moves Headroom's own unparsable state aside, never a user file
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                    let _ = crate::client_adapters::move_aside(&path, &path.with_extension("json.corrupt"));
                     Self::fresh()
                 })
         } else {
@@ -4987,8 +5010,7 @@ impl SavingsTracker {
             Ok(state) => state,
             Err(err) => {
                 log::warn!("savings-state.json unreadable ({err}); backing up");
-                // direct-write: moves Headroom's own unparsable state aside, never a user file
-                let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
+                let _ = crate::client_adapters::move_aside(&state_path, &state_path.with_extension("json.corrupt"));
                 None
             }
         }
@@ -6196,8 +6218,8 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
             path.display(),
             persisted.schema_version
         );
-        // direct-write: moves Headroom's own unparsable state aside, never a user file
-        let _ = std::fs::rename(path, path.with_extension("json.schema-mismatch"));
+        let _ =
+            crate::client_adapters::move_aside(path, &path.with_extension("json.schema-mismatch"));
         Ok(None)
     }
 }
@@ -8618,6 +8640,13 @@ pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const PS_SWEEP_ENUMERATION_FAILED: i32 = 3;
 
+/// Deadline for one process-sweep powershell. A healthy run is ~1s warm and a
+/// few seconds cold; this only has to be long enough never to cut a slow but
+/// working WMI short, and short enough that quit and upgrade stay usable when
+/// WMI is wedged.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PS_SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Escape a value for use inside a single-quoted PowerShell `-like` pattern.
 /// `[`/`]` are wildcard metacharacters to `-like`, and an embedded `'` would
 /// close the string literal early -- a Windows username containing `'` could
@@ -8821,15 +8850,30 @@ fn kill_processes_by_command_pattern(
     #[cfg(target_os = "windows")]
     {
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
-        let status = crate::proc::command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .status()
-            .with_context(|| {
-                format!(
-                    "running powershell kill for exe '{}' args '{args_pattern}'",
+        let mut command = crate::proc::command("powershell");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        // Bounded: this runs on quit (UI thread via restart_app), in the
+        // updater's before-exit hook and ahead of every upgrade. A wedged WMI
+        // (winmgmt stuck, corrupt repository) or an AMSI/AV stall left
+        // `.status()` waiting forever: "Not responding" on quit, the update
+        // installer never launched, the upgrade stuck on "Preparing update".
+        let status = match crate::proc::output_with_timeout(command, PS_SWEEP_TIMEOUT) {
+            Ok(output) => output.status,
+            Err(crate::proc::OutputError::TimedOut) => {
+                return Err(anyhow!(
+                    "powershell sweep timed out after {}s for exe '{}' args '{}'",
+                    PS_SWEEP_TIMEOUT.as_secs(),
+                    exe.display(),
+                    args_pattern
+                ));
+            }
+            Err(crate::proc::OutputError::Spawn(err)) => {
+                return Err(anyhow!(
+                    "running powershell kill for exe '{}' args '{args_pattern}': {err}",
                     exe.display()
-                )
-            })?;
+                ));
+            }
+        };
 
         if status.success() {
             return Ok(());

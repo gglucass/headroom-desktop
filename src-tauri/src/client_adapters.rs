@@ -1867,9 +1867,32 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
 /// footprint (the app-support dir or `~/.headroom`). Uninstall deletes both,
 /// so a surviving entry could only ever spawn a failing server.
 fn mcp_command_in_headroom_footprint(command: &str) -> bool {
-    let app_dir = format!("{}/", app_data_dir().display());
-    let dot_headroom = format!("{}/", home_dir().join(".headroom").display());
-    command.starts_with(&app_dir) || command.starts_with(&dot_headroom)
+    command_under_dir(command, &app_data_dir())
+        || command_under_dir(command, &home_dir().join(".headroom"))
+}
+
+/// Is `command` a path inside `dir`? A literal `format!("{dir}/")` prefix never
+/// matched on Windows, where the configs hold `C:\Users\...\serena.exe` with
+/// backslashes and any drive-letter/user casing, so uninstall left entries
+/// pointing at deleted executables in every Claude session.
+fn command_under_dir(command: &str, dir: &Path) -> bool {
+    command_under_dir_for(command, &dir.display().to_string(), cfg!(windows))
+}
+
+fn command_under_dir_for(command: &str, dir: &str, windows: bool) -> bool {
+    let norm = |s: &str| {
+        if windows {
+            s.replace('/', "\\").to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let sep = if windows { '\\' } else { '/' };
+    let mut prefix = norm(dir);
+    if !prefix.ends_with(sep) {
+        prefix.push(sep);
+    }
+    norm(command).starts_with(&prefix)
 }
 
 /// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
@@ -2696,6 +2719,24 @@ fn is_transient_denied(err: &std::io::Error) -> bool {
         || (cfg!(windows) && err.raw_os_error() == Some(32))
 }
 
+/// Move `path` to `dest` so the next write cannot destroy it. The rename is
+/// retried through the transient Windows denials a scanner causes, and when
+/// it still fails the file is COPIED instead: a bare rename failing on
+/// Windows let the fresh default state persist over the only copy of a user's
+/// savings history, which is exactly what the backup exists to prevent.
+pub(crate) fn move_aside(path: &Path, dest: &Path) -> std::io::Result<()> {
+    // direct-write: moves Headroom's own unparsable state aside, never a user file
+    match retry_transient_denied(|| std::fs::rename(path, dest)) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => std::fs::copy(path, dest).map(|_| ()).map_err(|copy_err| {
+            std::io::Error::new(
+                copy_err.kind(),
+                format!("rename failed ({rename_err}); copy failed ({copy_err})"),
+            )
+        }),
+    }
+}
+
 /// Move an unparsable state file aside instead of letting the next write
 /// silently overwrite it. Single fixed `.corrupt` slot per file, so repeated
 /// failures overwrite each other rather than growing without bound.
@@ -2707,8 +2748,7 @@ pub(crate) fn quarantine_unparsable(path: &Path, reason: &str) {
     let mut s = path.as_os_str().to_os_string();
     s.push(".corrupt");
     let dest = PathBuf::from(s);
-    // direct-write: moves Headroom's own unparsable state aside, never a user file
-    match std::fs::rename(path, &dest) {
+    match move_aside(path, &dest) {
         Ok(()) => log::warn!(
             "quarantined unparsable {} -> {} ({reason})",
             path.display(),
@@ -13055,6 +13095,54 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         });
         assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn command_under_dir_matches_windows_paths_by_separator_and_case() {
+        let dir = r"C:\Users\Jo\AppData\Local\Headroom";
+        // What Claude's config actually holds on Windows: backslashes, and
+        // whatever casing the writer used. The old `format!("{dir}/")` prefix
+        // matched none of these, so uninstall left them behind.
+        assert!(super::command_under_dir_for(
+            r"C:\Users\Jo\AppData\Local\Headroom\tools\serena\serena.exe",
+            dir,
+            true
+        ));
+        assert!(super::command_under_dir_for(
+            "c:/users/jo/appdata/local/headroom/tools/serena/serena.exe",
+            dir,
+            true
+        ));
+        // A sibling that merely shares the prefix is not inside the footprint.
+        assert!(!super::command_under_dir_for(
+            r"C:\Users\Jo\AppData\Local\HeadroomOther\x.exe",
+            dir,
+            true
+        ));
+        // Unix stays exact: case matters there.
+        assert!(super::command_under_dir_for(
+            "/Users/jo/.headroom/bin/x",
+            "/Users/jo/.headroom",
+            false
+        ));
+        assert!(!super::command_under_dir_for(
+            "/Users/jo/.HEADROOM/bin/x",
+            "/Users/jo/.headroom",
+            false
+        ));
+    }
+
+    #[test]
+    fn move_aside_moves_the_file_and_keeps_its_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("savings-state.json");
+        let dest = dir.path().join("savings-state.json.corrupt");
+        std::fs::write(&path, b"{history}").expect("seed");
+        super::move_aside(&path, &dest).expect("move aside");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&dest).expect("backup"), b"{history}");
+        // A missing source is an error, not a silent success.
+        assert!(super::move_aside(&path, &dest).is_err());
     }
 
     #[cfg(windows)]
