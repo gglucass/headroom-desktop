@@ -998,7 +998,11 @@ async fn install_app_update(
     // bundle transfer for nothing.
     #[cfg(target_os = "macos")]
     if bundle_is_read_only() {
-        log::warn!("update: refusing in-place install; the bundle folder is read-only");
+        // Info, not warn: running off the DMG / translocated is the user's
+        // setup, not a defect, and the returned message already tells them
+        // the fix. Every quiet background install re-hit this and the bridge
+        // filed it as an escalating error (RUST-9J, RUST-JM).
+        log::info!("update: refusing in-place install; the bundle folder is read-only");
         log::info!(
             "update: read-only bundle path {:?}",
             current_app_bundle_path()

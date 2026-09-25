@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import * as Sentry from "@sentry/react";
+
+vi.mock("@sentry/react", () => ({
+  captureException: vi.fn(),
+}));
 
 import type { AppUpdateConfiguration, AvailableAppUpdate } from "./types";
 import {
@@ -388,6 +393,29 @@ describe("app update helpers", () => {
     expect(result).toEqual({
       statusCopy: "Could not download the update: the connection dropped. Try again.",
     });
+  });
+
+  it("shows the read-only-bundle refusal without reporting it (RUST-JK)", async () => {
+    const readOnly =
+      "Headroom cannot update itself because it is running from a read-only folder. " +
+      "If you opened it straight from the disk image, drag Headroom to your " +
+      "Applications folder and open it from there, then check for updates again.";
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      quiet: true,
+      invokeFn: vi.fn().mockRejectedValueOnce(readOnly),
+    });
+
+    expect(result).toEqual({ statusCopy: readOnly });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
+    await runAppUpdateInstall({
+      availableUpdate,
+      invokeFn: vi.fn().mockRejectedValueOnce("permission denied"),
+    });
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
 
   it("re-checks and retries once when the staged update was already consumed", async () => {

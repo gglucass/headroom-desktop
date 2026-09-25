@@ -6625,7 +6625,7 @@ impl ToolManager {
             let deps_start = std::time::Instant::now();
             let deps_progress_ref = std::cell::RefCell::new(&mut progress);
             let mut dep_counter: u32 = 0;
-            if let Err(err) = run_pip_install_with_retries_streaming(
+            if let Err(err) = run_pip_install_with_retries_clearing_locks(
                 &self.runtime.managed_python(),
                 &[
                     "-m",
@@ -6645,6 +6645,7 @@ impl ToolManager {
                     lock_path.to_string_lossy().as_ref(),
                 ],
                 &self.runtime.root_dir,
+                &self.runtime.venv_dir,
                 |line| {
                     pip_capture.borrow_mut().push(line);
                     if let Some(update) = pip_line_to_progress(
@@ -6713,7 +6714,12 @@ impl ToolManager {
         } else {
             headroom_spec.clone()
         };
-        if let Err(err) = run_pip_install_with_retries_streaming(
+        // The dependency pass above can run for minutes, and the sweep at the
+        // top of atomic_upgrade_headroom is that stale by now: an MCP server a
+        // Claude Code session spawned meanwhile holds Scripts\headroom.exe,
+        // which this --force-reinstall must replace (RUST-29).
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
+        if let Err(err) = run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -6731,6 +6737,7 @@ impl ToolManager {
                 &headroom_arg,
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
             |line| {
                 pip_capture.borrow_mut().push(line);
             },
@@ -6824,7 +6831,7 @@ impl ToolManager {
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
         let spec = format!("headroom-ai=={version}");
-        run_pip_install_with_retries(
+        run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -6842,6 +6849,8 @@ impl ToolManager {
                 &spec,
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
+            |_| {},
         )
         .with_context(|| format!("reinstalling Headroom version {version}"))
     }
@@ -6907,7 +6916,7 @@ impl ToolManager {
     /// are skipped by pip, only packages that were actually churned by the
     /// failed upgrade get reinstalled.
     fn pip_restore_deps_from_backup(&self, backup_lock: &Path) -> Result<()> {
-        run_pip_install_with_retries(
+        run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -6927,6 +6936,8 @@ impl ToolManager {
                 backup_lock.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
+            &self.runtime.venv_dir,
+            |_| {},
         )
         .with_context(|| {
             format!(
@@ -12761,6 +12772,42 @@ fn run_pip_install_with_retries_streaming<F>(
     python: &Path,
     args: &[&str],
     cwd: &Path,
+    on_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    run_pip_install_with_retries_streaming_inner(python, args, cwd, None, on_line)
+}
+
+/// `run_pip_install_with_retries_streaming` for pip runs that mutate the LIVE
+/// managed venv while the proxy is deliberately down (upgrade, rollback,
+/// wheel repair). A sharing-violation retry first re-kills whatever runs from
+/// `venv_dir`: the sweep at the start of an upgrade is minutes stale by the
+/// time the wheel lands (dependency pass first), and every Claude Code
+/// session opened in that window spawns a fresh `headroom.exe` MCP server that
+/// locks Scripts\headroom.exe. Backoff alone cannot clear a lock a live
+/// process holds (RUST-29: six attempts over 67s, then restored=false). Not
+/// for installs that run beside a live proxy (markitdown), which this would
+/// kill.
+fn run_pip_install_with_retries_clearing_locks<F>(
+    python: &Path,
+    args: &[&str],
+    cwd: &Path,
+    venv_dir: &Path,
+    on_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    run_pip_install_with_retries_streaming_inner(python, args, cwd, Some(venv_dir), on_line)
+}
+
+fn run_pip_install_with_retries_streaming_inner<F>(
+    python: &Path,
+    args: &[&str],
+    cwd: &Path,
+    lock_sweep_dir: Option<&Path>,
     mut on_line: F,
 ) -> Result<()>
 where
@@ -12804,6 +12851,11 @@ where
                 backoff.as_secs()
             );
             std::thread::sleep(backoff);
+            if let Some(venv_dir) = lock_sweep_dir {
+                if pip_failure_is_sharing_violation(&evidence) {
+                    crate::state::kill_venv_lock_holders(venv_dir);
+                }
+            }
             continue;
         }
         if crate::is_disk_full_signal(&compact) || crate::is_disk_full_signal(&format!("{err:#}")) {
