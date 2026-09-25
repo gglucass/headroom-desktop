@@ -2512,6 +2512,13 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
 /// user-owned configs (settings.json, config.toml, shell rc files) breaks the
 /// user's shell or client startup.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    // Write through a symlink, not over it. Renaming the tmp onto the link
+    // replaces the link itself with a regular file, so a dotfiles-managed
+    // `~/.zprofile -> ~/dotfiles/zprofile` silently forked into a copy and the
+    // repo never saw the edit. Resolving first also keeps the tmp beside the
+    // real file, so the rename stays on one filesystem.
+    let resolved = resolve_symlink_chain(path);
+    let path = resolved.as_path();
     // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
     // writers to the same file: A renames tmp->path, then B's rename finds its
     // tmp already consumed and fails ENOENT (Sentry RUST-3W / RUST-4W). pid +
@@ -2586,6 +2593,38 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             )
         },
     )
+}
+
+/// Follows `path` through any symlinks to the file a write should land in.
+///
+/// Hand-rolled rather than `canonicalize` so a dangling link resolves to its
+/// (missing) target instead of failing: writing through it creates the target,
+/// as `echo >> link` would. Relative targets resolve against the link's own
+/// directory. Gives up after 40 hops (the kernel's ELOOP limit) and returns the
+/// last path reached, so a link cycle degrades to the old replace-the-link
+/// behaviour instead of an error.
+pub(crate) fn resolve_symlink_chain(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map(|dir| dir.join(&target))
+                .unwrap_or(target)
+        };
+    }
+    current
 }
 
 /// Renames a freshly written tmp into place, rewriting it once if it vanished.
@@ -13919,6 +13958,81 @@ sys.exit(3)
             assert_eq!(got, mode, "mode {mode:o} was not kept");
             assert_eq!(std::fs::read(&path).unwrap(), b"new");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_block_writes_through_a_symlinked_profile() {
+        // A dotfiles-managed `~/.zprofile -> dotfiles/zprofile` must stay a
+        // link: the rename used to replace the link with a regular file, so the
+        // block landed in a fork the dotfiles repo never saw. Relative target
+        // plus a second hop covers the stow-style `../dotfiles/...` chains.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles").join("zprofile");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "export FOO=1\n").unwrap();
+        let hop = dir.path().join("hop");
+        std::os::unix::fs::symlink("dotfiles/zprofile", &hop).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join(".zprofile");
+        std::os::unix::fs::symlink("../hop", &link).unwrap();
+
+        let (changed, _) = super::upsert_managed_block(&link, "test", "export BAR=2").unwrap();
+        assert!(changed);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&hop)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let body = std::fs::read_to_string(&real).unwrap();
+        assert!(body.starts_with("export FOO=1\n"), "{body}");
+        assert!(body.contains("export BAR=2"), "{body}");
+
+        // Backups stay beside the link, never inside the dotfiles repo.
+        let repo: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(repo, vec![std::ffi::OsString::from("zprofile")]);
+
+        assert!(super::remove_managed_block(&link, "test").unwrap());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "export FOO=1\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_dangling_symlink_creates_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        super::atomic_write(&link, b"x").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_on_a_symlink_cycle_still_writes() {
+        // A cycle cannot be followed; fall back to replacing the link rather
+        // than failing the write.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        super::atomic_write(&a, b"x").unwrap();
     }
 
     #[test]

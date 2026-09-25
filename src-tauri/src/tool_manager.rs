@@ -9089,8 +9089,12 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
         let _ = crate::client_adapters::backup_if_exists(path)?;
 
         // Publish atomically (tmp + rename) so a crash mid-write can never
-        // leave a truncated ~/.claude.json behind.
-        let mut tmp = path.as_os_str().to_os_string();
+        // leave a truncated ~/.claude.json behind. Rename onto the link's
+        // target, not the link: renaming over a dotfiles-managed symlink
+        // replaced it with a regular file. The backup above stays beside the
+        // link so it never lands in the user's dotfiles repo.
+        let target = crate::client_adapters::resolve_symlink_chain(path);
+        let mut tmp = target.as_os_str().to_os_string();
         tmp.push(".headroom-tmp");
         let tmp = PathBuf::from(tmp);
         std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
@@ -9102,7 +9106,7 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             let _ = std::fs::remove_file(&tmp);
             continue;
         }
-        return std::fs::rename(&tmp, path)
+        return std::fs::rename(&tmp, &target)
             .with_context(|| format!("renaming {} into place", tmp.display()));
     }
     unreachable!("loop always returns")
@@ -19962,6 +19966,35 @@ exit 0
             .collect();
         assert!(names.iter().any(|n| n.contains(".headroom-backup-")));
         assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_json_write_keeps_a_symlinked_file_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("claude.json");
+        fs::write(&real, r#"{"oauthAccount":{"id":"abc"}}"#).unwrap();
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink("dotfiles/claude.json", &link).unwrap();
+
+        super::write_headroom_to_claude_json_at(&link, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+        assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
+        // Backup and tmp stay out of the dotfiles repo.
+        let repo: Vec<String> = fs::read_dir(&dotfiles)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(repo, vec!["claude.json".to_string()]);
     }
 
     fn pip_failure(stderr: &str) -> anyhow::Error {
