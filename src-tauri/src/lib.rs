@@ -1002,9 +1002,8 @@ async fn install_app_update(
         // setup, not a defect, and the returned message already tells them
         // the fix. Every quiet background install re-hit this and the bridge
         // filed it as an escalating error (RUST-9J, RUST-JM).
-        log::info!("update: refusing in-place install; the bundle folder is read-only");
         log::info!(
-            "update: read-only bundle path {:?}",
+            "update: refusing in-place install; read-only bundle path {:?}",
             current_app_bundle_path()
         );
         return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
