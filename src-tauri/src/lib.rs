@@ -3852,7 +3852,9 @@ fn claude_desktop_installed() -> bool {
     client_adapters::claude_desktop_installed()
 }
 
-#[tauri::command]
+// async: polled every 5s from the post-install screen, and a sync command
+// runs `tasklist` / `ps` on the main thread (Tauri 2), stuttering the UI.
+#[tauri::command(async)]
 fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize> {
     #[cfg(windows)]
     {
@@ -3891,16 +3893,19 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
 /// can offer one click instead of a copy-paste terminal round-trip. Exactly
 /// the script the panel shows for manual use; nothing is decided here, the
 /// panel re-probes connectors afterwards and the installer's own output comes
-/// back on failure. Blocking for its ~30-60s is fine: Tauri runs sync
-/// commands off the UI thread and the button holds a busy state. No timeout —
-/// a hung download leaves the button busy, which the user can abandon for the
-/// manual command sitting right under it.
-#[tauri::command]
+/// back on failure. Blocking for its ~30-60s is fine only off the UI thread:
+/// Tauri 2 runs a plain sync command ON the main thread, so it takes
+/// `command(async)` to keep the window responsive while the button holds a
+/// busy state. No timeout - a hung download leaves the button busy, which the
+/// user can abandon for the manual command sitting right under it.
+#[tauri::command(async)]
 fn install_claude_code_cli() -> Result<(), String> {
     #[cfg(windows)]
     let output = crate::proc::command("powershell")
         .args([
             "-NoProfile",
+            // No console to answer a prompt on: fail instead of waiting.
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
@@ -4706,10 +4711,24 @@ fn aggregate_live_learnings(
     Ok(out)
 }
 
+/// No `headroom.exe` CLI runs while a runtime upgrade is in flight. The
+/// activity observer's memory export fires every ~60s, so across a
+/// multi-minute upgrade it was all but certain to hold Scripts\headroom.exe
+/// (and half-installed .pyd files) against the wheel reinstall, the
+/// requirements repair and the venv swap renames on Windows (RUST-29 /
+/// RUST-6S), and to import a package mid-replacement.
+fn refuse_venv_cli_during_upgrade(state: &AppState) -> Result<(), String> {
+    if state.runtime_upgrade_in_progress() {
+        return Err("Headroom is updating its runtime; try again in a minute.".into());
+    }
+    Ok(())
+}
+
 fn memory_export_cached(state: &State<'_, AppState>, memory_path: &Path) -> Result<String, String> {
     if let Some(cached) = state.cached_memory_export() {
         return Ok(cached);
     }
+    refuse_venv_cli_during_upgrade(state)?;
     let entrypoint = state.tool_manager.headroom_entrypoint();
     let stdout = run_memory_export(&entrypoint, memory_path)?;
     state.store_memory_export(stdout.clone());
@@ -4722,6 +4741,7 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
     if !memory_path.exists() {
         return Err("Memory database does not exist.".into());
     }
+    refuse_venv_cli_during_upgrade(&state)?;
     let entrypoint = state.tool_manager.headroom_entrypoint();
     let output = crate::proc::command(&entrypoint)
         .arg("memory")
@@ -7723,6 +7743,17 @@ fn execute_headroom_learn_run(
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
+    // A learn run lasts up to 15 minutes off Scripts\headroom.exe; mid-upgrade
+    // it would hold the files pip replaces and then be killed by the venv
+    // sweep with nothing to show for it.
+    if let Err(message) = refuse_venv_cli_during_upgrade(state) {
+        return HeadroomLearnRunResult {
+            success: false,
+            summary: format!("headroom learn skipped for {project_name}."),
+            error: Some(message),
+            output_tail: Vec::new(),
+        };
+    }
     let entrypoint = state.tool_manager.headroom_entrypoint();
     if !entrypoint.exists() {
         return HeadroomLearnRunResult {
@@ -8783,9 +8814,14 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // it either observes the proxy recover or re-gives-up, which
             // reschedules the next retry with a longer backoff.
             if runtime.auto_paused {
-                let due = auto_pause_next_retry
-                    .map(|t| std::time::Instant::now() >= t)
-                    .unwrap_or(true);
+                // Not mid-upgrade: its stop_headroom would kill the proxy boot
+                // validation is waiting on and roll back a good upgrade ("Retry
+                // update" from the auto-paused state is exactly this). The
+                // upgrade owns the lifecycle until it ends; retry after.
+                let due = !state.runtime_upgrade_in_progress()
+                    && auto_pause_next_retry
+                        .map(|t| std::time::Instant::now() >= t)
+                        .unwrap_or(true);
                 if due {
                     log::info!(
                         "watchdog: auto-resume attempt (failed_attempts={auto_pause_failed}); killing wedged proxy and restarting"
