@@ -2603,7 +2603,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// directory. Gives up after 40 hops (the kernel's ELOOP limit) and returns the
 /// last path reached, so a link cycle degrades to the old replace-the-link
 /// behaviour instead of an error.
-fn resolve_symlink_chain(path: &Path) -> PathBuf {
+pub(crate) fn resolve_symlink_chain(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
         let is_link = std::fs::symlink_metadata(&current)
@@ -13991,6 +13991,13 @@ sys.exit(3)
         let body = std::fs::read_to_string(&real).unwrap();
         assert!(body.starts_with("export FOO=1\n"), "{body}");
         assert!(body.contains("export BAR=2"), "{body}");
+
+        // Backups stay beside the link, never inside the dotfiles repo.
+        let repo: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(repo, vec![std::ffi::OsString::from("zprofile")]);
 
         assert!(super::remove_managed_block(&link, "test").unwrap());
         assert!(std::fs::symlink_metadata(&link)
