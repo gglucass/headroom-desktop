@@ -477,6 +477,13 @@ pub struct AppState {
     /// True while an atomic runtime upgrade is running (install + boot validation).
     /// Gates the watchdog from auto-pausing during the ~minutes-long upgrade.
     pub runtime_upgrade_in_progress: Mutex<bool>,
+    /// True only while an upgrade's pip install / rollback mutates the live
+    /// venv (the proxy is down on purpose). Unlike `runtime_upgrade_in_progress`,
+    /// which relaxes the gates so boot validation can spawn, this refuses every
+    /// spawn: a tray open or gate flip mid-install started a proxy off the
+    /// half-replaced venv, which locked Scripts\headroom.exe against pip and
+    /// served /stats 500s (RUST-29, RUST-JP).
+    pub runtime_upgrade_installing: AtomicBool,
     pub runtime_upgrade_progress: Mutex<RuntimeUpgradeProgress>,
     pub last_startup_error: Mutex<Option<String>>,
     /// Exit status of the last tracked child that died on its own (not via
@@ -673,6 +680,7 @@ impl AppState {
             runtime_auto_paused: AtomicBool::new(false),
             runtime_starting: Mutex::new(false),
             runtime_upgrade_in_progress: Mutex::new(false),
+            runtime_upgrade_installing: AtomicBool::new(false),
             runtime_upgrade_progress: Mutex::new(RuntimeUpgradeProgress {
                 running: false,
                 complete: false,
@@ -1040,6 +1048,9 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
 
+        // Before the stop, so a spawn already queued on the lifecycle lock
+        // re-reads it after the stop and stands down.
+        let install_guard = UpgradeInstallGuard::engage(self);
         self.stop_headroom();
 
         analytics::track_event(
@@ -1094,6 +1105,9 @@ impl AppState {
                 .map(|()| String::new())
                 .map_err(|error| (false, error)),
         };
+        // pip is done (and any install-phase rollback with it): from here the
+        // upgrade itself restarts the proxy, on either branch below.
+        drop(install_guard);
         let install_pip_output_tail: String = match install_result {
             Err((restored, error)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -1376,12 +1390,14 @@ impl AppState {
             None
         };
 
+        let rollback_guard = UpgradeInstallGuard::engage(self);
         self.stop_headroom();
         let rollback_result = if needs_commit_or_rollback {
             self.tool_manager.rollback_headroom_upgrade()
         } else {
             Ok(())
         };
+        drop(rollback_guard);
         let rollback_restored = needs_commit_or_rollback && rollback_result.is_ok();
         if let Err(err) = rollback_result {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
@@ -3157,6 +3173,20 @@ impl AppState {
         *progress = bootstrap_failed_state(&progress, message.into());
     }
 
+    /// See `runtime_upgrade_installing`. Ok-and-skip, like the gate short-
+    /// circuits: the upgrade restarts the proxy itself once pip is done.
+    fn upgrade_install_blocks_spawn(&self) -> bool {
+        let installing = self
+            .runtime_upgrade_installing
+            .load(std::sync::atomic::Ordering::Acquire);
+        if installing {
+            log::info!(
+                "ensure_headroom_running: runtime upgrade is installing; not starting proxy"
+            );
+        }
+        installing
+    }
+
     pub fn ensure_headroom_running(&self) -> Result<()> {
         // Exit teardown is in progress: stop_headroom has run (or is about
         // to), and a proxy spawned now would be orphaned when the process
@@ -3164,6 +3194,9 @@ impl AppState {
         // Unconditional — even mid-upgrade-validation, quit wins.
         if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
             log::info!("ensure_headroom_running: app is shutting down; not starting proxy");
+            return Ok(());
+        }
+        if self.upgrade_install_blocks_spawn() {
             return Ok(());
         }
         if !self.tool_manager.python_runtime_installed() {
@@ -3234,6 +3267,11 @@ impl AppState {
         // port is reachable and `headroom_process` has been recorded.
         let _lifecycle_guard = self.lifecycle_lock.lock();
 
+        // Re-read: a caller that passed the check above can wait here on the
+        // upgrade's own stop_headroom, then must not spawn into its install.
+        if self.upgrade_install_blocks_spawn() {
+            return Ok(());
+        }
         // Another caller may have brought the runtime up while we waited.
         if !self.tool_manager.python_runtime_installed() {
             return Ok(());
@@ -8647,12 +8685,22 @@ fn windows_process_sweep_script(
             if own_children { "$true" } else { "$false" }
         ),
     };
+    // The exe can match on the image path as well as the command line: a
+    // client that launches `headroom mcp serve` by bare name off PATH leaves
+    // no venv path in CommandLine, yet that process is exactly the one holding
+    // Scripts\headroom.exe against a wheel reinstall (RUST-29). An empty args
+    // pattern adds no clause, so such a process is not then dropped by a
+    // `$null -like '**'` on a CommandLine WMI would not show us.
+    let args_rule = if args_pattern.is_empty() {
+        String::new()
+    } else {
+        format!("-and $_.CommandLine -like '*{args_escaped}*' ")
+    };
     format!(
         "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
-         -and $_.CommandLine -like '*{exe_pattern}*' \
-         -and $_.CommandLine -like '*{args_escaped}*' \
-         -and {parent_rule} }} \
+         -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
+         {args_rule}-and {parent_rule} }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
@@ -8842,6 +8890,28 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     // any process whose command line mentions the venv dir.
     if let Err(err) = kill_processes_by_command_pattern(venv_dir, "", SweepParents::Any) {
         log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
+    }
+}
+
+/// Holds `runtime_upgrade_installing` for its lifetime, cleared on every exit
+/// including a panic (the upgrade runs on a bare thread; a stuck flag would
+/// refuse every proxy start until relaunch).
+struct UpgradeInstallGuard<'a>(&'a AppState);
+
+impl<'a> UpgradeInstallGuard<'a> {
+    fn engage(state: &'a AppState) -> Self {
+        state
+            .runtime_upgrade_installing
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self(state)
+    }
+}
+
+impl Drop for UpgradeInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .runtime_upgrade_installing
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -11512,6 +11582,27 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_install_guard_blocks_spawns_until_dropped_even_on_panic() {
+        let base_dir = temp_test_dir("headroom-upgrade-install-guard");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        let guard = super::UpgradeInstallGuard::engage(&state);
+        assert!(state.upgrade_install_blocks_spawn());
+        drop(guard);
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        // A panic mid-install must not leave every later proxy start refused.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::UpgradeInstallGuard::engage(&state);
+            panic!("pip wrapper panicked");
+        }));
+        assert!(panicked.is_err());
+        assert!(!state.upgrade_install_blocks_spawn());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn stop_headroom_gives_up_on_a_held_lifecycle_lock() {
         let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
         let state = std::sync::Arc::new(AppState::new_in(base_dir.clone()).expect("app state"));
@@ -12922,6 +13013,18 @@ mod tests {
         let any = windows_process_sweep_script(exe, "", 4242, super::SweepParents::Any);
         assert!(!any.contains("ParentProcessId"), "{any}");
         assert!(any.contains("-and $true }"), "{any}");
+        // RUST-29: a holder launched by bare name off PATH shows the venv only
+        // in its image path, and an empty args pattern adds no clause that a
+        // hidden CommandLine would fail.
+        assert!(
+            any.contains(r"-or $_.ExecutablePath -like '*C:\Users\a\venv\Scripts\headroom.exe*')"),
+            "{any}"
+        );
+        assert!(!any.contains("-like '**'"), "{any}");
+        assert!(
+            held.contains("-and $_.CommandLine -like '*proxy --port*' -and ("),
+            "{held}"
+        );
     }
 
     /// A `'` in a Windows username would close the single-quoted `-like`

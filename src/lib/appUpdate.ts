@@ -24,6 +24,11 @@ const APP_UPDATE_PROGRESS_EVENT = "app-update://progress";
 // Matches the backend's empty-slot error (lib.rs `install_pending_update`).
 const STALE_STAGED_UPDATE = /no longer staged/i;
 
+// install_app_update's refusal when the app runs off the DMG or an
+// App-Translocated copy (READ_ONLY_BUNDLE_MESSAGE in lib.rs). The message is
+// the user's fix, not a defect to report (RUST-JK).
+const READ_ONLY_BUNDLE = /running from a read-only folder/i;
+
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
@@ -347,11 +352,14 @@ export async function runAppUpdateInstall({
     // level. Same class the check flow already keeps below Error, and the same
     // recovery: the failed install consumed the staged handle, so the retry is
     // a fresh check plus install - which the branch above now does for them.
-    const transport = TRANSPORT_FAILURE.test(describeInvokeError(error, ""));
-    Sentry.captureException(error, {
-      level: transport ? "warning" : "error",
-      tags: { flow: "app_update_install" },
-    });
+    const detail = describeInvokeError(error, "");
+    const transport = TRANSPORT_FAILURE.test(detail);
+    if (!READ_ONLY_BUNDLE.test(detail)) {
+      Sentry.captureException(error, {
+        level: transport ? "warning" : "error",
+        tags: { flow: "app_update_install" },
+      });
+    }
     return {
       statusCopy: transport
         ? "Could not download the update: the connection dropped. Try again."
