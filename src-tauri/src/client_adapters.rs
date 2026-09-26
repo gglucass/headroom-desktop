@@ -14188,6 +14188,72 @@ sys.exit(3)
     }
 
     #[test]
+    #[serial_test::serial]
+    fn connector_round_trip_keeps_every_symlinked_config_a_symlink() {
+        // A dotfiles repo owning every file the Claude Code and Codex connectors
+        // write. Apply, pause (clear) and resume (restore) must each land in the
+        // repo's files and leave every link in place.
+        let home = TestHome::new();
+        let repo = home.path().join("dotfiles");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let files = [
+            (".zshrc", "# user zshrc\n"),
+            (".zshenv", "# user zshenv\n"),
+            (".zprofile", "# user zprofile\n"),
+            (".claude/settings.json", "{}"),
+            (".claude.json", "{}"),
+            (".codex/config.toml", "# user codex\n"),
+        ];
+        for (name, body) in files {
+            let real = repo.join(name.replace('/', "_"));
+            fs::write(&real, body).unwrap();
+            if !super::symlink_file_or_skip(&real, &home.path().join(name)) {
+                return;
+            }
+        }
+        seed_installed_rtk();
+        let links_intact = || {
+            for (name, _) in files {
+                let meta = fs::symlink_metadata(home.path().join(name)).unwrap();
+                assert!(meta.file_type().is_symlink(), "{name} replaced by a file");
+            }
+        };
+        let repo_has = |needle: &str| {
+            files.iter().any(|(name, _)| {
+                fs::read_to_string(repo.join(name.replace('/', "_")))
+                    .unwrap()
+                    .contains(needle)
+            })
+        };
+
+        super::apply_client_setup("claude_code").expect("apply claude");
+        super::apply_client_setup("codex").expect("apply codex");
+        links_intact();
+        assert!(
+            repo_has("127.0.0.1:6767"),
+            "routing landed in the repo files"
+        );
+
+        super::clear_client_setups().expect("pause");
+        links_intact();
+        assert!(!repo_has("127.0.0.1:6767"), "pause stripped the repo files");
+
+        super::restore_client_setups();
+        links_intact();
+        assert!(repo_has("127.0.0.1:6767"), "resume restored the repo files");
+
+        // Every backup stays beside its link, never inside the repo.
+        let mut in_repo: Vec<_> = fs::read_dir(&repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        in_repo.sort();
+        assert_eq!(in_repo.len(), files.len(), "{in_repo:?}");
+    }
+
+    #[test]
     fn atomic_write_through_a_dangling_symlink_creates_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("missing");

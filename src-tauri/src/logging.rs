@@ -538,6 +538,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The venv-lock-holder sweep runs the same query, so one broken WMI filed
+    // it beside stop_headroom's capture in the same second (RUST-JX twin of
+    // JW). The pip step it guards reports its own failure if a holder survives.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with(
+            "killing venv lock holders before venv mutation failed: powershell could not enumerate processes",
+        )
+    {
+        return true;
+    }
     // Same for a timed-out sweep: stop_headroom captures it once per stop
     // under `proxy_sweep_timed_out`.
     if target.starts_with("headroom_desktop_lib::state")
@@ -1204,6 +1214,11 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "failed to clean detached headroom proxy processes: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+        // RUST-JX: the venv-lock-holder sweep's twin of the same verdict.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "killing venv lock holders before venv mutation failed: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv' args ''"
         ));
         // Same for a timed-out sweep (captured as proxy_sweep_timed_out).
         assert!(skip_sentry(

@@ -6518,6 +6518,23 @@ static STATS_FETCH_RECOVERED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// `get_recent`) from one starved by traffic (RUST-86 residual on 0.9.16).
 /// Never nested with the two locks above.
 static STATS_FETCH_LAST_OK: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+/// When the previous `/stats` failure happened. Never nested with the locks above.
+static STATS_FETCH_LAST_FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether a `/stats` failure is a lone stall that is not worth a Sentry event.
+///
+/// The stall context above answered it: every RUST-86 event after the 0.9.17
+/// feed fix was the FIRST poll to fail after a good one (27-39s since the last
+/// success), 8 of 10 with zero proxied requests in between, spread across
+/// eight hosts. The dashboard serves the last good payload across one miss, so
+/// the user sees nothing, and nothing in the report can say what blocked the
+/// backend loop. What still reports is a timeout
+/// that recurs inside `STATS_FETCH_RECOVERY_WINDOW`: a stall that persists
+/// or comes back is the one the dashboard actually shows.
+fn lone_stats_stall(category: &str, since_previous_failure: Option<Duration>) -> bool {
+    category == "timeout"
+        && since_previous_failure.is_none_or(|gap| gap >= STATS_FETCH_RECOVERY_WINDOW)
+}
 
 fn total_intercept_requests() -> u64 {
     crate::proxy_intercept::intercept_request_counts()
@@ -6571,6 +6588,15 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 }
 
 fn warn_stats_fetch_failed(reason: &str) {
+    let category = stats_fetch_failure_category(reason);
+    let previous_failure = STATS_FETCH_LAST_FAILED_AT.lock().replace(Instant::now());
+    if lone_stats_stall(&category, previous_failure.map(|at| at.elapsed())) {
+        // Still breaks a recovery run, but does not arm the backoff, so the
+        // repeat that makes it reportable is not throttled for 15 minutes.
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+        log::warn!("headroom /stats fetch failed ({reason}); lone stall, not reported");
+        return;
+    }
     let mut last = STATS_FETCH_WARNED_AT.lock();
     // Any failure breaks the recovery run -- including one this window
     // throttles, which is still evidence the condition has not healed.
@@ -6586,7 +6612,6 @@ fn warn_stats_fetch_failed(reason: &str) {
     };
     *last = Some((Instant::now(), streak));
     drop(last);
-    let category = stats_fetch_failure_category(reason);
     // A 4xx means SOMETHING answered 6767 without the backend's routes, and
     // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
     // there deliberately counts as reachable). The listener's identity is the
@@ -9778,8 +9803,8 @@ mod tests {
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
-        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
+        lifetime_token_milestones_crossed, log_mtime_advanced, lone_stats_stall,
+        merge_daily_savings, merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
         proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
@@ -9790,8 +9815,9 @@ mod tests {
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
         HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
         RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_RECOVERED_AT,
+        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -13216,6 +13242,8 @@ mod tests {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
         *STATS_FETCH_WARNED_AT.lock() = None;
+        // A repeat, so the lone-stall gate does not swallow the first call.
+        *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 5s");
         let (first, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
@@ -13267,6 +13295,7 @@ mod tests {
         // decay never applied: 97 events in 2 days from one host.
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+        *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 15s");
         let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
@@ -13308,6 +13337,35 @@ mod tests {
             let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
             assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
         }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    #[serial_test::serial(stats_fetch_warn)]
+    fn a_lone_stats_stall_stays_local_and_its_repeat_reports() {
+        assert!(lone_stats_stall("timeout", None));
+        assert!(lone_stats_stall(
+            "timeout",
+            Some(STATS_FETCH_RECOVERY_WINDOW)
+        ));
+        assert!(!lone_stats_stall("timeout", Some(Duration::from_secs(27))));
+        // Only timeouts: a 500 or 404 is a fault on its first occurrence.
+        assert!(!lone_stats_stall("http-500", None));
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_LAST_FAILED_AT.lock() = None;
+        warn_stats_fetch_failed("timed out after 15s");
+        assert!(
+            (*STATS_FETCH_WARNED_AT.lock()).is_none(),
+            "a lone stall must not report or arm the backoff"
+        );
+        warn_stats_fetch_failed("timed out after 15s");
+        assert!(
+            (*STATS_FETCH_WARNED_AT.lock()).is_some(),
+            "a repeat inside the recovery window reports"
+        );
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;

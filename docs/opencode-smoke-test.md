@@ -48,14 +48,14 @@ Expect: same `client=opencode` attribution with a `gpt-*` model. This proves the
 
 ### O4. Transport plugin routes third-party providers
 
-No Google key needed - a vendor-worded auth error is the pass signal.
+No key needed: OpenCode Zen's free models answer anonymously. (opencode 1.18.5 hides providers it has no credentials for, so the old `google/gemini-2.5-flash` step now fails inside opencode with `ProviderModelNotFoundError` before any request is sent.)
 
 ```bash
-opencode run -m google/gemini-2.5-flash "say hi" 2>&1 | tail -2
-grep 'generativelanguage' ~/.headroom/logs/proxy.log | tail -1
+opencode run -m opencode/big-pickle "Reply with exactly the word: pong" </dev/null 2>&1 | tail -2
+grep 'opencode.ai/zen' "$(ls -t ~/.headroom/logs/proxy*.log | head -1)" | tail -1
 ```
 
-Expect: an error mentioning a Google API key (not an OpenAI or Anthropic error - the wording proves which vendor answered), and a proxy log line forwarding to `generativelanguage.googleapis.com` with `client=opencode` and `transforms=none`. `transforms=none` is EXPECTED: third-party formats are routed and attributed but not compressed (upstream issue #2602). If the error mentions `127.0.0.1:8787` instead, the vendored plugin's 6767 default regressed.
+Expect: `pong`, and an `outbound_request` line forwarding to `https://opencode.ai/zen/v1/chat/completions`. Zen speaks the OpenAI chat format, so its `PERF` line can show real `tok_saved` (0.9.24-rc.9: 393 of 15,866); only formats the backend has no handler for pass with `transforms=none` (upstream issue #2602). An `UnpinnableUpstreamError` in the wheel log means the proxied-guarded-upstream vendor stopped binding. If the error mentions `127.0.0.1:8787` instead, the vendored plugin's 6767 default regressed.
 
 ### O5. Backend attributes the agent
 
