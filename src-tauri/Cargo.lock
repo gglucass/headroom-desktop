@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "headroom-desktop"
-version = "0.9.24-rc.5"
+version = "0.9.24-rc.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2571,9 +2571,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.1.1"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
+checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",

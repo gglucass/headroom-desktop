@@ -8999,6 +8999,35 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     }
 }
 
+/// Kills Headroom proxies whose parent app is gone. Windows only: an app that
+/// exited without stopping its proxy (an update clicked mid-boot, before the
+/// kill-on-close job existed) left the tree running, and mio < 1.2.1 created
+/// every socket inheritable, so that tree kept the dead app's 6767 listener
+/// open. Nothing else ever released it: the listener's pid is gone, so the
+/// intercept read the port as draining and its SO_REUSEADDR rebind got 10013
+/// forever. Proxies with a live parent (this app's, or a relaunching
+/// instance's) are spared by the orphan rule.
+pub(crate) fn reap_orphaned_proxies(venv_dir: &std::path::Path) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    // ponytail: one pass per tree level (headroom.exe -> venv python -> base
+    // python); each pass orphans the next level. A per-pid tree kill would
+    // do it in one, if a deeper tree ever shows up.
+    for _ in 0..3 {
+        if let Err(err) = kill_processes_by_command_pattern(
+            venv_dir,
+            "proxy --port",
+            SweepParents::Orphans {
+                own_children: false,
+            },
+        ) {
+            log::info!("reaping orphaned proxies failed: {err:#}");
+            return;
+        }
+    }
+}
+
 /// Holds `runtime_upgrade_installing` for its lifetime, released on every exit
 /// including a panic (the upgrade runs on a bare thread; a stuck flag would
 /// refuse every proxy start until relaunch).

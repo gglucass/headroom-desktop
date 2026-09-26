@@ -949,6 +949,20 @@ pub fn spawn(
                                         );
                                         continue;
                                     }
+                                    // The listener can outlive its app: see
+                                    // `reap_orphaned_proxies`. Harmless when
+                                    // there are none; retry the plain bind
+                                    // before any SO_REUSEADDR one.
+                                    if cfg!(windows) {
+                                        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(
+                                            &crate::storage::app_data_dir(),
+                                        );
+                                        crate::state::reap_orphaned_proxies(&runtime.venv_dir);
+                                        log::info!(
+                                            "[proxy_intercept] reaped orphaned proxies holding port {INTERCEPT_PORT}; retrying bind"
+                                        );
+                                        continue;
+                                    }
                                 }
                                 // Who actually holds it decides whether this
                                 // is worth a report. `listener_process` only
