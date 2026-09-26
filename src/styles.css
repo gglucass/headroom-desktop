@@ -1296,8 +1296,8 @@ select {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #215247;
-  background: rgba(79, 158, 145, 0.18);
+  color: var(--success);
+  background: var(--accent-tint-strong);
   padding: 0.1rem 0.45rem;
   border-radius: 0.3rem;
   vertical-align: middle;
