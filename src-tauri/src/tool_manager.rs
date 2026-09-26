@@ -4384,7 +4384,9 @@ impl ToolManager {
                     );
                     match self.pip_force_reinstall_headroom_version(&version) {
                         Ok(()) => {
-                            log::warn!("headroom wheel repair succeeded; retrying startup");
+                            // Info: the warn above already reported the incident,
+                            // and a success is not a second one (RUST-JV).
+                            log::info!("headroom wheel repair succeeded; retrying startup");
                             allow_repair = false;
                             continue 'attempt;
                         }
@@ -6131,7 +6133,11 @@ impl ToolManager {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("headroom-") && name.ends_with(".log") {
+            // Learn logs are per-run and their mtime is the UI's "last run".
+            if name.starts_with("headroom-")
+                && !name.starts_with("headroom-learn-")
+                && name.ends_with(".log")
+            {
                 cap_live_log(&entry.path(), LIVE_LOG_MAX_BYTES);
             }
         }
@@ -7420,10 +7426,12 @@ impl ToolManager {
         // An unwritable ~/.claude.json (EPERM: an immutable flag or security
         // software; RUST-HW/HX) defeats `claude mcp add` too -- the CLI printed
         // "registered" on two runs 30s apart and the entry never landed. That
-        // is the user's environment, not a registration we missed.
+        // is the user's environment, not a registration we missed. Info, not
+        // warn: the bridge filed it per run, split by the backup timestamp in
+        // the error (RUST-JS/JT).
         if let Err(err) = &direct_write {
             if crate::client_adapters::is_permission_denied(err) {
-                log::warn!(
+                log::info!(
                     "Headroom MCP install: ~/.claude.json is not writable, so Claude Code \
                      cannot persist the server either: {err:#}"
                 );
@@ -8446,6 +8454,33 @@ impl ToolManager {
                     .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
                     .err();
                 installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+            }
+            // Codex stages the plugin and renames it into
+            // `plugins/cache/<marketplace>/<plugin>`, which fails "Directory
+            // not empty" when an earlier install left that entry behind
+            // (RUST-DQ: `failed to activate plugin cache entry`). The plugin is
+            // not registered on this branch, so the entry is an orphan; drop
+            // it and add once more.
+            if matches!(host, PluginHost::Codex)
+                && installed.as_ref().err().is_some_and(|err| {
+                    plugin_install_failure_category(&format!("{err:#}")) == "host-cache-conflict"
+                })
+            {
+                let name = plugin.plugin_ref.split('@').next().unwrap_or(plugin.id);
+                let entry = crate::client_adapters::codex_home()
+                    .join("plugins")
+                    .join("cache")
+                    .join(plugin.marketplace_name)
+                    .join(name);
+                log::info!(
+                    "{} [{}]: stale plugin cache entry {}; removing and retrying",
+                    plugin.id,
+                    host.label(),
+                    entry.display()
+                );
+                if std::fs::remove_dir_all(&entry).is_ok() {
+                    installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+                }
             }
             installed.map_err(|err| match marketplace_err {
                 Some(add_err) => err.context(format!("marketplace add failed first: {add_err:#}")),
@@ -12942,6 +12977,11 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // The host CLI lost a file of its own mid-install (RUST-DQ: Codex
         // `plugin add` failing "failed to copy plugin file" on Windows).
         "host-file-missing"
+    } else if lower.contains("directory not empty") || lower.contains("directory is not empty") {
+        // The host CLI's rename into its plugin cache hit an entry an earlier
+        // install left behind (RUST-DQ: Codex "failed to activate plugin cache
+        // entry: Directory not empty (os error 66)").
+        "host-cache-conflict"
     } else if lower.contains("oauth access token is invalid")
         || lower.contains("authentication_error")
         || lower.contains("please run /login")
@@ -20019,6 +20059,33 @@ after
         assert!(gone, "plugin_installed() should be false after uninstall");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_install_clears_a_stale_plugin_cache_entry() {
+        // RUST-DQ: Codex's rename into its plugin cache fails "Directory not
+        // empty" while an orphaned entry sits there. The fake CLI fails the
+        // same way until the entry is gone.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, _runtime, manager) = seed_test_runtime("plugin-codex-cache-conflict");
+        let _home = HomeGuard::new(&root);
+        let entry = root.join(".codex/plugins/cache/caveman/caveman/1.0.0");
+        fs::create_dir_all(&entry).expect("stale entry");
+        let cli = root.join("codex");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$2\" = add ] || exit 0\n\
+             if [ -e \"$HOME/.codex/plugins/cache/caveman/caveman\" ]; then\n\
+             echo 'Error: failed to activate plugin cache entry: Directory not empty (os error 66)' >&2\n\
+             exit 1\nfi\n",
+        )
+        .expect("fake codex");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let caveman = PLUGIN_ADDONS.iter().find(|p| p.id == "caveman").unwrap();
+        let result = manager.install_plugin_into(caveman, PluginHost::Codex, &cli);
+        let _ = fs::remove_dir_all(&root);
+        result.expect("install retries once the stale cache entry is removed");
+    }
+
     #[test]
     fn is_outdated_codex_detects_unrecognized_subcommand() {
         let outdated = anyhow::Error::new(CommandFailure {
@@ -20811,6 +20878,12 @@ exit 0
                  {\"type\":\"authentication_error\",\"message\":\"OAuth access token is \
                  invalid.\"},\"request_id\":null} \u{b7} Please run /login\n\nstderr:\n",
                 "cli-not-authenticated",
+            ),
+            (
+                "Codex: command failed (exit 1): ~/.local/bin/codex plugin add caveman@caveman\n\
+                 stdout:\n\nstderr:\nError: failed to activate plugin cache entry: Directory not \
+                 empty (os error 66)",
+                "host-cache-conflict",
             ),
             ("Codex: something we have not seen", "other"),
         ];

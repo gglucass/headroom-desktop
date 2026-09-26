@@ -2553,7 +2553,23 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // repo never saw the edit. Resolving first also keeps the tmp beside the
     // real file, so the rename stays on one filesystem.
     let resolved = resolve_symlink_chain(path);
-    let path = resolved.as_path();
+    if resolved == path {
+        return atomic_write_at(path, contents);
+    }
+    atomic_write_at(&resolved, contents).or_else(|err| {
+        // A link into a tree we cannot write (Nix home-manager points
+        // ~/.claude/settings.json into the read-only /nix/store) can't be
+        // written through. Replacing the link is what every write did before,
+        // and it beats failing a routing write outright.
+        log::info!(
+            "writing through symlink {} failed ({err}); replacing the link",
+            path.display()
+        );
+        atomic_write_at(path, contents)
+    })
+}
+
+fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
     // writers to the same file: A renames tmp->path, then B's rename finds its
     // tmp already consumed and fails ENOENT (Sentry RUST-3W / RUST-4W). pid +
@@ -14185,6 +14201,32 @@ sys.exit(3)
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_read_only_target_replaces_the_link() {
+        // home-manager links into the read-only /nix/store: writing through
+        // cannot work, so the write falls back to replacing the link.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let target = store.join("settings.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = super::atomic_write(&link, b"new");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert!(!std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"new");
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
     }
 
     #[test]

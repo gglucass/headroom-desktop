@@ -2274,6 +2274,17 @@ fn codex_error_summary(body: &[u8]) -> String {
                     summary.push_str(" detail=");
                     summary.push_str(&detail);
                 }
+                // `{success, error, errorType}` gateways (RUST-FD, opencode)
+                // put the class in `errorType` beside a free-text `error`.
+                // An identifier-shaped value is schema, like a key name.
+                if let Some(kind) = json
+                    .get("errorType")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| is_safe_shape_key(v))
+                {
+                    summary.push_str(" errorType=");
+                    summary.push_str(kind);
+                }
                 return summary;
             }
             format!(
@@ -5886,6 +5897,15 @@ mod tests {
             codex_error_summary(br#"{"detail":"bad input: {\"x\": 1}"}"#),
             "no structural error fields; shape=object{detail} (34 bytes)"
         );
+        // RUST-FD: the class rides in `errorType`; the free-text `error` never does.
+        assert_eq!(
+            codex_error_summary(
+                br#"{"success":false,"error":"SECRET prompt","errorType":"invalid_request"}"#
+            ),
+            "no structural error fields; shape=object{error,errorType,success} (71 bytes) \
+             errorType=invalid_request"
+        );
+        assert!(!codex_error_summary(br#"{"errorType":"has spaces SECRET"}"#).contains("SECRET"));
         let long = format!(r#"{{"detail":"{}"}}"#, "a".repeat(121));
         assert!(!codex_error_summary(long.as_bytes()).contains("detail="));
         // An auth error naming the rejected account is the likeliest way a

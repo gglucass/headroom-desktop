@@ -231,12 +231,13 @@ mod tests {
     }
 
     #[test]
-    fn chopratejas_instance_id_is_none_when_home_missing() {
-        // This one does not swap $HOME, it deletes it. Anything reading the
-        // home dir concurrently gets None.
+    fn chopratejas_instance_id_is_none_without_a_headroom_dir() {
+        // An empty home, not an unset one: with HOME unset the resolver falls
+        // back to the real profile, which on a dev machine has a ~/.headroom.
         let _home_lock = crate::test_env_lock::lock_home();
+        let home = tempfile::tempdir().expect("tempdir");
         let previous = std::env::var_os("HOME");
-        std::env::remove_var("HOME");
+        std::env::set_var("HOME", home.path());
         let result = read_chopratejas_instance_id();
         if let Some(value) = previous {
             std::env::set_var("HOME", value);

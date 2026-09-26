@@ -500,8 +500,10 @@ pub struct AppState {
     /// which relaxes the gates so boot validation can spawn, this refuses every
     /// spawn: a tray open or gate flip mid-install started a proxy off the
     /// half-replaced venv, which locked Scripts\headroom.exe against pip and
-    /// served /stats 500s (RUST-29, RUST-JP).
-    pub runtime_upgrade_installing: AtomicBool,
+    /// served /stats 500s (RUST-29, RUST-JP). A count, not a flag: guards
+    /// from different threads (launch recovery, a "Retry update" click) can
+    /// overlap, and the first to finish must not clear the other's.
+    pub runtime_upgrade_installing: std::sync::atomic::AtomicUsize,
     pub runtime_upgrade_progress: Mutex<RuntimeUpgradeProgress>,
     pub last_startup_error: Mutex<Option<String>>,
     /// Exit status of the last tracked child that died on its own (not via
@@ -698,7 +700,7 @@ impl AppState {
             runtime_auto_paused: AtomicBool::new(false),
             runtime_starting: Mutex::new(false),
             runtime_upgrade_in_progress: Mutex::new(false),
-            runtime_upgrade_installing: AtomicBool::new(false),
+            runtime_upgrade_installing: std::sync::atomic::AtomicUsize::new(0),
             runtime_upgrade_progress: Mutex::new(RuntimeUpgradeProgress {
                 running: false,
                 complete: false,
@@ -3222,7 +3224,8 @@ impl AppState {
     fn upgrade_install_blocks_spawn(&self) -> bool {
         let installing = self
             .runtime_upgrade_installing
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
         if installing {
             log::info!(
                 "ensure_headroom_running: runtime upgrade is installing; not starting proxy"
@@ -8996,7 +8999,7 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     }
 }
 
-/// Holds `runtime_upgrade_installing` for its lifetime, cleared on every exit
+/// Holds `runtime_upgrade_installing` for its lifetime, released on every exit
 /// including a panic (the upgrade runs on a bare thread; a stuck flag would
 /// refuse every proxy start until relaunch).
 struct UpgradeInstallGuard<'a>(&'a AppState);
@@ -9005,7 +9008,7 @@ impl<'a> UpgradeInstallGuard<'a> {
     fn engage(state: &'a AppState) -> Self {
         state
             .runtime_upgrade_installing
-            .store(true, std::sync::atomic::Ordering::Release);
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self(state)
     }
 }
@@ -9014,7 +9017,7 @@ impl Drop for UpgradeInstallGuard<'_> {
     fn drop(&mut self) {
         self.0
             .runtime_upgrade_installing
-            .store(false, std::sync::atomic::Ordering::Release);
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -11693,6 +11696,14 @@ mod tests {
         let guard = super::UpgradeInstallGuard::engage(&state);
         assert!(state.upgrade_install_blocks_spawn());
         drop(guard);
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        // Overlapping guards: the first to finish leaves the other in force.
+        let first = super::UpgradeInstallGuard::engage(&state);
+        let second = super::UpgradeInstallGuard::engage(&state);
+        drop(first);
+        assert!(state.upgrade_install_blocks_spawn());
+        drop(second);
         assert!(!state.upgrade_install_blocks_spawn());
 
         // A panic mid-install must not leave every later proxy start refused.
