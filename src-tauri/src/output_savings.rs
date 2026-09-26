@@ -213,9 +213,9 @@ pub struct OutputEstimate {
 /// default of `~/.headroom` (neither the proxy nor the seeding run sets
 /// `HEADROOM_WORKSPACE_DIR`, so both resolve here).
 pub fn ledger_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)?;
+    // The proxy writes this under Python's `Path.home()`, which is the
+    // profile folder on Windows whatever `HOME` says.
+    let home = crate::client_adapters::home_dir();
     Some(home.join(".headroom").join("output_savings.json"))
 }
 

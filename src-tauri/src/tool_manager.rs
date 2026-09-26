@@ -2708,7 +2708,15 @@ fn extract_msvc_runtime_dlls(wheel_path: &Path, targets: &[&Path]) -> Result<usi
         for target in targets {
             std::fs::create_dir_all(target)
                 .with_context(|| format!("creating {}", target.display()))?;
-            crate::client_adapters::atomic_write(&target.join(&name), &bytes)?;
+            // Only fill what is missing. A DLL already here is loaded by every
+            // running venv python (MCP servers, an orphan proxy), so replacing
+            // it fails on Windows and failed the whole vendoring with it,
+            // leaving the missing one missing too.
+            let dest = target.join(&name);
+            if dest.exists() {
+                continue;
+            }
+            crate::client_adapters::atomic_write(&dest, &bytes)?;
         }
         extracted += 1;
     }
@@ -2960,14 +2968,10 @@ pub(crate) fn hf_hub_cache_dir() -> Option<PathBuf> {
         .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
         .or_else(|| var("HF_HOME").map(|home| home.join("hub")))
         .or_else(|| {
-            // `HOME` before `dirs::home_dir()`: on Windows the dirs crate reads the
-            // profile known folder and ignores `$HOME`, so a redirected home (tests,
-            // Git Bash) would resolve the sweep against the REAL profile instead.
-            let cache = var("XDG_CACHE_HOME").or_else(|| {
-                var("HOME")
-                    .or_else(dirs::home_dir)
-                    .map(|h| h.join(".cache"))
-            })?;
+            // Same home the proxy's huggingface_hub resolves (see
+            // `client_adapters::home_dir`), so the sweep and the cache agree.
+            let cache = var("XDG_CACHE_HOME")
+                .unwrap_or_else(|| crate::client_adapters::home_dir().join(".cache"));
             Some(cache.join("huggingface").join("hub"))
         })
 }
@@ -4228,6 +4232,9 @@ impl ToolManager {
                             args.join(" ")
                         )
                     })?;
+                // Dies with the app, however the app dies (see winproc).
+                #[cfg(windows)]
+                crate::winproc::adopt_into_proxy_job(&child);
 
                 let mut startup_ok = false;
                 let mut reason: Option<String> = None;
@@ -4264,12 +4271,20 @@ impl ToolManager {
                 // Timeout path (process still alive, port never opened): send SIGABRT
                 // so PYTHONFAULTHANDLER=1 dumps all-thread tracebacks to the log file
                 // before the process dies. Skip if the process already exited on its own.
+                #[cfg(unix)]
                 if reason.is_none() {
                     let _ = crate::proc::command("/bin/kill")
                         .arg("-ABRT")
                         .arg(child.id().to_string())
                         .status();
                     thread::sleep(Duration::from_millis(500));
+                }
+                // Windows has no SIGABRT and `child.kill()` ends only the
+                // `headroom.exe` launcher; the python under it kept the port
+                // and the next variant failed "already running". Take the tree.
+                #[cfg(windows)]
+                if reason.is_none() {
+                    crate::state::terminate_process_tree(child.id() as i32, true);
                 }
 
                 let _ = child.kill();
@@ -4793,7 +4808,7 @@ impl ToolManager {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
 
-        let status = crate::proc::command(python)
+        let mut child = crate::proc::command(python)
             .arg("-c")
             .arg(
                 "from headroom.transforms.kompress_compressor import KompressCompressor; \
@@ -4820,8 +4835,25 @@ impl ToolManager {
                     .with_context(|| format!("cloning {}", log_path.display()))?,
             ))
             .stderr(Stdio::from(log_file))
-            .status()
+            .spawn()
             .with_context(|| format!("running kompress prefetch via {}", python.display()))?;
+        // Bounded, generously: ~260MB on a slow link is minutes, but a stalled
+        // pull used to hold this venv python (and its file locks) forever.
+        const KOMPRESS_PREFETCH_DEADLINE: Duration = Duration::from_secs(60 * 60);
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait().context("waiting for kompress prefetch")? {
+                Some(status) => break status,
+                None if started.elapsed() >= KOMPRESS_PREFETCH_DEADLINE => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(KompressPrefetchOutcome::Failed {
+                        cause: format!("timed out after {}s", KOMPRESS_PREFETCH_DEADLINE.as_secs()),
+                    });
+                }
+                None => thread::sleep(Duration::from_millis(500)),
+            }
+        };
 
         if status.success() {
             Ok(KompressPrefetchOutcome::Downloaded)
@@ -6090,6 +6122,32 @@ impl ToolManager {
         self.runtime.tools_dir.join("headroom.json.backup")
     }
 
+    /// Cap every proxy stdout/stderr log (`headroom-*.log`) the running proxy
+    /// may still be appending to. See `cap_live_log`.
+    pub fn cap_live_proxy_logs(&self) {
+        let Ok(entries) = std::fs::read_dir(self.runtime.logs_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("headroom-") && name.ends_with(".log") {
+                cap_live_log(&entry.path(), LIVE_LOG_MAX_BYTES);
+            }
+        }
+    }
+
+    /// The managed runtime's virtualenv directory.
+    pub fn venv_dir(&self) -> PathBuf {
+        self.runtime.venv_dir.clone()
+    }
+
+    /// True when a previous upgrade left its in-progress marker behind, i.e.
+    /// `recover_from_interrupted_upgrade` has work to do.
+    pub fn upgrade_interrupted(&self) -> bool {
+        self.upgrade_marker_path().exists()
+    }
+
     fn upgrade_marker_path(&self) -> PathBuf {
         self.runtime.runtime_dir.join("upgrade.in_progress.json")
     }
@@ -6133,6 +6191,21 @@ impl ToolManager {
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
         Some((previous, target, lock_backup))
+    }
+
+    /// Put the pre-upgrade receipt back. Written atomically (a plain copy over
+    /// the live receipt could leave it truncated), and the backup is removed
+    /// only once the restore landed: two recovery paths deleted it after a
+    /// FAILED copy, losing the only record of what the venv holds.
+    fn restore_receipt_from_backup(&self) -> Result<()> {
+        let backup = self.headroom_receipt_backup_path();
+        let receipt = self.headroom_receipt_path();
+        let bytes = crate::client_adapters::retry_transient_denied(|| std::fs::read(&backup))
+            .with_context(|| format!("reading {}", backup.display()))?;
+        crate::client_adapters::atomic_write(&receipt, &bytes)
+            .with_context(|| format!("restoring {}", receipt.display()))?;
+        let _ = std::fs::remove_file(&backup);
+        Ok(())
     }
 
     fn clear_upgrade_marker(&self) {
@@ -6202,10 +6275,10 @@ impl ToolManager {
                 let _ = std::fs::remove_file(backup);
             }
             let receipt_backup = self.headroom_receipt_backup_path();
-            let receipt_path = self.headroom_receipt_path();
             if receipt_backup.exists() {
-                let _ = std::fs::copy(&receipt_backup, &receipt_path);
-                let _ = std::fs::remove_file(&receipt_backup);
+                if let Err(err) = self.restore_receipt_from_backup() {
+                    log::warn!("recover_from_interrupted_upgrade: {err:#}");
+                }
             }
             self.clear_upgrade_marker();
             return true;
@@ -6214,7 +6287,6 @@ impl ToolManager {
         let backup_dir = self.venv_backup_dir();
         let venv_dir = &self.runtime.venv_dir;
         let receipt_backup = self.headroom_receipt_backup_path();
-        let receipt_path = self.headroom_receipt_path();
 
         log::info!(
             "recover_from_interrupted_upgrade: found stale marker at {}; restoring backup",
@@ -6244,8 +6316,9 @@ impl ToolManager {
                 return false;
             }
             if receipt_backup.exists() {
-                let _ = std::fs::copy(&receipt_backup, &receipt_path);
-                let _ = std::fs::remove_file(&receipt_backup);
+                if let Err(err) = self.restore_receipt_from_backup() {
+                    log::warn!("recover_from_interrupted_upgrade: {err:#}");
+                }
             }
         } else {
             // No backup to restore from. Rare — the user (or a script) deleted
@@ -6493,11 +6566,8 @@ impl ToolManager {
                     )
                 })?;
             let receipt_backup = self.headroom_receipt_backup_path();
-            let receipt_path = self.headroom_receipt_path();
             if receipt_backup.exists() {
-                std::fs::copy(&receipt_backup, &receipt_path)
-                    .with_context(|| format!("restoring {}", receipt_path.display()))?;
-                let _ = std::fs::remove_file(&receipt_backup);
+                self.restore_receipt_from_backup()?;
             }
             self.clear_upgrade_marker();
             return Ok(());
@@ -7013,11 +7083,8 @@ impl ToolManager {
             .pip_force_reinstall_headroom_version(&ctx.previous_version)
             .is_ok();
         let receipt_backup = self.headroom_receipt_backup_path();
-        let receipt_path = self.headroom_receipt_path();
         let receipt_ok = if receipt_backup.exists() {
-            let copy_ok = std::fs::copy(&receipt_backup, &receipt_path).is_ok();
-            let _ = std::fs::remove_file(&receipt_backup);
-            copy_ok
+            self.restore_receipt_from_backup().is_ok()
         } else {
             true
         };
@@ -7099,16 +7166,10 @@ impl ToolManager {
             return false;
         }
         if had_receipt {
-            let receipt_path = self.headroom_receipt_path();
-            let receipt_backup = self.headroom_receipt_backup_path();
-            if let Err(err) = std::fs::copy(&receipt_backup, &receipt_path) {
-                log::error!(
-                    "rollback: failed to restore {}: {err}",
-                    receipt_path.display()
-                );
+            if let Err(err) = self.restore_receipt_from_backup() {
+                log::error!("rollback: {err:#}");
                 return false;
             }
-            let _ = std::fs::remove_file(&receipt_backup);
         }
         // Rollback complete — clear the marker so we don't trigger recovery
         // on the next launch.
@@ -7216,10 +7277,25 @@ impl ToolManager {
                     cmd.env("PATH", crate::proc::path_with_dir_prepended(dir));
                 }
             }
-            let output = cmd
-                .output()
-                .with_context(|| format!("starting {} {}", entrypoint.display(), args.join(" ")))
-                .context("configuring Headroom MCP integration")?;
+            // Bounded: this runs on every launch until MCP is configured, and
+            // `headroom mcp install` shells out to `claude mcp add`, which can
+            // sit on a first-run prompt or a slow Node start indefinitely.
+            let output = match crate::proc::output_with_timeout(cmd, MCP_INSTALL_TIMEOUT) {
+                Ok(output) => output,
+                Err(crate::proc::OutputError::TimedOut) => bail!(
+                    "{} {} timed out after {}s",
+                    entrypoint.display(),
+                    args.join(" "),
+                    MCP_INSTALL_TIMEOUT.as_secs()
+                ),
+                Err(crate::proc::OutputError::Spawn(err)) => {
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| {
+                            format!("starting {} {}", entrypoint.display(), args.join(" "))
+                        })
+                        .context("configuring Headroom MCP integration");
+                }
+            };
             Ok((output, args))
         };
 
@@ -9403,20 +9479,13 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
     // runtime is ours by construction, whatever its argv says.
     #[cfg(windows)]
     {
-        let Ok(output) = crate::proc::command("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "{PS_UTF8_OUTPUT}(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"
-                ),
-            ])
-            .output()
-        else {
+        // Straight from the kernel, not PowerShell: works where AppLocker/SRP
+        // blocks powershell.exe (there this check failed closed, our own
+        // orphan read as foreign, and every relaunch drifted to a fallback
+        // port), and it is one syscall rather than a PowerShell cold start.
+        let Some(path) = crate::winproc::process_image_path(pid) else {
             return false;
         };
-        let path = String::from_utf8_lossy(&output.stdout);
         let runtime_dir =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).runtime_dir;
         return exe_path_is_under(&path, &runtime_dir);
@@ -9794,7 +9863,9 @@ fn kill_pid(pid: u32, force: bool) {
         if force {
             command.arg("/F");
         }
-        let _ = command.status();
+        // Bounded: taskkill /T walks the tree through the same process
+        // enumeration a wedged WMI stalls.
+        let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
     }
     #[cfg(not(windows))]
     {
@@ -9894,6 +9965,12 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     log::info!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
+        // Re-verify before forcing: in those 3s the pid can exit and be
+        // reused by an unrelated process, and the identity check above was
+        // about the old one.
+        if !pid_is_headroom_desktop_twin(pid) && !pid_is_headroom_backend(pid) {
+            return false;
+        }
         kill_pid(pid, true);
         if !wait_for_port_free(port, Duration::from_secs(2)) {
             return false;
@@ -9931,22 +10008,13 @@ fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     else {
         return false;
     };
+    // Native on Windows, for the same reasons as `pid_is_headroom_backend`.
     #[cfg(windows)]
     let theirs = {
-        let Ok(output) = crate::proc::command("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "{PS_UTF8_OUTPUT}(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"
-                ),
-            ])
-            .output()
-        else {
+        let Some(path) = crate::winproc::process_image_path(pid) else {
             return false;
         };
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        path
     };
     #[cfg(not(windows))]
     let theirs = {
@@ -10192,7 +10260,8 @@ pub(crate) fn newest_proxy_log_path(logs_dir: &Path) -> Option<PathBuf> {
         if !name_str.starts_with("headroom-proxy") || !name_str.ends_with(".log") {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
+        // fs::metadata: see state::newest_proxy_log_mtime.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
             if let Ok(mtime) = meta.modified() {
                 let path = entry.path();
                 newest = Some(match newest {
@@ -10555,18 +10624,21 @@ fn ps_command(pid: u32) -> Option<String> {
 }
 
 fn ps_command_uncached(pid: u32) -> Option<String> {
+    // Bounded: this runs ahead of the lifecycle lock in every
+    // ensure_headroom_running, so a wedged WMI stalled the watchdog thread.
     #[cfg(windows)]
-    let output = crate::proc::command("powershell")
-        .args([
+    let output = {
+        let mut command = crate::proc::command("powershell");
+        command.args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &format!(
                 "{PS_UTF8_OUTPUT}(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
             ),
-        ])
-        .output()
-        .ok()?;
+        ]);
+        crate::proc::output_with_timeout(command, Duration::from_secs(15)).ok()?
+    };
     #[cfg(not(windows))]
     let output = crate::proc::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -10639,7 +10711,49 @@ fn rotate_log_if_large(path: &Path) {
         let backup = path.with_extension("log.old");
         let _ = std::fs::remove_file(&backup);
         // direct-write: rotates Headroom's own log; a rename, not a rewrite
-        let _ = std::fs::rename(path, &backup);
+        if std::fs::rename(path, &backup).is_err() {
+            // Held open (a scanner, or a proxy that has not let go): copy
+            // aside and truncate, which works on a held file, instead of
+            // silently leaving it past the cap.
+            cap_live_log(path, MAX_LOG_BYTES);
+        }
+    }
+}
+
+/// Ceiling for a proxy log that is still open in the running proxy.
+const LIVE_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Cap a log another process is appending to. It cannot be renamed away on
+/// Windows while held (and a rename on Unix just moves the writer's target),
+/// so the current contents are copied to `.log.old` and the file is truncated
+/// in place. The writer opened it for append, so its next write lands at the
+/// new end instead of leaving a hole. Returns whether it rotated.
+fn cap_live_log(path: &Path, max_bytes: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() <= max_bytes {
+        return false;
+    }
+    let backup = path.with_extension("log.old");
+    if let Err(err) = std::fs::copy(path, &backup) {
+        log::info!(
+            "capping {}: copy to {} failed: {err}",
+            path.display(),
+            backup.display()
+        );
+        return false;
+    }
+    match OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_len(0))
+    {
+        Ok(()) => true,
+        Err(err) => {
+            log::info!("capping {}: truncate failed: {err}", path.display());
+            false
+        }
     }
 }
 
@@ -10699,7 +10813,8 @@ fn newest_wheel_proxy_log(logs_dir: &Path) -> Option<PathBuf> {
         {
             continue;
         }
-        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+        // fs::metadata: see state::newest_proxy_log_mtime.
+        let Ok(mtime) = std::fs::metadata(entry.path()).and_then(|m| m.modified()) else {
             continue;
         };
         if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
@@ -11157,8 +11272,14 @@ where
                 }
             }
 
-            // direct-write: download staging in Headroom's cache, sha256-verified before the rename
-            std::fs::rename(&tmp_path, destination).with_context(|| {
+            // Retried: Defender scans a freshly written archive before letting
+            // go, and a denied rename here threw away a verified download and
+            // started it again from zero.
+            crate::client_adapters::retry_transient_denied(|| {
+                // direct-write: download staging in Headroom's cache, sha256-verified before the rename
+                std::fs::rename(&tmp_path, destination)
+            })
+            .with_context(|| {
                 format!(
                     "renaming {} to {}",
                     tmp_path.display(),
@@ -11522,9 +11643,7 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
 }
 
 pub fn claude_project_memory_file(project_path: &str) -> PathBuf {
-    let home = dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir);
+    let home = crate::client_adapters::home_dir();
     home.join(".claude")
         .join("projects")
         .join(encode_claude_project_folder_name(project_path))
@@ -11601,8 +11720,17 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
     }
 }
 
+/// Ceiling for `headroom mcp install` (see `install_headroom_mcp`).
+const MCP_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ceiling for one venv/ensurepip/pip-probe step. Minutes on a Defender-
+/// scanned fresh install is normal; never finishing is not, and before this
+/// a stalled interpreter (AV hold, DLL-load deadlock) hung bootstrap forever
+/// with the progress bar frozen.
+const PYTHON_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
-    run_command(python, args, cwd)
+    run_command_with_timeout(python, args, cwd, PYTHON_COMMAND_TIMEOUT)
 }
 
 /// Path to the output-shaper savings ledger, which `output_savings` also reads
@@ -13276,6 +13404,7 @@ fn run_command_with_timeout(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
     let output = build_command(binary, args, cwd)
         .output()
@@ -16801,6 +16930,15 @@ print("OK smh")
             );
             assert!(!target.join("msvc_runtime.cp312-win_amd64.pyd").exists());
         }
+
+        // A DLL already in place is loaded by live pythons on Windows and
+        // cannot be replaced; it is left alone rather than failing the run.
+        std::fs::write(scripts.join("msvcp140.dll"), b"in-use").expect("seed");
+        super::extract_msvc_runtime_dlls(&wheel_path, &[scripts.as_path()]).expect("re-extract");
+        assert_eq!(
+            std::fs::read(scripts.join("msvcp140.dll")).expect("dll present"),
+            b"in-use"
+        );
     }
 
     #[test]
@@ -16844,6 +16982,38 @@ print("OK smh")
                 .len(),
             5 * 1024 * 1024 + 1
         );
+    }
+
+    #[test]
+    fn cap_live_log_truncates_in_place_under_an_open_appender() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("headroom-default.log");
+        // The running proxy's handle: opened for append, kept open throughout.
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .expect("open appender");
+        writer.write_all(b"small").expect("write");
+        assert!(
+            !super::cap_live_log(&log, 16),
+            "under the cap it is left alone"
+        );
+
+        writer.write_all(&[b'x'; 64]).expect("write");
+        assert!(super::cap_live_log(&log, 16));
+        assert_eq!(fs::metadata(&log).expect("log").len(), 0);
+        assert_eq!(
+            fs::metadata(log.with_extension("log.old"))
+                .expect("old")
+                .len(),
+            69
+        );
+
+        // The appender carries on at the new end, not at its old offset.
+        writer.write_all(b"after").expect("write after cap");
+        assert_eq!(fs::read(&log).expect("read"), b"after");
     }
 
     #[test]

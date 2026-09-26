@@ -193,7 +193,9 @@ fn total_dir_size_bytes(path: &std::path::Path, max_entries: usize) -> u64 {
             if file_type.is_dir() {
                 stack.push(entry.path());
             } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
+                // fs::metadata: see newest_proxy_log_mtime (a blob being
+                // downloaded kept its directory-entry size on Windows).
+                if let Ok(meta) = std::fs::metadata(entry.path()) {
                     total = total.saturating_add(meta.len());
                 }
             }
@@ -252,6 +254,7 @@ pub(crate) fn proxy_port_accepts_connection() -> bool {
 /// depending on duration. Returns whole seconds; sub-second precision
 /// is dropped (we only care about per-tick advancement, which is
 /// always >=1s of CPU work to register).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -277,14 +280,25 @@ fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
 /// to call on a 500ms boot-validation tick — fork+exec of a tiny
 /// system binary, no I/O beyond the kernel proc table.
 pub(crate) fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
-    let output = crate::proc::command("ps")
-        .args(["-p", &pid.to_string(), "-o", "time="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    // Windows has no `ps`, and the tracked pid is the idle `headroom.exe`
+    // launcher rather than the python doing the work. The proxy job's CPU
+    // total covers the whole tree; callers only ever ask whether it grew.
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        crate::winproc::proxy_job_cpu_time_secs()
     }
-    parse_ps_cpu_time(&String::from_utf8_lossy(&output.stdout))
+    #[cfg(not(windows))]
+    {
+        let output = crate::proc::command("ps")
+            .args(["-p", &pid.to_string(), "-o", "time="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_ps_cpu_time(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 
 /// Whether the tracked process's accumulated CPU time advanced since
@@ -347,7 +361,11 @@ pub(crate) fn newest_proxy_log_mtime(logs_dir: &std::path::Path) -> Option<std::
         if !name_str.starts_with("headroom-proxy") || !name_str.ends_with(".log") {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
+        // fs::metadata, not DirEntry::metadata: on Windows the latter is
+        // the directory entry's cached copy, which NTFS updates lazily
+        // for a file still held open for writing, so a live log (or a
+        // model download in progress) looked frozen to this signal.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
             if let Ok(mtime) = meta.modified() {
                 newest = Some(match newest {
                     Some(prev) if prev > mtime => prev,
@@ -760,7 +778,19 @@ impl AppState {
         // run was killed between move-aside and commit, the venv.backup/
         // dir holds the real working environment and the live venv is a
         // partial install. Restore before doing anything else.
-        let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        if self.tool_manager.upgrade_interrupted() {
+            // Recovery pip-reinstalls or renames the live venv, so it gets the
+            // upgrade's protection: no spawn may start mid-recovery, a start
+            // already in flight is waited out, and whatever runs from the venv
+            // (the updater's orphan proxy, Claude Code's MCP servers) is
+            // cleared first. Only when a marker exists: this sweep on every
+            // launch would kill the user's MCP servers for nothing.
+            let _recovery_guard = UpgradeInstallGuard::engage(self);
+            drop(self.lifecycle_lock.lock());
+            self.stop_headroom();
+            kill_venv_lock_holders(&self.tool_manager.venv_dir());
+            let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        }
 
         if !self.tool_manager.python_runtime_installed() {
             // First-run; start_bootstrap (wizard) handles install.
@@ -838,7 +868,14 @@ impl AppState {
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
-        if let Err(err) = self.tool_manager.ensure_mcp_configured() {
+        // Under the install guard: when the MCP install hits a corrupt venv it
+        // self-heals with a requirements repair (pip into the live venv), and
+        // a tray open racing that must not start a proxy off it.
+        let mcp_result = {
+            let _mcp_guard = UpgradeInstallGuard::engage(self);
+            self.tool_manager.ensure_mcp_configured()
+        };
+        if let Err(err) = mcp_result {
             // install_headroom_mcp captures rich structured data to Sentry
             // at the failure site; log to file only to avoid a duplicate
             // (and stripped) Sentry event from the FileLogger forwarder.
@@ -3601,6 +3638,11 @@ impl AppState {
     /// loop was stuck. Blocking sleep is fine: only the watchdog thread calls
     /// this, once per down episode.
     pub fn dump_backend_stacks(&self) {
+        // No SIGUSR1 on Windows: the call did nothing there and still cost
+        // the watchdog a 1.5s sleep per wedge.
+        if !cfg!(unix) {
+            return;
+        }
         let Some(pid) = self.headroom_process.lock().as_ref().map(|c| c.id()) else {
             return;
         };
@@ -4217,15 +4259,24 @@ impl Drop for AppState {
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
             terminate_process_tree(pid, false);
-            let _ = child.wait();
+            // Bounded like stop_headroom: an unbounded wait on a child that
+            // ignores the stop hung teardown forever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while matches!(child.try_wait(), Ok(None)) {
+                if std::time::Instant::now() >= deadline {
+                    terminate_process_tree(pid, true);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 }
 
 fn user_home_dir() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
+    crate::client_adapters::home_dir()
 }
 
 fn claude_projects_dir() -> PathBuf {
@@ -8572,14 +8623,18 @@ pub(crate) fn recent_app_kills_summary() -> Vec<String> {
         .collect()
 }
 
-fn terminate_process_tree(pid: i32, force: bool) {
+pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
+        // Always /F: without it taskkill only posts WM_CLOSE, which a
+        // windowless python never reads, so the "graceful" stage did nothing
+        // and every stop sat out its full 2s wait before the forced one
+        // (several times over on quit). The proxy has no shutdown hook that a
+        // gentler stop would have run. Bounded like the sweep: taskkill
+        // enumerates the tree through the same machinery a wedged WMI stalls.
+        let _ = force;
         let mut command = crate::proc::command("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T"]);
-        if force {
-            command.arg("/F");
-        }
-        let _ = command.status();
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
     } else {
         let Some(target) = group_kill_target(pid) else {
             log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");

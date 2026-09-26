@@ -62,7 +62,16 @@ impl FileLogger {
         let backup = self.path.with_extension("log.old");
         let _ = fs::remove_file(&backup);
         // direct-write: rotates Headroom's own log; a rename, not a rewrite
-        let _ = fs::rename(&self.path, &backup);
+        if fs::rename(&self.path, &backup).is_err() {
+            // Windows: a scanner or a log viewer holding the file refuses the
+            // rename, and ignoring that left the log growing past its cap for
+            // as long as the hold lasted. Copy aside and truncate instead.
+            if fs::copy(&self.path, &backup).is_ok() {
+                if let Ok(f) = OpenOptions::new().write(true).open(&self.path) {
+                    let _ = f.set_len(0);
+                }
+            }
+        }
         if let Ok(f) = OpenOptions::new()
             .create(true)
             .append(true)
