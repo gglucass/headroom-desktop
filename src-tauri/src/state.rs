@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -560,15 +560,15 @@ pub struct AppState {
     /// overage from pausing Codex optimization for mixed users, the symmetric
     /// counterpart to `codex_bypass`.
     pub claude_only_bypass: Arc<AtomicBool>,
-    /// Debounce streak for `codex_bypass`, mirroring `pricing_gate_violation_streak`.
-    codex_gate_violation_streak: Arc<AtomicU32>,
-    /// Number of consecutive `apply_pricing_gate_status` calls that reported
-    /// `optimization_allowed=false` while bypass was off. Acts as a debounce:
-    /// the ungated→gated transition only fires once this hits
-    /// `PRICING_GATE_DEBOUNCE_POLLS`. Reset to 0 on any ungated poll. Prevents
-    /// a single bad pricing read (network blip, brief utilization spike) from
+    /// Debounce window for `codex_bypass`, mirroring `pricing_gate_first_gated_at`.
+    codex_gate_first_gated_at: Arc<Mutex<Option<Instant>>>,
+    /// When the current run of gated `apply_pricing_gate_status` readings
+    /// began while bypass was off. The ungated->gated flip only fires once a
+    /// gated reading lands `PRICING_GATE_DEBOUNCE_MIN_SPAN` after it (see
+    /// `gated_reading_confirms`); any ungated reading clears it. Prevents a
+    /// single bad pricing read (network blip, brief utilization spike) from
     /// flipping the gate off and back on within minutes.
-    pricing_gate_violation_streak: Arc<AtomicU32>,
+    pricing_gate_first_gated_at: Arc<Mutex<Option<Instant>>>,
     /// Per-session rising-edge latches so the weekly-limit nudge is reported to
     /// the server at most once per condition while it holds, instead of on every
     /// 60s pricing poll. They reset to `false` on any non-gated poll and on app
@@ -731,8 +731,8 @@ impl AppState {
             proxy_bypass: Arc::new(AtomicBool::new(false)),
             claude_only_bypass: Arc::new(AtomicBool::new(false)),
             codex_bypass: Arc::new(AtomicBool::new(false)),
-            codex_gate_violation_streak: Arc::new(AtomicU32::new(0)),
-            pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
+            codex_gate_first_gated_at: Arc::new(Mutex::new(None)),
+            pricing_gate_first_gated_at: Arc::new(Mutex::new(None)),
             weekly_limit_reached_reported: Arc::new(AtomicBool::new(false)),
             weekly_limit_approaching_reported: Arc::new(AtomicBool::new(false)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
@@ -3434,6 +3434,19 @@ impl AppState {
                 // Fresh child: a death recorded for its predecessor is no
                 // longer diagnostic of the current episode.
                 *self.last_child_natural_exit.lock() = None;
+                // A full-bypass gate flip that raced this spawn timed out on
+                // the lifecycle lock we hold and, lock-less, reaped only
+                // orphans, so the child just recorded would otherwise run for
+                // the whole gated period. Its teardown is owed here.
+                if self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                    && !*self.runtime_upgrade_in_progress.lock()
+                {
+                    drop(_lifecycle_guard);
+                    log::info!(
+                        "ensure_headroom_running: proxy_bypass set during spawn; stopping the new backend"
+                    );
+                    self.stop_headroom();
+                }
                 Ok(())
             }
             Err(err) => {
@@ -3961,8 +3974,22 @@ impl AppState {
                 // bypass, so a Claude overage doesn't pause Codex. Mirrors
                 // `apply_pricing_gate_status`. Python lifecycle is handled by
                 // `stop_python_if_gated` / `ensure_headroom_running` — this
-                // only flips the flags (lock-safe).
-                if crate::client_adapters::any_gate_exempt_client_enabled() {
+                // only flips the flags (lock-safe). Not debounced: this runs at
+                // launch and before a spawn, where it keeps a gated user from
+                // getting a free poll interval of optimization per relaunch.
+                let keep_alive = crate::client_adapters::any_gate_exempt_client_enabled();
+                if !self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                    && !self
+                        .claude_only_bypass
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    log::info!(
+                        "enforce_pricing_gate: entering {} bypass (gate_reason={:?})",
+                        if keep_alive { "claude-only" } else { "full" },
+                        status.gate_reason
+                    );
+                }
+                if keep_alive {
                     self.claude_only_bypass.store(true, Release);
                     self.proxy_bypass.store(false, Release);
                 } else {
@@ -4007,8 +4034,8 @@ impl AppState {
     /// poll.
     ///
     /// The ungated→gated transition is debounced: the bypass flip only
-    /// fires once `optimization_allowed=false` has been observed for
-    /// `PRICING_GATE_DEBOUNCE_POLLS` consecutive polls. The gated→ungated
+    /// fires once `optimization_allowed=false` has been observed on readings
+    /// `PRICING_GATE_DEBOUNCE_MIN_SPAN` apart. The gated→ungated
     /// direction has no debounce — recovery should be immediate.
     ///
     /// Acquires `lifecycle_lock` (via `stop_headroom` / `ensure_headroom_running`),
@@ -4052,7 +4079,7 @@ impl AppState {
         status: &crate::models::HeadroomPricingStatus,
         codex_keep_alive: bool,
     ) {
-        use std::sync::atomic::Ordering::{Acquire, Release};
+        use std::sync::atomic::Ordering::Acquire;
         let was_bypassed = self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
         // Account wall (trial ended / sign-in required) vs plan-usage metering:
@@ -4068,18 +4095,15 @@ impl AppState {
 
         if should_bypass {
             if !was_bypassed {
-                // Debounce the ungated → gated transition: only flip once we've
-                // seen `PRICING_GATE_DEBOUNCE_POLLS` consecutive gated readings.
-                let prev = self
-                    .pricing_gate_violation_streak
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let streak = prev.saturating_add(1);
-                if streak < PRICING_GATE_DEBOUNCE_POLLS {
-                    log::info!(
-                        "pricing_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
-                    );
+                // Debounce the ungated → gated transition.
+                if !gated_reading_confirms(&self.pricing_gate_first_gated_at, "pricing_gate") {
                     return;
                 }
+                log::info!(
+                    "pricing_gate: entering {} bypass (gate_reason={:?}, account_wall={account_wall})",
+                    if codex_keep_alive { "claude-only" } else { "full" },
+                    status.gate_reason
+                );
             }
             // Enter (or re-sync) the Claude gate. Idempotent: the swap guards
             // below only fire stop_headroom/ensure_headroom_running on a real
@@ -4089,11 +4113,12 @@ impl AppState {
             self.enter_claude_gate(codex_keep_alive);
             crate::proxy_intercept::set_account_gate(account_wall);
         } else {
-            // Any ungated reading clears the violation streak so a later
-            // gated reading starts the debounce window over.
-            self.pricing_gate_violation_streak.store(0, Release);
+            // Any ungated reading clears the debounce window so a later
+            // gated reading starts it over.
+            *self.pricing_gate_first_gated_at.lock() = None;
             crate::proxy_intercept::set_account_gate(false);
             if was_bypassed {
+                log::info!("pricing_gate: leaving bypass (optimization allowed)");
                 self.exit_claude_gate();
             }
         }
@@ -4203,36 +4228,68 @@ impl AppState {
             if was_bypassed {
                 return;
             }
-            let prev = self
-                .codex_gate_violation_streak
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let streak = prev.saturating_add(1);
-            if streak < PRICING_GATE_DEBOUNCE_POLLS {
-                log::info!(
-                    "codex_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
-                );
+            if !gated_reading_confirms(&self.codex_gate_first_gated_at, "codex_gate") {
                 return;
             }
+            log::info!(
+                "codex_gate: entering bypass (gate_reason={:?})",
+                codex.gate_reason
+            );
             self.codex_bypass
                 .store(true, std::sync::atomic::Ordering::Release);
         } else {
-            self.codex_gate_violation_streak
-                .store(0, std::sync::atomic::Ordering::Release);
+            *self.codex_gate_first_gated_at.lock() = None;
             if was_bypassed {
+                log::info!("codex_gate: leaving bypass (optimization allowed)");
                 self.codex_bypass
                     .store(false, std::sync::atomic::Ordering::Release);
             }
         }
     }
+
+    /// Test hook: pretend the pending debounce windows opened long enough ago
+    /// for the next gated reading to confirm them.
+    #[cfg(test)]
+    fn age_gate_debounce(&self) {
+        for first in [
+            &self.pricing_gate_first_gated_at,
+            &self.codex_gate_first_gated_at,
+        ] {
+            if let Some(at) = first.lock().as_mut() {
+                *at -= PRICING_GATE_DEBOUNCE_MIN_SPAN;
+            }
+        }
+    }
 }
 
-/// Number of consecutive gated pricing polls required before flipping
-/// `proxy_bypass` on. With the React UI's 60s focused / 600s blurred poll
-/// cadence, 2 polls = 1–10 minutes minimum before a gated state takes effect.
-/// Tuned to ride out single-poll spikes (Anthropic returning a stale or
-/// momentary high utilization, transient network failures clearing auth
-/// state) without delaying real threshold crossings meaningfully.
-const PRICING_GATE_DEBOUNCE_POLLS: u32 = 2;
+/// How far apart the first and the confirming gated reading must be before
+/// the gate flips on. It counts time, not calls: every trigger (frontend
+/// poll, deep link, sign-in, the background loop) evaluates the same cached
+/// status, so two of them milliseconds apart are one observation, and a call
+/// counter let that pair flip the gate on a single reading. At or under the
+/// 60s focused poll, so a real gate still engages on the second poll; the
+/// blurred (600s) cadence and the background loop are slower anyway.
+const PRICING_GATE_DEBOUNCE_MIN_SPAN: Duration = Duration::from_secs(45);
+
+/// Debounce step for one gated reading taken while its gate is off. True once
+/// a gated reading lands `PRICING_GATE_DEBOUNCE_MIN_SPAN` after the first one
+/// (the window then resets, so a gate cleared behind our back re-debounces);
+/// callers clear `first_gated_at` on every ungated reading.
+fn gated_reading_confirms(first_gated_at: &Mutex<Option<Instant>>, gate: &str) -> bool {
+    let mut first = first_gated_at.lock();
+    match *first {
+        None => {
+            *first = Some(Instant::now());
+            log::info!("{gate}: gated reading 1/2 - debouncing before bypass flip");
+            false
+        }
+        Some(at) if at.elapsed() < PRICING_GATE_DEBOUNCE_MIN_SPAN => false,
+        Some(_) => {
+            *first = None;
+            true
+        }
+    }
+}
 
 pub(crate) fn current_platform() -> &'static str {
     std::env::consts::OS
@@ -12046,6 +12103,7 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
         // Gated after the debounce.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass
@@ -12083,6 +12141,7 @@ mod tests {
         let mut wall = pricing_status_with_optimization(false);
         wall.gate_reason = Some(PricingGateReason::TrialEnded);
         state.apply_pricing_gate_status(&wall, true);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&wall, true);
         assert!(
             crate::proxy_intercept::account_gate(),
@@ -12118,6 +12177,7 @@ mod tests {
         );
 
         // Second consecutive gated reading crosses the debounce threshold.
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(
             state
@@ -12137,6 +12197,7 @@ mod tests {
         // codex_keep_alive=true the gate must use the Claude-only bypass so the
         // Python backend stays up for Codex.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
         assert!(
             state
@@ -12202,6 +12263,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Second consecutive gated reading crosses the debounce threshold.
+        state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
@@ -12226,6 +12288,7 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
         // Flip it on first.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
+        state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
@@ -12250,6 +12313,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Ungated reading resets the streak — a single-poll spike clears.
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(true), false);
 
         // Now another gated reading is the first of a new window, not the
@@ -12261,6 +12325,38 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "an intervening ungated reading must reset the debounce streak"
         );
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn gate_debounce_counts_time_not_concurrent_callers() {
+        use std::sync::atomic::Ordering::Acquire;
+        let base_dir = temp_test_dir("headroom-bypass-debounce-span");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let gated = pricing_status_with_optimization(false);
+        let codex_gated = codex_usage_with_optimization(false);
+
+        // Several triggers evaluating the same reading in the same instant
+        // (frontend poll + background loop + deep link) are one observation.
+        for _ in 0..3 {
+            state.apply_pricing_gate_status(&gated, false);
+            state.apply_codex_pricing_gate_status(Some(&codex_gated));
+        }
+        assert!(
+            !state.proxy_bypass.load(Acquire),
+            "back-to-back readings must not flip"
+        );
+        assert!(
+            !state.codex_bypass.load(Acquire),
+            "back-to-back readings must not flip"
+        );
+
+        // A gated reading a full span after the first confirms both gates.
+        state.age_gate_debounce();
+        state.apply_pricing_gate_status(&gated, false);
+        state.apply_codex_pricing_gate_status(Some(&codex_gated));
+        assert!(state.proxy_bypass.load(Acquire));
+        assert!(state.codex_bypass.load(Acquire));
         fs::remove_dir_all(base_dir).ok();
     }
 
@@ -12297,6 +12393,7 @@ mod tests {
 
         // Two consecutive gated readings cross the debounce threshold and flip.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass

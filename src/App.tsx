@@ -144,7 +144,6 @@ import {
   formatLearnStatus,
   formatMonthLabel,
   formatSelectedDayLabel,
-  getEnabledSupportedConnectors,
   hasEnabledConnector,
   hasNeverScanned,
   hourOfDayTickFormatter,
@@ -395,8 +394,7 @@ function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
   );
 }
 
-// Connectors the Claude pricing gate neither auto-disables nor blocks
-// enabling while the user is authenticated: Codex has its own proxy-side
+// Connectors the Claude pricing gate does not block enabling while the user is authenticated: Codex has its own proxy-side
 // gate (codex_bypass); OpenCode bills against the user's own provider API
 // keys, so the Claude gate has nothing to meter (no dedicated bypass).
 const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
@@ -3510,39 +3508,18 @@ export default function App() {
     }
   }, [checkoutPollingDeadline, pricingStatus?.account?.subscriptionActive]);
 
-  // When the pricing gate closes, pause optimization on enabled connectors
-  // one at a time. Each disable refreshes `connectors`, re-running this
-  // effect until none remain. Codex is exempt while authenticated:
-  // `optimizationAllowed` reflects the *Claude* paid-plan gate, and Codex has
-  // its own independent gate enforced proxy-side (codex_bypass) — a Claude
-  // weekly cap must not switch off a Codex-heavy user's optimization.
+  // The pricing gate is enforced in the Rust intercept (proxy_bypass,
+  // claude_only_bypass, codex_bypass, the account wall), which forwards gated
+  // traffic direct and counts it for the "unsaved while blocked" nudge. Builds
+  // before 0.9.24-rc.11 ALSO disconnected connectors here on the first gated
+  // reading, with no debounce, and only this webview could reconnect them once
+  // the gate opened: a user who upgraded while it was not running, or whose
+  // localStorage was lost, stayed disconnected and saved nothing. Drain what
+  // those builds left behind, gated or not; the intercept keeps a gated
+  // connector unoptimized. One attempt per connector, so a failing re-enable
+  // cannot loop.
   useEffect(() => {
-    if (!pricingStatus || pricingStatus.optimizationAllowed || connectorsBusy) {
-      return;
-    }
-    const target = getEnabledSupportedConnectors(connectors).find(
-      (connector) =>
-        !pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId)
-    );
-    if (!target) {
-      return;
-    }
-    autoDisabledByGateRef.current.add(target.clientId);
-    persistAutoDisabledByGate();
-    void toggleConnector(target, false);
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
-  }, [connectors, connectorsBusy, pricingStatus]);
-
-  // Companion to the auto-disable effect above: when the pricing gate
-  // releases (e.g., user just signed up post-grace, or weekly usage
-  // rolled over), bring back every connector we auto-disabled without forcing
-  // a manual re-enable click. Scoped to our own prior auto-disables so a
-  // user's manual disable during an ungated period is preserved.
-  useEffect(() => {
-    if (!pricingStatus?.optimizationAllowed || autoDisabledByGateRef.current.size === 0) {
-      return;
-    }
-    if (connectorsBusy) {
+    if (autoDisabledByGateRef.current.size === 0 || connectorsBusy || !connectorsRef.current) {
       return;
     }
     const target = aggregateClientConnectors(connectors).find(
@@ -3554,9 +3531,11 @@ export default function App() {
       persistAutoDisabledByGate();
       return;
     }
+    autoDisabledByGateRef.current.delete(target.clientId);
+    persistAutoDisabledByGate();
     void toggleConnector(target, true);
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
-  }, [connectors, connectorsBusy, pricingStatus]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors change, so toggleConnector is fresh when it acts
+  }, [connectors, connectorsBusy]);
 
   useEffect(() => {
     const runtimeHealthyNow =
@@ -3823,11 +3802,10 @@ export default function App() {
     return connectorSupportWarnings[connector.clientId] ?? null;
   }
 
-  // Pricing gate: enabling a connector while optimization is disallowed just
-  // triggers the auto-disable effect (the ON->OFF flash). Mirror that effect's
-  // exemption exactly -- Codex is exempt while authenticated (its own
-  // proxy-side gate). Only blocks *enabling*; an already-on connector is left
-  // to the auto-disable effect.
+  // Pricing gate: enabling a connector while optimization is disallowed is
+  // steered to the upgrade/sign-in CTA instead. Codex is exempt while
+  // authenticated (its own proxy-side gate). Only blocks *enabling*; an
+  // already-on connector stays on and the intercept keeps it unoptimized.
   function connectorGateBlocksEnable(connector: ClientConnectorStatus) {
     return (
       pricingStatus != null &&

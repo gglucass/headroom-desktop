@@ -1538,8 +1538,14 @@ async fn handle(
 
     // Codex-only gate: keep Codex routed through the Python backend so it can
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
-    // but tell it to skip optimization for this request.
-    if is_codex && !is_opencode && !is_grok && codex_bypass.load(Ordering::Acquire) {
+    // but tell it to skip optimization for this request. The account wall
+    // counts too: the Codex gate reads a signed-out user as ungated (no
+    // account), which the frontend used to cover by disconnecting Codex.
+    if is_codex
+        && !is_opencode
+        && !is_grok
+        && (codex_bypass.load(Ordering::Acquire) || account_gate())
+    {
         record_gated_bypass(&buf);
         stamp_headroom_bypass_header(&mut buf);
     }
