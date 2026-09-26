@@ -9575,6 +9575,7 @@ fn headroom_python_startup_args() -> Vec<String> {
         headroom_proxy_port(),
         "--no-http2".to_string(),
         "--log-messages".to_string(),
+        "--no-rate-limit".to_string(),
     ]
 }
 
@@ -9737,6 +9738,13 @@ fn headroom_entrypoint_startup_args(
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
+    // The wheel's per-key limiter (100k tokens/min default) started counting
+    // tokens in 0.39.0 (#3350). Its bucket caps at the per-minute rate, so one
+    // request above 100k tokens can never pass: every 1M-context session past
+    // that size got a permanent 429 "Token rate limited. Retry after Ns".
+    // A single-user local proxy has nothing to rate limit; the provider does
+    // that. Defined on both entrypoints of every runtime we can fall back to.
+    args.push("--no-rate-limit".to_string());
     // CCR: both reasons it was disabled are fixed in the 0.37.0 pin, so it is
     // back ON by default here.
     //
@@ -9793,7 +9801,7 @@ fn headroom_entrypoint_startup_args(
 /// With auto-learning off the learn flags are not passed, so they drop out of
 /// the signature too.
 fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
-    let mut flags = vec!["--port", "--log-messages"];
+    let mut flags = vec!["--port", "--log-messages", "--no-rate-limit"];
     if learn_enabled {
         flags.extend([
             "--learn",
@@ -15458,7 +15466,7 @@ mod tests {
 
     #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --no-rate-limit \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
@@ -15469,13 +15477,13 @@ mod tests {
         // users still have one of those running, and it must be recognized as
         // ours rather than treated as a foreign occupant of the port.
         let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 --log-messages \
-                    --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
+                    --no-rate-limit --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_matches_without_learn_flags_when_auto_learn_off() {
-        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
         assert!(proxy_argv_contains_expected_flags(argv, false));
     }
 
@@ -15514,8 +15522,8 @@ mod tests {
     #[test]
     fn proxy_argv_match_works_for_python_module_invocation() {
         let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
-                    --no-http2 --log-messages --learn --no-memory-tools --no-memory-context \
-                    --memory-db-path /tmp/m.db";
+                    --no-http2 --log-messages --no-rate-limit --learn --no-memory-tools \
+                    --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
@@ -16351,6 +16359,7 @@ time.sleep(30)
                 default_port,
                 "--no-http2".to_string(),
                 "--log-messages".to_string(),
+                "--no-rate-limit".to_string(),
             ]
         );
         // The python -m fallback must not pass learn flags; argparse on
@@ -16439,6 +16448,26 @@ time.sleep(30)
         // that cannot take the flag would otherwise never match and the
         // desktop would stop/restart the proxy on every check.
         assert!(!super::expected_proxy_arg_signature(true).contains(&"--no-ccr"));
+
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    fn every_entrypoint_disables_the_wheel_rate_limiter() {
+        backend_port::reset_for_tests();
+
+        // 0.39.0's token bucket permanently 429s any request over 100k tokens.
+        // Every runtime version takes the flag on both entrypoints, and it is
+        // in the signature so a proxy an older build started gets restarted.
+        let flag = "--no-rate-limit".to_string();
+        for version in [Some("0.26.0"), Some("0.39.0"), None] {
+            assert!(headroom_entrypoint_startup_args(version, true).contains(&flag));
+        }
+        assert!(headroom_python_startup_args().contains(&flag));
+        assert!(super::expected_proxy_arg_signature(false).contains(&"--no-rate-limit"));
+        // The rc.7/rc.8 proxy that is 429ing right now must be restarted.
+        let rc8 = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        assert!(!proxy_argv_contains_expected_flags(rc8, false));
 
         backend_port::reset_for_tests();
     }
