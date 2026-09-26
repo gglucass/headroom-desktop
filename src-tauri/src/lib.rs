@@ -4722,9 +4722,16 @@ fn aggregate_live_learnings(
 /// multi-minute upgrade it was all but certain to hold Scripts\headroom.exe
 /// (and half-installed .pyd files) against the wheel reinstall, the
 /// requirements repair and the venv swap renames on Windows (RUST-29 /
-/// RUST-6S), and to import a package mid-replacement.
+/// RUST-6S), and to import a package mid-replacement. The install guard
+/// covers the pip runs outside an upgrade (launch recovery of an interrupted
+/// one, the MCP self-heal's requirements repair), which mutate the same venv.
 fn refuse_venv_cli_during_upgrade(state: &AppState) -> Result<(), String> {
-    if state.runtime_upgrade_in_progress() {
+    if state.runtime_upgrade_in_progress()
+        || state
+            .runtime_upgrade_installing
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    {
         return Err("Headroom is updating its runtime; try again in a minute.".into());
     }
     Ok(())
@@ -13188,6 +13195,21 @@ Some unrelated content.
         ] {
             assert_eq!(learn_step_label(line), None, "line leaked: {line:?}");
         }
+    }
+
+    #[test]
+    fn venv_cli_is_refused_while_an_install_guard_holds_the_venv() {
+        // Launch recovery and the MCP self-heal pip into the live venv under the
+        // install guard without setting runtime_upgrade_in_progress.
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-venv-cli-guard-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(super::refuse_venv_cli_during_upgrade(&state).is_ok());
+        state
+            .runtime_upgrade_installing
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::refuse_venv_cli_during_upgrade(&state).is_err());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]

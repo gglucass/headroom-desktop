@@ -35,6 +35,9 @@ name: Release App
 # either. Promote later without a rebuild:
 #   gh release edit vX.Y.Z --repo gglucass/headroom-desktop --prerelease=false --latest
 # Beta installs then pick it up on the next release's staging-rolling refresh.
+# Its rc releases are not pruned automatically; staging-rolling still points at
+# the last one, so delete them (`gh release delete vX.Y.Z-rc.N`) only after the
+# next release has moved staging-rolling on.
 
 on:
   push:
@@ -712,3 +715,12 @@ jobs:
               --title "Headroom Windows preview (rolling)" \
               --notes "Windows now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
           fi
+
+          # This version's rcs are dead now that staging-rolling points at the
+          # stable assets: delete their releases, keep the tags (bisects and
+          # `git describe` read them). Last on purpose, so a failed publish
+          # keeps its rcs, and a failed delete only warns: the release is out.
+          # A download-only stable exits above and keeps its rcs (see the header).
+          for rc in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' | grep -E "^${STABLE_TAG}-rc\.[0-9]+$" || true); do
+            gh release delete "$rc" --yes --repo "$GITHUB_REPOSITORY" || echo "::warning::could not delete release $rc"
+          done

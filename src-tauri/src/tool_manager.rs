@@ -13463,12 +13463,29 @@ mod tests {
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
     }
 
+    /// Exact-pin vendors only bind on the pinned wheel; a dev machine whose
+    /// runtime has not upgraded yet must skip, not fail.
+    fn installed_wheel_is_pinned(python: &std::path::Path) -> bool {
+        crate::proc::command(python)
+            .args([
+                "-c",
+                "import importlib.metadata as m; print(m.version('headroom-ai'))",
+            ])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == HEADROOM_PINNED_VERSION)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn transient_system_lineage_behaves_against_the_installed_wheel() {
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() {
             eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        if !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: installed wheel is not the {HEADROOM_PINNED_VERSION} pin");
             return;
         }
         let dir = std::env::temp_dir().join(format!("hd-transient-lineage-{}", std::process::id()));
@@ -13584,6 +13601,10 @@ mod tests {
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() {
             eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        if !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: installed wheel is not the {HEADROOM_PINNED_VERSION} pin");
             return;
         }
         let dir = std::env::temp_dir().join(format!("hd-cache-integrity-{}", std::process::id()));
