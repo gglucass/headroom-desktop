@@ -4432,7 +4432,7 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 /// `limit=100` returned ~44 MB because every event carried `request_messages`
 /// plus a byte-identical `compressed_messages` (~160 KB per event) while the
 /// observer and the canary between them read ~403 bytes of each; the fetch now
-/// asks for `include_messages=0` (upstream #3672, vendored), and this guard
+/// asks for `include_messages=0` (upstream #3672, native since wheel 0.39.0), and this guard
 /// still bounds how often even the slim pull runs. The backend serializes all of it on
 /// its event loop, and `/stats` -- which the dashboard polls on its own cadence
 /// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
@@ -7279,8 +7279,8 @@ fn fetch_transformations_feed_from(
         .map_err(|err| err.to_string())?;
     // include_messages=0: the observer and the canary read ~400 B of numbers
     // per event; the bodies were ~44 MB per limit=100 pull, serialized on the
-    // backend's event loop (RUST-86). Served by the #3672 vendor on the pinned
-    // wheel; a wheel without it ignores the parameter and sends bodies as
+    // backend's event loop (RUST-86). Native since wheel 0.39.0 (#3672); a
+    // wheel without it ignores the parameter and sends bodies as
     // before, which the deserializer already tolerates.
     let url = format!("{base_url}/transformations/feed?limit={limit}&include_messages=0");
     let response = client.get(url).send().map_err(|err| err.to_string())?;

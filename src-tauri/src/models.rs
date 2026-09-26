@@ -612,11 +612,10 @@ pub struct TransformationFeedEvent {
     pub workspace: Option<String>,
     #[serde(default, alias = "turn_id")]
     pub turn_id: Option<String>,
-    // Per-request prefix-cache split, from the #3672 feed vendor on the
-    // pinned wheel. uncached + cache_write is the "new input" denominator the
+    // Per-request prefix-cache split, from the feed (#3672, native since
+    // wheel 0.39.0). uncached + cache_write is the "new input" denominator the
     // overview rate uses (state.rs session_savings_pct, dashboardHelpers
-    // newInputSavingsRate); see `apply_new_input_basis`. Absent on a wheel
-    // without the vendor.
+    // newInputSavingsRate); see `apply_new_input_basis`. Absent on older wheels.
     #[serde(default, alias = "uncached_input_tokens")]
     pub uncached_input_tokens: Option<u64>,
     #[serde(default, alias = "cache_write_tokens")]

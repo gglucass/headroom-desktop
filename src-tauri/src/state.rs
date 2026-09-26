@@ -8999,15 +8999,17 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     }
 }
 
-/// Kills Headroom proxies whose parent app is gone. Windows only: an app that
-/// exited without stopping its proxy (an update clicked mid-boot, before the
-/// kill-on-close job existed) left the tree running, and mio < 1.2.1 created
-/// every socket inheritable, so that tree kept the dead app's 6767 listener
-/// open. Nothing else ever released it: the listener's pid is gone, so the
-/// intercept read the port as draining and its SO_REUSEADDR rebind got 10013
-/// forever. Proxies with a live parent (this app's, or a relaunching
-/// instance's) are spared by the orphan rule.
-pub(crate) fn reap_orphaned_proxies(venv_dir: &std::path::Path) {
+/// Kills every process running from the venv whose parent app is gone.
+/// Windows only: mio < 1.2.1 created every socket inheritable, so any child
+/// of an app that exited without stopping it (an update clicked mid-boot
+/// before the kill-on-close job existed, or a learn run or model prefetch,
+/// which never join the job) kept that app's 6767 listener open. Nothing else
+/// released it: the listener's pid is gone, so the intercept read the port
+/// as draining and its SO_REUSEADDR rebind got 10013 until the holder exited,
+/// which for a proxy is never. Anything with a live parent (this app's
+/// children, a relaunching instance's, MCP servers a running client started)
+/// is spared by the orphan rule.
+pub(crate) fn reap_orphaned_venv_processes(venv_dir: &std::path::Path) {
     if !cfg!(target_os = "windows") {
         return;
     }
@@ -9015,14 +9017,16 @@ pub(crate) fn reap_orphaned_proxies(venv_dir: &std::path::Path) {
     // python); each pass orphans the next level. A per-pid tree kill would
     // do it in one, if a deeper tree ever shows up.
     for _ in 0..3 {
+        // Empty args: the venv path is the whole filter, as in
+        // `kill_venv_lock_holders`.
         if let Err(err) = kill_processes_by_command_pattern(
             venv_dir,
-            "proxy --port",
+            "",
             SweepParents::Orphans {
                 own_children: false,
             },
         ) {
-            log::info!("reaping orphaned proxies failed: {err:#}");
+            log::info!("reaping orphaned venv processes failed: {err:#}");
             return;
         }
     }
@@ -13167,6 +13171,21 @@ mod tests {
         assert!(
             held.contains("-and $_.CommandLine -like '*proxy --port*' -and ("),
             "{held}"
+        );
+        // reap_orphaned_venv_processes: empty args must still carry the orphan
+        // rule, or the reap kills every MCP server a live client started.
+        let reap = windows_process_sweep_script(
+            exe,
+            "",
+            4242,
+            super::SweepParents::Orphans {
+                own_children: false,
+            },
+        );
+        assert!(!reap.contains("CommandLine -like '**'"), "{reap}");
+        assert!(
+            reap.contains("*') -and (($_.ParentProcessId -eq $me -and $false)"),
+            "{reap}"
         );
     }
 

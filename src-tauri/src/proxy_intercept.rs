@@ -748,6 +748,7 @@ pub fn spawn(
                 // Headroom desktop instance (updater relaunch), which nothing
                 // else ever clears -- see reclaim_stranded_intercept_holder.
                 let mut reclaim_attempted = false;
+                let mut orphans_reaped = false;
                 // A restart -- the updater relaunch, or the "Restart now"
                 // button -- starts the new process while the old one still
                 // holds the port, so the first bind after launch routinely
@@ -908,6 +909,15 @@ pub fn spawn(
                                     "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
                                     launched_at.elapsed().as_secs()
                                 );
+                                // Orphans only, so safe while the previous
+                                // instance is still on its way out; no need to
+                                // sit out the rest of the grace first.
+                                if launched_at.elapsed() >= HINT_GRACE && !orphans_reaped {
+                                    orphans_reaped = true;
+                                    if reap_orphans_holding_intercept() {
+                                        continue;
+                                    }
+                                }
                             } else {
                                 // Nothing answered /health, so the port is
                                 // held without being served: bind says in-use
@@ -949,19 +959,11 @@ pub fn spawn(
                                         );
                                         continue;
                                     }
-                                    // The listener can outlive its app: see
-                                    // `reap_orphaned_proxies`. Harmless when
-                                    // there are none; retry the plain bind
-                                    // before any SO_REUSEADDR one.
-                                    if cfg!(windows) {
-                                        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(
-                                            &crate::storage::app_data_dir(),
-                                        );
-                                        crate::state::reap_orphaned_proxies(&runtime.venv_dir);
-                                        log::info!(
-                                            "[proxy_intercept] reaped orphaned proxies holding port {INTERCEPT_PORT}; retrying bind"
-                                        );
-                                        continue;
+                                    if !orphans_reaped {
+                                        orphans_reaped = true;
+                                        if reap_orphans_holding_intercept() {
+                                            continue;
+                                        }
                                     }
                                 }
                                 // Who actually holds it decides whether this
@@ -1164,6 +1166,22 @@ pub fn spawn(
             });
         })
         .expect("spawn proxy intercept thread");
+}
+
+/// A dead app's listener can outlive it in an orphaned child: see
+/// `state::reap_orphaned_venv_processes`. Returns whether a reap ran (Windows
+/// only), so the caller retries the plain bind before any SO_REUSEADDR one.
+fn reap_orphans_holding_intercept() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let runtime =
+        crate::tool_manager::ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir());
+    crate::state::reap_orphaned_venv_processes(&runtime.venv_dir);
+    log::info!(
+        "[proxy_intercept] reaped orphaned venv processes that could hold port {INTERCEPT_PORT}; retrying bind"
+    );
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
