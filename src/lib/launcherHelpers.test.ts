@@ -15,11 +15,17 @@ import {
   nextAutoConfigureStep,
   nextAutoConfigureStepAfterApply,
   recommendedHeadroomTier,
-  INSTALL_WIZARD_STEPS
+  INSTALL_WIZARD_STEPS,
+  BILLING_FUNNEL_STEPS
 } from "./launcherHelpers";
 import type { ClientConnectorStatus } from "./types";
 
 describe("install-wizard funnel steps", () => {
+  // MUST match DesktopFunnelStep::BILLING in headroom-web, or the server drops them.
+  it("pins the billing steps shared with the server", () => {
+    expect([...BILLING_FUNNEL_STEPS]).toEqual(["upgrade_view_opened", "checkout_clicked"]);
+  });
+
   // Pins the ordered step list. MUST stay in sync with DesktopFunnelStep::ORDER
   // in the headroom-web repo — the server ignores any step not in its list, so a
   // silent drift here means silently-dropped beacons.

@@ -173,7 +173,8 @@ import {
   recommendedHeadroomTier,
   type LauncherStage,
   type MagicLinkState,
-  type InstallWizardStep
+  type InstallWizardStep,
+  type FunnelStep
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
@@ -489,7 +490,7 @@ function setConnectorTrafficVerified(verified: boolean): void {
 // Fire-and-forget install-wizard funnel beacon. Errors (offline/mid-install)
 // are swallowed so tracking never affects the wizard. Dedup is server-side
 // (first-write-wins), so re-emitting a step on back-nav is harmless.
-function reportFunnelStep(step: InstallWizardStep): void {
+function reportFunnelStep(step: FunnelStep): void {
   void invoke("report_funnel_step", { step }).catch(() => {});
 }
 
@@ -3270,6 +3271,8 @@ export default function App() {
   useEffect(() => {
     if (activeView !== "upgrade") {
       setUpgradeActionError(null);
+    } else {
+      reportFunnelStep("upgrade_view_opened");
     }
   }, [activeView]);
 
@@ -4663,11 +4666,9 @@ export default function App() {
       return;
     }
 
-    trackAnalyticsEvent("upgrade_button_clicked", {
-      plan_id: planId,
-      action_kind: action.kind,
-      email: pricingStatus?.account?.email ?? pricingStatus?.claude?.email ?? undefined,
-    });
+    if (action.kind === "checkout") {
+      reportFunnelStep("checkout_clicked");
+    }
 
     if (action.kind === "internal") {
       setUpgradeActionError(null);
