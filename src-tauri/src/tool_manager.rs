@@ -1426,6 +1426,45 @@ if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Proxied guarded upstreams (upstream PR #3804; self-neutralizes once
+# upstream_pinning grows `proxied_guarded_upstreams_allowed`):
+# 0.39.0 pins caller-supplied upstreams (x-headroom-base-url) to the address the
+# SSRF guard judged, and refuses them outright on a proxy transport, which
+# resolves the target itself. Grok and OpenCode route through that header, and
+# httpx builds proxy transports from the macOS/Windows system proxy settings, so
+# every Grok/OpenCode request from a corporate network failed with
+# UnpinnableUpstreamError (verified through a CONNECT proxy: 0.38.0 reached
+# api.x.ai, 0.39.0 answered 502). HEADROOM_ALLOWED_BASE_URLS cannot help: it
+# flips the guard to allow-only, and OpenCode targets whatever gateway the user
+# configured. With HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS=1 (the desktop sets
+# it) a proxy route forwards on the guard's name verdict, the 0.38.0 behaviour;
+# direct routes stay pinned and internal answers are still refused. Exact-pin
+# gated to wheel 0.39.0.
+_hd_pgu_flag = _hd_os.environ.get("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "")
+if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
+    try:
+        import importlib.metadata as _hd_pgu_meta
+
+        if _hd_pgu_meta.version("headroom-ai") == "0.39.0":
+            from headroom.proxy import upstream_pinning as _hd_pgu_mod
+
+            if not hasattr(_hd_pgu_mod, "proxied_guarded_upstreams_allowed"):
+                _hd_pgu_cls = _hd_pgu_mod.GuardedUpstreamRefusingTransport
+                _hd_pgu_orig = _hd_pgu_cls.handle_async_request
+
+                async def _hd_pgu_handle(self, request):
+                    pool = getattr(self._inner, "_pool", None)
+                    if _hd_pgu_mod._PROXY_POOLS and isinstance(
+                        pool, _hd_pgu_mod._PROXY_POOLS
+                    ):
+                        return await self._inner.handle_async_request(request)
+                    return await _hd_pgu_orig(self, request)
+
+                _hd_pgu_cls.handle_async_request = _hd_pgu_handle
+    except Exception:
+        # Fail-closed: on any binding failure the wheel keeps refusing.
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -3171,6 +3210,12 @@ impl ToolManager {
                     // and the task self-disables where there is no trim call
                     // (Windows), so ask for it everywhere.
                     .env("HEADROOM_MALLOC_TRIM", "1")
+                    // Wheel 0.39.0 refuses every x-headroom-base-url upstream
+                    // (Grok, OpenCode) on a proxy route, and httpx takes the
+                    // macOS/Windows system proxy settings, so both broke for
+                    // corporate users. Name verdict, then out via the proxy,
+                    // as on 0.38.0 (sitecustomize vendor / upstream PR).
+                    .env("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "1")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
@@ -13644,6 +13689,59 @@ mod tests {
         assert!(
             py.contains(r#"_hd_cq_meta.version("headroom-ai") == "0.39.0""#),
             "exact-pin gate missing"
+        );
+    }
+
+    #[test]
+    fn proxied_guarded_upstream_vendor_behaves_against_the_installed_wheel() {
+        // Grok/OpenCode behind a system proxy: the shipped sitecustomize must let
+        // a guarded x-headroom-base-url upstream out through a proxy transport
+        // while direct routes stay pinned (scripts/verify-proxied-guarded-upstream.py).
+        // Self-skips when the vendor does not bind.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-proxied-guarded-upstream.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-pgu-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", flag)
+                .output()
+                .expect("run proxied guarded-upstream probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&on.stdout).to_string();
+        if stdout.contains("FAIL pgu bound") {
+            eprintln!(
+                "skipping: proxied guarded-upstream vendor did not bind (not the 0.39.0 pin)"
+            );
+            return;
+        }
+        assert!(
+            on.status.success() && stdout.contains("OK   internal answer still refused"),
+            "proxied guarded-upstream vendor misbehaved\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        // Off, the wheel's own refusal stands, which also proves the probe can
+        // tell the two apart.
+        assert!(
+            String::from_utf8_lossy(&off.stdout).contains("REFUSED"),
+            "with the flag off the wheel should refuse\n{}",
+            String::from_utf8_lossy(&off.stderr)
         );
     }
 
