@@ -391,6 +391,10 @@ lines, so up to 15 such bullets pushed the user's own entries off the end.
 The desktop's launch scrub (memory_scrubber.rs) only cleaned it between
 flushes. Environment/architecture (CLAUDE.md) and preference routing are
 untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
+
+Also runs learn's `claude -p` analysis with no tools, so a model that starts
+exploring cannot stream past the hard cap (RUST-KK). Kill switch:
+HEADROOM_LEARN_NO_TOOLS=0.
 """
 import faulthandler
 import signal
@@ -2426,6 +2430,29 @@ if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: the analysis `claude -p` gets no tools (posture) --------------------
+# The digest is the whole input and the answer is one JSON object, but the
+# headless session is a full Claude Code agent: Bash, Edit, Task and every MCP
+# server, under the user's own permissions, persona hooks and skills. A model
+# that goes off to read or verify things streams events the whole time, so the
+# idle cap never fires and the run dies at the hard cap with nothing written
+# (RUST-KK: 900s). `--tools ""` plus `--strict-mcp-config` leaves zero tools, so
+# one turn. Not version-gated: a wheel that already passes either flag, or
+# renames the table, leaves this inert. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
+_hd_lnt_flag = _hd_os.environ.get("HEADROOM_LEARN_NO_TOOLS", "1")
+if _hd_lnt_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.learn import analyzer as _hd_lnt_mod
+
+        for _hd_lnt_name, _hd_lnt_model, _hd_lnt_cmd in _hd_lnt_mod._CLI_BACKENDS:
+            if _hd_lnt_model == "claude-cli" and not {"--tools", "--strict-mcp-config"} & set(
+                _hd_lnt_cmd
+            ):
+                _hd_lnt_cmd.extend(["--tools", "", "--strict-mcp-config"])
+                _hd_bound.add("learn_no_tools")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2457,6 +2484,7 @@ _HD_VENDORS = (
     "learn_rule_coerce",
     "learn_worktree_merge",
     "learn_drop_error_recovery",
+    "learn_no_tools",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -16366,6 +16394,42 @@ assert g.done"#,
         }
         assert_eq!(on, "False memory_file", "stderr:\n{on_err}");
         assert_eq!(off, "True memory_file", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_no_tools_behaves_against_the_installed_wheel() {
+        // RUST-KK: the claude-cli analysis command carries the no-tools flags
+        // exactly once; the kill switch leaves the wheel's command alone.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-nt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn.analyzer import _CLI_BACKENDS as b\n\
+                     c = next(c for _, m, c in b if m == 'claude-cli')\n\
+                     print(c.count('--tools'), c[c.index('--tools') + 1:] if '--tools' in c else '-')";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_NO_TOOLS", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "1 ['', '--strict-mcp-config']", "stderr:\n{on_err}");
+        assert_eq!(off, "0 -", "stderr:\n{off_err}");
     }
 
     #[test]

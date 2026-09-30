@@ -8201,10 +8201,14 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
 ///
 /// Only a flag current CLIs accept counts. Any other unknown flag is upstream
 /// passing something no CLI has, which is ours to fix and must reach Sentry.
-/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here.
+/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here,
+/// as does a sitecustomize vendor (`--tools`/`--strict-mcp-config`: learn no
+/// tools, RUST-KK).
 fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
     const CURRENT_FLAGS: &[&str] = &[
         "--include-partial-messages",
+        "--tools",
+        "--strict-mcp-config",
         "--output-format",
         "--verbose",
         "--skip-git-repo-check",
@@ -14249,6 +14253,9 @@ Some unrelated content.
         ));
         assert!(learn_failure_is_agent_cli_outdated(
             "LLM analysis failed: `codex exec --json` failed (exit 2):\nerror: unexpected argument '--json' found\n"
+        ));
+        assert!(learn_failure_is_agent_cli_outdated(
+            "error: unknown option '--tools'"
         ));
         for stderr in [
             "Error: No such option: --foo",
