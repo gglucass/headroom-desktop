@@ -556,8 +556,8 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     let projects = state.list_claude_code_projects().unwrap_or_default();
     let claude = claude_sessions_touched_since(&projects, since);
     // Shared with the hourly self-heal in `detect_unrouted_clients`: the one
-    // helper that knows Codex's session dir AND its GUI thread store, and how
-    // to ignore Headroom's own writes to it. It walks, so it is re-asked at
+    // helper that knows which Codex writes are turns (rollouts, not the thread
+    // store an idle app-server rewrites). It walks, so it is re-asked at
     // most once a minute, not on every 5s poll.
     let codex_active_at = codex_local_activity_at();
     let codex = codex_active_at.is_some_and(|at| at > since);
@@ -1088,6 +1088,20 @@ async fn install_app_update(
         return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
     }
 
+    // The plugin swaps the bundle at the path this process launched from, so if
+    // the user moved or deleted Headroom.app while it ran, the swap's first
+    // rename dies on a bare "No such file or directory (os error 2)" after the
+    // whole download (RUST-HZ: one process retried for a week). Same class as
+    // the read-only case: the user's setup, fixed by relaunching the copy.
+    #[cfg(target_os = "macos")]
+    if current_app_bundle_path().is_some_and(|bundle| !bundle.exists()) {
+        log::info!(
+            "update: refusing in-place install; running bundle {:?} is gone",
+            current_app_bundle_path()
+        );
+        return Err(MOVED_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -1253,6 +1267,12 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it is running from a read-only folder. \
      If you opened it straight from the disk image, drag Headroom to your \
      Applications folder and open it from there, then check for updates again.";
+
+/// The message shown when the running bundle's path no longer exists.
+#[cfg(target_os = "macos")]
+const MOVED_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it was moved or deleted while running. \
+     Quit Headroom, open it from its current location, then check for updates again.";
 
 /// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
 /// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the

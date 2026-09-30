@@ -1172,38 +1172,13 @@ pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<Sys
 /// evidence it ran, independent of whether Headroom saw any of it.
 pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
     match normalized_setup_id(client_id) {
-        "codex_cli" => {
-            let mut newest =
-                newest_mtime_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP);
-            // GUI/TUI thread store: state_<N>.sqlite and its -wal. Not the -shm
-            // (touched by idle readers, e.g. a backgrounded Codex GUI), and not
-            // anything at or before Headroom's own provider retag: that rewrites
-            // the store on every launch and connect, and read as "Codex ran"
-            // it false-fired the unrouted alert on machines that never ran it.
-            let own_write = last_codex_retag_at().map(|at| at + Duration::from_secs(2));
-            for dir in codex_state_dirs() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    if !entry.file_name().to_str().is_some_and(|name| {
-                        name.starts_with("state_")
-                            && (name.ends_with(".sqlite") || name.ends_with(".sqlite-wal"))
-                    }) {
-                        continue;
-                    }
-                    if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
-                        if own_write.is_some_and(|until| modified <= until) {
-                            continue;
-                        }
-                        if Some(modified) > newest {
-                            newest = Some(modified);
-                        }
-                    }
-                }
-            }
-            newest
-        }
+        // Rollouts only, which every surface (CLI, exec, Desktop, the IDE
+        // extension) appends on each turn. Not the state_<N>.sqlite thread
+        // store: the idle `codex app-server` an IDE extension or Codex Desktop
+        // keeps running rewrites it (and its -wal) with no turn at all, which
+        // read as "Codex ran, nothing proxied" for users who never opened it
+        // (RUST-KC, codex_rollout_fresh=false).
+        "codex_cli" => newest_mtime_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP),
         "claude_code" => {
             newest_claude_transcript_mtime(&home_dir().join(".claude").join("projects"))
         }
@@ -1280,8 +1255,8 @@ fn parse_codex_session_meta(first_line: &str) -> Option<CodexSessionMeta> {
 /// "openai" after Headroom started never read the config at all. `resumed`
 /// marks a thread older than `app_started_at`, whose provider predates us.
 /// `rollout_fresh` says whether that rollout was written this run at all:
-/// activity can come from the GUI thread store alone, and then the newest
-/// rollout is some older session whose provider says nothing about this one.
+/// activity is rollout mtimes now, so "false" means some non-rollout file
+/// under `sessions/` moved, and the provider says nothing about this run.
 /// Call it BEFORE re-applying the setup, or `codex_config_routed` reports
 /// our own repair instead of what Codex read.
 pub(crate) fn codex_unrouted_diagnostics(
@@ -4559,14 +4534,6 @@ fn discover_codex_state_dbs() -> Vec<PathBuf> {
     out
 }
 
-/// When this process last rewrote the Codex thread store, so
-/// `client_local_activity_at` does not mistake our write for Codex running.
-static LAST_CODEX_RETAG: std::sync::Mutex<Option<SystemTime>> = std::sync::Mutex::new(None);
-
-fn last_codex_retag_at() -> Option<SystemTime> {
-    *LAST_CODEX_RETAG.lock().unwrap()
-}
-
 /// Best-effort retag of Codex thread provider tags so the history menu stays
 /// whole across the Headroom proxy boundary. Never fails the caller: a missing
 /// store, a missing `threads` table, or a DB locked by a running Codex is logged
@@ -4604,7 +4571,6 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
         }
     }
     report_codex_retag_skips(&skip_reasons);
-    *LAST_CODEX_RETAG.lock().unwrap() = Some(SystemTime::now());
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
     // the table itself (discovery already survives a file rename). Only flag when
     // the store-shaped name is present, so a clean or CLI-only / pre-sqlite
@@ -19141,24 +19107,28 @@ sys.exit(3)
 
     #[test]
     #[serial_test::serial]
-    fn codex_activity_ignores_headrooms_own_retag_write() {
-        // Every launch retags the thread store; that write must not read as
-        // "Codex ran" or the unrouted alert fires on machines that never ran it.
+    fn codex_activity_is_rollouts_not_the_thread_store() {
+        // Our launch retag and an idle `codex app-server` both write the thread
+        // store with no turn; either read as "Codex ran" fired RUST-KC.
         let home = TestHome::new();
         let db = home.path().join(".codex").join("state_5.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         seed_codex_threads_db(&db, &[("a", "openai")]);
-
         retag_codex_threads_to_headroom();
-        assert_eq!(super::client_local_activity_at("codex"), None);
-
-        // Codex itself writing the store afterwards does count.
+        let wal = db.with_extension("sqlite-wal");
+        std::fs::write(&wal, b"idle app-server").unwrap();
         std::fs::File::options()
             .write(true)
-            .open(&db)
+            .open(&wal)
             .unwrap()
-            .set_modified(SystemTime::now() + std::time::Duration::from_secs(10))
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
             .unwrap();
+        assert_eq!(super::client_local_activity_at("codex"), None);
+
+        // A turn appends a rollout, and that does count.
+        let day = home.path().join(".codex/sessions/2026/09/30");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-x.jsonl"), b"{}\n").unwrap();
         assert!(super::client_local_activity_at("codex").is_some());
     }
 

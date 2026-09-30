@@ -14125,6 +14125,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // as a prompt; `run_plugin_cmd` now refuses such a CLI, so this bucket
         // reappearing is a new cause.
         "cli-not-authenticated"
+    } else if lower.contains("(stalled installer)") {
+        // Our own silence watchdog killed the host CLI (RUST-DQ: Linux
+        // `claude plugin update` quiet for 180s after "Checking for updates").
+        "host-cli-stalled"
     } else {
         "other"
     }
@@ -14370,7 +14374,14 @@ where
     use std::sync::mpsc;
 
     let mut cmd = build_command(binary, args, cwd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Stdin closed, not inherited: nothing here can answer a prompt, and the
+    // child leads its own process group, so on an app started from a terminal
+    // any touch of that TTY (a read, a raw-mode switch) stops it with
+    // SIGTTIN/SIGTTOU. That reads as silence and the watchdog below killed it
+    // (RUST-DQ: Linux `claude plugin update`, "no output for 180s").
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     crate::proc::own_process_group(&mut cmd);
 
     let mut child = cmd
@@ -23872,6 +23883,23 @@ exit 0
         assert!(failure.stdout.contains("hi"), "output is kept");
     }
 
+    /// RUST-DQ: a host CLI that touched an inherited stdin sat stopped until
+    /// the silence watchdog killed it. A child reading stdin gets EOF at once.
+    #[test]
+    #[cfg(unix)]
+    fn run_command_streaming_closes_the_childs_stdin() {
+        let mut lines = Vec::new();
+        super::run_command_streaming(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "read -r x; echo \"read rc=$?\""],
+            &std::env::temp_dir(),
+            Some(Duration::from_secs(3)),
+            &mut |line: &str| lines.push(line.to_string()),
+        )
+        .expect("a child reading stdin must see EOF, not wait on ours");
+        assert_eq!(lines, ["read rc=1"]);
+    }
+
     #[test]
     #[cfg(unix)]
     fn run_command_streaming_spares_slow_but_talking_child() {
@@ -24299,6 +24327,13 @@ exit 0
                  stdout:\n\nstderr:\nError: failed to activate plugin cache entry: Directory not \
                  empty (os error 66)",
                 "host-cache-conflict",
+            ),
+            (
+                "Claude Code: command failed (killed by signal): ~/.local/bin/claude plugin \
+                 update caveman@caveman\nstdout:\nChecking for updates for plugin \
+                 \"caveman@caveman\" at user scope\u{2026}\n\nstderr:\n\n[headroom] killed: no \
+                 output for 180s (stalled installer)\n",
+                "host-cli-stalled",
             ),
             ("Codex: something we have not seen", "other"),
         ];

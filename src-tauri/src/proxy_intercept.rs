@@ -2199,14 +2199,16 @@ async fn splice_with_codex_capture(
 
     // backend -> client: capture the response head, then stream the remainder.
     let downstream = async {
+        // No deadline on the head: the backend sends it only after compressing
+        // the request, which can take well over 10s on a long session, and the
+        // copy below waits on the same stream unbounded anyway. A 10s timeout
+        // here dropped the status of every slow prompt, so it was tallied as
+        // `no_response` by `note_codex_prompt_outcome` (RUST-KG) and its
+        // rate-limit headers were never read.
         let mut head = Vec::with_capacity(4096);
-        let read_head = tokio::time::timeout(
-            HEADER_READ_TIMEOUT,
-            read_http_headers(&mut backend_rd, &mut head),
-        )
-        .await;
+        let read_head = read_http_headers(&mut backend_rd, &mut head).await;
 
-        if matches!(read_head, Ok(Ok(()))) {
+        if read_head.is_ok() {
             stamp_backend_traffic();
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
