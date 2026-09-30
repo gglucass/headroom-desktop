@@ -183,10 +183,17 @@ impl Ledger {
         })
     }
 
-    /// Every shaped request in the ledger, scored or not: the denominator
-    /// both coverage gates measure against.
+    /// Every shaped request in the ledger, scored or not: the synthetic
+    /// control's coverage denominator.
     fn shaped(&self) -> u64 {
         self.treatment.values().map(|acc| acc.n).sum()
+    }
+
+    /// The shaped requests that carry a conversation (`qn`): the measured
+    /// estimate's coverage denominator, since those are the only rows it can
+    /// ever score.
+    fn qualified(&self) -> u64 {
+        self.treatment.values().map(|acc| acc.qn).sum()
     }
 }
 
@@ -366,16 +373,22 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         baseline_tokens,
         var,
         requests,
-        ledger.shaped(),
+        ledger.qualified(),
     )
 }
 
 /// The measured estimate, but only once it is worth showing: it must cover
-/// [`MEASURED_MIN_COVERAGE_PCT`] of the shaped traffic and carry a band no wider
-/// than [`MEASURED_MAX_CI_HALF_WIDTH_PCT`].
+/// [`MEASURED_MIN_COVERAGE_PCT`] of the conversation-qualified shaped traffic
+/// and carry a band no wider than [`MEASURED_MAX_CI_HALF_WIDTH_PCT`].
 ///
-/// Coverage is measured against the same denominator the synthetic control
-/// uses, so a holdout only displaces an estimate it genuinely outgrew.
+/// Coverage counts qualified rows only. Rows without a conversation (from
+/// before wheel 0.38.0, or dropped by `requalify_output_savings_arms_once`)
+/// can never enter the measured estimate, so counting them in its
+/// denominator held promotion back by however much history a machine had:
+/// 54k such rows on one machine against a few thousand a day of new ones.
+/// The check below still refuses a measurement of less traffic than the
+/// estimate it would replace, so a holdout only displaces an estimate it
+/// genuinely outgrew.
 fn measured_if_ready(
     ledger: &Ledger,
     estimated: &Option<OutputEstimate>,
@@ -565,16 +578,19 @@ mod tests {
 
     #[test]
     fn legacy_treatment_rows_do_not_block_a_solid_holdout() {
-        // A ledger upgraded from before wheel 0.38.0 keeps 10 treatment rows
-        // with no conversation: they count in n, never in qn. The measured
-        // side is on the qn basis, so the "never trade for less traffic"
-        // check has to be too, or it refuses promotion for good.
+        // A ledger upgraded from before wheel 0.38.0, or requalified for the
+        // holdout key, keeps treatment rows with no conversation: they count
+        // in n, never in qn. Here they are 10x the qualified rows. The
+        // measured side is on the qn basis, so both its coverage gate and the
+        // "never trade for less traffic" check have to be too, or it cannot
+        // promote until new traffic outweighs all of that history.
         let e = estimate(&HOLDOUT.replace(
             r#"{"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
-            r#"{"n": 1010, "sum": 808000, "sumsq": 656390000,"#,
+            r#"{"n": 11000, "sum": 8800000, "sumsq": 7049990000,"#,
         ));
         assert_eq!(e.method, "measured");
         assert_eq!(e.requests, 1000);
+        assert!((e.coverage_percent - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -596,7 +612,9 @@ mod tests {
         // requests and has no control samples at all.
         let json = HOLDOUT.replace(
             r#""treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
-            r#""treatment": {"opus|ask|xl|tools": {"n": 4000, "sum": 4000000, "sumsq": 4009990000},
+            r#""treatment": {"opus|ask|xl|tools": {"n": 4000, "sum": 4000000, "sumsq": 4009990000,
+                                                   "qn": 4000, "qsum": 4000000, "qsumsq": 4009990000,
+                                                   "clusters": ["x1"]},
                              "opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
         ).replace(
             r#""strata": {"opus|ask|l|tools": {"n": 100, "sum": 95000, "sumsq": 90490000}}"#,
