@@ -1702,7 +1702,7 @@ if _hd_os.environ.get(
 # _estimate_tokens, both Kompress attempts are judged with it, and the inline
 # lossless-then-lossy attempt is recorded in the chain so a losing one is not
 # run again. The inference that already ran now pays for itself. A compression
-# change (raises savings on code no-op blocks): soak + savings:did. It relies
+# change (raises savings on code no-op blocks): savings:did after release. It relies
 # on token_read_window keeping recent Reads out of the router, and supersedes
 # kompress_waste, which skips the very calls this keeps, so that vendor stands
 # down when this one binds. Exact-pin gated to wheel 0.39.0; self-neutralizes
@@ -1822,8 +1822,8 @@ fallback_tokens = _estimate_tokens(fallback_compressed)
 # the guards and the forwarded bytes stay the wheel's. "Cannot" means the
 # must-keep words Kompress always keeps already cost W tokens, or would with a
 # keep-floor share of the other tokens. Latency only: fixing the unit mismatch
-# would start compressing code Reads, a compression change for the soak and
-# savings:did gate. Exact-pin gated to wheel 0.39.0; self-neutralizes once
+# would start compressing code Reads, a compression change to check with
+# savings:did. Exact-pin gated to wheel 0.39.0; self-neutralizes once
 # either half of the mismatch changes. Kill switch: HEADROOM_KOMPRESS_WASTE=0.
 _hd_kw_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE", "1")
 if (
@@ -1940,7 +1940,7 @@ if (
 # body loses its negations. Drop a zero window so the router uses token mode's
 # own; protect_recent, the positional guard for all other tool output, is
 # untouched. A compression change (lowers savings on recent excluded-tool
-# output): soak + savings:did. Exact-pin gated to wheel 0.39.0; self-neutralizes
+# output): savings:did after release. Exact-pin gated to wheel 0.39.0; self-neutralizes
 # when the router stops letting a zero window narrow protection. Kill switch:
 # HEADROOM_TOKEN_READ_WINDOW=0.
 _hd_trw_flag = _hd_os.environ.get("HEADROOM_TOKEN_READ_WINDOW", "1")
