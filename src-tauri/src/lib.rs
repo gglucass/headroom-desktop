@@ -1029,8 +1029,19 @@ async fn check_for_app_update(
     // failed to start or relaunch us. A relaunched build's launch-time
     // restore_client_setups re-applies the remembered clients.
     let teardown = app.clone();
-    let updater = app
-        .updater_builder()
+    let builder = app.updater_builder();
+    // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary,
+    // RUST-KR), tauri's own current_exe() refuses the path on macOS and every
+    // check fails. Hand it the resolved binary instead. Only a path that
+    // canonicalizes: the plugin replaces the directory two levels above a
+    // `Contents/MacOS` exe, or else the exe's own parent, so a raw link path
+    // would aim the install at `~/.local/bin`.
+    #[cfg(target_os = "macos")]
+    let builder = match canonical_current_exe() {
+        Some(exe) => builder.executable_path(exe),
+        None => builder,
+    };
+    let updater = builder
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
@@ -1251,10 +1262,25 @@ async fn restart_app(app: AppHandle) {
     }
 }
 
+/// `current_exe` with symlinks resolved, or None when it no longer resolves
+/// (bundle moved or deleted while running).
+#[cfg(target_os = "macos")]
+fn canonical_current_exe() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()?.canonicalize().ok()
+}
+
 /// Walks up from `current_exe` to find the enclosing `.app` bundle path.
 #[cfg(target_os = "macos")]
 fn current_app_bundle_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    app_bundle_of(std::env::current_exe().ok()?)
+}
+
+/// Uses the resolved binary, since a symlinked launch path has no `.app`
+/// ancestor (RUST-KR); falls back to the raw path so a moved bundle still reads
+/// as gone.
+#[cfg(target_os = "macos")]
+fn app_bundle_of(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let exe = exe.canonicalize().unwrap_or(exe);
     exe.ancestors()
         .find(|p| p.extension().is_some_and(|ext| ext == "app"))
         .map(|p| p.to_path_buf())
@@ -6223,6 +6249,11 @@ const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
      Move Headroom to /Applications and relaunch.";
 
+#[cfg(target_os = "macos")]
+const READ_ONLY_BUNDLE_AUTOSTART_MESSAGE: &str =
+    "Headroom cannot open at login while it runs from the disk image. Drag Headroom \
+     to your Applications folder, open it from there, then turn this on again.";
+
 #[cfg(not(target_os = "macos"))]
 const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
@@ -6239,6 +6270,14 @@ async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
 #[tauri::command]
 async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = autolaunch(&app).ok_or(AUTOSTART_UNAVAILABLE)?;
+    // Run off the DMG (straight from the mount, or App-Translocated), the login
+    // item would name a path that is gone after the next reboot, and it would
+    // still read as enabled once the user moves Headroom to Applications.
+    // Onboarding turns this on by default, so that cohort hits it first.
+    #[cfg(target_os = "macos")]
+    if enabled && bundle_is_read_only() {
+        return Err(READ_ONLY_BUNDLE_AUTOSTART_MESSAGE.to_string());
+    }
     if enabled {
         manager.enable().map_err(|err| err.to_string())?;
     } else {
@@ -10726,7 +10765,9 @@ mod tests {
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
-    use super::{bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem};
+    use super::{
+        app_bundle_of, bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem,
+    };
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -10745,6 +10786,27 @@ mod tests {
         fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
             Box::pin(async move { self.install_result })
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_bundle_of_follows_a_symlinked_launch_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let macos = dir.path().join("Headroom.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("bundle dirs");
+        let exe = macos.join("headroom-desktop");
+        std::fs::write(&exe, b"").expect("write exe");
+        let bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let link = bin.join("headroom");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink");
+
+        let bundle = dir.path().canonicalize().unwrap().join("Headroom.app");
+        assert_eq!(app_bundle_of(link), Some(bundle));
+
+        // A moved bundle keeps its stale path, so the moved-bundle guard fires.
+        let gone = dir.path().join("Gone.app/Contents/MacOS/headroom-desktop");
+        assert_eq!(app_bundle_of(gone), Some(dir.path().join("Gone.app")));
     }
 
     #[test]

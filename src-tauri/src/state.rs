@@ -3882,7 +3882,19 @@ impl AppState {
         // spawn, and its child is exactly what the sweep below would match:
         // it has our pid as parent and has not bound the port yet. Reap only
         // true orphans in that case (see kill_processes_by_command_pattern).
+        // Except on the way out: the spawn's own teardown runs only once the
+        // child binds its port, after this process is gone, so a quit or an
+        // update restart during a backend boot left that child running. The
+        // next instance adopted it as a healthy backend and served the old
+        // version's sitecustomize until its next restart (0.9.28-rc.6 ran
+        // rc.5's backend without the keepalive vendor).
+        // ponytail: a child spawned after this sweep (the spawn loop's next
+        // variant) still escapes; it has ~100ms before exit to get there. A
+        // SHUTTING_DOWN bail before `command.spawn()` closes it, once start
+        // failures during quit stop reporting to Sentry.
         let lock_held = _lifecycle_guard.is_some();
+        let reap_own_children =
+            lock_held || crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire);
         // Every app-initiated stop is a down window we caused: a watchdog
         // restart, a pricing-gate pause, a port rebind, quit. The down->up
         // transition that follows is not an outage worth paging, and when the
@@ -3963,7 +3975,7 @@ impl AppState {
                 exe,
                 args_pattern,
                 SweepParents::Orphans {
-                    own_children: lock_held,
+                    own_children: reap_own_children,
                 },
             ) {
                 // `:#` prints the whole context chain: a spawn failure's io
