@@ -1,0 +1,246 @@
+name: Release App (Garm Tech signing test)
+
+# Separate track for moving macOS signing from Idiosyncratocracy BV (team
+# ZA6LNF9PF9) to Garm Tech B.V. (team LG7M5PWA5X). It runs only on the
+# garmtech-signing branch and never touches the regular update files
+# (releases/latest, staging-rolling): every build here bakes in
+# garmtech-rolling as BOTH updater endpoints, and its releases are prereleases.
+#
+# A version bump to X.Y.Z-gt.N pushed to garmtech-signing builds macOS only and
+# signs it as Garm Tech, or as Idiosyncratocracy when the bump commit message
+# carries [signer: idiosyncratocracy]. The Idiosyncratocracy variant exists to
+# test the cross-team update: install it, then let it update to a Garm Tech
+# build from garmtech-rolling.
+
+on:
+  push:
+    branches:
+      - garmtech-signing
+    paths:
+      - package.json
+      - src-tauri/tauri.conf.json
+
+concurrency:
+  group: macos-release-garmtech
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: Check for a -gt.N version bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_release: ${{ steps.release_guard.outputs.should_release }}
+      package_version: ${{ steps.release_guard.outputs.package_version }}
+      signer: ${{ steps.release_guard.outputs.signer }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version and pick the signer
+        id: release_guard
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "JSON.parse(require('fs').readFileSync('./src-tauri/tauri.conf.json', 'utf8')).version")"
+          should_release=true
+
+          if [[ "$package_version" != "$tauri_version" ]]; then
+            echo "package.json version ($package_version) does not match src-tauri/tauri.conf.json version ($tauri_version)." >&2
+            exit 1
+          fi
+
+          # Never an -rc.N: a staging merge into this branch brings one, and a
+          # release under that tag would collide with the real rc.
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-gt\.[0-9]+$ ]]; then
+            echo "This track requires an -gt.N version (got: $package_version). Bump it before pushing." >&2
+            exit 1
+          fi
+
+          before_sha="${BEFORE_SHA:-}"
+          if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
+            previous_version="$(git show "${before_sha}:package.json" | node -e "console.log(JSON.parse(require('fs').readFileSync(0, 'utf8')).version)")"
+            if [[ "${previous_version}" == "${package_version}" ]]; then
+              should_release=false
+              echo "No version bump relative to ${before_sha}; skipping release."
+            fi
+          fi
+
+          signer=garmtech
+          if grep -qiE '\[signer: *idiosyncratocracy\]' <<<"$COMMIT_MESSAGE"; then
+            signer=idiosyncratocracy
+          fi
+          echo "Signer: $signer"
+
+          echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "signer=${signer}" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: macOS Universal (${{ needs.guard.outputs.signer }})
+    needs: guard
+    if: needs.guard.outputs.should_release == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/garmtech-rolling/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/garmtech-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      SIGNER: ${{ needs.guard.outputs.signer }}
+      EXPECTED_TEAM: ${{ needs.guard.outputs.signer == 'garmtech' && 'LG7M5PWA5X' || 'ZA6LNF9PF9' }}
+      GARMTECH_SECRETS_SET: ${{ secrets.GARMTECH_APPLE_CERTIFICATE != '' && secrets.GARMTECH_APPLE_CERTIFICATE_PASSWORD != '' && secrets.GARMTECH_APPLE_SIGNING_IDENTITY != '' && secrets.GARMTECH_APPLE_API_ISSUER != '' && secrets.GARMTECH_APPLE_API_KEY != '' && secrets.GARMTECH_APPLE_API_PRIVATE_KEY_P8 != '' && secrets.GARMTECH_APPLE_TEAM_ID != '' }}
+      APPLE_CERTIFICATE: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_CERTIFICATE || secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_CERTIFICATE_PASSWORD || secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_ISSUER: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_API_ISSUER || secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_API_KEY || secrets.APPLE_API_KEY }}
+      APPLE_API_PRIVATE_KEY_P8: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_API_PRIVATE_KEY_P8 || secrets.APPLE_API_PRIVATE_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ needs.guard.outputs.signer == 'garmtech' && secrets.GARMTECH_APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            src-tauri -> target
+          env-vars: HEADROOM_SENTRY_DSN
+
+      - name: Validate signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each APPLE_* falls back to the Idiosyncratocracy secret when its
+          # GARMTECH_* twin is empty, so a Garm Tech build must prove the whole
+          # set is present, or it would sign or notarize with the wrong team.
+          # The shipped app's team is checked after the build.
+          if [[ "$SIGNER" == garmtech && "$GARMTECH_SECRETS_SET" != true ]]; then
+            echo "A GARMTECH_APPLE_* secret is missing; refusing to fall back to the Idiosyncratocracy credentials." >&2
+            exit 1
+          fi
+          for key in HEADROOM_ACCOUNT_API_BASE_URL HEADROOM_APTABASE_APP_KEY HEADROOM_UPDATER_PUBLIC_KEY \
+            APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY_P8 \
+            TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret or variable: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Prepare App Store Connect API key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY_P8" > "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish the versioned prerelease
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: .
+          tagName: v__VERSION__
+          releaseName: Headroom v__VERSION__ (Garm Tech signing test, ${{ needs.guard.outputs.signer }})
+          releaseBody: |
+            Signing-migration test build, signed by ${{ needs.guard.outputs.signer }}. Not for distribution: it updates only from garmtech-rolling.
+          releaseDraft: false
+          prerelease: true
+          releaseAssetNamePattern: '[name]_[version]_mac[ext]'
+          uploadUpdaterJson: true
+          args: --target universal-apple-darwin
+
+      - name: Verify the shipped signature
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.guard.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir" -p '*_mac.app.tar.gz'
+          tar xzf "$workdir"/*_mac.app.tar.gz -C "$workdir"
+          app="$workdir/Headroom.app"
+          codesign --verify --deep --strict "$app"
+          team="$(codesign -dv "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          if [[ "$team" != "$EXPECTED_TEAM" ]]; then
+            echo "Shipped app is signed by team $team, expected $EXPECTED_TEAM ($SIGNER)." >&2
+            exit 1
+          fi
+          spctl -a -vv -t exec "$app"
+
+  rolling:
+    name: Publish garmtech-rolling
+    needs: [guard, release]
+    if: needs.guard.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Point garmtech-rolling at this build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.guard.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir" -p '*_mac.app.tar.gz' -p '*_mac.app.tar.gz.sig' -p latest.json
+
+          # tauri-action writes api.github.com asset URLs (rate limited) and
+          # darwin-<arch>-app keys the updater reads first, so rebuild the
+          # platform map against the versioned tag, like the staging mirror.
+          mac_sig="$(ls "$workdir"/*_mac.app.tar.gz.sig)"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "${mac_sig%.sig}")"
+          jq --arg sig "$(cat "$mac_sig")" --arg url "$url" \
+            '.platforms = {"darwin-aarch64": {signature: $sig, url: $url}, "darwin-x86_64": {signature: $sig, url: $url}}' \
+            "$workdir/latest.json" > "$workdir/latest.rolling.json"
+          mv "$workdir/latest.rolling.json" "$workdir/latest.json"
+
+          if ! gh release view garmtech-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create garmtech-rolling --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+              --title "Headroom Garm Tech signing test (rolling)" \
+              --notes "Update endpoint for Garm Tech signing-test builds only. Not for distribution."
+          fi
+          gh release upload garmtech-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit garmtech-rolling --repo "$GITHUB_REPOSITORY" --notes "Update endpoint for Garm Tech signing-test builds only. Not for distribution. Current: $TAG"
