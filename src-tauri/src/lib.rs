@@ -8126,6 +8126,9 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         "please run `codex login`",
         "run `codex login`",
         "no credentials found",
+        // `codex exec` with no login: `ERROR: unexpected status 401
+        // Unauthorized: Missing bearer or basic authentication in header`.
+        "missing bearer or basic authentication",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -8446,6 +8449,20 @@ fn learn_failure_signature_source(text: &str) -> String {
         return first.to_string();
     };
     match lines.get(marker + 1) {
+        // RUST-KT: `codex exec` opens its stderr with this banner and states
+        // its verdict last, as `ERROR: ...` after its `Reconnecting...` retries.
+        // The status variant ends `, url: ..., cf-ray: ..., request id: ...`,
+        // unique per request, so it is cut there.
+        Some(&"Reading prompt from stdin...") => {
+            let reason = lines[marker + 1..]
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                .map_or("Reading prompt from stdin...", |l| {
+                    l.split_once(", url: ").map_or(*l, |(head, _)| head)
+                });
+            format!("{} {reason}", lines[marker])
+        }
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
     }
@@ -9190,10 +9207,10 @@ fn tray_savings_line(today: TraySavingsToday) -> String {
     )
 }
 
-/// One line per plan, as its newest response reported it: Claude from the
-/// `anthropic-ratelimit-unified-*` headers, Codex from `x-codex-*`. A window
-/// whose reset time has passed is back at 0; a plan with nothing reported
-/// since launch gets no line.
+/// One line per plan, as last reported: Claude from the
+/// `anthropic-ratelimit-unified-*` headers or the usage fetch (kept across
+/// launches), Codex from `x-codex-*`. A window whose reset time has passed is
+/// back at 0; a plan with nothing reported gets no line.
 fn tray_usage_lines(
     claude: Option<ClaudePlanUsage>,
     codex: Option<&CodexRateLimitSnapshot>,
@@ -9634,7 +9651,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 let menu_info = (
                     tray_savings_line(today),
                     tray_usage_lines(
-                        proxy_intercept::claude_plan_usage(),
+                        claude_statusline::plan_usage(),
                         codex.as_ref(),
                         Utc::now().timestamp(),
                     ),
@@ -14782,6 +14799,37 @@ Some unrelated content.
             learn_failure_signature_source(marker),
             "LLM analysis failed: `claude -p` failed (exit 1): Credit balance is too low"
         );
+    }
+
+    #[test]
+    fn learn_failure_signature_source_takes_codex_verdict_not_its_banner() {
+        // RUST-KT: codex's stderr after the marker, prompt echo dropped by the
+        // learn_prompt_echo vendor. The banner line grouped every Codex failure
+        // as one cause-less issue; the request ids would split one per event.
+        let codex = |verdict: &str| {
+            format!(
+                "2026-10-01 14:09:48,279 - headroom.learn.analyzer - WARNING - LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\n\
+                 Reading prompt from stdin...\nOpenAI Codex v0.159.2\n--------\nmodel: gpt-5.6-sol\n--------\nuser\n[prompt omitted]\n\
+                 2026-10-01T12:14:29.724211Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized\n\
+                 ERROR: Reconnecting... 5/5\n{verdict}\n"
+            )
+        };
+        let stderr = codex("ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a43b638e9ffc8239-AMS, request id: req_ffc7141fa5204c0fb9aab93aa7a9bd22");
+        let signature = learn_failure_signature_source(&stderr);
+        assert_eq!(
+            signature,
+            "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1): ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+        );
+        assert!(learn_failure_is_agent_auth(&stderr));
+        let other = codex("ERROR: stream disconnected before completion");
+        assert!(learn_failure_signature_source(&other)
+            .ends_with("stream disconnected before completion"));
+        assert!(!learn_failure_is_agent_auth(&other));
+        // No verdict line (a wheel without the vendor cut it off): as before.
+        assert!(learn_failure_signature_source(
+            "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
+        )
+        .ends_with("Reading prompt from stdin..."));
     }
 
     #[test]

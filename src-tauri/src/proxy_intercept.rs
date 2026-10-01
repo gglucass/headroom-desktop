@@ -418,6 +418,11 @@ struct ResponseSniffer<R> {
     /// is read to its end and `x-headroom-tokens-saved` is booked against it
     /// for the statusline (claude_statusline.rs).
     savings_session: Option<String>,
+    /// A Claude Code conversation's response whose plan-usage headers are
+    /// still to be read. Every status carries them, a 429 at the cap included.
+    usage_pending: bool,
+    /// The status called for error capture: keep the bounded slice.
+    capturing: bool,
 }
 
 /// A real status line ("HTTP/1.1 429 Too Many Requests\r\n") fits well within
@@ -434,10 +439,13 @@ impl<R> ResponseSniffer<R> {
             client_key,
             capture_path,
             savings_session: None,
+            usage_pending: false,
+            capturing: false,
         }
     }
 
     fn with_savings_session(mut self, session: Option<String>) -> Self {
+        self.usage_pending = session.is_some();
         self.savings_session = session;
         self
     }
@@ -463,17 +471,23 @@ impl<R> ResponseSniffer<R> {
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
             }
-            let capture = self.capture_path.is_some()
+            self.capturing = self.capture_path.is_some()
                 && self
                     .status
                     .is_some_and(|s| is_reportable_upstream_error(&s));
             if !self.status.is_some_and(|s| (200..300).contains(&s)) {
                 self.savings_session = None;
             }
-            if !capture && self.savings_session.is_none() {
+            if !self.capturing && self.savings_session.is_none() && !self.usage_pending {
                 self.done = true;
                 self.buf = Vec::new();
                 return;
+            }
+        }
+        if self.usage_pending && find_header_end(&self.buf).is_some() {
+            self.usage_pending = false;
+            if let Some(usage) = parse_claude_plan_usage(&self.buf) {
+                crate::claude_statusline::record_plan_usage(usage);
             }
         }
         // 2xx for a Claude Code conversation: read on to the end of the head,
@@ -485,12 +499,18 @@ impl<R> ResponseSniffer<R> {
                 {
                     crate::claude_statusline::record(session, saved);
                 }
-                if let Some(usage) = parse_claude_plan_usage(&self.buf) {
-                    *CLAUDE_PLAN_USAGE.lock() = Some(usage);
-                }
                 self.done = true;
                 self.buf = Vec::new();
             } else if self.buf.len() >= MAX_ERROR_BODY {
+                self.done = true;
+                self.buf = Vec::new();
+            }
+            return;
+        }
+        // Only here for the plan usage: stop once read, or at the cap if the
+        // head never ends.
+        if !self.capturing {
+            if !self.usage_pending || self.buf.len() >= MAX_ERROR_BODY {
                 self.done = true;
                 self.buf = Vec::new();
             }
@@ -2804,14 +2824,6 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// Claude's plan usage from the newest Claude Code response, for the tray menu.
-static CLAUDE_PLAN_USAGE: parking_lot::Mutex<Option<ClaudePlanUsage>> =
-    parking_lot::Mutex::new(None);
-
-pub fn claude_plan_usage() -> Option<ClaudePlanUsage> {
-    *CLAUDE_PLAN_USAGE.lock()
 }
 
 /// The `anthropic-ratelimit-unified-*` windows Claude Code itself reads for
@@ -5602,6 +5614,41 @@ mod tests {
         bare.observe(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
         assert!(bare.done);
         assert_eq!(crate::claude_statusline::recorded("sess-bare"), None);
+    }
+
+    /// The 429 at the cap carries the plan usage too, and is the response
+    /// that matters most: without it the tray stuck at the last 2xx figure.
+    /// A response with nothing to capture stops once the head is read.
+    #[test]
+    fn sniffer_reads_plan_usage_from_every_status_of_a_claude_conversation() {
+        let mut capped = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-capped".into()));
+        capped.observe(
+            b"HTTP/1.1 429 Too Many Requests\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\n",
+        );
+        capped.observe(
+            b"anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{\"type\":\"error\"}",
+        );
+        let five = crate::claude_statusline::plan_usage()
+            .and_then(|u| u.five_hour)
+            .expect("5h window from the 429");
+        assert_eq!((five.used_percent, five.resets_at), (100.0, 4_102_444_800));
+        // A 429 is not a reported error: nothing more to keep.
+        assert!(capped.done && capped.buf.is_empty());
+
+        // A reported error keeps its slice for the capture.
+        let mut failed = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-failed".into()));
+        failed.observe(b"HTTP/1.1 500 Internal Server Error\r\n\r\n{}");
+        assert!(!failed.done && !failed.buf.is_empty());
+
+        // Not a reportable error and no saving: done once the head is read.
+        let mut quiet = ResponseSniffer::new((), "claude-code", None)
+            .with_savings_session(Some("sess-quiet".into()));
+        quiet.observe(b"HTTP/1.1 304 Not Modified\r\n");
+        assert!(!quiet.done, "stopped before the head ended");
+        quiet.observe(b"etag: x\r\n\r\n");
+        assert!(quiet.done && quiet.buf.is_empty());
     }
 
     #[test]

@@ -1212,19 +1212,35 @@ pub struct CodexRateLimitSnapshot {
     pub captured_at: i64,
 }
 
-/// One plan-usage window for the tray menu: percent used and when it resets.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One plan-usage window: percent used and when it resets.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanWindow {
     pub used_percent: f64,
     /// Epoch seconds.
     pub resets_at: i64,
 }
 
-/// Claude's plan usage as its responses report it, captured by the intercept.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// Claude's plan usage, from its response headers or the usage endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ClaudePlanUsage {
     pub five_hour: Option<PlanWindow>,
     pub seven_day: Option<PlanWindow>,
+}
+
+/// The usage endpoint's windows: utilization is already a percent there.
+impl From<&ClaudeUsage> for ClaudePlanUsage {
+    fn from(usage: &ClaudeUsage) -> Self {
+        let window = |w: &ClaudeUsageWindow| PlanWindow {
+            used_percent: w.utilization,
+            resets_at: w.resets_at.timestamp(),
+        };
+        Self {
+            five_hour: usage.five_hour.as_ref().map(window),
+            seven_day: usage.seven_day.as_ref().map(window),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

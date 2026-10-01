@@ -2568,6 +2568,47 @@ if _hd_lnt_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: drop the prompt a failed CLI echoed to stderr (diagnostics) --------
+# `codex exec` prints the whole prompt to stderr ahead of its own error, and the
+# analyzer keeps only the first 2000 chars of a failed CLI's stderr, so every
+# Codex failure reported Codex's banner and our system prompt, never the reason
+# (RUST-KT: "failed (exit 1): Reading prompt from stdin..."). Replace the echo
+# with a marker and keep the END of what the CLI printed after it, where its
+# verdict is, inside that cut. The echo also carries the digest of the user's
+# sessions, which must stay out of the error either way. Not version-gated: a
+# CLI or wheel that stops echoing leaves nothing to match, so this goes inert.
+# Kill switch: HEADROOM_LEARN_PROMPT_ECHO=0.
+_hd_lpe_flag = _hd_os.environ.get("HEADROOM_LEARN_PROMPT_ECHO", "1")
+if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.learn import analyzer as _hd_lpe_mod
+
+        _hd_lpe_orig = _hd_lpe_mod.run
+        _hd_lpe_cap = _hd_lpe_mod._MAX_SNIPPET_LEN
+
+        def _hd_lpe_run(cmd, *args, **kwargs):
+            result = _hd_lpe_orig(cmd, *args, **kwargs)
+            prompt, stderr = kwargs.get("input"), result.stderr
+            if result.returncode and isinstance(prompt, str) and isinstance(stderr, str):
+                # Text-mode pipes read the echo back with universal newlines.
+                echo = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+                head, sep, tail = stderr.partition(echo) if echo else ("", "", "")
+                if sep:
+                    head += "[prompt omitted]\n"
+                    tail = tail.strip()
+                    room = max(_hd_lpe_cap - len(head), 0)
+                    if len(tail) > room:
+                        # Whole lines where possible: the verdict is the last one.
+                        cut = tail[len(tail) - room :]
+                        tail = cut.partition("\n")[2] or cut
+                    result.stderr = head + tail
+            return result
+
+        _hd_lpe_mod.run = _hd_lpe_run
+        _hd_bound.add("learn_prompt_echo")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2601,6 +2642,7 @@ _HD_VENDORS = (
     "learn_worktree_merge",
     "learn_drop_error_recovery",
     "learn_no_tools",
+    "learn_prompt_echo",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -9982,7 +10024,9 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
     let desired = json!({
         "command": entrypoint,
         "args": ["mcp", "serve"],
-        "env": { "HEADROOM_PROXY_URL": proxy_url },
+        // The upstream beacon is on by default and its MCP server reports
+        // to it; the proxy runs with it off (see HEADROOM_BEACON there).
+        "env": { "HEADROOM_PROXY_URL": proxy_url, "HEADROOM_BEACON": "off" },
     });
 
     let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -16661,6 +16705,46 @@ assert g.done"#,
             "stderr:\n{on_err}"
         );
         assert_eq!(off, "0 -", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_prompt_echo_behaves_against_the_installed_wheel() {
+        // RUST-KT: a CLI that echoes the prompt to stderr before failing (as
+        // `codex exec` does) leaves its verdict, not the prompt, in the
+        // analyzer's failure detail; the kill switch restores the cut-off one.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-pe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sys\n\
+                     from headroom.learn import analyzer as a\n\
+                     cli = \"import sys; p = sys.stdin.read(); sys.stderr.write('Reading prompt from stdin...\\\\nuser\\\\n' + p + '\\\\n' + 'retry\\\\n' * 400 + 'ERROR: boom\\\\n'); sys.exit(1)\"\n\
+                     r = a.run([sys.executable, '-c', cli], input='SECRET\\r\\n' * 600, capture_output=True, text=True)\n\
+                     d = a._failure_detail(r.stderr, r.stdout)\n\
+                     print(d.endswith('ERROR: boom'), 'SECRET' in d, len(d) <= a._MAX_SNIPPET_LEN)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_PROMPT_ECHO", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True False True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True True", "stderr:\n{off_err}");
     }
 
     #[test]

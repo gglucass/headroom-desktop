@@ -453,6 +453,26 @@ describe("app update helpers", () => {
     expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
 
+  it("reports a declined admin prompt only when a quiet install hit it (RUST-JD)", async () => {
+    const declined = "Failed to move the new app into place";
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      invokeFn: vi.fn().mockRejectedValueOnce(declined),
+    });
+
+    expect(result.statusCopy).toMatch(/administrator password/);
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
+    await runAppUpdateInstall({
+      availableUpdate,
+      quiet: true,
+      invokeFn: vi.fn().mockRejectedValueOnce(declined),
+    });
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+  });
+
   it("re-checks and retries once when the staged update was already consumed", async () => {
     const invokeFn = vi
       .fn()

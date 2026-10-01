@@ -988,22 +988,16 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // every future authenticated call while the app keeps working — exactly
     // the silence the auth-silent alarm exists for.
     let session_token = read_session_token().inspect_err(|err| {
-        maybe_report_auth_silent(
-            &local_state,
-            &identity,
-            &format!("keychain read failed: {err}"),
-        );
+        maybe_report_auth_silent(&local_state, &format!("keychain read failed: {err}"));
     })?;
     let (authenticated, account, account_sync_error, promo) =
         if let Some(token) = session_token.as_deref() {
             let envelope_result = fetch_remote_account(token, &identity);
             match &envelope_result {
                 Ok(_) => stamp_account_sync_ok(&mut local_state),
-                Err(err) => maybe_report_auth_silent(
-                    &local_state,
-                    &identity,
-                    &format!("account sync failed: {err:?}"),
-                ),
+                Err(err) => {
+                    maybe_report_auth_silent(&local_state, &format!("account sync failed: {err:?}"))
+                }
             }
             let promo = envelope_result
                 .as_ref()
@@ -1074,21 +1068,20 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     maybe_apply_fake_weekly_gate(&mut status);
     // Attach the signed-in account to the Sentry scope so later captures from
     // anywhere in the process (notably the proxy watchdog's auto-pause event)
-    // carry the user's email and tier — without this, support can't map a crash
-    // to the customer who reported it. Global scope: persists until overwritten.
-    set_sentry_user(status.account.as_ref());
+    // carry the user's plan. Global scope: persists until overwritten.
+    set_sentry_tier(status.account.as_ref());
     Ok(status)
 }
 
-/// Set (or clear) the Sentry user from the Headroom account. Email is the
-/// support-triage key; tier rides along as the `headroom.tier` tag.
-fn set_sentry_user(account: Option<&HeadroomAccountProfile>) {
+/// Set (or clear) the `headroom.tier` Sentry tag from the Headroom account.
+fn set_sentry_tier(account: Option<&HeadroomAccountProfile>) {
     // Not `sentry::configure_scope`: that is per-thread, and this runs on the
     // pricing-loop thread while the captures that need it come from everywhere.
-    crate::logging::set_sentry_user(
-        account.map(|acc| acc.email.clone()),
-        account.and_then(|acc| acc.subscription_tier.map(|t| format!("{t:?}"))),
-    );
+    crate::logging::set_sentry_tier(account.map(|acc| {
+        acc.subscription_tier
+            .map(|t| format!("{t:?}"))
+            .unwrap_or_else(|| "none".into())
+    }));
 }
 
 /// Debug-only: force the weekly-limit nudge or gate so the savings-counterfactual
@@ -2973,6 +2966,8 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
     // `codex_rate_limits`); a failed fetch keeps the last known value.
     if let Some(u) = usage.as_ref() {
         *state.claude_usage_windows.lock() = Some(claude_usage_windows_summary(u));
+        // Fills the tray's Claude line before this launch's first response.
+        crate::claude_statusline::record_plan_usage(u.into());
     }
 
     let (plan_tier, plan_detection_source) = if let Some(ref p) = profile {
@@ -3553,7 +3548,7 @@ fn auth_silent_hours(local: &LocalPricingState, now: DateTime<Utc>) -> Option<i6
     (hours >= SILENT_ALARM_HOURS).then_some(hours)
 }
 
-fn maybe_report_server_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
+fn maybe_report_server_silent(local: &LocalPricingState, err: &str) {
     let failing_long_enough = {
         let mut run = GRACE_FAILING_SINCE
             .lock()
@@ -3572,12 +3567,11 @@ fn maybe_report_server_silent(local: &LocalPricingState, identity: &IdentityPayl
     report_silent(
         "desktop running but backend-silent past the alarm window",
         hours,
-        identity,
         err,
     );
 }
 
-fn maybe_report_auth_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
+fn maybe_report_auth_silent(local: &LocalPricingState, err: &str) {
     let Some(hours) = auth_silent_hours(local, Utc::now()) else {
         return;
     };
@@ -3587,25 +3581,20 @@ fn maybe_report_auth_silent(local: &LocalPricingState, identity: &IdentityPayloa
     report_silent(
         "desktop auth-silent: backend reachable but authenticated sync failing",
         hours,
-        identity,
         err,
     );
 }
 
 /// Fixed message + fingerprint per class so each stays one Sentry issue; the
 /// variable detail rides in extras (same pattern as activation-parse-error).
-/// claude_email is included so support can map the event to a customer — the
-/// usual sentry user tag is absent here, since set_sentry_user needs the very
-/// account fetch that is failing.
-fn report_silent(message: &str, hours: i64, identity: &IdentityPayload, err: &str) {
+/// No email (the privacy policy says Sentry gets none): the install id every
+/// event carries (`logging::attach_sentry_user`) maps it to the account.
+fn report_silent(message: &str, hours: i64, err: &str) {
     sentry::with_scope(
         |scope| {
             scope.set_fingerprint(Some(&[message]));
             scope.set_extra("hours_silent", hours.into());
             scope.set_extra("error", err.to_string().into());
-            if let Some(email) = identity.claude_email.as_deref() {
-                scope.set_extra("claude_email", email.to_string().into());
-            }
         },
         || sentry::capture_message(message, sentry::Level::Warning),
     );
@@ -3896,7 +3885,7 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
         Err(err) => {
             // Server unreachable; keep whatever we have locally. reconcile_with_server
             // stays set if this is a fresh install so the next successful call wins.
-            maybe_report_server_silent(&local, &identity, &err);
+            maybe_report_server_silent(&local, &err);
         }
     }
     Ok(local)

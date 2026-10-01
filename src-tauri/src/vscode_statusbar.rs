@@ -12,7 +12,8 @@
 //! quit: an editor CLI round trip per launch would be slow and churn the
 //! editor's extension list. Once installed, a missing copy means the user
 //! uninstalled it, and it is not put back unless they turn the feature on
-//! again. macOS only for now, like the terminal line's untested Windows path.
+//! again. Finds VS Code and Cursor where their installers put the CLI on
+//! macOS, Windows and Linux (not a Cursor AppImage, which has no fixed path).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -39,36 +40,83 @@ struct Editor {
 }
 
 fn editors() -> Vec<Editor> {
-    if !cfg!(target_os = "macos") {
-        return Vec::new();
-    }
     let home = crate::client_adapters::home_dir();
+    let data_root = editor_data_root(&home);
     [
-        (
-            "vscode",
-            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-            ".vscode",
-            "Code",
-        ),
-        (
-            "cursor",
-            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-            ".cursor",
-            "Cursor",
-        ),
+        ("vscode", ".vscode", "Code"),
+        ("cursor", ".cursor", "Cursor"),
     ]
     .into_iter()
-    .map(|(id, cli, dir, data)| Editor {
-        id,
-        cli: PathBuf::from(cli),
-        extensions_dir: home.join(dir).join("extensions"),
-        user_dir: home
-            .join("Library/Application Support")
-            .join(data)
-            .join("User"),
+    .filter_map(|(id, dir, data)| {
+        Some(Editor {
+            id,
+            cli: cli_candidates(id, &home)
+                .into_iter()
+                .find(|cli| cli.exists())?,
+            extensions_dir: home.join(dir).join("extensions"),
+            user_dir: data_root.join(data).join("User"),
+        })
     })
-    .filter(|editor| editor.cli.exists())
     .collect()
+}
+
+/// Where VS Code and its forks keep their `User` folder on this OS.
+fn editor_data_root(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+    }
+}
+
+/// The editor's CLI where its installers put it; the first that exists wins.
+/// Linux: the .deb/.rpm location, its /usr/bin link, the snap.
+fn cli_candidates(id: &str, home: &Path) -> Vec<PathBuf> {
+    let local_programs = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Local"))
+        .join("Programs");
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    match (id, std::env::consts::OS) {
+        ("vscode", "macos") => {
+            vec!["/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code".into()]
+        }
+        ("cursor", "macos") => {
+            vec!["/Applications/Cursor.app/Contents/Resources/app/bin/cursor".into()]
+        }
+        ("vscode", "windows") => [local_programs, program_files]
+            .into_iter()
+            .map(|root| root.join("Microsoft VS Code").join("bin").join("code.cmd"))
+            .collect(),
+        ("cursor", "windows") => vec![local_programs
+            .join("cursor")
+            .join("resources")
+            .join("app")
+            .join("bin")
+            .join("cursor.cmd")],
+        ("vscode", "linux") => {
+            vec![
+                "/usr/share/code/bin/code".into(),
+                "/usr/bin/code".into(),
+                "/snap/bin/code".into(),
+            ]
+        }
+        ("cursor", "linux") => vec![
+            "/usr/share/cursor/resources/app/bin/cursor".into(),
+            "/usr/bin/cursor".into(),
+            home.join(".local").join("bin").join("cursor"),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn extension_version() -> String {
@@ -232,7 +280,7 @@ fn build_vsix(state_path: &Path, script_path: &Path) -> Result<Vec<u8>> {
   <Metadata>
     <Identity Language="en-US" Id="headroom-status" Version="{version}" Publisher="headroom"/>
     <DisplayName>Headroom</DisplayName>
-    <Description xml:space="preserve">Shows what Headroom saved in your Claude Code conversation, in the status bar.</Description>
+    <Description xml:space="preserve">Shows what Headroom saved in your Claude Code conversation, and your Claude plan usage, in the status bar.</Description>
   </Metadata>
   <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
   <Dependencies/>

@@ -632,19 +632,21 @@ fn replace_ascii_ci(haystack: &str, needle: &str, with: &str) -> String {
 /// failure (RUST-7R) correctly suppresses, carrying an unscrubbed
 /// `/Users/<name>/...` path. Only the target-agnostic rule is applied here -
 /// the target-scoped ones need a `Record` that a direct capture does not have.
-/// Signed-in Headroom account, stamped onto every outgoing event by
-/// [`sanitize_event`]. Process-wide on purpose: `sentry::configure_scope` only
-/// touches the calling thread's hub (each thread snapshots the global scope
-/// on first use), so a user set from the `pricing-loop` thread never reached
-/// the intercept, watchdog, or log-bridge captures. Measured 2026-09-21: 4%
-/// of events carried `user.email`, which made support lookups by email blind.
-static SENTRY_USER: std::sync::RwLock<Option<(String, String)>> = std::sync::RwLock::new(None);
+/// The signed-in account's plan, stamped onto every outgoing event by
+/// [`sanitize_event`] as the `headroom.tier` tag. Process-wide on purpose:
+/// `sentry::configure_scope` only touches the calling thread's hub, so a value
+/// set from the `pricing-loop` thread never reached the intercept, watchdog,
+/// or log-bridge captures.
+///
+/// No email: the privacy policy says it is not shared with Sentry. Support
+/// finds a user's events through the install id (`user.id`), which the
+/// database joins to the account (`trial_identities.machine_id_digest`).
+static SENTRY_TIER: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
-/// Set (or clear) the account every later event is attributed to. `tier` is
-/// added as the `headroom.tier` tag so issues can be filtered by plan.
-pub(crate) fn set_sentry_user(email: Option<String>, tier: Option<String>) {
-    *SENTRY_USER.write().unwrap_or_else(|e| e.into_inner()) =
-        email.map(|email| (email, tier.unwrap_or_else(|| "none".into())));
+/// Set the signed-in account's plan (`"none"` without one), or clear it on
+/// sign-out.
+pub(crate) fn set_sentry_tier(tier: Option<String>) {
+    *SENTRY_TIER.write().unwrap_or_else(|e| e.into_inner()) = tier;
 }
 
 /// sha256 of the hardware UUID, the same value `trial_identities.machine_id_digest`
@@ -673,14 +675,10 @@ fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
             user.id = Some(install.clone());
         }
     }
-    let guard = SENTRY_USER.read().unwrap_or_else(|e| e.into_inner());
-    let Some((email, tier)) = guard.as_ref() else {
+    let guard = SENTRY_TIER.read().unwrap_or_else(|e| e.into_inner());
+    let Some(tier) = guard.as_ref() else {
         return;
     };
-    let user = event.user.get_or_insert_with(Default::default);
-    if user.email.is_none() {
-        user.email = Some(email.clone());
-    }
     event
         .tags
         .entry("headroom.tier".into())
@@ -1743,29 +1741,25 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_event_attaches_the_process_wide_user_to_any_thread_capture() {
-        super::set_sentry_user(Some("jeremy@example.com".into()), Some("Max5x".into()));
+    fn sanitize_event_attaches_the_process_wide_tier_to_any_thread_capture() {
+        super::set_sentry_tier(Some("Max5x".into()));
         let mut event = sentry::protocol::Event::new();
         event.message = Some("codex upstream error 401 on /v1/responses".into());
         // Captured from a thread that never touched the Sentry scope.
         let sent = std::thread::spawn(move || super::sanitize_event(event).unwrap())
             .join()
             .unwrap();
-        assert_eq!(
-            sent.user.unwrap().email.as_deref(),
-            Some("jeremy@example.com")
-        );
+        // Never the email: the privacy policy promises Sentry does not get it.
+        assert!(sent.user.and_then(|user| user.email).is_none());
         assert_eq!(
             sent.tags.get("headroom.tier").map(String::as_str),
             Some("Max5x")
         );
 
-        super::set_sentry_user(None, None);
+        super::set_sentry_tier(None);
         let mut event = sentry::protocol::Event::new();
         event.message = Some("signed out".into());
         let sent = super::sanitize_event(event).unwrap();
-        // The install id outlives sign-out by design, so only the account is gone.
-        assert!(sent.user.and_then(|user| user.email).is_none());
         assert!(!sent.tags.contains_key("headroom.tier"));
     }
 

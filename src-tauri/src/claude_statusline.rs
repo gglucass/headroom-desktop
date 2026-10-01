@@ -14,12 +14,18 @@
 //! The script parses this file with a bash regex, not a JSON parser (a Python
 //! start cost ~30 ms and it runs every second), so `Session`'s field order is
 //! part of the file format: serde writes fields in declaration order.
+//!
+//! It also keeps Claude's plan usage (`planUsage`), from the response headers
+//! and the usage fetch, for the tray menu and the VS Code status bar item. The
+//! terminal script reads its own from Claude Code instead.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
+
+use crate::models::ClaudePlanUsage;
 
 /// Conversations kept; the least recently active is dropped first. Every
 /// Claude Code session is booked (VS Code panel chats, headless `claude -p`
@@ -59,9 +65,11 @@ impl Session {
 pub(crate) struct Persisted {
     pub(crate) schema_version: u32,
     pub(crate) sessions: BTreeMap<String, Session>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_usage: Option<ClaudePlanUsage>,
 }
 
-static SESSIONS: Mutex<Option<BTreeMap<String, Session>>> = Mutex::new(None);
+static STATE: Mutex<Option<Persisted>> = Mutex::new(None);
 /// Held across serialize + write so a snapshot taken later is always written
 /// later: two in-flight writes can never leave the older one on disk.
 static WRITE: Mutex<()> = Mutex::new(());
@@ -76,12 +84,12 @@ pub fn state_path() -> PathBuf {
     crate::storage::config_file(&crate::storage::app_data_dir(), FILE_NAME)
 }
 
-fn load(path: &Path) -> BTreeMap<String, Session> {
+fn load(path: &Path) -> Persisted {
     let Ok(bytes) = std::fs::read(path) else {
-        return BTreeMap::new();
+        return Persisted::default();
     };
     match serde_json::from_slice::<Persisted>(&bytes) {
-        Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted.sessions,
+        Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted,
         Ok(persisted) => {
             log::warn!(
                 "{FILE_NAME} has schema {} (expected {SCHEMA_VERSION}); backing up and starting fresh",
@@ -89,13 +97,13 @@ fn load(path: &Path) -> BTreeMap<String, Session> {
             );
             // direct-write: moves Headroom's own unparsable state aside, never a user file
             let _ = std::fs::rename(path, path.with_extension("json.bak"));
-            BTreeMap::new()
+            Persisted::default()
         }
         Err(err) => {
             log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
             // direct-write: moves Headroom's own unparsable state aside, never a user file
             let _ = std::fs::rename(path, path.with_extension("json.bak"));
-            BTreeMap::new()
+            Persisted::default()
         }
     }
 }
@@ -144,13 +152,14 @@ fn evict(sessions: &mut BTreeMap<String, Session>) {
 fn persist() {
     let _write = lock(&WRITE);
     let bytes = {
-        let guard = lock(&SESSIONS);
-        let Some(sessions) = guard.as_ref() else {
+        let guard = lock(&STATE);
+        let Some(state) = guard.as_ref() else {
             return;
         };
         serde_json::to_vec(&Persisted {
             schema_version: SCHEMA_VERSION,
-            sessions: sessions.clone(),
+            sessions: state.sessions.clone(),
+            plan_usage: state.plan_usage,
         })
         .unwrap_or_default()
     };
@@ -162,34 +171,56 @@ fn persist() {
 /// Book one Claude Code request's input saving against its conversation.
 pub fn record(session_id: &str, tokens_saved: i64) {
     let saved = tokens_saved.max(0) as u64;
-    update(|sessions, now_ms| apply(sessions, session_id, saved, now_ms));
+    update(|state, now_ms| apply(&mut state.sessions, session_id, saved, now_ms));
 }
 
 /// A request of this conversation just went to the backend for compression.
 pub fn record_request(session_id: &str) {
-    update(|sessions, now_ms| {
-        apply_request(sessions, session_id, now_ms);
+    update(|state, now_ms| {
+        apply_request(&mut state.sessions, session_id, now_ms);
         true
     });
 }
 
-/// Mutate the in-memory map, then persist when `f` reports a change.
-fn update(f: impl FnOnce(&mut BTreeMap<String, Session>, i64) -> bool) {
-    {
-        let mut guard = lock(&SESSIONS);
-        // Unit tests stay in memory: without HEADROOM_DATA_DIR, state_path()
-        // is the real profile's config dir.
-        let sessions = guard.get_or_insert_with(|| {
-            if cfg!(test) {
-                BTreeMap::new()
-            } else {
-                load(&state_path())
-            }
-        });
-        let changed = f(sessions, chrono::Utc::now().timestamp_millis());
-        if cfg!(test) || !changed {
-            return;
+/// Claude's latest plan usage. Written to disk only when what the readers
+/// show changes (a whole percent or a reset time): the headers carry it on
+/// every response.
+pub fn record_plan_usage(usage: ClaudePlanUsage) {
+    update(|state, _| {
+        let shown = |u: &ClaudePlanUsage| {
+            [u.five_hour, u.seven_day]
+                .map(|w| w.map(|w| (w.used_percent.trunc() as i64, w.resets_at)))
+        };
+        let changed = state.plan_usage.as_ref().map(shown) != Some(shown(&usage));
+        state.plan_usage = Some(usage);
+        changed
+    });
+}
+
+/// The last plan usage recorded, this run or a previous one.
+pub fn plan_usage() -> Option<ClaudePlanUsage> {
+    with_state(|state| state.plan_usage)
+}
+
+fn with_state<R>(f: impl FnOnce(&mut Persisted) -> R) -> R {
+    let mut guard = lock(&STATE);
+    // Unit tests stay in memory: without HEADROOM_DATA_DIR, state_path()
+    // is the real profile's config dir.
+    let state = guard.get_or_insert_with(|| {
+        if cfg!(test) {
+            Persisted::default()
+        } else {
+            load(&state_path())
         }
+    });
+    f(state)
+}
+
+/// Mutate the in-memory state, then persist when `f` reports a change.
+fn update(f: impl FnOnce(&mut Persisted, i64) -> bool) {
+    let changed = with_state(|state| f(state, chrono::Utc::now().timestamp_millis()));
+    if cfg!(test) || !changed {
+        return;
     }
     // atomic_write fsyncs; keep that off the relay task that called us.
     match tokio::runtime::Handle::try_current() {
@@ -203,8 +234,9 @@ fn update(f: impl FnOnce(&mut BTreeMap<String, Session>, i64) -> bool) {
 /// (tokens saved this conversation, saved on its last request).
 #[cfg(test)]
 pub(crate) fn recorded(session_id: &str) -> Option<(u64, u64)> {
-    lock(&SESSIONS)
+    lock(&STATE)
         .as_ref()?
+        .sessions
         .get(session_id)
         .map(|s| (s.tokens_saved, s.last_saved))
 }

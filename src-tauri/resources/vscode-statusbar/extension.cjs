@@ -7,6 +7,7 @@
 // file (claude_statusline.rs) and shows this workspace's most recently active
 // Claude Code conversation in the window's status bar. A workspace's
 // conversations are the transcripts under ~/.claude/projects/<its slug>/.
+// After it, Claude's plan usage, which Headroom keeps in the same file.
 "use strict";
 
 const fs = require("fs");
@@ -19,6 +20,10 @@ const COMPRESS_MS = 2000;
 const POLL_MS = 500;
 // Claude Code truncates longer project folder names and appends a hash.
 const SLUG_MAX = 200;
+// A window this full turns the item yellow, as in the tray and terminal.
+const WARN_PERCENT = 80;
+const SAVINGS_TOOLTIP =
+  "Input tokens Headroom saved in this workspace's latest Claude Code conversation";
 
 /** Claude Code's ~/.claude/projects folder name for a working directory. */
 function projectSlug(dir) {
@@ -98,6 +103,40 @@ function view(session, now) {
   return null;
 }
 
+/** "usage: 5h 34%, week 62%" from the plan usage Headroom keeps, or null without
+ *  any. A window past its reset is back at 0, as in the tray. */
+function usageView(usage, now) {
+  const parts = [];
+  const resets = [];
+  let warn = false;
+  for (const [key, label] of [
+    ["fiveHour", "5h"],
+    ["sevenDay", "week"]
+  ]) {
+    const window = usage && usage[key];
+    if (!window || typeof window.usedPercent !== "number") continue;
+    const resetsAtMs = (window.resetsAt || 0) * 1000;
+    const used = now >= resetsAtMs ? 0 : Math.trunc(Math.min(100, Math.max(0, window.usedPercent)));
+    warn = warn || used >= WARN_PERCENT;
+    parts.push(`${label} ${used}%`);
+    if (now < resetsAtMs) resets.push(`${label} resets ${new Date(resetsAtMs).toLocaleString()}`);
+  }
+  if (!parts.length) return null;
+  const tooltip = `Claude plan usage${resets.length ? ` (${resets.join(", ")})` : ""}`;
+  return { text: `usage: ${parts.join(", ")}`, warn, tooltip };
+}
+
+/** The item for a saving view and a usage view, savings first; null hides. */
+function combine(saving, usage) {
+  if (!saving && !usage) return null;
+  return {
+    text: saving ? (usage ? `${saving.text} | ${usage.text}` : saving.text) : `$(zap) ${usage.text}`,
+    highlight: Boolean(saving && saving.highlight),
+    warn: Boolean(usage && usage.warn),
+    tooltip: usage ? `${SAVINGS_TOOLTIP}\n${usage.tooltip}` : SAVINGS_TOOLTIP
+  };
+}
+
 function activate(context) {
   const vscode = require("vscode");
   let statePath;
@@ -123,8 +162,8 @@ function activate(context) {
     100
   );
   item.name = "Headroom savings";
-  item.tooltip = "Input tokens Headroom saved in this workspace's latest Claude Code conversation";
   const green = new vscode.ThemeColor("charts.green");
+  const yellow = new vscode.ThemeColor("charts.yellow");
 
   let dirs = [];
   // Only positives are cached: a new conversation's transcript can appear a
@@ -132,6 +171,7 @@ function activate(context) {
   const known = new Set();
   let mtime = -1;
   let session = null;
+  let planUsage = null;
   const belongs = (id) => {
     if (known.has(id)) return true;
     if (!dirs.some((dir) => fs.existsSync(path.join(dir, `${id}.jsonl`)))) return false;
@@ -149,19 +189,26 @@ function activate(context) {
       const current = fs.statSync(statePath).mtimeMs;
       if (current !== mtime) {
         mtime = current;
-        session = pickSession(JSON.parse(fs.readFileSync(statePath, "utf8")).sessions, belongs);
+        const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+        session = pickSession(state.sessions, belongs);
+        planUsage = state.planUsage || null;
       }
     } catch {
       mtime = -1;
       session = null;
+      planUsage = null;
     }
-    const shown = routed(scriptPath, fs.existsSync) ? view(session, Date.now()) : null;
+    const now = Date.now();
+    const shown = routed(scriptPath, fs.existsSync)
+      ? combine(view(session, now), usageView(planUsage, now))
+      : null;
     if (!shown) {
       item.hide();
       return;
     }
     item.text = shown.text;
-    item.color = shown.highlight ? green : undefined;
+    item.tooltip = shown.tooltip;
+    item.color = shown.highlight ? green : shown.warn ? yellow : undefined;
     item.show();
   };
 
@@ -180,4 +227,15 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, fmt, pickSession, projectDirs, projectSlug, routed, view };
+module.exports = {
+  activate,
+  deactivate,
+  combine,
+  fmt,
+  pickSession,
+  projectDirs,
+  projectSlug,
+  routed,
+  usageView,
+  view
+};

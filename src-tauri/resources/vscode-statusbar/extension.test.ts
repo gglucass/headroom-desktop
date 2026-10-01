@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 // `activate` (which needs the vscode API) is exercised in a real editor.
 import ext from "./extension.cjs";
 
-const { fmt, pickSession, projectDirs, projectSlug, routed, view } = ext;
+const { combine, fmt, pickSession, projectDirs, projectSlug, routed, usageView, view } = ext;
 
 describe("vscode status bar extension", () => {
   it("rounds like the terminal statusline", () => {
@@ -63,6 +63,33 @@ describe("vscode status bar extension", () => {
     });
     expect(view(session(0, now - 60_000, 0), now)).toBeNull();
     expect(view(null, now)).toBeNull();
+  });
+
+  it("adds Claude plan usage after the savings, yellow near the cap", () => {
+    const now = 1_790_000_000_000;
+    const at = (seconds: number) => Math.floor(now / 1000) + seconds;
+    const usage = (five: number, fiveAt: number, week: number, weekAt: number) => ({
+      fiveHour: { usedPercent: five, resetsAt: fiveAt },
+      sevenDay: { usedPercent: week, resetsAt: weekAt }
+    });
+    expect(usageView(usage(34.9, at(3_600), 62, at(300_000)), now)).toMatchObject({
+      text: "usage: 5h 34%, week 62%",
+      warn: false
+    });
+    // A window past its reset is back at 0; one at 80% or more warns.
+    expect(usageView(usage(97, at(-60), 91, at(3_600)), now)).toMatchObject({
+      text: "usage: 5h 0%, week 91%",
+      warn: true
+    });
+    expect(usageView(null, now)).toBeNull();
+    expect(usageView({}, now)).toBeNull();
+
+    const saving = { text: "$(zap) Headroom saved 31k", highlight: false };
+    const shown = usageView(usage(34, at(3_600), 62, at(300_000)), now);
+    expect(combine(saving, shown)?.text).toBe("$(zap) Headroom saved 31k | usage: 5h 34%, week 62%");
+    expect(combine(null, shown)?.text).toBe("$(zap) usage: 5h 34%, week 62%");
+    expect(combine(saving, null)?.text).toBe("$(zap) Headroom saved 31k");
+    expect(combine(null, null)).toBeNull();
   });
 
   it("hides once Headroom removed its statusline script (pause, quit, disconnect)", () => {
