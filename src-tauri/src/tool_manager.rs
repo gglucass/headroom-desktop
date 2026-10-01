@@ -392,9 +392,9 @@ The desktop's launch scrub (memory_scrubber.rs) only cleaned it between
 flushes. Environment/architecture (CLAUDE.md) and preference routing are
 untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
 
-Also runs learn's `claude -p` analysis with no tools, so a model that starts
-exploring cannot stream past the hard cap (RUST-KK). Kill switch:
-HEADROOM_LEARN_NO_TOOLS=0.
+Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
+that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
+Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
 """
 import faulthandler
 import signal
@@ -2108,6 +2108,110 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
         # Fail-closed: on any binding failure the wheel keeps refusing.
         pass
 
+# Upstream TCP keepalive (upstream PR #3907; self-neutralizes once the wheel
+# ships headroom.proxy.tcp_keepalive): a request waiting on a model reads
+# nothing for minutes, so the read timeout cannot tell a slow answer from a link
+# that died without a reset (a train tunnel, a Wi-Fi handover, a NAT dropping
+# its state). The buffered-CCR path (~30% of Claude Code turns) waits 600s per
+# attempt, three attempts, and heartbeats Claude Code meanwhile, so Claude
+# Code's own 3-minute stall detector never fires: a dead link became a 10-30
+# minute spinner ending in "check your proxy", where a direct connection fails
+# over in about three. The vendor turns keepalive on for every upstream socket,
+# direct and through system proxies, by wrapping each pool's network backend
+# before install_upstream_pinning runs (pinning hides proxy pools). A dead link
+# then fails after ~idle+60s as a transport error, which _retry_request retries
+# on a fresh connection; a live slow answer is untouched because the peer's
+# kernel answers the probes. Options are set after connect and a refused one is
+# skipped, never failing the request. Rebinds the name in server.py too, which
+# earlier vendors have already imported. Exact-pin gated to wheel 0.39.0. Same
+# knob as the PR: HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS (idle seconds before
+# the first probe, default 30; 0 disables).
+try:
+    _hd_tka_idle = int(_hd_os.environ.get("HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS", "30"))
+except ValueError:
+    _hd_tka_idle = 30
+if _hd_tka_idle < 0:
+    _hd_tka_idle = 30
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_tka_idle > 0:
+    try:
+        import importlib.metadata as _hd_tka_meta
+        import importlib.util as _hd_tka_util
+
+        if (
+            _hd_tka_meta.version("headroom-ai") == "0.39.0"
+            and _hd_tka_util.find_spec("headroom.proxy.tcp_keepalive") is None
+        ):
+            import socket as _hd_tka_socket
+
+            import httpcore as _hd_tka_httpcore
+
+            from headroom.proxy import upstream_pinning as _hd_tka_up
+
+            # Linux and Windows call the idle time TCP_KEEPIDLE, macOS TCP_KEEPALIVE.
+            _hd_tka_idle_opt = getattr(_hd_tka_socket, "TCP_KEEPIDLE", None)
+            if _hd_tka_idle_opt is None:
+                _hd_tka_idle_opt = getattr(_hd_tka_socket, "TCP_KEEPALIVE", None)
+            _hd_tka_options = [(_hd_tka_socket.SOL_SOCKET, _hd_tka_socket.SO_KEEPALIVE, 1)]
+            for _hd_tka_name, _hd_tka_value in (
+                (_hd_tka_idle_opt, _hd_tka_idle),
+                (getattr(_hd_tka_socket, "TCP_KEEPINTVL", None), 10),
+                (getattr(_hd_tka_socket, "TCP_KEEPCNT", None), 6),
+            ):
+                if _hd_tka_name is not None:
+                    _hd_tka_options.append(
+                        (_hd_tka_socket.IPPROTO_TCP, _hd_tka_name, _hd_tka_value)
+                    )
+
+            class _HdKeepaliveBackend(_hd_tka_httpcore.AsyncNetworkBackend):
+                def __init__(self, inner):
+                    self._inner = inner
+
+                async def connect_tcp(
+                    self, host, port, timeout=None, local_address=None, socket_options=None
+                ):
+                    stream = await self._inner.connect_tcp(
+                        host,
+                        port,
+                        timeout=timeout,
+                        local_address=local_address,
+                        socket_options=socket_options,
+                    )
+                    sock = stream.get_extra_info("socket")
+                    if sock is not None:
+                        for option in _hd_tka_options:
+                            try:
+                                sock.setsockopt(*option)
+                            except OSError:
+                                pass
+                    return stream
+
+                async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+                    return await self._inner.connect_unix_socket(
+                        path, timeout=timeout, socket_options=socket_options
+                    )
+
+                async def sleep(self, seconds):
+                    await self._inner.sleep(seconds)
+
+            _hd_tka_orig = _hd_tka_up.install_upstream_pinning
+
+            def _hd_tka_install(client):
+                for transport in (client._transport, *client._mounts.values()):
+                    pool = getattr(transport, "_pool", None)
+                    backend = getattr(pool, "_network_backend", None)
+                    if backend is not None and not isinstance(backend, _HdKeepaliveBackend):
+                        pool._network_backend = _HdKeepaliveBackend(backend)
+                return _hd_tka_orig(client)
+
+            _hd_tka_up.install_upstream_pinning = _hd_tka_install
+            _hd_tka_server = _hd_sys.modules.get("headroom.proxy.server")
+            if _hd_tka_server is not None:
+                _hd_tka_server.install_upstream_pinning = _hd_tka_install
+            _hd_bound.add("upstream_tcp_keepalive")
+    except Exception:
+        # Fail-open to the wheel: nothing is rebound, sockets stay as they were.
+        pass
+
 # --- Output holdout: key a conversation on its whole opener (vendor, #3209) ----
 # The holdout picks a conversation's arm by hashing the model plus the first 512
 # chars of the FIRST text block of its first user message. Claude Code opens
@@ -2430,26 +2534,37 @@ if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
-# --- Learn: the analysis `claude -p` gets no tools (posture) --------------------
+# --- Learn: the analysis `claude -p` gets no tools and no hooks (posture) -------
 # The digest is the whole input and the answer is one JSON object, but the
 # headless session is a full Claude Code agent: Bash, Edit, Task and every MCP
 # server, under the user's own permissions, persona hooks and skills. A model
 # that goes off to read or verify things streams events the whole time, so the
 # idle cap never fires and the run dies at the hard cap with nothing written
 # (RUST-KK: 900s). `--tools ""` plus `--strict-mcp-config` leaves zero tools, so
-# one turn. Not version-gated: a wheel that already passes either flag, or
-# renames the table, leaves this inert. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
+# one turn. Hooks, from settings and plugins alike, still ran: a blocking Stop
+# hook (the vitals plugin's prompt hook) forced a second turn whose JSON replaced
+# the analysis, so learn found no rules in it and reported "No actionable
+# patterns found" with no error. `disableAllHooks` via `--settings` stops them
+# while the user's settings still load, keeping env routing and auth (`--bare`
+# would skip OAuth). Not version-gated: a flag the wheel already passes is left
+# alone, and a wheel that renames the table leaves this inert. Kill switch:
+# HEADROOM_LEARN_NO_TOOLS=0.
 _hd_lnt_flag = _hd_os.environ.get("HEADROOM_LEARN_NO_TOOLS", "1")
 if _hd_lnt_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         from headroom.learn import analyzer as _hd_lnt_mod
 
         for _hd_lnt_name, _hd_lnt_model, _hd_lnt_cmd in _hd_lnt_mod._CLI_BACKENDS:
-            if _hd_lnt_model == "claude-cli" and not {"--tools", "--strict-mcp-config"} & set(
-                _hd_lnt_cmd
+            if _hd_lnt_model != "claude-cli":
+                continue
+            for _hd_lnt_args in (
+                ["--tools", ""],
+                ["--strict-mcp-config"],
+                ["--settings", '{"disableAllHooks":true}'],
             ):
-                _hd_lnt_cmd.extend(["--tools", "", "--strict-mcp-config"])
-                _hd_bound.add("learn_no_tools")
+                if _hd_lnt_args[0] not in _hd_lnt_cmd:
+                    _hd_lnt_cmd.extend(_hd_lnt_args)
+                    _hd_bound.add("learn_no_tools")
     except Exception:
         pass
 
@@ -2480,6 +2595,7 @@ _HD_VENDORS = (
     "token_read_window",
     "codex_whole_read",
     "proxied_guarded_upstreams",
+    "upstream_tcp_keepalive",
     "holdout_key",
     "learn_rule_coerce",
     "learn_worktree_merge",
@@ -16186,6 +16302,81 @@ assert g.done"#,
     }
 
     #[test]
+    fn sitecustomize_vendors_upstream_tcp_keepalive() {
+        // Behaviour is proven by upstream_tcp_keepalive_behaves_against_the_installed_wheel;
+        // this pins the gate, the knob, the self-neutralization probe, that the
+        // options never ride httpcore's socket_options (a refused one would fail
+        // every connect), and that server.py's already-imported name is rebound.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains(r#"_hd_os.environ.get("HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS", "30")"#)
+        );
+        assert!(py.contains(r#"_hd_tka_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#"_hd_tka_util.find_spec("headroom.proxy.tcp_keepalive") is None"#));
+        assert!(py.contains("sock.setsockopt(*option)"));
+        assert!(py.contains("_hd_tka_up.install_upstream_pinning = _hd_tka_install"));
+        assert!(py.contains("_hd_tka_server.install_upstream_pinning = _hd_tka_install"));
+    }
+
+    #[test]
+    fn upstream_tcp_keepalive_behaves_against_the_installed_wheel() {
+        // The shipped sitecustomize must put keepalive on the real upstream
+        // socket that server.py's startup() client opens, under the pin, and on
+        // proxy mounts (scripts/verify-upstream-tcp-keepalive.py). A dead link
+        // then fails over in ~idle+60s instead of the 600s buffered read
+        // timeout per attempt. Self-skips when the vendor does not bind.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-upstream-tcp-keepalive.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-tka-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |idle: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS", idle)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run upstream TCP keepalive probe")
+        };
+        let on = run("25");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&on.stdout).to_string();
+        if stdout.contains("FAIL tka bound") {
+            eprintln!("skipping: upstream TCP keepalive vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert!(
+            on.status.success()
+                && stdout.contains("OK   direct upstream socket probed after 25s idle")
+                && stdout.contains("OK   proxy mount dials through keepalive"),
+            "upstream TCP keepalive vendor misbehaved\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        // 0 unbinds it and the same socket goes unprobed, which also proves the
+        // probe can tell the two apart.
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        assert!(
+            off.status.success()
+                && off_stdout.contains("FAIL tka bound")
+                && off_stdout.contains("OFF  socket not probed"),
+            "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS=0 did not unbind the vendor\nstdout:\n{off_stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
     fn sitecustomize_vendors_token_read_window() {
         // Behaviour is proven by token_read_window_behaves_against_the_installed_wheel;
         // this pins the gate, the kill switch, the self-neutralization probe and
@@ -16398,8 +16589,8 @@ assert g.done"#,
 
     #[test]
     fn learn_no_tools_behaves_against_the_installed_wheel() {
-        // RUST-KK: the claude-cli analysis command carries the no-tools flags
-        // exactly once; the kill switch leaves the wheel's command alone.
+        // RUST-KK: the claude-cli analysis command carries the no-tools and
+        // no-hooks flags exactly once; the kill switch leaves it alone.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() {
@@ -16428,7 +16619,10 @@ assert g.done"#,
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "1 ['', '--strict-mcp-config']", "stderr:\n{on_err}");
+        assert_eq!(
+            on, r#"1 ['', '--strict-mcp-config', '--settings', '{"disableAllHooks":true}']"#,
+            "stderr:\n{on_err}"
+        );
         assert_eq!(off, "0 -", "stderr:\n{off_err}");
     }
 
