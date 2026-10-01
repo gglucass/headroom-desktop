@@ -98,6 +98,8 @@ const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 /// Headless revert of Headroom's edits to other tools, for package managers that
 /// can run a command before deleting the bundle. See `handle_uninstall_flag`.
 const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
+/// The crash guard's launch argument. See `handle_crash_guard_flag`.
+const CRASH_GUARD_ARG: &str = "--crash-guard";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
@@ -1459,7 +1461,7 @@ fn spawn_detached(script: &str) -> std::io::Result<()> {
 /// reparented to launchd while we are still alive. stdio to `/dev/null`: it
 /// runs on after our fds are gone, and it reports by appending to the desktop
 /// log rather than through anything it inherited from us.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn detached_script(script: &str) -> String {
     format!("( trap '' HUP; {script} ) >/dev/null 2>&1 &")
 }
@@ -6433,6 +6435,103 @@ fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
 
+/// The crash guard: a second copy of this binary that the app starts at launch
+/// and that does nothing until the app is gone. Quit and pause unwire every
+/// client; a crash, a force quit or a `kill -9` does not, and left Claude Code
+/// and Codex pointed at a dead 127.0.0.1:6767, failing with ECONNREFUSED until
+/// Headroom was opened again. The guard then unwires them the way quit does,
+/// and the next launch wires them back.
+///
+/// It waits on its stdin, a pipe whose write end only the app holds and never
+/// writes to, so the read returns once the OS closes that end, which happens
+/// however the app dies. Runs before `logging::init` so a guard idling beside
+/// the app never rotates the log under it; it opens the log only to report.
+fn handle_crash_guard_flag() {
+    if !std::env::args().any(|arg| arg == CRASH_GUARD_ARG) {
+        return;
+    }
+    let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+    let unwired = client_adapters::unwire_clients_after_crash(|| {
+        let intercept =
+            std::net::SocketAddr::from(([127, 0, 0, 1], proxy_intercept::INTERCEPT_PORT));
+        std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
+    });
+    if !unwired.is_empty() {
+        let _ = logging::init();
+        log::info!("crash guard: unwired {unwired:?}");
+        log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
+        if let Some(client) = sentry::Hub::current().client() {
+            client.flush(Some(std::time::Duration::from_secs(2)));
+        }
+    }
+    std::process::exit(0);
+}
+
+/// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
+/// it a crash leaves the clients wired, as it always did.
+fn spawn_crash_guard() {
+    // An AppImage runs from a mount that is torn down with the app, so a guard
+    // started from `current_exe` would lose its own binary at the moment it is
+    // needed. Start the image itself instead.
+    #[cfg(target_os = "linux")]
+    let exe = std::env::var_os("APPIMAGE")
+        .filter(|image| !image.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    #[cfg(not(target_os = "linux"))]
+    let exe = std::env::current_exe().ok();
+    let Some(exe) = exe else {
+        log::warn!("crash guard: no executable path to start it from");
+        return;
+    };
+    match spawn_crash_guard_process(&exe) {
+        // Never written to and never closed: the OS closes it when we die,
+        // and that is the guard's signal.
+        Ok(pipe) => std::mem::forget(pipe),
+        Err(err) => log::warn!("crash guard: failed to start: {err}"),
+    }
+}
+
+/// Detached like the relauncher (`spawn_detached`), which a quitting macOS app
+/// otherwise takes down with it. The pipe reaches the guard as fd 3 first: a
+/// shell without job control points a background job's stdin at /dev/null,
+/// whose immediate EOF would read as a crash at every launch.
+#[cfg(unix)]
+fn spawn_crash_guard_process(exe: &Path) -> std::io::Result<std::process::ChildStdin> {
+    use std::os::unix::process::CommandExt;
+    let script = format!(
+        "exec 3<&0; {}",
+        detached_script(&format!("exec \"$0\" {CRASH_GUARD_ARG} 0<&3 3<&-"))
+    );
+    let mut shell = crate::proc::command("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg(exe)
+        .stdin(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let pipe = shell.stdin.take();
+    // The shell only backgrounds the guard and exits at once; reap it.
+    let _ = shell.wait();
+    pipe.ok_or_else(|| std::io::Error::other("no stdin pipe"))
+}
+
+/// A Windows child outlives its parent unless a job ties them together, and
+/// the app is in none (`winproc` puts only the backend in its job).
+#[cfg(windows)]
+fn spawn_crash_guard_process(exe: &Path) -> std::io::Result<std::process::ChildStdin> {
+    let mut guard = crate::proc::command(exe)
+        .arg(CRASH_GUARD_ARG)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    guard
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdin pipe"))
+}
+
 /// Handle `--uninstall` and exit; return normally otherwise.
 ///
 /// Exists for package managers that delete the app themselves and so cannot
@@ -6788,6 +6887,9 @@ pub fn run() {
             ..Default::default()
         },
     ));
+
+    // Before the logger: the guard idles beside the app for its whole life.
+    handle_crash_guard_flag();
 
     // Initialize the panic-safe file logger after Sentry so warn!/error!
     // records flow into Sentry too. Failure here cannot abort startup.
@@ -7215,6 +7317,8 @@ pub fn run() {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch(&app_handle);
             });
+            // Before anything is wired back, so a crash from here on is covered.
+            spawn_crash_guard();
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
                 client_adapters::restore_client_setups();
@@ -15609,6 +15713,43 @@ Some unrelated content.
             "helper died with the process that spawned it: {script}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crash guard must read EOF once the app's end of its pipe closes,
+    /// and not before. Started through a bare `( ... ) &`, a shell without job
+    /// control hands a background job /dev/null for stdin, and the guard took
+    /// that EOF for a crash and unwired every client at launch.
+    #[cfg(unix)]
+    #[test]
+    fn crash_guard_reads_eof_only_once_the_app_end_closes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let eof = dir.path().join("eof");
+        let guard = dir.path().join("guard");
+        std::fs::write(
+            &guard,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho \"$1\" > {}\n",
+                super::shell_quote_path(&eof)
+            ),
+        )
+        .expect("write stand-in guard");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let pipe = super::spawn_crash_guard_process(&guard).expect("start guard");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !eof.exists(),
+            "the guard saw EOF while the app still held the pipe"
+        );
+
+        drop(pipe);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !eof.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let arg = std::fs::read_to_string(&eof).expect("the guard never saw the pipe close");
+        assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
     }
 
     #[test]

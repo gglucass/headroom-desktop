@@ -1598,6 +1598,28 @@ pub fn rewire_clients_after_port_reclaimed() {
     }
 }
 
+/// The crash guard's unwire (`handle_crash_guard_flag` in lib.rs), run once
+/// the app is gone: what quit does, for an app that died without quitting, so
+/// the clients connect directly instead of failing with ECONNREFUSED on the
+/// dead 6767, remembered for the next launch's `restore_client_setups`.
+/// Nothing wired (a quit or pause already unwired them) or an intercept that
+/// answers again (the next instance is already up) means there is nothing to
+/// undo. Returns the clients it unwired.
+pub fn unwire_clients_after_crash(intercept_answers: impl FnOnce() -> bool) -> Vec<String> {
+    let state = load_setup_state();
+    if state.configured_clients.is_empty() || intercept_answers() {
+        return Vec::new();
+    }
+    let codex = is_configured(&state, "codex_cli");
+    if let Err(err) = clear_client_setups() {
+        log::warn!("crash guard: unwiring clients failed: {err:#}");
+    }
+    if codex {
+        retag_codex_threads_to_native();
+    }
+    state.configured_clients.into_keys().collect()
+}
+
 fn clear_and_remember_client_setups() -> Result<()> {
     // Capture snapshot before disabling. We re-apply it afterwards because
     // disable_client_setup also clears remembered_clients as a side effect,
@@ -14076,6 +14098,47 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             crate::tool_manager::cc_switch_captured_upstream().as_deref(),
             Some(relay),
             "relaunch dropped the capture the quit restored"
+        );
+    }
+
+    /// The crash guard runs quit's unwire, and only for an app that died with
+    /// clients still wired. After a quit or pause nothing is wired: it must not
+    /// even probe the port (a closed loopback port takes ~1s to refuse on
+    /// Windows, on every quit) and must keep the snapshot the next launch
+    /// restores from.
+    #[test]
+    #[serial_test::serial]
+    fn crash_guard_unwires_only_what_a_dead_app_left_wired() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+        let base_url = || read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].clone();
+
+        // The next instance already answers on 6767: its wiring stays.
+        assert!(super::unwire_clients_after_crash(|| true).is_empty());
+        assert_eq!(base_url(), super::HEADROOM_ANTHROPIC_BASE_URL);
+
+        assert_eq!(
+            super::unwire_clients_after_crash(|| false),
+            vec!["claude_code".to_string()]
+        );
+        assert_ne!(base_url(), super::HEADROOM_ANTHROPIC_BASE_URL);
+        assert!(super::load_setup_state()
+            .remembered_clients
+            .contains_key("claude_code"));
+
+        assert!(
+            super::unwire_clients_after_crash(|| panic!("probed with nothing wired")).is_empty()
+        );
+        assert!(
+            super::load_setup_state()
+                .remembered_clients
+                .contains_key("claude_code"),
+            "a second unwire lost the snapshot the next launch restores"
         );
     }
 
