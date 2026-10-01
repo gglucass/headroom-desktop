@@ -71,10 +71,11 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapFailureReport, BootstrapProgress,
-    ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
-    DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, RuntimeStatus,
-    RuntimeUpgradeProgress, TransformationFeedResponse,
+    ClaudeAccountProfile, ClaudeCodeProject, ClaudePlanUsage, ClaudeUsage, ClientConnectorStatus,
+    ClientSetupResult, CodexRateLimitSnapshot, DailySavingsPoint, DashboardState,
+    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, PlanWindow, RuntimeStatus, RuntimeUpgradeProgress,
+    TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -9177,19 +9178,159 @@ fn execute_headroom_learn_run(
     }
 }
 
+/// Usage this high gets its reset time, in the tray menu and the Claude Code
+/// statusline.
+pub(crate) const TRAY_USAGE_RESET_SHOWN_AT_PERCENT: f64 = 80.0;
+
+fn tray_savings_line(today: TraySavingsToday) -> String {
+    format!(
+        "Saved today: ${:.2}, {} tokens",
+        today.usd,
+        tool_manager::compact_token_count(today.tokens)
+    )
+}
+
+/// One line per plan, as its newest response reported it: Claude from the
+/// `anthropic-ratelimit-unified-*` headers, Codex from `x-codex-*`. A window
+/// whose reset time has passed is back at 0; a plan with nothing reported
+/// since launch gets no line.
+fn tray_usage_lines(
+    claude: Option<ClaudePlanUsage>,
+    codex: Option<&CodexRateLimitSnapshot>,
+    now: i64,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(claude) = claude {
+        let windows = [
+            ("5h".to_string(), claude.five_hour),
+            ("week".to_string(), claude.seven_day),
+        ];
+        lines.extend(plan_usage_line(
+            "Claude",
+            windows.into_iter().filter_map(|(l, w)| Some((l, w?))),
+            now,
+        ));
+    }
+    if let Some(codex) = codex {
+        let windows = [&codex.primary, &codex.secondary]
+            .into_iter()
+            .flatten()
+            .filter_map(|w| {
+                let label = match w.window_minutes? {
+                    10_080 => "week".to_string(),
+                    minutes => w
+                        .window_label
+                        .clone()
+                        .unwrap_or_else(|| format!("{minutes}m")),
+                };
+                let resets_at = codex.captured_at + w.seconds_until_reset?;
+                Some((
+                    label,
+                    PlanWindow {
+                        used_percent: w.used_percent,
+                        resets_at,
+                    },
+                ))
+            });
+        lines.extend(plan_usage_line("Codex", windows, now));
+    }
+    lines
+}
+
+fn plan_usage_line(
+    plan: &str,
+    windows: impl Iterator<Item = (String, PlanWindow)>,
+    now: i64,
+) -> Option<String> {
+    let parts: Vec<String> = windows
+        .map(|(label, window)| {
+            // Whole percents, cut not rounded, as the statusline shows them.
+            let used = if now >= window.resets_at {
+                0.0
+            } else {
+                window.used_percent.clamp(0.0, 100.0).trunc()
+            };
+            if used < TRAY_USAGE_RESET_SHOWN_AT_PERCENT {
+                return format!("{label} {used:.0}%");
+            }
+            let resets = chrono::DateTime::from_timestamp(window.resets_at, 0)
+                .map(|at| at.with_timezone(&Local))
+                .map(|at| {
+                    let format = if window.resets_at - now < 86_400 {
+                        "%H:%M"
+                    } else {
+                        "%a %H:%M"
+                    };
+                    at.format(format).to_string()
+                })
+                .unwrap_or_default();
+            format!("{label} {used:.0}% (resets {resets})")
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("{plan} usage: {}", parts.join(", ")))
+}
+
+/// Sets the savings line and puts `usage` under it as disabled items,
+/// replacing the ones `items` holds. Reuses them while the count holds, so
+/// the open menu updates in place instead of jumping.
+fn update_tray_menu_info(
+    app: &AppHandle,
+    savings: &str,
+    usage: &[String],
+    items: &mut Vec<tauri::menu::MenuItem<tauri::Wry>>,
+) -> tauri::Result<()> {
+    let (Some(menu), Some(savings_item)) = (TRAY_MENU.get(), TRAY_SAVINGS_ITEM.get()) else {
+        return Ok(());
+    };
+    savings_item.set_text(savings)?;
+    if items.len() != usage.len() {
+        for item in items.drain(..) {
+            menu.remove(&item)?;
+        }
+        for (i, line) in usage.iter().enumerate() {
+            let item = tauri::menu::MenuItem::new(app, line, false, None::<&str>)?;
+            menu.insert(&item, i + 1)?;
+            items.push(item);
+        }
+        return Ok(());
+    }
+    for (item, line) in items.iter().zip(usage) {
+        item.set_text(line)?;
+    }
+    Ok(())
+}
+
 /// The tray's pause/resume item, kept here so the tray updater loop can flip its
 /// label. `TrayIcon` has no menu getter.
 static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
+/// The tray menu and its savings line, for `update_tray_menu_info`.
+static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync::OnceLock::new();
+static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    // Opens Headroom like "show"; enabled so it reads as the menu's headline.
+    let savings = tauri::menu::MenuItem::with_id(
+        app,
+        "savings",
+        tray_savings_line(TraySavingsToday::default()),
+        true,
+        None::<&str>,
+    )?;
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
     // Text flips to "Resume Headroom" while paused, from the tray updater loop.
     let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
+    let info_separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let menu = tauri::menu::Menu::with_items(
+        app,
+        &[&savings, &info_separator, &show, &pause, &separator, &quit],
+    )?;
     let _ = TRAY_PAUSE_ITEM.set(pause.clone());
+    let _ = TRAY_SAVINGS_ITEM.set(savings);
+    let _ = TRAY_MENU.set(menu.clone());
     #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
@@ -9232,7 +9373,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
+            "show" | "savings" => {
                 if show_primary_window(app).unwrap_or(false) {
                     let app_bg = app.clone();
                     std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
@@ -9406,6 +9547,8 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut pulse_drawn_last_tick = false;
         let mut last_tooltip: Option<String> = None;
         let mut last_pause_label: Option<&str> = None;
+        let mut last_menu_info: Option<(String, Vec<String>)> = None;
+        let mut usage_items: Vec<tauri::menu::MenuItem<tauri::Wry>> = Vec::new();
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -9481,6 +9624,28 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         let _ = item.set_text(pause_label);
                         last_pause_label = Some(pause_label);
                     }
+                }
+
+                let codex = {
+                    let state: tauri::State<'_, AppState> = app.state();
+                    let codex = state.codex_rate_limits.lock().clone();
+                    codex
+                };
+                let menu_info = (
+                    tray_savings_line(today),
+                    tray_usage_lines(
+                        proxy_intercept::claude_plan_usage(),
+                        codex.as_ref(),
+                        Utc::now().timestamp(),
+                    ),
+                );
+                if last_menu_info.as_ref() != Some(&menu_info) {
+                    if let Err(err) =
+                        update_tray_menu_info(&app, &menu_info.0, &menu_info.1, &mut usage_items)
+                    {
+                        log::warn!("tray menu info update failed: {err}");
+                    }
+                    last_menu_info = Some(menu_info);
                 }
 
                 let mut icon_changed = false;
@@ -15729,8 +15894,8 @@ Some unrelated content.
         std::fs::write(
             &guard,
             format!(
-                "#!/bin/sh\ncat >/dev/null\necho \"$1\" > {}\n",
-                super::shell_quote_path(&eof)
+                "#!/bin/sh\ncat >/dev/null\necho \"$1\" > '{}'\n",
+                eof.display()
             ),
         )
         .expect("write stand-in guard");
@@ -15750,6 +15915,61 @@ Some unrelated content.
         }
         let arg = std::fs::read_to_string(&eof).expect("the guard never saw the pipe close");
         assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
+    }
+
+    #[test]
+    fn tray_usage_lines_show_each_plan_that_reported() {
+        let now = 1_790_000_000;
+        let claude = super::ClaudePlanUsage {
+            five_hour: Some(super::PlanWindow {
+                used_percent: 34.9,
+                resets_at: now + 3_600,
+            }),
+            seven_day: Some(super::PlanWindow {
+                used_percent: 62.0,
+                resets_at: now + 300_000,
+            }),
+        };
+        let window = |used, minutes, reset| crate::models::CodexUsageWindow {
+            used_percent: used,
+            window_label: Some(proxy_intercept_window_label(minutes)),
+            window_minutes: Some(minutes),
+            seconds_until_reset: Some(reset),
+        };
+        // Captured an hour ago: its 5h window reset half an hour ago.
+        let codex = super::CodexRateLimitSnapshot {
+            primary: Some(window(97.0, 300, 1_800)),
+            secondary: Some(window(88.0, 10_080, 200_000)),
+            captured_at: now - 3_600,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::tray_usage_lines(None, None, now),
+            Vec::<String>::new()
+        );
+        let lines = super::tray_usage_lines(Some(claude), Some(&codex), now);
+        assert_eq!(lines[0], "Claude usage: 5h 34%, week 62%");
+        assert!(
+            lines[1].starts_with("Codex usage: 5h 0%, week 88% (resets "),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            super::tray_savings_line(super::TraySavingsToday {
+                usd: 14.2,
+                tokens: 1_234_567
+            }),
+            "Saved today: $14.20, 1.2M tokens"
+        );
+    }
+
+    fn proxy_intercept_window_label(minutes: i64) -> String {
+        if minutes == 300 {
+            "5h".into()
+        } else {
+            format!("{minutes}m")
+        }
     }
 
     #[test]

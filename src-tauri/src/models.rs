@@ -1207,6 +1207,24 @@ pub struct CodexRateLimitSnapshot {
     pub secondary: Option<CodexUsageWindow>,
     pub credits_balance: Option<String>,
     pub credits_unlimited: bool,
+    /// When it was captured (epoch seconds): `seconds_until_reset` counts from
+    /// here, so the tray can tell a window that has reset since.
+    pub captured_at: i64,
+}
+
+/// One plan-usage window for the tray menu: percent used and when it resets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanWindow {
+    pub used_percent: f64,
+    /// Epoch seconds.
+    pub resets_at: i64,
+}
+
+/// Claude's plan usage as its responses report it, captured by the intercept.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClaudePlanUsage {
+    pub five_hour: Option<PlanWindow>,
+    pub seven_day: Option<PlanWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

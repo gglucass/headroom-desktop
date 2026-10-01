@@ -26,7 +26,9 @@ use base64::Engine;
 
 use crate::backend_port;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
-use crate::models::{CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow};
+use crate::models::{
+    ClaudePlanUsage, CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow, PlanWindow,
+};
 
 pub const INTERCEPT_PORT: u16 = 6767;
 
@@ -482,6 +484,9 @@ impl<R> ResponseSniffer<R> {
                     .and_then(|v| v.trim().parse::<i64>().ok())
                 {
                     crate::claude_statusline::record(session, saved);
+                }
+                if let Some(usage) = parse_claude_plan_usage(&self.buf) {
+                    *CLAUDE_PLAN_USAGE.lock() = Some(usage);
                 }
                 self.done = true;
                 self.buf = Vec::new();
@@ -2801,6 +2806,33 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Claude's plan usage from the newest Claude Code response, for the tray menu.
+static CLAUDE_PLAN_USAGE: parking_lot::Mutex<Option<ClaudePlanUsage>> =
+    parking_lot::Mutex::new(None);
+
+pub fn claude_plan_usage() -> Option<ClaudePlanUsage> {
+    *CLAUDE_PLAN_USAGE.lock()
+}
+
+/// The `anthropic-ratelimit-unified-*` windows Claude Code itself reads for
+/// /usage and its statusline: utilization 0-1, reset in epoch seconds.
+fn parse_claude_plan_usage(head: &[u8]) -> Option<ClaudePlanUsage> {
+    let window = |name: &str| {
+        let header = |field: &str| {
+            extract_header_value(head, &format!("anthropic-ratelimit-unified-{name}-{field}"))
+        };
+        Some(PlanWindow {
+            used_percent: header("utilization")?.parse::<f64>().ok()? * 100.0,
+            resets_at: header("reset")?.parse().ok()?,
+        })
+    };
+    let usage = ClaudePlanUsage {
+        five_hour: window("5h"),
+        seven_day: window("7d"),
+    };
+    (usage != ClaudePlanUsage::default()).then_some(usage)
+}
+
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
 /// (status line + headers up to the blank line). Mirrors the schema in upstream
 /// `headroom/subscription/codex_rate_limits.py`. Returns `None` when there is no
@@ -2869,6 +2901,7 @@ fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot>
         secondary,
         credits_balance,
         credits_unlimited,
+        captured_at: now,
     })
 }
 
@@ -3002,6 +3035,7 @@ fn codex_snapshot_from_usage_payload(payload: &UsagePayloadJson) -> Option<Codex
         secondary,
         credits_balance,
         credits_unlimited,
+        captured_at: now,
     })
 }
 
@@ -7068,6 +7102,27 @@ mod tests {
         // Valid JWT shape but no auth claim.
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}");
         assert!(decode_codex_plan_tier(&format!("h.{payload}.s")).is_none());
+    }
+
+    #[test]
+    fn claude_plan_usage_reads_the_unified_rate_limit_headers() {
+        let head = b"HTTP/1.1 200 OK\r\n\
+            anthropic-ratelimit-unified-5h-utilization: 0.345\r\n\
+            anthropic-ratelimit-unified-5h-reset: 1790870400\r\n\
+            Anthropic-Ratelimit-Unified-7d-Utilization: 1.02\r\n\
+            anthropic-ratelimit-unified-7d-reset: 1791216000\r\n\r\nevent: message_start\n";
+        let usage = super::parse_claude_plan_usage(head).expect("usage");
+        let five = usage.five_hour.expect("5h");
+        assert!((five.used_percent - 34.5).abs() < 1e-9);
+        assert_eq!(five.resets_at, 1_790_870_400);
+        assert_eq!(usage.seven_day.expect("7d").resets_at, 1_791_216_000);
+        // API-key traffic carries none of them.
+        assert_eq!(
+            super::parse_claude_plan_usage(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -8171,14 +8171,21 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// "Headroom compressing..." for a moment after each request goes out. The
 /// real compression is ~100 ms (p50); the moment is stretched to a couple of
 /// seconds so a 1 s render cycle cannot miss it. A saving outranks it, so a
-/// follow-up request never cuts a saving's highlight short. Silent until the
-/// conversation has sent a request or saved something, and on any error.
+/// follow-up request never cuts a saving's highlight short. After it, the plan
+/// usage Claude Code passes in `rate_limits` (Pro and Max, once the session has
+/// had a response): "| 5h 34%, week 62%", a window at 80% or more in yellow
+/// with its reset time, a window past its reset at 0. Silent until there is
+/// either, and on any error.
+///
+/// Percentages are cut to whole numbers as strings: bash's float printf reads
+/// "23.5" as invalid under a comma-decimal locale.
 ///
 /// Plain bash, parsing with regexes, because it runs every second
 /// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
 /// Stays bash 3.2 compatible (macOS /bin/bash): no EPOCHREALTIME, no printf %T.
 fn build_claude_statusline_script(state_path: &Path) -> String {
     let state = shell_double_quote(&state_path.to_string_lossy());
+    let warn = crate::TRAY_USAGE_RESET_SHOWN_AT_PERCENT as u32;
     format!(
         r#"#!/bin/bash
 # Headroom statusline (managed by Headroom Desktop - do not edit).
@@ -8186,13 +8193,25 @@ state_file="{state}"
 flash_secs=4
 compress_secs=2
 IFS= read -r -d '' input
-[[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] || exit 0
-sid=${{BASH_REMATCH[1]}}
-[ -r "$state_file" ] || exit 0
-state=$(<"$state_file")
-[[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]] || exit 0
-total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
-now_ms=$(( $(date +%s) * 1000 ))
+now_s=$(date +%s)
+now_ms=$(( now_s * 1000 ))
+usage=
+win() {{
+  local pct at r f
+  [[ $input =~ \"$1\"[[:space:]]*:[[:space:]]*\{{[^}}]*\"used_percentage\"[[:space:]]*:[[:space:]]*([0-9]*)(\.[0-9]*)? ]] || return 0
+  pct=${{BASH_REMATCH[1]:-0}}
+  [[ $input =~ \"$1\"[[:space:]]*:[[:space:]]*\{{[^}}]*\"resets_at\"[[:space:]]*:[[:space:]]*([0-9]+) ]] && at=${{BASH_REMATCH[1]}}
+  if [ -n "$at" ] && [ "$now_s" -ge "$at" ]; then pct=0; fi
+  if [ "$pct" -gt 100 ]; then pct=100; fi
+  r="$2 $pct%"
+  if [ "$pct" -ge {warn} ] && [ -n "$at" ]; then
+    if [ $(( at - now_s )) -lt 86400 ]; then f=+%H:%M; else f=+%a; fi
+    r=$'\033[33m'"$r (resets $(date -d "@$at" "$f" 2>/dev/null || date -r "$at" "$f" 2>/dev/null))"$'\033[0m'
+  fi
+  usage="${{usage:+$usage, }}$r"
+}}
+win five_hour 5h
+win seven_day week
 fmt() {{
   local n=$1 d u t
   if [ "$n" -ge 999500 ]; then d=1000000 u=M
@@ -8203,13 +8222,26 @@ fmt() {{
   elif [ $(( t % 10 )) -eq 0 ]; then echo "$(( t / 10 ))$u"
   else echo "$(( t / 10 )).$(( t % 10 ))$u"; fi
 }}
-line="Headroom saved $(fmt "$total") tokens this session"
-if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
-  printf '\033[1;32m%s (+%s)\033[0m\n' "$line" "$(fmt "$last")"
-elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
-  printf '\033[32mHeadroom compressing...\033[0m\n'
-elif [ "$total" -gt 0 ]; then
-  printf '%s\n' "$line"
+saved=
+if [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] && [ -r "$state_file" ]; then
+  sid=${{BASH_REMATCH[1]}}
+  state=$(<"$state_file")
+  if [[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]]; then
+    total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
+    line="Headroom saved $(fmt "$total") tokens this session"
+    if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
+      saved=$'\033[1;32m'"$line (+$(fmt "$last"))"$'\033[0m'
+    elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
+      saved=$'\033[32mHeadroom compressing...\033[0m'
+    elif [ "$total" -gt 0 ]; then
+      saved=$line
+    fi
+  fi
+fi
+if [ -n "$saved" ] && [ -n "$usage" ]; then
+  printf '%s | %s\n' "$saved" "$usage"
+elif [ -n "$saved$usage" ]; then
+  printf '%s\n' "$saved$usage"
 fi
 "#
     )
@@ -17279,6 +17311,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
         assert_eq!(render("not json"), "");
+
+        // Plan usage from Claude Code's own `rate_limits`, after the savings,
+        // pretty-printed as Claude Code sends it.
+        let now = chrono::Utc::now().timestamp();
+        let limits = |five: &str, five_at: i64, week: &str, week_at: i64| {
+            format!(
+                "{{\n  \"session_id\": \"bbbb-quiet\",\n  \"rate_limits\": {{\n    \"five_hour\": {{\n      \"used_percentage\": {five},\n      \"resets_at\": {five_at}\n    }},\n    \"seven_day\": {{\n      \"used_percentage\": {week},\n      \"resets_at\": {week_at}\n    }}\n  }}\n}}"
+            )
+        };
+        assert_eq!(
+            render(&limits("34.9", now + 3_600, "62", now + 300_000)),
+            "Headroom saved 3.1k tokens this session | 5h 34%, week 62%\n"
+        );
+        // A window past its reset is back at 0; one near its cap turns
+        // yellow with its reset time.
+        let near = render(&limits("97.2", now - 60, "91", now + 3_600));
+        assert!(
+            near.starts_with(
+                "Headroom saved 3.1k tokens this session | 5h 0%, \x1b[33mweek 91% (resets "
+            ),
+            "{near:?}"
+        );
+        assert!(near.ends_with(")\x1b[0m\n"), "{near:?}");
+        // Usage alone, before this conversation has saved anything.
+        assert_eq!(
+            render(
+                &limits("12", now + 3_600, "40", now + 300_000).replace("bbbb-quiet", "unknown")
+            ),
+            "5h 12%, week 40%\n"
+        );
     }
 
     #[cfg(unix)]

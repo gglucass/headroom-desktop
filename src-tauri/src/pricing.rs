@@ -5938,6 +5938,7 @@ mod tests {
             }),
             credits_balance: Some("$5.00".into()),
             credits_unlimited: false,
+            captured_at: 0,
         }
     }
 
@@ -6086,6 +6087,7 @@ mod tests {
             secondary,
             credits_balance: None,
             credits_unlimited: false,
+            captured_at: 0,
         }
     }
 
