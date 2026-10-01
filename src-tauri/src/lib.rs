@@ -6772,7 +6772,9 @@ pub fn run() {
         .and_then(|exe| symlink_free_exe(&exe))
     {
         use std::os::unix::process::CommandExt;
-        let _ = std::process::Command::new(real)
+        // proc::command like every spawn (check-no-console.sh); the
+        // PYTHONIOENCODING it sets is what every child gets anyway.
+        let _ = crate::proc::command(real)
             .args(std::env::args_os().skip(1))
             .exec();
     }
