@@ -435,7 +435,8 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     let mut replaced_base_url = None;
 
     match client_id {
-        "claude_code" => {
+        // One settings.json write for the whole arm; see `coalesce_writes`.
+        "claude_code" => coalesce_writes(claude_settings_path(), || -> Result<()> {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
             // Critical, app-owned writes first: the ~/.claude/settings.json env is
             // what actually routes Claude Code through Headroom. Do it before the
@@ -536,7 +537,8 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             state
                 .managed_shell_files
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
-        }
+            Ok(())
+        })?,
         "vscode" => {
             let (changed, backups, replaced) = configure_vscode_settings()?;
             changed_files.extend(changed);
@@ -951,10 +953,10 @@ pub fn repair_client_setups() -> Vec<String> {
         .collect()
 }
 
-/// Codex answered a request with 401 "Missing bearer": the provider block was
-/// written before `codex login` and lacks `requires_openai_auth`, so Codex
-/// attaches no credentials at all. The hourly scan above would fix it within
-/// the hour, but the user is failing NOW, on every prompt, with no hint that
+/// Codex answered a request with 401 "Missing bearer": the provider block
+/// lacks `requires_openai_auth` (written by a build before 0.9.28, or edited
+/// by hand), so Codex attaches no credentials at all. The hourly scan above
+/// would fix it within the hour, but the user is failing NOW, on every prompt, with no hint that
 /// Headroom is the cause (RUST-C1, ~16 hosts/week; the Sep 14-20 cohort of
 /// activated-but-never-saved users was 80% Codex-plan). Repair immediately,
 /// bounded to once per five minutes so a retry loop cannot churn config.toml,
@@ -1105,37 +1107,6 @@ pub const UNROUTED_MIN_UPTIME: Duration = Duration::from_secs(2 * 3600);
 /// Entry cap for the artifact walk; Codex keeps years of session rollouts.
 const LOCAL_ACTIVITY_WALK_CAP: usize = 20_000;
 
-/// Newest modification time of anything under `root`, visiting at most `cap`
-/// entries. A missing or unreadable root is simply "never".
-pub(crate) fn newest_mtime_under(root: &Path, cap: usize) -> Option<SystemTime> {
-    let mut newest: Option<SystemTime> = None;
-    let mut stack = vec![root.to_path_buf()];
-    let mut visited = 0usize;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > cap {
-                return newest;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if let Ok(modified) = meta.modified() {
-                if Some(modified) > newest {
-                    newest = Some(modified);
-                }
-            }
-            if meta.is_dir() {
-                stack.push(entry.path());
-            }
-        }
-    }
-    newest
-}
-
 /// Newest Claude Code transcript, `<projects_root>/<project>/*.jsonl`: the
 /// one artifact only a running session writes. The whole-tree walk this
 /// replaced also counted `<project>/memory/MEMORY.md`, which Headroom's own
@@ -1177,8 +1148,11 @@ pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
         // store: the idle `codex app-server` an IDE extension or Codex Desktop
         // keeps running rewrites it (and its -wal) with no turn at all, which
         // read as "Codex ran, nothing proxied" for users who never opened it
-        // (RUST-KC, codex_rollout_fresh=false).
-        "codex_cli" => newest_mtime_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP),
+        // (RUST-KC, codex_rollout_fresh=false). Nor the date directories: a
+        // Codex that opens a thread it never writes creates today's directory
+        // with no rollout in it, which kept RUST-KC firing on 0.9.27.
+        "codex_cli" => newest_jsonl_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP)
+            .map(|(at, _)| at),
         "claude_code" => {
             newest_claude_transcript_mtime(&home_dir().join(".claude").join("projects"))
         }
@@ -1255,8 +1229,8 @@ fn parse_codex_session_meta(first_line: &str) -> Option<CodexSessionMeta> {
 /// "openai" after Headroom started never read the config at all. `resumed`
 /// marks a thread older than `app_started_at`, whose provider predates us.
 /// `rollout_fresh` says whether that rollout was written this run at all:
-/// activity is rollout mtimes now, so "false" means some non-rollout file
-/// under `sessions/` moved, and the provider says nothing about this run.
+/// activity is the newest rollout's mtime since 0.9.28, so "false" on a
+/// newer build means the rollout walk and this one disagree (the walk cap).
 /// Call it BEFORE re-applying the setup, or `codex_config_routed` reports
 /// our own repair instead of what Codex read.
 pub(crate) fn codex_unrouted_diagnostics(
@@ -1452,8 +1426,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         "codex_gui" => {
             disable_codex_gui()?;
         }
-        "claude_code" => {
-            // Routing first, shell profiles best-effort (as codex and grok_build
+        // One settings.json write for the whole arm; see `coalesce_writes`.
+        "claude_code" => coalesce_writes(claude_settings_path(), || -> Result<()> {
+            // Routing first, shell profiles best-effort     (as codex and grok_build
             // do): the block routes nothing, and a shell cleanup failure that
             // returned early left settings.json pointing Claude Code at the
             // stopped proxy after quit. A settings.json restore error is
@@ -1495,7 +1470,8 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 let _ = remove_shell_block(&shell_targets, "managed_rtk");
             }
             restored?;
-        }
+            Ok(())
+        })?,
         "vscode" => {
             // Same settings.json key as claude_code: stop the reconciler first.
             crate::tool_manager::set_cc_switch_routed(false);
@@ -2472,11 +2448,11 @@ fn strip_headroom_hook_from_settings(settings_path: &Path) -> Result<bool> {
 /// user hook in the same matcher group stays), pruning empty `PreToolUse`/`hooks`
 /// containers. Returns whether the file changed.
 fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result<bool> {
-    if !settings_path.exists() {
+    if !held_or_exists(settings_path) {
         return Ok(false);
     }
 
-    let raw = std::fs::read_to_string(settings_path)
+    let raw = read_held_or_disk(settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
     if raw.trim().is_empty() {
         return Ok(false);
@@ -2859,6 +2835,74 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
     atomic_write(&path, &payload)
 }
 
+thread_local! {
+    /// The file a `coalesce_writes` scope holds back, and its pending contents.
+    static HELD_WRITE: std::cell::RefCell<Option<(PathBuf, Option<Vec<u8>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every `atomic_write` of `path` held in memory, then write it
+/// once (on error too, so a partial apply persists as it did step by step).
+/// Claude Code writes settings.json from its in-memory copy, not the file, so
+/// a session that loaded it between two of our several writes per apply
+/// later wrote it back without the rest: the guard, from a snapshot taken
+/// after the env write (RUST-GS), or the env, from one taken mid-teardown
+/// (RUST-KH). One write leaves only whole states to snapshot. Readers of the
+/// held file go through `read_held_or_disk` / `held_or_exists`.
+fn coalesce_writes<T>(path: PathBuf, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    // Clears the hold even if `f` panics, so this thread's later writes land.
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            HELD_WRITE.with(|held| held.borrow_mut().take());
+        }
+    }
+    if HELD_WRITE.with(|held| held.borrow().is_some()) {
+        return f();
+    }
+    HELD_WRITE.with(|held| *held.borrow_mut() = Some((path.clone(), None)));
+    let release = Release;
+    let result = f();
+    let pending = HELD_WRITE
+        .with(|held| held.borrow_mut().take())
+        .and_then(|(_, bytes)| bytes);
+    drop(release);
+    let flushed = pending.map_or(Ok(()), |bytes| atomic_write(&path, &bytes));
+    match (result, flushed) {
+        (Ok(value), flushed) => flushed.map(|()| value),
+        (Err(err), flushed) => {
+            if let Err(flush_err) = flushed {
+                log::warn!(
+                    "writing {} after a failed step: {flush_err:#}",
+                    path.display()
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+fn held_bytes(path: &Path) -> Option<Vec<u8>> {
+    HELD_WRITE.with(|held| match held.borrow().as_ref() {
+        Some((held_path, bytes)) if held_path == path => bytes.clone(),
+        _ => None,
+    })
+}
+
+/// `std::fs::read_to_string`, seeing a write `coalesce_writes` holds back.
+fn read_held_or_disk(path: &Path) -> std::io::Result<String> {
+    match held_bytes(path) {
+        Some(bytes) => String::from_utf8(bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        None => std::fs::read_to_string(path),
+    }
+}
+
+/// `path.exists()`, seeing a write `coalesce_writes` holds back.
+fn held_or_exists(path: &Path) -> bool {
+    held_bytes(path).is_some() || path.exists()
+}
+
 /// Write via a sibling tmp file then rename. POSIX rename is atomic, so
 /// concurrent readers (other apps parsing their own config, the tray-icon
 /// thread calling `is_claude_code_enabled` every 2s) see either the old file
@@ -2867,6 +2911,16 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
 /// user-owned configs (settings.json, config.toml, shell rc files) breaks the
 /// user's shell or client startup.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let held = HELD_WRITE.with(|held| match held.borrow_mut().as_mut() {
+        Some((held_path, bytes)) if held_path == path => {
+            *bytes = Some(contents.to_vec());
+            true
+        }
+        _ => false,
+    });
+    if held {
+        return Ok(());
+    }
     // Write through a symlink, not over it. Renaming the tmp onto the link
     // replaces the link itself with a regular file, so a dotfiles-managed
     // `~/.zprofile -> ~/dotfiles/zprofile` silently forked into a copy and the
@@ -3532,8 +3586,8 @@ fn set_markitdown_bash_permission(
         .map(|p| format!("Bash({} *)", p.display()))
         .collect();
 
-    let mut content = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path)
+    let mut content = if held_or_exists(&settings_path) {
+        let raw = read_held_or_disk(&settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
         if raw.trim().is_empty() {
             Value::Object(Default::default())
@@ -3733,8 +3787,8 @@ fn configure_claude_settings_env_impl(
     overwrite_existing: bool,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let settings_path = claude_settings_path();
-    let mut content = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path)
+    let mut content = if held_or_exists(&settings_path) {
+        let raw = read_held_or_disk(&settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
         Value::Object(parse_json_object(&raw, &settings_path)?)
     } else {
@@ -3856,8 +3910,8 @@ fn ensure_claude_settings_hook(
     marker: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let settings_path = claude_settings_path();
-    let mut content = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path)
+    let mut content = if held_or_exists(&settings_path) {
+        let raw = read_held_or_disk(&settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
         Value::Object(parse_json_object(&raw, &settings_path)?)
     } else {
@@ -4253,10 +4307,10 @@ pub fn apply_upstream_client_config(
 /// Current value of one `env` key in `~/.claude/settings.json`, if any.
 fn read_claude_settings_env(env_key: &str) -> Result<Option<String>> {
     let settings_path = claude_settings_path();
-    if !settings_path.exists() {
+    if !held_or_exists(&settings_path) {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&settings_path)
+    let raw = read_held_or_disk(&settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
     let root = parse_json_object(&raw, &settings_path)?;
     Ok(root
@@ -4273,11 +4327,11 @@ fn remove_claude_settings_env(
     restore_value: Option<&str>,
 ) -> Result<()> {
     let settings_path = claude_settings_path();
-    if !settings_path.exists() {
+    if !held_or_exists(&settings_path) {
         return Ok(());
     }
 
-    let raw = std::fs::read_to_string(&settings_path)
+    let raw = read_held_or_disk(&settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
     let mut root = parse_json_object(&raw, &settings_path)?;
     let mut changed = false;
@@ -4460,11 +4514,13 @@ fn codex_config_toml_path() -> PathBuf {
 // `invalid type: string "headroom", expected a boolean in features`. The root
 // keys therefore go in a block at the *top* of the file (nothing above ⇒ root
 // scope), and the `[model_providers.headroom]` table goes in a block at the
-// *end*. `requires_openai_auth` is emitted only for ChatGPT-OAuth users: the
-// flag is what makes Codex render the account menu (profile/email/plan/usage),
-// but it also forces Codex to demand an OpenAI OAuth login (issue #406), which
-// would break users authenticated with an OpenAI API key. See
-// `codex_uses_chatgpt_auth`.
+// *end*. The table always carries `requires_openai_auth = true`, as Codex's
+// built-in `openai` provider does: without it Codex attaches NO credential of
+// any kind (`resolve_provider_auth` returns the unauthenticated provider), so
+// API-key, `chatgptAuthTokens` and personal-access-token logins all 401'd with
+// "Missing bearer" (RUST-C1, RUST-KN) while only `auth_mode: chatgpt` got it.
+// The login screen it can raise only shows for a user with no credential at
+// all, who could not get a request through either way (#406 predates that).
 const CODEX_ROOT_BLOCK_ID: &str = "codex_cli";
 const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 
@@ -4740,66 +4796,15 @@ fn codex_root_keys_body() -> String {
     )
 }
 
-/// Whether Codex is authenticated via ChatGPT OAuth (rather than an OpenAI API
-/// key), read from `~/.codex/auth.json`. Drives whether the managed provider
-/// block carries `requires_openai_auth = true` (see [`codex_provider_table_body`]).
-fn codex_uses_chatgpt_auth() -> bool {
-    let path = codex_home().join("auth.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    // Codex records the active method explicitly; trust it when present.
-    if let Some(mode) = obj.get("auth_mode").and_then(Value::as_str) {
-        return mode.eq_ignore_ascii_case("chatgpt");
-    }
-    // Older auth.json files predate `auth_mode`: infer ChatGPT mode from the
-    // presence of an OAuth account id.
-    let Some(tokens) = obj.get("tokens").and_then(Value::as_object) else {
-        return false;
-    };
-    if tokens
-        .get("account_id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.trim().is_empty())
-    {
-        return true;
-    }
-    // Newer Codex writes an auth.json with neither `auth_mode` nor a
-    // top-level `tokens.account_id`: the account identity lives only in the
-    // `id_token` claims (upstream #3206 / #3212). Those configs read as
-    // API-key mode, so `requires_openai_auth` is omitted, Codex attaches no
-    // Authorization header, and every request 401s with "Missing bearer".
-    // The payload is decoded, not verified: it is a local file the user
-    // already owns, and the result only picks which key we write into their
-    // own config.toml. An API-key user has no ChatGPT id_token, so this
-    // cannot resurrect the forced-OAuth-login regression in #406.
-    tokens
-        .get("id_token")
-        .and_then(Value::as_str)
-        .and_then(|token| {
-            crate::proxy_intercept::decode_codex_auth_claim(token, "chatgpt_account_id")
-        })
-        .is_some_and(|id| !id.trim().is_empty())
-}
-
-fn codex_provider_table_body(requires_openai_auth: bool) -> String {
-    let mut body = format!(
+fn codex_provider_table_body() -> String {
+    format!(
         "[model_providers.headroom]\n\
          name = \"Headroom persistent proxy\"\n\
          base_url = \"{base}\"\n\
-         supports_websockets = false",
+         supports_websockets = false\n\
+         requires_openai_auth = true",
         base = HEADROOM_OPENAI_BASE_URL,
-    );
-    if requires_openai_auth {
-        body.push_str("\nrequires_openai_auth = true");
-    }
-    body
+    )
 }
 
 fn codex_marker_block(block_id: &str, body: &str) -> String {
@@ -5118,7 +5123,7 @@ fn render_codex_config(existing: &str) -> String {
     out.push('\n');
     out.push_str(&codex_marker_block(
         CODEX_TABLE_BLOCK_ID,
-        &codex_provider_table_body(codex_uses_chatgpt_auth()),
+        &codex_provider_table_body(),
     ));
     out
 }
@@ -6349,14 +6354,14 @@ fn codex_provider_block_matches() -> Result<bool> {
             CODEX_TABLE_BLOCK_ID,
             "supports_websockets = false",
         );
-    // The flag must track the CURRENT auth mode, not the one at write time. A
-    // block written before `codex login` omits `requires_openai_auth`, so Codex
-    // never attaches the ChatGPT bearer and every request 401s with "Missing
-    // bearer"; failing verify here makes hourly repair rewrite the block after
-    // the user logs in. Symmetrically, a leftover flag after a switch to
-    // API-key auth would force an OAuth login screen (#406).
-    let auth_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, "requires_openai_auth")
-        == codex_uses_chatgpt_auth();
+    // Builds before 0.9.28 wrote the flag only for `auth_mode: chatgpt`, so
+    // every other login sends no bearer and 401s with "Missing bearer";
+    // failing verify here makes repair add it (see `codex_provider_table_body`).
+    let auth_ok = marker_block_contains(
+        &content,
+        CODEX_TABLE_BLOCK_ID,
+        "requires_openai_auth = true",
+    );
     Ok(root_ok && table_ok && auth_ok)
 }
 
@@ -6736,8 +6741,8 @@ fn register_hook_entries(
     hooks_path: &Path,
     hooks: &[(&str, Option<&str>, &str, &str)],
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let mut content = if hooks_path.exists() {
-        let raw = std::fs::read_to_string(hooks_path)
+    let mut content = if held_or_exists(hooks_path) {
+        let raw = read_held_or_disk(hooks_path)
             .with_context(|| format!("reading {}", hooks_path.display()))?;
         Value::Object(parse_json_object(&raw, hooks_path)?)
     } else {
@@ -6810,10 +6815,10 @@ fn register_hook_entries(
 
 /// Whether `command` is registered under any event in a hooks file.
 fn guard_registered_in_hooks(hooks_path: &Path, command: &str) -> Result<bool> {
-    if !hooks_path.exists() {
+    if !held_or_exists(hooks_path) {
         return Ok(false);
     }
-    let raw = std::fs::read_to_string(hooks_path)
+    let raw = read_held_or_disk(hooks_path)
         .with_context(|| format!("reading {}", hooks_path.display()))?;
     let content = Value::Object(parse_json_object(&raw, hooks_path)?);
     Ok(content
@@ -6841,10 +6846,10 @@ fn remove_guard_hook_entries(
     delete_if_empty: bool,
     only_events: Option<&[&str]>,
 ) -> Result<()> {
-    if !hooks_path.exists() {
+    if !held_or_exists(hooks_path) {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(hooks_path)
+    let raw = read_held_or_disk(hooks_path)
         .with_context(|| format!("reading {}", hooks_path.display()))?;
     let mut content = Value::Object(parse_json_object(&raw, hooks_path)?);
     let mut changed = false;
@@ -8226,7 +8231,7 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
     let settings_path = claude_settings_path();
     // Only a missing file reads as empty: an unreadable one (permissions,
     // non-UTF-8) would otherwise be replaced by a file holding just statusLine.
-    let raw = match std::fs::read_to_string(&settings_path) {
+    let raw = match read_held_or_disk(&settings_path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         other => other.with_context(|| format!("reading {}", settings_path.display()))?,
     };
@@ -8664,12 +8669,11 @@ fn shell_block_contains_text_in_files(
 
 fn claude_settings_env_matches(env_key: &str, expected_value: &str) -> Result<bool> {
     let path = claude_settings_path();
-    if !path.exists() {
+    if !held_or_exists(&path) {
         return Ok(false);
     }
 
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = read_held_or_disk(&path).with_context(|| format!("reading {}", path.display()))?;
     let content: Value = Value::Object(parse_json_object(&raw, &path)?);
     Ok(matches!(
         content.get("env").and_then(|env| env.get(env_key)),
@@ -8679,12 +8683,11 @@ fn claude_settings_env_matches(env_key: &str, expected_value: &str) -> Result<bo
 
 fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
     let path = claude_settings_path();
-    if !path.exists() {
+    if !held_or_exists(&path) {
         return Ok(false);
     }
 
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = read_held_or_disk(&path).with_context(|| format!("reading {}", path.display()))?;
     let content: Value = Value::Object(parse_json_object(&raw, &path)?);
 
     Ok(content
@@ -14887,11 +14890,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             toml.contains("supports_websockets = false"),
             "Codex must use the reliable HTTP Responses transport, got:\n{toml}"
         );
-        // No ~/.codex/auth.json in this test ⇒ not ChatGPT-OAuth ⇒ the flag is
-        // omitted (it would force an OpenAI OAuth login for API-key users, #406).
         assert!(
-            !toml.contains("requires_openai_auth"),
-            "requires_openai_auth must NOT be written without ChatGPT auth, got:\n{toml}"
+            toml.contains("requires_openai_auth = true"),
+            "Codex attaches no credential without the flag, got:\n{toml}"
         );
 
         // OPENAI_BASE_URL exported from a managed shell block, only while the
@@ -15879,132 +15880,31 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn apply_codex_emits_requires_openai_auth_for_chatgpt_users() {
-        let home = TestHome::new();
-        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        let codex_dir = home.path().join(".codex");
-        fs::create_dir_all(&codex_dir).unwrap();
-        fs::write(
-            codex_dir.join("auth.json"),
-            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
-        )
-        .unwrap();
+    fn apply_codex_emits_requires_openai_auth_for_every_login() {
+        // Without the flag Codex sends no credential at all, whatever the
+        // login: these all 401'd "Missing bearer" while the flag was written
+        // only for `auth_mode: chatgpt` (RUST-C1, RUST-KN).
+        for auth in [
+            None,
+            Some("{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}"),
+            Some("{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"sk-test\"}"),
+            Some("{\"auth_mode\":\"chatgptAuthTokens\",\"tokens\":{}}"),
+        ] {
+            let home = TestHome::new();
+            fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+            let codex_dir = home.path().join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            if let Some(auth) = auth {
+                fs::write(codex_dir.join("auth.json"), auth).unwrap();
+            }
 
-        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-        assert!(
-            toml.contains("requires_openai_auth = true"),
-            "ChatGPT-OAuth users need the flag for the account menu, got:\n{toml}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_codex_omits_requires_openai_auth_for_api_key_users() {
-        let home = TestHome::new();
-        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        let codex_dir = home.path().join(".codex");
-        fs::create_dir_all(&codex_dir).unwrap();
-        fs::write(
-            codex_dir.join("auth.json"),
-            "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"sk-test\"}",
-        )
-        .unwrap();
-
-        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-        assert!(
-            !toml.contains("requires_openai_auth"),
-            "API-key users must not be forced into an OpenAI OAuth login (#406), got:\n{toml}"
-        );
-    }
-
-    /// Build an unsigned JWT whose payload carries `claims`. Only the payload
-    /// segment is read, so header and signature are placeholders.
-    fn fake_id_token(claims: &str) -> String {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        format!(
-            "{}.{}.sig",
-            b64.encode(b"{\"alg\":\"none\"}"),
-            b64.encode(claims.as_bytes())
-        )
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_codex_emits_requires_openai_auth_from_id_token_claim() {
-        // Newer Codex writes neither `auth_mode` nor `tokens.account_id`; the
-        // account id lives only in the id_token claims (upstream #3206). Read
-        // as API-key mode, Codex sends no Authorization header and every
-        // request 401s.
-        let home = TestHome::new();
-        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        let codex_dir = home.path().join(".codex");
-        fs::create_dir_all(&codex_dir).unwrap();
-        let token = fake_id_token(
-            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
-        );
-        fs::write(
-            codex_dir.join("auth.json"),
-            format!("{{\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
-        )
-        .unwrap();
-
-        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-        assert!(
-            toml.contains("requires_openai_auth = true"),
-            "id_token-only ChatGPT auth still needs the flag, got:\n{toml}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_codex_omits_requires_openai_auth_when_apikey_mode_is_explicit() {
-        // An explicit `auth_mode` wins outright: a stale ChatGPT id_token
-        // alongside it must not force an OAuth login (#406).
-        let home = TestHome::new();
-        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        let codex_dir = home.path().join(".codex");
-        fs::create_dir_all(&codex_dir).unwrap();
-        let token = fake_id_token(
-            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
-        );
-        fs::write(
-            codex_dir.join("auth.json"),
-            format!("{{\"auth_mode\":\"apikey\",\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
-        )
-        .unwrap();
-
-        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-        assert!(
-            !toml.contains("requires_openai_auth"),
-            "explicit apikey mode must win over a ChatGPT id_token (#406), got:\n{toml}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_codex_omits_requires_openai_auth_for_id_token_without_claim() {
-        let home = TestHome::new();
-        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        let codex_dir = home.path().join(".codex");
-        fs::create_dir_all(&codex_dir).unwrap();
-        let token = fake_id_token("{\"sub\":\"user_1\"}");
-        fs::write(
-            codex_dir.join("auth.json"),
-            format!("{{\"tokens\":{{\"id_token\":\"{token}\"}}}}"),
-        )
-        .unwrap();
-
-        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
-        assert!(
-            !toml.contains("requires_openai_auth"),
-            "an id_token without the ChatGPT claim is not ChatGPT auth, got:\n{toml}"
-        );
+            super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+            let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+            assert!(
+                toml.contains("requires_openai_auth = true"),
+                "auth {auth:?} needs the flag, got:\n{toml}"
+            );
+        }
     }
 
     #[test]
@@ -16180,32 +16080,31 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
+    /// Turn a freshly applied block into the flagless one older builds wrote.
+    fn strip_codex_auth_flag(codex_dir: &std::path::Path) {
+        let path = codex_dir.join("config.toml");
+        let toml = fs::read_to_string(&path).unwrap();
+        fs::write(&path, toml.replace("\nrequires_openai_auth = true", "")).unwrap();
+    }
+
     #[test]
     #[serial_test::serial]
-    fn codex_block_goes_stale_when_login_postdates_it_and_repair_upgrades_it() {
-        // The enable-before-login hole: the block is written while auth.json is
-        // absent, so it omits requires_openai_auth. Codex then sends no bearer
-        // and every request 401s ("Missing bearer"). A later `codex login` must
-        // flip verify to failing so hourly repair rewrites the block.
+    fn codex_block_without_the_auth_flag_is_stale_and_reapply_adds_it() {
+        // Builds before 0.9.28 wrote the block without requires_openai_auth
+        // for every login but `auth_mode: chatgpt`, so Codex sent no bearer
+        // and every request 401'd ("Missing bearer"). Verify must fail on such
+        // a block so repair rewrites it.
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         let codex_dir = home.path().join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
 
         super::apply_client_setup("codex").expect("apply_client_setup succeeds");
-        assert!(
-            super::codex_provider_block_matches().unwrap(),
-            "flagless block matches while logged out"
-        );
-
-        fs::write(
-            codex_dir.join("auth.json"),
-            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
-        )
-        .unwrap();
+        assert!(super::codex_provider_block_matches().unwrap());
+        strip_codex_auth_flag(&codex_dir);
         assert!(
             !super::codex_provider_block_matches().unwrap(),
-            "block written before login is stale once ChatGPT auth appears"
+            "a flagless block is stale"
         );
 
         super::apply_client_setup("codex").expect("re-apply succeeds");
@@ -16328,19 +16227,6 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             rendered.contains("[model_providers.gateway]"),
             "user provider table preserved, got:\n{rendered}"
         );
-    }
-
-    #[test]
-    fn newest_mtime_under_walks_nested_dirs_and_respects_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("sessions");
-        fs::create_dir_all(root.join("2026/09/06")).unwrap();
-        fs::write(root.join("2026/09/06/rollout.jsonl"), b"x").unwrap();
-        let newest = super::newest_mtime_under(&root, 1_000).expect("some mtime");
-        assert!(newest <= SystemTime::now());
-        assert!(super::newest_mtime_under(&root.join("missing"), 1_000).is_none());
-        // Cap of 1 visits only the first entry (the year dir) and stops.
-        assert!(super::newest_mtime_under(&root, 1).is_some());
     }
 
     #[test]
@@ -16467,19 +16353,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     #[serial_test::serial]
     fn codex_missing_bearer_repair_rewrites_flagless_block_at_once() {
-        // Install-then-login: the block is written logged out (no
-        // requires_openai_auth), the user logs into Codex, every request 401s.
-        // The intercept's 401 hook must fix it now, not on the hourly scan.
+        // A flagless block left by an older build: every request 401s. The
+        // intercept's 401 hook must fix it now, not on the hourly scan.
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         let codex_dir = home.path().join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
         super::apply_client_setup("codex").expect("apply succeeds");
-        fs::write(
-            codex_dir.join("auth.json"),
-            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
-        )
-        .unwrap();
+        strip_codex_auth_flag(&codex_dir);
 
         // Exactly what the 401 hook does: claim the slot on the caller, then
         // do the filesystem work.
@@ -18510,6 +18391,49 @@ sys.exit(3)
     }
 
     #[test]
+    fn coalesce_writes_lands_every_edit_as_one_write() {
+        // RUST-GS/KH: a Claude Code session that read settings.json between
+        // two of our writes kept that half-applied copy and wrote it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let other = tmp.path().join("other.json");
+        std::fs::write(&path, "{}").unwrap();
+        super::coalesce_writes(path.clone(), || {
+            super::atomic_write(&path, b"{\"env\":1}")?;
+            super::atomic_write(&path, b"{\"env\":1,\"hooks\":2}")?;
+            // Readers see the held edit; the disk does not, until the end.
+            assert_eq!(
+                super::read_held_or_disk(&path).unwrap(),
+                "{\"env\":1,\"hooks\":2}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+            // Only the held path waits.
+            super::atomic_write(&other, b"x")?;
+            assert_eq!(std::fs::read(&other).unwrap(), b"x");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"env\":1,\"hooks\":2}"
+        );
+
+        // A failed step still persists what came before it, as step-by-step did.
+        let fresh = tmp.path().join("fresh.json");
+        let err = super::coalesce_writes(fresh.clone(), || -> anyhow::Result<()> {
+            assert!(!super::held_or_exists(&fresh));
+            super::atomic_write(&fresh, b"{}")?;
+            assert!(super::held_or_exists(&fresh));
+            Err(anyhow::anyhow!("later step failed"))
+        });
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"{}");
+        // And the hold is released: writes land directly again.
+        super::atomic_write(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+    }
+
+    #[test]
     fn atomic_write_creates_missing_parent_dir() {
         // RUST-8M: callers that skip their own `create_dir_all` got ENOENT
         // (os error 3 on Windows) when the config dir was missing.
@@ -19125,9 +19049,12 @@ sys.exit(3)
             .unwrap();
         assert_eq!(super::client_local_activity_at("codex"), None);
 
-        // A turn appends a rollout, and that does count.
+        // Nor does a date directory with no rollout in it yet (0.9.27 KC).
         let day = home.path().join(".codex/sessions/2026/09/30");
         std::fs::create_dir_all(&day).unwrap();
+        assert_eq!(super::client_local_activity_at("codex"), None);
+
+        // A turn appends a rollout, and that does count.
         std::fs::write(day.join("rollout-x.jsonl"), b"{}\n").unwrap();
         assert!(super::client_local_activity_at("codex").is_some());
     }

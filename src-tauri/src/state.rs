@@ -7288,11 +7288,17 @@ fn warn_stats_fetch_failed(reason: &str) {
     if !foreign_holder && backend_ready {
         let (secs_since_ok, requests_since_ok) =
             stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
+        let hops = matches!(category.as_str(), "timeout" | "transport").then(stats_stall_hops);
         sentry::with_scope(
             |scope| {
                 scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
                 scope.set_extra("secs_since_last_ok", secs_since_ok.into());
                 scope.set_extra("requests_since_last_ok", requests_since_ok.into());
+                if let Some((direct_stats_ms, intercept_readyz_ms, tasks)) = &hops {
+                    scope.set_extra("direct_stats_ms", (*direct_stats_ms).into());
+                    scope.set_extra("intercept_readyz_ms", (*intercept_readyz_ms).into());
+                    scope.set_extra("backend_tasks", tasks.clone().into());
+                }
             },
             || {
                 sentry::capture_message(&message, sentry::Level::Warning);
@@ -7304,6 +7310,78 @@ fn warn_stats_fetch_failed(reason: &str) {
     // readiness verdict rides along so a support log still says which half of
     // the gate suppressed the event.
     log::warn!("{message} (backend_ready={backend_ready})");
+}
+
+/// Which hop held a `/stats` fetch that just failed. The fetch goes through
+/// the intercept (6767) while the readyz gate above probes the backend
+/// directly, so every RUST-86 event fits two stalls: the backend's `/stats`
+/// queued behind its snapshot/throughput locks on a free event loop, or our
+/// own intercept not forwarding (which would hang client traffic too). A slow
+/// `direct_stats_ms` with a fast `intercept_readyz_ms` is the backend, and
+/// `backend_tasks` shows what is piled up there; the reverse is the intercept.
+/// -1 means no answer inside the probe's timeout. At most ~9s, once per warn
+/// window.
+fn stats_stall_hops() -> (i64, i64, String) {
+    fn timed_get(url: &str, timeout: Duration) -> (i64, Option<String>) {
+        let started = Instant::now();
+        let body = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false)
+            .timeout(timeout)
+            .build()
+            .ok()
+            .and_then(|client| client.get(url).send().ok())
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.text().ok());
+        match body {
+            Some(body) => (started.elapsed().as_millis() as i64, Some(body)),
+            None => (-1, None),
+        }
+    }
+    let backend = crate::backend_port::get();
+    let (direct_stats_ms, _) = timed_get(
+        &format!("http://127.0.0.1:{backend}/stats?cached=1"),
+        Duration::from_secs(5),
+    );
+    let (intercept_readyz_ms, _) = timed_get(
+        &format!("http://127.0.0.1:{}/readyz", local_proxy_port()),
+        Duration::from_secs(2),
+    );
+    let (_, tasks) = timed_get(
+        &format!("http://127.0.0.1:{backend}/debug/tasks"),
+        Duration::from_secs(2),
+    );
+    (
+        direct_stats_ms,
+        intercept_readyz_ms,
+        tasks
+            .map(|body| summarize_backend_tasks(&body))
+            .unwrap_or_default(),
+    )
+}
+
+/// The backend's `/debug/tasks` as `qualname x count`, most frequent first:
+/// requests piled up behind one slow `/stats` build read as one large
+/// `RequestResponseCycle.run_asgi` count on an otherwise idle host.
+fn summarize_backend_tasks(body: &str) -> String {
+    let Ok(Value::Array(tasks)) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for name in tasks
+        .iter()
+        .filter_map(|task| task.get("coro_qualname").and_then(Value::as_str))
+    {
+        *counts.entry(name).or_default() += 1;
+    }
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts
+        .iter()
+        .take(12)
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Record a successful `/stats` fetch, clearing the warn backoff only once the
@@ -14832,6 +14910,21 @@ mod tests {
             state.cached_headroom_stats.lock().is_none(),
             "a poll that did not fetch must not cache a miss"
         );
+    }
+
+    #[test]
+    fn backend_tasks_summary_counts_qualnames_most_frequent_first() {
+        let body = r#"[
+            {"coro_qualname": "RequestResponseCycle.run_asgi"},
+            {"coro_qualname": "trim_periodically"},
+            {"coro_qualname": "RequestResponseCycle.run_asgi"},
+            {"name": "no qualname"}
+        ]"#;
+        assert_eq!(
+            super::summarize_backend_tasks(body),
+            "RequestResponseCycle.run_asgi x2, trim_periodically x1"
+        );
+        assert_eq!(super::summarize_backend_tasks("not json"), "");
     }
 
     #[test]
