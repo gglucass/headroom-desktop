@@ -1709,6 +1709,20 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Kill every process running out of `dir`, except this one.
+#[cfg(target_os = "windows")]
+fn kill_processes_under(dir: &Path) {
+    kill_processes_like(dir, "\\*");
+}
+
+/// Kill every process whose image is exactly `exe`: a Headroom-installed binary
+/// that must be replaced or deleted, which Windows refuses while it runs.
+#[cfg(target_os = "windows")]
+pub(crate) fn kill_processes_running(exe: &Path) {
+    kill_processes_like(exe, "");
+}
+
+/// Kill every process whose image path is `path` followed by the `-like`
+/// pattern `suffix`, except this one.
 ///
 /// Windows keeps a running image undeletable, so anything still executing from
 /// inside Headroom's footprint pins it: the backend proxy, and the MCP servers
@@ -1722,10 +1736,10 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
 /// only ever match a binary Headroom installed. `uninstall.exe` is exempt: it
 /// lives in the same directory and is usually the process driving this sweep.
 #[cfg(target_os = "windows")]
-fn kill_processes_under(dir: &Path) {
+fn kill_processes_like(path: &Path, suffix: &str) {
     // `-like` metacharacters, plus `'` so a username containing one cannot
     // close the PowerShell literal early.
-    let escaped = dir
+    let escaped = path
         .display()
         .to_string()
         .replace('`', "``")
@@ -1736,7 +1750,7 @@ fn kill_processes_under(dir: &Path) {
     // `$PID` is the powershell process itself: its own command line embeds the
     // pattern, and Win32_Process would hand it back as a match (RUST-6F).
     let script = format!(
-        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}{suffix}' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
     let mut command = crate::proc::command("powershell");
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
