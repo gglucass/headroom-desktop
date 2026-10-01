@@ -451,8 +451,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     .preserved_base_urls
                     .insert(state_id.clone(), original.clone());
                 replaced_base_url = Some(original);
-                // Persist now: settings.json already holds our URL, so if a
-                // later step fails the gateway would otherwise be lost for good.
+                // Persist now: `coalesce_writes` lands our URL in settings.json
+                // even when a later step fails, and the gateway would otherwise
+                // be lost for good.
                 write_setup_state(&state)?;
             }
             // Ride ENABLE_TOOL_SEARCH alongside the base URL so Claude Code keeps
@@ -1428,7 +1429,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         }
         // One settings.json write for the whole arm; see `coalesce_writes`.
         "claude_code" => coalesce_writes(claude_settings_path(), || -> Result<()> {
-            // Routing first, shell profiles best-effort     (as codex and grok_build
+            // Routing first, shell profiles best-effort (as codex and grok_build
             // do): the block routes nothing, and a shell cleanup failure that
             // returned early left settings.json pointing Claude Code at the
             // stopped proxy after quit. A settings.json restore error is

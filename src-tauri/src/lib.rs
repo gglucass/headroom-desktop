@@ -8264,11 +8264,18 @@ fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
 ///
 /// stderr only at the call site: stdout echoes written memory files back
 /// verbatim and must never reach a Sentry title.
+///
+/// Python log records are unwrapped first. When the run imports the wheel's
+/// `proxy/server.py`, its module-level `basicConfig` puts `<asctime> - <logger>
+/// - <LEVEL> - ` on every record, so the first line became an INFO line with a
+/// timestamp in it: a fingerprint unique per event, titled with no cause
+/// (RUST-KQ, a 900s hard cap that is RUST-KK's class).
 fn learn_failure_signature_source(text: &str) -> String {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .filter_map(learn_log_record_message)
         .collect();
     let Some(first) = lines.first() else {
         return "no output".to_string();
@@ -8288,6 +8295,25 @@ fn learn_failure_signature_source(text: &str) -> String {
     match lines.get(marker + 1) {
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
+    }
+}
+
+/// A stderr line with any Python log-record prefix removed: the message of a
+/// WARNING-or-worse record, None for DEBUG/INFO chatter, any other line as is.
+fn learn_log_record_message(line: &str) -> Option<&str> {
+    let mut parts = line.splitn(4, " - ");
+    let (Some(asctime), Some(_logger), Some(level), Some(message)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Some(line);
+    };
+    if !asctime.starts_with(|c: char| c.is_ascii_digit()) {
+        return Some(line);
+    }
+    match level {
+        "DEBUG" | "INFO" => None,
+        "WARNING" | "ERROR" | "CRITICAL" => Some(message.trim()),
+        _ => Some(line),
     }
 }
 
@@ -14393,6 +14419,25 @@ Some unrelated content.
         );
         // ...but the raw stderr always is, which is what the guard now reads.
         assert!(stderr.contains("is not readable"), "{stderr}");
+    }
+
+    #[test]
+    fn learn_failure_signature_source_unwraps_python_log_records() {
+        // RUST-KQ: the wheel's basicConfig format put a timestamped INFO line
+        // first, so every event got its own fingerprint and no cause in the title.
+        let stderr = "2026-09-30 23:57:46,378 - headroom.learn.analyzer - INFO - HEADROOM_LEARN_CLI=claude \u{2014} using claude CLI backend\n\
+                      2026-10-01 00:12:47,900 - headroom.learn.analyzer - WARNING - LLM analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap.\n  \
+                      Analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap.\n";
+        assert_eq!(
+            learn_failure_signature_source(stderr),
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap."
+        );
+        // A logged `failed (exit N):` marker still joins its reason line.
+        let marker = "2026-10-01 00:12:47,900 - headroom.learn.analyzer - WARNING - LLM analysis failed: `claude -p` failed (exit 1):\nCredit balance is too low\n";
+        assert_eq!(
+            learn_failure_signature_source(marker),
+            "LLM analysis failed: `claude -p` failed (exit 1): Credit balance is too low"
+        );
     }
 
     #[test]
