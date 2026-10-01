@@ -1029,19 +1029,8 @@ async fn check_for_app_update(
     // failed to start or relaunch us. A relaunched build's launch-time
     // restore_client_setups re-applies the remembered clients.
     let teardown = app.clone();
-    let builder = app.updater_builder();
-    // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary,
-    // RUST-KR), tauri's own current_exe() refuses the path on macOS and every
-    // check fails. Hand it the resolved binary instead. Only a path that
-    // canonicalizes: the plugin replaces the directory two levels above a
-    // `Contents/MacOS` exe, or else the exe's own parent, so a raw link path
-    // would aim the install at `~/.local/bin`.
-    #[cfg(target_os = "macos")]
-    let builder = match canonical_current_exe() {
-        Some(exe) => builder.executable_path(exe),
-        None => builder,
-    };
-    let updater = builder
+    let updater = app
+        .updater_builder()
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
@@ -1262,25 +1251,24 @@ async fn restart_app(app: AppHandle) {
     }
 }
 
-/// `current_exe` with symlinks resolved, or None when it no longer resolves
-/// (bundle moved or deleted while running).
+/// The resolved binary when any component of `exe` is a symlink: the same test
+/// tauri-utils' `StartingBinary` applies, so `run` re-execs exactly when tauri
+/// would refuse the path. The resolved path holds no symlink, so it cannot loop.
 #[cfg(target_os = "macos")]
-fn canonical_current_exe() -> Option<std::path::PathBuf> {
-    std::env::current_exe().ok()?.canonicalize().ok()
+fn symlink_free_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    exe.ancestors()
+        .any(|p| {
+            p.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        })
+        .then(|| exe.canonicalize().ok())
+        .flatten()
 }
 
 /// Walks up from `current_exe` to find the enclosing `.app` bundle path.
 #[cfg(target_os = "macos")]
 fn current_app_bundle_path() -> Option<std::path::PathBuf> {
-    app_bundle_of(std::env::current_exe().ok()?)
-}
-
-/// Uses the resolved binary, since a symlinked launch path has no `.app`
-/// ancestor (RUST-KR); falls back to the raw path so a moved bundle still reads
-/// as gone.
-#[cfg(target_os = "macos")]
-fn app_bundle_of(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
-    let exe = exe.canonicalize().unwrap_or(exe);
+    let exe = std::env::current_exe().ok()?;
     exe.ancestors()
         .find(|p| p.extension().is_some_and(|ext| ext == "app"))
         .map(|p| p.to_path_buf())
@@ -6770,6 +6758,25 @@ fn finish_single_instance_hand_off(app: &tauri::App) {
 }
 
 pub fn run() {
+    // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary),
+    // tauri's current_exe() refuses the path on macOS, so every update check
+    // failed (RUST-KR/KS). Handing the updater an `executable_path` does not
+    // help: its builder evaluates current_exe()? anyway. Re-exec the resolved
+    // binary before anything starts instead. The running image is then the very
+    // file tauri resolves, which the `process-relaunch-dangerous-allow-symlink-
+    // macos` feature cannot promise. Falls through to the old failure if exec
+    // does.
+    #[cfg(target_os = "macos")]
+    if let Some(real) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| symlink_free_exe(&exe))
+    {
+        use std::os::unix::process::CommandExt;
+        let _ = std::process::Command::new(real)
+            .args(std::env::args_os().skip(1))
+            .exec();
+    }
+
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
@@ -10766,7 +10773,7 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use super::{
-        app_bundle_of, bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem,
+        bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -10790,7 +10797,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn app_bundle_of_follows_a_symlinked_launch_path() {
+    fn symlink_free_exe_resolves_a_symlinked_launch_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let macos = dir.path().join("Headroom.app/Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("bundle dirs");
@@ -10801,12 +10808,16 @@ mod tests {
         let link = bin.join("headroom");
         std::os::unix::fs::symlink(&exe, &link).expect("symlink");
 
-        let bundle = dir.path().canonicalize().unwrap().join("Headroom.app");
-        assert_eq!(app_bundle_of(link), Some(bundle));
-
-        // A moved bundle keeps its stale path, so the moved-bundle guard fires.
-        let gone = dir.path().join("Gone.app/Contents/MacOS/headroom-desktop");
-        assert_eq!(app_bundle_of(gone), Some(dir.path().join("Gone.app")));
+        // RUST-KR/KS: launched as ~/.local/bin/headroom -> the bundle binary.
+        let real = exe.canonicalize().unwrap();
+        assert_eq!(symlink_free_exe(&link), Some(real.clone()));
+        // The re-exec'd process sees no symlink, so it never execs again.
+        assert_eq!(symlink_free_exe(&real), None);
+        // A symlinked directory counts too, as it does for tauri.
+        let apps = dir.path().join("Applications");
+        std::os::unix::fs::symlink(dir.path(), &apps).expect("dir symlink");
+        let via_dir = apps.join("Headroom.app/Contents/MacOS/headroom-desktop");
+        assert_eq!(symlink_free_exe(&via_dir), Some(real));
     }
 
     #[test]
