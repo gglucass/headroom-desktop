@@ -4813,6 +4813,7 @@ fn run_activity_observation(app: &AppHandle) {
             Ok(feed) => {
                 *FEED_FAILING_SINCE.lock() = None;
                 let _ = state.observe_activity_from_transformations(&feed.transformations);
+                capture_tile_bodies(&state, feed.log_full_messages);
                 // Same batch, second reader: flags a client whose requests all
                 // stopped compressing (see savings_canary for why the server
                 // cannot see this).
@@ -6341,10 +6342,10 @@ fn get_compression_diffs_enabled() -> bool {
     client_adapters::is_compression_diffs_enabled()
 }
 
-/// Toggle "Keep before/after" in the Activity tab: whether the proxy holds the
-/// text of its last 100 requests so a compression can be shown as a diff.
-/// Read only when the proxy is spawned, so restart it here; turning it off
-/// also drops whatever text the old backend held.
+/// Toggle "Keep before/after" in the Activity tab (on by default): whether the
+/// proxy runs with --log-messages so the compression and record tiles can show
+/// a diff. Read only when the proxy is spawned, so restart it here; turning it
+/// off also drops whatever text the old backend held.
 #[tauri::command]
 async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     run_lifecycle_command(app, move |app| {
@@ -6362,44 +6363,71 @@ async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<
     .await
 }
 
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompressionDiffResponse {
-    // False when the backend does not keep request text at all.
-    log_full_messages: bool,
-    // None when the request has aged out of the backend's 100-request window
-    // (or predates a backend restart).
-    request_messages: Option<serde_json::Value>,
-    compressed_messages: Option<serde_json::Value>,
+type RawJson = Box<serde_json::value::RawValue>;
+
+/// The backend keeps bodies on its newest 10 log entries (the sitecustomize
+/// message_window setting), so ask for no more than that.
+const TILE_BODIES_FEED_LIMIT: u32 = 10;
+
+/// One tile request's messages before and after compression, kept as raw JSON:
+/// a transcript is MBs, and the desktop only hands it to the frontend verbatim.
+#[derive(Clone)]
+struct RequestBodies {
+    request_messages: RawJson,
+    compressed_messages: Option<RawJson>,
 }
 
-/// Original and compressed messages of one request, fetched only when the user
-/// expands an Activity row. The observer's poll stays on include_messages=0
-/// (RUST-86); this pull carries bodies, so it runs once per expand.
-#[tauri::command]
-async fn get_compression_diff(request_id: String) -> Result<CompressionDiffResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        fetch_compression_diff_from("http://127.0.0.1:6767", &request_id)
-    })
-    .await
-    .map_err(|err| err.to_string())?
+/// Bodies behind the large-compression and record tiles, copied out of the
+/// backend before its window drops them. Memory only, never persisted, and
+/// replaced as the tiles move on. `None` means a fetch found the request
+/// without bodies (aged out, or a backend restart), so it is not refetched.
+static TILE_BODIES: Mutex<Vec<(String, Option<RequestBodies>)>> = Mutex::new(Vec::new());
+
+/// Drop held bodies no tile shows anymore and return the tile ids not held yet.
+fn tile_bodies_to_fetch(
+    held: &mut Vec<(String, Option<RequestBodies>)>,
+    mut wanted: Vec<String>,
+) -> Vec<String> {
+    wanted.dedup();
+    held.retain(|(id, _)| wanted.contains(id));
+    wanted.retain(|id| !held.iter().any(|(h, _)| h == id));
+    wanted
 }
 
-fn fetch_compression_diff_from(
+/// Runs on the observer tick right after the tiles update, so a new pick is
+/// copied while it is still in the backend's window. Fetches only when a tile
+/// points at a request not held yet, which is rare: a tile moves only for a
+/// bigger compression, a stale pick or a new record.
+fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
+    if !log_full_messages {
+        // Off, or a backend that predates the switch: hold nothing.
+        TILE_BODIES.lock().clear();
+        return;
+    }
+    let missing = tile_bodies_to_fetch(&mut TILE_BODIES.lock(), state.activity_tile_request_ids());
+    if missing.is_empty() {
+        return;
+    }
+    // A failed pull leaves them missing, so the next tick retries.
+    if let Ok(found) = fetch_request_bodies_from("http://127.0.0.1:6767", &missing) {
+        TILE_BODIES.lock().extend(found);
+    }
+}
+
+fn fetch_request_bodies_from(
     base_url: &str,
-    request_id: &str,
-) -> Result<CompressionDiffResponse, String> {
+    ids: &[String],
+) -> Result<Vec<(String, Option<RequestBodies>)>, String> {
     #[derive(serde::Deserialize)]
     struct Entry {
         request_id: Option<String>,
         #[serde(default)]
-        request_messages: Option<serde_json::Value>,
+        request_messages: Option<RawJson>,
         #[serde(default)]
-        compressed_messages: Option<serde_json::Value>,
+        compressed_messages: Option<RawJson>,
     }
     #[derive(serde::Deserialize)]
     struct Feed {
-        log_full_messages: bool,
         transformations: Vec<Entry>,
     }
     let client = reqwest::blocking::Client::builder()
@@ -6408,28 +6436,59 @@ fn fetch_compression_diff_from(
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
-    // limit=100 is the backend's cap and its MESSAGE_WINDOW: older entries
-    // have had their bodies dropped already.
+    // No include_messages=0: this is the one pull that wants the bodies.
     let response = client
-        .get(format!("{base_url}/transformations/feed?limit=100"))
+        .get(format!(
+            "{base_url}/transformations/feed?limit={TILE_BODIES_FEED_LIMIT}"
+        ))
         .send()
         .map_err(|err| err.to_string())?;
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let feed: Feed = response.json().map_err(|err| err.to_string())?;
-    let entry = feed
-        .transformations
-        .into_iter()
-        .find(|e| e.request_id.as_deref() == Some(request_id));
-    let (request_messages, compressed_messages) = entry
-        .map(|e| (e.request_messages, e.compressed_messages))
-        .unwrap_or((None, None));
-    Ok(CompressionDiffResponse {
-        log_full_messages: feed.log_full_messages,
-        request_messages,
-        compressed_messages,
-    })
+    let mut feed: Feed = response.json().map_err(|err| err.to_string())?;
+    Ok(ids
+        .iter()
+        .map(|id| {
+            let bodies = feed
+                .transformations
+                .iter_mut()
+                .find(|e| e.request_id.as_deref() == Some(id.as_str()))
+                .and_then(|e| {
+                    Some(RequestBodies {
+                        request_messages: e.request_messages.take()?,
+                        compressed_messages: e.compressed_messages.take(),
+                    })
+                });
+            (id.clone(), bodies)
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressionDiffResponse {
+    // False when "Keep before/after" is off.
+    log_full_messages: bool,
+    // None when the desktop holds no text for this request (see TILE_BODIES).
+    request_messages: Option<RawJson>,
+    compressed_messages: Option<RawJson>,
+}
+
+/// What the observer copied out for one tile request, asked for when the user
+/// expands its Activity row.
+#[tauri::command]
+fn get_compression_diff(request_id: String) -> CompressionDiffResponse {
+    let held = TILE_BODIES
+        .lock()
+        .iter()
+        .find(|(id, _)| *id == request_id)
+        .and_then(|(_, bodies)| bodies.clone());
+    CompressionDiffResponse {
+        log_full_messages: client_adapters::is_compression_diffs_enabled(),
+        request_messages: held.as_ref().map(|b| b.request_messages.clone()),
+        compressed_messages: held.and_then(|b| b.compressed_messages),
+    }
 }
 
 #[tauri::command]
@@ -11149,7 +11208,7 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, feed_failure_is_persistent, feed_pull_limit, fetch_compression_diff_from,
+        fake_override, feed_failure_is_persistent, feed_pull_limit, fetch_request_bodies_from,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
         give_up_startup_key, install_pending_update, is_blocked_runtime_dll_signal,
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
@@ -12843,66 +12902,75 @@ mod tests {
     }
 
     #[test]
-    fn fetch_compression_diff_picks_the_request_and_asks_for_bodies() {
+    fn fetch_request_bodies_copies_tile_requests_out_of_the_window() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            let mut paths = Vec::new();
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 1024];
-                let n = stream.read(&mut buf).unwrap();
-                paths.push(
-                    String::from_utf8_lossy(&buf[..n])
-                        .lines()
-                        .next()
-                        .unwrap()
-                        .to_string(),
-                );
-                let body = serde_json::json!({
-                    "log_full_messages": true,
-                    "transformations": [
-                        {"request_id": "hr_1", "request_messages": [{"role": "user", "content": "a"}],
-                         "compressed_messages": null},
-                        {"request_id": "hr_2", "request_messages": [{"role": "user", "content": "long"}],
-                         "compressed_messages": [{"role": "user", "content": "short"}]}
-                    ]
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-            paths
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let body = serde_json::json!({
+                "log_full_messages": true,
+                "transformations": [
+                    {"request_id": "hr_1", "request_messages": [{"role": "user", "content": "a"}],
+                     "compressed_messages": null},
+                    {"request_id": "hr_2", "request_messages": [{"role": "user", "content": "long"}],
+                     "compressed_messages": [{"role": "user", "content": "short"}]},
+                    {"request_id": "hr_aged", "request_messages": null, "compressed_messages": null}
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
         });
 
-        let base = format!("http://127.0.0.1:{port}");
-        let hit = fetch_compression_diff_from(&base, "hr_2").unwrap();
-        // Aged out of the backend's window: reachable, but nothing to diff.
-        let gone = fetch_compression_diff_from(&base, "hr_old").unwrap();
-        let paths = server.join().unwrap();
+        let ids = ["hr_2", "hr_1", "hr_aged", "hr_gone"].map(String::from);
+        let found = fetch_request_bodies_from(&format!("http://127.0.0.1:{port}"), &ids).unwrap();
+        // Bodies only come without include_messages=0, and only the window holds them.
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /transformations/feed?limit=10 HTTP/1.1"
+        );
 
-        // Bodies are only in the default response; include_messages=0 drops them.
-        assert!(paths
-            .iter()
-            .all(|p| p.starts_with("GET /transformations/feed?limit=100 ")));
-        assert!(hit.log_full_messages);
+        let get = |id: &str| found.iter().find(|(i, _)| i == id).unwrap().1.as_ref();
+        let hr_2 = get("hr_2").unwrap();
         assert_eq!(
-            hit.request_messages,
-            Some(serde_json::json!([{"role": "user", "content": "long"}]))
+            hr_2.request_messages.get(),
+            r#"[{"content":"long","role":"user"}]"#
         );
         assert_eq!(
-            hit.compressed_messages,
-            Some(serde_json::json!([{"role": "user", "content": "short"}]))
+            hr_2.compressed_messages.as_ref().unwrap().get(),
+            r#"[{"content":"short","role":"user"}]"#
         );
-        assert!(gone.log_full_messages);
-        assert!(gone.request_messages.is_none() && gone.compressed_messages.is_none());
+        assert!(get("hr_1").unwrap().compressed_messages.is_none());
+        // Aged out of the window, or not in it at all: held as None, not refetched.
+        assert!(get("hr_aged").is_none() && get("hr_gone").is_none());
+        assert_eq!(found.len(), 4);
+    }
+
+    #[test]
+    fn tile_bodies_follow_the_tiles() {
+        use super::tile_bodies_to_fetch;
+        let mut held = vec![("old".to_string(), None), ("kept".to_string(), None)];
+        // The record and the compression tile can be the same request.
+        let missing = tile_bodies_to_fetch(&mut held, vec!["kept".into(), "new".into()]);
+        assert_eq!(missing, vec!["new".to_string()]);
+        assert_eq!(held.len(), 1, "a tile that moved on drops its bodies");
+        assert!(tile_bodies_to_fetch(&mut held, vec!["kept".into(), "kept".into()]).is_empty());
+        assert!(tile_bodies_to_fetch(&mut held, vec![]).is_empty());
+        assert!(held.is_empty());
     }
 
     #[test]

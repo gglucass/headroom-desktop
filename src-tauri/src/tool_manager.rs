@@ -4257,8 +4257,10 @@ impl ToolManager {
             } else {
                 vec![(python.clone(), headroom_python_startup_args())]
             };
-            // Opt-in only ("Keep before/after" in the Activity tab): the arg
-            // helpers never pass it, see backend_is_never_asked_to_keep_message_bodies.
+            // On unless the user turned "Keep before/after" off in the Activity
+            // tab; the sitecustomize message_window narrows what it keeps to 10
+            // requests. The arg helpers never pass it, see
+            // backend_is_never_asked_to_keep_message_bodies.
             if crate::client_adapters::is_compression_diffs_enabled() {
                 for (_, args) in &mut startup_variants {
                     args.push("--log-messages".to_string());
@@ -11571,8 +11573,8 @@ fn headroom_entrypoint_startup_args(
     // runtime regressing on the env var — but only on runtimes whose click
     // entrypoint defines it (see runtime_supports_no_http2). No --log-messages:
     // it keeps the last 100 full prompts and completions readable from
-    // /transformations/feed by any local account. The spawn site adds it only
-    // when the user turns on "Keep before/after" in the Activity tab.
+    // /transformations/feed by any local account. The spawn site adds it
+    // unless the user turned "Keep before/after" off in the Activity tab.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
@@ -11725,9 +11727,8 @@ pub fn running_proxy_matches_expected_args() -> bool {
 }
 
 /// --log-messages must follow the "Keep before/after" switch both ways: a
-/// backend holding prompt bodies the user did not opt into (or one an older
-/// build started with it) is restarted, and so is one missing it after the
-/// user opted in.
+/// backend holding prompt bodies after the user turned it off is restarted,
+/// and so is one missing it while it is on.
 fn proxy_argv_keeps_messages_as_set(argv: &str, keep_messages: bool) -> bool {
     argv_contains_flag(argv, "--log-messages") == keep_messages
 }
@@ -19177,7 +19178,7 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     fn backend_is_never_asked_to_keep_message_bodies() {
         // --log-messages holds the last 100 full prompts and completions,
         // readable from /transformations/feed by any local account. Only the
-        // "Keep before/after" opt-in adds it, at the spawn site.
+        // "Keep before/after" switch adds it, at the spawn site.
         backend_port::reset_for_tests();
         let flag = "--log-messages".to_string();
         for learn in [true, false] {
@@ -19187,15 +19188,14 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
             assert!(!super::expected_proxy_arg_signature(learn).contains(&"--log-messages"));
         }
         assert!(!headroom_python_startup_args().contains(&flag));
-        // A backend an older build started still holds bodies: restart it,
-        // unless the user has since opted in.
+        // A backend holding bodies after the switch went off: restart it.
         let old = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
         assert!(!proxy_argv_keeps_messages_as_set(old, false));
         assert!(proxy_argv_keeps_messages_as_set(old, true));
         let old_fallback = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
                             --no-http2 --log-messages --no-rate-limit";
         assert!(!proxy_argv_keeps_messages_as_set(old_fallback, false));
-        // Opting in restarts a backend that does not keep them yet.
+        // Switching on restarts a backend that does not keep them yet.
         let current = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
         assert!(proxy_argv_keeps_messages_as_set(current, false));
         assert!(!proxy_argv_keeps_messages_as_set(current, true));

@@ -279,9 +279,9 @@ function ExpandableRow({
 }
 
 /**
- * "Keep before/after": opt-in because the proxy then holds the text of its
- * last 100 requests, readable from its loopback feed by any local account.
- * Flipping it restarts the backend.
+ * "Keep before/after", on by default: the proxy holds the text of its last 10
+ * requests and the desktop copies out the two the tiles show. Off holds
+ * nothing. Flipping it restarts the backend.
  */
 function KeepDiffsSwitch() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
@@ -290,7 +290,7 @@ function KeepDiffsSwitch() {
     let active = true;
     void invoke<boolean>("get_compression_diffs_enabled")
       .then((value) => active && setEnabled(value))
-      .catch(() => active && setEnabled(false));
+      .catch(() => active && setEnabled(true));
     return () => {
       active = false;
     };
@@ -299,7 +299,9 @@ function KeepDiffsSwitch() {
   async function toggle() {
     setBusy(true);
     try {
-      setEnabled(await invoke<boolean>("set_compression_diffs_enabled", { enabled: !enabled }));
+      setEnabled(
+        await invoke<boolean>("set_compression_diffs_enabled", { enabled: enabled === false })
+      );
     } catch (error) {
       console.error("Failed to update Keep before/after", error);
     } finally {
@@ -312,15 +314,15 @@ function KeepDiffsSwitch() {
       <div className="activity-card__diffs-text">
         <span className="activity-card__diffs-label">Keep before/after</span>
         <span className="activity-card__diffs-meta">
-          {enabled
-            ? "On. Expand a compression to see what was removed. The text of the last 100 requests stays in memory on this computer."
-            : "Off. Turn on to see exactly what a compression removed."}
+          {enabled === false
+            ? "Off. Turn on to see exactly what a compression removed."
+            : "Expand a compression to see what was removed. The text stays in memory on this computer, for the last 10 requests and the two shown here."}
         </span>
       </div>
       <button
-        aria-checked={enabled ?? false}
-        aria-label={`${enabled ? "Disable" : "Enable"} keep before/after`}
-        className={`connector-switch${enabled ? " is-on" : ""}`}
+        aria-checked={enabled ?? true}
+        aria-label={`${enabled === false ? "Enable" : "Disable"} keep before/after`}
+        className={`connector-switch${enabled === false ? "" : " is-on"}`}
         disabled={enabled === null || busy}
         onClick={() => void toggle()}
         role="switch"
@@ -447,7 +449,8 @@ export function collapseDiff(diff: DiffLine[], context = DIFF_CONTEXT): Collapse
 
 /**
  * dt/dd pair for the detail grid: the request's messages before and after
- * compression as a unified line diff, fetched from the proxy when the row is
+ * compression as a unified line diff. The desktop copied them out of the proxy
+ * when the tile appeared; they are fetched over IPC only when the row is
  * expanded (the detail only mounts then). Shared by the compression and
  * record rows.
  */
@@ -477,13 +480,14 @@ function CompressionDiff({ requestId }: { requestId: string }) {
 
   let body;
   if (error) {
-    body = "Could not reach Headroom to load the request.";
+    body = "Could not load the request text.";
   } else if (!result) {
     body = "Loading...";
   } else if (!result.logFullMessages) {
     body = "Turn on Keep before/after above to see what this compression removed.";
   } else if (!view) {
-    body = "No longer held. Headroom keeps the text of its last 100 requests only, and not across restarts.";
+    body =
+      "Not available for this request. Headroom keeps the text in memory only, so it is gone after a restart.";
   } else if (!view.lines) {
     // Too large to diff: show both sides whole.
     return (

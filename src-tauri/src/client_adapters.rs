@@ -225,19 +225,19 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&state)
 }
 
-/// True when the user turned on "Keep before/after" in the Activity tab. The
-/// proxy is then spawned with `--log-messages`, holding the full text of its
-/// last 100 requests in memory so a compression can be shown as a diff.
+/// "Keep before/after" in the Activity tab, on unless the user turned it off.
+/// The proxy is then spawned with `--log-messages`, holding the text of its
+/// last 10 requests so the desktop can copy out the two its tiles show.
 pub fn is_compression_diffs_enabled() -> bool {
-    load_setup_state().compression_diffs_enabled
+    !load_setup_state().compression_diffs_disabled
 }
 
-/// Persist the before/after opt-in. Only read when the proxy is spawned, so
+/// Persist the before/after switch. Only read when the proxy is spawned, so
 /// the caller restarts the backend for it to take effect.
 pub fn set_compression_diffs_enabled(enabled: bool) -> Result<()> {
     let _setup = setup_write_lock();
     let mut state = load_setup_state();
-    state.compression_diffs_enabled = enabled;
+    state.compression_diffs_disabled = !enabled;
     write_setup_state(&state)
 }
 
@@ -2747,11 +2747,11 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
-    /// User turned on "Keep before/after" in the Activity tab. Off by default:
-    /// the proxy then holds the full text of its last 100 requests, readable
-    /// from its loopback /transformations/feed by any local account.
+    /// User turned "Keep before/after" off in the Activity tab. When false the
+    /// proxy holds the text of its last 10 requests, readable from its
+    /// loopback /transformations/feed by any local account.
     #[serde(default)]
-    compression_diffs_enabled: bool,
+    compression_diffs_disabled: bool,
     /// User turned the Claude Code statusline off in Settings > Advanced. When
     /// true, client setup skips installing it.
     #[serde(default)]
@@ -11129,7 +11129,7 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
-            compression_diffs_enabled: false,
+            compression_diffs_disabled: false,
             statusline_disabled: false,
             setup_versions: BTreeMap::new(),
         };

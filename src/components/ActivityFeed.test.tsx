@@ -807,10 +807,10 @@ describe("before/after", () => {
     expect(await screen.findByText(/Turn on Keep before\/after above/)).toBeInTheDocument();
   });
 
-  it("says so when the request has aged out of the proxy's window", async () => {
+  it("says so when the desktop holds no text for the request", async () => {
     diffResponse({});
     await expand();
-    expect(await screen.findByText(/No longer held/)).toBeInTheDocument();
+    expect(await screen.findByText(/Not available for this request/)).toBeInTheDocument();
   });
 });
 

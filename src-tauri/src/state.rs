@@ -2536,6 +2536,19 @@ impl AppState {
         events
     }
 
+    /// Request ids behind the large-compression and record tiles: the only
+    /// requests whose bodies the desktop holds (`capture_tile_bodies`).
+    pub fn activity_tile_request_ids(&self) -> Vec<String> {
+        let snapshot = self.activity_facts.lock().activity_feed_snapshot();
+        [
+            snapshot.transformation.and_then(|t| t.request_id),
+            snapshot.record.and_then(|r| r.request_id),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// Read-only snapshot of the latest-of-kind slots. The `get_activity_feed`
     /// IPC command wraps this straight into the response; observation runs on
     /// a backend timer and is the sole writer.
