@@ -556,8 +556,8 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     let projects = state.list_claude_code_projects().unwrap_or_default();
     let claude = claude_sessions_touched_since(&projects, since);
     // Shared with the hourly self-heal in `detect_unrouted_clients`: the one
-    // helper that knows Codex's session dir AND its GUI thread store, and how
-    // to ignore Headroom's own writes to it. It walks, so it is re-asked at
+    // helper that knows which Codex writes are turns (rollouts, not the thread
+    // store an idle app-server rewrites). It walks, so it is re-asked at
     // most once a minute, not on every 5s poll.
     let codex_active_at = codex_local_activity_at();
     let codex = codex_active_at.is_some_and(|at| at > since);
@@ -1088,6 +1088,20 @@ async fn install_app_update(
         return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
     }
 
+    // The plugin swaps the bundle at the path this process launched from, so if
+    // the user moved or deleted Headroom.app while it ran, the swap's first
+    // rename dies on a bare "No such file or directory (os error 2)" after the
+    // whole download (RUST-HZ: one process retried for a week). Same class as
+    // the read-only case: the user's setup, fixed by relaunching the copy.
+    #[cfg(target_os = "macos")]
+    if current_app_bundle_path().is_some_and(|bundle| !bundle.exists()) {
+        log::info!(
+            "update: refusing in-place install; running bundle {:?} is gone",
+            current_app_bundle_path()
+        );
+        return Err(MOVED_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -1237,6 +1251,20 @@ async fn restart_app(app: AppHandle) {
     }
 }
 
+/// The resolved binary when any component of `exe` is a symlink: the same test
+/// tauri-utils' `StartingBinary` applies, so `run` re-execs exactly when tauri
+/// would refuse the path. The resolved path holds no symlink, so it cannot loop.
+#[cfg(target_os = "macos")]
+fn symlink_free_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    exe.ancestors()
+        .any(|p| {
+            p.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        })
+        .then(|| exe.canonicalize().ok())
+        .flatten()
+}
+
 /// Walks up from `current_exe` to find the enclosing `.app` bundle path.
 #[cfg(target_os = "macos")]
 fn current_app_bundle_path() -> Option<std::path::PathBuf> {
@@ -1253,6 +1281,12 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it is running from a read-only folder. \
      If you opened it straight from the disk image, drag Headroom to your \
      Applications folder and open it from there, then check for updates again.";
+
+/// The message shown when the running bundle's path no longer exists.
+#[cfg(target_os = "macos")]
+const MOVED_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it was moved or deleted while running. \
+     Quit Headroom, open it from its current location, then check for updates again.";
 
 /// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
 /// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the
@@ -6203,6 +6237,11 @@ const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
      Move Headroom to /Applications and relaunch.";
 
+#[cfg(target_os = "macos")]
+const READ_ONLY_BUNDLE_AUTOSTART_MESSAGE: &str =
+    "Headroom cannot open at login while it runs from the disk image. Drag Headroom \
+     to your Applications folder, open it from there, then turn this on again.";
+
 #[cfg(not(target_os = "macos"))]
 const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
@@ -6219,6 +6258,14 @@ async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
 #[tauri::command]
 async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = autolaunch(&app).ok_or(AUTOSTART_UNAVAILABLE)?;
+    // Run off the DMG (straight from the mount, or App-Translocated), the login
+    // item would name a path that is gone after the next reboot, and it would
+    // still read as enabled once the user moves Headroom to Applications.
+    // Onboarding turns this on by default, so that cohort hits it first.
+    #[cfg(target_os = "macos")]
+    if enabled && bundle_is_read_only() {
+        return Err(READ_ONLY_BUNDLE_AUTOSTART_MESSAGE.to_string());
+    }
     if enabled {
         manager.enable().map_err(|err| err.to_string())?;
     } else {
@@ -6711,6 +6758,27 @@ fn finish_single_instance_hand_off(app: &tauri::App) {
 }
 
 pub fn run() {
+    // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary),
+    // tauri's current_exe() refuses the path on macOS, so every update check
+    // failed (RUST-KR/KS). Handing the updater an `executable_path` does not
+    // help: its builder evaluates current_exe()? anyway. Re-exec the resolved
+    // binary before anything starts instead. The running image is then the very
+    // file tauri resolves, which the `process-relaunch-dangerous-allow-symlink-
+    // macos` feature cannot promise. Falls through to the old failure if exec
+    // does.
+    #[cfg(target_os = "macos")]
+    if let Some(real) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| symlink_free_exe(&exe))
+    {
+        use std::os::unix::process::CommandExt;
+        // proc::command like every spawn (check-no-console.sh); the
+        // PYTHONIOENCODING it sets is what every child gets anyway.
+        let _ = crate::proc::command(real)
+            .args(std::env::args_os().skip(1))
+            .exec();
+    }
+
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
@@ -6955,8 +7023,8 @@ pub fn run() {
             }
 
             let launched_from_autostart = launched_from_autostart();
-            // Autostart is opt-in. Users enable it explicitly from Settings,
-            // which avoids triggering macOS's "Background item added" prompt
+            // Autostart is opt-in. Users enable it explicitly from Settings or
+            // the onboarding's open-at-login step, which avoids triggering macOS's "Background item added" prompt
             // on first launch.
 
             #[cfg(target_os = "linux")]
@@ -8181,10 +8249,14 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
 ///
 /// Only a flag current CLIs accept counts. Any other unknown flag is upstream
 /// passing something no CLI has, which is ours to fix and must reach Sentry.
-/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here.
+/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here,
+/// as does a sitecustomize vendor (`--tools`/`--strict-mcp-config`: learn no
+/// tools, RUST-KK).
 fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
     const CURRENT_FLAGS: &[&str] = &[
         "--include-partial-messages",
+        "--tools",
+        "--strict-mcp-config",
         "--output-format",
         "--verbose",
         "--skip-git-repo-check",
@@ -8240,11 +8312,18 @@ fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
 ///
 /// stderr only at the call site: stdout echoes written memory files back
 /// verbatim and must never reach a Sentry title.
+///
+/// Python log records are unwrapped first. When the run imports the wheel's
+/// `proxy/server.py`, its module-level `basicConfig` puts
+/// `<asctime> - <logger> - <LEVEL> - ` on every record, so the first line
+/// became an INFO line with a timestamp in it: a fingerprint unique per event,
+/// titled with no cause (RUST-KQ, a 900s hard cap that is RUST-KK's class).
 fn learn_failure_signature_source(text: &str) -> String {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .filter_map(learn_log_record_message)
         .collect();
     let Some(first) = lines.first() else {
         return "no output".to_string();
@@ -8264,6 +8343,25 @@ fn learn_failure_signature_source(text: &str) -> String {
     match lines.get(marker + 1) {
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
+    }
+}
+
+/// A stderr line with any Python log-record prefix removed: the message of a
+/// WARNING-or-worse record, None for DEBUG/INFO chatter, any other line as is.
+fn learn_log_record_message(line: &str) -> Option<&str> {
+    let mut parts = line.splitn(4, " - ");
+    let (Some(asctime), Some(_logger), Some(level), Some(message)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Some(line);
+    };
+    if !asctime.starts_with(|c: char| c.is_ascii_digit()) {
+        return Some(line);
+    }
+    match level {
+        "DEBUG" | "INFO" => None,
+        "WARNING" | "ERROR" | "CRITICAL" => Some(message.trim()),
+        _ => Some(line),
     }
 }
 
@@ -10676,7 +10774,9 @@ mod tests {
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
-    use super::{bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem};
+    use super::{
+        bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
+    };
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -10695,6 +10795,31 @@ mod tests {
         fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
             Box::pin(async move { self.install_result })
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn symlink_free_exe_resolves_a_symlinked_launch_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let macos = dir.path().join("Headroom.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("bundle dirs");
+        let exe = macos.join("headroom-desktop");
+        std::fs::write(&exe, b"").expect("write exe");
+        let bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let link = bin.join("headroom");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink");
+
+        // RUST-KR/KS: launched as ~/.local/bin/headroom -> the bundle binary.
+        let real = exe.canonicalize().unwrap();
+        assert_eq!(symlink_free_exe(&link), Some(real.clone()));
+        // The re-exec'd process sees no symlink, so it never execs again.
+        assert_eq!(symlink_free_exe(&real), None);
+        // A symlinked directory counts too, as it does for tauri.
+        let apps = dir.path().join("Applications");
+        std::os::unix::fs::symlink(dir.path(), &apps).expect("dir symlink");
+        let via_dir = apps.join("Headroom.app/Contents/MacOS/headroom-desktop");
+        assert_eq!(symlink_free_exe(&via_dir), Some(real));
     }
 
     #[test]
@@ -14230,6 +14355,9 @@ Some unrelated content.
         assert!(learn_failure_is_agent_cli_outdated(
             "LLM analysis failed: `codex exec --json` failed (exit 2):\nerror: unexpected argument '--json' found\n"
         ));
+        assert!(learn_failure_is_agent_cli_outdated(
+            "error: unknown option '--tools'"
+        ));
         for stderr in [
             "Error: No such option: --foo",
             // A flag no CLI has is an upstream break, not a stale install.
@@ -14366,6 +14494,25 @@ Some unrelated content.
         );
         // ...but the raw stderr always is, which is what the guard now reads.
         assert!(stderr.contains("is not readable"), "{stderr}");
+    }
+
+    #[test]
+    fn learn_failure_signature_source_unwraps_python_log_records() {
+        // RUST-KQ: the wheel's basicConfig format put a timestamped INFO line
+        // first, so every event got its own fingerprint and no cause in the title.
+        let stderr = "2026-09-30 23:57:46,378 - headroom.learn.analyzer - INFO - HEADROOM_LEARN_CLI=claude \u{2014} using claude CLI backend\n\
+                      2026-10-01 00:12:47,900 - headroom.learn.analyzer - WARNING - LLM analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap.\n  \
+                      Analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap.\n";
+        assert_eq!(
+            learn_failure_signature_source(stderr),
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` exceeded the 900s hard cap."
+        );
+        // A logged `failed (exit N):` marker still joins its reason line.
+        let marker = "2026-10-01 00:12:47,900 - headroom.learn.analyzer - WARNING - LLM analysis failed: `claude -p` failed (exit 1):\nCredit balance is too low\n";
+        assert_eq!(
+            learn_failure_signature_source(marker),
+            "LLM analysis failed: `claude -p` failed (exit 1): Credit balance is too low"
+        );
     }
 
     #[test]

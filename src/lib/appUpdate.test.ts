@@ -435,6 +435,17 @@ describe("app update helpers", () => {
     expect(result).toEqual({ statusCopy: readOnly });
     expect(Sentry.captureException).not.toHaveBeenCalled();
 
+    const moved =
+      "Headroom cannot update itself because it was moved or deleted while running. " +
+      "Quit Headroom, open it from its current location, then check for updates again.";
+    expect(
+      await runAppUpdateInstall({
+        availableUpdate,
+        invokeFn: vi.fn().mockRejectedValueOnce(moved),
+      })
+    ).toEqual({ statusCopy: moved });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
     await runAppUpdateInstall({
       availableUpdate,
       invokeFn: vi.fn().mockRejectedValueOnce("permission denied"),

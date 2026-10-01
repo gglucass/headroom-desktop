@@ -2032,14 +2032,15 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
                 }
             }
         } else {
-            report_models_rewrite(
-                "truncated_body",
-                sentry::Level::Warning,
-                &format!(
-                    "read {} of {total} body bytes ({})",
-                    body.len(),
-                    stopped_by.unwrap_or("short")
-                ),
+            // Local only. Every reason is the backend or its provider link,
+            // never this code: `idle_timeout` is a stalled backend event loop
+            // (RUST-7S hosts all filed RUST-86 /stats timeouts too, which
+            // already tracks it), `backend_eof`/`read_error` a provider
+            // stream cut mid-catalog. The forward below fails open.
+            log::info!(
+                "codex models rewrite truncated_body: read {} of {total} body bytes ({})",
+                body.len(),
+                stopped_by.unwrap_or("short")
             );
         }
         for part in [&head, &body, &extra] {
@@ -2123,7 +2124,7 @@ fn rewrite_use_responses_lite(body: &[u8]) -> ModelsRewrite {
 }
 
 /// Report a models-rewrite event to Sentry. `kind` is one of `applied`,
-/// `unparseable_json`, `truncated_body`, `compressed`, `no_content_length`,
+/// `unparseable_json`, `compressed`, `no_content_length`,
 /// `oversize` — fingerprinted per kind so each failure class is its own issue
 /// (mirrors report_upstream_error's grouping rationale).
 fn report_models_rewrite(kind: &'static str, level: sentry::Level, detail: &str) {
@@ -2199,14 +2200,16 @@ async fn splice_with_codex_capture(
 
     // backend -> client: capture the response head, then stream the remainder.
     let downstream = async {
+        // No deadline on the head: the backend sends it only after compressing
+        // the request, which can take well over 10s on a long session, and the
+        // copy below waits on the same stream unbounded anyway. A 10s timeout
+        // here dropped the status of every slow prompt, so it was tallied as
+        // `no_response` by `note_codex_prompt_outcome` (RUST-KG) and its
+        // rate-limit headers were never read.
         let mut head = Vec::with_capacity(4096);
-        let read_head = tokio::time::timeout(
-            HEADER_READ_TIMEOUT,
-            read_http_headers(&mut backend_rd, &mut head),
-        )
-        .await;
+        let read_head = read_http_headers(&mut backend_rd, &mut head).await;
 
-        if matches!(read_head, Ok(Ok(()))) {
+        if read_head.is_ok() {
             stamp_backend_traffic();
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
@@ -2289,9 +2292,12 @@ async fn splice_with_codex_capture(
 }
 
 /// Whether a Codex prompt failed in a way the user saw: `Some(true)` failed,
-/// `Some(false)` succeeded, `None` says nothing either way. 402/429 are the
-/// user's plan, which Codex names itself; a response that never started
-/// because the client left first is a cancel.
+/// `Some(false)` succeeded, `None` says nothing either way. A 4xx belongs to
+/// `report_upstream_error`, which reports the ones we cause (missing bearer, a
+/// body we built) and drops the user's account (invalid key, plan, rate
+/// limit); counting them here filed RUST-KN as a second issue for RUST-C1's
+/// missing-bearer 401s. A response that never started because the client left
+/// first is a cancel.
 fn codex_prompt_failed(
     status: Option<u16>,
     stream_failed: bool,
@@ -2299,7 +2305,7 @@ fn codex_prompt_failed(
 ) -> Option<bool> {
     match status {
         Some(200..=299) => Some(stream_failed),
-        Some(402 | 429) => None,
+        Some(400..=499) => None,
         Some(_) => Some(true),
         None if client_gone => None,
         None => Some(true),
@@ -2423,6 +2429,10 @@ fn is_reportable_upstream_error(status: &u16) -> bool {
     *status >= 400 && !matches!(status, 402 | 429)
 }
 
+fn is_transient_upstream_status(status: u16) -> bool {
+    status == 408 || (500..600).contains(&status)
+}
+
 /// True when a 401 body says the request carried no credentials at all. That
 /// means the CLIENT attached nothing -- a configuration bug we likely caused --
 /// as opposed to an invalid or expired key, which only the user can fix.
@@ -2472,7 +2482,8 @@ fn report_upstream_error(
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     log::warn!("{client} upstream error {status} on {path}: {raw_snippet}");
     // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
-    // that Headroom neither caused nor can fix. Capturing every one just burns
+    // that Headroom neither caused nor can fix, and so is a 408 (RUST-KM:
+    // Anthropic `timeout_error`), which the SDKs retry just like a 5xx. Capturing every one just burns
     // Sentry quota (RUST-46/4G/4T were all this). Keep full detail in the local
     // log::warn! above; only forward non-5xx classes (4xx auth/challenge, novel
     // statuses) that can indicate an actionable request-construction bug.
@@ -2485,7 +2496,7 @@ fn report_upstream_error(
     if tls_interception {
         UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
     }
-    if (500..600).contains(&status) && !tls_interception {
+    if is_transient_upstream_status(status) && !tls_interception {
         return;
     }
     // A geo-block is a property of where the user is, not of anything we sent:
@@ -5502,11 +5513,21 @@ mod tests {
         assert_eq!(codex_prompt_failed(Some(502), false, false), Some(true));
         assert_eq!(codex_prompt_failed(Some(200), true, false), Some(true));
         assert_eq!(codex_prompt_failed(None, false, false), Some(true));
-        // Success re-arms; plan limits and cancels say nothing.
+        // Success re-arms; a 4xx (report_upstream_error's) and cancels say nothing.
         assert_eq!(codex_prompt_failed(Some(200), false, false), Some(false));
         assert_eq!(codex_prompt_failed(Some(429), false, false), None);
         assert_eq!(codex_prompt_failed(Some(402), false, false), None);
+        assert_eq!(codex_prompt_failed(Some(401), false, false), None);
+        assert_eq!(codex_prompt_failed(Some(400), false, false), None);
         assert_eq!(codex_prompt_failed(None, false, true), None);
+    }
+
+    #[test]
+    fn provider_timeouts_and_5xx_are_transient() {
+        assert!(super::is_transient_upstream_status(408));
+        assert!(super::is_transient_upstream_status(502));
+        assert!(!super::is_transient_upstream_status(400));
+        assert!(!super::is_transient_upstream_status(401));
     }
 
     #[test]

@@ -26,8 +26,9 @@ const STALE_STAGED_UPDATE = /no longer staged/i;
 
 // install_app_update's refusal when the app runs off the DMG or an
 // App-Translocated copy (READ_ONLY_BUNDLE_MESSAGE in lib.rs). The message is
-// the user's fix, not a defect to report (RUST-JK).
-const READ_ONLY_BUNDLE = /running from a read-only folder/i;
+// the user's fix, not a defect to report (RUST-JK). Same for the bundle moved
+// or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ).
+const READ_ONLY_BUNDLE = /running from a read-only folder|moved or deleted while running/i;
 
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
