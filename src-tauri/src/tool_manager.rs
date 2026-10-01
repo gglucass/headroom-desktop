@@ -2737,15 +2737,17 @@ const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
+const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
+    "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "2b193085410af3801634a522f4b17dcd6699695e015a068393c87817c1d260d4";
+    "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "e2804a20f5a6fc392af361525a232703e351b7d1aacb81b88eef806eec5959fa";
+    "c0e46c87cf37e35f1ac0bd9cc7e1d8b0ca4ef40034e1008805d709fa52a4e38a";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "e5cba4cad6ca8254a85f45041fc8a831908d7d5cb64f98fc3f8eb70a58671793";
+    "032b33c1833919a2d1de67ff6367fa6ea46aee8689c86ef223c88fae3b6e4536";
+const CODEBASE_MEMORY_SHA256_WINDOWS_X86_64: &str =
+    "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -8050,26 +8052,7 @@ impl ToolManager {
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
 
-        #[cfg(target_os = "windows")]
-        {
-            let file = std::fs::File::open(&archive_path)
-                .with_context(|| format!("opening {}", archive_path.display()))?;
-            let mut archive = zip::ZipArchive::new(file)
-                .with_context(|| format!("reading zip {}", archive_path.display()))?;
-            archive
-                .extract(&extract_dir)
-                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let file = std::fs::File::open(&archive_path)
-                .with_context(|| format!("opening {}", archive_path.display()))?;
-            let decoder = GzDecoder::new(file);
-            let mut archive = Archive::new(decoder);
-            archive
-                .unpack(&extract_dir)
-                .with_context(|| format!("extracting into {}", extract_dir.display()))?;
-        }
+        unpack_release_archive(&archive_path, &extract_dir)?;
 
         let binary_name = if cfg!(target_os = "windows") {
             "rtk.exe"
@@ -8807,7 +8790,12 @@ impl ToolManager {
     }
 
     pub fn codebase_memory_entrypoint(&self) -> PathBuf {
-        self.runtime.bin_dir.join("codebase-memory-mcp")
+        let name = if cfg!(target_os = "windows") {
+            "codebase-memory-mcp.exe"
+        } else {
+            "codebase-memory-mcp"
+        };
+        self.runtime.bin_dir.join(name)
     }
 
     /// Index databases live here (via `CBM_CACHE_DIR`) instead of the
@@ -8825,10 +8813,15 @@ impl ToolManager {
     pub fn install_codebase_memory(&self) -> Result<()> {
         let artifact = codebase_memory_distribution_artifact()?;
         let archive_path = self.runtime.downloads_dir.join(format!(
-            "codebase-memory-mcp-v{}-{}-{}.tar.gz",
+            "codebase-memory-mcp-v{}-{}-{}.{}",
             CODEBASE_MEMORY_VERSION,
             std::env::consts::OS,
-            std::env::consts::ARCH
+            std::env::consts::ARCH,
+            if cfg!(target_os = "windows") {
+                "zip"
+            } else {
+                "tar.gz"
+            }
         ));
         download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
 
@@ -8839,16 +8832,11 @@ impl ToolManager {
         }
         std::fs::create_dir_all(&extract_dir)
             .with_context(|| format!("creating {}", extract_dir.display()))?;
+        unpack_release_archive(&archive_path, &extract_dir)?;
 
-        let file = std::fs::File::open(&archive_path)
-            .with_context(|| format!("opening {}", archive_path.display()))?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = Archive::new(decoder);
-        archive
-            .unpack(&extract_dir)
-            .with_context(|| format!("extracting into {}", extract_dir.display()))?;
-
-        let extracted_binary = extract_dir.join("codebase-memory-mcp");
+        let destination = self.codebase_memory_entrypoint();
+        let extracted_binary =
+            extract_dir.join(destination.file_name().expect("entrypoint has a file name"));
         if !extracted_binary.exists() {
             bail!(
                 "codebase-memory extraction completed but {} was not found",
@@ -8859,7 +8847,6 @@ impl ToolManager {
         // Stage then rename: live agent sessions may be running the old
         // binary as an MCP server, and copying over it risks ETXTBSY /
         // truncated-exec. Rename is atomic.
-        let destination = self.codebase_memory_entrypoint();
         let staged = {
             let mut s = destination.as_os_str().to_os_string();
             s.push(".new");
@@ -8878,9 +8865,19 @@ impl ToolManager {
             std::fs::set_permissions(&staged, permissions)
                 .with_context(|| format!("marking {} executable", staged.display()))?;
         }
-        // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
-        std::fs::rename(&staged, &destination)
-            .with_context(|| format!("installing {}", destination.display()))?;
+        // Windows refuses to replace a running image, so stop the old one
+        // first. Upstream's own `update` does the same: every CBM process must
+        // run one build, so a session left on the old one would refuse the
+        // new one anyway.
+        #[cfg(target_os = "windows")]
+        if destination.exists() {
+            crate::client_adapters::kill_processes_running(&destination);
+        }
+        crate::client_adapters::retry_transient_denied(|| {
+            // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
+            std::fs::rename(&staged, &destination)
+        })
+        .with_context(|| format!("installing {}", destination.display()))?;
 
         run_command_with_timeout(
             &destination,
@@ -8924,15 +8921,20 @@ impl ToolManager {
         // would make every new agent session spawn a failing server.
         self.unregister_codebase_memory_mcp()?;
         let binary = self.codebase_memory_entrypoint();
+        // Windows keeps a running image and its open index databases
+        // undeletable; agent sessions and the shared daemon run this binary.
+        #[cfg(target_os = "windows")]
         if binary.exists() {
-            std::fs::remove_file(&binary)
+            crate::client_adapters::kill_processes_running(&binary);
+        }
+        // Retried: Windows releases a killed process's handles asynchronously.
+        if binary.exists() {
+            crate::client_adapters::retry_transient_denied(|| std::fs::remove_file(&binary))
                 .with_context(|| format!("removing {}", binary.display()))?;
         }
         let cache = self.codebase_memory_cache_dir();
-        if cache.exists() {
-            std::fs::remove_dir_all(&cache)
-                .with_context(|| format!("removing {}", cache.display()))?;
-        }
+        crate::client_adapters::remove_dir_all_retry(&cache)
+            .with_context(|| format!("removing {}", cache.display()))?;
         let receipt = self.runtime.tools_dir.join("codebase-memory.json");
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -12186,28 +12188,63 @@ fn addon_unavailable_reason(id: &str) -> Option<String> {
             std::env::consts::ARCH
         )),
         "codebase-memory" if codebase_memory_distribution_artifact().is_err() => Some(format!(
-            "Not available on {platform}: codebase-memory publishes macOS and Linux binaries only."
+            "Not available on {platform} {}: codebase-memory publishes no build for this architecture yet.",
+            std::env::consts::ARCH
         )),
         _ => None,
     }
 }
 
 fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
-    let (target, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("darwin-arm64", CODEBASE_MEMORY_SHA256_MACOS_AARCH64),
-        ("macos", "x86_64") => ("darwin-amd64", CODEBASE_MEMORY_SHA256_MACOS_X86_64),
-        ("linux", "aarch64") => ("linux-arm64", CODEBASE_MEMORY_SHA256_LINUX_AARCH64),
-        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64),
+    let (target, sha256, extension) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => (
+            "darwin-arm64",
+            CODEBASE_MEMORY_SHA256_MACOS_AARCH64,
+            "tar.gz",
+        ),
+        ("macos", "x86_64") => (
+            "darwin-amd64",
+            CODEBASE_MEMORY_SHA256_MACOS_X86_64,
+            "tar.gz",
+        ),
+        ("linux", "aarch64") => (
+            "linux-arm64",
+            CODEBASE_MEMORY_SHA256_LINUX_AARCH64,
+            "tar.gz",
+        ),
+        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64, "tar.gz"),
+        ("windows", "x86_64") => (
+            "windows-amd64",
+            CODEBASE_MEMORY_SHA256_WINDOWS_X86_64,
+            "zip",
+        ),
         (os, arch) => bail!("unsupported codebase-memory target: {os}/{arch}"),
     };
 
     Ok(DownloadArtifact {
         url: format!(
-            "https://github.com/DeusData/codebase-memory-mcp/releases/download/v{}/codebase-memory-mcp-{}.tar.gz",
-            CODEBASE_MEMORY_VERSION, target
+            "https://github.com/DeusData/codebase-memory-mcp/releases/download/v{}/codebase-memory-mcp-{}.{}",
+            CODEBASE_MEMORY_VERSION, target, extension
         ),
         sha256: Some(sha256),
     })
+}
+
+/// Unpack a GitHub release archive: `.zip` on Windows, `.tar.gz` elsewhere,
+/// matching what the artifact resolvers pick per platform.
+fn unpack_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("opening {}", archive_path.display()))?;
+    #[cfg(target_os = "windows")]
+    zip::ZipArchive::new(file)
+        .with_context(|| format!("reading zip {}", archive_path.display()))?
+        .extract(extract_dir)
+        .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+    #[cfg(not(target_os = "windows"))]
+    Archive::new(GzDecoder::new(file))
+        .unpack(extract_dir)
+        .with_context(|| format!("extracting into {}", extract_dir.display()))?;
+    Ok(())
 }
 
 fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>) -> Result<()> {
@@ -18187,6 +18224,9 @@ assert g.done"#,
             .ends_with("Scripts\\headroom.exe"));
         assert!(manager.rtk_entrypoint().ends_with("bin\\rtk.exe"));
         assert!(manager
+            .codebase_memory_entrypoint()
+            .ends_with("bin\\codebase-memory-mcp.exe"));
+        assert!(manager
             .markitdown_shim_path()
             .ends_with("bin\\markitdown.cmd"));
     }
@@ -18306,6 +18346,16 @@ assert g.done"#,
         assert!(artifact.url.contains("x86_64-pc-windows-msvc"));
         assert!(artifact.url.ends_with(".zip"));
         assert!(artifact.sha256.is_some(), "rtk checksum should be pinned");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn codebase_memory_distribution_artifact_supports_windows_x86_64() {
+        let artifact = codebase_memory_distribution_artifact().expect("windows target");
+        assert!(artifact
+            .url
+            .ends_with("codebase-memory-mcp-windows-amd64.zip"));
+        assert!(artifact.sha256.is_some());
     }
 
     #[test]
