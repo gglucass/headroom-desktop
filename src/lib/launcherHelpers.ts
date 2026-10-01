@@ -18,6 +18,7 @@ export const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export type LauncherStage =
   | "install"
   | "client_setup"
+  | "autostart"
   | "paywall"
   | "post_install";
 

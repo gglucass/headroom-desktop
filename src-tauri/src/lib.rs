@@ -6975,8 +6975,8 @@ pub fn run() {
             }
 
             let launched_from_autostart = launched_from_autostart();
-            // Autostart is opt-in. Users enable it explicitly from Settings,
-            // which avoids triggering macOS's "Background item added" prompt
+            // Autostart is opt-in. Users enable it explicitly from Settings or
+            // the onboarding's open-at-login step, which avoids triggering macOS's "Background item added" prompt
             // on first launch.
 
             #[cfg(target_os = "linux")]

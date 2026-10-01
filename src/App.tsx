@@ -1835,6 +1835,9 @@ export default function App() {
   const [showCacheInfo, setShowCacheInfo] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
+  // Onboarding's open-at-login switch: on by default, applied on Continue so
+  // flipping it never adds and removes a login item mid-screen.
+  const [openAtLoginChoice, setOpenAtLoginChoice] = useState(true);
   const [rtkBusy, setRtkBusy] = useState(false);
   const [autoLearnEnabled, setAutoLearnEnabled] = useState<boolean | null>(null);
   const [autoLearnBusy, setAutoLearnBusy] = useState(false);
@@ -4843,7 +4846,10 @@ export default function App() {
       // fall back to cached state
     }
 
-    setLauncherStage("post_install");
+    // Ask about open-at-login once, before the final screen: a user who
+    // reboots before reopening Headroom otherwise runs without it.
+    const autostartOn = await invoke<boolean>("get_autostart_enabled").catch(() => false);
+    setLauncherStage(autostartOn ? "post_install" : "autostart");
     setProxyVerificationHint(null);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     // Reset to null so the polling effect re-anchors on its first reachable
@@ -6028,6 +6034,69 @@ export default function App() {
           {signedIn && authFlowError ? (
             <p className="install-progress__error">{authFlowError}</p>
           ) : null}
+        </div>
+      </LauncherShell>
+    );
+  }
+
+  if (windowLabel === "launcher" && launcherStage === "autostart") {
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--post-install"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+      >
+        <div className="post-install__lead">
+          <h1>Keep Headroom running</h1>
+          <p>
+            Headroom only saves tokens while it is running. With this on, it opens by
+            itself when you log in, so you never have to remember to reopen it.
+          </p>
+          <div className="connector-list">
+            <article className="connector-item">
+              <div>
+                <h3>Open Headroom at login</h3>
+              </div>
+              <div className="connector-item__controls">
+                <button
+                  aria-checked={openAtLoginChoice}
+                  aria-label="Open Headroom at login"
+                  className={`connector-switch${openAtLoginChoice ? " is-on" : ""}`}
+                  onClick={() => setOpenAtLoginChoice((current) => !current)}
+                  role="switch"
+                  type="button"
+                >
+                  <span className="connector-switch__thumb" />
+                </button>
+              </div>
+            </article>
+          </div>
+          <p>You can change this later in Settings.</p>
+        </div>
+        <div className="post-install__actions">
+          <button
+            className="secondary-button post-install__reopen-setup"
+            onClick={() => setLauncherStage("client_setup")}
+            type="button"
+          >
+            Back
+          </button>
+          <button
+            className="primary-button primary-button--large primary-button--success"
+            disabled={autostartBusy}
+            // A failed enable is logged by handleAutostartToggle and moves on:
+            // the Settings switch shows the real state.
+            onClick={() =>
+              void (openAtLoginChoice ? handleAutostartToggle(true) : Promise.resolve()).then(
+                () => setLauncherStage("post_install")
+              )
+            }
+            type="button"
+          >
+            Continue
+          </button>
         </div>
       </LauncherShell>
     );
