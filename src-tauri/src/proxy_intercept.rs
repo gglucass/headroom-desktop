@@ -26,7 +26,9 @@ use base64::Engine;
 
 use crate::backend_port;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
-use crate::models::{CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow};
+use crate::models::{
+    ClaudePlanUsage, CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow, PlanWindow,
+};
 
 pub const INTERCEPT_PORT: u16 = 6767;
 
@@ -416,6 +418,11 @@ struct ResponseSniffer<R> {
     /// is read to its end and `x-headroom-tokens-saved` is booked against it
     /// for the statusline (claude_statusline.rs).
     savings_session: Option<String>,
+    /// A Claude Code conversation's response whose plan-usage headers are
+    /// still to be read. Every status carries them, a 429 at the cap included.
+    usage_pending: bool,
+    /// The status called for error capture: keep the bounded slice.
+    capturing: bool,
 }
 
 /// A real status line ("HTTP/1.1 429 Too Many Requests\r\n") fits well within
@@ -432,10 +439,13 @@ impl<R> ResponseSniffer<R> {
             client_key,
             capture_path,
             savings_session: None,
+            usage_pending: false,
+            capturing: false,
         }
     }
 
     fn with_savings_session(mut self, session: Option<String>) -> Self {
+        self.usage_pending = session.is_some();
         self.savings_session = session;
         self
     }
@@ -461,17 +471,23 @@ impl<R> ResponseSniffer<R> {
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
             }
-            let capture = self.capture_path.is_some()
+            self.capturing = self.capture_path.is_some()
                 && self
                     .status
                     .is_some_and(|s| is_reportable_upstream_error(&s));
             if !self.status.is_some_and(|s| (200..300).contains(&s)) {
                 self.savings_session = None;
             }
-            if !capture && self.savings_session.is_none() {
+            if !self.capturing && self.savings_session.is_none() && !self.usage_pending {
                 self.done = true;
                 self.buf = Vec::new();
                 return;
+            }
+        }
+        if self.usage_pending && find_header_end(&self.buf).is_some() {
+            self.usage_pending = false;
+            if let Some(usage) = parse_claude_plan_usage(&self.buf) {
+                crate::claude_statusline::record_plan_usage(usage);
             }
         }
         // 2xx for a Claude Code conversation: read on to the end of the head,
@@ -486,6 +502,15 @@ impl<R> ResponseSniffer<R> {
                 self.done = true;
                 self.buf = Vec::new();
             } else if self.buf.len() >= MAX_ERROR_BODY {
+                self.done = true;
+                self.buf = Vec::new();
+            }
+            return;
+        }
+        // Only here for the plan usage: stop once read, or at the cap if the
+        // head never ends.
+        if !self.capturing {
+            if !self.usage_pending || self.buf.len() >= MAX_ERROR_BODY {
                 self.done = true;
                 self.buf = Vec::new();
             }
@@ -1841,8 +1866,9 @@ async fn handle(
     // backend is up (e.g. during bootstrap). Once per process; server is
     // first-write-wins so an extra send is cheap.
     //
-    // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop polls
-    // its own dashboard through this listener (`127.0.0.1:6767/stats`), so
+    // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop
+    // probes its own front door through this listener (`127.0.0.1:6767/readyz`;
+    // `/stats` did too until RUST-86 moved it to the backend port), so
     // without the guard the app fired this beacon at itself on the first
     // successful poll after bootstrap -- landing in the same second as
     // `bootstrap_completed`, before any client was even configured, and
@@ -2801,6 +2827,33 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The `anthropic-ratelimit-unified-*` windows Claude Code itself reads for
+/// /usage and its statusline: utilization 0-1, reset in epoch seconds.
+fn parse_claude_plan_usage(head: &[u8]) -> Option<ClaudePlanUsage> {
+    let window = |name: &str| {
+        let header = |field: &str| {
+            extract_header_value(head, &format!("anthropic-ratelimit-unified-{name}-{field}"))
+        };
+        // Rust parses "NaN"/"inf"; serde_json writes them as null, which
+        // claude-statusline.json then fails to load and is reset.
+        let utilization = header("utilization")?
+            .parse::<f64>()
+            .ok()
+            .filter(|u| u.is_finite())?;
+        Some(PlanWindow {
+            // To hundredths of a percent: 0.29 * 100.0 is 28.999..., which the
+            // readers' truncation would show as 28.
+            used_percent: (utilization * 10_000.0).round() / 100.0,
+            resets_at: header("reset")?.parse().ok()?,
+        })
+    };
+    let usage = ClaudePlanUsage {
+        five_hour: window("5h"),
+        seven_day: window("7d"),
+    };
+    (usage != ClaudePlanUsage::default()).then_some(usage)
+}
+
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
 /// (status line + headers up to the blank line). Mirrors the schema in upstream
 /// `headroom/subscription/codex_rate_limits.py`. Returns `None` when there is no
@@ -2829,7 +2882,8 @@ fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot>
         let used_percent: f64 = headers
             .get(&format!("x-codex-{prefix}-used-percent"))?
             .parse()
-            .ok()?;
+            .ok()
+            .filter(|v: &f64| v.is_finite())?;
         let window_minutes = headers
             .get(&format!("x-codex-{prefix}-window-minutes"))
             .and_then(|v| v.parse::<i64>().ok());
@@ -2869,6 +2923,7 @@ fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot>
         secondary,
         credits_balance,
         credits_unlimited,
+        captured_at: now,
     })
 }
 
@@ -3002,6 +3057,7 @@ fn codex_snapshot_from_usage_payload(payload: &UsagePayloadJson) -> Option<Codex
         secondary,
         credits_balance,
         credits_unlimited,
+        captured_at: now,
     })
 }
 
@@ -4858,8 +4914,8 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
-    /// The desktop polls its own dashboard through this listener
-    /// (`127.0.0.1:6767/stats`), so a local path reaching a live backend must
+    /// The desktop probes its own front door through this listener
+    /// (`127.0.0.1:6767/readyz`), so a local path reaching a live backend must
     /// not fire the `first_optimized_request` funnel beacon -- it is supposed to
     /// mean "a coding tool sent a request", and self-polling made it fire in the
     /// same second bootstrap finished, before any client was configured.
@@ -5568,6 +5624,41 @@ mod tests {
         bare.observe(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
         assert!(bare.done);
         assert_eq!(crate::claude_statusline::recorded("sess-bare"), None);
+    }
+
+    /// The 429 at the cap carries the plan usage too, and is the response
+    /// that matters most: without it the tray stuck at the last 2xx figure.
+    /// A response with nothing to capture stops once the head is read.
+    #[test]
+    fn sniffer_reads_plan_usage_from_every_status_of_a_claude_conversation() {
+        let mut capped = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-capped".into()));
+        capped.observe(
+            b"HTTP/1.1 429 Too Many Requests\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\n",
+        );
+        capped.observe(
+            b"anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{\"type\":\"error\"}",
+        );
+        let five = crate::claude_statusline::plan_usage()
+            .and_then(|u| u.five_hour)
+            .expect("5h window from the 429");
+        assert_eq!((five.used_percent, five.resets_at), (100.0, 4_102_444_800));
+        // A 429 is not a reported error: nothing more to keep.
+        assert!(capped.done && capped.buf.is_empty());
+
+        // A reported error keeps its slice for the capture.
+        let mut failed = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-failed".into()));
+        failed.observe(b"HTTP/1.1 500 Internal Server Error\r\n\r\n{}");
+        assert!(!failed.done && !failed.buf.is_empty());
+
+        // Not a reportable error and no saving: done once the head is read.
+        let mut quiet = ResponseSniffer::new((), "claude-code", None)
+            .with_savings_session(Some("sess-quiet".into()));
+        quiet.observe(b"HTTP/1.1 304 Not Modified\r\n");
+        assert!(!quiet.done, "stopped before the head ended");
+        quiet.observe(b"etag: x\r\n\r\n");
+        assert!(quiet.done && quiet.buf.is_empty());
     }
 
     #[test]
@@ -7068,6 +7159,37 @@ mod tests {
         // Valid JWT shape but no auth claim.
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}");
         assert!(decode_codex_plan_tier(&format!("h.{payload}.s")).is_none());
+    }
+
+    #[test]
+    fn claude_plan_usage_reads_the_unified_rate_limit_headers() {
+        let head = b"HTTP/1.1 200 OK\r\n\
+            anthropic-ratelimit-unified-5h-utilization: 0.345\r\n\
+            anthropic-ratelimit-unified-5h-reset: 1790870400\r\n\
+            Anthropic-Ratelimit-Unified-7d-Utilization: 1.02\r\n\
+            anthropic-ratelimit-unified-7d-reset: 1791216000\r\n\r\nevent: message_start\n";
+        let usage = super::parse_claude_plan_usage(head).expect("usage");
+        let five = usage.five_hour.expect("5h");
+        assert!((five.used_percent - 34.5).abs() < 1e-9);
+        assert_eq!(five.resets_at, 1_790_870_400);
+        assert_eq!(usage.seven_day.expect("7d").resets_at, 1_791_216_000);
+        // 0.29 * 100.0 is 28.999...; the readers truncate, so it must land on 29.
+        let head = b"HTTP/1.1 200 OK\r\n\
+            anthropic-ratelimit-unified-5h-utilization: 0.29\r\n\
+            anthropic-ratelimit-unified-5h-reset: 1790870400\r\n\
+            anthropic-ratelimit-unified-7d-utilization: NaN\r\n\
+            anthropic-ratelimit-unified-7d-reset: 1791216000\r\n\r\n";
+        let usage = super::parse_claude_plan_usage(head).expect("usage");
+        assert_eq!(usage.five_hour.expect("5h").used_percent.trunc(), 29.0);
+        // A non-finite value would persist as null and reset the statusline file.
+        assert_eq!(usage.seven_day, None);
+        // API-key traffic carries none of them.
+        assert_eq!(
+            super::parse_claude_plan_usage(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
+            ),
+            None
+        );
     }
 
     #[test]

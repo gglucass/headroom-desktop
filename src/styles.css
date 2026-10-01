@@ -5289,6 +5289,49 @@ html.window-hiding {
   font-size: 0.72rem;
 }
 
+.activity-feed__message-dump {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activity-feed__diff {
+  padding: 6px 0;
+}
+
+.activity-feed__diff-line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activity-feed__diff-line--del {
+  background: var(--danger-tint);
+  color: var(--danger);
+}
+
+.activity-feed__diff-line--add {
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+}
+
+.activity-feed__diff-line--skip {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  user-select: none;
+}
+
 .activity-feed__detail-list {
   list-style: none;
   margin: 0;

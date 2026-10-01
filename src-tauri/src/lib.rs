@@ -71,10 +71,11 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapFailureReport, BootstrapProgress,
-    ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
-    DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, RuntimeStatus,
-    RuntimeUpgradeProgress, TransformationFeedResponse,
+    ClaudeAccountProfile, ClaudeCodeProject, ClaudePlanUsage, ClaudeUsage, ClientConnectorStatus,
+    ClientSetupResult, CodexRateLimitSnapshot, DailySavingsPoint, DashboardState,
+    HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, LabeledPlanWindow, PlanWindow, RuntimeStatus, RuntimeUpgradeProgress,
+    TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -98,6 +99,8 @@ const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 /// Headless revert of Headroom's edits to other tools, for package managers that
 /// can run a command before deleting the bundle. See `handle_uninstall_flag`.
 const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
+/// The crash guard's launch argument. See `handle_crash_guard_flag`.
+const CRASH_GUARD_ARG: &str = "--crash-guard";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
@@ -1459,7 +1462,7 @@ fn spawn_detached(script: &str) -> std::io::Result<()> {
 /// reparented to launchd while we are still alive. stdio to `/dev/null`: it
 /// runs on after our fds are gone, and it reports by appending to the desktop
 /// log rather than through anything it inherited from us.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn detached_script(script: &str) -> String {
     format!("( trap '' HUP; {script} ) >/dev/null 2>&1 &")
 }
@@ -4810,6 +4813,7 @@ fn run_activity_observation(app: &AppHandle) {
             Ok(feed) => {
                 *FEED_FAILING_SINCE.lock() = None;
                 let _ = state.observe_activity_from_transformations(&feed.transformations);
+                capture_tile_bodies(&state, feed.log_full_messages);
                 // Same batch, second reader: flags a client whose requests all
                 // stopped compressing (see savings_canary for why the server
                 // cannot see this).
@@ -6324,13 +6328,146 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
     let state: tauri::State<'_, AppState> = app.state();
     client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
     state.stop_headroom();
-    if let Err(err) = state.ensure_headroom_running() {
-        log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+    // Paused stays paused: resume spawns the backend with the new flag.
+    if !state.runtime_is_paused() {
+        if let Err(err) = state.ensure_headroom_running() {
+            log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+        }
     }
     state.invalidate_runtime_status_cache();
     let action = if enabled { "enabled" } else { "disabled" };
     analytics::track_event(&app, &format!("auto_learn_{action}"), None);
     Ok(!client_adapters::is_auto_learn_disabled())
+}
+
+type RawJson = Box<serde_json::value::RawValue>;
+
+/// The backend keeps bodies on its newest 20 log entries (the sitecustomize
+/// message_window setting), so ask for no more than that.
+const TILE_BODIES_FEED_LIMIT: u32 = 20;
+
+/// One tile request's messages before and after compression, kept as raw JSON:
+/// a transcript is MBs, and the desktop only hands it to the frontend verbatim.
+#[derive(Clone)]
+struct RequestBodies {
+    request_messages: RawJson,
+    compressed_messages: Option<RawJson>,
+}
+
+/// Bodies behind the large-compression and record tiles, copied out of the
+/// backend before its window drops them. Memory only, never persisted, and
+/// replaced as the tiles move on. `None` means a fetch found the request
+/// without bodies (aged out, or a backend restart), so it is not refetched.
+static TILE_BODIES: Mutex<Vec<(String, Option<RequestBodies>)>> = Mutex::new(Vec::new());
+
+/// Drop held bodies no tile shows anymore and return the tile ids not held yet.
+fn tile_bodies_to_fetch(
+    held: &mut Vec<(String, Option<RequestBodies>)>,
+    mut wanted: Vec<String>,
+) -> Vec<String> {
+    wanted.dedup();
+    held.retain(|(id, _)| wanted.contains(id));
+    wanted.retain(|id| !held.iter().any(|(h, _)| h == id));
+    wanted
+}
+
+/// Runs on the observer tick right after the tiles update, so a new pick is
+/// copied while it is still in the backend's window. Fetches only when a tile
+/// points at a request not held yet, which is rare: a tile moves only for a
+/// bigger compression, a stale pick or a new record.
+fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
+    if !log_full_messages {
+        // A runtime too old for --log-messages: hold nothing.
+        TILE_BODIES.lock().clear();
+        return;
+    }
+    let missing = tile_bodies_to_fetch(&mut TILE_BODIES.lock(), state.activity_tile_request_ids());
+    if missing.is_empty() {
+        return;
+    }
+    // A failed pull is not retried: it serializes every body in the backend's
+    // window on its event loop, and one that timed out on a large transcript
+    // would time out again on every tick until the request aged out.
+    let found =
+        fetch_request_bodies_from("http://127.0.0.1:6767", &missing).unwrap_or_else(|err| {
+            log::debug!("tile bodies pull failed: {err}");
+            missing.into_iter().map(|id| (id, None)).collect()
+        });
+    TILE_BODIES.lock().extend(found);
+}
+
+fn fetch_request_bodies_from(
+    base_url: &str,
+    ids: &[String],
+) -> Result<Vec<(String, Option<RequestBodies>)>, String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        request_id: Option<String>,
+        #[serde(default)]
+        request_messages: Option<RawJson>,
+        #[serde(default)]
+        compressed_messages: Option<RawJson>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Feed {
+        transformations: Vec<Entry>,
+    }
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
+        .build()
+        .map_err(|err| err.to_string())?;
+    // No include_messages=0: this is the one pull that wants the bodies.
+    let response = client
+        .get(format!(
+            "{base_url}/transformations/feed?limit={TILE_BODIES_FEED_LIMIT}"
+        ))
+        .send()
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("proxy returned HTTP {}", response.status()));
+    }
+    let mut feed: Feed = response.json().map_err(|err| err.to_string())?;
+    Ok(ids
+        .iter()
+        .map(|id| {
+            let bodies = feed
+                .transformations
+                .iter_mut()
+                .find(|e| e.request_id.as_deref() == Some(id.as_str()))
+                .and_then(|e| {
+                    Some(RequestBodies {
+                        request_messages: e.request_messages.take()?,
+                        compressed_messages: e.compressed_messages.take(),
+                    })
+                });
+            (id.clone(), bodies)
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressionDiffResponse {
+    // None when the desktop holds no text for this request (see TILE_BODIES).
+    request_messages: Option<RawJson>,
+    compressed_messages: Option<RawJson>,
+}
+
+/// What the observer copied out for one tile request, asked for when the user
+/// expands its Activity row.
+#[tauri::command]
+fn get_compression_diff(request_id: String) -> CompressionDiffResponse {
+    let held = TILE_BODIES
+        .lock()
+        .iter()
+        .find(|(id, _)| *id == request_id)
+        .and_then(|(_, bodies)| bodies.clone());
+    CompressionDiffResponse {
+        request_messages: held.as_ref().map(|b| b.request_messages.clone()),
+        compressed_messages: held.and_then(|b| b.compressed_messages),
+    }
 }
 
 #[tauri::command]
@@ -6431,6 +6568,112 @@ async fn quit_headroom(app: AppHandle) {
 
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
+}
+
+/// The crash guard: a second copy of this binary that the app starts at launch
+/// and that does nothing until the app is gone. Quit and pause unwire every
+/// client; a crash, a force quit or a `kill -9` does not, and left Claude Code
+/// and Codex pointed at a dead 127.0.0.1:6767, failing with ECONNREFUSED until
+/// Headroom was opened again. The guard then unwires them the way quit does,
+/// and the next launch wires them back.
+///
+/// It waits on its stdin, a pipe whose write end only the app holds and never
+/// writes to, so the read returns once the OS closes that end, which happens
+/// however the app dies. Runs before `logging::init` so a guard idling beside
+/// the app never rotates the log under it; it opens the log only to report.
+fn handle_crash_guard_flag() {
+    if !std::env::args().any(|arg| arg == CRASH_GUARD_ARG) {
+        return;
+    }
+    let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+    let unwired = client_adapters::unwire_clients_after_crash(|| {
+        let intercept =
+            std::net::SocketAddr::from(([127, 0, 0, 1], proxy_intercept::INTERCEPT_PORT));
+        std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
+    });
+    if !unwired.is_empty() {
+        let _ = logging::init();
+        log::info!("crash guard: unwired {unwired:?}");
+        log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
+        if let Some(client) = sentry::Hub::current().client() {
+            client.flush(Some(std::time::Duration::from_secs(2)));
+        }
+    }
+    std::process::exit(0);
+}
+
+/// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
+/// it a crash leaves the clients wired, as it always did.
+fn spawn_crash_guard() {
+    // An AppImage runs from a mount that is torn down with the app, so a guard
+    // started from `current_exe` would lose its own binary at the moment it is
+    // needed. Start the image itself instead.
+    #[cfg(target_os = "linux")]
+    let exe = std::env::var_os("APPIMAGE")
+        .filter(|image| !image.is_empty())
+        // Only our own image: a shell started from another AppImage leaks its
+        // APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard would
+        // start that app. tauri-utils' current_exe makes the same check.
+        .filter(
+            |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
+                (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
+                _ => false,
+            },
+        )
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    #[cfg(not(target_os = "linux"))]
+    let exe = std::env::current_exe().ok();
+    let Some(exe) = exe else {
+        log::warn!("crash guard: no executable path to start it from");
+        return;
+    };
+    match spawn_crash_guard_process(&exe) {
+        // Never written to and never closed: the OS closes it when we die,
+        // and that is the guard's signal.
+        Ok(pipe) => std::mem::forget(pipe),
+        Err(err) => log::warn!("crash guard: failed to start: {err}"),
+    }
+}
+
+/// Detached like the relauncher (`spawn_detached`), which a quitting macOS app
+/// otherwise takes down with it. The pipe reaches the guard as fd 3 first: a
+/// shell without job control points a background job's stdin at /dev/null,
+/// whose immediate EOF would read as a crash at every launch.
+#[cfg(unix)]
+fn spawn_crash_guard_process(exe: &Path) -> std::io::Result<std::process::ChildStdin> {
+    use std::os::unix::process::CommandExt;
+    let script = format!(
+        "exec 3<&0; {}",
+        detached_script(&format!("exec \"$0\" {CRASH_GUARD_ARG} 0<&3 3<&-"))
+    );
+    let mut shell = crate::proc::command("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg(exe)
+        .stdin(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let pipe = shell.stdin.take();
+    // The shell only backgrounds the guard and exits at once; reap it.
+    let _ = shell.wait();
+    pipe.ok_or_else(|| std::io::Error::other("no stdin pipe"))
+}
+
+/// A Windows child outlives its parent unless a job ties them together, and
+/// the app is in none (`winproc` puts only the backend in its job).
+#[cfg(windows)]
+fn spawn_crash_guard_process(exe: &Path) -> std::io::Result<std::process::ChildStdin> {
+    let mut guard = crate::proc::command(exe)
+        .arg(CRASH_GUARD_ARG)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    guard
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdin pipe"))
 }
 
 /// Handle `--uninstall` and exit; return normally otherwise.
@@ -6788,6 +7031,9 @@ pub fn run() {
             ..Default::default()
         },
     ));
+
+    // Before the logger: the guard idles beside the app for its whole life.
+    handle_crash_guard_flag();
 
     // Initialize the panic-safe file logger after Sentry so warn!/error!
     // records flow into Sentry too. Failure here cannot abort startup.
@@ -7215,6 +7461,8 @@ pub fn run() {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch(&app_handle);
             });
+            // Before anything is wired back, so a crash from here on is covered.
+            spawn_crash_guard();
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
                 client_adapters::restore_client_setups();
@@ -7362,6 +7610,7 @@ pub fn run() {
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
+            get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
             uninstall_and_quit,
@@ -8021,6 +8270,9 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         "please run `codex login`",
         "run `codex login`",
         "no credentials found",
+        // `codex exec` with no login: `ERROR: unexpected status 401
+        // Unauthorized: Missing bearer or basic authentication in header`.
+        "missing bearer or basic authentication",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -8341,6 +8593,20 @@ fn learn_failure_signature_source(text: &str) -> String {
         return first.to_string();
     };
     match lines.get(marker + 1) {
+        // RUST-KT: `codex exec` opens its stderr with this banner and states
+        // its verdict last, as `ERROR: ...` after its `Reconnecting...` retries.
+        // The status variant ends `, url: ..., cf-ray: ..., request id: ...`,
+        // unique per request, so it is cut there.
+        Some(&"Reading prompt from stdin...") => {
+            let reason = lines[marker + 1..]
+                .iter()
+                .rev()
+                .find(|l| l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                .map_or("Reading prompt from stdin...", |l| {
+                    l.split_once(", url: ").map_or(*l, |(head, _)| head)
+                });
+            format!("{} {reason}", lines[marker])
+        }
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
     }
@@ -9073,19 +9339,167 @@ fn execute_headroom_learn_run(
     }
 }
 
+/// Usage this high gets its reset time, in the tray menu and the Claude Code
+/// statusline.
+pub(crate) const TRAY_USAGE_RESET_SHOWN_AT_PERCENT: f64 = 80.0;
+
+fn tray_savings_line(today: TraySavingsToday) -> String {
+    format!(
+        "Saved today: ${:.2}, {} tokens",
+        today.usd,
+        tool_manager::compact_token_count(today.tokens)
+    )
+}
+
+/// One line per plan, as last reported: Claude from the
+/// `anthropic-ratelimit-unified-*` headers or the usage fetch, Codex from
+/// `x-codex-*`, both kept across launches. A window whose reset time has
+/// passed is back at 0; a plan with nothing reported gets no line.
+fn tray_usage_lines(
+    claude: Option<ClaudePlanUsage>,
+    codex: Option<Vec<LabeledPlanWindow>>,
+    now: i64,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(claude) = claude {
+        let windows = [
+            ("5h".to_string(), claude.five_hour),
+            ("week".to_string(), claude.seven_day),
+        ];
+        lines.extend(plan_usage_line(
+            "Claude",
+            windows.into_iter().filter_map(|(l, w)| Some((l, w?))),
+            now,
+        ));
+    }
+    if let Some(codex) = codex {
+        lines.extend(plan_usage_line(
+            "Codex",
+            codex.into_iter().map(|w| (w.label, w.window)),
+            now,
+        ));
+    }
+    lines
+}
+
+/// Codex's windows from a captured snapshot, its weekly one labelled "week".
+fn codex_plan_windows(codex: &CodexRateLimitSnapshot) -> Vec<LabeledPlanWindow> {
+    [&codex.primary, &codex.secondary]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            let label = match w.window_minutes? {
+                10_080 => "week".to_string(),
+                minutes => w
+                    .window_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{minutes}m")),
+            };
+            Some(LabeledPlanWindow {
+                label,
+                window: PlanWindow {
+                    used_percent: w.used_percent,
+                    resets_at: codex.captured_at + w.seconds_until_reset?,
+                },
+            })
+        })
+        .collect()
+}
+
+fn plan_usage_line(
+    plan: &str,
+    windows: impl Iterator<Item = (String, PlanWindow)>,
+    now: i64,
+) -> Option<String> {
+    let parts: Vec<String> = windows
+        .map(|(label, window)| {
+            // Whole percents, cut not rounded, as the statusline shows them.
+            let used = if now >= window.resets_at {
+                0.0
+            } else {
+                window.used_percent.clamp(0.0, 100.0).trunc()
+            };
+            if used < TRAY_USAGE_RESET_SHOWN_AT_PERCENT {
+                return format!("{label} {used:.0}%");
+            }
+            let resets = chrono::DateTime::from_timestamp(window.resets_at, 0)
+                .map(|at| at.with_timezone(&Local))
+                .map(|at| {
+                    let format = if window.resets_at - now < 86_400 {
+                        "%H:%M"
+                    } else {
+                        "%a %H:%M"
+                    };
+                    at.format(format).to_string()
+                })
+                .unwrap_or_default();
+            format!("{label} {used:.0}% (resets {resets})")
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("{plan} usage: {}", parts.join(", ")))
+}
+
+/// Sets the savings line and puts `usage` under it as disabled items,
+/// replacing the ones `items` holds. Reuses them while the count holds, so
+/// the open menu updates in place instead of jumping.
+fn update_tray_menu_info(
+    app: &AppHandle,
+    savings: &str,
+    usage: &[String],
+    items: &mut Vec<tauri::menu::MenuItem<tauri::Wry>>,
+) -> tauri::Result<()> {
+    let (Some(menu), Some(savings_item)) = (TRAY_MENU.get(), TRAY_SAVINGS_ITEM.get()) else {
+        return Ok(());
+    };
+    savings_item.set_text(savings)?;
+    if items.len() != usage.len() {
+        for item in items.drain(..) {
+            menu.remove(&item)?;
+        }
+        for (i, line) in usage.iter().enumerate() {
+            let item = tauri::menu::MenuItem::new(app, line, false, None::<&str>)?;
+            menu.insert(&item, i + 1)?;
+            items.push(item);
+        }
+        return Ok(());
+    }
+    for (item, line) in items.iter().zip(usage) {
+        item.set_text(line)?;
+    }
+    Ok(())
+}
+
 /// The tray's pause/resume item, kept here so the tray updater loop can flip its
 /// label. `TrayIcon` has no menu getter.
 static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
+/// The tray menu and its savings line, for `update_tray_menu_info`.
+static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync::OnceLock::new();
+static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
+    std::sync::OnceLock::new();
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    // Opens Headroom like "show"; enabled so it reads as the menu's headline.
+    let savings = tauri::menu::MenuItem::with_id(
+        app,
+        "savings",
+        tray_savings_line(TraySavingsToday::default()),
+        true,
+        None::<&str>,
+    )?;
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show Headroom", true, None::<&str>)?;
     // Text flips to "Resume Headroom" while paused, from the tray updater loop.
     let pause = tauri::menu::MenuItem::with_id(app, "pause", "Pause Headroom", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit Headroom", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let menu = tauri::menu::Menu::with_items(app, &[&show, &pause, &separator, &quit])?;
+    let info_separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let menu = tauri::menu::Menu::with_items(
+        app,
+        &[&savings, &info_separator, &show, &pause, &separator, &quit],
+    )?;
     let _ = TRAY_PAUSE_ITEM.set(pause.clone());
+    let _ = TRAY_SAVINGS_ITEM.set(savings);
+    let _ = TRAY_MENU.set(menu.clone());
     #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
@@ -9128,7 +9542,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
+            "show" | "savings" => {
                 if show_primary_window(app).unwrap_or(false) {
                     let app_bg = app.clone();
                     std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
@@ -9302,6 +9716,8 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut pulse_drawn_last_tick = false;
         let mut last_tooltip: Option<String> = None;
         let mut last_pause_label: Option<&str> = None;
+        let mut last_menu_info: Option<(String, Vec<String>)> = None;
+        let mut usage_items: Vec<tauri::menu::MenuItem<tauri::Wry>> = Vec::new();
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -9377,6 +9793,39 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         let _ = item.set_text(pause_label);
                         last_pause_label = Some(pause_label);
                     }
+                }
+
+                let codex_live = {
+                    let state: tauri::State<'_, AppState> = app.state();
+                    let codex = state.codex_rate_limits.lock().clone();
+                    codex
+                }
+                .map(|snapshot| codex_plan_windows(&snapshot))
+                .filter(|windows| !windows.is_empty());
+                // Kept for the next launch, which has no snapshot until
+                // Codex's first response.
+                let codex = match codex_live {
+                    Some(windows) => {
+                        claude_statusline::record_codex_plan_usage(windows.clone());
+                        Some(windows)
+                    }
+                    None => claude_statusline::codex_plan_usage(),
+                };
+                let menu_info = (
+                    tray_savings_line(today),
+                    tray_usage_lines(
+                        claude_statusline::plan_usage(),
+                        codex,
+                        Utc::now().timestamp(),
+                    ),
+                );
+                if last_menu_info.as_ref() != Some(&menu_info) {
+                    if let Err(err) =
+                        update_tray_menu_info(&app, &menu_info.0, &menu_info.1, &mut usage_items)
+                    {
+                        log::warn!("tray menu info update failed: {err}");
+                    }
+                    last_menu_info = Some(menu_info);
                 }
 
                 let mut icon_changed = false;
@@ -10096,8 +10545,9 @@ fn spawn_tray_savings_updater(app: AppHandle) {
     // fast enough that the badge feels live during active traffic and slow
     // enough that `build_dashboard` runs ~3x/min instead of 12x/min.
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+    // Samples before sleeping: the tray headline otherwise reads $0.00 for the
+    // first 20s after launch.
     std::thread::spawn(move || loop {
-        std::thread::sleep(INTERVAL);
         let state: tauri::State<'_, AppState> = app.state();
         let dashboard = state.dashboard();
         let today_key = Local::now().format("%Y-%m-%d").to_string();
@@ -10113,6 +10563,7 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
         *savings_state.0.lock() = savings;
         let _ = app.emit("savings-today-updated", savings);
+        std::thread::sleep(INTERVAL);
     });
 }
 
@@ -10745,7 +11196,7 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, feed_failure_is_persistent, feed_pull_limit,
+        fake_override, feed_failure_is_persistent, feed_pull_limit, fetch_request_bodies_from,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
         give_up_startup_key, install_pending_update, is_blocked_runtime_dll_signal,
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
@@ -12436,6 +12887,78 @@ mod tests {
         assert_eq!(cached.savings_percent, None);
         assert_eq!(cached.input_tokens_original, None);
         assert_eq!(cached.input_tokens_optimized, None);
+    }
+
+    #[test]
+    fn fetch_request_bodies_copies_tile_requests_out_of_the_window() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let body = serde_json::json!({
+                "log_full_messages": true,
+                "transformations": [
+                    {"request_id": "hr_1", "request_messages": [{"role": "user", "content": "a"}],
+                     "compressed_messages": null},
+                    {"request_id": "hr_2", "request_messages": [{"role": "user", "content": "long"}],
+                     "compressed_messages": [{"role": "user", "content": "short"}]},
+                    {"request_id": "hr_aged", "request_messages": null, "compressed_messages": null}
+                ]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        });
+
+        let ids = ["hr_2", "hr_1", "hr_aged", "hr_gone"].map(String::from);
+        let found = fetch_request_bodies_from(&format!("http://127.0.0.1:{port}"), &ids).unwrap();
+        // Bodies only come without include_messages=0, and only the window holds them.
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /transformations/feed?limit=20 HTTP/1.1"
+        );
+
+        let get = |id: &str| found.iter().find(|(i, _)| i == id).unwrap().1.as_ref();
+        let hr_2 = get("hr_2").unwrap();
+        assert_eq!(
+            hr_2.request_messages.get(),
+            r#"[{"content":"long","role":"user"}]"#
+        );
+        assert_eq!(
+            hr_2.compressed_messages.as_ref().unwrap().get(),
+            r#"[{"content":"short","role":"user"}]"#
+        );
+        assert!(get("hr_1").unwrap().compressed_messages.is_none());
+        // Aged out of the window, or not in it at all: held as None, not refetched.
+        assert!(get("hr_aged").is_none() && get("hr_gone").is_none());
+        assert_eq!(found.len(), 4);
+    }
+
+    #[test]
+    fn tile_bodies_follow_the_tiles() {
+        use super::tile_bodies_to_fetch;
+        let mut held = vec![("old".to_string(), None), ("kept".to_string(), None)];
+        // The record and the compression tile can be the same request.
+        let missing = tile_bodies_to_fetch(&mut held, vec!["kept".into(), "new".into()]);
+        assert_eq!(missing, vec!["new".to_string()]);
+        assert_eq!(held.len(), 1, "a tile that moved on drops its bodies");
+        assert!(tile_bodies_to_fetch(&mut held, vec!["kept".into(), "kept".into()]).is_empty());
+        assert!(tile_bodies_to_fetch(&mut held, vec![]).is_empty());
+        assert!(held.is_empty());
     }
 
     #[test]
@@ -14516,6 +15039,37 @@ Some unrelated content.
     }
 
     #[test]
+    fn learn_failure_signature_source_takes_codex_verdict_not_its_banner() {
+        // RUST-KT: codex's stderr after the marker, prompt echo dropped by the
+        // learn_prompt_echo vendor. The banner line grouped every Codex failure
+        // as one cause-less issue; the request ids would split one per event.
+        let codex = |verdict: &str| {
+            format!(
+                "2026-10-01 14:09:48,279 - headroom.learn.analyzer - WARNING - LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\n\
+                 Reading prompt from stdin...\nOpenAI Codex v0.159.2\n--------\nmodel: gpt-5.6-sol\n--------\nuser\n[prompt omitted]\n\
+                 2026-10-01T12:14:29.724211Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized\n\
+                 ERROR: Reconnecting... 5/5\n{verdict}\n"
+            )
+        };
+        let stderr = codex("ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a43b638e9ffc8239-AMS, request id: req_ffc7141fa5204c0fb9aab93aa7a9bd22");
+        let signature = learn_failure_signature_source(&stderr);
+        assert_eq!(
+            signature,
+            "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1): ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+        );
+        assert!(learn_failure_is_agent_auth(&stderr));
+        let other = codex("ERROR: stream disconnected before completion");
+        assert!(learn_failure_signature_source(&other)
+            .ends_with("stream disconnected before completion"));
+        assert!(!learn_failure_is_agent_auth(&other));
+        // No verdict line (a wheel without the vendor cut it off): as before.
+        assert!(learn_failure_signature_source(
+            "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
+        )
+        .ends_with("Reading prompt from stdin..."));
+    }
+
+    #[test]
     fn learn_failure_signature_source_leaves_a_self_contained_line_alone() {
         let stderr = "ModuleNotFoundError: No module named 'headroom'\nTraceback follows\n";
         assert_eq!(
@@ -15609,6 +16163,99 @@ Some unrelated content.
             "helper died with the process that spawned it: {script}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crash guard must read EOF once the app's end of its pipe closes,
+    /// and not before. Started through a bare `( ... ) &`, a shell without job
+    /// control hands a background job /dev/null for stdin, and the guard took
+    /// that EOF for a crash and unwired every client at launch.
+    #[cfg(unix)]
+    #[test]
+    fn crash_guard_reads_eof_only_once_the_app_end_closes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let eof = dir.path().join("eof");
+        let guard = dir.path().join("guard");
+        std::fs::write(
+            &guard,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho \"$1\" > '{}'\n",
+                eof.display()
+            ),
+        )
+        .expect("write stand-in guard");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let pipe = super::spawn_crash_guard_process(&guard).expect("start guard");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !eof.exists(),
+            "the guard saw EOF while the app still held the pipe"
+        );
+
+        drop(pipe);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !eof.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let arg = std::fs::read_to_string(&eof).expect("the guard never saw the pipe close");
+        assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
+    }
+
+    #[test]
+    fn tray_usage_lines_show_each_plan_that_reported() {
+        let now = 1_790_000_000;
+        let claude = super::ClaudePlanUsage {
+            five_hour: Some(super::PlanWindow {
+                used_percent: 34.9,
+                resets_at: now + 3_600,
+            }),
+            seven_day: Some(super::PlanWindow {
+                used_percent: 62.0,
+                resets_at: now + 300_000,
+            }),
+        };
+        let window = |used, minutes, reset| crate::models::CodexUsageWindow {
+            used_percent: used,
+            window_label: Some(proxy_intercept_window_label(minutes)),
+            window_minutes: Some(minutes),
+            seconds_until_reset: Some(reset),
+        };
+        // Captured an hour ago: its 5h window reset half an hour ago.
+        let codex = super::CodexRateLimitSnapshot {
+            primary: Some(window(97.0, 300, 1_800)),
+            secondary: Some(window(88.0, 10_080, 200_000)),
+            captured_at: now - 3_600,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::tray_usage_lines(None, None, now),
+            Vec::<String>::new()
+        );
+        let lines =
+            super::tray_usage_lines(Some(claude), Some(super::codex_plan_windows(&codex)), now);
+        assert_eq!(lines[0], "Claude usage: 5h 34%, week 62%");
+        assert!(
+            lines[1].starts_with("Codex usage: 5h 0%, week 88% (resets "),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            super::tray_savings_line(super::TraySavingsToday {
+                usd: 14.2,
+                tokens: 1_234_567
+            }),
+            "Saved today: $14.20, 1.2M tokens"
+        );
+    }
+
+    fn proxy_intercept_window_label(minutes: i64) -> String {
+        if minutes == 300 {
+            "5h".into()
+        } else {
+            format!("{minutes}m")
+        }
     }
 
     #[test]

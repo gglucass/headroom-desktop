@@ -2381,12 +2381,13 @@ impl AppState {
             return None;
         }
         let _in_flight = InFlight(&self.headroom_stats_fetch_in_flight);
-        let (stats, hold) = if is_headroom_proxy_reachable() {
-            let stats = fetch_headroom_dashboard_stats();
-            let hold = if stats.is_some() { TTL } else { MISS_TTL };
-            (stats, hold)
-        } else {
-            (None, UNREACHABLE_TTL)
+        let (stats, hold) = match backend_data_port().filter(|_| is_headroom_proxy_reachable()) {
+            Some(port) => {
+                let stats = fetch_headroom_dashboard_stats(port);
+                let hold = if stats.is_some() { TTL } else { MISS_TTL };
+                (stats, hold)
+            }
+            None => (None, UNREACHABLE_TTL),
         };
         let fetched_at = Instant::now();
         *self.cached_headroom_stats.lock() = Some((stats.clone(), fetched_at, hold));
@@ -2429,10 +2430,9 @@ impl AppState {
                 .and_then(|(history, _, _)| history.clone());
         }
         let _in_flight = InFlight(&self.headroom_history_fetch_in_flight);
-        let (fetched, hold) = if is_headroom_proxy_reachable() {
-            (fetch_headroom_savings_history(), TTL)
-        } else {
-            (None, UNREACHABLE_TTL)
+        let (fetched, hold) = match backend_data_port().filter(|_| is_headroom_proxy_reachable()) {
+            Some(port) => (fetch_headroom_savings_history(port), TTL),
+            None => (None, UNREACHABLE_TTL),
         };
         // A miss retains the last good history so a transient proxy pause
         // doesn't revert the Home chart to the sparse tracker-only layer.
@@ -2534,6 +2534,19 @@ impl AppState {
         let events = facts.observe_train_suggestions(projects, Utc::now());
         let _ = facts.save_if_dirty();
         events
+    }
+
+    /// Request ids behind the large-compression and record tiles: the only
+    /// requests whose bodies the desktop holds (`capture_tile_bodies`).
+    pub fn activity_tile_request_ids(&self) -> Vec<String> {
+        let snapshot = self.activity_facts.lock().activity_feed_snapshot();
+        [
+            snapshot.transformation.and_then(|t| t.request_id),
+            snapshot.record.and_then(|r| r.request_id),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Read-only snapshot of the latest-of-kind slots. The `get_activity_feed`
@@ -7259,18 +7272,19 @@ fn warn_stats_fetch_failed(reason: &str) {
     };
     *last = Some((Instant::now(), streak));
     drop(last);
-    // A 4xx means SOMETHING answered 6767 without the backend's routes, and
-    // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
-    // there deliberately counts as reachable). The listener's identity is the
+    // A 4xx means SOMETHING answered the backend port without the backend's
+    // routes, and the readyz gate cannot tell it from an ancient-but-ours
+    // proxy (a 404 there deliberately counts as reachable). The listener's identity is the
     // one fact that splits "foreign squatter" from "orphaned old Headroom" --
     // RUST-87 shipped three unattributable 404s before this. Throttled to one
     // lookup per 15-minute warn window, so the lsof subprocess is free here.
     // `foreign_holder` stays false when the lookup returns None: "we could not
     // resolve the listener" is not evidence that it is someone else's, and
     // guessing wrong here silently drops a real backend fault.
+    let backend = crate::backend_port::get();
     let (held_by, foreign_holder) = if category.starts_with("http-4") {
-        match crate::tool_manager::listener_identity_and_ownership(6767) {
-            Some((who, is_ours)) => (format!("; port 6767 is held by {who}"), !is_ours),
+        match crate::tool_manager::listener_identity_and_ownership(backend) {
+            Some((who, is_ours)) => (format!("; port {backend} is held by {who}"), !is_ours),
             None => (String::new(), false),
         }
     } else {
@@ -7281,7 +7295,7 @@ fn warn_stats_fetch_failed(reason: &str) {
          only this endpoint reports (output shaping, tool schema)"
     );
     // A 4xx answered by a process that is demonstrably not ours means another
-    // application owns 6767 on this host. Nothing we ship changes that -- the
+    // application owns the port on this host. Nothing we ship changes that -- the
     // backoff above was added for exactly this case (RUST-87) and only slowed
     // the bleed: one mac still sent 129 events with no end state, because a
     // throttle cannot reach zero. The user-visible remedy is freeing the port,
@@ -7296,19 +7310,18 @@ fn warn_stats_fetch_failed(reason: &str) {
     // the same budget the lsof lookup above already spends. What survives the
     // gate is the fault worth a Sentry event: /stats stalling while the
     // backend is demonstrably serving.
-    let backend_ready = crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+    let backend_ready = crate::tool_manager::probe_backend_readyz_ok(backend);
     if !foreign_holder && backend_ready {
         let (secs_since_ok, requests_since_ok) =
             stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
-        let hops = matches!(category.as_str(), "timeout" | "transport").then(stats_stall_hops);
+        let tasks =
+            matches!(category.as_str(), "timeout" | "transport").then(|| backend_tasks(backend));
         sentry::with_scope(
             |scope| {
                 scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
                 scope.set_extra("secs_since_last_ok", secs_since_ok.into());
                 scope.set_extra("requests_since_last_ok", requests_since_ok.into());
-                if let Some((direct_stats_ms, intercept_readyz_ms, tasks)) = &hops {
-                    scope.set_extra("direct_stats_ms", (*direct_stats_ms).into());
-                    scope.set_extra("intercept_readyz_ms", (*intercept_readyz_ms).into());
+                if let Some(tasks) = &tasks {
                     scope.set_extra("backend_tasks", tasks.clone().into());
                 }
             },
@@ -7324,57 +7337,29 @@ fn warn_stats_fetch_failed(reason: &str) {
     log::warn!("{message} (backend_ready={backend_ready})");
 }
 
-/// Which hop held a `/stats` fetch that just failed. The fetch goes through
-/// the intercept (6767) while the readyz gate above probes the backend
-/// directly, so every RUST-86 event fits two stalls: the backend's `/stats`
-/// queued behind its snapshot/throughput locks on a free event loop, or our
-/// own intercept not forwarding (which would hang client traffic too). A slow
-/// `direct_stats_ms` with a fast `intercept_readyz_ms` is the backend, and
-/// `backend_tasks` shows what is piled up there; the reverse is the intercept.
-/// -1 means no answer inside the probe's timeout. At most ~9s, once per warn
-/// window.
-fn stats_stall_hops() -> (i64, i64, String) {
-    fn timed_get(url: &str, timeout: Duration) -> (i64, Option<String>) {
-        let started = Instant::now();
-        let body = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .tls_built_in_root_certs(false)
-            .timeout(timeout)
-            .build()
-            .ok()
-            .and_then(|client| client.get(url).send().ok())
-            .filter(|response| response.status().is_success())
-            .and_then(|response| response.text().ok());
-        match body {
-            Some(body) => (started.elapsed().as_millis() as i64, Some(body)),
-            None => (-1, None),
-        }
-    }
-    let backend = crate::backend_port::get();
-    let (direct_stats_ms, _) = timed_get(
-        &format!("http://127.0.0.1:{backend}/stats?cached=1"),
-        Duration::from_secs(5),
-    );
-    let (intercept_readyz_ms, _) = timed_get(
-        &format!("http://127.0.0.1:{}/readyz", local_proxy_port()),
-        Duration::from_secs(2),
-    );
-    let (_, tasks) = timed_get(
-        &format!("http://127.0.0.1:{backend}/debug/tasks"),
-        Duration::from_secs(2),
-    );
-    (
-        direct_stats_ms,
-        intercept_readyz_ms,
-        tasks
-            .map(|body| summarize_backend_tasks(&body))
-            .unwrap_or_default(),
-    )
+/// What is piled up on the backend when a `/stats` read just failed: requests
+/// queued behind one slow build read as one large `RequestResponseCycle.run_asgi`
+/// count on an otherwise idle host. Empty when it does not answer inside 2s.
+fn backend_tasks(port: u16) -> String {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()
+        .and_then(|client| {
+            client
+                .get(format!("http://127.0.0.1:{port}/debug/tasks"))
+                .send()
+                .ok()
+        })
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.text().ok())
+        .map(|body| summarize_backend_tasks(&body))
+        .unwrap_or_default()
 }
 
-/// The backend's `/debug/tasks` as `qualname x count`, most frequent first:
-/// requests piled up behind one slow `/stats` build read as one large
-/// `RequestResponseCycle.run_asgi` count on an otherwise idle host.
+/// The backend's `/debug/tasks` as `qualname x count`, most frequent first.
 fn summarize_backend_tasks(body: &str) -> String {
     let Ok(Value::Array(tasks)) = serde_json::from_str::<Value>(body) else {
         return String::new();
@@ -7550,7 +7535,7 @@ impl Drop for InFlight<'_> {
 }
 
 /// Callers probe `/readyz` first (see `polled_headroom_stats`).
-fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
+fn fetch_headroom_dashboard_stats(port: u16) -> Option<HeadroomDashboardStats> {
     // 500ms was silently fatal: `/stats` rebuilds its whole payload per call
     // and crossed half a second as history grew, so every fetch timed out and
     // the dashboard lost the layers only this endpoint reports (output
@@ -7571,7 +7556,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     let mut last_failure: Option<String> = None;
 
     for host in hosts {
-        let url = format!("http://{host}:{}/stats?cached=1", local_proxy_port());
+        let url = format!("http://{host}:{port}/stats?cached=1");
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -7585,8 +7570,16 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
                 warn_stats_fetch_failed(&format!("timed out after {STATS_FETCH_TIMEOUT_SECS}s"));
                 return None;
             }
+            // reqwest's own text stops at "error sending request for url";
+            // whether the socket was refused, reset or closed early is in the
+            // source chain, which RUST-CM never carried.
             Err(err) => {
-                last_failure = Some(err.to_string());
+                last_failure = Some(
+                    std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(": "),
+                );
                 continue;
             }
         };
@@ -7607,7 +7600,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
             // Whether compression ran at all. `/stats` cannot answer this --
             // the quarantine counters are Prometheus-only -- so this rides the
             // same poll on its own throttle.
-            scrape_compression_quarantine();
+            scrape_compression_quarantine(port);
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -7632,7 +7625,7 @@ const QUARANTINE_SCRAPE_INTERVAL: Duration = Duration::from_secs(300);
 /// Scrape `/metrics` and let the canary decide whether compression is being
 /// starved. Silent on every failure: this is an observer, and a backend that
 /// cannot answer a scrape has louder problems already reported elsewhere.
-fn scrape_compression_quarantine() {
+fn scrape_compression_quarantine(port: u16) {
     static LAST_SCRAPE: Mutex<Option<Instant>> = Mutex::new(None);
     {
         let mut last = LAST_SCRAPE.lock();
@@ -7650,7 +7643,10 @@ fn scrape_compression_quarantine() {
     else {
         return;
     };
-    let Ok(response) = client.get("http://127.0.0.1:6767/metrics").send() else {
+    let Ok(response) = client
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+    else {
         return;
     };
     if !response.status().is_success() {
@@ -7662,7 +7658,12 @@ fn scrape_compression_quarantine() {
         // of them. Fetched only when the canary is about to fire, so the
         // every-five-minutes path stays exactly one scrape.
         let health = crate::savings_canary::detect_quarantine_starvation(&body)
-            .and_then(|_| client.get("http://127.0.0.1:6767/health").send().ok())
+            .and_then(|_| {
+                client
+                    .get(format!("http://127.0.0.1:{port}/health"))
+                    .send()
+                    .ok()
+            })
             .filter(|response| response.status().is_success())
             .and_then(|response| response.text().ok());
         crate::savings_canary::observe_quarantine(&body, health.as_deref());
@@ -7670,7 +7671,7 @@ fn scrape_compression_quarantine() {
 }
 
 /// Callers probe `/readyz` first (see `cached_headroom_history`).
-fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
+fn fetch_headroom_savings_history(port: u16) -> Option<HeadroomSavingsHistoryResponse> {
     // Same budget as `/stats`: the backend builds this on its event loop in
     // 0.5-1.9s under ordinary traffic, so the 500ms this used to allow failed
     // most fetches and re-ran the build on every retry.
@@ -7684,7 +7685,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     let hosts = ["127.0.0.1", "localhost"];
 
     for host in hosts {
-        let url = format!("http://{host}:{}/stats-history", local_proxy_port());
+        let url = format!("http://{host}:{port}/stats-history");
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             // Both host names reach the same listener, so retrying a stalled
@@ -9277,9 +9278,9 @@ fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(local_proxy_port(), Duration::from_millis(1500)).0
 }
 
-/// The intercept port the local `/readyz`, `/stats` and `/stats-history` polls
-/// target. A test points its own thread at a throwaway listener instead, since
-/// a dev machine has the real Headroom answering on 6767.
+/// The intercept port the local `/readyz` polls target. A test points its own
+/// thread at a throwaway listener instead, since a dev machine has the real
+/// Headroom answering on 6767.
 fn local_proxy_port() -> u16 {
     #[cfg(test)]
     if let Some(port) = TEST_PROXY_PORT.with(std::cell::Cell::get) {
@@ -9288,9 +9289,30 @@ fn local_proxy_port() -> u16 {
     crate::proxy_intercept::INTERCEPT_PORT
 }
 
+/// Where the app reads its own backend's data (`/stats`, `/stats-history`,
+/// `/metrics`): the backend port itself, not the intercept. RUST-86/RUST-CM on
+/// 0.9.28 carried hop probes taken right after each failure. The backend
+/// answered `/stats` directly in 4-398ms every time (a warm snapshot, so it
+/// had built the failed request), while the same read through 6767 timed out
+/// or reset and one intercept `/readyz` failed outright. The relay is the
+/// clients' front door on one runtime thread; the dashboard does not need it.
+/// None until tool_manager has vetted the port (see `backend_port::selected`).
+fn backend_data_port() -> Option<u16> {
+    #[cfg(test)]
+    if let Some(port) = TEST_BACKEND_PORT
+        .with(std::cell::Cell::get)
+        .or(TEST_PROXY_PORT.with(std::cell::Cell::get))
+    {
+        return Some(port);
+    }
+    crate::backend_port::selected().then(crate::backend_port::get)
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_PROXY_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// `backend_data_port` for this thread; unset, it follows TEST_PROXY_PORT.
+    static TEST_BACKEND_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the runtime is already serving, so `ensure_headroom_running` can
@@ -10736,7 +10758,7 @@ mod tests {
         SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
         STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK, STATS_FETCH_RECOVERED_AT,
         STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL, TEST_PROXY_PORT,
+        STATS_FETCH_WARN_MAX_INTERVAL, TEST_BACKEND_PORT, TEST_PROXY_PORT,
     };
 
     #[test]
@@ -13356,6 +13378,7 @@ mod tests {
             },
             codex: None,
             account: None,
+            last_account_email: None,
             launch_discount_active: false,
             active_percent_off: 0,
             pricing_cohorts: Vec::new(),
@@ -15087,6 +15110,61 @@ mod tests {
             "a 1s /stats-history build must land, not time out"
         );
         server.join().expect("mock server");
+    }
+
+    #[test]
+    fn stats_are_read_from_the_backend_not_through_the_intercept() {
+        // RUST-86/RUST-CM: the read through 6767 timed out or reset while the
+        // backend answered the same /stats directly in milliseconds. The
+        // intercept stand-in answers /readyz (the front-door gate) and fails
+        // anything else; the backend stand-in serves /stats and /metrics.
+        use std::io::{Read, Write};
+        fn serve(listener: std::net::TcpListener, answer: fn(&str) -> &'static str) {
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let (status, body) = match answer(&String::from_utf8_lossy(&buf[..n])) {
+                        "" => ("500 Internal Server Error", ""),
+                        body => ("200 OK", body),
+                    };
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+        let intercept = std::net::TcpListener::bind("127.0.0.1:0").expect("bind intercept");
+        let backend = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let intercept_port = intercept.local_addr().expect("addr").port();
+        let backend_port = backend.local_addr().expect("addr").port();
+        serve(intercept, |request| {
+            if request.starts_with("GET /readyz") {
+                "{}"
+            } else {
+                ""
+            }
+        });
+        serve(backend, |request| {
+            if request.starts_with("GET /stats?cached=1") {
+                r#"{"requests":{"total":3},"tokens":{"saved":120}}"#
+            } else {
+                ""
+            }
+        });
+        TEST_PROXY_PORT.with(|port| port.set(Some(intercept_port)));
+        TEST_BACKEND_PORT.with(|port| port.set(Some(backend_port)));
+        let state = AppState::new().expect("state");
+        assert!(
+            state.polled_headroom_stats().is_some(),
+            "/stats must come from the backend port"
+        );
     }
 
     #[test]

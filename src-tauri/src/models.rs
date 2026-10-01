@@ -1207,6 +1207,48 @@ pub struct CodexRateLimitSnapshot {
     pub secondary: Option<CodexUsageWindow>,
     pub credits_balance: Option<String>,
     pub credits_unlimited: bool,
+    /// When it was captured (epoch seconds): `seconds_until_reset` counts from
+    /// here, so the tray can tell a window that has reset since.
+    pub captured_at: i64,
+}
+
+/// One plan-usage window: percent used and when it resets.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlanWindow {
+    pub used_percent: f64,
+    /// Epoch seconds.
+    pub resets_at: i64,
+}
+
+/// A plan-usage window with its display label ("5h", "week").
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LabeledPlanWindow {
+    pub label: String,
+    pub window: PlanWindow,
+}
+
+/// Claude's plan usage, from its response headers or the usage endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClaudePlanUsage {
+    pub five_hour: Option<PlanWindow>,
+    pub seven_day: Option<PlanWindow>,
+}
+
+/// The usage endpoint's windows: utilization is already a percent there.
+impl From<&ClaudeUsage> for ClaudePlanUsage {
+    fn from(usage: &ClaudeUsage) -> Self {
+        let window = |w: &ClaudeUsageWindow| PlanWindow {
+            used_percent: w.utilization,
+            resets_at: w.resets_at.timestamp(),
+        };
+        Self {
+            five_hour: usage.five_hour.as_ref().map(window),
+            seven_day: usage.seven_day.as_ref().map(window),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1309,6 +1351,10 @@ pub struct HeadroomPricingStatus {
     #[serde(default)]
     pub codex_plan_tier: Option<CodexPlanTier>,
     pub account: Option<HeadroomAccountProfile>,
+    /// Email of the last signed-in account, kept while signed out (except after
+    /// an explicit sign-out) to prefill the sign-in form.
+    #[serde(default)]
+    pub last_account_email: Option<String>,
     pub launch_discount_active: bool,
     /// Percent off applied to the currently-selling founder-pricing cohort
     /// (0 when full price). Drives the discounted prices in the upgrade view.

@@ -1598,6 +1598,28 @@ pub fn rewire_clients_after_port_reclaimed() {
     }
 }
 
+/// The crash guard's unwire (`handle_crash_guard_flag` in lib.rs), run once
+/// the app is gone: what quit does, for an app that died without quitting, so
+/// the clients connect directly instead of failing with ECONNREFUSED on the
+/// dead 6767, remembered for the next launch's `restore_client_setups`.
+/// Nothing wired (a quit or pause already unwired them) or an intercept that
+/// answers again (the next instance is already up) means there is nothing to
+/// undo. Returns the clients it unwired.
+pub fn unwire_clients_after_crash(intercept_answers: impl FnOnce() -> bool) -> Vec<String> {
+    let state = load_setup_state();
+    if state.configured_clients.is_empty() || intercept_answers() {
+        return Vec::new();
+    }
+    let codex = is_configured(&state, "codex_cli");
+    if let Err(err) = clear_client_setups() {
+        log::warn!("crash guard: unwiring clients failed: {err:#}");
+    }
+    if codex {
+        retag_codex_threads_to_native();
+    }
+    state.configured_clients.into_keys().collect()
+}
+
 fn clear_and_remember_client_setups() -> Result<()> {
     // Capture snapshot before disabling. We re-apply it afterwards because
     // disable_client_setup also clears remembered_clients as a side effect,
@@ -1709,6 +1731,20 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Kill every process running out of `dir`, except this one.
+#[cfg(target_os = "windows")]
+fn kill_processes_under(dir: &Path) {
+    kill_processes_like(dir, "\\*");
+}
+
+/// Kill every process whose image is exactly `exe`: a Headroom-installed binary
+/// that must be replaced or deleted, which Windows refuses while it runs.
+#[cfg(target_os = "windows")]
+pub(crate) fn kill_processes_running(exe: &Path) {
+    kill_processes_like(exe, "");
+}
+
+/// Kill every process whose image path is `path` followed by the `-like`
+/// pattern `suffix`, except this one.
 ///
 /// Windows keeps a running image undeletable, so anything still executing from
 /// inside Headroom's footprint pins it: the backend proxy, and the MCP servers
@@ -1722,10 +1758,10 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
 /// only ever match a binary Headroom installed. `uninstall.exe` is exempt: it
 /// lives in the same directory and is usually the process driving this sweep.
 #[cfg(target_os = "windows")]
-fn kill_processes_under(dir: &Path) {
+fn kill_processes_like(path: &Path, suffix: &str) {
     // `-like` metacharacters, plus `'` so a username containing one cannot
     // close the PowerShell literal early.
-    let escaped = dir
+    let escaped = path
         .display()
         .to_string()
         .replace('`', "``")
@@ -1736,7 +1772,7 @@ fn kill_processes_under(dir: &Path) {
     // `$PID` is the powershell process itself: its own command line embeds the
     // pattern, and Win32_Process would hand it back as a match (RUST-6F).
     let script = format!(
-        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}{suffix}' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
     let mut command = crate::proc::command("powershell");
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
@@ -5192,7 +5228,9 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
 
 /// The shared rewrite behind [`pin_codex_mcp_command`] and
 /// [`pin_grok_mcp_command`]: both CLIs read the same `[mcp_servers.headroom]`
-/// table shape.
+/// table shape. Also turns the upstream beacon off in its
+/// `[mcp_servers.headroom.env]`: on by default upstream, and the MCP server
+/// reports to it (the proxy already runs with it off).
 fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -5210,7 +5248,9 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
     // with "No such option '-m'" — so the args must be pinned together.
     let target_args_line = r#"args = ["mcp", "serve"]"#;
 
+    let beacon_line = r#"HEADROOM_BEACON = "off""#;
     let mut in_headroom_table = false;
+    let mut in_env_table = false;
     let mut replaced = false;
     // When the replaced `args` value is a multi-line array, the continuation
     // lines ("-m", / "headroom.cli", / ]) must be dropped too, or the rebuilt
@@ -5225,7 +5265,18 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_headroom_table = trimmed == "[mcp_servers.headroom]";
+            in_env_table = trimmed == "[mcp_servers.headroom.env]";
             out.push(line.to_string());
+            if in_env_table {
+                out.push(beacon_line.to_string());
+            }
+            continue;
+        }
+        if in_env_table
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "HEADROOM_BEACON")
+        {
             continue;
         }
         if in_headroom_table {
@@ -8135,14 +8186,26 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// "Headroom compressing..." for a moment after each request goes out. The
 /// real compression is ~100 ms (p50); the moment is stretched to a couple of
 /// seconds so a 1 s render cycle cannot miss it. A saving outranks it, so a
-/// follow-up request never cuts a saving's highlight short. Silent until the
-/// conversation has sent a request or saved something, and on any error.
+/// follow-up request never cuts a saving's highlight short. After it, the plan
+/// usage Claude Code passes in `rate_limits` (Pro and Max, once the session has
+/// had a response): "| usage: 5h 34%, week 62%", a window at 80% or more in yellow
+/// with its reset time, a window past its reset at 0. Silent until there is
+/// either, and on any error.
+///
+/// Percentages are cut to whole numbers as strings: bash's float printf reads
+/// "23.5" as invalid under a comma-decimal locale.
 ///
 /// Plain bash, parsing with regexes, because it runs every second
 /// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
-/// Stays bash 3.2 compatible (macOS /bin/bash): no EPOCHREALTIME, no printf %T.
+/// No subshells or external commands on the common path: under Git Bash each
+/// is an MSYS fork, and the six per render this used to cost took +8.3% of a
+/// 2-vCPU Windows VM per Claude Code session, +3.5% without them (win-test,
+/// 2026-10-01). Stays bash 3.2
+/// compatible (macOS /bin/bash): EPOCHSECONDS (bash 5) falls back to `date`,
+/// no EPOCHREALTIME, no printf %T.
 fn build_claude_statusline_script(state_path: &Path) -> String {
     let state = shell_double_quote(&state_path.to_string_lossy());
+    let warn = crate::TRAY_USAGE_RESET_SHOWN_AT_PERCENT as u32;
     format!(
         r#"#!/bin/bash
 # Headroom statusline (managed by Headroom Desktop - do not edit).
@@ -8150,30 +8213,58 @@ state_file="{state}"
 flash_secs=4
 compress_secs=2
 IFS= read -r -d '' input
-[[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] || exit 0
-sid=${{BASH_REMATCH[1]}}
-[ -r "$state_file" ] || exit 0
-state=$(<"$state_file")
-[[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]] || exit 0
-total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
-now_ms=$(( $(date +%s) * 1000 ))
+now_s=${{EPOCHSECONDS:-$(date +%s)}}
+now_ms=$(( now_s * 1000 ))
+usage=
+win() {{
+  local pct at r f
+  [[ $input =~ \"$1\"[[:space:]]*:[[:space:]]*\{{[^}}]*\"used_percentage\"[[:space:]]*:[[:space:]]*([0-9]*)(\.[0-9]*)? ]] || return 0
+  pct=${{BASH_REMATCH[1]:-0}}
+  [[ $input =~ \"$1\"[[:space:]]*:[[:space:]]*\{{[^}}]*\"resets_at\"[[:space:]]*:[[:space:]]*([0-9]+) ]] && at=${{BASH_REMATCH[1]}}
+  if [ -n "$at" ] && [ "$now_s" -ge "$at" ]; then pct=0; fi
+  if [ "$pct" -gt 100 ]; then pct=100; fi
+  r="$2 $pct%"
+  if [ "$pct" -ge {warn} ] && [ -n "$at" ]; then
+    if [ $(( at - now_s )) -lt 86400 ]; then f=+%H:%M; else f=+%a; fi
+    r=$'\033[33m'"$r (resets $(date -d "@$at" "$f" 2>/dev/null || date -r "$at" "$f" 2>/dev/null))"$'\033[0m'
+  fi
+  usage="${{usage:+$usage, }}$r"
+}}
+win five_hour 5h
+win seven_day week
 fmt() {{
   local n=$1 d u t
   if [ "$n" -ge 999500 ]; then d=1000000 u=M
   elif [ "$n" -ge 1000 ]; then d=1000 u=k
-  else echo "$n"; return; fi
+  else fmt_out=$n; return; fi
   t=$(( (n * 10 + d / 2) / d ))
-  if [ "$t" -ge 100 ]; then echo "$(( (n + d / 2) / d ))$u"
-  elif [ $(( t % 10 )) -eq 0 ]; then echo "$(( t / 10 ))$u"
-  else echo "$(( t / 10 )).$(( t % 10 ))$u"; fi
+  if [ "$t" -ge 100 ]; then fmt_out="$(( (n + d / 2) / d ))$u"
+  elif [ $(( t % 10 )) -eq 0 ]; then fmt_out="$(( t / 10 ))$u"
+  else fmt_out="$(( t / 10 )).$(( t % 10 ))$u"; fi
 }}
-line="Headroom saved $(fmt "$total") tokens this session"
-if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
-  printf '\033[1;32m%s (+%s)\033[0m\n' "$line" "$(fmt "$last")"
-elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
-  printf '\033[32mHeadroom compressing...\033[0m\n'
-elif [ "$total" -gt 0 ]; then
-  printf '%s\n' "$line"
+saved=
+if [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] && [ -r "$state_file" ]; then
+  sid=${{BASH_REMATCH[1]}}
+  IFS= read -r -d '' state < "$state_file"
+  if [[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]]; then
+    total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
+    fmt "$total"
+    line="Headroom saved $fmt_out tokens this session"
+    if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
+      fmt "$last"
+      saved=$'\033[1;32m'"$line (+$fmt_out)"$'\033[0m'
+    elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
+      saved=$'\033[32mHeadroom compressing...\033[0m'
+    elif [ "$total" -gt 0 ]; then
+      saved=$line
+    fi
+  fi
+fi
+if [ -n "$usage" ]; then usage="usage: $usage"; fi
+if [ -n "$saved" ] && [ -n "$usage" ]; then
+  printf '%s | %s\n' "$saved" "$usage"
+elif [ -n "$saved$usage" ]; then
+  printf '%s\n' "$saved$usage"
 fi
 "#
     )
@@ -8210,18 +8301,36 @@ fn is_our_statusline(value: &Value) -> bool {
     value
         .get("command")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .and_then(|command| match command.strip_prefix('"') {
-            Some(rest) => rest.strip_suffix('"'),
-            // Unquoted, whitespace separates commands: `~/mine.sh; <ours>`.
-            None => (!command.contains(char::is_whitespace)).then_some(command),
+        .is_some_and(|command| {
+            is_our_statusline_command(command)
+                || without_bash_program(command).is_some_and(is_our_statusline_command)
         })
-        .is_some_and(|path| {
-            !path.contains(['"', ';', '&', '|', '`', '\n'])
-                && Path::new(path)
-                    .file_name()
-                    .is_some_and(|name| name == CLAUDE_STATUSLINE_SCRIPT)
-        })
+}
+
+/// The script path after a leading bash program, as Windows writes the
+/// command: `"C:\Program Files\Git\bin\bash.exe" "<script>"`, or bare `bash`.
+fn without_bash_program(command: &str) -> Option<&str> {
+    let command = command.trim();
+    let (program, rest) = match command.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"')?,
+        None => command.split_once(char::is_whitespace)?,
+    };
+    let name = program.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    matches!(name.as_str(), "bash" | "bash.exe").then_some(rest)
+}
+
+fn is_our_statusline_command(command: &str) -> bool {
+    let command = command.trim();
+    match command.strip_prefix('"') {
+        Some(rest) => rest.strip_suffix('"'),
+        // Unquoted, whitespace separates commands: `~/mine.sh; <ours>`.
+        None => (!command.contains(char::is_whitespace)).then_some(command),
+    }
+    .is_some_and(|path| {
+        // Both separators: a Windows path read anywhere still ends in ours.
+        !path.contains(['"', ';', '&', '|', '`', '\n'])
+            && path.rsplit(['/', '\\']).next() == Some(CLAUDE_STATUSLINE_SCRIPT)
+    })
 }
 
 /// `statusLine` is a single slot in ~/.claude/settings.json. Ours goes in only
@@ -8280,11 +8389,12 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
     Ok(true)
 }
 
-/// Install the savings statusline. Unix only for now: Windows runs statusline
-/// commands through Git Bash and is untested. A no-op when the user turned it
-/// off or already has a statusline of their own.
+/// Install the savings statusline. On Windows Claude Code runs statusline
+/// commands through Git Bash, as it does the hooks, so the command names
+/// bash.exe the way theirs does (`hook_shell_command`). A no-op when the user
+/// turned it off or already has a statusline of their own.
 fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
-    if cfg!(target_os = "windows") || is_statusline_disabled() {
+    if is_statusline_disabled() {
         return Ok((Vec::new(), Vec::new()));
     }
     let mut changed = Vec::new();
@@ -8301,7 +8411,11 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     if let Some(backup) = backup {
         backups.push(backup.display().to_string());
     }
-    let command = format!("\"{}\"", shell_double_quote(&script.to_string_lossy()));
+    let command = if cfg!(windows) {
+        hook_shell_command(&script)?
+    } else {
+        format!("\"{}\"", shell_double_quote(&script.to_string_lossy()))
+    };
     if set_claude_statusline_setting(Some(&command))? {
         changed.push(claude_settings_path().display().to_string());
     }
@@ -14065,6 +14179,47 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
+    /// The crash guard runs quit's unwire, and only for an app that died with
+    /// clients still wired. After a quit or pause nothing is wired: it must not
+    /// even probe the port (a closed loopback port takes ~1s to refuse on
+    /// Windows, on every quit) and must keep the snapshot the next launch
+    /// restores from.
+    #[test]
+    #[serial_test::serial]
+    fn crash_guard_unwires_only_what_a_dead_app_left_wired() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+        let base_url = || read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].clone();
+
+        // The next instance already answers on 6767: its wiring stays.
+        assert!(super::unwire_clients_after_crash(|| true).is_empty());
+        assert_eq!(base_url(), super::HEADROOM_ANTHROPIC_BASE_URL);
+
+        assert_eq!(
+            super::unwire_clients_after_crash(|| false),
+            vec!["claude_code".to_string()]
+        );
+        assert_ne!(base_url(), super::HEADROOM_ANTHROPIC_BASE_URL);
+        assert!(super::load_setup_state()
+            .remembered_clients
+            .contains_key("claude_code"));
+
+        assert!(
+            super::unwire_clients_after_crash(|| panic!("probed with nothing wired")).is_empty()
+        );
+        assert!(
+            super::load_setup_state()
+                .remembered_clients
+                .contains_key("claude_code"),
+            "a second unwire lost the snapshot the next launch restores"
+        );
+    }
+
     /// The relay a quit restored is the reconciler's, not a pre-Headroom
     /// gateway. Relaunch recorded it in preserved_base_urls, where it outlived
     /// the capture: after a switch to Claude Official (the backend drops the
@@ -17046,8 +17201,34 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(out.unwrap(), 2);
     }
 
+    /// Windows names the interpreter first, as the hooks do; the entry is
+    /// still ours, and a composed command that also runs ours is still not.
+    #[test]
+    fn our_statusline_is_recognised_behind_the_windows_bash_program() {
+        use super::is_our_statusline;
+        let ours =
+            |command: &str| is_our_statusline(&json!({ "type": "command", "command": command }));
+        assert!(ours(
+            r#""C:\Program Files\Git\bin\bash.exe" "C:\Users\a b\.claude\hooks\headroom-statusline.sh""#
+        ));
+        assert!(ours(
+            r#"bash "C:/Users/a/.claude/hooks/headroom-statusline.sh""#
+        ));
+        assert!(ours(r#""/Users/a/.claude/hooks/headroom-statusline.sh""#));
+        assert!(!ours(
+            r#""C:\Program Files\Git\bin\bash.exe" "C:\Users\a\.claude\mine.sh""#
+        ));
+        assert!(!ours(
+            r#"node "C:\Users\a\.claude\hooks\headroom-statusline.sh""#
+        ));
+        assert!(!ours(
+            r#"bash "C:\Users\a\mine.sh"; "C:\Users\a\.claude\hooks\headroom-statusline.sh""#
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn statusline_takes_only_an_empty_slot_and_removes_only_its_own() {
         let _home = TestHome::new();
         let settings = claude_settings_path();
@@ -17145,6 +17326,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 ("eeee-first-request".into(), session(0, 0, 0, now_ms)),
                 ("ffff-nothing-yet".into(), session(0, 0, 0, old)),
             ]),
+            // Written after the sessions; the script's regex must not care.
+            plan_usage: Some(crate::models::ClaudePlanUsage {
+                five_hour: Some(crate::models::PlanWindow {
+                    used_percent: 50.0,
+                    resets_at: 1,
+                }),
+                seven_day: None,
+            }),
+            codex_plan_usage: None,
         };
         // Plus an entry as the previous build wrote it, without lastRequestAtMs.
         let json = serde_json::to_string(&persisted).unwrap().replacen(
@@ -17202,6 +17392,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
         assert_eq!(render("not json"), "");
+
+        // Plan usage from Claude Code's own `rate_limits`, after the savings,
+        // pretty-printed as Claude Code sends it.
+        let now = chrono::Utc::now().timestamp();
+        let limits = |five: &str, five_at: i64, week: &str, week_at: i64| {
+            format!(
+                "{{\n  \"session_id\": \"bbbb-quiet\",\n  \"rate_limits\": {{\n    \"five_hour\": {{\n      \"used_percentage\": {five},\n      \"resets_at\": {five_at}\n    }},\n    \"seven_day\": {{\n      \"used_percentage\": {week},\n      \"resets_at\": {week_at}\n    }}\n  }}\n}}"
+            )
+        };
+        assert_eq!(
+            render(&limits("34.9", now + 3_600, "62", now + 300_000)),
+            "Headroom saved 3.1k tokens this session | usage: 5h 34%, week 62%\n"
+        );
+        // A window past its reset is back at 0; one near its cap turns
+        // yellow with its reset time.
+        let near = render(&limits("97.2", now - 60, "91", now + 3_600));
+        assert!(
+            near.starts_with(
+                "Headroom saved 3.1k tokens this session | usage: 5h 0%, \x1b[33mweek 91% (resets "
+            ),
+            "{near:?}"
+        );
+        assert!(near.ends_with(")\x1b[0m\n"), "{near:?}");
+        // Usage alone, before this conversation has saved anything.
+        assert_eq!(
+            render(
+                &limits("12", now + 3_600, "40", now + 300_000).replace("bbbb-quiet", "unknown")
+            ),
+            "usage: 5h 12%, week 40%\n"
+        );
     }
 
     #[cfg(unix)]
@@ -19116,9 +19336,26 @@ sys.exit(3)
         assert!(after.contains("command = \"/Applications/Codex.app/node_repl\""));
         // The headroom env sub-table has no `command`; nothing spurious added.
         assert_eq!(after.matches("command = ").count(), 2);
+        // The upstream beacon is turned off for Headroom's MCP server only.
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_BEACON"].as_str(),
+            Some("off")
+        );
+        assert!(parsed["mcp_servers"]["node_repl"].get("env").is_none());
 
         // Idempotent: a second run with the same entrypoint is a no-op.
         assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_none());
+
+        // A beacon the upstream registrar turned on is turned off, once.
+        std::fs::write(
+            &config,
+            after.replace(r#"HEADROOM_BEACON = "off""#, r#"HEADROOM_BEACON = "on""#),
+        )
+        .unwrap();
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_some());
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(after.matches("HEADROOM_BEACON").count(), 1, "{after}");
+        assert!(after.contains(r#"HEADROOM_BEACON = "off""#));
     }
 
     #[test]

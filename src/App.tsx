@@ -1965,6 +1965,14 @@ export default function App() {
   // Independent of launchExperience: any savings on record at all, which is
   // what retires the setup-stall watchdog below.
   const forcedSetupStall = debugOverrides?.setupStall ?? null;
+  // Signed out without a sign-out (the keychain session is gone, as on the
+  // macOS signature move): start the sign-in form on the last account's email.
+  const rememberedAuthEmail = pricingStatus?.authenticated ? null : pricingStatus?.lastAccountEmail;
+  useEffect(() => {
+    if (rememberedAuthEmail) {
+      setAuthEmail((current) => current || rememberedAuthEmail);
+    }
+  }, [rememberedAuthEmail]);
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
       return;

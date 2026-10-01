@@ -30,6 +30,15 @@ const STALE_STAGED_UPDATE = /no longer staged/i;
 // or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ).
 const READ_ONLY_BUNDLE = /running from a read-only folder|moved or deleted while running/i;
 
+// tauri-plugin-updater's macOS swap hit PermissionDenied, retried under an
+// AppleScript admin prompt, and that prompt was cancelled or failed (RUST-JD).
+// Quiet installs only run when `silent_install_supported` proved the bundle
+// writable, so after a click this is the user declining the password prompt.
+const ADMIN_PROMPT_FAILED = /Failed to move the new app into place/;
+const ADMIN_PROMPT_COPY =
+  "Headroom needs an administrator password to replace itself in its folder. " +
+  "Install again and approve the password prompt, or ask an administrator to update Headroom.";
+
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
@@ -360,7 +369,10 @@ export async function runAppUpdateInstall({
     // a fresh check plus install - which the branch above now does for them.
     const detail = describeInvokeError(error, "");
     const transport = TRANSPORT_FAILURE.test(detail);
-    if (!READ_ONLY_BUNDLE.test(detail)) {
+    const adminPrompt = ADMIN_PROMPT_FAILED.test(detail);
+    // A quiet install reaching the admin prompt means the writability gate
+    // missed a case, so that one still reports.
+    if (!READ_ONLY_BUNDLE.test(detail) && !(adminPrompt && !quiet)) {
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",
         tags: { flow: "app_update_install" },
@@ -369,7 +381,9 @@ export async function runAppUpdateInstall({
     return {
       statusCopy: transport
         ? "Could not download the update: the connection dropped. Try again."
-        : describeInvokeError(error, "Could not install the update."),
+        : adminPrompt
+          ? ADMIN_PROMPT_COPY
+          : describeInvokeError(error, "Could not install the update."),
     };
   } finally {
     unlisten?.();
