@@ -8266,10 +8266,10 @@ fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
 /// verbatim and must never reach a Sentry title.
 ///
 /// Python log records are unwrapped first. When the run imports the wheel's
-/// `proxy/server.py`, its module-level `basicConfig` puts `<asctime> - <logger>
-/// - <LEVEL> - ` on every record, so the first line became an INFO line with a
-/// timestamp in it: a fingerprint unique per event, titled with no cause
-/// (RUST-KQ, a 900s hard cap that is RUST-KK's class).
+/// `proxy/server.py`, its module-level `basicConfig` puts
+/// `<asctime> - <logger> - <LEVEL> - ` on every record, so the first line
+/// became an INFO line with a timestamp in it: a fingerprint unique per event,
+/// titled with no cause (RUST-KQ, a 900s hard cap that is RUST-KK's class).
 fn learn_failure_signature_source(text: &str) -> String {
     let lines: Vec<&str> = text
         .lines()

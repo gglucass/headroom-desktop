@@ -7375,7 +7375,7 @@ fn summarize_backend_tasks(body: &str) -> String {
         *counts.entry(name).or_default() += 1;
     }
     let mut counts: Vec<_> = counts.into_iter().collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     counts
         .iter()
         .take(12)
