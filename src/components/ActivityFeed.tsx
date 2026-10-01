@@ -279,7 +279,7 @@ function ExpandableRow({
 }
 
 /**
- * "Keep before/after", on by default: the proxy holds the text of its last 10
+ * "Keep before/after", on by default: the proxy holds the text of its last 20
  * requests and the desktop copies out the two the tiles show. Off holds
  * nothing. Flipping it restarts the backend.
  */
@@ -316,7 +316,7 @@ function KeepDiffsSwitch() {
         <span className="activity-card__diffs-meta">
           {enabled === false
             ? "Off. Turn on to see exactly what a compression removed."
-            : "Expand a compression to see what was removed. The text stays in memory on this computer, for the last 10 requests and the two shown here."}
+            : "Expand a compression to see what was removed. The text stays in memory on this computer, for the last 20 requests and the two shown here."}
         </span>
       </div>
       <button
@@ -468,12 +468,12 @@ function CompressionDiff({ requestId }: { requestId: string }) {
   }, [requestId]);
   // Computed once per fetch, not on every feed poll that re-renders the row.
   const view = useMemo(() => {
-    if (!result?.requestMessages?.length) return null;
+    // No compressed list means the proxy logged no pre-compression snapshot
+    // (only its Anthropic path does): requestMessages is then the sent body,
+    // and diffing it against itself would claim nothing was removed.
+    if (!result?.requestMessages?.length || !result.compressedMessages) return null;
     const original = formatRequestMessages(result.requestMessages);
-    // No compressed list: the proxy sent the messages as they were.
-    const compressed = result.compressedMessages
-      ? formatRequestMessages(result.compressedMessages)
-      : original;
+    const compressed = formatRequestMessages(result.compressedMessages);
     const diff = diffLines(original, compressed);
     return { original, compressed, lines: diff ? collapseDiff(diff) : null };
   }, [result]);
@@ -485,6 +485,8 @@ function CompressionDiff({ requestId }: { requestId: string }) {
     body = "Loading...";
   } else if (!result.logFullMessages) {
     body = "Turn on Keep before/after above to see what this compression removed.";
+  } else if (result.requestMessages?.length && !result.compressedMessages) {
+    body = "Headroom does not record the text before compression for this kind of request.";
   } else if (!view) {
     body =
       "Not available for this request. Headroom keeps the text in memory only, so it is gone after a restart.";

@@ -1213,8 +1213,8 @@ pub struct CodexRateLimitSnapshot {
 }
 
 /// One plan-usage window: percent used and when it resets.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct PlanWindow {
     pub used_percent: f64,
     /// Epoch seconds.
@@ -1222,8 +1222,8 @@ pub struct PlanWindow {
 }
 
 /// A plan-usage window with its display label ("5h", "week").
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct LabeledPlanWindow {
     pub label: String,
     pub window: PlanWindow,

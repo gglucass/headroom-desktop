@@ -807,6 +807,14 @@ describe("before/after", () => {
     expect(await screen.findByText(/Turn on Keep before\/after above/)).toBeInTheDocument();
   });
 
+  it("does not claim nothing was removed when the proxy kept no compressed side", async () => {
+    // OpenAI/Codex paths log only the sent body, with no pre-compression snapshot.
+    diffResponse({ requestMessages: [{ role: "user", content: "sent" }] });
+    await expand();
+    expect(await screen.findByText(/does not record the text before compression/)).toBeInTheDocument();
+    expect(screen.queryByText(/unchanged line/)).not.toBeInTheDocument();
+  });
+
   it("says so when the desktop holds no text for the request", async () => {
     diffResponse({});
     await expand();

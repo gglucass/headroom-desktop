@@ -227,7 +227,7 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
 
 /// "Keep before/after" in the Activity tab, on unless the user turned it off.
 /// The proxy is then spawned with `--log-messages`, holding the text of its
-/// last 10 requests so the desktop can copy out the two its tiles show.
+/// last 20 requests so the desktop can copy out the two its tiles show.
 pub fn is_compression_diffs_enabled() -> bool {
     !load_setup_state().compression_diffs_disabled
 }
@@ -2748,7 +2748,7 @@ struct ClientSetupState {
     #[serde(default)]
     auto_learn_disabled: bool,
     /// User turned "Keep before/after" off in the Activity tab. When false the
-    /// proxy holds the text of its last 10 requests, readable from its
+    /// proxy holds the text of its last 20 requests, readable from its
     /// loopback /transformations/feed by any local account.
     #[serde(default)]
     compression_diffs_disabled: bool,

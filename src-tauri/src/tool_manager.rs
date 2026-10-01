@@ -1559,16 +1559,19 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
-# --- Request-log body window: 10, not 100 (desktop setting) -------------------
+# --- Request-log body window: 20, not 100 (desktop setting) -------------------
 # With "Keep before/after" on (--log-messages, the Activity default) the wheel
 # keeps request, compressed and response bodies on its newest
 # RequestLogger.MESSAGE_WINDOW (100) entries, each one a whole transcript. The
 # desktop copies the two it shows (the large-compression and record tiles) into
 # its own memory on the next 20s observer tick, so the backend only has to hold
-# them that long. Only ever narrows the wheel's own constant, so it is gated on
+# them that long. 20, not 10: requests landing before the next tick pushed 6.4%
+# of requests out of a 10-entry window before the copy, 0.5% out of 20
+# (request-id counters, 526 requests on a heavy machine, 2026-10-01).
+# Only ever narrows the wheel's own constant, so it is gated on
 # that attribute rather than an exact pin: a wheel without it reports skipped.
 # HEADROOM_MESSAGE_WINDOW=0 keeps the wheel's window.
-_hd_mw_size = _hd_os.environ.get("HEADROOM_MESSAGE_WINDOW", "10").strip()
+_hd_mw_size = _hd_os.environ.get("HEADROOM_MESSAGE_WINDOW", "20").strip()
 if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
     try:
         from headroom.proxy import request_logger as _hd_mw_mod
@@ -4258,10 +4261,10 @@ impl ToolManager {
                 vec![(python.clone(), headroom_python_startup_args())]
             };
             // On unless the user turned "Keep before/after" off in the Activity
-            // tab; the sitecustomize message_window narrows what it keeps to 10
-            // requests. The arg helpers never pass it, see
+            // tab; the sitecustomize message_window narrows what it keeps. The
+            // arg helpers never pass it, see
             // backend_is_never_asked_to_keep_message_bodies.
-            if crate::client_adapters::is_compression_diffs_enabled() {
+            if backend_keeps_message_bodies(self.installed_headroom_version().as_deref()) {
                 for (_, args) in &mut startup_variants {
                     args.push("--log-messages".to_string());
                 }
@@ -8943,9 +8946,12 @@ impl ToolManager {
             s.push(".new");
             PathBuf::from(s)
         };
-        // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
-        std::fs::rename(&extracted_binary, &staged)
-            .with_context(|| format!("staging {}", staged.display()))?;
+        // Retried: Defender scans the freshly unzipped ~300 MB exe (RUST-9M).
+        crate::client_adapters::retry_transient_denied(|| {
+            // direct-write: staged binary install into Headroom's own bin dir (rename-over for exec safety)
+            std::fs::rename(&extracted_binary, &staged)
+        })
+        .with_context(|| format!("staging {}", staged.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -11379,12 +11385,28 @@ fn headroom_python_startup_args() -> Vec<String> {
 /// the receipt is from a current install, so assume the pinned (>= 0.28.0)
 /// runtime and keep the flag.
 fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
+    runtime_version_at_least(installed_version, (0, 28))
+}
+
+/// --log-messages only reaches a wheel that caps the bodies it keeps:
+/// `RequestLogger.MESSAGE_WINDOW` shipped in 0.39.0. An older runtime (the
+/// previous one a failed upgrade restarts on) keeps a whole transcript on every
+/// log entry, the 100 GB RSS incident, and the sitecustomize message_window
+/// cannot bind there.
+fn backend_keeps_message_bodies(installed_version: Option<&str>) -> bool {
+    crate::client_adapters::is_compression_diffs_enabled()
+        && runtime_version_at_least(installed_version, (0, 39))
+}
+
+/// Unknown/unparseable version means the receipt is from a current install,
+/// so assume the pinned runtime.
+fn runtime_version_at_least(installed_version: Option<&str>, min: (u64, u64)) -> bool {
     let Some(version) = installed_version else {
         return true;
     };
     let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
     match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(major), Some(minor)) => (major, minor) >= (0, 28),
+        (Some(major), Some(minor)) => (major, minor) >= min,
         _ => true,
     }
 }
@@ -11717,13 +11739,16 @@ pub fn running_proxy_matches_expected_args() -> bool {
         // host we cannot introspect killed and respawned a healthy backend.
         return true;
     };
-    proxy_argv_keeps_messages_as_set(
-        &argv,
-        crate::client_adapters::is_compression_diffs_enabled(),
-    ) && proxy_argv_contains_expected_flags(
-        &argv,
-        !crate::client_adapters::is_auto_learn_disabled(),
-    )
+    // Same verdict as the spawn, or a pre-0.39 runtime is restarted forever.
+    let installed = ToolManager::new(ManagedRuntime::bootstrap_root(
+        &crate::storage::app_data_dir(),
+    ))
+    .installed_headroom_version();
+    proxy_argv_keeps_messages_as_set(&argv, backend_keeps_message_bodies(installed.as_deref()))
+        && proxy_argv_contains_expected_flags(
+            &argv,
+            !crate::client_adapters::is_auto_learn_disabled(),
+        )
 }
 
 /// --log-messages must follow the "Keep before/after" switch both ways: a
@@ -16425,7 +16450,7 @@ assert g.done"#,
     #[test]
     fn message_window_behaves_against_the_installed_wheel() {
         // The desktop copies tile bodies out within one observer tick, so the
-        // backend keeps them on its newest 10 entries, not 100. Logs 12 entries
+        // backend keeps them on its newest 20 entries, not 100. Logs 22 entries
         // through the installed RequestLogger and counts who kept a body.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
@@ -16439,7 +16464,7 @@ assert g.done"#,
 from headroom.proxy.models import RequestLog
 from headroom.proxy.request_logger import RequestLogger
 rl = RequestLogger(log_full_messages=True)
-for i in range(12):
+for i in range(22):
     rl.log(RequestLog(request_id=str(i), timestamp="", provider="", model="",
         input_tokens_original=0, input_tokens_optimized=0, output_tokens=None,
         tokens_saved=0, savings_percent=0.0, optimization_latency_ms=0.0,
@@ -16457,14 +16482,14 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
                 .expect("run message window probe");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        let on = run("10");
+        let on = run("20");
         if on.starts_with("100 ") || on.is_empty() {
             eprintln!("skipping: message window did not bind (wheel bumped?): {on:?}");
             return;
         }
-        assert_eq!(on, "10 10");
+        assert_eq!(on, "20 20");
         // Off keeps the wheel's window, which also proves the probe sees it.
-        assert_eq!(run("0"), "100 12");
+        assert_eq!(run("0"), "100 22");
     }
 
     #[test]
@@ -19199,6 +19224,12 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let current = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
         assert!(proxy_argv_keeps_messages_as_set(current, false));
         assert!(!proxy_argv_keeps_messages_as_set(current, true));
+        // Only a wheel with RequestLogger.MESSAGE_WINDOW (0.39.0) gets the flag:
+        // an older rollback runtime would keep a body on every log entry.
+        assert!(!super::runtime_version_at_least(Some("0.38.0"), (0, 39)));
+        assert!(super::runtime_version_at_least(Some("0.39.0"), (0, 39)));
+        assert!(super::runtime_version_at_least(Some("1.0.0"), (0, 39)));
+        assert!(super::runtime_version_at_least(None, (0, 39)));
         backend_port::reset_for_tests();
     }
 

@@ -6328,8 +6328,11 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
     let state: tauri::State<'_, AppState> = app.state();
     client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
     state.stop_headroom();
-    if let Err(err) = state.ensure_headroom_running() {
-        log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+    // Paused stays paused: resume spawns the backend with the new flag.
+    if !state.runtime_is_paused() {
+        if let Err(err) = state.ensure_headroom_running() {
+            log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+        }
     }
     state.invalidate_runtime_status_cache();
     let action = if enabled { "enabled" } else { "disabled" };
@@ -6352,8 +6355,11 @@ async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<
         let state: tauri::State<'_, AppState> = app.state();
         client_adapters::set_compression_diffs_enabled(enabled).map_err(|err| err.to_string())?;
         state.stop_headroom();
-        if let Err(err) = state.ensure_headroom_running() {
-            log::warn!("set_compression_diffs_enabled: proxy restart failed: {err:#}");
+        // Paused stays paused: resume spawns the backend with the new flag.
+        if !state.runtime_is_paused() {
+            if let Err(err) = state.ensure_headroom_running() {
+                log::warn!("set_compression_diffs_enabled: proxy restart failed: {err:#}");
+            }
         }
         state.invalidate_runtime_status_cache();
         let action = if enabled { "enabled" } else { "disabled" };
@@ -6365,9 +6371,9 @@ async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<
 
 type RawJson = Box<serde_json::value::RawValue>;
 
-/// The backend keeps bodies on its newest 10 log entries (the sitecustomize
+/// The backend keeps bodies on its newest 20 log entries (the sitecustomize
 /// message_window setting), so ask for no more than that.
-const TILE_BODIES_FEED_LIMIT: u32 = 10;
+const TILE_BODIES_FEED_LIMIT: u32 = 20;
 
 /// One tile request's messages before and after compression, kept as raw JSON:
 /// a transcript is MBs, and the desktop only hands it to the frontend verbatim.
@@ -6408,10 +6414,15 @@ fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
     if missing.is_empty() {
         return;
     }
-    // A failed pull leaves them missing, so the next tick retries.
-    if let Ok(found) = fetch_request_bodies_from("http://127.0.0.1:6767", &missing) {
-        TILE_BODIES.lock().extend(found);
-    }
+    // A failed pull is not retried: it serializes every body in the backend's
+    // window on its event loop, and one that timed out on a large transcript
+    // would time out again on every tick until the request aged out.
+    let found =
+        fetch_request_bodies_from("http://127.0.0.1:6767", &missing).unwrap_or_else(|err| {
+            log::debug!("tile bodies pull failed: {err}");
+            missing.into_iter().map(|id| (id, None)).collect()
+        });
+    TILE_BODIES.lock().extend(found);
 }
 
 fn fetch_request_bodies_from(
@@ -6632,6 +6643,15 @@ fn spawn_crash_guard() {
     #[cfg(target_os = "linux")]
     let exe = std::env::var_os("APPIMAGE")
         .filter(|image| !image.is_empty())
+        // Only our own image: a shell started from another AppImage leaks its
+        // APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard would
+        // start that app. tauri-utils' current_exe makes the same check.
+        .filter(
+            |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
+                (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
+                _ => false,
+            },
+        )
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_exe().ok());
     #[cfg(not(target_os = "linux"))]
@@ -10559,8 +10579,9 @@ fn spawn_tray_savings_updater(app: AppHandle) {
     // fast enough that the badge feels live during active traffic and slow
     // enough that `build_dashboard` runs ~3x/min instead of 12x/min.
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+    // Samples before sleeping: the tray headline otherwise reads $0.00 for the
+    // first 20s after launch.
     std::thread::spawn(move || loop {
-        std::thread::sleep(INTERVAL);
         let state: tauri::State<'_, AppState> = app.state();
         let dashboard = state.dashboard();
         let today_key = Local::now().format("%Y-%m-%d").to_string();
@@ -10576,6 +10597,7 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
         *savings_state.0.lock() = savings;
         let _ = app.emit("savings-today-updated", savings);
+        std::thread::sleep(INTERVAL);
     });
 }
 
@@ -12941,7 +12963,7 @@ mod tests {
         // Bodies only come without include_messages=0, and only the window holds them.
         assert_eq!(
             server.join().unwrap(),
-            "GET /transformations/feed?limit=10 HTTP/1.1"
+            "GET /transformations/feed?limit=20 HTTP/1.1"
         );
 
         let get = |id: &str| found.iter().find(|(i, _)| i == id).unwrap().1.as_ref();

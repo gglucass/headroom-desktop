@@ -1866,8 +1866,9 @@ async fn handle(
     // backend is up (e.g. during bootstrap). Once per process; server is
     // first-write-wins so an extra send is cheap.
     //
-    // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop polls
-    // its own dashboard through this listener (`127.0.0.1:6767/stats`), so
+    // `!is_local_backend_path` is load-bearing, not a tidy-up: the desktop
+    // probes its own front door through this listener (`127.0.0.1:6767/readyz`;
+    // `/stats` did too until RUST-86 moved it to the backend port), so
     // without the guard the app fired this beacon at itself on the first
     // successful poll after bootstrap -- landing in the same second as
     // `bootstrap_completed`, before any client was even configured, and
@@ -2833,8 +2834,16 @@ fn parse_claude_plan_usage(head: &[u8]) -> Option<ClaudePlanUsage> {
         let header = |field: &str| {
             extract_header_value(head, &format!("anthropic-ratelimit-unified-{name}-{field}"))
         };
+        // Rust parses "NaN"/"inf"; serde_json writes them as null, which
+        // claude-statusline.json then fails to load and is reset.
+        let utilization = header("utilization")?
+            .parse::<f64>()
+            .ok()
+            .filter(|u| u.is_finite())?;
         Some(PlanWindow {
-            used_percent: header("utilization")?.parse::<f64>().ok()? * 100.0,
+            // To hundredths of a percent: 0.29 * 100.0 is 28.999..., which the
+            // readers' truncation would show as 28.
+            used_percent: (utilization * 10_000.0).round() / 100.0,
             resets_at: header("reset")?.parse().ok()?,
         })
     };
@@ -2873,7 +2882,8 @@ fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot>
         let used_percent: f64 = headers
             .get(&format!("x-codex-{prefix}-used-percent"))?
             .parse()
-            .ok()?;
+            .ok()
+            .filter(|v: &f64| v.is_finite())?;
         let window_minutes = headers
             .get(&format!("x-codex-{prefix}-window-minutes"))
             .and_then(|v| v.parse::<i64>().ok());
@@ -4904,8 +4914,8 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
-    /// The desktop polls its own dashboard through this listener
-    /// (`127.0.0.1:6767/stats`), so a local path reaching a live backend must
+    /// The desktop probes its own front door through this listener
+    /// (`127.0.0.1:6767/readyz`), so a local path reaching a live backend must
     /// not fire the `first_optimized_request` funnel beacon -- it is supposed to
     /// mean "a coding tool sent a request", and self-polling made it fire in the
     /// same second bootstrap finished, before any client was configured.
@@ -7163,6 +7173,16 @@ mod tests {
         assert!((five.used_percent - 34.5).abs() < 1e-9);
         assert_eq!(five.resets_at, 1_790_870_400);
         assert_eq!(usage.seven_day.expect("7d").resets_at, 1_791_216_000);
+        // 0.29 * 100.0 is 28.999...; the readers truncate, so it must land on 29.
+        let head = b"HTTP/1.1 200 OK\r\n\
+            anthropic-ratelimit-unified-5h-utilization: 0.29\r\n\
+            anthropic-ratelimit-unified-5h-reset: 1790870400\r\n\
+            anthropic-ratelimit-unified-7d-utilization: NaN\r\n\
+            anthropic-ratelimit-unified-7d-reset: 1791216000\r\n\r\n";
+        let usage = super::parse_claude_plan_usage(head).expect("usage");
+        assert_eq!(usage.five_hour.expect("5h").used_percent.trunc(), 29.0);
+        // A non-finite value would persist as null and reset the statusline file.
+        assert_eq!(usage.seven_day, None);
         // API-key traffic carries none of them.
         assert_eq!(
             super::parse_claude_plan_usage(
