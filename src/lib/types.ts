@@ -429,11 +429,10 @@ export interface TransformationRequestMessage {
 }
 
 // `get_compression_diff`: one tile request's messages before and after
-// compression, fetched when an Activity row is expanded. `logFullMessages` is
-// false when "Keep before/after" is off; the message lists are null when the
-// desktop holds no text for the request (it keeps them in memory only).
+// compression, fetched when an Activity row is expanded. The message lists are
+// null when the desktop holds no text for the request (it keeps them in memory
+// only).
 export interface CompressionDiffResponse {
-  logFullMessages: boolean;
   requestMessages: TransformationRequestMessage[] | null;
   compressedMessages: TransformationRequestMessage[] | null;
 }

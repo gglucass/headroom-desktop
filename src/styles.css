@@ -2636,8 +2636,7 @@ select {
   line-height: 1.4;
 }
 
-.optimize-card__auto-learn,
-.activity-card__diffs {
+.optimize-card__auto-learn {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2647,20 +2646,17 @@ select {
   border-top: 1px solid var(--border-subtle);
 }
 
-.optimize-card__auto-learn-text,
-.activity-card__diffs-text {
+.optimize-card__auto-learn-text {
   display: grid;
   gap: 2px;
 }
 
-.optimize-card__auto-learn-label,
-.activity-card__diffs-label {
+.optimize-card__auto-learn-label {
   font-size: var(--text-sm);
   color: var(--text-primary);
 }
 
-.optimize-card__auto-learn-meta,
-.activity-card__diffs-meta {
+.optimize-card__auto-learn-meta {
   font-size: var(--text-xs);
   color: var(--text-secondary);
 }
@@ -4489,7 +4485,6 @@ html.window-hiding {
   .optimize-project-row__status,
   .optimize-card__blurb,
   .optimize-card__auto-learn-meta,
-  .activity-card__diffs-meta,
   .optimize-minimal__blurb,
   .optimize-minimal__meta,
   .headroom-learn__progress p,
@@ -4521,7 +4516,6 @@ html.window-hiding {
 
   .optimize-project-row__name strong,
   .optimize-card__auto-learn-label,
-  .activity-card__diffs-label,
   .runtime-status__section-title {
     color: rgba(242, 237, 232, 0.9);
   }

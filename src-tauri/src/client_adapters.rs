@@ -225,22 +225,6 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&state)
 }
 
-/// "Keep before/after" in the Activity tab, on unless the user turned it off.
-/// The proxy is then spawned with `--log-messages`, holding the text of its
-/// last 20 requests so the desktop can copy out the two its tiles show.
-pub fn is_compression_diffs_enabled() -> bool {
-    !load_setup_state().compression_diffs_disabled
-}
-
-/// Persist the before/after switch. Only read when the proxy is spawned, so
-/// the caller restarts the backend for it to take effect.
-pub fn set_compression_diffs_enabled(enabled: bool) -> Result<()> {
-    let _setup = setup_write_lock();
-    let mut state = load_setup_state();
-    state.compression_diffs_disabled = !enabled;
-    write_setup_state(&state)
-}
-
 /// True when the user turned the Claude Code savings statusline off.
 pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
@@ -2747,11 +2731,6 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
-    /// User turned "Keep before/after" off in the Activity tab. When false the
-    /// proxy holds the text of its last 20 requests, readable from its
-    /// loopback /transformations/feed by any local account.
-    #[serde(default)]
-    compression_diffs_disabled: bool,
     /// User turned the Claude Code statusline off in Settings > Advanced. When
     /// true, client setup skips installing it.
     #[serde(default)]
@@ -8218,7 +8197,12 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 ///
 /// Plain bash, parsing with regexes, because it runs every second
 /// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
-/// Stays bash 3.2 compatible (macOS /bin/bash): no EPOCHREALTIME, no printf %T.
+/// No subshells or external commands on the common path: under Git Bash each
+/// is an MSYS fork, and the six per render this used to cost took +8.3% of a
+/// 2-vCPU Windows VM per Claude Code session, +3.5% without them (win-test,
+/// 2026-10-01). Stays bash 3.2
+/// compatible (macOS /bin/bash): EPOCHSECONDS (bash 5) falls back to `date`,
+/// no EPOCHREALTIME, no printf %T.
 fn build_claude_statusline_script(state_path: &Path) -> String {
     let state = shell_double_quote(&state_path.to_string_lossy());
     let warn = crate::TRAY_USAGE_RESET_SHOWN_AT_PERCENT as u32;
@@ -8229,7 +8213,7 @@ state_file="{state}"
 flash_secs=4
 compress_secs=2
 IFS= read -r -d '' input
-now_s=$(date +%s)
+now_s=${{EPOCHSECONDS:-$(date +%s)}}
 now_ms=$(( now_s * 1000 ))
 usage=
 win() {{
@@ -8252,21 +8236,23 @@ fmt() {{
   local n=$1 d u t
   if [ "$n" -ge 999500 ]; then d=1000000 u=M
   elif [ "$n" -ge 1000 ]; then d=1000 u=k
-  else echo "$n"; return; fi
+  else fmt_out=$n; return; fi
   t=$(( (n * 10 + d / 2) / d ))
-  if [ "$t" -ge 100 ]; then echo "$(( (n + d / 2) / d ))$u"
-  elif [ $(( t % 10 )) -eq 0 ]; then echo "$(( t / 10 ))$u"
-  else echo "$(( t / 10 )).$(( t % 10 ))$u"; fi
+  if [ "$t" -ge 100 ]; then fmt_out="$(( (n + d / 2) / d ))$u"
+  elif [ $(( t % 10 )) -eq 0 ]; then fmt_out="$(( t / 10 ))$u"
+  else fmt_out="$(( t / 10 )).$(( t % 10 ))$u"; fi
 }}
 saved=
 if [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] && [ -r "$state_file" ]; then
   sid=${{BASH_REMATCH[1]}}
-  state=$(<"$state_file")
+  IFS= read -r -d '' state < "$state_file"
   if [[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]]; then
     total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
-    line="Headroom saved $(fmt "$total") tokens this session"
+    fmt "$total"
+    line="Headroom saved $fmt_out tokens this session"
     if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
-      saved=$'\033[1;32m'"$line (+$(fmt "$last"))"$'\033[0m'
+      fmt "$last"
+      saved=$'\033[1;32m'"$line (+$fmt_out)"$'\033[0m'
     elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
       saved=$'\033[32mHeadroom compressing...\033[0m'
     elif [ "$total" -gt 0 ]; then
@@ -11129,7 +11115,6 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
-            compression_diffs_disabled: false,
             statusline_disabled: false,
             setup_versions: BTreeMap::new(),
         };

@@ -116,7 +116,6 @@ export function ActivityFeed({
           <p className="activity-card__blurb">
             Large compressions, learnings and daily records.
           </p>
-          <KeepDiffsSwitch />
         </header>
       </article>
       {error ? (
@@ -278,62 +277,6 @@ function ExpandableRow({
   );
 }
 
-/**
- * "Keep before/after", on by default: the proxy holds the text of its last 20
- * requests and the desktop copies out the two the tiles show. Off holds
- * nothing. Flipping it restarts the backend.
- */
-function KeepDiffsSwitch() {
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    let active = true;
-    void invoke<boolean>("get_compression_diffs_enabled")
-      .then((value) => active && setEnabled(value))
-      .catch(() => active && setEnabled(true));
-    return () => {
-      active = false;
-    };
-  }, []);
-  /* v8 ignore start - click handler needs a DOM and a Tauri backend. */
-  async function toggle() {
-    setBusy(true);
-    try {
-      setEnabled(
-        await invoke<boolean>("set_compression_diffs_enabled", { enabled: enabled === false })
-      );
-    } catch (error) {
-      console.error("Failed to update Keep before/after", error);
-    } finally {
-      setBusy(false);
-    }
-  }
-  /* v8 ignore stop */
-  return (
-    <div className="activity-card__diffs">
-      <div className="activity-card__diffs-text">
-        <span className="activity-card__diffs-label">Keep before/after</span>
-        <span className="activity-card__diffs-meta">
-          {enabled === false
-            ? "Off. Turn on to see exactly what a compression removed."
-            : "Expand a compression to see what was removed. The text stays in memory on this computer, for the last 20 requests and the two shown here."}
-        </span>
-      </div>
-      <button
-        aria-checked={enabled ?? true}
-        aria-label={`${enabled === false ? "Enable" : "Disable"} keep before/after`}
-        className={`connector-switch${enabled === false ? "" : " is-on"}`}
-        disabled={enabled === null || busy}
-        onClick={() => void toggle()}
-        role="switch"
-        type="button"
-      >
-        <span className="connector-switch__thumb" />
-      </button>
-    </div>
-  );
-}
-
 // Flatten a message/block `content` value to text. Anthropic sends a block
 // list, OpenAI a string. `tool_result` blocks carry their (compressible)
 // payload in `block.content`, a string or nested block list, not in
@@ -483,8 +426,6 @@ function CompressionDiff({ requestId }: { requestId: string }) {
     body = "Could not load the request text.";
   } else if (!result) {
     body = "Loading...";
-  } else if (!result.logFullMessages) {
-    body = "Turn on Keep before/after above to see what this compression removed.";
   } else if (result.requestMessages?.length && !result.compressedMessages) {
     body = "Headroom does not record the text before compression for this kind of request.";
   } else if (!view) {

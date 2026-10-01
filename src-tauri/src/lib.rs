@@ -6340,35 +6340,6 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
     Ok(!client_adapters::is_auto_learn_disabled())
 }
 
-#[tauri::command]
-fn get_compression_diffs_enabled() -> bool {
-    client_adapters::is_compression_diffs_enabled()
-}
-
-/// Toggle "Keep before/after" in the Activity tab (on by default): whether the
-/// proxy runs with --log-messages so the compression and record tiles can show
-/// a diff. Read only when the proxy is spawned, so restart it here; turning it
-/// off also drops whatever text the old backend held.
-#[tauri::command]
-async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    run_lifecycle_command(app, move |app| {
-        let state: tauri::State<'_, AppState> = app.state();
-        client_adapters::set_compression_diffs_enabled(enabled).map_err(|err| err.to_string())?;
-        state.stop_headroom();
-        // Paused stays paused: resume spawns the backend with the new flag.
-        if !state.runtime_is_paused() {
-            if let Err(err) = state.ensure_headroom_running() {
-                log::warn!("set_compression_diffs_enabled: proxy restart failed: {err:#}");
-            }
-        }
-        state.invalidate_runtime_status_cache();
-        let action = if enabled { "enabled" } else { "disabled" };
-        analytics::track_event(&app, &format!("compression_diffs_{action}"), None);
-        Ok(client_adapters::is_compression_diffs_enabled())
-    })
-    .await
-}
-
 type RawJson = Box<serde_json::value::RawValue>;
 
 /// The backend keeps bodies on its newest 20 log entries (the sitecustomize
@@ -6406,7 +6377,7 @@ fn tile_bodies_to_fetch(
 /// bigger compression, a stale pick or a new record.
 fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
     if !log_full_messages {
-        // Off, or a backend that predates the switch: hold nothing.
+        // A runtime too old for --log-messages: hold nothing.
         TILE_BODIES.lock().clear();
         return;
     }
@@ -6479,8 +6450,6 @@ fn fetch_request_bodies_from(
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompressionDiffResponse {
-    // False when "Keep before/after" is off.
-    log_full_messages: bool,
     // None when the desktop holds no text for this request (see TILE_BODIES).
     request_messages: Option<RawJson>,
     compressed_messages: Option<RawJson>,
@@ -6496,7 +6465,6 @@ fn get_compression_diff(request_id: String) -> CompressionDiffResponse {
         .find(|(id, _)| *id == request_id)
         .and_then(|(_, bodies)| bodies.clone());
     CompressionDiffResponse {
-        log_full_messages: client_adapters::is_compression_diffs_enabled(),
         request_messages: held.as_ref().map(|b| b.request_messages.clone()),
         compressed_messages: held.and_then(|b| b.compressed_messages),
     }
@@ -7642,8 +7610,6 @@ pub fn run() {
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
-            get_compression_diffs_enabled,
-            set_compression_diffs_enabled,
             get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,

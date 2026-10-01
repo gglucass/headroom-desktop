@@ -783,7 +783,7 @@ describe("before/after", () => {
   const diffResponse = (overrides: object) =>
     invokeMock.mockImplementation(async (command: string) =>
       command === "get_compression_diff"
-        ? { logFullMessages: true, requestMessages: null, compressedMessages: null, ...overrides }
+        ? { requestMessages: null, compressedMessages: null, ...overrides }
         : false
     );
   const expand = async () => {
@@ -799,12 +799,6 @@ describe("before/after", () => {
     await expand();
     expect(await screen.findByText("- noise")).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith("get_compression_diff", { requestId: "req-1" });
-  });
-
-  it("points at the switch when the proxy keeps no request text", async () => {
-    diffResponse({ logFullMessages: false });
-    await expand();
-    expect(await screen.findByText(/Turn on Keep before\/after above/)).toBeInTheDocument();
   });
 
   it("does not claim nothing was removed when the proxy kept no compressed side", async () => {

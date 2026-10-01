@@ -1560,7 +1560,7 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 # --- Request-log body window: 20, not 100 (desktop setting) -------------------
-# With "Keep before/after" on (--log-messages, the Activity default) the wheel
+# With --log-messages (the Activity before/after view) the wheel
 # keeps request, compressed and response bodies on its newest
 # RequestLogger.MESSAGE_WINDOW (100) entries, each one a whole transcript. The
 # desktop copies the two it shows (the large-compression and record tiles) into
@@ -4260,8 +4260,8 @@ impl ToolManager {
             } else {
                 vec![(python.clone(), headroom_python_startup_args())]
             };
-            // On unless the user turned "Keep before/after" off in the Activity
-            // tab; the sitecustomize message_window narrows what it keeps. The
+            // For the Activity before/after view; the sitecustomize
+            // message_window narrows what it keeps. The
             // arg helpers never pass it, see
             // backend_is_never_asked_to_keep_message_bodies.
             if backend_keeps_message_bodies(self.installed_headroom_version().as_deref()) {
@@ -11394,8 +11394,7 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
 /// log entry, the 100 GB RSS incident, and the sitecustomize message_window
 /// cannot bind there.
 fn backend_keeps_message_bodies(installed_version: Option<&str>) -> bool {
-    crate::client_adapters::is_compression_diffs_enabled()
-        && runtime_version_at_least(installed_version, (0, 39))
+    runtime_version_at_least(installed_version, (0, 39))
 }
 
 /// Unknown/unparseable version means the receipt is from a current install,
@@ -11596,7 +11595,7 @@ fn headroom_entrypoint_startup_args(
     // entrypoint defines it (see runtime_supports_no_http2). No --log-messages:
     // it keeps the last 100 full prompts and completions readable from
     // /transformations/feed by any local account. The spawn site adds it
-    // unless the user turned "Keep before/after" off in the Activity tab.
+    // for the Activity before/after view (backend_keeps_message_bodies).
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
@@ -11751,9 +11750,10 @@ pub fn running_proxy_matches_expected_args() -> bool {
         )
 }
 
-/// --log-messages must follow the "Keep before/after" switch both ways: a
-/// backend holding prompt bodies after the user turned it off is restarted,
-/// and so is one missing it while it is on.
+/// --log-messages must follow backend_keeps_message_bodies both ways: a
+/// backend holding uncapped prompt bodies is restarted, and so is one missing
+/// them (including one spawned while the removed "Keep before/after" switch
+/// was off).
 fn proxy_argv_keeps_messages_as_set(argv: &str, keep_messages: bool) -> bool {
     argv_contains_flag(argv, "--log-messages") == keep_messages
 }
@@ -19203,7 +19203,7 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     fn backend_is_never_asked_to_keep_message_bodies() {
         // --log-messages holds the last 100 full prompts and completions,
         // readable from /transformations/feed by any local account. Only the
-        // "Keep before/after" switch adds it, at the spawn site.
+        // spawn site adds it, gated on backend_keeps_message_bodies.
         backend_port::reset_for_tests();
         let flag = "--log-messages".to_string();
         for learn in [true, false] {
