@@ -74,7 +74,7 @@ use crate::models::{
     ClaudeAccountProfile, ClaudeCodeProject, ClaudePlanUsage, ClaudeUsage, ClientConnectorStatus,
     ClientSetupResult, CodexRateLimitSnapshot, DailySavingsPoint, DashboardState,
     HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, PlanWindow, RuntimeStatus, RuntimeUpgradeProgress,
+    HeadroomSubscriptionTier, LabeledPlanWindow, PlanWindow, RuntimeStatus, RuntimeUpgradeProgress,
     TransformationFeedResponse,
 };
 use crate::state::AppState;
@@ -6337,6 +6337,102 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
 }
 
 #[tauri::command]
+fn get_compression_diffs_enabled() -> bool {
+    client_adapters::is_compression_diffs_enabled()
+}
+
+/// Toggle "Keep before/after" in the Activity tab: whether the proxy holds the
+/// text of its last 100 requests so a compression can be shown as a diff.
+/// Read only when the proxy is spawned, so restart it here; turning it off
+/// also drops whatever text the old backend held.
+#[tauri::command]
+async fn set_compression_diffs_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    run_lifecycle_command(app, move |app| {
+        let state: tauri::State<'_, AppState> = app.state();
+        client_adapters::set_compression_diffs_enabled(enabled).map_err(|err| err.to_string())?;
+        state.stop_headroom();
+        if let Err(err) = state.ensure_headroom_running() {
+            log::warn!("set_compression_diffs_enabled: proxy restart failed: {err:#}");
+        }
+        state.invalidate_runtime_status_cache();
+        let action = if enabled { "enabled" } else { "disabled" };
+        analytics::track_event(&app, &format!("compression_diffs_{action}"), None);
+        Ok(client_adapters::is_compression_diffs_enabled())
+    })
+    .await
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressionDiffResponse {
+    // False when the backend does not keep request text at all.
+    log_full_messages: bool,
+    // None when the request has aged out of the backend's 100-request window
+    // (or predates a backend restart).
+    request_messages: Option<serde_json::Value>,
+    compressed_messages: Option<serde_json::Value>,
+}
+
+/// Original and compressed messages of one request, fetched only when the user
+/// expands an Activity row. The observer's poll stays on include_messages=0
+/// (RUST-86); this pull carries bodies, so it runs once per expand.
+#[tauri::command]
+async fn get_compression_diff(request_id: String) -> Result<CompressionDiffResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_compression_diff_from("http://127.0.0.1:6767", &request_id)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn fetch_compression_diff_from(
+    base_url: &str,
+    request_id: &str,
+) -> Result<CompressionDiffResponse, String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        request_id: Option<String>,
+        #[serde(default)]
+        request_messages: Option<serde_json::Value>,
+        #[serde(default)]
+        compressed_messages: Option<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Feed {
+        log_full_messages: bool,
+        transformations: Vec<Entry>,
+    }
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
+        .build()
+        .map_err(|err| err.to_string())?;
+    // limit=100 is the backend's cap and its MESSAGE_WINDOW: older entries
+    // have had their bodies dropped already.
+    let response = client
+        .get(format!("{base_url}/transformations/feed?limit=100"))
+        .send()
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("proxy returned HTTP {}", response.status()));
+    }
+    let feed: Feed = response.json().map_err(|err| err.to_string())?;
+    let entry = feed
+        .transformations
+        .into_iter()
+        .find(|e| e.request_id.as_deref() == Some(request_id));
+    let (request_messages, compressed_messages) = entry
+        .map(|e| (e.request_messages, e.compressed_messages))
+        .unwrap_or((None, None));
+    Ok(CompressionDiffResponse {
+        log_full_messages: feed.log_full_messages,
+        request_messages,
+        compressed_messages,
+    })
+}
+
+#[tauri::command]
 async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     // Prevent the launch-time OSS-plugin worker from mutating Claude's hook
     // cache after cleanup has restored it.
@@ -7467,6 +7563,9 @@ pub fn run() {
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
+            get_compression_diffs_enabled,
+            set_compression_diffs_enabled,
+            get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
             uninstall_and_quit,
@@ -9208,12 +9307,12 @@ fn tray_savings_line(today: TraySavingsToday) -> String {
 }
 
 /// One line per plan, as last reported: Claude from the
-/// `anthropic-ratelimit-unified-*` headers or the usage fetch (kept across
-/// launches), Codex from `x-codex-*`. A window whose reset time has passed is
-/// back at 0; a plan with nothing reported gets no line.
+/// `anthropic-ratelimit-unified-*` headers or the usage fetch, Codex from
+/// `x-codex-*`, both kept across launches. A window whose reset time has
+/// passed is back at 0; a plan with nothing reported gets no line.
 fn tray_usage_lines(
     claude: Option<ClaudePlanUsage>,
-    codex: Option<&CodexRateLimitSnapshot>,
+    codex: Option<Vec<LabeledPlanWindow>>,
     now: i64,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -9229,29 +9328,37 @@ fn tray_usage_lines(
         ));
     }
     if let Some(codex) = codex {
-        let windows = [&codex.primary, &codex.secondary]
-            .into_iter()
-            .flatten()
-            .filter_map(|w| {
-                let label = match w.window_minutes? {
-                    10_080 => "week".to_string(),
-                    minutes => w
-                        .window_label
-                        .clone()
-                        .unwrap_or_else(|| format!("{minutes}m")),
-                };
-                let resets_at = codex.captured_at + w.seconds_until_reset?;
-                Some((
-                    label,
-                    PlanWindow {
-                        used_percent: w.used_percent,
-                        resets_at,
-                    },
-                ))
-            });
-        lines.extend(plan_usage_line("Codex", windows, now));
+        lines.extend(plan_usage_line(
+            "Codex",
+            codex.into_iter().map(|w| (w.label, w.window)),
+            now,
+        ));
     }
     lines
+}
+
+/// Codex's windows from a captured snapshot, its weekly one labelled "week".
+fn codex_plan_windows(codex: &CodexRateLimitSnapshot) -> Vec<LabeledPlanWindow> {
+    [&codex.primary, &codex.secondary]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            let label = match w.window_minutes? {
+                10_080 => "week".to_string(),
+                minutes => w
+                    .window_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{minutes}m")),
+            };
+            Some(LabeledPlanWindow {
+                label,
+                window: PlanWindow {
+                    used_percent: w.used_percent,
+                    resets_at: codex.captured_at + w.seconds_until_reset?,
+                },
+            })
+        })
+        .collect()
 }
 
 fn plan_usage_line(
@@ -9643,16 +9750,27 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                 }
 
-                let codex = {
+                let codex_live = {
                     let state: tauri::State<'_, AppState> = app.state();
                     let codex = state.codex_rate_limits.lock().clone();
                     codex
+                }
+                .map(|snapshot| codex_plan_windows(&snapshot))
+                .filter(|windows| !windows.is_empty());
+                // Kept for the next launch, which has no snapshot until
+                // Codex's first response.
+                let codex = match codex_live {
+                    Some(windows) => {
+                        claude_statusline::record_codex_plan_usage(windows.clone());
+                        Some(windows)
+                    }
+                    None => claude_statusline::codex_plan_usage(),
                 };
                 let menu_info = (
                     tray_savings_line(today),
                     tray_usage_lines(
                         claude_statusline::plan_usage(),
-                        codex.as_ref(),
+                        codex,
                         Utc::now().timestamp(),
                     ),
                 );
@@ -11031,7 +11149,7 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, feed_failure_is_persistent, feed_pull_limit,
+        fake_override, feed_failure_is_persistent, feed_pull_limit, fetch_compression_diff_from,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
         give_up_startup_key, install_pending_update, is_blocked_runtime_dll_signal,
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
@@ -12722,6 +12840,69 @@ mod tests {
         assert_eq!(cached.savings_percent, None);
         assert_eq!(cached.input_tokens_original, None);
         assert_eq!(cached.input_tokens_optimized, None);
+    }
+
+    #[test]
+    fn fetch_compression_diff_picks_the_request_and_asks_for_bodies() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                );
+                let body = serde_json::json!({
+                    "log_full_messages": true,
+                    "transformations": [
+                        {"request_id": "hr_1", "request_messages": [{"role": "user", "content": "a"}],
+                         "compressed_messages": null},
+                        {"request_id": "hr_2", "request_messages": [{"role": "user", "content": "long"}],
+                         "compressed_messages": [{"role": "user", "content": "short"}]}
+                    ]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            paths
+        });
+
+        let base = format!("http://127.0.0.1:{port}");
+        let hit = fetch_compression_diff_from(&base, "hr_2").unwrap();
+        // Aged out of the backend's window: reachable, but nothing to diff.
+        let gone = fetch_compression_diff_from(&base, "hr_old").unwrap();
+        let paths = server.join().unwrap();
+
+        // Bodies are only in the default response; include_messages=0 drops them.
+        assert!(paths
+            .iter()
+            .all(|p| p.starts_with("GET /transformations/feed?limit=100 ")));
+        assert!(hit.log_full_messages);
+        assert_eq!(
+            hit.request_messages,
+            Some(serde_json::json!([{"role": "user", "content": "long"}]))
+        );
+        assert_eq!(
+            hit.compressed_messages,
+            Some(serde_json::json!([{"role": "user", "content": "short"}]))
+        );
+        assert!(gone.log_full_messages);
+        assert!(gone.request_messages.is_none() && gone.compressed_messages.is_none());
     }
 
     #[test]
@@ -15996,7 +16177,8 @@ Some unrelated content.
             super::tray_usage_lines(None, None, now),
             Vec::<String>::new()
         );
-        let lines = super::tray_usage_lines(Some(claude), Some(&codex), now);
+        let lines =
+            super::tray_usage_lines(Some(claude), Some(super::codex_plan_windows(&codex)), now);
         assert_eq!(lines[0], "Claude usage: 5h 34%, week 62%");
         assert!(
             lines[1].starts_with("Codex usage: 5h 0%, week 88% (resets "),

@@ -1,8 +1,14 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
-import { ActivityFeed, groupTransforms } from "./ActivityFeed";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ActivityFeed,
+  collapseDiff,
+  diffLines,
+  formatRequestMessages,
+  groupTransforms
+} from "./ActivityFeed";
 import type {
   ActivityFeedResponse,
   ActivityFeedSnapshot,
@@ -13,6 +19,16 @@ import type {
   TransformationFeedEvent,
   WeeklyRecapEvent
 } from "../lib/types";
+
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args)
+}));
+
+beforeEach(() => {
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(false);
+});
 
 const emptyTiles: ActivityFeedSnapshot = {
   transformation: null,
@@ -762,3 +778,187 @@ describe("groupTransforms", () => {
     expect(result[0].targets).toEqual([]);
   });
 });
+
+describe("before/after", () => {
+  const diffResponse = (overrides: object) =>
+    invokeMock.mockImplementation(async (command: string) =>
+      command === "get_compression_diff"
+        ? { logFullMessages: true, requestMessages: null, compressedMessages: null, ...overrides }
+        : false
+    );
+  const expand = async () => {
+    render(<ActivityFeed feed={feedWith({ transformation: transformation() })} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: /Recent large compression/ }));
+  };
+
+  it("fetches the expanded request and marks what compression removed", async () => {
+    diffResponse({
+      requestMessages: [{ role: "user", content: "keep\nnoise" }],
+      compressedMessages: [{ role: "user", content: "keep" }]
+    });
+    await expand();
+    expect(await screen.findByText("- noise")).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("get_compression_diff", { requestId: "req-1" });
+  });
+
+  it("points at the switch when the proxy keeps no request text", async () => {
+    diffResponse({ logFullMessages: false });
+    await expand();
+    expect(await screen.findByText(/Turn on Keep before\/after above/)).toBeInTheDocument();
+  });
+
+  it("says so when the request has aged out of the proxy's window", async () => {
+    diffResponse({});
+    await expand();
+    expect(await screen.findByText(/No longer held/)).toBeInTheDocument();
+  });
+});
+
+describe("formatRequestMessages", () => {
+  it("emits role + plain string content (OpenAI shape)", () => {
+    expect(
+      formatRequestMessages([
+        { role: "user", content: "please refactor parseFoo" },
+        { role: "assistant", content: "ok - reading it now" }
+      ])
+    ).toBe("user:\nplease refactor parseFoo\n\nassistant:\nok - reading it now");
+  });
+
+  it("flattens Anthropic content-block lists, keeping text verbatim", () => {
+    expect(
+      formatRequestMessages([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "text", text: "reading the file" }
+          ]
+        }
+      ])
+    ).toBe("assistant:\nlet me check\nreading the file");
+  });
+
+  it("marks non-text blocks with [type] so they are not silently dropped", () => {
+    // A tool_use or tool_result block has no surfaced `text` - rather than
+    // show nothing, the formatter inserts a `[tool_use]` marker so the
+    // reader knows something non-text was in the message.
+    expect(
+      formatRequestMessages([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "done, running it:" },
+            { type: "tool_use", name: "Bash" }
+          ]
+        }
+      ])
+    ).toBe("assistant:\ndone, running it:\n[tool_use]");
+  });
+
+  it("surfaces tool_result payload from block.content so compression is diffable", () => {
+    // kompress shrinks the *content* of tool_result blocks. That payload lives
+    // in `block.content` (string or nested text blocks), not `block.text`, so
+    // it must be flattened - otherwise both diff sides render a bare
+    // [tool_result] and the diff shows no change.
+    expect(
+      formatRequestMessages([
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "x", content: "huge tool output here" }
+          ]
+        }
+      ])
+    ).toBe("user:\nhuge tool output here");
+    expect(
+      formatRequestMessages([
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "x",
+              content: [
+                { type: "text", text: "line one" },
+                { type: "text", text: "line two" }
+              ]
+            }
+          ]
+        }
+      ])
+    ).toBe("user:\nline one\nline two");
+  });
+
+  it("labels a missing role as (unknown) instead of rendering a bare newline", () => {
+    expect(formatRequestMessages([{ content: "orphan content" }])).toBe(
+      "(unknown):\norphan content"
+    );
+  });
+
+  it("survives block shapes the proxy log can hand it", () => {
+    // Everything here comes off the wire, so no shape is guaranteed. The rule
+    // is the same throughout: render what is legible, drop what is not, never
+    // throw -- a malformed block must not take the whole detail view down.
+    const cases: Array<[unknown, string]> = [
+      [null, ""], // content absent entirely
+      [42, ""], // neither string nor block list
+      [{ type: "text", text: "not in a list" }, ""], // a bare block, unwrapped
+      [[null, "raw string entry", { type: "text", text: "kept" }], "kept"],
+      [[{ tool_use_id: "x" }], ""], // no text, no content, no type
+      [[{ type: "tool_result", content: [] }], "[tool_result]"] // empty payload
+    ];
+    for (const [content, expected] of cases) {
+      expect(
+        formatRequestMessages([{ role: "user", content } as never])
+      ).toBe(`user:\n${expected}`);
+    }
+  });
+});
+
+describe("diffLines", () => {
+  it("marks removed, kept, and added lines", () => {
+    expect(diffLines("a\nb\nc", "a\nINSERTED\nc")).toEqual([
+      { type: "same", text: "a" },
+      { type: "del", text: "b" },
+      { type: "add", text: "INSERTED" },
+      { type: "same", text: "c" }
+    ]);
+  });
+
+  it("diffs large inputs that the old per-side line cap would have rejected", () => {
+    const original = Array.from({ length: 2000 }, (_, i) => String(i)).join("\n");
+    const compressed = Array.from({ length: 2000 }, (_, i) =>
+      i === 1000 ? "CHANGED" : String(i)
+    ).join("\n");
+    const diff = diffLines(original, compressed);
+    expect(diff).not.toBeNull();
+    expect(diff!.some((l) => l.type === "del" && l.text === "1000")).toBe(true);
+    expect(diff!.some((l) => l.type === "add" && l.text === "CHANGED")).toBe(true);
+  });
+
+  it("returns null only when the cell product exceeds the memory cap", () => {
+    const huge = Array.from({ length: 6000 }, (_, i) => String(i)).join("\n");
+    expect(diffLines(huge, huge)).toBeNull(); // 6001^2 ≈ 36M > 30M cap
+  });
+});
+
+describe("collapseDiff", () => {
+  it("collapses long unchanged runs while keeping context around changes", () => {
+    const original = Array.from({ length: 2000 }, (_, i) => String(i)).join("\n");
+    const compressed = Array.from({ length: 2000 }, (_, i) =>
+      i === 1000 ? "CHANGED" : String(i)
+    ).join("\n");
+    const collapsed = collapseDiff(diffLines(original, compressed)!, 3);
+    // The removed line survives and sits near the top of the collapsed output.
+    const delIdx = collapsed.findIndex((l) => l.type === "del" && l.text === "1000");
+    expect(delIdx).toBeGreaterThanOrEqual(0);
+    expect(delIdx).toBeLessThan(10);
+    // Thousands of identical lines are reduced to two skip markers.
+    expect(collapsed.filter((l) => l.type === "skip").length).toBe(2);
+    expect(collapsed.some((l) => l.type === "same" && l.text === "0")).toBe(false);
+    // Context lines immediately around the change are preserved.
+    expect(collapsed.some((l) => l.type === "same" && l.text === "999")).toBe(true);
+    expect(collapsed.some((l) => l.type === "same" && l.text === "1001")).toBe(true);
+  });
+});
+

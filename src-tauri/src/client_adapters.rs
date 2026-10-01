@@ -225,6 +225,22 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&state)
 }
 
+/// True when the user turned on "Keep before/after" in the Activity tab. The
+/// proxy is then spawned with `--log-messages`, holding the full text of its
+/// last 100 requests in memory so a compression can be shown as a diff.
+pub fn is_compression_diffs_enabled() -> bool {
+    load_setup_state().compression_diffs_enabled
+}
+
+/// Persist the before/after opt-in. Only read when the proxy is spawned, so
+/// the caller restarts the backend for it to take effect.
+pub fn set_compression_diffs_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    state.compression_diffs_enabled = enabled;
+    write_setup_state(&state)
+}
+
 /// True when the user turned the Claude Code savings statusline off.
 pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
@@ -2731,6 +2747,11 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
+    /// User turned on "Keep before/after" in the Activity tab. Off by default:
+    /// the proxy then holds the full text of its last 100 requests, readable
+    /// from its loopback /transformations/feed by any local account.
+    #[serde(default)]
+    compression_diffs_enabled: bool,
     /// User turned the Claude Code statusline off in Settings > Advanced. When
     /// true, client setup skips installing it.
     #[serde(default)]
@@ -11108,6 +11129,7 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
+            compression_diffs_enabled: false,
             statusline_disabled: false,
             setup_versions: BTreeMap::new(),
         };
@@ -17198,6 +17220,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     /// still ours, and a composed command that also runs ours is still not.
     #[test]
     fn our_statusline_is_recognised_behind_the_windows_bash_program() {
+        use super::is_our_statusline;
         let ours =
             |command: &str| is_our_statusline(&json!({ "type": "command", "command": command }));
         assert!(ours(
@@ -17326,6 +17349,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 }),
                 seven_day: None,
             }),
+            codex_plan_usage: None,
         };
         // Plus an entry as the previous build wrote it, without lastRequestAtMs.
         let json = serde_json::to_string(&persisted).unwrap().replacen(

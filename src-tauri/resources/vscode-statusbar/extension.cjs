@@ -40,9 +40,11 @@ function projectDirs(root, folders, readdir) {
       continue;
     }
     // The hash suffix is Claude Code's own; match on the truncated prefix.
-    const prefix = `${slug.slice(0, SLUG_MAX)}-`;
+    // Case-insensitively: on Windows VS Code reports the drive as `c:` where
+    // Claude Code's folder has `C--`.
+    const prefix = `${slug.slice(0, SLUG_MAX)}-`.toLowerCase();
     for (const name of readdir(root)) {
-      if (name.startsWith(prefix)) dirs.push(path.join(root, name));
+      if (name.toLowerCase().startsWith(prefix)) dirs.push(path.join(root, name));
     }
   }
   return dirs;

@@ -37,6 +37,12 @@ jobs:
     name: Windows x64 (download only)
     runs-on: windows-latest
     timeout-minutes: 45
+    # A job-level block replaces the workflow's, so restate contents.
+    # id-token + attestations are only for the provenance step below.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     env:
       # The stable endpoint on purpose: a fresh install of this build polls the
@@ -131,6 +137,14 @@ jobs:
         # also builds an MSI nothing publishes. signCommand signs both the inner
         # .exe and the installer.
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Attest build provenance
+        # Same as release-macos.yml: `gh attestation verify <file> --repo
+        # gglucass/headroom-desktop` must work on this installer too. Before
+        # publish on purpose: a failed attestation publishes nothing.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
 
       - name: Publish the installer as a prerelease
         shell: bash

@@ -1559,6 +1559,27 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
+# --- Request-log body window: 10, not 100 (desktop setting) -------------------
+# With "Keep before/after" on (--log-messages, the Activity default) the wheel
+# keeps request, compressed and response bodies on its newest
+# RequestLogger.MESSAGE_WINDOW (100) entries, each one a whole transcript. The
+# desktop copies the two it shows (the large-compression and record tiles) into
+# its own memory on the next 20s observer tick, so the backend only has to hold
+# them that long. Only ever narrows the wheel's own constant, so it is gated on
+# that attribute rather than an exact pin: a wheel without it reports skipped.
+# HEADROOM_MESSAGE_WINDOW=0 keeps the wheel's window.
+_hd_mw_size = _hd_os.environ.get("HEADROOM_MESSAGE_WINDOW", "10").strip()
+if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
+    try:
+        from headroom.proxy import request_logger as _hd_mw_mod
+
+        if int(_hd_mw_size) < getattr(_hd_mw_mod.RequestLogger, "MESSAGE_WINDOW", 0):
+            _hd_mw_mod.RequestLogger.MESSAGE_WINDOW = int(_hd_mw_size)
+            _hd_bound.add("message_window")
+    except Exception:
+        # Memory only: the wheel's 100-entry window stands.
+        pass
+
 # Quarantine only a saturated pool (no upstream PR yet):
 # the timeout-debt quarantine refuses ALL compression while even one
 # timed-out worker is still running, on a pool of cpu_count workers. One
@@ -2629,6 +2650,7 @@ _HD_VENDORS = (
     "prefix_replay_guard",
     "cc_switch_reset",
     "tool_ref_hint",
+    "message_window",
     "quarantine_spare_capacity",
     "ccr_repair_order",
     "kompress_fallback_units",
@@ -4221,7 +4243,7 @@ impl ToolManager {
             // proxy ends up trying to bind the foreign-held port.
             // Use the console_scripts entrypoint when available to avoid the Python
             // -m double-import RuntimeWarning. Fall back to -m if missing.
-            let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
+            let mut startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
                 vec![
                     (
                         entrypoint,
@@ -4235,6 +4257,13 @@ impl ToolManager {
             } else {
                 vec![(python.clone(), headroom_python_startup_args())]
             };
+            // Opt-in only ("Keep before/after" in the Activity tab): the arg
+            // helpers never pass it, see backend_is_never_asked_to_keep_message_bodies.
+            if crate::client_adapters::is_compression_diffs_enabled() {
+                for (_, args) in &mut startup_variants {
+                    args.push("--log-messages".to_string());
+                }
+            }
 
             for (executable, args) in &startup_variants {
                 let variant = if args.is_empty() {
@@ -6344,7 +6373,11 @@ impl ToolManager {
         let headroom_arg = if use_wheel {
             wheel_path.to_string_lossy().into_owned()
         } else {
-            headroom_spec.clone()
+            headroom_index_requirement(
+                &self.runtime.downloads_dir,
+                &release.version,
+                Some(&release.sha256),
+            )?
         };
         run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
@@ -7377,11 +7410,23 @@ impl ToolManager {
             percent: 75,
         });
 
-        let headroom_spec = format!("headroom-ai=={}", release.version);
         let headroom_arg = if use_wheel {
             wheel_path.to_string_lossy().into_owned()
         } else {
-            headroom_spec.clone()
+            match headroom_index_requirement(
+                &self.runtime.downloads_dir,
+                &release.version,
+                Some(&release.sha256),
+            ) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                    return UpgradeOutcome::InstallFailed {
+                        restored,
+                        error: err,
+                    };
+                }
+            }
         };
         // The dependency pass above can run for minutes, and the sweep at the
         // top of atomic_upgrade_headroom is that stale by now: an MCP server a
@@ -7499,7 +7544,9 @@ impl ToolManager {
     }
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
-        let spec = format!("headroom-ai=={version}");
+        let pinned = pinned_headroom_release()?;
+        let sha256 = (version == pinned.version).then_some(pinned.sha256.as_str());
+        let spec = headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
@@ -11524,9 +11571,8 @@ fn headroom_entrypoint_startup_args(
     // runtime regressing on the env var — but only on runtimes whose click
     // entrypoint defines it (see runtime_supports_no_http2). No --log-messages:
     // it keeps the last 100 full prompts and completions readable from
-    // /transformations/feed by any local account, and the desktop reads only
-    // the per-request numbers (include_messages=0). HEADROOM_LOG_MESSAGES=1
-    // in the launch environment still opts back in.
+    // /transformations/feed by any local account. The spawn site adds it only
+    // when the user turns on "Keep before/after" in the Activity tab.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
@@ -11669,18 +11715,27 @@ pub fn running_proxy_matches_expected_args() -> bool {
         // host we cannot introspect killed and respawned a healthy backend.
         return true;
     };
-    proxy_argv_contains_expected_flags(&argv, !crate::client_adapters::is_auto_learn_disabled())
+    proxy_argv_keeps_messages_as_set(
+        &argv,
+        crate::client_adapters::is_compression_diffs_enabled(),
+    ) && proxy_argv_contains_expected_flags(
+        &argv,
+        !crate::client_adapters::is_auto_learn_disabled(),
+    )
+}
+
+/// --log-messages must follow the "Keep before/after" switch both ways: a
+/// backend holding prompt bodies the user did not opt into (or one an older
+/// build started with it) is restarted, and so is one missing it after the
+/// user opted in.
+fn proxy_argv_keeps_messages_as_set(argv: &str, keep_messages: bool) -> bool {
+    argv_contains_flag(argv, "--log-messages") == keep_messages
 }
 
 fn proxy_argv_contains_expected_flags(argv: &str, learn_enabled: bool) -> bool {
     // A proxy still carrying --learn after the user turned auto-learning off is
     // as stale as one missing a flag: restart it so the opt-out takes effect.
     if !learn_enabled && argv_contains_flag(argv, "--learn") {
-        return false;
-    }
-    // Older builds passed --log-messages; such a backend still holds full
-    // prompt and completion bodies, so restart it rather than adopt it.
-    if argv_contains_flag(argv, "--log-messages") {
         return false;
     }
     // The `-m headroom.proxy.server` fallback cannot take the learn flags
@@ -12074,6 +12129,32 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 /// yields `ModuleNotFoundError: No module named 'headroom._core'` at proxy
 /// start (RUST-6E: every 0.7.7 Windows install). Keep this in step with
 /// `python_distribution_artifact`'s platform matrix.
+/// The `pip install` argument for headroom-ai `version` from the package
+/// index, used when the wheel's own download fails and for repairs. With the
+/// wheel's `sha256` it is hash-checked: the wheel is the PyPI file itself, and
+/// given its hash pip picks exactly that one and refuses anything else.
+/// Without one (rolling back to the previous engine after a failed update,
+/// whose hash this build does not carry) it installs unchecked.
+fn headroom_index_requirement(
+    downloads_dir: &Path,
+    version: &str,
+    sha256: Option<&str>,
+) -> Result<String> {
+    let spec = format!("headroom-ai=={version}");
+    let Some(sha256) = sha256 else {
+        return Ok(spec);
+    };
+    // pip takes --hash only from a requirements file.
+    let path = downloads_dir.join("headroom-ai-pinned.txt");
+    std::fs::create_dir_all(downloads_dir)
+        .with_context(|| format!("creating {}", downloads_dir.display()))?;
+    crate::client_adapters::atomic_write(
+        &path,
+        format!("{spec} --hash=sha256:{sha256}\n").as_bytes(),
+    )?;
+    Ok(format!("--requirement={}", path.display()))
+}
+
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
@@ -15213,18 +15294,18 @@ mod tests {
         pending_addon_update, pinned_headroom_release, pip_failure_category, pip_line_to_progress,
         plugin_addon, plugin_install_failure_category, pre_upstream_concurrency,
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
-        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
-        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
-        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
-        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        UNKNOWN_OCCUPANT,
+        proxy_argv_keeps_messages_as_set, purge_legacy_output_savings_control_arm_once,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
+        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
+        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
+        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -15245,6 +15326,30 @@ mod tests {
         lines.push("not-json".into());
         fs::write(&path, lines.join("\n")).expect("write obs");
         path
+    }
+
+    #[test]
+    fn index_fallback_for_the_pinned_engine_is_hash_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = super::pinned_headroom_release().unwrap();
+        let arg =
+            super::headroom_index_requirement(dir.path(), &pinned.version, Some(&pinned.sha256))
+                .unwrap();
+        let file = arg
+            .strip_prefix("--requirement=")
+            .expect("a requirements file");
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            format!(
+                "headroom-ai=={} --hash=sha256:{}\n",
+                pinned.version, pinned.sha256
+            )
+        );
+        // An older version has no hash in this build.
+        assert_eq!(
+            super::headroom_index_requirement(dir.path(), "0.1.0", None).unwrap(),
+            "headroom-ai==0.1.0"
+        );
     }
 
     #[test]
@@ -16314,6 +16419,51 @@ assert g.done"#,
                 "{flag} vendor shipped in the wheel; drop it"
             );
         }
+    }
+
+    #[test]
+    fn message_window_behaves_against_the_installed_wheel() {
+        // The desktop copies tile bodies out within one observer tick, so the
+        // backend keeps them on its newest 10 entries, not 100. Logs 12 entries
+        // through the installed RequestLogger and counts who kept a body.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.proxy.models import RequestLog
+from headroom.proxy.request_logger import RequestLogger
+rl = RequestLogger(log_full_messages=True)
+for i in range(12):
+    rl.log(RequestLog(request_id=str(i), timestamp="", provider="", model="",
+        input_tokens_original=0, input_tokens_optimized=0, output_tokens=None,
+        tokens_saved=0, savings_percent=0.0, optimization_latency_ms=0.0,
+        total_latency_ms=None, tags={}, cache_hit=False, transforms_applied=[],
+        request_messages=[{"role": "user", "content": "x"}]))
+print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
+    for e in rl.get_recent_with_messages(100)))
+"#;
+        let run = |size: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_MESSAGE_WINDOW", size)
+                .output()
+                .expect("run message window probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let on = run("10");
+        if on.starts_with("100 ") || on.is_empty() {
+            eprintln!("skipping: message window did not bind (wheel bumped?): {on:?}");
+            return;
+        }
+        assert_eq!(on, "10 10");
+        // Off keeps the wheel's window, which also proves the probe sees it.
+        assert_eq!(run("0"), "100 12");
     }
 
     #[test]
@@ -19026,9 +19176,8 @@ assert g.done"#,
     #[serial_test::serial]
     fn backend_is_never_asked_to_keep_message_bodies() {
         // --log-messages holds the last 100 full prompts and completions,
-        // readable from /transformations/feed by any local account. Nothing
-        // in the desktop reads them (the feed is fetched with
-        // include_messages=0).
+        // readable from /transformations/feed by any local account. Only the
+        // "Keep before/after" opt-in adds it, at the spawn site.
         backend_port::reset_for_tests();
         let flag = "--log-messages".to_string();
         for learn in [true, false] {
@@ -19038,12 +19187,18 @@ assert g.done"#,
             assert!(!super::expected_proxy_arg_signature(learn).contains(&"--log-messages"));
         }
         assert!(!headroom_python_startup_args().contains(&flag));
-        // A backend an older build started still holds bodies: restart it.
+        // A backend an older build started still holds bodies: restart it,
+        // unless the user has since opted in.
         let old = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
-        assert!(!proxy_argv_contains_expected_flags(old, false));
+        assert!(!proxy_argv_keeps_messages_as_set(old, false));
+        assert!(proxy_argv_keeps_messages_as_set(old, true));
         let old_fallback = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
                             --no-http2 --log-messages --no-rate-limit";
-        assert!(!proxy_argv_contains_expected_flags(old_fallback, true));
+        assert!(!proxy_argv_keeps_messages_as_set(old_fallback, false));
+        // Opting in restarts a backend that does not keep them yet.
+        let current = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
+        assert!(proxy_argv_keeps_messages_as_set(current, false));
+        assert!(!proxy_argv_keeps_messages_as_set(current, true));
         backend_port::reset_for_tests();
     }
 

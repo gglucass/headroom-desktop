@@ -1221,6 +1221,14 @@ pub struct PlanWindow {
     pub resets_at: i64,
 }
 
+/// A plan-usage window with its display label ("5h", "week").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabeledPlanWindow {
+    pub label: String,
+    pub window: PlanWindow,
+}
+
 /// Claude's plan usage, from its response headers or the usage endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -1343,6 +1351,10 @@ pub struct HeadroomPricingStatus {
     #[serde(default)]
     pub codex_plan_tier: Option<CodexPlanTier>,
     pub account: Option<HeadroomAccountProfile>,
+    /// Email of the last signed-in account, kept while signed out (except after
+    /// an explicit sign-out) to prefill the sign-in form.
+    #[serde(default)]
+    pub last_account_email: Option<String>,
     pub launch_discount_active: bool,
     /// Percent off applied to the currently-selling founder-pricing cohort
     /// (0 when full price). Drives the discounted prices in the upgrade view.

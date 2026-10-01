@@ -2636,7 +2636,8 @@ select {
   line-height: 1.4;
 }
 
-.optimize-card__auto-learn {
+.optimize-card__auto-learn,
+.activity-card__diffs {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2646,17 +2647,20 @@ select {
   border-top: 1px solid var(--border-subtle);
 }
 
-.optimize-card__auto-learn-text {
+.optimize-card__auto-learn-text,
+.activity-card__diffs-text {
   display: grid;
   gap: 2px;
 }
 
-.optimize-card__auto-learn-label {
+.optimize-card__auto-learn-label,
+.activity-card__diffs-label {
   font-size: var(--text-sm);
   color: var(--text-primary);
 }
 
-.optimize-card__auto-learn-meta {
+.optimize-card__auto-learn-meta,
+.activity-card__diffs-meta {
   font-size: var(--text-xs);
   color: var(--text-secondary);
 }
@@ -4485,6 +4489,7 @@ html.window-hiding {
   .optimize-project-row__status,
   .optimize-card__blurb,
   .optimize-card__auto-learn-meta,
+  .activity-card__diffs-meta,
   .optimize-minimal__blurb,
   .optimize-minimal__meta,
   .headroom-learn__progress p,
@@ -4516,6 +4521,7 @@ html.window-hiding {
 
   .optimize-project-row__name strong,
   .optimize-card__auto-learn-label,
+  .activity-card__diffs-label,
   .runtime-status__section-title {
     color: rgba(242, 237, 232, 0.9);
   }
@@ -5287,6 +5293,49 @@ html.window-hiding {
 .activity-feed__detail-mono {
   font-family: var(--font-mono);
   font-size: 0.72rem;
+}
+
+.activity-feed__message-dump {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activity-feed__diff {
+  padding: 6px 0;
+}
+
+.activity-feed__diff-line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.activity-feed__diff-line--del {
+  background: var(--danger-tint);
+  color: var(--danger);
+}
+
+.activity-feed__diff-line--add {
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+}
+
+.activity-feed__diff-line--skip {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  user-select: none;
 }
 
 .activity-feed__detail-list {

@@ -30,6 +30,10 @@ describe("vscode status bar extension", () => {
       path.join("/p", "-a-b"),
       path.join("/p", truncated)
     ]);
+    // Windows: VS Code says `c:\`, Claude Code's folder says `C--`.
+    const win = `c:\\Users\\garm\\${"y".repeat(250)}`;
+    const winFolder = `C${projectSlug(win).slice(1, 200)}-def456`;
+    expect(projectDirs("/p", [win], () => [winFolder])).toEqual([path.join("/p", winFolder)]);
   });
 
   it("follows the workspace's most recently active conversation", () => {

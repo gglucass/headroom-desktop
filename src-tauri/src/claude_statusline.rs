@@ -16,8 +16,9 @@
 //! part of the file format: serde writes fields in declaration order.
 //!
 //! It also keeps Claude's plan usage (`planUsage`), from the response headers
-//! and the usage fetch, for the tray menu and the VS Code status bar item. The
-//! terminal script reads its own from Claude Code instead.
+//! and the usage fetch, for the tray menu and the VS Code status bar item (the
+//! terminal script reads its own from Claude Code), and the last Codex usage
+//! (`codexPlanUsage`) so the tray has it before Codex's first response.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::ClaudePlanUsage;
+use crate::models::{ClaudePlanUsage, LabeledPlanWindow};
 
 /// Conversations kept; the least recently active is dropped first. Every
 /// Claude Code session is booked (VS Code panel chats, headless `claude -p`
@@ -67,6 +68,8 @@ pub(crate) struct Persisted {
     pub(crate) sessions: BTreeMap<String, Session>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) plan_usage: Option<ClaudePlanUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_plan_usage: Option<Vec<LabeledPlanWindow>>,
 }
 
 static STATE: Mutex<Option<Persisted>> = Mutex::new(None);
@@ -160,6 +163,7 @@ fn persist() {
             schema_version: SCHEMA_VERSION,
             sessions: state.sessions.clone(),
             plan_usage: state.plan_usage,
+            codex_plan_usage: state.codex_plan_usage.clone(),
         })
         .unwrap_or_default()
     };
@@ -200,6 +204,31 @@ pub fn record_plan_usage(usage: ClaudePlanUsage) {
 /// The last plan usage recorded, this run or a previous one.
 pub fn plan_usage() -> Option<ClaudePlanUsage> {
     with_state(|state| state.plan_usage)
+}
+
+/// Codex's latest windows, written only when what the tray shows changes.
+pub fn record_codex_plan_usage(windows: Vec<LabeledPlanWindow>) {
+    update(|state, _| {
+        let shown = |ws: &[LabeledPlanWindow]| {
+            ws.iter()
+                .map(|w| {
+                    (
+                        w.label.clone(),
+                        w.window.used_percent.trunc() as i64,
+                        w.window.resets_at,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let changed = state.codex_plan_usage.as_deref().map(shown) != Some(shown(&windows));
+        state.codex_plan_usage = Some(windows);
+        changed
+    });
+}
+
+/// The last Codex windows recorded, this run or a previous one.
+pub fn codex_plan_usage() -> Option<Vec<LabeledPlanWindow>> {
+    with_state(|state| state.codex_plan_usage.clone())
 }
 
 fn with_state<R>(f: impl FnOnce(&mut Persisted) -> R) -> R {
@@ -277,6 +306,40 @@ mod tests {
             (a.tokens_saved, a.last_saved, a.last_request_at_ms),
             (900, 900, 7)
         );
+    }
+
+    /// Plan usage survives a restart: the tray reads it back before the first
+    /// response. A file from before it existed still loads.
+    #[test]
+    fn plan_usage_round_trips_through_the_file() {
+        use crate::models::PlanWindow;
+        let window = PlanWindow {
+            used_percent: 62.5,
+            resets_at: 1_790_000_000,
+        };
+        let persisted = Persisted {
+            schema_version: SCHEMA_VERSION,
+            sessions: BTreeMap::new(),
+            plan_usage: Some(ClaudePlanUsage {
+                five_hour: None,
+                seven_day: Some(window),
+            }),
+            codex_plan_usage: Some(vec![LabeledPlanWindow {
+                label: "week".into(),
+                window,
+            }]),
+        };
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            json.contains(r#""codexPlanUsage":[{"label":"week","window":{"usedPercent":62.5"#),
+            "{json}"
+        );
+        let back: Persisted = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.plan_usage, persisted.plan_usage);
+        assert_eq!(back.codex_plan_usage, persisted.codex_plan_usage);
+
+        let old: Persisted = serde_json::from_str(r#"{"schemaVersion":1,"sessions":{}}"#).unwrap();
+        assert!(old.plan_usage.is_none() && old.codex_plan_usage.is_none());
     }
 
     #[test]

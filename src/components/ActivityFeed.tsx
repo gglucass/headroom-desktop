@@ -1,4 +1,5 @@
-import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
@@ -6,6 +7,7 @@ import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing"
 import type {
   ActivityFeedResponse,
   ActivityFeedSnapshot,
+  CompressionDiffResponse,
   LearningsMilestoneEvent,
   RecordEvent,
   RecordTag,
@@ -13,6 +15,7 @@ import type {
   SerenaTodayStats,
   TrainSuggestionEvent,
   TransformationFeedEvent,
+  TransformationRequestMessage,
   WeeklyRecapEvent
 } from "../lib/types";
 
@@ -113,6 +116,7 @@ export function ActivityFeed({
           <p className="activity-card__blurb">
             Large compressions, learnings and daily records.
           </p>
+          <KeepDiffsSwitch />
         </header>
       </article>
       {error ? (
@@ -274,6 +278,255 @@ function ExpandableRow({
   );
 }
 
+/**
+ * "Keep before/after": opt-in because the proxy then holds the text of its
+ * last 100 requests, readable from its loopback feed by any local account.
+ * Flipping it restarts the backend.
+ */
+function KeepDiffsSwitch() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void invoke<boolean>("get_compression_diffs_enabled")
+      .then((value) => active && setEnabled(value))
+      .catch(() => active && setEnabled(false));
+    return () => {
+      active = false;
+    };
+  }, []);
+  /* v8 ignore start - click handler needs a DOM and a Tauri backend. */
+  async function toggle() {
+    setBusy(true);
+    try {
+      setEnabled(await invoke<boolean>("set_compression_diffs_enabled", { enabled: !enabled }));
+    } catch (error) {
+      console.error("Failed to update Keep before/after", error);
+    } finally {
+      setBusy(false);
+    }
+  }
+  /* v8 ignore stop */
+  return (
+    <div className="activity-card__diffs">
+      <div className="activity-card__diffs-text">
+        <span className="activity-card__diffs-label">Keep before/after</span>
+        <span className="activity-card__diffs-meta">
+          {enabled
+            ? "On. Expand a compression to see what was removed. The text of the last 100 requests stays in memory on this computer."
+            : "Off. Turn on to see exactly what a compression removed."}
+        </span>
+      </div>
+      <button
+        aria-checked={enabled ?? false}
+        aria-label={`${enabled ? "Disable" : "Enable"} keep before/after`}
+        className={`connector-switch${enabled ? " is-on" : ""}`}
+        disabled={enabled === null || busy}
+        onClick={() => void toggle()}
+        role="switch"
+        type="button"
+      >
+        <span className="connector-switch__thumb" />
+      </button>
+    </div>
+  );
+}
+
+// Flatten a message/block `content` value to text. Anthropic sends a block
+// list, OpenAI a string. `tool_result` blocks carry their (compressible)
+// payload in `block.content`, a string or nested block list, not in
+// `block.text`, so without recursing both diff sides render a bare
+// `[tool_result]` and the diff shows no change. Other non-text blocks become a
+// `[type]` marker rather than vanish.
+function flattenContent(c: unknown): string {
+  if (typeof c === "string") return c;
+  if (!Array.isArray(c)) return "";
+  return c
+    .map((block) => {
+      if (!block || typeof block !== "object") return "";
+      const b = block as { type?: unknown; text?: unknown; content?: unknown };
+      if (typeof b.text === "string") return b.text;
+      if (b.content !== undefined) {
+        const inner = flattenContent(b.content);
+        if (inner.length > 0) return inner;
+      }
+      if (typeof b.type === "string") return `[${b.type}]`;
+      return "";
+    })
+    .filter((s) => s.length > 0)
+    .join("\n");
+}
+
+export function formatRequestMessages(messages: TransformationRequestMessage[]): string {
+  return messages
+    .map((m) => {
+      const role = (m.role ?? "").trim() || "(unknown)";
+      return `${role}:\n${flattenContent(m.content)}`;
+    })
+    .join("\n\n");
+}
+
+export type DiffLine = { type: "same" | "add" | "del"; text: string };
+
+// LCS line diff. ponytail: O(n*m) flat Uint16 table. Large compressions, the
+// whole point of this view, routinely run to thousands of lines, so the cap is
+// on the cell product (memory), not per-side line count. ~30M cells = 60MB,
+// computed once per expand. Over that we fall back to side-by-side dumps.
+// Upgrade to Hirschberg/Myers if the cap ever bites.
+const MAX_DIFF_CELLS = 30_000_000;
+
+export function diffLines(a: string, b: string): DiffLine[] | null {
+  const oldL = a.split("\n");
+  const newL = b.split("\n");
+  const n = oldL.length;
+  const m = newL.length;
+  // Uint16 caps LCS values at 65535; the cell cap keeps n,m well under that.
+  if ((n + 1) * (m + 1) > MAX_DIFF_CELLS) return null;
+  const w = m + 1;
+  const dp = new Uint16Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] =
+        oldL[i] === newL[j]
+          ? dp[(i + 1) * w + (j + 1)] + 1
+          : Math.max(dp[(i + 1) * w + j], dp[i * w + (j + 1)]);
+    }
+  }
+  const out: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (oldL[i] === newL[j]) {
+      out.push({ type: "same", text: oldL[i] });
+      i++;
+      j++;
+    } else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) {
+      out.push({ type: "del", text: oldL[i] });
+      i++;
+    } else {
+      out.push({ type: "add", text: newL[j] });
+      j++;
+    }
+  }
+  while (i < n) out.push({ type: "del", text: oldL[i++] });
+  while (j < m) out.push({ type: "add", text: newL[j++] });
+  return out;
+}
+
+export type CollapsedDiffLine = DiffLine | { type: "skip"; text: string };
+
+// Keep `context` unchanged lines around each change and collapse the rest, so
+// the removed (red) / added (green) lines are visible the moment the row opens
+// instead of buried under hundreds of identical context lines.
+const DIFF_CONTEXT = 3;
+
+export function collapseDiff(diff: DiffLine[], context = DIFF_CONTEXT): CollapsedDiffLine[] {
+  const keep = new Array(diff.length).fill(false);
+  for (let i = 0; i < diff.length; i++) {
+    if (diff[i].type === "same") continue;
+    for (let j = Math.max(0, i - context); j <= Math.min(diff.length - 1, i + context); j++) {
+      keep[j] = true;
+    }
+  }
+  const out: CollapsedDiffLine[] = [];
+  let i = 0;
+  while (i < diff.length) {
+    if (diff[i].type !== "same" || keep[i]) {
+      out.push(diff[i]);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < diff.length && diff[j].type === "same" && !keep[j]) j++;
+    const n = j - i;
+    out.push({ type: "skip", text: `... ${n} unchanged line${n === 1 ? "" : "s"}` });
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * dt/dd pair for the detail grid: the request's messages before and after
+ * compression as a unified line diff, fetched from the proxy when the row is
+ * expanded (the detail only mounts then). Shared by the compression and
+ * record rows.
+ */
+function CompressionDiff({ requestId }: { requestId: string }) {
+  const [result, setResult] = useState<CompressionDiffResponse | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    invoke<CompressionDiffResponse>("get_compression_diff", { requestId })
+      .then((value) => active && setResult(value))
+      .catch(() => active && setError(true));
+    return () => {
+      active = false;
+    };
+  }, [requestId]);
+  // Computed once per fetch, not on every feed poll that re-renders the row.
+  const view = useMemo(() => {
+    if (!result?.requestMessages?.length) return null;
+    const original = formatRequestMessages(result.requestMessages);
+    // No compressed list: the proxy sent the messages as they were.
+    const compressed = result.compressedMessages
+      ? formatRequestMessages(result.compressedMessages)
+      : original;
+    const diff = diffLines(original, compressed);
+    return { original, compressed, lines: diff ? collapseDiff(diff) : null };
+  }, [result]);
+
+  let body;
+  if (error) {
+    body = "Could not reach Headroom to load the request.";
+  } else if (!result) {
+    body = "Loading...";
+  } else if (!result.logFullMessages) {
+    body = "Turn on Keep before/after above to see what this compression removed.";
+  } else if (!view) {
+    body = "No longer held. Headroom keeps the text of its last 100 requests only, and not across restarts.";
+  } else if (!view.lines) {
+    // Too large to diff: show both sides whole.
+    return (
+      <>
+        <dt>Before</dt>
+        <dd>
+          <pre className="activity-feed__message-dump">{view.original}</pre>
+        </dd>
+        <dt>After</dt>
+        <dd>
+          <pre className="activity-feed__message-dump">{view.compressed}</pre>
+        </dd>
+      </>
+    );
+  } else {
+    body = (
+      <pre className="activity-feed__message-dump activity-feed__diff">
+        {view.lines.map((line, idx) => (
+          <div
+            key={idx}
+            className={`activity-feed__diff-line activity-feed__diff-line--${line.type}`}
+          >
+            {line.type === "del"
+              ? "- "
+              : line.type === "add"
+                ? "+ "
+                : line.type === "skip"
+                  ? ""
+                  : "  "}
+            {line.text}
+          </div>
+        ))}
+      </pre>
+    );
+  }
+  return (
+    <>
+      <dt>Before / after</dt>
+      <dd>{body}</dd>
+    </>
+  );
+}
+
 function TimeChip({ iso }: { iso: string | null | undefined }) {
   return (
     <span className="activity-feed__time" title={formatDateTime(iso)}>
@@ -361,6 +614,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <>
           <dt>Request ID</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
+          <CompressionDiff requestId={event.requestId!} />
         </>
       ) : null}
     </dl>
@@ -689,6 +943,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
         <>
           <dt>Request ID</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
+          <CompressionDiff requestId={event.requestId!} />
         </>
       ) : null}
     </dl>

@@ -419,6 +419,25 @@ export interface HeadroomLearnPrereqStatus {
   codexLoggedIn: boolean;
 }
 
+// A single message of a logged request. Intentionally loose: the proxy passes
+// through whatever shape the upstream provider uses (Anthropic: `content` is a
+// string or a block list; OpenAI: a string). `ActivityFeed.tsx` flattens it.
+export interface TransformationRequestMessage {
+  role?: string;
+  content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }>;
+  [k: string]: unknown;
+}
+
+// `get_compression_diff`: one request's messages before and after compression,
+// fetched when an Activity row is expanded. `logFullMessages` is false unless
+// "Keep before/after" is on; the message lists are null once the request has
+// aged out of the proxy's 100-request window.
+export interface CompressionDiffResponse {
+  logFullMessages: boolean;
+  requestMessages: TransformationRequestMessage[] | null;
+  compressedMessages: TransformationRequestMessage[] | null;
+}
+
 export interface TransformationFeedEvent {
   requestId?: string | null;
   timestamp?: string | null;
@@ -678,6 +697,9 @@ export interface HeadroomPricingStatus {
   codex?: CodexUsage | null;
   codexPlanTier?: CodexPlanTier | null;
   account?: HeadroomAccountProfile | null;
+  /// Last signed-in account's email, kept while signed out unless the user
+  /// signed out explicitly. Prefills the sign-in form.
+  lastAccountEmail?: string | null;
   launchDiscountActive: boolean;
   activePercentOff?: number;
   pricingCohorts?: PricingCohort[];

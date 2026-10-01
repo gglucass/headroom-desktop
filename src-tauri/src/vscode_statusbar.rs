@@ -326,10 +326,22 @@ fn run_cli(editor: &Editor, profile: &Profile, args: &[&std::ffi::OsStr]) -> Res
             "{} exited {}: {}",
             editor.id,
             out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            cli_stderr(&out.stderr)
         );
     }
     Ok(())
+}
+
+/// The CLI's stderr without Node's deprecation warnings, which older editors
+/// print first and which filled the whole Sentry message cap (RUST-KP).
+fn cli_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !line.starts_with("(node:") && !line.starts_with("(Use `"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn install(editor: &Editor, profile: &Profile, vsix_bytes: &[u8]) -> Result<()> {
@@ -400,6 +412,14 @@ fn install_where_needed(editors: &[Editor]) {
                     log::info!("installed Headroom status bar extension in {}", profile.key);
                     tracking.installed.insert(profile.key);
                 }
+                // An editor older than the extension's `engines.vscode` cannot run
+                // the Claude Code extension either; nothing to fix on our side.
+                Err(err) if format!("{err:#}").contains("not compatible with") => {
+                    log::info!(
+                        "{} is too old for the Headroom status bar: {err:#}",
+                        profile.key
+                    )
+                }
                 Err(err) => {
                     log::warn!("installing Headroom status bar extension failed: {err:#}")
                 }
@@ -457,6 +477,17 @@ mod tests {
         assert!(!should_install("0.2.0", &v(&["0.2.0"]), true), "up to date");
         assert!(should_install("0.2.0", &v(&["0.1.0"]), true), "older build");
         assert!(!should_install("0.2.0", &[], true), "user removed it");
+    }
+
+    #[test]
+    fn cli_errors_drop_node_deprecation_noise() {
+        let stderr = b"(node:9001) [DEP0005] DeprecationWarning: Buffer() is deprecated.\n\
+            (Use `Electron --trace-deprecation ...` to show where the warning was created)\n\
+            Unable to install extension 'headroom.headroom-status' as it is not compatible with VS Code '1.74.3'.\n";
+        assert_eq!(
+            cli_stderr(stderr),
+            "Unable to install extension 'headroom.headroom-status' as it is not compatible with VS Code '1.74.3'."
+        );
     }
 
     #[test]
