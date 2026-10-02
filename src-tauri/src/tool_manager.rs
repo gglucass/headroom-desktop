@@ -8592,13 +8592,21 @@ impl ToolManager {
                 self.markitdown_entrypoint().display()
             );
         }
-        run_command_with_timeout(
-            &self.markitdown_entrypoint(),
-            &["--help"],
-            &self.runtime.root_dir,
-            HEADROOM_SMOKE_TEST_TIMEOUT,
-        )
-        .context("markitdown installed but failed its smoke test")?;
+        // The 60s and one retry `smoke_test_markitdown` allows: this first run
+        // pays Gatekeeper/EDR scanning of the new files plus cold imports
+        // (RUST-22). The core 15s bound here killed it, and a venv rebuild then
+        // uninstalled the addon (RUST-M0, macOS 27).
+        let smoke = || {
+            run_command_with_timeout(
+                &self.markitdown_entrypoint(),
+                &["--help"],
+                &self.runtime.root_dir,
+                MARKITDOWN_SMOKE_TEST_TIMEOUT,
+            )
+        };
+        smoke()
+            .or_else(|_| smoke())
+            .context("markitdown installed but failed its smoke test")?;
         self.ensure_markitdown_shim()?;
         self.write_tool_receipt(
             "markitdown",
