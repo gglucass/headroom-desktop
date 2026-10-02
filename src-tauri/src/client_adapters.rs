@@ -1979,7 +1979,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     // Sweep `<basename>.headroom-backup-*` and `<basename>.nommer-backup-*`
     // siblings created by `backup_if_exists` for every file we ever mutated.
     // Without this, stale backups remain in ~/.claude, ~/.claude/hooks,
-    // ~/.codex, ~/Library/Application Support/Code/User, and the user's
+    // ~/.codex, VS Code's User folder, and the user's
     // shell rc directory after uninstall.
     for target in managed_backup_targets() {
         removed.extend(sweep_managed_backups(&target));
@@ -2148,14 +2148,7 @@ fn managed_backup_targets() -> Vec<PathBuf> {
     // whichever file was active at apply/disable time.
     targets.push(opencode_config_dir().join("opencode.json"));
     targets.push(opencode_config_dir().join("opencode.jsonc"));
-    targets.push(
-        home_dir()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
-            .join("User")
-            .join("settings.json"),
-    );
+    targets.push(vscode_user_settings_path());
     targets.extend(all_shell_paths());
     targets
 }
@@ -7592,9 +7585,7 @@ fn claude_remote_control_panel_command_path() -> PathBuf {
 }
 
 fn vscode_user_settings_path() -> PathBuf {
-    home_dir()
-        .join("Library")
-        .join("Application Support")
+    crate::vscode_statusbar::editor_data_root(&home_dir())
         .join("Code")
         .join("User")
         .join("settings.json")
@@ -7812,13 +7803,14 @@ while True:
     .to_string()
 }
 
-/// Point the VS Code extension at the wrapper. macOS only, like every other
-/// VS Code settings write here: the wrapper needs the Unix relaunch script.
+/// Point the VS Code extension at the wrapper. macOS and Linux: the wrapper
+/// needs the Unix relaunch script, and on Windows the extension spawns the
+/// wrapper without a shell, so it would have to be an .exe, not a script.
 /// Only with a working /usr/bin/python3 (the wrapper's interpreter): without
-/// the Command Line Tools it is a stub that fails, and every panel session
-/// would then fail to start.
+/// the Command Line Tools it is a stub that fails on macOS, a distro may not
+/// ship it at all, and every panel session would then fail to start.
 fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
-    if !cfg!(target_os = "macos") {
+    if cfg!(windows) {
         return Ok((Vec::new(), Vec::new()));
     }
     let settings_path = vscode_user_settings_path();
@@ -17522,26 +17514,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let (changed, _) = ensure_claude_remote_control_command().expect("install");
         assert_eq!(
             changed.len(),
-            if cfg!(target_os = "macos") { 6 } else { 5 },
-            "script + 2 commands + wrapper + hooks (+ vscode setting): {changed:?}"
+            6,
+            "script + 2 commands + wrapper + hooks + vscode setting: {changed:?}"
         );
         let panel = std::fs::read_to_string(claude_remote_control_panel_command_path()).unwrap();
         assert!(panel.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
         assert!(panel.contains("from the VS Code panel"));
         let wrapper = std::fs::read_to_string(claude_remote_control_wrapper_path()).unwrap();
         assert!(wrapper.starts_with("#!/usr/bin/python3\n"));
-        if cfg!(target_os = "macos") {
-            let raw = std::fs::read_to_string(&vscode).unwrap();
-            let v = parse_json_object(&raw, &vscode).unwrap();
-            assert_eq!(
-                v[VSCODE_PROCESS_WRAPPER_KEY],
-                Value::String(claude_remote_control_wrapper_path().display().to_string())
-            );
-            assert!(
-                raw.ends_with(&original[1..]),
-                "only the key is added: {raw}"
-            );
-        }
+        let raw = std::fs::read_to_string(&vscode).unwrap();
+        let v = parse_json_object(&raw, &vscode).unwrap();
+        assert_eq!(
+            v[VSCODE_PROCESS_WRAPPER_KEY],
+            Value::String(claude_remote_control_wrapper_path().display().to_string())
+        );
+        assert!(
+            raw.ends_with(&original[1..]),
+            "only the key is added: {raw}"
+        );
         let command = std::fs::read_to_string(claude_remote_control_command_path()).unwrap();
         let script_path = claude_remote_control_script_path();
         assert!(command.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
@@ -17589,9 +17579,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         remove_vscode_wrapper_file_if_unreferenced();
         assert!(!claude_remote_control_wrapper_path().exists());
         assert!(!claude_remote_control_panel_command_path().exists());
-        if cfg!(target_os = "macos") {
-            assert_eq!(std::fs::read_to_string(&vscode).unwrap(), original);
-        }
+        assert_eq!(std::fs::read_to_string(&vscode).unwrap(), original);
         let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
         assert!(!settings.contains("headroom-remote-control"), "{settings}");
         assert_eq!(
