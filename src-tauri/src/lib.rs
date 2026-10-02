@@ -2877,6 +2877,13 @@ fn headroom_start_failure_category(reason: &str) -> String {
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
+    // A quit or relaunch during startup stops the proxy being polled, and the
+    // start returns that as an error. Reported, it was an Error-level event
+    // for nothing but the user closing the app.
+    if technical_err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+        return;
+    }
+
     // Environmental failures: another process holds port 6768, or a stale
     // headroom proxy is still bound. The user gets an actionable hint via
     // `state::classify_startup_error` and the persistent-conflict case is
@@ -16395,6 +16402,51 @@ Some unrelated content.
         assert!(!skips("unknown", "true", "false"));
         assert!(!skips("openai", "false", "false"));
         assert!(!skips("openai", "true", "true"));
+    }
+
+    #[test]
+    fn a_start_the_apps_own_exit_cut_short_is_not_reported() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        sentry::Hub::run(hub, || {
+            // 2026-10-02, rc.1 -> rc.3: a relaunch while the proxy started.
+            let cut_short = anyhow::anyhow!(
+                "{}; stopped the headroom proxy mid-startup",
+                crate::tool_manager::START_CUT_SHORT_BY_EXIT
+            );
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &cut_short,
+            );
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &anyhow::anyhow!("wait check failed: interrupted"),
+            );
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "only the real failure reports");
+        assert!(events[0]
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("wait check failed")));
     }
 
     #[test]
