@@ -4341,7 +4341,6 @@ pub fn apply_upstream_client_config(
     Ok(())
 }
 
-/// Current value of one `env` key in `~/.claude/settings.json`, if any.
 /// Chisle's PostToolUse hook elides the middle of any tool result over 8k
 /// chars, and by default that includes every `mcp__*` tool. Two of those are
 /// not safe to cut: Serena's symbol and file reads feed its exact-match edit
@@ -4353,8 +4352,14 @@ const CHISLE_COMPRESS_TOOLS_KEY: &str = "CHISLE_COMPRESS_TOOLS";
 const CHISLE_COMPRESS_TOOLS_VALUE: &str = "Bash,Agent,WebFetch,WebSearch,Grep,Glob";
 
 /// Plants (or, on uninstall, removes) the list above. A value the user set
-/// themselves wins on install and survives the removal.
+/// themselves wins on install and survives the removal. Not planted without
+/// `~/.claude`: Chisle went into Codex alone (Claude Code's own install leaves
+/// `~/.claude/plugins`), and a settings.json written there would make Claude
+/// Code read as installed (`claude_code_user_state_exists`) for good.
 pub fn scope_chisle_compression(scoped: bool) -> Result<()> {
+    if scoped && !home_dir().join(".claude").is_dir() {
+        return Ok(());
+    }
     if scoped {
         configure_claude_settings_env_if_absent(
             CHISLE_COMPRESS_TOOLS_KEY,
@@ -4366,6 +4371,7 @@ pub fn scope_chisle_compression(scoped: bool) -> Result<()> {
     }
 }
 
+/// Current value of one `env` key in `~/.claude/settings.json`, if any.
 fn read_claude_settings_env(env_key: &str) -> Result<Option<String>> {
     let settings_path = claude_settings_path();
     if !held_or_exists(&settings_path) {
@@ -13701,6 +13707,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "verification reports the hook check, got: {:?}",
             verification.checks
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chisle_compression_scope_leaves_a_machine_without_claude_code_alone() {
+        let home = TestHome::new();
+        super::scope_chisle_compression(true).unwrap();
+        assert!(!home.path().join(".claude").exists());
+        assert!(!super::claude_code_user_state_exists(home.path()));
     }
 
     #[test]
