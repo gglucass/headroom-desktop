@@ -1034,6 +1034,19 @@ impl AppState {
         let maintenance_plan =
             match self.runtime_maintenance_plan_for_app_version(&current_app_version) {
                 Some(plan) => plan,
+                // A rebuild of a runtime with no maintenance due: the watchdog's
+                // last resort for one that keeps dying at startup, which no
+                // plan ever sees (the lock sha and the wheel both still match).
+                // Without this, force_rebuild did nothing here at all.
+                None if force_rebuild && !runtime_upgrade_disabled_by_env() => {
+                    match crate::tool_manager::pinned_headroom_release() {
+                        Ok(release) => RuntimeMaintenancePlan::Upgrade(release),
+                        Err(err) => {
+                            log::warn!("run_upgrade_with_ui: no release to rebuild from: {err:#}");
+                            return;
+                        }
+                    }
+                }
                 None => {
                     // App version changed but no runtime maintenance is actually
                     // needed: stamp the version, under the launch path's guard

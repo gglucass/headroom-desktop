@@ -12462,7 +12462,7 @@ fn headroom_index_requirement(
     Ok(format!("--requirement={}", path.display()))
 }
 
-fn pinned_headroom_release() -> Result<HeadroomRelease> {
+pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
             "https://files.pythonhosted.org/packages/b9/c0/585a2dd630a8936c20bf1062fa76cdbbe3cb4a29a909367f7c040770a1e5/headroom_ai-0.39.0-cp310-abi3-macosx_11_0_arm64.whl",
@@ -21141,14 +21141,23 @@ time.sleep(30)
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let exiting = AtomicBool::new(false);
-        let mut child = crate::proc::command("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut child = crate::proc::command("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
 
         assert!(super::stop_if_shutting_down(&mut child, &exiting).is_ok());
-        assert!(child.try_wait().expect("try_wait").is_none(), "stopped while not exiting");
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "stopped while not exiting"
+        );
 
         exiting.store(true, Ordering::Release);
         assert!(super::stop_if_shutting_down(&mut child, &exiting).is_err());
-        assert!(child.try_wait().expect("try_wait").is_some(), "still running after exit");
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "still running after exit"
+        );
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`

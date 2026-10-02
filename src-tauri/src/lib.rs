@@ -10085,6 +10085,40 @@ fn auto_resume_backoff(failed_attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Give-ups in a row whose start died before opening its port before the
+/// watchdog rebuilds the runtime: the first plus the 30s, 1m and 2m retries,
+/// so about four minutes of the same death.
+const AUTO_REBUILD_AFTER_STRIKES: u32 = 4;
+
+/// True when the backend's last start exited on its own before it opened its
+/// port, for a reason a fresh runtime can fix. Every self-heal retry repeats
+/// such a death until the runtime is replaced: a package pip lost, a truncated
+/// file, a half-installed wheel, shapes the start path's targeted repairs only
+/// partly name. The machine's own verdicts (endpoint protection, a denied
+/// loopback socket, a port someone else holds) are left out: a rebuild
+/// changes none of them and re-downloads the runtime for nothing.
+pub(crate) fn startup_death_needs_rebuild(last_startup_error: Option<&str>) -> bool {
+    let Some(err) = last_startup_error else {
+        return false;
+    };
+    let key = startup_error_fingerprint_key(Some(err));
+    err.contains("exited with status")
+        && err.contains("before opening port")
+        && !is_environmental_startup_key(key)
+        && key != Some("startup_port_conflict")
+}
+
+/// Claims the watchdog's runtime rebuild once per app version, persisted in
+/// `marker`: a rebuild that did not fix the runtime will not fix it on the next
+/// episode or launch either, and each one re-downloads it. Refuses when the
+/// marker cannot be written, since then nothing would bound it.
+fn claim_auto_rebuild(marker: &std::path::Path, app_version: &str) -> bool {
+    if std::fs::read_to_string(marker).is_ok_and(|claimed| claimed.trim() == app_version) {
+        return false;
+    }
+    client_adapters::atomic_write(marker, app_version.as_bytes()).is_ok()
+}
+
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
@@ -10117,6 +10151,8 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // counts failed attempts to grow the backoff (see `auto_resume_backoff`).
         let mut auto_pause_next_retry: Option<std::time::Instant> = None;
         let mut auto_pause_failed: u32 = 0;
+        // Consecutive give-ups whose last start died before opening its port.
+        let mut rebuild_strikes: u32 = 0;
         // Set after a forced kill+restart of a hung process. Prevents the
         // hung-kill path from looping forever if the new process also hangs:
         // on the second trip through MAX_CONSECUTIVE_FAILURES we fall through
@@ -10259,9 +10295,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             if runtime.proxy_reachable {
                 consecutive_failures = 0;
                 hung_kill_attempted = false;
+                if auto_pause_failed > 0 {
+                    pricing::report_funnel_step(&app, "runtime_auto_recovered");
+                }
                 // Healthy again — reset the self-heal backoff so a future
                 // wedge starts its retries fresh at 30s.
                 auto_pause_failed = 0;
+                rebuild_strikes = 0;
                 auto_pause_next_retry = None;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
@@ -10547,12 +10587,46 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 state.set_runtime_auto_paused(true);
                 state.stop_headroom();
                 analytics::track_event(&app, "runtime_auto_paused", None);
-                let _ = show_notification_impl(
-                    &app,
-                    "Headroom paused",
-                    "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
-                    Some("connectors".into()),
-                );
+                // Once per down episode. Every failed self-heal retry ends back
+                // here, so a backend that never starts re-notified at 30s, 1m,
+                // 2m and then every 5 minutes for as long as the app ran.
+                if auto_pause_failed == 0 {
+                    let _ = show_notification_impl(
+                        &app,
+                        "Headroom paused",
+                        "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
+                        Some("connectors".into()),
+                    );
+                    // Server-side count of machines stuck here; the way out is
+                    // `runtime_auto_recovered` below, or savings landing again.
+                    pricing::report_funnel_step(&app, "runtime_auto_paused");
+                }
+                // Last resort for a runtime that dies the same way at every
+                // start: rebuild it. See `startup_death_needs_rebuild`.
+                let startup_error = state.last_startup_error.lock().clone();
+                rebuild_strikes = if startup_death_needs_rebuild(startup_error.as_deref()) {
+                    rebuild_strikes.saturating_add(1)
+                } else {
+                    0
+                };
+                if rebuild_strikes >= AUTO_REBUILD_AFTER_STRIKES
+                    && claim_auto_rebuild(
+                        &state.tool_manager.logs_dir().join("auto-rebuild.attempted"),
+                        &app.package_info().version.to_string(),
+                    )
+                {
+                    log::warn!(
+                        "watchdog: backend died before opening its port on every start; \
+                         rebuilding the runtime"
+                    );
+                    let app_clone = app.clone();
+                    std::thread::spawn(move || {
+                        let state: tauri::State<'_, AppState> = app_clone.state();
+                        // Owns the lifecycle until it ends; the auto-resume
+                        // above stands down meanwhile and restarts it after.
+                        state.run_upgrade_with_ui(&app_clone, true);
+                    });
+                }
                 // Arm the self-heal: first retry after 30s, backing off on
                 // repeated failures (auto_resume_backoff). The retry runs in the
                 // `runtime.auto_paused` branch at the top of the loop.
@@ -15718,6 +15792,59 @@ Some unrelated content.
         ] {
             assert!(!is_missing_headroom_module_signal(other), "for: {other}");
         }
+    }
+
+    #[test]
+    fn only_a_runtime_death_at_startup_earns_the_watchdog_rebuild() {
+        // RUST-BA (0.9.30, macOS) and the Windows spelling of the same death.
+        for death in [
+            "unable to keep headroom running in background: exited with status exit status: 1 \
+             before opening port 6768 (...)\n--- log tail ---\n\
+             ModuleNotFoundError: No module named 'httpcore'",
+            "unable to keep headroom running in background: exited with status exit code: 1 \
+             before opening port 6768",
+        ] {
+            assert!(
+                super::startup_death_needs_rebuild(Some(death)),
+                "for: {death}"
+            );
+        }
+        // The machine's own verdicts: a rebuild changes none of them.
+        for other in [
+            "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+             ImportError: DLL load failed while importing unicodedata: An Application \
+             Control policy has blocked this file.",
+            "exited with status exit status: 1 before opening port 6768\n--- log tail ---\n\
+             Library not loaded: onnxruntime.dylib (code signature invalid)",
+            "headroom proxy already running on port 6768",
+        ] {
+            assert!(
+                !super::startup_death_needs_rebuild(Some(other)),
+                "for: {other}"
+            );
+        }
+        assert!(!super::startup_death_needs_rebuild(None));
+    }
+
+    #[test]
+    fn the_watchdog_rebuild_is_claimed_once_per_app_version() {
+        let dir = std::env::temp_dir().join(format!("auto-rebuild-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("auto-rebuild.attempted");
+        assert!(super::claim_auto_rebuild(&marker, "0.9.31"));
+        assert!(
+            !super::claim_auto_rebuild(&marker, "0.9.31"),
+            "twice in one version"
+        );
+        assert!(
+            super::claim_auto_rebuild(&marker, "0.9.32"),
+            "a new version gets one"
+        );
+        // No marker can be written: no bound, so no rebuild.
+        let unwritable = dir.join("a-directory");
+        std::fs::create_dir_all(&unwritable).unwrap();
+        assert!(!super::claim_auto_rebuild(&unwritable, "0.9.33"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
