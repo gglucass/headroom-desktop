@@ -2767,6 +2767,71 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     except Exception:
         pass
 
+# --- Streamed Anthropic uncached input from usage (savings denominator) -------
+# StreamingMixin._finalize_stream_response derives uncached input as Headroom's
+# own tokenizer count minus cache read and write, instead of taking Anthropic's
+# usage.input_tokens (already the uncached count, the field the non-streaming
+# path records). The estimate's error lands in uncached input, which is half of
+# the new-input denominator (uncached + cache write). On 2026-10-02 three long
+# screenshot-heavy sessions ran ~10% over the provider's count: 20.1M uncached
+# logged vs 3.3M real, and the day's rate showed 14.8% for a real 24.7%. Where
+# the estimate runs under, real uncached input clamped to 0 instead. Accounting
+# only: forwarded bytes, tokens saved and list-priced savings are unchanged; the
+# rate moves both ways. Exact-pin gated to wheel 0.39.0; self-neutralizes when
+# the derivation's text is gone. Kill switch: HEADROOM_STREAM_UNCACHED_INPUT=0.
+_hd_sui_flag = _hd_os.environ.get("HEADROOM_STREAM_UNCACHED_INPUT", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_sui_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_sui_meta
+
+        if _hd_sui_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_sui_inspect
+            import re as _hd_sui_re
+            import textwrap as _hd_sui_tw
+
+            from headroom.proxy.handlers import streaming as _hd_sui_mod
+
+            _hd_sui_old = """uncached_input_tokens = max(
+    effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+)
+"""
+            _hd_sui_new = """if provider == "anthropic" and isinstance(provider_input_tokens, int):
+    uncached_input_tokens = max(provider_input_tokens, 0)
+else:
+    uncached_input_tokens = max(
+        effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+    )
+"""
+            _hd_sui_src = _hd_sui_tw.dedent(
+                _hd_sui_inspect.getsource(_hd_sui_mod.StreamingMixin._finalize_stream_response)
+            )
+            _hd_sui_at = _hd_sui_re.findall(r"(?m)^( *)uncached_input_tokens = max\($", _hd_sui_src)
+            if len(_hd_sui_at) == 1:
+                _hd_sui_o, _hd_sui_n = (
+                    "".join(_hd_sui_at[0] + ln for ln in b.splitlines(True))
+                    for b in (_hd_sui_old, _hd_sui_new)
+                )
+                if _hd_sui_src.count(_hd_sui_o) == 1:
+                    _hd_sui_ns = {}
+                    exec(
+                        compile(
+                            _hd_sui_src.replace(_hd_sui_o, _hd_sui_n),
+                            "<headroom-desktop streaming uncached input>",
+                            "exec",
+                        ),
+                        _hd_sui_mod.__dict__,
+                        _hd_sui_ns,
+                    )
+                    _hd_sui_mod.StreamingMixin._finalize_stream_response = _hd_sui_ns[
+                        "_finalize_stream_response"
+                    ]
+                    _hd_bound.add("stream_uncached_input")
+    except Exception:
+        # Fail-open to the wheel's tokenizer derivation (the pre-vendor behaviour).
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2804,6 +2869,7 @@ _HD_VENDORS = (
     "learn_prompt_echo",
     "image_memo",
     "image_worker_reap",
+    "stream_uncached_input",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -17318,6 +17384,71 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True False", "stderr:\n{on_err}");
         assert_eq!(off, "True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn stream_uncached_input_behaves_against_the_installed_wheel() {
+        // A streamed Anthropic turn records the provider's uncached count, over
+        // and under the local estimate, and the tokenizer derivation when no
+        // usage arrived; the kill switch keeps the derivation throughout.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-stream-uncached-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        // Production figures: Anthropic reported input_tokens=2 on a turn the
+        // wheel logged with 50,663 uncached tokens.
+        let probe = "import asyncio, sitecustomize\n\
+                     from types import SimpleNamespace\n\
+                     from headroom.proxy.server import HeadroomProxy\n\
+                     def go(optimized, reported):\n\
+                     \x20   h = object.__new__(HeadroomProxy)\n\
+                     \x20   h.config = SimpleNamespace(log_full_messages=False)\n\
+                     \x20   out = []\n\
+                     \x20   async def rec(o):\n\
+                     \x20       out.append(o)\n\
+                     \x20   h._record_request_outcome = rec\n\
+                     \x20   st = {'input_tokens': reported, 'output_tokens': 7,\n\
+                     \x20         'cache_read_input_tokens': 360949, 'cache_creation_input_tokens': 840,\n\
+                     \x20         'cache_creation_ephemeral_5m_input_tokens': 0,\n\
+                     \x20         'cache_creation_ephemeral_1h_input_tokens': 840,\n\
+                     \x20         'total_bytes': 100, 'sse_buffer': bytearray(), 'ttfb_ms': 4.0}\n\
+                     \x20   asyncio.run(h._finalize_stream_response(\n\
+                     \x20       body={'messages': [{'role': 'user', 'content': 'x'}]},\n\
+                     \x20       provider='anthropic', model='claude-opus-5-5', request_id='r',\n\
+                     \x20       original_tokens=optimized + 5, optimized_tokens=optimized,\n\
+                     \x20       tokens_saved=5, transforms_applied=[], optimization_latency=1.0,\n\
+                     \x20       stream_state=st, start_time=0.0))\n\
+                     \x20   return out[0].uncached_input_tokens\n\
+                     print(go(412452, 2), go(300000, 2), go(400000, None),\n\
+                     \x20     'stream_uncached_input' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STREAM_UNCACHED_INPUT", kill)
+                .output()
+                .expect("run stream uncached probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: stream uncached input vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "2 2 38211 True", "stderr:\n{on_err}");
+        assert_eq!(off, "50663 0 38211 False", "stderr:\n{off_err}");
     }
 
     #[test]
