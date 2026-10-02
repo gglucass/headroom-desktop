@@ -1231,6 +1231,7 @@ fn spawn_idle_update_applier(app: AppHandle) {
                 log::info!(
                     "update: idle for {idle_minutes} minutes; restarting into the staged update"
                 );
+                storage::mark_quiet_relaunch(&storage::app_data_dir());
                 tauri::async_runtime::spawn(restart_app(app.clone()));
                 return;
             }
@@ -1243,10 +1244,15 @@ fn spawn_idle_update_applier(app: AppHandle) {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let pending = app.state::<PendingAppUpdate>();
+                    // The installer's /R relaunch reuses this process's args.
+                    storage::mark_quiet_relaunch(&storage::app_data_dir());
                     if let Err(err) =
                         install_pending_update(&pending.0, Arc::new(|_: AppUpdateProgress| {}))
                             .await
                     {
+                        let _ = std::fs::remove_file(storage::quiet_relaunch_path(
+                            &storage::app_data_dir(),
+                        ));
                         log::info!("update: idle install failed: {err}");
                     }
                 });
@@ -7619,7 +7625,9 @@ pub fn run() {
                 fresh_bearer_tx,
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
-            if state.should_present_on_launch() && !launched_from_autostart {
+            let quiet_relaunch =
+                storage::take_quiet_relaunch(&storage::app_data_dir(), chrono::Utc::now());
+            if state.should_present_on_launch() && !launched_from_autostart && !quiet_relaunch {
                 let _ = show_primary_window(app.handle());
             }
             if state.tool_manager.python_runtime_installed() {

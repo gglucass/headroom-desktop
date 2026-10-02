@@ -193,9 +193,69 @@ pub fn report_unfinished_restart(base_dir: &Path) {
     let _ = std::fs::remove_file(&attempted);
 }
 
+/// Written by the idle update applier just before it restarts or installs.
+/// Its relaunch is not a login launch, so it would raise the window (and take
+/// focus) on a machine whose owner is away or typing in another app.
+pub fn quiet_relaunch_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("quiet-relaunch")
+}
+
+/// A marker older than this belongs to a relaunch that never happened; the
+/// next launch is the user's own and shows its window.
+const QUIET_RELAUNCH_WINDOW_SECS: i64 = 15 * 60;
+
+pub fn mark_quiet_relaunch(base_dir: &Path) {
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Err(err) =
+        crate::client_adapters::atomic_write(&quiet_relaunch_path(base_dir), now.as_bytes())
+    {
+        log::warn!("update: writing the quiet-relaunch marker failed: {err}");
+    }
+}
+
+/// True when this launch is the idle applier's relaunch. Consumes the marker,
+/// so only that one launch stays in the tray.
+pub fn take_quiet_relaunch(base_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let path = quiet_relaunch_path(base_dir);
+    let Ok(note) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&path);
+    chrono::DateTime::parse_from_rfc3339(note.trim()).is_ok_and(|at| {
+        (0..=QUIET_RELAUNCH_WINDOW_SECS).contains(&now.signed_duration_since(at).num_seconds())
+    })
+}
+
 #[cfg(test)]
 mod restart_marker_tests {
     use super::*;
+
+    #[test]
+    fn only_the_idle_relaunch_stays_in_the_tray() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        let now = chrono::Utc::now();
+
+        assert!(
+            !take_quiet_relaunch(base, now),
+            "no marker: a normal launch"
+        );
+
+        mark_quiet_relaunch(base);
+        assert!(take_quiet_relaunch(
+            base,
+            now + chrono::Duration::seconds(20)
+        ));
+        assert!(
+            !take_quiet_relaunch(base, now + chrono::Duration::seconds(21)),
+            "consumed: the user's next launch shows its window"
+        );
+
+        // A relaunch that never came: the user's own launch later is not quiet.
+        mark_quiet_relaunch(base);
+        assert!(!take_quiet_relaunch(base, now + chrono::Duration::hours(1)));
+        assert!(!quiet_relaunch_path(base).exists());
+    }
 
     /// A relaunch that never happened has to be distinguishable from one that
     /// worked, and neither may leave markers behind to confuse the next launch.
