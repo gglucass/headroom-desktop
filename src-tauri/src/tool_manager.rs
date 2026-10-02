@@ -2633,6 +2633,52 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Image memo: OCR and SigLIP once per image, not once per turn (CPU) -------
+# Every turn resends the whole conversation, so the image-isolation worker
+# re-ran RapidOCR on every screenshot in history whenever a turn routed to
+# transcode, and SigLIP on the first image every turn: on 2026-10-02 one
+# machine OCR'd the same screenshot 114 times in two hours, holding the worker
+# near a full core. Both are pure functions of the image bytes, so they are
+# memoized per process on the bytes' sha256; the router's query half still runs
+# every turn, so the technique and the forwarded bytes are unchanged. A None is
+# cached like any result: a failed OCR call sticks for that image until the
+# worker restarts, forwarding the image as-is, the wheel's own fallback.
+# ponytail: FIFO-bounded at 256 images, an LRU if long sessions thrash it.
+# Binds in the spawn worker too, which inherits HEADROOM_SDK. Exact-pin gated
+# to wheel 0.39.0. Kill switch: HEADROOM_IMAGE_MEMO=0.
+_hd_im_flag = _hd_os.environ.get("HEADROOM_IMAGE_MEMO", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_im_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import hashlib as _hd_im_hashlib
+        import importlib.metadata as _hd_im_meta
+
+        if _hd_im_meta.version("headroom-ai") == "0.39.0":
+            from headroom.image.compressor import ImageCompressor as _hd_im_comp
+            from headroom.image.onnx_router import OnnxTechniqueRouter as _hd_im_router
+
+            _hd_im_cache = {}
+
+            def _hd_im_memo(orig):
+                def _hd_im_wrapper(self, image_data, *args):
+                    if not isinstance(image_data, bytes):
+                        return orig(self, image_data, *args)
+                    key = (orig, _hd_im_hashlib.sha256(image_data).digest(), args)
+                    if key not in _hd_im_cache:
+                        if len(_hd_im_cache) >= 256:
+                            _hd_im_cache.pop(next(iter(_hd_im_cache)))
+                        _hd_im_cache[key] = orig(self, image_data, *args)
+                    return _hd_im_cache[key]
+
+                return _hd_im_wrapper
+
+            _hd_im_comp._ocr_extract = _hd_im_memo(_hd_im_comp._ocr_extract)
+            _hd_im_router.analyze_image = _hd_im_memo(_hd_im_router.analyze_image)
+            _hd_bound.add("image_memo")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2668,6 +2714,7 @@ _HD_VENDORS = (
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_prompt_echo",
+    "image_memo",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -16992,6 +17039,46 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn image_memo_behaves_against_the_installed_wheel() {
+        // The same screenshot resent every turn is OCR'd once per process,
+        // with the same text; the kill switch restores one OCR per call.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-image-memo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.image.compressor import ImageCompressor as C\n\
+                     from headroom.image.onnx_router import OnnxTechniqueRouter as R\n\
+                     c, n = C(), []\n\
+                     c._ocr_engine = lambda b: (n.append(b), ([(None, 'hi', 0.99)], 0.0))[1]\n\
+                     r = [c._ocr_extract(b) for b in (b'a', b'a', b'b')]\n\
+                     print(len(n), r == ['hi'] * 3, C._ocr_extract.__name__ == R.analyze_image.__name__ == '_hd_im_wrapper')";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_IMAGE_MEMO", kill)
+                .output()
+                .expect("run image memo probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "2 True True", "stderr:\n{on_err}");
+        assert_eq!(off, "3 True False", "stderr:\n{off_err}");
     }
 
     #[test]
