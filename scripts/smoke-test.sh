@@ -50,7 +50,8 @@ open_tray_menu() {
   local p
   p=$(AX 'to get {position, size} of menu bar item 1 of menu bar 2' | tr -d ' ')
   [[ "$p" =~ ^([0-9-]+),([0-9-]+),([0-9]+),([0-9]+)$ ]] || return 1
-  cliclick "rc:$(( ${BASH_REMATCH[1]} + ${BASH_REMATCH[3]} / 2 )),$(( ${BASH_REMATCH[2]} + ${BASH_REMATCH[4]} / 2 ))"
+  # Then put the pointer back where it was: this runs while someone works.
+  cliclick "rc:$(( ${BASH_REMATCH[1]} + ${BASH_REMATCH[3]} / 2 )),$(( ${BASH_REMATCH[2]} + ${BASH_REMATCH[4]} / 2 ))" "m:$(cliclick p)"
 }
 
 # The backend listens on 6768 by default but scans up to 6790 (check 9). 6767 is
