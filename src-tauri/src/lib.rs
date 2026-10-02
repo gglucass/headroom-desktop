@@ -6353,6 +6353,20 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn get_usage_data_enabled() -> bool {
+    !client_adapters::is_usage_data_disabled()
+}
+
+/// Settings > Usage analytics and crash reports. Takes effect at once: every
+/// sender checks `analytics::sharing_enabled` before it sends.
+#[tauri::command]
+fn set_usage_data_enabled(enabled: bool) -> Result<bool, String> {
+    client_adapters::set_usage_data_enabled(enabled).map_err(|err| err.to_string())?;
+    analytics::set_sharing_enabled(enabled);
+    Ok(!client_adapters::is_usage_data_disabled())
+}
+
+#[tauri::command]
 fn get_claude_statusline_enabled() -> bool {
     !client_adapters::is_statusline_disabled()
 }
@@ -6652,6 +6666,9 @@ fn handle_crash_guard_flag() {
     });
     if !unwired.is_empty() {
         let _ = logging::init();
+        // The guard read the setting at launch; the user may have changed it
+        // since, in the app it has been idling beside.
+        analytics::set_sharing_enabled(!client_adapters::is_usage_data_disabled());
         log::info!("crash guard: unwired {unwired:?}");
         log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
         if let Some(client) = sentry::Hub::current().client() {
@@ -7081,12 +7098,14 @@ pub fn run() {
             .exec();
     }
 
+    // Before Sentry: its before_send reads this for every event.
+    analytics::set_sharing_enabled(!client_adapters::is_usage_data_disabled());
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
             release: sentry::release_name!(),
             attach_stacktrace: true,
-            before_send: Some(std::sync::Arc::new(logging::sanitize_event)),
+            before_send: Some(std::sync::Arc::new(logging::before_send)),
             ..Default::default()
         },
     ));
@@ -7672,6 +7691,8 @@ pub fn run() {
             get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
+            get_usage_data_enabled,
+            set_usage_data_enabled,
             uninstall_and_quit,
             quit_headroom,
             #[cfg(debug_assertions)]

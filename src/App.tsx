@@ -84,6 +84,7 @@ import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
+import { UsageDataPanel } from "./components/UsageDataPanel";
 import {
   authCodeSentMessage,
   buildInstallFailureMailto,
@@ -8331,6 +8332,8 @@ export default function App() {
                   </div>
                 </div>
               </article>
+
+              <UsageDataPanel />
 
               {/* Power-user settings almost nobody needs, collapsed so they do
                   not crowd out the ones people came here for. New ones go

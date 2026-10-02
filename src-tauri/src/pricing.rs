@@ -375,11 +375,33 @@ impl IdentityPayload {
             payload.tier_mismatch_since = local.mismatch_since.map(|at| at.to_rfc3339());
             payload.tier_mismatch_clamped_at = local.mismatch_clamped_at.map(|at| at.to_rfc3339());
         }
-        payload
+        payload.without_analytics_unless_shared()
     }
 
     fn device_only() -> Self {
-        Self::build(None, None)
+        Self::build(None, None).without_analytics_unless_shared()
+    }
+
+    /// Drops the fields only the admin's fleet views read (usage windows, the
+    /// Claude Desktop and WSL buckets) while the user has usage data off. What
+    /// licensing reads (device, accounts, plan tiers, the tier-mismatch clock,
+    /// terms) stays.
+    fn without_analytics_unless_shared(self) -> Self {
+        if crate::analytics::sharing_enabled() {
+            self
+        } else {
+            self.without_analytics()
+        }
+    }
+
+    fn without_analytics(self) -> Self {
+        Self {
+            codex_usage_windows: None,
+            claude_usage_windows: None,
+            claude_desktop: None,
+            wsl_agents: None,
+            ..self
+        }
     }
 
     fn build(claude: Option<&ClaudeAccountProfile>, codex: Option<&CodexAccountProfile>) -> Self {
@@ -509,6 +531,9 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
 /// on that thread too: callers include sync commands on the main thread.
 pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
     use tauri::Manager;
+    if !crate::analytics::sharing_enabled() {
+        return;
+    }
     let app = app.clone();
     spawn_funnel_step(
         move || IdentityPayload::for_state(&app.state::<AppState>()),
@@ -521,6 +546,9 @@ pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {
+    if !crate::analytics::sharing_enabled() {
+        return;
+    }
     spawn_funnel_step(
         IdentityPayload::device_only,
         step,
@@ -1895,7 +1923,9 @@ pub fn report_milestone(milestone_tokens_saved: u64, savings: Option<&SavingsRep
         .apply_headers(builder)
         .json(&serde_json::json!({
             "milestone_tokens_saved": milestone_tokens_saved,
-            "savings": savings,
+            // The token count is the account's activation and referral credit;
+            // the snapshot only feeds the admin profile.
+            "savings": savings.filter(|_| crate::analytics::sharing_enabled()),
         }))
         .send();
 }
@@ -4479,6 +4509,39 @@ mod tests {
             "unexpected verdict: {}",
             json["claudeDesktop"]
         );
+    }
+
+    #[test]
+    fn identity_payload_without_analytics_keeps_only_what_licensing_reads() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            claude_email: Some("me@example.com".into()),
+            claude_plan_tier: Some(ClaudePlanTier::Max5x),
+            tier_mismatch_since: Some("2026-10-01T00:00:00Z".into()),
+            claude_usage_windows: Some("five_hour=12@300".into()),
+            codex_usage_windows: Some("primary=99@43200".into()),
+            wsl_agents: Some("none".into()),
+            claude_desktop: Some("absent"),
+            ..Default::default()
+        }
+        .without_analytics();
+        let json = serde_json::to_value(&identity).unwrap();
+        for kept in [
+            "deviceId",
+            "claudeEmail",
+            "claudePlanTier",
+            "tierMismatchSince",
+        ] {
+            assert!(json.get(kept).is_some(), "{kept} dropped: {json}");
+        }
+        for dropped in [
+            "claudeUsageWindows",
+            "codexUsageWindows",
+            "wslAgents",
+            "claudeDesktop",
+        ] {
+            assert!(json.get(dropped).is_none(), "{dropped} sent: {json}");
+        }
     }
 
     #[test]
