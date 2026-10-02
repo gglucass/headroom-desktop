@@ -478,7 +478,13 @@ fn maybe_fire_onboarding_recovery_nudge(
     if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
         return;
     }
-    if dashboard.lifetime_requests > 0 || unrouted_usage_expected(state) {
+    // Arrivals as well as completions: see `maybe_fire_unrouted_usage_nudge`.
+    if dashboard.lifetime_requests > 0
+        || proxy_intercept::intercept_request_counts()
+            .values()
+            .any(|count| *count > 0)
+        || unrouted_usage_expected(state)
+    {
         return;
     }
     if !state.try_mark_onboarding_recovery_notified() {
@@ -593,13 +599,22 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
             client_adapters::routed_since(client_id, since.into()).into();
         (Utc::now() - at >= chrono::Duration::minutes(3)).then_some(at)
     };
+    // `lifetime_requests` is the backend's `requests.total`, which counts a
+    // request once it COMPLETES: a first turn still streaming, or one the
+    // upstream refused, reads as nothing proxied. The intercept counts
+    // arrivals, so an agent it has heard from this run is routed (RUST-KC on
+    // 0.9.28: `first_optimized_request` landed 2.5 minutes before the event,
+    // and the user was told to restart a Codex that was already wired).
+    let reached = proxy_intercept::intercept_request_counts();
+    let unheard = |agent: &str| reached.get(agent).is_none_or(|count| *count == 0);
     // The Claude-only gate sends Claude Code direct on purpose while Codex
     // stays routed, so only the Codex half can still be a leak.
     let claude = claude
+        && unheard("claude-code")
         && !state.claude_only_bypass.load(Ordering::Acquire)
         && routed("claude_code").is_some_and(|at| claude_sessions_touched_since(&projects, at));
-    let codex_routed_since =
-        routed("codex").filter(|at| codex_active_at.is_some_and(|active| active > *at));
+    let codex_routed_since = routed("codex")
+        .filter(|at| unheard("codex") && codex_active_at.is_some_and(|active| active > *at));
     let codex = codex_routed_since.is_some();
     if !claude && !codex {
         return;
