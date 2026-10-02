@@ -3959,15 +3959,21 @@ export default function App() {
 
     try {
       const versionForCopy = update.version;
-      applyAppUpdatePatch(
-        await runAppUpdateInstall({
-          availableUpdate: update,
-          quiet,
-          onProgress: (progress) => {
-            setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
-          },
-        })
-      );
+      const patch = await runAppUpdateInstall({
+        availableUpdate: update,
+        quiet,
+        onProgress: (progress) => {
+          setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
+        },
+      });
+      applyAppUpdatePatch(patch);
+      // A clicked install restarts straight into the new build: the window
+      // hides on focus loss during the download, and a second trip through
+      // the tray for "Restart now" is one most users never make. Quiet
+      // background installs still wait for the user.
+      if (!quiet && patch.stagedVersion) {
+        restartIntoInstalledUpdate();
+      }
     } finally {
       setAppUpdateInstallBusy(false);
     }
@@ -5424,7 +5430,7 @@ export default function App() {
           : appUpdateReadyToRestart
             ? "Restart now"
             : appUpdateAvailable
-              ? `Install ${appUpdateAvailable.version}`
+              ? `Install ${appUpdateAvailable.version} and restart`
               : "Check for updates";
 
     const statusCopy = !showInstallProgress
@@ -8902,7 +8908,7 @@ export default function App() {
                         ? "Installing…"
                         : displayedUpdateInstalled
                           ? "Restart now"
-                          : `Install ${appUpdateAvailable.version}`}
+                          : "Install and restart"}
                   </button>
                 </div>
               </div>
