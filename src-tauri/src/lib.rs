@@ -1760,16 +1760,16 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
             )
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             let outdated = state
                 .tool_manager
                 .install_plugin(id)
                 .map_err(|err| err.to_string())?;
             if let Some(host) = outdated {
-                let name = if id == "caveman" {
-                    "Caveman"
-                } else {
-                    "Ponytail"
+                let name = match id {
+                    "caveman" => "Caveman",
+                    "chisle" => "Chisle",
+                    _ => "Ponytail",
                 };
                 let other = if host == "Codex" {
                     "Claude Code"
@@ -1846,7 +1846,7 @@ fn set_addon_enabled_blocking(
                 .map_err(|err| err.to_string())?;
             }
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             state
                 .tool_manager
                 .set_plugin_enabled(id, enabled)
@@ -1907,7 +1907,7 @@ fn uninstall_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState,
                 .uninstall_rtk()
                 .map_err(|err| err.to_string())?;
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             state
                 .tool_manager
                 .uninstall_plugin(id)
@@ -6496,7 +6496,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
-        for plugin_id in ["ponytail", "caveman"] {
+        for plugin_id in ["ponytail", "caveman", "chisle"] {
             if let Err(err) = state.tool_manager.uninstall_plugin(plugin_id) {
                 log::warn!("uninstall: removing {plugin_id} plugin failed: {err:#}");
             }
@@ -16422,6 +16422,7 @@ mod output_reduction_report_tests {
             requests: 19_644,
             coverage_percent: Some(63.5),
             publishable: true,
+            alongside_addon: None,
         }
     }
 

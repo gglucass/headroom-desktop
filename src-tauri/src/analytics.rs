@@ -56,6 +56,10 @@ const ALLOWED_EVENTS: &[&str] = &[
     "caveman_enabled",
     "caveman_disabled",
     "caveman_uninstalled",
+    "chisle_installed",
+    "chisle_enabled",
+    "chisle_disabled",
+    "chisle_uninstalled",
     // Open-source plugin/CLI coexistence, at most once per app start and only
     // when something is actually present. Tells us how many users run the OSS
     // Claude Code plugin next to the app, whether its bare hook was absorbed, and

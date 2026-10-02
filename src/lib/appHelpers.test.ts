@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { ToolStatus } from "./types";
+
 import {
   authCodeSentMessage,
   buildInstallFailureMailto,
@@ -10,6 +12,7 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   higherSubscriptionTier,
+  replyAddonOverlapNotice,
   annualFirstYearSavingCents,
   introFirstYearCents,
   introPercentOff,
@@ -956,5 +959,34 @@ describe("restorePendingAuth", () => {
     expect(restorePendingAuth(null, 0)).toBeNull();
     expect(restorePendingAuth("{not json", 0)).toBeNull();
     expect(restorePendingAuth(JSON.stringify({ email: 5 }), 0)).toBeNull();
+  });
+});
+
+describe("replyAddonOverlapNotice", () => {
+  const tool = (id: string, name: string, enabled = true, status: ToolStatus = "healthy") => ({
+    id,
+    name,
+    enabled,
+    status
+  });
+
+  it("is silent when nothing overlaps or the overlapping addon is off", () => {
+    const ponytail = tool("ponytail", "Ponytail");
+    expect(replyAddonOverlapNotice(ponytail, [ponytail, tool("caveman", "Caveman")])).toBeNull();
+    expect(
+      replyAddonOverlapNotice(ponytail, [ponytail, tool("chisle", "Chisle", false)])
+    ).toBeNull();
+    expect(
+      replyAddonOverlapNotice(ponytail, [ponytail, tool("chisle", "Chisle", true, "not_installed")])
+    ).toBeNull();
+  });
+
+  it("names every overlapping addon on Chisle's card and Chisle on theirs", () => {
+    const chisle = tool("chisle", "Chisle");
+    const all = [chisle, tool("ponytail", "Ponytail"), tool("caveman", "Caveman")];
+    expect(replyAddonOverlapNotice(chisle, all)).toBe(
+      "Ponytail and Caveman are on too. Chisle already covers them, so your agent gets overlapping instructions in every session. Disable Ponytail and Caveman."
+    );
+    expect(replyAddonOverlapNotice(all[2], all)).toContain("Chisle is on too and already covers Caveman");
   });
 });

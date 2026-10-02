@@ -119,6 +119,7 @@ If the proxy dies unexpectedly, a watchdog restarts it; after repeated failures 
 | [context7](https://github.com/upstash/context7) | MCP server that fetches current, version-specific library docs | Opt-in add-on |
 | [ponytail](https://github.com/DietrichGebert/ponytail) | Plugin that nudges the agent toward leaner, less over-engineered code | Opt-in add-on |
 | [caveman](https://github.com/JuliusBrussee/caveman) | Plugin that makes replies terse, cutting output tokens while keeping code and errors exact | Opt-in add-on |
+| [chisle](https://github.com/JayPokale/Chisle) | Plugin that combines terse replies and minimal code (what ponytail and caveman do) and trims long command output | Opt-in add-on |
 
 **Tool inclusion policy:** only tools that run entirely locally, inside Headroom-managed storage, with a stable CLI surface make it in. No cloud dependencies, no host profile mutations. See [`research/tool-compatibility-matrix.md`](research/tool-compatibility-matrix.md).
 

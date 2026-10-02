@@ -136,6 +136,11 @@ pub struct OutputReduction {
     /// travel, so the floor can be tuned against fleet data rather than guessed
     /// at twice. The threshold lives in one place, not in every caller.
     pub publishable: bool,
+    /// An enabled addon that also shapes replies (Chisle, Caveman, Ponytail).
+    /// Only ever set on a measured figure, which then reads as Headroom's
+    /// shaping on top of that addon (`ToolManager::active_reply_addon`).
+    #[serde(default)]
+    pub alongside_addon: Option<String>,
 }
 
 /// Auto-learning progress from the backend's `/stats` `traffic_learner` block.
