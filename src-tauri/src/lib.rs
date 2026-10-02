@@ -3041,6 +3041,10 @@ pub(crate) fn startup_error_fingerprint_key(
         // force-reinstalls the pinned wheel, so an event here means that
         // repair did not take. Its own issue, not the exit-1 grab-bag.
         Some("startup_venv_missing_module")
+    } else if !missing_dependency_modules(err).is_empty() {
+        // Same for a third-party package: the in-startup repair re-syncs the
+        // lock, so an event here means that repair did not take either.
+        Some("startup_venv_missing_dependency")
     } else if crate::tool_manager::onnx_probe_crashed(err) {
         // The machine's onnxruntime aborts the interpreter as it loads, so the
         // proxy dies mid-import with no traceback (RUST-C7). The startup path
@@ -3792,6 +3796,24 @@ pub(crate) fn is_loopback_socket_denied_signal(text: &str) -> bool {
 /// `DLL load failed` ImportError (RUST-7W/8V/8W) both stay out of it.
 pub(crate) fn is_missing_headroom_module_signal(text: &str) -> bool {
     text.contains("ModuleNotFoundError: No module named 'headroom")
+}
+
+/// The requirements half of the above: the top-level modules of third-party
+/// packages the venv no longer has. An interrupted pip (an app restart mid
+/// install) takes a package out after the receipt was stamped, so the lock sha
+/// still matches, no maintenance plan re-syncs it, and every launch dies on
+/// the same import (RUST-BA on 0.9.30: `httpcore`, via `upstream_pinning`).
+/// Our own package and the base stdlib's `encodings` have their own repairs.
+pub(crate) fn missing_dependency_modules(text: &str) -> Vec<&str> {
+    const MARKER: &str = "ModuleNotFoundError: No module named '";
+    let mut modules: Vec<&str> = text
+        .match_indices(MARKER)
+        .filter_map(|(at, _)| text[at + MARKER.len()..].split(['\'', '.']).next())
+        .filter(|m| !m.is_empty() && !m.starts_with("headroom") && *m != "encodings")
+        .collect();
+    modules.sort_unstable();
+    modules.dedup();
+    modules
 }
 
 /// True for a `startup_error_fingerprint_key` that names a verdict of the
@@ -11250,19 +11272,19 @@ mod tests {
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
         learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
-        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
-        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
-        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
-        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        missing_dependency_modules, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, savings_report, select_updater_endpoints,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
@@ -15699,6 +15721,38 @@ Some unrelated content.
     }
 
     #[test]
+    fn missing_dependency_modules_names_third_party_packages_only() {
+        // RUST-BA verbatim (0.9.30, macOS): the venv lost httpcore, and the
+        // litellm warning above the traceback names it too without the marker.
+        let tail = "LiteLLM: Failed to fetch remote model cost map: No module named 'httpcore'. \
+                    Falling back to local backup.\n\
+                    File \"~/venv/lib/python3.12/site-packages/headroom/proxy/upstream_pinning.py\", \
+                    line 69, in <module>\n    import httpcore\n\
+                    ModuleNotFoundError: No module named 'httpcore'";
+        assert_eq!(missing_dependency_modules(tail), ["httpcore"]);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(tail)),
+            Some("startup_venv_missing_dependency")
+        );
+        // A submodule maps to its top-level package; repeats collapse.
+        assert_eq!(
+            missing_dependency_modules(
+                "ModuleNotFoundError: No module named 'google.protobuf'\n\
+                 ModuleNotFoundError: No module named 'google'"
+            ),
+            ["google"]
+        );
+        // Our own package and the base stdlib have their own repairs.
+        for own in [
+            "ModuleNotFoundError: No module named 'headroom.providers.claude'",
+            "ModuleNotFoundError: No module named 'encodings'",
+            "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
+        ] {
+            assert!(missing_dependency_modules(own).is_empty(), "for: {own}");
+        }
+    }
+
+    #[test]
     fn startup_error_fingerprint_key_only_names_causes_with_a_remedy() {
         assert_eq!(startup_error_fingerprint_key(None), None);
         assert_eq!(
@@ -15736,11 +15790,14 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(crashed)),
             Some("startup_onnx_native_crash")
         );
-        // A missing or broken module is a venv problem, and it already has a
-        // key of its own -- the wheel repair, not the Kompress retry.
+        // A missing module is a venv problem with a key of its own -- the
+        // dependency repair, not the Kompress retry.
         let missing = "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: \
                        No module named 'onnxruntime')";
-        assert_eq!(startup_error_fingerprint_key(Some(missing)), None);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(missing)),
+            Some("startup_venv_missing_dependency")
+        );
         // A killed probe stays with the endpoint-protection verdict, which
         // names the remedy.
         let killed = "(onnx probe: import onnxruntime failed (killed))";

@@ -5066,6 +5066,35 @@ impl ToolManager {
                     }
                 }
 
+                // Same shape, a third-party package (RUST-BA: `httpcore`).
+                // Nothing else ever re-syncs it: the receipt's lock sha still
+                // matches, and reinstalling the app reuses the runtime, so
+                // every launch died on the same import until the user deleted
+                // the runtime by hand. Same once-per-process budget as above.
+                let missing: Vec<String> = failures
+                    .iter()
+                    .flat_map(|f| crate::missing_dependency_modules(&f.log_tail))
+                    .map(str::to_string)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if claim_once(&DEPENDENCY_REPAIR_ATTEMPTED, !missing.is_empty()) {
+                    log::warn!(
+                        "headroom proxy failed on missing dependencies {missing:?}; \
+                         reinstalling them from the lock and retrying"
+                    );
+                    match self.repair_missing_dependencies(&missing) {
+                        Ok(()) => {
+                            log::info!("dependency repair succeeded; retrying startup");
+                            allow_repair = false;
+                            continue 'attempt;
+                        }
+                        Err(repair_err) => {
+                            log::error!("dependency repair failed: {repair_err:#}");
+                        }
+                    }
+                }
+
                 // A native onnxruntime abort leaves no traceback at all, so the
                 // only evidence is the exit code -- 0xffffffff on Windows, a
                 // signal on the others -- and the probe. Ask it once, and if
@@ -7758,6 +7787,27 @@ impl ToolManager {
     fn repair_pydantic_core(&self) -> Result<()> {
         self.reinstall_lock_pins(&["pydantic", "pydantic-core"], "pydantic-repair.lock")
             .context("reinstalling the lock's pydantic and pydantic-core")
+    }
+
+    /// Put back the third-party packages behind `modules` (import names the
+    /// proxy could not load). A package whose dist-info outlived its files
+    /// reads as installed to every `pip install` short of `--force-reinstall`,
+    /// so force the lock pin named like each module first. Then re-sync the
+    /// whole lock, which restores whatever else the same interruption took,
+    /// under any import name.
+    fn repair_missing_dependencies(&self, modules: &[String]) -> Result<()> {
+        let lock = bootstrap_requirements_lock();
+        let pinned: Vec<&str> = modules
+            .iter()
+            .map(String::as_str)
+            .filter(|module| !lock_entries_named(lock, module).is_empty())
+            .collect();
+        if !pinned.is_empty() {
+            if let Err(err) = self.reinstall_lock_pins(&pinned, "dependency-repair.lock") {
+                log::warn!("force-reinstalling {pinned:?} failed; re-syncing the lock: {err:#}");
+            }
+        }
+        self.repair_stale_requirements_with_progress(|_| {})
     }
 
     /// Force-reinstall `names` at the platform lock's pins, hash-checked and
@@ -15322,6 +15372,10 @@ fn looks_like_corrupt_venv_error(err: &anyhow::Error) -> bool {
 /// a torn install, so the retry-driven start path cannot run pip repeatedly.
 static WHEEL_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+/// The same budget for the startup path's missing-dependency repair, which
+/// runs a full lock re-sync: once per process, the next launch retries.
+static DEPENDENCY_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
 /// Set once the startup path has asked the onnx probe whether this machine's
 /// `import onnxruntime` is fatal, so the 15s probe runs at most once per
 /// process even though the tray retries a failed start every ~20s.
@@ -21674,6 +21728,61 @@ Always run the linter first.
     /// bare `pydantic` (whatever PyPI served) and an unhashed pydantic-core,
     /// bypassing the hash-pinned locks. Both must come from the platform lock,
     /// hashes included, in hash-checking mode.
+    /// RUST-BA: httpcore's dist-info can outlive its files, which reads as
+    /// installed to the lock re-sync, so the module's own pin is
+    /// force-reinstalled (hashed) BEFORE the re-sync that restores the rest.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn repair_missing_dependencies_forces_the_modules_pin_then_resyncs_the_lock() {
+        let (root, runtime, manager) = seed_test_runtime("dependency-repair");
+        let _home = HomeGuard::new(&root);
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
+                 for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+        write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0","artifact":{"requirementsLockSha256":"x"},"mcp":{}}"#,
+        )
+        .expect("seed receipt");
+
+        // `_sqlite3` is no lock package: nothing to force, the re-sync still runs.
+        manager
+            .repair_missing_dependencies(&["httpcore".into(), "_sqlite3".into()])
+            .expect("fake pip succeeds");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let argvs: Vec<&str> = calls.lines().filter(|l| l.starts_with("ARGV ")).collect();
+        let force = argvs
+            .iter()
+            .position(|a| a.contains("--force-reinstall") && a.contains("--require-hashes"))
+            .expect("a hashed force-reinstall");
+        let resync = argvs
+            .iter()
+            .position(|a| a.contains("--upgrade") && a.contains("--requirement"))
+            .expect("a lock re-sync");
+        assert!(force < resync, "{argvs:#?}");
+        let entry = super::lock_entries_named(super::bootstrap_requirements_lock(), "httpcore")
+            .into_iter()
+            .next()
+            .expect("lock pins httpcore");
+        assert!(
+            calls.contains(&entry),
+            "httpcore not from its hashed entry:\n{calls}"
+        );
+        assert!(!calls.contains("_sqlite3"), "{calls}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn repair_pydantic_core_installs_the_locks_hashed_pins() {
