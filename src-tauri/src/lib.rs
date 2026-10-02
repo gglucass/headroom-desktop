@@ -1146,7 +1146,113 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
-    install_pending_update(&pending_update.0, emitter).await
+    let installed = install_pending_update(&pending_update.0, emitter).await;
+    // Windows never gets here (the installer exits the app); elsewhere the new
+    // build is on disk and runs at the next restart.
+    if installed.is_ok() {
+        UPDATE_STAGED.store(true, Ordering::Release);
+    }
+    installed
+}
+
+/// Set once an installed update is waiting for the restart that runs it.
+static UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
+
+/// Minutes of awake time without client traffic before a ready update applies
+/// itself. Long enough that an agent between turns is not cut off mid-task.
+const IDLE_UPDATE_MINUTES: u32 = 30;
+
+/// `minutes` of idle so far, one minute later. Any client request or streamed
+/// response restarts the count, and so does a gap in the ticks: a laptop that
+/// just woke has an owner about to use it, however long it slept.
+fn idle_minutes_after(minutes: u32, traffic: bool, slept: bool) -> u32 {
+    if traffic || slept {
+        0
+    } else {
+        minutes.saturating_add(1)
+    }
+}
+
+/// Applies a ready update once Headroom has carried no traffic for
+/// `IDLE_UPDATE_MINUTES` with every window hidden. Updates only take effect
+/// on a restart, and a menu-bar app goes weeks without one: on 2026-10-02,
+/// 59% of macOS and 75% of Windows installs old enough to have been offered
+/// 0.9.29 were still running a build a week or more older, so fixes shipped
+/// to the people who needed them most never reached them.
+///
+/// macOS (and Linux after a user-approved install) restarts into the staged
+/// build through `restart_app`. Windows has no staging: its install runs the
+/// installer, which exits and relaunches the app, so the idle moment is when
+/// it runs. A macOS update that could not stage quietly (read-only bundle, an
+/// admin prompt) is left to the user, never installed from here.
+fn spawn_idle_update_applier(app: AppHandle) {
+    const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+    std::thread::spawn(move || {
+        let mut idle_minutes: u32 = 0;
+        let mut last_requests: Option<u64> = None;
+        let mut last_tick_wall = std::time::SystemTime::now();
+        // One idle install per process: a Windows install that fails
+        // re-downloads the installer each time, and the user's own click and
+        // the next launch both still get theirs.
+        #[cfg(windows)]
+        let mut install_attempted = false;
+        loop {
+            std::thread::sleep(TICK);
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
+            let now = std::time::SystemTime::now();
+            let slept = now
+                .duration_since(last_tick_wall)
+                .map_or(true, |gap| gap > TICK * 3);
+            last_tick_wall = now;
+            let requests: u64 = proxy_intercept::intercept_request_counts().values().sum();
+            let traffic =
+                last_requests != Some(requests) || proxy_intercept::backend_traffic_within(TICK);
+            last_requests = Some(requests);
+            idle_minutes = idle_minutes_after(idle_minutes, traffic, slept);
+            if idle_minutes < IDLE_UPDATE_MINUTES {
+                continue;
+            }
+
+            let state: tauri::State<'_, AppState> = app.state();
+            let windows_hidden = app
+                .webview_windows()
+                .values()
+                .all(|window| !window.is_visible().unwrap_or(false));
+            if !windows_hidden
+                || INSTALLING_UPDATE.load(Ordering::Acquire)
+                || state.runtime_upgrade_in_progress()
+                || state.bootstrap_progress().running
+            {
+                continue;
+            }
+            if UPDATE_STAGED.load(Ordering::Acquire) {
+                log::info!(
+                    "update: idle for {idle_minutes} minutes; restarting into the staged update"
+                );
+                tauri::async_runtime::spawn(restart_app(app.clone()));
+                return;
+            }
+            #[cfg(windows)]
+            if !install_attempted && app.state::<PendingAppUpdate>().0.lock().is_some() {
+                install_attempted = true;
+                log::info!(
+                    "update: idle for {idle_minutes} minutes; installing the pending update"
+                );
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let pending = app.state::<PendingAppUpdate>();
+                    if let Err(err) =
+                        install_pending_update(&pending.0, Arc::new(|_: AppUpdateProgress| {}))
+                            .await
+                    {
+                        log::info!("update: idle install failed: {err}");
+                    }
+                });
+            }
+        }
+    });
 }
 
 fn store_checked_update<U>(
@@ -7343,6 +7449,7 @@ pub fn run() {
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
             spawn_proxy_watchdog(app.handle().clone());
+            spawn_idle_update_applier(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
             spawn_claude_projects_warmer(app.handle().clone());
             wsl_probe::spawn_probe();
@@ -15824,6 +15931,19 @@ Some unrelated content.
             );
         }
         assert!(!super::startup_death_needs_rebuild(None));
+    }
+
+    #[test]
+    fn a_ready_update_waits_for_thirty_quiet_awake_minutes() {
+        let mut minutes = 0;
+        for _ in 0..super::IDLE_UPDATE_MINUTES {
+            minutes = super::idle_minutes_after(minutes, false, false);
+        }
+        assert_eq!(minutes, super::IDLE_UPDATE_MINUTES);
+        // One request, or one wake from sleep, and the clock starts over: the
+        // owner of a laptop that just woke is about to use it.
+        assert_eq!(super::idle_minutes_after(minutes, true, false), 0);
+        assert_eq!(super::idle_minutes_after(minutes, false, true), 0);
     }
 
     #[test]
