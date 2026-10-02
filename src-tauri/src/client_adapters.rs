@@ -7560,11 +7560,21 @@ fn claude_code_shell_block(port: u16) -> String {
 /// marker and asks the session to exit from a detached child so the command's
 /// own output lands first.
 fn claude_remote_control_wrapper_path() -> PathBuf {
-    home_dir()
-        .join(".claude")
-        .join("hooks")
-        .join("headroom-claude-wrapper.py")
+    // An .exe on Windows: the extension spawns the wrapper with `shell: false`
+    // (`build_windows_wrapper_exe`).
+    let name = if cfg!(windows) {
+        "headroom-claude-wrapper.exe"
+    } else {
+        "headroom-claude-wrapper.py"
+    };
+    home_dir().join(".claude").join("hooks").join(name)
 }
+
+/// What the Windows panel command runs: the wrapper's own confirm step, since
+/// Windows gets no relaunch script. `~` because Git Bash and PowerShell both
+/// expand it, and an unquoted home path with a space would split.
+const WINDOWS_REMOTE_CONTROL_CONFIRM: &str =
+    "~/.claude/hooks/headroom-claude-wrapper.exe --confirm";
 
 /// The VS Code extension's Claude process wrapper setting: an executable it
 /// launches the CLI through as `<wrapper> <claude-binary> <args...>`.
@@ -7614,6 +7624,11 @@ extension never sees a process exit. Headroom is off for the swapped session.
 The panel shows nothing for the swap, so the answer to that request becomes a
 line in the conversation: Remote Control is active, or it did not start.
 Once the extension closes stdin or signals the wrapper, nothing is respawned.
+
+Windows has no relaunch script (its ps and kill cannot see a native pid), so
+there `--confirm` records the restart and the wrapper ends its own child once
+the turn's result is out, by closing the child's stdin: a stream-json CLI takes
+that as the end of input and exits cleanly, transcript saved.
 """
 import json
 import os
@@ -7631,6 +7646,38 @@ MARKER_MAX_AGE = 60
 # Control requests that carry session state; replayed into a respawned child.
 REPLAYED = ("initialize", "mcp_set_servers", "update_settings")
 RC_REQUEST = "headroom-remote-control"
+ENDS_CHILD = os.name == "nt"
+# How long a confirmed restart waits for its turn to end (the Stop hook's 10 min).
+PENDING_MAX_AGE = 600
+
+
+def confirm():
+    base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not base or base.startswith("https://api.anthropic.com"):
+        print("Remote Control is already available in this session: type /rc.")
+        return
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    os.makedirs(DIR, exist_ok=True)
+    if not sid or os.environ.get("HEADROOM_RC_RELAUNCHER") != "wrapper":
+        # A settings file, not inline JSON: Windows PowerShell 5.1 strips the
+        # inner quotes when it passes an argument to a native command.
+        settings = os.path.join(DIR, "settings.json")
+        with open(settings, "w") as f:
+            f.write(OVERRIDE)
+        print("Headroom cannot restart this session by itself: it was not started "
+              "through Headroom's VS Code wrapper.")
+        print('Exit this session, then run: claude --settings "%s" -r %s --remote-control'
+              % (settings, sid or "<session-id>"))
+        return
+    open(os.path.join(DIR, "exit-" + sid), "w").close()
+    print("Restarting this session with Remote Control. Headroom is off for the restarted session.")
+    print("The restart takes up to 30 seconds; this panel stays open and picks up where "
+          "it left off, and says so here once Remote Control is on.")
+
+
+if sys.argv[1:] == ["--confirm"]:
+    confirm()
+    sys.exit(0)
 
 if len(sys.argv) < 2:
     sys.exit("usage: headroom-claude-wrapper.py <claude-binary> [args...]")
@@ -7666,8 +7713,23 @@ def write_child(line):
         try:
             child.stdin.write(line)
             child.stdin.flush()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, ValueError):
             pass
+
+
+def restart_after(result):
+    # The turn that ran --confirm is over. Its record is consumed either way;
+    # an interrupted turn drops the restart, as the Stop hook never runs then.
+    pending = os.path.join(DIR, "exit-" + (state["sid"] or ""))
+    try:
+        fresh = time.time() - os.stat(pending).st_mtime < PENDING_MAX_AGE
+        os.remove(pending)
+    except OSError:
+        return False
+    if not fresh or result.get("subtype") != "success":
+        return False
+    open(os.path.join(DIR, "resume-" + state["sid"]), "w").close()
+    return True
 
 
 def pump_stdin():
@@ -7713,11 +7775,14 @@ def pump_child(child):
         line = child.stdout.readline()
         if not line:
             return
+        end = False
         try:
             parsed = json.loads(line)
             sid = parsed.get("session_id")
             if sid:
                 state["sid"] = sid
+            if ENDS_CHILD and parsed.get("type") == "result":
+                end = restart_after(parsed)
             if parsed.get("type") == "control_response":
                 rid = (parsed.get("response") or {}).get("request_id")
                 if rid in state["swallow"]:
@@ -7733,6 +7798,11 @@ def pump_child(child):
                 out.flush()
             except (BrokenPipeError, OSError):
                 return
+        if end:
+            try:
+                child.stdin.close()
+            except (OSError, ValueError):
+                pass
 
 
 def resume_marker():
@@ -7759,8 +7829,10 @@ def forward_signal(signum, _frame):
             pass
 
 
-for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-    signal.signal(sig, forward_signal)
+# Windows has no SIGHUP.
+for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), forward_signal)
 
 child = spawn([])
 state["child"] = child
@@ -7803,23 +7875,125 @@ while True:
     .to_string()
 }
 
-/// Point the VS Code extension at the wrapper. macOS and Linux: the wrapper
-/// needs the Unix relaunch script, and on Windows the extension spawns the
-/// wrapper without a shell, so it would have to be an .exe, not a script.
-/// Only with a working /usr/bin/python3 (the wrapper's interpreter): without
-/// the Command Line Tools it is a stub that fails on macOS, a distro may not
-/// ship it at all, and every panel session would then fail to start.
-fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
-    if cfg!(windows) {
+/// The Windows wrapper. The extension spawns it with `shell: false`, so it has
+/// to be an .exe; it is built the way pip builds console scripts: distlib's
+/// launcher stub, a shebang naming the interpreter, and a zip holding the
+/// wrapper as `__main__.py`. The stub finds the shebang just before the zip
+/// (the zip's own offsets locate its start, so they must count from it) and
+/// runs `<python> <exe> <args>`, and Python runs the zip.
+fn build_windows_wrapper_exe(stub: &[u8], python: &Path, source: &str) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        "__main__.py",
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )?;
+    zip.write_all(source.as_bytes())?;
+    let archive = zip.finish()?.into_inner();
+    let mut exe = stub.to_vec();
+    exe.extend_from_slice(format!("#!\"{}\"\n", python.display()).as_bytes());
+    exe.extend_from_slice(&archive);
+    Ok(exe)
+}
+
+/// The interpreter and launcher stub for the Windows wrapper, when both are
+/// there. The base interpreter, not the venv's: a running wrapper holds its
+/// executable open for the whole panel session, and the venv is the part a
+/// runtime repair deletes. The stub ships in the venv's pip.
+fn windows_wrapper_parts() -> Option<(PathBuf, PathBuf)> {
+    let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir());
+    let stub = if cfg!(target_arch = "aarch64") {
+        "t64-arm.exe"
+    } else {
+        "t64.exe"
+    };
+    let stub = runtime
+        .venv_dir
+        .join("Lib")
+        .join("site-packages")
+        .join("pip")
+        .join("_vendor")
+        .join("distlib")
+        .join(stub);
+    (runtime.standalone_runtime_intact() && stub.is_file())
+        .then(|| (runtime.standalone_python(), stub))
+}
+
+/// Windows gets the VS Code panel restart only: the terminal one needs the
+/// managed zsh/bash `claude` function, and PowerShell gets none.
+fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
+    let Some((python, stub)) = windows_wrapper_parts() else {
+        // No runtime yet: no wrapper, and no command offering a restart
+        // nothing would perform. The next setup after bootstrap adds both.
+        remove_vscode_process_wrapper()?;
         return Ok((Vec::new(), Vec::new()));
+    };
+    let mut changed = Vec::new();
+    let mut backups = Vec::new();
+    let wrapper = claude_remote_control_wrapper_path();
+    let exe = build_windows_wrapper_exe(
+        &std::fs::read(&stub).with_context(|| format!("reading {}", stub.display()))?,
+        &python,
+        &build_claude_remote_control_wrapper(),
+    )?;
+    if std::fs::read(&wrapper).ok().as_deref() != Some(exe.as_slice()) {
+        if let Some(parent) = wrapper.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        match atomic_write(&wrapper, &exe) {
+            Ok(()) => changed.push(wrapper.display().to_string()),
+            // A panel session running it holds the file; the old wrapper still
+            // works, and the next setup replaces it.
+            Err(err) => {
+                log::info!("keeping the running {}: {err:#}", wrapper.display())
+            }
+        }
     }
+    let command = claude_remote_control_panel_command_path();
+    let content = build_claude_remote_control_command_with(
+        CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION,
+        WINDOWS_REMOTE_CONTROL_CONFIRM,
+    );
+    if std::fs::read_to_string(&command)
+        .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
+    {
+        log::info!("keeping the user's own {}", command.display());
+    } else {
+        let (did_change, backup) = write_file_if_changed(&command, &content, false)?;
+        if did_change {
+            changed.push(command.display().to_string());
+            backups.extend(backup.map(|p| p.display().to_string()));
+        }
+    }
+    if wrapper.is_file() {
+        match configure_vscode_process_wrapper() {
+            Ok((mut c, mut b)) => {
+                changed.append(&mut c);
+                backups.append(&mut b);
+            }
+            Err(err) => log::log!(
+                vscode_settings_failure_level(&err),
+                "configuring the VS Code process wrapper failed: {err}"
+            ),
+        }
+    }
+    Ok((changed, backups))
+}
+
+/// Point the VS Code extension at the wrapper. On macOS and Linux only with a
+/// working /usr/bin/python3 (the wrapper's interpreter): without the Command
+/// Line Tools it is a stub that fails on macOS, a distro may not ship it at
+/// all, and every panel session would then fail to start. Windows checks its
+/// interpreter before building the .exe (`windows_wrapper_parts`).
+fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
     let settings_path = vscode_user_settings_path();
     if !settings_path.exists() {
         // No VS Code user settings at all: nothing launches through us yet, and
         // creating the file would claim a config the user never made.
         return Ok((Vec::new(), Vec::new()));
     }
-    if !system_python_usable() {
+    if !cfg!(windows) && !system_python_usable() {
         remove_vscode_process_wrapper()?;
         return Ok((Vec::new(), Vec::new()));
     }
@@ -7884,8 +8058,11 @@ fn remove_vscode_wrapper_file_if_unreferenced() {
         return;
     }
     let settings = vscode_user_settings_path();
+    // As settings.json spells it: JSON-escaped, so a Windows path's
+    // backslashes are doubled.
+    let spelled = Value::String(wrapper.display().to_string()).to_string();
     let referenced = match std::fs::read_to_string(&settings) {
-        Ok(raw) => raw.contains(&wrapper.display().to_string()),
+        Ok(raw) => raw.contains(&spelled[1..spelled.len() - 1]),
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     };
     if referenced {
@@ -8037,17 +8214,22 @@ echo "The restart takes up to 30 seconds. If it does not come back by itself, ru
 fn build_claude_remote_control_command() -> String {
     build_claude_remote_control_command_with(
         "Restart this session with Remote Control (Headroom off for that session)",
+        &claude_remote_control_script_path().display().to_string(),
     )
 }
+
+const CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION: &str =
+    "Restart this session with Remote Control from the VS Code panel (Headroom off for that session)";
 
 fn build_claude_remote_control_panel_command() -> String {
     build_claude_remote_control_command_with(
-        "Restart this session with Remote Control from the VS Code panel (Headroom off for that session)",
+        CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION,
+        &claude_remote_control_script_path().display().to_string(),
     )
 }
 
-fn build_claude_remote_control_command_with(description: &str) -> String {
-    let script = claude_remote_control_script_path().display().to_string();
+/// `script` is the command the confirmed restart runs with the Bash tool.
+fn build_claude_remote_control_command_with(description: &str, script: &str) -> String {
     format!(
         "---\n\
 description: {description}\n\
@@ -8070,11 +8252,12 @@ Otherwise reply only \"Staying in this session.\"\n"
     )
 }
 
-/// Install the /remote-control relaunch command and its script. Unix only:
-/// the relaunch needs the managed zsh/bash function, which Windows does not get.
+/// Install the /remote-control relaunch command and its script. The terminal
+/// relaunch needs the managed zsh/bash function, which Windows does not get,
+/// so Windows gets the VS Code panel's restart alone.
 fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> {
     if cfg!(target_os = "windows") {
-        return Ok((Vec::new(), Vec::new()));
+        return ensure_windows_remote_control_panel();
     }
     let mut changed = Vec::new();
     let mut backups = Vec::new();
@@ -10847,6 +11030,7 @@ mod tests {
         vscode_settings_failure_level, write_file_if_changed, ClientSetupState, ShellFamily,
         NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
     };
+    use super::{build_claude_remote_control_wrapper, build_windows_wrapper_exe};
     #[cfg(unix)]
     use super::{
         build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
@@ -17623,6 +17807,140 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .path()
             .join(".claude/commands/remote-control.md")
             .exists());
+    }
+
+    #[test]
+    fn windows_wrapper_exe_puts_the_shebang_right_before_its_zip() {
+        let python = Path::new(r"C:\Users\A B\AppData\Roaming\Headroom\python.exe");
+        let exe = build_windows_wrapper_exe(b"MZstub", python, "print(1)\n").unwrap();
+        // What distlib's launcher does: locate the end-of-central-directory
+        // record, step back over the directory to the archive's start, and
+        // read the shebang line that ends there.
+        let eocd = exe
+            .windows(4)
+            .rposition(|w| w == b"PK\x05\x06")
+            .expect("end of central directory");
+        let u32_at = |at: usize| u32::from_le_bytes(exe[at..at + 4].try_into().unwrap()) as usize;
+        let start = eocd - u32_at(eocd + 12) - u32_at(eocd + 16);
+        assert_eq!(&exe[..6], b"MZstub");
+        assert_eq!(
+            &exe[6..start],
+            "#!\"C:\\Users\\A B\\AppData\\Roaming\\Headroom\\python.exe\"\n".as_bytes()
+        );
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&exe[start..])).unwrap();
+        let mut main = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("__main__.py").unwrap(), &mut main).unwrap();
+        assert_eq!(main, "print(1)\n");
+    }
+
+    /// The Windows flow, run by the system Python with the Windows switch on:
+    /// --confirm records the restart, and the wrapper ends its child after the
+    /// turn's result and resumes the same session with Remote Control on. The
+    /// file is the real .exe layout minus the stub, which Python runs as a zip.
+    #[cfg(unix)]
+    #[test]
+    fn windows_wrapper_restarts_its_child_once_the_confirmed_turn_ends() {
+        use std::io::{BufRead, Write};
+        let home = TestHome::new();
+        let source = build_claude_remote_control_wrapper()
+            .replace("ENDS_CHILD = os.name == \"nt\"", "ENDS_CHILD = True");
+        assert!(source.contains("ENDS_CHILD = True"));
+        let wrapper = home.path().join("wrapper.exe");
+        std::fs::write(
+            &wrapper,
+            build_windows_wrapper_exe(b"", Path::new("/usr/bin/python3"), &source).unwrap(),
+        )
+        .unwrap();
+        let log = home.path().join("argv.log");
+        let fake = home.path().join("fake_claude.py");
+        std::fs::write(
+            &fake,
+            r#"import json, sys
+with open(sys.argv[1], "a") as f:
+    f.write(" ".join(sys.argv[2:]) + "\n")
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("type") == "user":
+        print(json.dumps({"type": "result", "subtype": "success", "session_id": "s1"}), flush=True)
+    elif msg.get("request_id") == "headroom-remote-control":
+        print(json.dumps({"type": "control_response", "response": {"subtype": "success",
+            "request_id": "headroom-remote-control",
+            "response": {"session_url": "https://claude.ai/code/session_x"}}}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let confirm = crate::proc::command("/usr/bin/python3")
+            .arg(&wrapper)
+            .arg("--confirm")
+            .env("HOME", home.path())
+            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:6767")
+            .env("CLAUDE_CODE_SESSION_ID", "s1")
+            .env("HEADROOM_RC_RELAUNCHER", "wrapper")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&confirm.stdout);
+        assert!(said.contains("Restarting this session"), "{said}");
+        let dir = home.path().join(".headroom").join("remote-control");
+        assert!(dir.join("exit-s1").exists());
+
+        let mut child = crate::proc::command("/usr/bin/python3")
+            .arg(&wrapper)
+            .arg("/usr/bin/python3")
+            .arg(&fake)
+            .arg(&log)
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = tx.send(line);
+            }
+        });
+        writeln!(
+            stdin,
+            r#"{{"type":"user","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let announced = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(line) if line.contains("Remote Control is now active") => break line,
+                Ok(line) => seen.push(line),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("no announcement; saw {seen:?}");
+                }
+            }
+        };
+        drop(stdin);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("wrapper outlived its stdin");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            announced.contains("claude.ai/code/session_x"),
+            "{announced}"
+        );
+        assert!(seen[0].contains(r#""type": "result""#), "{seen:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        let runs: Vec<&str> = argv.lines().collect();
+        assert_eq!(runs.len(), 2, "{argv}");
+        assert!(runs[1].starts_with("--resume s1 --settings "), "{argv}");
+        assert!(!dir.join("exit-s1").exists() && !dir.join("resume-s1").exists());
     }
 
     #[cfg(unix)]
