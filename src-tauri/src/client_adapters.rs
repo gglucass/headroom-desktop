@@ -4490,9 +4490,24 @@ fn command_contains(command: &Value, fragment: &str) -> bool {
 /// before the hooks were stripped. An unparseable file is left untouched.
 fn remove_legacy_vscode_base_url_keys() -> (Vec<String>, Vec<String>) {
     try_remove_legacy_vscode_base_url_keys().unwrap_or_else(|err| {
-        log::warn!("skipping legacy VS Code base URL cleanup: {err:#}");
+        log::log!(
+            vscode_settings_failure_level(&err),
+            "skipping legacy VS Code base URL cleanup: {err:#}"
+        );
         Default::default()
     })
+}
+
+/// A settings.json our parsers refuse but VS Code applies (a missing comma,
+/// RUST-M2/M3/M4) is the user's file, and the best-effort VS Code edits leave
+/// it untouched: local log only, since every distinct parse error message was
+/// its own Sentry issue. Any other failure still warns.
+fn vscode_settings_failure_level(err: &anyhow::Error) -> log::Level {
+    if err.chain().any(|cause| cause.is::<json5::Error>()) {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    }
 }
 
 fn try_remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
@@ -8092,7 +8107,10 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             changed.append(&mut c);
             backups.append(&mut b);
         }
-        Err(err) => log::warn!("configuring the VS Code process wrapper failed: {err}"),
+        Err(err) => log::log!(
+            vscode_settings_failure_level(&err),
+            "configuring the VS Code process wrapper failed: {err}"
+        ),
     }
     // The Stop hook performs the exit the script recorded, once the turn ends;
     // the next prompt drops one an interrupted turn left behind. No status
@@ -8163,7 +8181,10 @@ fn remove_claude_remote_control_command() -> Result<()> {
     // window still launches the old path: deleting the file failed it with
     // "native binary not found". A leftover wrapper is an inert passthrough.
     if let Err(err) = remove_vscode_process_wrapper() {
-        log::warn!("removing the VS Code process wrapper setting failed: {err}");
+        log::log!(
+            vscode_settings_failure_level(&err),
+            "removing the VS Code process wrapper setting failed: {err}"
+        );
     }
     Ok(())
 }
@@ -10807,8 +10828,8 @@ mod tests {
         retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
         serialize_paths, shell_block_contains_in_files, shell_block_contains_text_in_files,
         shell_double_quote, strip_headroom_hook_from_settings, upsert_managed_block,
-        write_file_if_changed, ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
-        PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
+        vscode_settings_failure_level, write_file_if_changed, ClientSetupState, ShellFamily,
+        NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(unix)]
     use super::{
@@ -11160,6 +11181,17 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must contain a top-level JSON object"));
+    }
+
+    #[test]
+    fn unparseable_vscode_settings_stay_out_of_sentry() {
+        // RUST-M2: the user's file, missing a comma; VS Code applies it anyway.
+        let raw = "{\n    \"chat.viewSessions.orientation\": \"stacked\"\n    \"a\": 1\n}\n";
+        let err = parse_json_object(raw, Path::new("settings.json")).expect_err("missing comma");
+        assert_eq!(vscode_settings_failure_level(&err), log::Level::Info);
+
+        let io = anyhow::Error::from(std::io::Error::other("denied")).context("writing settings");
+        assert_eq!(vscode_settings_failure_level(&io), log::Level::Warn);
     }
 
     #[test]
@@ -17567,10 +17599,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
         std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
         let spawn_claude = || {
-            crate::proc::command(bin.join("claude"))
-                .arg("30")
-                .spawn()
-                .expect("spawn fake claude")
+            use std::os::unix::process::CommandExt;
+            let mut cmd = crate::proc::command(bin.join("claude"));
+            cmd.arg("30");
+            // No controlling terminal, as on CI. With an empty
+            // HEADROOM_REMOTE_CONTROL_TTY the script reads this pid's tty from
+            // `ps`, so run from a terminal it found one and restarted.
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn().expect("spawn fake claude")
         };
         let wait_for_term = |child: &mut std::process::Child, what: &str| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);

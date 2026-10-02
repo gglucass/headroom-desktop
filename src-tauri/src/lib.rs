@@ -478,7 +478,13 @@ fn maybe_fire_onboarding_recovery_nudge(
     if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
         return;
     }
-    if dashboard.lifetime_requests > 0 || unrouted_usage_expected(state) {
+    // Arrivals as well as completions: see `maybe_fire_unrouted_usage_nudge`.
+    if dashboard.lifetime_requests > 0
+        || proxy_intercept::intercept_request_counts()
+            .values()
+            .any(|count| *count > 0)
+        || unrouted_usage_expected(state)
+    {
         return;
     }
     if !state.try_mark_onboarding_recovery_notified() {
@@ -593,13 +599,22 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
             client_adapters::routed_since(client_id, since.into()).into();
         (Utc::now() - at >= chrono::Duration::minutes(3)).then_some(at)
     };
+    // `lifetime_requests` is the backend's `requests.total`, which counts a
+    // request once it COMPLETES: a first turn still streaming, or one the
+    // upstream refused, reads as nothing proxied. The intercept counts
+    // arrivals, so an agent it has heard from this run is routed (RUST-KC on
+    // 0.9.28: `first_optimized_request` landed 2.5 minutes before the event,
+    // and the user was told to restart a Codex that was already wired).
+    let reached = proxy_intercept::intercept_request_counts();
+    let unheard = |agent: &str| reached.get(agent).is_none_or(|count| *count == 0);
     // The Claude-only gate sends Claude Code direct on purpose while Codex
     // stays routed, so only the Codex half can still be a leak.
     let claude = claude
+        && unheard("claude-code")
         && !state.claude_only_bypass.load(Ordering::Acquire)
         && routed("claude_code").is_some_and(|at| claude_sessions_touched_since(&projects, at));
-    let codex_routed_since =
-        routed("codex").filter(|at| codex_active_at.is_some_and(|active| active > *at));
+    let codex_routed_since = routed("codex")
+        .filter(|at| unheard("codex") && codex_active_at.is_some_and(|active| active > *at));
     let codex = codex_routed_since.is_some();
     if !claude && !codex {
         return;
@@ -9503,7 +9518,6 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
-        .menu(&menu)
         .icon_as_template(false)
         .tooltip("Headroom")
         .show_menu_on_left_click(false)
@@ -9521,9 +9535,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             // macOS only. With a menu attached, Windows and Linux open it
             // themselves on right-click; popping a second one here raced the
             // built-in and left the tray with no usable menu at all, so there
-            // was no way to quit from the tray. macOS does not auto-open on
-            // right-click (only left, which `show_menu_on_left_click(false)`
-            // turns off), so it still needs the manual popup.
+            // was no way to quit from the tray. macOS has no menu attached (see
+            // below), so it attaches one only for the click: `show_menu` is a
+            // performClick that blocks until the menu closes, drops it under the
+            // icon and clears the highlight tray-icon set on mouse-down (a
+            // `window.popup_menu` left the icon stuck highlighted).
             #[cfg(target_os = "macos")]
             if let TrayIconEvent::Click {
                 button: MouseButton::Right,
@@ -9531,14 +9547,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                let window = app
-                    .get_webview_window("main")
-                    .or_else(|| app.get_webview_window("launcher"));
-
-                if let Some(window) = window {
-                    let _ = window.popup_menu(&popup_menu);
-                }
+                let _ = tray.set_menu(Some(popup_menu.clone()));
+                let _ = tray.with_inner_tray_icon(|inner| inner.show_menu());
+                let _ = tray.set_menu(None::<tauri::menu::Menu<tauri::Wry>>);
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -9573,6 +9584,14 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
     if let Some(icon) = app.default_window_icon() {
         tray_builder = tray_builder.icon(icon.clone());
+    }
+    // macOS 27 opens an NSStatusItem's attached menu on ANY click, before
+    // tray-icon's click overlay sees it, so `show_menu_on_left_click(false)`
+    // stopped working and a left click showed the menu instead of the
+    // dashboard. Attach it everywhere else; macOS opens it on right-click above.
+    #[cfg(not(target_os = "macos"))]
+    {
+        tray_builder = tray_builder.menu(&menu);
     }
 
     tray_builder.build(app)?;

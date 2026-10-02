@@ -3910,23 +3910,45 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
                 }
             }
         }
+        // RUST-78: a content filter on this Mac drops our flow. Account sync
+        // already tells the user to allow Headroom (FILTER_DROP_HINT); the
+        // alarm would file one event per launch for a cause no change on our
+        // side can fix, and bury the causes it exists to catch.
+        Err(err) if err.filter_blocked => log::info!("{}", err.message),
         Err(err) => {
             // Server unreachable; keep whatever we have locally. reconcile_with_server
             // stays set if this is a fresh install so the next successful call wins.
-            maybe_report_server_silent(&local, &err);
+            maybe_report_server_silent(&local, &err.message);
         }
     }
     Ok(local)
 }
 
-fn fetch_grace_start(identity: &IdentityPayload) -> Result<GraceResponse, String> {
+/// A failed `grace/start` POST. `filter_blocked` is a local content filter's
+/// drop (`is_local_filter_drop`), which the server-silent alarm skips.
+#[derive(Debug)]
+struct GraceStartError {
+    message: String,
+    filter_blocked: bool,
+}
+
+impl From<String> for GraceStartError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            filter_blocked: false,
+        }
+    }
+}
+
+fn fetch_grace_start(identity: &IdentityPayload) -> Result<GraceResponse, GraceStartError> {
     fetch_grace_start_with_base_url(identity, &api_base_url())
 }
 
 fn fetch_grace_start_with_base_url(
     identity: &IdentityPayload,
     base_url: &str,
-) -> Result<GraceResponse, String> {
+) -> Result<GraceResponse, GraceStartError> {
     let builder = http_client()?.post(join_url(base_url, "desktop/grace/start"));
     let response = identity
         .apply_headers(builder)
@@ -3935,23 +3957,21 @@ fn fetch_grace_start_with_base_url(
         // The chain, not {err}: reqwest 0.12's Display stops at "error sending
         // request", so RUST-78's `error` extra could not tell a DNS block from
         // a firewall from TLS interception. Never shown to the user.
-        .map_err(|err| {
-            format!(
+        .map_err(|err| GraceStartError {
+            message: format!(
                 "grace/start request failed: {}",
                 transport_cause_chain(&err)
-            )
+            ),
+            filter_blocked: is_local_filter_drop(&err),
         })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "grace/start returned {}",
-            response.status().as_u16()
-        ));
+        return Err(format!("grace/start returned {}", response.status().as_u16()).into());
     }
 
     response
         .json::<GraceResponse>()
-        .map_err(|err| format!("grace/start parse failed: {err}"))
+        .map_err(|err| format!("grace/start parse failed: {err}").into())
 }
 
 fn local_state_path() -> PathBuf {
@@ -7162,6 +7182,12 @@ mod tests {
         let refused = "http://127.0.0.1:1"; // nothing listens here
         let grace =
             super::fetch_grace_start_with_base_url(&identity, refused).expect_err("port 1 refuses");
+        // A refusal still alarms: only a content filter's drop is skipped.
+        assert!(
+            !grace.filter_blocked,
+            "a refused connect is not a filter drop"
+        );
+        let grace = grace.message;
         let funnel = super::post_grace_start_with_step_to(&identity, "test_step", refused)
             .expect_err("port 1 refuses");
         let account =
@@ -7192,7 +7218,8 @@ mod tests {
             &super::IdentityPayload::default(),
             "http://headroom-test.invalid",
         )
-        .expect_err(".invalid never resolves");
+        .expect_err(".invalid never resolves")
+        .message;
         assert!(err.contains("dns error"), "cause dropped: {err}");
     }
 

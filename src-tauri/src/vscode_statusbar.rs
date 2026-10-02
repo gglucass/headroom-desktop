@@ -235,11 +235,24 @@ fn should_install(current: &str, present: &[String], installed_before: bool) -> 
     !present.is_empty() || !installed_before
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct Tracking {
     /// Profiles Headroom has installed the extension into (`Profile::key`).
     installed: BTreeSet<String>,
+    /// Profile -> extension version whose failed install was already reported.
+    reported_failures: BTreeMap<String, String>,
+}
+
+/// True the first time `key` fails to install `version`. An editor that
+/// cannot install (a `.vscode` junction to a missing drive: ENOENT on its own
+/// extensions folder, RUST-KX) fails identically every launch, and each retry
+/// filed another Sentry event. Retries continue; only the report is once.
+fn first_failure(tracking: &mut Tracking, key: &str, version: &str) -> bool {
+    tracking
+        .reported_failures
+        .insert(key.to_string(), version.to_string())
+        .is_none_or(|reported| reported != version)
 }
 
 fn tracking_path() -> PathBuf {
@@ -394,7 +407,7 @@ fn install_where_needed(editors: &[Editor]) {
         }
     };
     let mut tracking = load_tracking();
-    let before = tracking.installed.clone();
+    let before = tracking.clone();
     for editor in editors {
         for profile in profiles(editor) {
             let present = installed_versions(&profile.registry_dir);
@@ -410,6 +423,7 @@ fn install_where_needed(editors: &[Editor]) {
             match install(editor, &profile, &vsix) {
                 Ok(()) => {
                     log::info!("installed Headroom status bar extension in {}", profile.key);
+                    tracking.reported_failures.remove(&profile.key);
                     tracking.installed.insert(profile.key);
                 }
                 // An editor older than the extension's `engines.vscode` cannot run
@@ -420,13 +434,17 @@ fn install_where_needed(editors: &[Editor]) {
                         profile.key
                     )
                 }
-                Err(err) => {
+                Err(err) if first_failure(&mut tracking, &profile.key, &current) => {
                     log::warn!("installing Headroom status bar extension failed: {err:#}")
                 }
+                Err(err) => log::info!(
+                    "installing Headroom status bar extension failed again in {}: {err:#}",
+                    profile.key
+                ),
             }
         }
     }
-    if tracking.installed != before {
+    if tracking != before {
         save_tracking(&tracking);
     }
 }
@@ -469,6 +487,24 @@ fn uninstall_from(editors: &[Editor]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_a_failed_install_once_per_profile_and_version() {
+        let mut tracking = Tracking::default();
+        assert!(first_failure(&mut tracking, "vscode", "0.2.0"));
+        assert!(
+            !first_failure(&mut tracking, "vscode", "0.2.0"),
+            "same failure, next launch"
+        );
+        assert!(
+            first_failure(&mut tracking, "cursor", "0.2.0"),
+            "another profile"
+        );
+        assert!(
+            first_failure(&mut tracking, "vscode", "0.3.0"),
+            "new extension build"
+        );
+    }
 
     #[test]
     fn installs_fresh_and_upgrades_but_respects_a_user_uninstall() {
