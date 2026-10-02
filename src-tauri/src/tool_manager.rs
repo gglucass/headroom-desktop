@@ -2679,6 +2679,46 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     except Exception:
         pass
 
+# --- Image worker reap: kill the worker a pool reset abandons (CPU) -----------
+# `image_isolation._reset_image_pool` drops the pool after a timeout, crash or
+# error with `shutdown(wait=False, cancel_futures=True)`, which never stops the
+# worker: it runs the abandoned image to the end, its result thrown away, while
+# the next request cold-loads the ONNX models in a fresh one. On a loaded
+# machine that feeds itself: on 2026-10-02 one proxy respawned 6-8 workers per
+# 10 minutes and held four at once, ~1 core each. The vendor kills the dropped
+# pool's workers. ponytail: the reset drops whatever pool is current, so a
+# request on a pool a concurrent request just rebuilt can lose its worker and
+# forwards its original image, the wheel's own fail-open; per-pool reset if
+# that shows up. Exact-pin gated to wheel 0.39.0. Kill switch:
+# HEADROOM_IMAGE_WORKER_REAP=0.
+_hd_iwr_flag = _hd_os.environ.get("HEADROOM_IMAGE_WORKER_REAP", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_iwr_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_iwr_meta
+
+        if _hd_iwr_meta.version("headroom-ai") == "0.39.0":
+            from headroom.proxy import image_isolation as _hd_iwr_mod
+
+            _hd_iwr_orig = _hd_iwr_mod._reset_image_pool
+
+            def _hd_iwr_reset():
+                # shutdown() sets _processes to None, so take them first.
+                pool = _hd_iwr_mod._IMAGE_POOL
+                procs = list((getattr(pool, "_processes", None) or {}).values())
+                _hd_iwr_orig()
+                for proc in procs:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            _hd_iwr_mod._reset_image_pool = _hd_iwr_reset
+            _hd_bound.add("image_worker_reap")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2715,6 +2755,7 @@ _HD_VENDORS = (
     "learn_no_tools",
     "learn_prompt_echo",
     "image_memo",
+    "image_worker_reap",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -17079,6 +17120,62 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "2 True True", "stderr:\n{on_err}");
         assert_eq!(off, "3 True False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn image_worker_reap_behaves_against_the_installed_wheel() {
+        // A timed-out image call forwards the original payload and its worker
+        // dies with the dropped pool; the kill switch leaves it running the
+        // abandoned call.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-image-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        // Spawn workers import their callable by name, so it lives on PYTHONPATH.
+        std::fs::write(
+            dir.join("hd_slow_worker.py"),
+            "import time\ndef slow(messages, provider):\n    time.sleep(60)\n",
+        )
+        .expect("write slow worker");
+        let probe = "import asyncio\n\
+                     from headroom.proxy import image_isolation as m\n\
+                     from hd_slow_worker import slow\n\
+                     msgs = [{'role': 'user', 'content': 'x'}]\n\
+                     async def go():\n\
+                     \x20   m._IMAGE_WORKER = m._success_worker\n\
+                     \x20   await m.run_image_compression_isolated(msgs, 'anthropic', timeout=120)\n\
+                     \x20   (proc,) = m._IMAGE_POOL._processes.values()\n\
+                     \x20   m._IMAGE_WORKER = slow\n\
+                     \x20   out = await m.run_image_compression_isolated(msgs, 'anthropic', timeout=1)\n\
+                     \x20   proc.join(5)\n\
+                     \x20   alive = proc.is_alive()\n\
+                     \x20   proc.kill()\n\
+                     \x20   print(out == (msgs, None), alive)\n\
+                     asyncio.run(go())";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_IMAGE_WORKER_REAP", kill)
+                .output()
+                .expect("run image reap probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True False", "stderr:\n{on_err}");
+        assert_eq!(off, "True True", "stderr:\n{off_err}");
     }
 
     #[test]
