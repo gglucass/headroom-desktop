@@ -9518,7 +9518,6 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     let popup_menu = menu.clone();
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
-        .menu(&menu)
         .icon_as_template(false)
         .tooltip("Headroom")
         .show_menu_on_left_click(false)
@@ -9536,9 +9535,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             // macOS only. With a menu attached, Windows and Linux open it
             // themselves on right-click; popping a second one here raced the
             // built-in and left the tray with no usable menu at all, so there
-            // was no way to quit from the tray. macOS does not auto-open on
-            // right-click (only left, which `show_menu_on_left_click(false)`
-            // turns off), so it still needs the manual popup.
+            // was no way to quit from the tray. macOS has no menu attached (see
+            // below), so it attaches one only for the click: `show_menu` is a
+            // performClick that blocks until the menu closes, drops it under the
+            // icon and clears the highlight tray-icon set on mouse-down (a
+            // `window.popup_menu` left the icon stuck highlighted).
             #[cfg(target_os = "macos")]
             if let TrayIconEvent::Click {
                 button: MouseButton::Right,
@@ -9546,14 +9547,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                let window = app
-                    .get_webview_window("main")
-                    .or_else(|| app.get_webview_window("launcher"));
-
-                if let Some(window) = window {
-                    let _ = window.popup_menu(&popup_menu);
-                }
+                let _ = tray.set_menu(Some(popup_menu.clone()));
+                let _ = tray.with_inner_tray_icon(|inner| inner.show_menu());
+                let _ = tray.set_menu(None::<tauri::menu::Menu<tauri::Wry>>);
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -9588,6 +9584,14 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
     if let Some(icon) = app.default_window_icon() {
         tray_builder = tray_builder.icon(icon.clone());
+    }
+    // macOS 27 opens an NSStatusItem's attached menu on ANY click, before
+    // tray-icon's click overlay sees it, so `show_menu_on_left_click(false)`
+    // stopped working and a left click showed the menu instead of the
+    // dashboard. Attach it everywhere else; macOS opens it on right-click above.
+    #[cfg(not(target_os = "macos"))]
+    {
+        tray_builder = tray_builder.menu(&menu);
     }
 
     tray_builder.build(app)?;
