@@ -4439,6 +4439,15 @@ impl ToolManager {
             }
 
             for (executable, args) in &startup_variants {
+                // A quit or relaunch mid-startup: stop_headroom's sweep killed
+                // the variant being polled, the loop read that as a failed start
+                // and spawned the next one after the sweep, and that proxy
+                // outlived the app holding the port. On 2026-10-02 (rc.1 ->
+                // rc.3) the new build's own proxy then died "address already in
+                // use" and traffic ran on rc.1's sitecustomize.
+                if crate::SHUTTING_DOWN.load(Ordering::Acquire) {
+                    bail!("app is shutting down; not starting the headroom proxy");
+                }
                 let variant = if args.is_empty() {
                     "default".to_string()
                 } else {
@@ -4912,6 +4921,7 @@ impl ToolManager {
                 let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
                 for _ in 0..startup_polls {
                     thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
+                    stop_if_shutting_down(&mut child, &crate::SHUTTING_DOWN)?;
                     if is_local_proxy_reachable() {
                         startup_ok = true;
                         break;
@@ -11427,6 +11437,20 @@ fn fatal_header_lines(path: &Path) -> Vec<String> {
         }
     }
     kept.into_iter().collect()
+}
+
+/// Stops a proxy still starting once the app has begun to exit. The exit does
+/// not wait out a 300s startup, so a child left polling outlives the app and
+/// holds the port the next launch needs (see the startup variant loop).
+fn stop_if_shutting_down(child: &mut Child, shutting_down: &AtomicBool) -> Result<()> {
+    if !shutting_down.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    crate::state::terminate_process_tree(child.id() as i32, true);
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!("app is shutting down; stopped the headroom proxy mid-startup")
 }
 
 /// The 80-line tail a startup failure carries to Sentry, led by the fatal
@@ -21104,6 +21128,24 @@ time.sleep(30)
              assert seen == [RELAY] and r.current_upstream == RELAY, (seen, r.current_upstream)\n\
              assert json.loads(capture.read_text()) == {'url': RELAY}",
         );
+    }
+
+    /// Regression: a relaunch mid-startup left a proxy polling for readiness
+    /// that outlived the app and held the port (rc.1 -> rc.3, 2026-10-02).
+    #[cfg(unix)]
+    #[test]
+    fn startup_poll_stops_the_proxy_once_the_app_is_exiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let exiting = AtomicBool::new(false);
+        let mut child = crate::proc::command("sleep").arg("30").spawn().expect("spawn sleep");
+
+        assert!(super::stop_if_shutting_down(&mut child, &exiting).is_ok());
+        assert!(child.try_wait().expect("try_wait").is_none(), "stopped while not exiting");
+
+        exiting.store(true, Ordering::Release);
+        assert!(super::stop_if_shutting_down(&mut child, &exiting).is_err());
+        assert!(child.try_wait().expect("try_wait").is_some(), "still running after exit");
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
