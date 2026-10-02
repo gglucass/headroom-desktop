@@ -4449,7 +4449,7 @@ impl ToolManager {
                 // rc.3) the new build's own proxy then died "address already in
                 // use" and traffic ran on rc.1's sitecustomize.
                 if crate::SHUTTING_DOWN.load(Ordering::Acquire) {
-                    bail!("app is shutting down; not starting the headroom proxy");
+                    bail!("{START_CUT_SHORT_BY_EXIT}; not starting the headroom proxy");
                 }
                 let variant = if args.is_empty() {
                     "default".to_string()
@@ -11442,6 +11442,10 @@ fn fatal_header_lines(path: &Path) -> Vec<String> {
     kept.into_iter().collect()
 }
 
+/// Leads the error of a start the app's own exit cut short. No failure:
+/// `capture_headroom_start_failure` leaves it out of Sentry.
+pub(crate) const START_CUT_SHORT_BY_EXIT: &str = "app is shutting down";
+
 /// Stops a proxy still starting once the app has begun to exit. The exit does
 /// not wait out a 300s startup, so a child left polling outlives the app and
 /// holds the port the next launch needs (see the startup variant loop).
@@ -11453,7 +11457,7 @@ fn stop_if_shutting_down(child: &mut Child, shutting_down: &AtomicBool) -> Resul
     crate::state::terminate_process_tree(child.id() as i32, true);
     let _ = child.kill();
     let _ = child.wait();
-    bail!("app is shutting down; stopped the headroom proxy mid-startup")
+    bail!("{START_CUT_SHORT_BY_EXIT}; stopped the headroom proxy mid-startup")
 }
 
 /// The 80-line tail a startup failure carries to Sentry, led by the fatal
