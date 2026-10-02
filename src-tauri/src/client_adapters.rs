@@ -17599,10 +17599,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
         std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
         let spawn_claude = || {
-            crate::proc::command(bin.join("claude"))
-                .arg("30")
-                .spawn()
-                .expect("spawn fake claude")
+            use std::os::unix::process::CommandExt;
+            let mut cmd = crate::proc::command(bin.join("claude"));
+            cmd.arg("30");
+            // No controlling terminal, as on CI. With an empty
+            // HEADROOM_REMOTE_CONTROL_TTY the script reads this pid's tty from
+            // `ps`, so run from a terminal it found one and restarted.
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn().expect("spawn fake claude")
         };
         let wait_for_term = |child: &mut std::process::Child, what: &str| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
