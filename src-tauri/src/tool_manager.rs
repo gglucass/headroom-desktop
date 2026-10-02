@@ -2642,30 +2642,45 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # memoized per process on the bytes' sha256; the router's query half still runs
 # every turn, so the technique and the forwarded bytes are unchanged. A None is
 # cached like any result: a failed OCR call sticks for that image until the
-# worker restarts, forwarding the image as-is, the wheel's own fallback.
+# worker restarts, which takes the wheel's own no-text fallback.
+# The memo dies with its worker, and a cold transcode of a long history (~11
+# screenshots) outran the 30s isolation timeout, so each turn's fresh worker
+# started over from the first image and the history never compressed (32
+# timeouts that day). So the parent hands the worker a deadline at 2/3 of the
+# timeout; past it the OCR memo only answers what it already has, an image not
+# reached takes the no-text fallback this turn, and the next turn continues.
+# The deadline crosses the spawn boundary as a partial of _hd_im_worker, which
+# the worker resolves in its own copy of this module.
 # ponytail: FIFO-bounded at 256 images, an LRU if long sessions thrash it.
 # Binds in the spawn worker too, which inherits HEADROOM_SDK. Exact-pin gated
-# to wheel 0.39.0. Kill switch: HEADROOM_IMAGE_MEMO=0.
+# to wheel 0.39.0; upstream PR #3941. Kill switch: HEADROOM_IMAGE_MEMO=0.
 _hd_im_flag = _hd_os.environ.get("HEADROOM_IMAGE_MEMO", "1")
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     _hd_im_flag.strip().lower() not in ("", "0", "false", "no", "off")
 ):
     try:
+        import functools as _hd_im_functools
         import hashlib as _hd_im_hashlib
         import importlib.metadata as _hd_im_meta
+        import time as _hd_im_time
 
         if _hd_im_meta.version("headroom-ai") == "0.39.0":
             from headroom.image.compressor import ImageCompressor as _hd_im_comp
             from headroom.image.onnx_router import OnnxTechniqueRouter as _hd_im_router
+            from headroom.proxy import image_isolation as _hd_im_iso
 
             _hd_im_cache = {}
+            _hd_im_deadline = [None]
 
-            def _hd_im_memo(orig):
+            def _hd_im_memo(orig, deadlined=False):
                 def _hd_im_wrapper(self, image_data, *args):
                     if not isinstance(image_data, bytes):
                         return orig(self, image_data, *args)
                     key = (orig, _hd_im_hashlib.sha256(image_data).digest(), args)
                     if key not in _hd_im_cache:
+                        due = _hd_im_deadline[0]
+                        if deadlined and due is not None and _hd_im_time.time() > due:
+                            return None
                         if len(_hd_im_cache) >= 256:
                             _hd_im_cache.pop(next(iter(_hd_im_cache)))
                         _hd_im_cache[key] = orig(self, image_data, *args)
@@ -2673,8 +2688,38 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 
                 return _hd_im_wrapper
 
-            _hd_im_comp._ocr_extract = _hd_im_memo(_hd_im_comp._ocr_extract)
+            _hd_im_comp._ocr_extract = _hd_im_memo(_hd_im_comp._ocr_extract, deadlined=True)
             _hd_im_router.analyze_image = _hd_im_memo(_hd_im_router.analyze_image)
+
+            # Worker side: runs the wheel's worker under the parent's deadline.
+            def _hd_im_worker(messages, provider, deadline=None):
+                _hd_im_deadline[0] = deadline
+                try:
+                    return _hd_im_iso._compress_messages_worker(messages, provider)
+                finally:
+                    _hd_im_deadline[0] = None
+
+            # Parent side: the wheel reads _IMAGE_WORKER before its first await,
+            # so each call submits with its own deadline. A worker a probe or
+            # test swapped in is left alone.
+            _hd_im_real = _hd_im_iso._IMAGE_WORKER
+            _hd_im_run_orig = _hd_im_iso.run_image_compression_isolated
+
+            async def _hd_im_run(messages, provider, *, timeout):
+                worker = _hd_im_iso._IMAGE_WORKER
+                if worker is _hd_im_real or getattr(worker, "func", None) is _hd_im_worker:
+                    _hd_im_iso._IMAGE_WORKER = _hd_im_functools.partial(
+                        _hd_im_worker, deadline=_hd_im_time.time() + timeout * 2 / 3
+                    )
+                return await _hd_im_run_orig(messages, provider, timeout=timeout)
+
+            # Vendors above import server.py, so both handlers already hold the
+            # wheel's function by name.
+            _hd_im_iso.run_image_compression_isolated = _hd_im_run
+            for _hd_im_name in ("anthropic", "openai"):
+                _hd_im_mod = _hd_sys.modules.get("headroom.proxy.handlers." + _hd_im_name)
+                if getattr(_hd_im_mod, "run_image_compression_isolated", None) is _hd_im_run_orig:
+                    _hd_im_mod.run_image_compression_isolated = _hd_im_run
             _hd_bound.add("image_memo")
     except Exception:
         pass
@@ -2689,8 +2734,8 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # pool's workers. ponytail: the reset drops whatever pool is current, so a
 # request on a pool a concurrent request just rebuilt can lose its worker and
 # forwards its original image, the wheel's own fail-open; per-pool reset if
-# that shows up. Exact-pin gated to wheel 0.39.0. Kill switch:
-# HEADROOM_IMAGE_WORKER_REAP=0.
+# that shows up (upstream PR #3940 resets per pool). Exact-pin gated to wheel
+# 0.39.0. Kill switch: HEADROOM_IMAGE_WORKER_REAP=0.
 _hd_iwr_flag = _hd_os.environ.get("HEADROOM_IMAGE_WORKER_REAP", "1")
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     _hd_iwr_flag.strip().lower() not in ("", "0", "false", "no", "off")
@@ -17085,7 +17130,10 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     #[test]
     fn image_memo_behaves_against_the_installed_wheel() {
         // The same screenshot resent every turn is OCR'd once per process,
-        // with the same text; the kill switch restores one OCR per call.
+        // with the same text; past the deadline only memoized text comes
+        // back; the handler hands the worker a picklable deadline at 2/3 of
+        // the timeout, which the worker side applies for the one call. The
+        // kill switch restores one OCR per call and no deadline.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17096,12 +17144,25 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         std::fs::create_dir_all(&dir).expect("temp inject dir");
         std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
             .expect("write sitecustomize");
-        let probe = "from headroom.image.compressor import ImageCompressor as C\n\
-                     from headroom.image.onnx_router import OnnxTechniqueRouter as R\n\
+        let probe = "import asyncio, pickle, time, sitecustomize as s\n\
+                     import headroom.proxy.image_isolation as m\n\
+                     import headroom.proxy.handlers.anthropic as a\n\
+                     from headroom.image.compressor import ImageCompressor as C\n\
                      c, n = C(), []\n\
                      c._ocr_engine = lambda b: (n.append(b), ([(None, 'hi', 0.99)], 0.0))[1]\n\
                      r = [c._ocr_extract(b) for b in (b'a', b'a', b'b')]\n\
-                     print(len(n), r == ['hi'] * 3, C._ocr_extract.__name__ == R.analyze_image.__name__ == '_hd_im_wrapper')";
+                     d = getattr(s, '_hd_im_deadline', [None])\n\
+                     d[0] = 0.0\n\
+                     late = [c._ocr_extract(b) for b in (b'a', b'c')]\n\
+                     d[0] = None\n\
+                     c._ocr_extract(b'c')\n\
+                     async def seen(messages, provider, *, timeout): return m._IMAGE_WORKER\n\
+                     s._hd_im_run_orig = seen\n\
+                     wrapped = a.run_image_compression_isolated.__name__ == '_hd_im_run'\n\
+                     w = asyncio.run(a.run_image_compression_isolated([], 'anthropic', timeout=30.0)) if wrapped else None\n\
+                     handed = wrapped and pickle.loads(pickle.dumps(w)).func is s._hd_im_worker and 15 < w.keywords['deadline'] - time.time() <= 20\n\
+                     applied = hasattr(s, '_hd_im_worker') and (setattr(m, '_compress_messages_worker', lambda msgs, p: d[0]) or s._hd_im_worker([], 'x', deadline=5.0)) == 5.0 and d[0] is None\n\
+                     print(len(n), r == ['hi'] * 3, late, handed, applied)";
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
                 .args(["-c", probe])
@@ -17118,8 +17179,8 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "2 True True", "stderr:\n{on_err}");
-        assert_eq!(off, "3 True False", "stderr:\n{off_err}");
+        assert_eq!(on, "3 True ['hi', None] True True", "stderr:\n{on_err}");
+        assert_eq!(off, "6 True ['hi', 'hi'] False False", "stderr:\n{off_err}");
     }
 
     #[test]
