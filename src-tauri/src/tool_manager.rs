@@ -2640,9 +2640,12 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # machine OCR'd the same screenshot 114 times in two hours, holding the worker
 # near a full core. Both are pure functions of the image bytes, so they are
 # memoized per process on the bytes' sha256; the router's query half still runs
-# every turn, so the technique and the forwarded bytes are unchanged. A None is
-# cached like any result: a failed OCR call sticks for that image until the
-# worker restarts, which takes the wheel's own no-text fallback.
+# every turn, so the technique and the forwarded bytes are unchanged. A failure
+# is not memoized, so a recovered engine retries the image (upstream #3941
+# review): both wheel functions return None for a failure as for "no text", so
+# the OCR engine is wrapped to flag a call that raised (no engine at all means
+# its init raised), and a None from analyze_image, which swallows its own
+# errors, is never kept. A "no confident text" None is kept like any result.
 # The memo dies with its worker, and a cold transcode of a long history (~11
 # screenshots) outran the 30s isolation timeout, so each turn's fresh worker
 # started over from the first image and the history never compressed (32
@@ -2651,10 +2654,13 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # reached takes the no-text fallback this turn, and the next turn continues.
 # The deadline crosses the spawn boundary as a partial of _hd_im_worker, which
 # the worker resolves in its own copy of this module.
-# FIFO-bounded at 4096 entries (a few MB): a transcode turn scans history
-# oldest-first, so a bound below one history's image count evicts the very
-# image the scan reaches next and nothing is reused (upstream #3941 review).
-# ponytail: thrashes again past 4096 images in one history.
+# FIFO-bounded at 4096 entries and 32 MB of values (sys.getsizeof, exact for
+# OCR text): OCR text has no size limit, and the worker outlives conversations.
+# A dense screenshot OCRs to ~10-20 KB, so even 100 KB each keeps a 300-image
+# history; a transcode turn scans history oldest-first, so a bound below one
+# history's image count evicts the very image the scan reaches next and nothing
+# is reused. A single value over the whole budget is returned uncached.
+# ponytail: thrashes again past 4096 images (or 32 MB of text) in one history.
 # Binds in the spawn worker too, which inherits HEADROOM_SDK. Exact-pin gated
 # to wheel 0.39.0; upstream PR #3941. Kill switch: HEADROOM_IMAGE_MEMO=0.
 _hd_im_flag = _hd_os.environ.get("HEADROOM_IMAGE_MEMO", "1")
@@ -2668,31 +2674,68 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         import time as _hd_im_time
 
         if _hd_im_meta.version("headroom-ai") == "0.39.0":
+            from headroom.image import compressor as _hd_im_cmod
             from headroom.image.compressor import ImageCompressor as _hd_im_comp
             from headroom.image.onnx_router import OnnxTechniqueRouter as _hd_im_router
             from headroom.proxy import image_isolation as _hd_im_iso
 
             _hd_im_cache = {}
+            _hd_im_bytes = [0]
+            _hd_im_budget = 32 * 1024 * 1024
             _hd_im_deadline = [None]
 
-            def _hd_im_memo(orig, deadlined=False):
+            def _hd_im_memo(orig, failed, deadlined=False):
                 def _hd_im_wrapper(self, image_data, *args):
                     if not isinstance(image_data, bytes):
                         return orig(self, image_data, *args)
                     key = (orig, _hd_im_hashlib.sha256(image_data).digest(), args)
-                    if key not in _hd_im_cache:
-                        due = _hd_im_deadline[0]
-                        if deadlined and due is not None and _hd_im_time.time() > due:
-                            return None
-                        if len(_hd_im_cache) >= 4096:
-                            _hd_im_cache.pop(next(iter(_hd_im_cache)))
-                        _hd_im_cache[key] = orig(self, image_data, *args)
-                    return _hd_im_cache[key]
+                    if key in _hd_im_cache:
+                        return _hd_im_cache[key][0]
+                    due = _hd_im_deadline[0]
+                    if deadlined and due is not None and _hd_im_time.time() > due:
+                        return None
+                    value = orig(self, image_data, *args)
+                    size = _hd_sys.getsizeof(value)
+                    if failed(self, value) or size > _hd_im_budget:
+                        return value
+                    _hd_im_cache[key] = (value, size)
+                    _hd_im_bytes[0] += size
+                    while len(_hd_im_cache) > 4096 or _hd_im_bytes[0] > _hd_im_budget:
+                        _hd_im_bytes[0] -= _hd_im_cache.pop(next(iter(_hd_im_cache)))[1]
+                    return value
 
                 return _hd_im_wrapper
 
-            _hd_im_comp._ocr_extract = _hd_im_memo(_hd_im_comp._ocr_extract, deadlined=True)
-            _hd_im_router.analyze_image = _hd_im_memo(_hd_im_router.analyze_image)
+            # The wheel builds its engine from _resolve_rapidocr()'s class, so
+            # every engine it makes is one of these. failed is set until a call
+            # returns, so it stays set when the call raised.
+            class _hd_im_engine:
+                def __init__(self, cls):
+                    self.engine, self.failed = cls(), False
+
+                def __call__(self, image_data):
+                    self.failed = True
+                    raw = self.engine(image_data)
+                    self.failed = False
+                    return raw
+
+            _hd_im_resolve = _hd_im_cmod._resolve_rapidocr
+
+            def _hd_im_resolve_flagged():
+                cls, api = _hd_im_resolve()
+                return (cls and _hd_im_functools.partial(_hd_im_engine, cls)), api
+
+            def _hd_im_ocr_failed(self, value):
+                engine = self.__dict__.get("_ocr_engine")
+                return value is None and getattr(engine, "failed", engine is None)
+
+            _hd_im_cmod._resolve_rapidocr = _hd_im_resolve_flagged
+            _hd_im_comp._ocr_extract = _hd_im_memo(
+                _hd_im_comp._ocr_extract, _hd_im_ocr_failed, deadlined=True
+            )
+            _hd_im_router.analyze_image = _hd_im_memo(
+                _hd_im_router.analyze_image, lambda self, value: value is None
+            )
 
             # Worker side: runs the wheel's worker under the parent's deadline.
             def _hd_im_worker(messages, provider, deadline=None):
@@ -17283,8 +17326,11 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         // The same screenshot resent every turn is OCR'd once per process,
         // with the same text; past the deadline only memoized text comes
         // back; the handler hands the worker a picklable deadline at 2/3 of
-        // the timeout, which the worker side applies for the one call. The
-        // kill switch restores one OCR per call and no deadline.
+        // the timeout, which the worker side applies for the one call. An
+        // OCR engine that failed to start or run, or a SigLIP analysis that
+        // failed, is retried next call while "no text" is kept; retained
+        // values stay within the byte budget, and one over it is not kept.
+        // The kill switch restores one OCR per call and no deadline.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17313,7 +17359,40 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
                      w = asyncio.run(a.run_image_compression_isolated([], 'anthropic', timeout=30.0)) if wrapped else None\n\
                      handed = wrapped and pickle.loads(pickle.dumps(w)).func is s._hd_im_worker and 15 < w.keywords['deadline'] - time.time() <= 20\n\
                      applied = hasattr(s, '_hd_im_worker') and (setattr(m, '_compress_messages_worker', lambda msgs, p: d[0]) or s._hd_im_worker([], 'x', deadline=5.0)) == 5.0 and d[0] is None\n\
-                     print(len(n), r == ['hi'] * 3, late, handed, applied)";
+                     import io, sys, numpy as np, headroom.image.compressor as cm\n\
+                     from PIL import Image\n\
+                     from headroom.image.onnx_router import OnnxTechniqueRouter as R\n\
+                     f, calls = [], []\n\
+                     class E:\n\
+                     \x20   def __init__(self):\n\
+                     \x20       if not f: f.append(1); raise RuntimeError('init')\n\
+                     \x20   def __call__(self, b):\n\
+                     \x20       calls.append(b)\n\
+                     \x20       if len(calls) == 1: raise RuntimeError('run')\n\
+                     \x20       return ([(None, 'ok', 0.99)], 0.0) if b == b'y' else ([], 0.0)\n\
+                     cm._RESOLVED_OCR = (E, 'v1')\n\
+                     c2 = C()\n\
+                     retry = [c2._ocr_extract(b) for b in (b'y', b'y', b'y', b'y', b'z', b'z')]\n\
+                     buf = io.BytesIO()\n\
+                     Image.new('RGB', (2, 2)).save(buf, 'PNG')\n\
+                     rt, runs = R(), []\n\
+                     rt._load_siglip = lambda: None\n\
+                     class S:\n\
+                     \x20   def run(self, out, feeds):\n\
+                     \x20       runs.append(1)\n\
+                     \x20       if len(runs) == 1: raise RuntimeError('siglip')\n\
+                     \x20       return [np.ones((1, 4), dtype=np.float32)]\n\
+                     rt._siglip_session = S()\n\
+                     sig = [rt.analyze_image(buf.getvalue()) is None for _ in range(3)]\n\
+                     bounded = False\n\
+                     if hasattr(s, '_hd_im_budget'):\n\
+                     \x20   t = 'x' * 1000\n\
+                     \x20   s._hd_im_cache.clear(); s._hd_im_bytes[0] = 0; s._hd_im_budget = 3 * sys.getsizeof(t)\n\
+                     \x20   c3 = C()\n\
+                     \x20   c3._ocr_engine = lambda b: ([(None, t * 10 if b == b'huge' else t, 0.99)], 0.0)\n\
+                     \x20   got = [c3._ocr_extract(b) for b in (b'1', b'2', b'3', b'4', b'huge')]\n\
+                     \x20   bounded = got[-1] == t * 10 and len(s._hd_im_cache) == 3 and s._hd_im_bytes[0] == s._hd_im_budget\n\
+                     print(len(n), r == ['hi'] * 3, late, handed, applied, retry, len(calls), sig, len(runs), bounded)";
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
                 .args(["-c", probe])
@@ -17330,8 +17409,16 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "3 True ['hi', None] True True", "stderr:\n{on_err}");
-        assert_eq!(off, "6 True ['hi', 'hi'] False False", "stderr:\n{off_err}");
+        assert_eq!(
+            on,
+            "3 True ['hi', None] True True [None, None, 'ok', 'ok', None, None] 3 [True, False, False] 2 True",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off,
+            "6 True ['hi', 'hi'] False False [None, None, 'ok', 'ok', None, None] 5 [True, False, False] 3 False",
+            "stderr:\n{off_err}"
+        );
     }
 
     #[test]
