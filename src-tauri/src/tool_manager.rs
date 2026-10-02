@@ -2651,7 +2651,10 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # reached takes the no-text fallback this turn, and the next turn continues.
 # The deadline crosses the spawn boundary as a partial of _hd_im_worker, which
 # the worker resolves in its own copy of this module.
-# ponytail: FIFO-bounded at 256 images, an LRU if long sessions thrash it.
+# FIFO-bounded at 4096 entries (a few MB): a transcode turn scans history
+# oldest-first, so a bound below one history's image count evicts the very
+# image the scan reaches next and nothing is reused (upstream #3941 review).
+# ponytail: thrashes again past 4096 images in one history.
 # Binds in the spawn worker too, which inherits HEADROOM_SDK. Exact-pin gated
 # to wheel 0.39.0; upstream PR #3941. Kill switch: HEADROOM_IMAGE_MEMO=0.
 _hd_im_flag = _hd_os.environ.get("HEADROOM_IMAGE_MEMO", "1")
@@ -2681,7 +2684,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                         due = _hd_im_deadline[0]
                         if deadlined and due is not None and _hd_im_time.time() > due:
                             return None
-                        if len(_hd_im_cache) >= 256:
+                        if len(_hd_im_cache) >= 4096:
                             _hd_im_cache.pop(next(iter(_hd_im_cache)))
                         _hd_im_cache[key] = orig(self, image_data, *args)
                     return _hd_im_cache[key]
