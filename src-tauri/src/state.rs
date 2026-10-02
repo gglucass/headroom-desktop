@@ -427,7 +427,8 @@ fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
 #[derive(Debug, Clone)]
 struct PostSpawnSnapshot {
     tracked_child: bool,
-    python_installed: bool,
+    /// `ToolManager::missing_runtime_marker`; `None` is "installed".
+    missing_runtime: Option<&'static str>,
     proxy_bypass: bool,
     pricing_allows_optimization: bool,
     runtime_paused: bool,
@@ -1033,6 +1034,19 @@ impl AppState {
         let maintenance_plan =
             match self.runtime_maintenance_plan_for_app_version(&current_app_version) {
                 Some(plan) => plan,
+                // A rebuild of a runtime with no maintenance due: the watchdog's
+                // last resort for one that keeps dying at startup, which no
+                // plan ever sees (the lock sha and the wheel both still match).
+                // Without this, force_rebuild did nothing here at all.
+                None if force_rebuild && !runtime_upgrade_disabled_by_env() => {
+                    match crate::tool_manager::pinned_headroom_release() {
+                        Ok(release) => RuntimeMaintenancePlan::Upgrade(release),
+                        Err(err) => {
+                            log::warn!("run_upgrade_with_ui: no release to rebuild from: {err:#}");
+                            return;
+                        }
+                    }
+                }
                 None => {
                     // App version changed but no runtime maintenance is actually
                     // needed: stamp the version, under the launch path's guard
@@ -1179,7 +1193,7 @@ impl AppState {
                 log::warn!(
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
-                let restarted = self.ensure_headroom_running().is_ok();
+                let restarted = self.restart_after_failed_maintenance();
                 self.stop_python_if_any_gate();
                 let hint = crate::classify_upgrade_error(&error);
                 let fallback_hint = match maintenance_kind {
@@ -1289,7 +1303,7 @@ impl AppState {
         // attributable in Sentry instead of surfacing as a blank "Stalled".
         let post_spawn = PostSpawnSnapshot {
             tracked_child: self.headroom_process.lock().is_some(),
-            python_installed: self.tool_manager.python_runtime_installed(),
+            missing_runtime: self.tool_manager.missing_runtime_marker(),
             proxy_bypass: self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire),
             pricing_allows_optimization: self.pricing_allows_optimization(),
             runtime_paused: self.runtime_is_paused(),
@@ -1297,11 +1311,11 @@ impl AppState {
             ensure_error: ensure_err,
         };
         log::info!(
-            "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={} \
+            "run_upgrade_with_ui: post-spawn tracked_child={} missing_runtime={:?} \
              proxy_bypass={} pricing_allows_optimization={} runtime_paused={} \
              proxy_reachable={} ensure_error={:?}",
             post_spawn.tracked_child,
-            post_spawn.python_installed,
+            post_spawn.missing_runtime,
             post_spawn.proxy_bypass,
             post_spawn.pricing_allows_optimization,
             post_spawn.runtime_paused,
@@ -1412,7 +1426,7 @@ impl AppState {
             port_occupant: crate::tool_manager::describe_proxy_port_occupant(
                 crate::backend_port::get(),
             ),
-            python_installed: post_spawn.python_installed,
+            python_installed: post_spawn.missing_runtime.is_none(),
             proxy_bypass: post_spawn.proxy_bypass,
             pricing_allows_optimization: post_spawn.pricing_allows_optimization,
             runtime_paused: post_spawn.runtime_paused,
@@ -1448,12 +1462,16 @@ impl AppState {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
         analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
-        let restarted = self.ensure_headroom_running().is_ok();
+        let restarted = self.restart_after_failed_maintenance();
         self.stop_python_if_any_gate();
 
+        let runtime_note = post_spawn
+            .missing_runtime
+            .map(|marker| format!("\n\n(managed runtime missing after maintenance: {marker})"))
+            .unwrap_or_default();
         let err_msg = match log_tail.as_deref() {
             Some(tail) => format!(
-                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n--- last proxy log lines ---\n{}",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).{runtime_note}\n\n--- last proxy log lines ---\n{}",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -1462,7 +1480,7 @@ impl AppState {
                 tail
             ),
             None => format!(
-                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n(no new proxy log lines written during validation window)",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).{runtime_note}\n\n(no new proxy log lines written during validation window)",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -1491,6 +1509,8 @@ impl AppState {
         // nothing is running.
         let startup_hint = if restarted {
             None
+        } else if !self.tool_manager.python_runtime_installed() {
+            Some(RUNTIME_MISSING_HINT.to_string())
         } else {
             post_spawn
                 .ensure_error
@@ -2674,7 +2694,17 @@ impl AppState {
             crate::output_savings::LedgerEstimate::NoEvidence
         );
         let ledger_estimate = ledger_read.scored();
-        let output_reduction = ledger_estimate
+        // An addon shaping replies too (Chisle, Caveman, Ponytail) leaves only
+        // the holdout honest: the estimate and the backend's figure both book
+        // the addon's savings as Headroom's. The lifetime dollar row below
+        // keeps `ledger_estimate`; it is floored by the backend's own daily
+        // output buckets, which this cannot reach anyway (audit #50).
+        let reply_addon = self.tool_manager.active_reply_addon();
+        let tile_estimate = match reply_addon {
+            Some(_) => crate::output_savings::measured(),
+            None => ledger_estimate.clone(),
+        };
+        let output_reduction = tile_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
                 method: e.method.to_string(),
@@ -2684,9 +2714,10 @@ impl AppState {
                 requests: e.requests,
                 coverage_percent: Some(e.coverage_percent),
                 publishable: e.covers_enough(),
+                alongside_addon: reply_addon.clone(),
             })
             .or_else(|| {
-                if !backend_output_fallback_allowed {
+                if !backend_output_fallback_allowed || reply_addon.is_some() {
                     return None;
                 }
                 stats
@@ -2700,6 +2731,7 @@ impl AppState {
                         requests: o.requests,
                         coverage_percent: None,
                         publishable: true,
+                        alongside_addon: None,
                     })
             });
 
@@ -3323,6 +3355,8 @@ impl AppState {
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
     )> {
+        // Read before the lock: a few small file reads per poll.
+        let reply_addon_active = self.tool_manager.active_reply_addon().is_some();
         let mut tracker = self.savings_tracker.lock();
         // Concurrent builders (tray updater, dashboard poll) can finish out of
         // order: one holding a retained or cached payload records after
@@ -3336,6 +3370,9 @@ impl AppState {
                 return None;
             }
             *last = Some(fetched_at);
+        }
+        if reply_addon_active {
+            tracker.pause_output_sampling();
         }
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
@@ -3410,6 +3447,13 @@ impl AppState {
             );
         }
         installing
+    }
+
+    /// Restart after a failed runtime maintenance. `ensure_headroom_running`
+    /// returns Ok without spawning when the runtime is gone, so Ok alone told
+    /// the user "restarted" while nothing ran (RUST-MA).
+    fn restart_after_failed_maintenance(&self) -> bool {
+        self.ensure_headroom_running().is_ok() && self.tool_manager.python_runtime_installed()
     }
 
     pub fn ensure_headroom_running(&self) -> Result<()> {
@@ -6569,6 +6613,20 @@ impl SavingsTracker {
         }
     }
 
+    /// Called before every observe while an addon shapes replies too (Chisle,
+    /// Caveman, Ponytail). The sampled series is the synthetic-control estimate,
+    /// which books that addon's savings as Headroom's, so nothing is sampled
+    /// meanwhile. Dropping the mark rather than holding it makes the next
+    /// reading a seed: holding it would bill the whole paused stretch to the
+    /// first bucket after the addon goes off.
+    ///
+    /// ponytail: pauses rather than sampling the measured figure, whose
+    /// cumulative moves with the control mean and would need its own mark.
+    /// Sample it if addon users ask for output bars.
+    fn pause_output_sampling(&mut self) {
+        self.output_sample_watermark = None;
+    }
+
     /// A readable ledger that scores no strata convicts this machine's entire
     /// sampled output series. Scoreability only grows -- the verbosity
     /// baseline is seeded once and never relearned, control accumulators only
@@ -9055,6 +9113,12 @@ pub(crate) fn headroom_proxy_readyz() -> (bool, Option<serde_json::Value>) {
     probe_proxy_readyz(local_proxy_port(), Duration::from_secs(5))
 }
 
+/// Runtime files vanished during maintenance (RUST-MA: AV on Windows). The
+/// launcher's bootstrap reinstalls them; reopening Headroom routes there.
+const RUNTIME_MISSING_HINT: &str = "Some of Headroom's runtime files were removed while it was \
+     updating, usually by antivirus. Reopen Headroom to reinstall them. If this keeps happening, \
+     allow Headroom's folder in your security software.";
+
 /// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
 /// `classify_startup_error`'s reading of the new runtime's spawn error and is
 /// only passed when the fallback did not restart either, so the banner can
@@ -9157,7 +9221,9 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // the base runtime's `Lib` tree being gone while `python.exe` survived
     // (RUST-C8). Same remedy as a missing headroom.* module, and the
     // installed gate now routes the next launch to bootstrap's reinstall.
-    if crate::is_missing_headroom_module_signal(raw) || raw.contains("No module named 'encodings'")
+    if crate::is_missing_headroom_module_signal(raw)
+        || raw.contains("No module named 'encodings'")
+        || !crate::missing_dependency_modules(raw).is_empty()
     {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \
@@ -12320,6 +12386,25 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
+    }
+
+    #[test]
+    fn a_reply_addon_pause_books_nothing_and_resumes_without_a_spike() {
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
+        // Addon on: every poll pauses first, so its readings only seed.
+        for reading in [(5_000, 9_000), (9_000, 15_000)] {
+            tracker.pause_output_sampling();
+            tracker.sample_output_reduction(Some(reading));
+        }
+        assert_eq!(tracker.output_daily_samples[&day_key].saved_tokens, 400);
+        // Addon off: only work after the last paused reading is booked.
+        tracker.sample_output_reduction(Some((9_300, 16_000)));
+        let day = tracker.output_daily_samples[&day_key];
+        assert_eq!(day.saved_tokens, 700);
+        assert_eq!(day.baseline_tokens, 2_000);
     }
 
     #[test]

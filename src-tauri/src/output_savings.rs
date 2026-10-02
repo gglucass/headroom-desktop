@@ -288,6 +288,23 @@ pub fn estimate() -> LedgerEstimate {
     }
 }
 
+/// The A/B holdout figure alone, never the synthetic control, for when an
+/// addon (Chisle, Caveman, Ponytail) shapes replies too. Its effect lands in
+/// both holdout arms, so the A/B difference is the shaper's share alone; the
+/// synthetic control scores against replies from before the addon and would
+/// book its savings as Headroom's. The "never trade a usable estimate for a
+/// measurement of less traffic" rule in [`measured_if_ready`] is skipped:
+/// that estimate is the one being ruled out. `None` until the holdout is
+/// ready, which shows nothing rather than the inflated number.
+pub fn measured() -> Option<OutputEstimate> {
+    measured_from_bytes(&std::fs::read(ledger_path()?).ok()?)
+}
+
+fn measured_from_bytes(bytes: &[u8]) -> Option<OutputEstimate> {
+    let ledger = serde_json::from_slice::<Ledger>(bytes).ok()?;
+    measured_if_ready(&ledger, &None)
+}
+
 fn estimate_from_bytes(bytes: &[u8]) -> LedgerEstimate {
     let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
         return LedgerEstimate::NoEvidence;
@@ -739,5 +756,31 @@ mod tests {
         assert_eq!(e.method, "measured");
         assert_eq!(e.reduction_percent, 0.0);
         assert!(e.ci_high_percent < 0.0, "band stays unclamped for the gate");
+    }
+
+    #[test]
+    fn measured_only_ignores_the_estimate_a_reply_addon_inflates() {
+        // A solid holdout on `l`, plus an `xl` stratum the baseline scores but
+        // the holdout cannot: the estimate covers more traffic, so it wins.
+        let json = HOLDOUT
+            .replace(
+                r#""treatment": {"#,
+                r#""treatment": {"opus|ask|xl|tools": {"n": 500, "sum": 500000, "sumsq": 500990000,
+                                                      "qn": 500, "qsum": 500000, "qsumsq": 500990000,
+                                                      "clusters": ["x1"]},"#,
+            )
+            .replace(
+                r#""strata": {"#,
+                r#""strata": {"opus|ask|xl|tools": {"n": 100, "sum": 120000, "sumsq": 144990000},"#,
+            );
+        assert_eq!(estimate(&json).method, "estimated");
+
+        let m = measured_from_bytes(json.as_bytes()).expect("holdout is solid");
+        assert_eq!(m.method, "measured");
+        assert_eq!(m.requests, 1000);
+        assert!((m.reduction_percent - 20.0).abs() < 1e-9);
+
+        // No holdout at all: nothing, never the estimate.
+        assert_eq!(measured_from_bytes(MIXED.as_bytes()), None);
     }
 }

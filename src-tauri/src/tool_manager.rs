@@ -2633,6 +2633,248 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Image memo: OCR and SigLIP once per image, not once per turn (CPU) -------
+# Every turn resends the whole conversation, so the image-isolation worker
+# re-ran RapidOCR on every screenshot in history whenever a turn routed to
+# transcode, and SigLIP on the first image every turn: on 2026-10-02 one
+# machine OCR'd the same screenshot 114 times in two hours, holding the worker
+# near a full core. Both are pure functions of the image bytes, so they are
+# memoized per process on the bytes' sha256; the router's query half still runs
+# every turn, so the technique and the forwarded bytes are unchanged. A failure
+# is not memoized, so a recovered engine retries the image (upstream #3941
+# review): both wheel functions return None for a failure as for "no text", so
+# the OCR engine is wrapped to flag a call that raised (no engine at all means
+# its init raised), and a None from analyze_image, which swallows its own
+# errors, is never kept. A "no confident text" None is kept like any result.
+# The memo dies with its worker, and a cold transcode of a long history (~11
+# screenshots) outran the 30s isolation timeout, so each turn's fresh worker
+# started over from the first image and the history never compressed (32
+# timeouts that day). So the parent hands the worker a deadline at 2/3 of the
+# timeout; past it the OCR memo only answers what it already has, an image not
+# reached takes the no-text fallback this turn, and the next turn continues.
+# The deadline crosses the spawn boundary as a partial of _hd_im_worker, which
+# the worker resolves in its own copy of this module.
+# FIFO-bounded at 4096 entries and 32 MB of values (sys.getsizeof, exact for
+# OCR text): OCR text has no size limit, and the worker outlives conversations.
+# A dense screenshot OCRs to ~10-20 KB, so even 100 KB each keeps a 300-image
+# history; a transcode turn scans history oldest-first, so a bound below one
+# history's image count evicts the very image the scan reaches next and nothing
+# is reused. A single value over the whole budget is returned uncached.
+# ponytail: thrashes again past 4096 images (or 32 MB of text) in one history.
+# Binds in the spawn worker too, which inherits HEADROOM_SDK. Exact-pin gated
+# to wheel 0.39.0; upstream PR #3941. Kill switch: HEADROOM_IMAGE_MEMO=0.
+_hd_im_flag = _hd_os.environ.get("HEADROOM_IMAGE_MEMO", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_im_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import functools as _hd_im_functools
+        import hashlib as _hd_im_hashlib
+        import importlib.metadata as _hd_im_meta
+        import time as _hd_im_time
+
+        if _hd_im_meta.version("headroom-ai") == "0.39.0":
+            from headroom.image import compressor as _hd_im_cmod
+            from headroom.image.compressor import ImageCompressor as _hd_im_comp
+            from headroom.image.onnx_router import OnnxTechniqueRouter as _hd_im_router
+            from headroom.proxy import image_isolation as _hd_im_iso
+
+            _hd_im_cache = {}
+            _hd_im_bytes = [0]
+            _hd_im_budget = 32 * 1024 * 1024
+            _hd_im_deadline = [None]
+
+            def _hd_im_memo(orig, failed, deadlined=False):
+                def _hd_im_wrapper(self, image_data, *args):
+                    if not isinstance(image_data, bytes):
+                        return orig(self, image_data, *args)
+                    key = (orig, _hd_im_hashlib.sha256(image_data).digest(), args)
+                    if key in _hd_im_cache:
+                        return _hd_im_cache[key][0]
+                    due = _hd_im_deadline[0]
+                    if deadlined and due is not None and _hd_im_time.time() > due:
+                        return None
+                    value = orig(self, image_data, *args)
+                    size = _hd_sys.getsizeof(value)
+                    if failed(self, value) or size > _hd_im_budget:
+                        return value
+                    _hd_im_cache[key] = (value, size)
+                    _hd_im_bytes[0] += size
+                    while len(_hd_im_cache) > 4096 or _hd_im_bytes[0] > _hd_im_budget:
+                        _hd_im_bytes[0] -= _hd_im_cache.pop(next(iter(_hd_im_cache)))[1]
+                    return value
+
+                return _hd_im_wrapper
+
+            # The wheel builds its engine from _resolve_rapidocr()'s class, so
+            # every engine it makes is one of these. failed is set until a call
+            # returns, so it stays set when the call raised.
+            class _hd_im_engine:
+                def __init__(self, cls):
+                    self.engine, self.failed = cls(), False
+
+                def __call__(self, image_data):
+                    self.failed = True
+                    raw = self.engine(image_data)
+                    self.failed = False
+                    return raw
+
+            _hd_im_resolve = _hd_im_cmod._resolve_rapidocr
+
+            def _hd_im_resolve_flagged():
+                cls, api = _hd_im_resolve()
+                return (cls and _hd_im_functools.partial(_hd_im_engine, cls)), api
+
+            def _hd_im_ocr_failed(self, value):
+                engine = self.__dict__.get("_ocr_engine")
+                return value is None and getattr(engine, "failed", engine is None)
+
+            _hd_im_cmod._resolve_rapidocr = _hd_im_resolve_flagged
+            _hd_im_comp._ocr_extract = _hd_im_memo(
+                _hd_im_comp._ocr_extract, _hd_im_ocr_failed, deadlined=True
+            )
+            _hd_im_router.analyze_image = _hd_im_memo(
+                _hd_im_router.analyze_image, lambda self, value: value is None
+            )
+
+            # Worker side: runs the wheel's worker under the parent's deadline.
+            def _hd_im_worker(messages, provider, deadline=None):
+                _hd_im_deadline[0] = deadline
+                try:
+                    return _hd_im_iso._compress_messages_worker(messages, provider)
+                finally:
+                    _hd_im_deadline[0] = None
+
+            # Parent side: the wheel reads _IMAGE_WORKER before its first await,
+            # so each call submits with its own deadline. A worker a probe or
+            # test swapped in is left alone.
+            _hd_im_real = _hd_im_iso._IMAGE_WORKER
+            _hd_im_run_orig = _hd_im_iso.run_image_compression_isolated
+
+            async def _hd_im_run(messages, provider, *, timeout):
+                worker = _hd_im_iso._IMAGE_WORKER
+                if worker is _hd_im_real or getattr(worker, "func", None) is _hd_im_worker:
+                    _hd_im_iso._IMAGE_WORKER = _hd_im_functools.partial(
+                        _hd_im_worker, deadline=_hd_im_time.time() + timeout * 2 / 3
+                    )
+                return await _hd_im_run_orig(messages, provider, timeout=timeout)
+
+            # Vendors above import server.py, so both handlers already hold the
+            # wheel's function by name.
+            _hd_im_iso.run_image_compression_isolated = _hd_im_run
+            for _hd_im_name in ("anthropic", "openai"):
+                _hd_im_mod = _hd_sys.modules.get("headroom.proxy.handlers." + _hd_im_name)
+                if getattr(_hd_im_mod, "run_image_compression_isolated", None) is _hd_im_run_orig:
+                    _hd_im_mod.run_image_compression_isolated = _hd_im_run
+            _hd_bound.add("image_memo")
+    except Exception:
+        pass
+
+# --- Image worker reap: kill the worker a pool reset abandons (CPU) -----------
+# `image_isolation._reset_image_pool` drops the pool after a timeout, crash or
+# error with `shutdown(wait=False, cancel_futures=True)`, which never stops the
+# worker: it runs the abandoned image to the end, its result thrown away, while
+# the next request cold-loads the ONNX models in a fresh one. On a loaded
+# machine that feeds itself: on 2026-10-02 one proxy respawned 6-8 workers per
+# 10 minutes and held four at once, ~1 core each. The vendor kills the dropped
+# pool's workers. ponytail: the reset drops whatever pool is current, so a
+# request on a pool a concurrent request just rebuilt can lose its worker and
+# forwards its original image, the wheel's own fail-open; per-pool reset if
+# that shows up (upstream PR #3940 resets per pool). Exact-pin gated to wheel
+# 0.39.0. Kill switch: HEADROOM_IMAGE_WORKER_REAP=0.
+_hd_iwr_flag = _hd_os.environ.get("HEADROOM_IMAGE_WORKER_REAP", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_iwr_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_iwr_meta
+
+        if _hd_iwr_meta.version("headroom-ai") == "0.39.0":
+            from headroom.proxy import image_isolation as _hd_iwr_mod
+
+            _hd_iwr_orig = _hd_iwr_mod._reset_image_pool
+
+            def _hd_iwr_reset():
+                # shutdown() sets _processes to None, so take them first.
+                pool = _hd_iwr_mod._IMAGE_POOL
+                procs = list((getattr(pool, "_processes", None) or {}).values())
+                _hd_iwr_orig()
+                for proc in procs:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            _hd_iwr_mod._reset_image_pool = _hd_iwr_reset
+            _hd_bound.add("image_worker_reap")
+    except Exception:
+        pass
+
+# --- Streamed Anthropic uncached input from usage (savings denominator) -------
+# StreamingMixin._finalize_stream_response derives uncached input as Headroom's
+# own tokenizer count minus cache read and write, instead of taking Anthropic's
+# usage.input_tokens (already the uncached count, the field the non-streaming
+# path records). The estimate's error lands in uncached input, which is half of
+# the new-input denominator (uncached + cache write). On 2026-10-02 three long
+# screenshot-heavy sessions ran ~10% over the provider's count: 20.1M uncached
+# logged vs 3.3M real, and the day's rate showed 14.8% for a real 24.7%. Where
+# the estimate runs under, real uncached input clamped to 0 instead. Accounting
+# only: forwarded bytes, tokens saved and list-priced savings are unchanged; the
+# rate moves both ways. Exact-pin gated to wheel 0.39.0; self-neutralizes when
+# the derivation's text is gone. Kill switch: HEADROOM_STREAM_UNCACHED_INPUT=0.
+_hd_sui_flag = _hd_os.environ.get("HEADROOM_STREAM_UNCACHED_INPUT", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_sui_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_sui_meta
+
+        if _hd_sui_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_sui_inspect
+            import re as _hd_sui_re
+            import textwrap as _hd_sui_tw
+
+            from headroom.proxy.handlers import streaming as _hd_sui_mod
+
+            _hd_sui_old = """uncached_input_tokens = max(
+    effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+)
+"""
+            _hd_sui_new = """if provider == "anthropic" and isinstance(provider_input_tokens, int):
+    uncached_input_tokens = max(provider_input_tokens, 0)
+else:
+    uncached_input_tokens = max(
+        effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+    )
+"""
+            _hd_sui_src = _hd_sui_tw.dedent(
+                _hd_sui_inspect.getsource(_hd_sui_mod.StreamingMixin._finalize_stream_response)
+            )
+            _hd_sui_at = _hd_sui_re.findall(r"(?m)^( *)uncached_input_tokens = max\($", _hd_sui_src)
+            if len(_hd_sui_at) == 1:
+                _hd_sui_o, _hd_sui_n = (
+                    "".join(_hd_sui_at[0] + ln for ln in b.splitlines(True))
+                    for b in (_hd_sui_old, _hd_sui_new)
+                )
+                if _hd_sui_src.count(_hd_sui_o) == 1:
+                    _hd_sui_ns = {}
+                    exec(
+                        compile(
+                            _hd_sui_src.replace(_hd_sui_o, _hd_sui_n),
+                            "<headroom-desktop streaming uncached input>",
+                            "exec",
+                        ),
+                        _hd_sui_mod.__dict__,
+                        _hd_sui_ns,
+                    )
+                    _hd_sui_mod.StreamingMixin._finalize_stream_response = _hd_sui_ns[
+                        "_finalize_stream_response"
+                    ]
+                    _hd_bound.add("stream_uncached_input")
+    except Exception:
+        # Fail-open to the wheel's tokenizer derivation (the pre-vendor behaviour).
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2668,6 +2910,9 @@ _HD_VENDORS = (
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_prompt_echo",
+    "image_memo",
+    "image_worker_reap",
+    "stream_uncached_input",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -3024,7 +3269,7 @@ struct PluginAddon {
     plugin_ref: &'static str,
 }
 
-static PLUGIN_ADDONS: [PluginAddon; 2] = [
+static PLUGIN_ADDONS: [PluginAddon; 3] = [
     PluginAddon {
         id: "ponytail",
         marketplace: "DietrichGebert/ponytail",
@@ -3036,6 +3281,12 @@ static PLUGIN_ADDONS: [PluginAddon; 2] = [
         marketplace: "JuliusBrussee/caveman",
         marketplace_name: "caveman",
         plugin_ref: "caveman@caveman",
+    },
+    PluginAddon {
+        id: "chisle",
+        marketplace: "JayPokale/Chisle",
+        marketplace_name: "chisle",
+        plugin_ref: "chisle@chisle",
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
@@ -3689,6 +3940,18 @@ impl ToolManager {
                 checksum: None,
                 required: false,
             },
+            ManagedToolManifest {
+                id: "chisle".into(),
+                name: "Chisle".into(),
+                description:
+                    "Plugin that keeps replies terse and code minimal, and trims long command and web output. Covers what Ponytail and Caveman do, so use it instead of them, not alongside. Installs into Claude Code and Codex. Requires their CLI and Node.js on PATH."
+                        .into(),
+                runtime: "plugin".into(),
+                source_url: "https://github.com/JayPokale/Chisle".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
         ];
 
         Self {
@@ -3772,8 +4035,8 @@ impl ToolManager {
     }
 
     /// Chip text for the Addons tab. markitdown and serena are measured
-    /// (shim counter / serena's logs plus its live dashboard stats); ponytail
-    /// and caveman are the plugins' published benchmark medians — their skills
+    /// (shim counter / serena's logs plus its live dashboard stats); ponytail,
+    /// caveman and chisle are the plugins' published benchmark figures — their skills
     /// forbid inventing per-repo figures, so the labels say "benchmark". rtk's
     /// figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
@@ -3793,6 +4056,8 @@ impl ToolManager {
             }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
             "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
+            // Its 2026-10-01 rerun: 83% of a bare model's billed output.
+            "chisle" => Some("~17% fewer output tokens (benchmark)".to_string()),
             _ => None,
         }
     }
@@ -3904,6 +4169,14 @@ impl ToolManager {
     }
 
     pub fn python_runtime_installed(&self) -> bool {
+        self.missing_runtime_marker().is_none()
+    }
+
+    /// The first runtime file `python_runtime_installed` finds missing, named
+    /// for diagnostics. RUST-MA: a 6-minute requirements repair on Windows
+    /// ended with the runtime gone (AV killed `headroom mcp install` with exit
+    /// 0x4B494C4C, "KILL", 10s earlier) and the event could not say which file.
+    pub fn missing_runtime_marker(&self) -> Option<&'static str> {
         // The base interpreter counts too, not just the venv. A venv's
         // `Scripts/python.exe` is a redirector stub that execs the interpreter
         // recorded in `pyvenv.cfg`; deleting `runtime/python` (AV quarantine,
@@ -3922,10 +4195,17 @@ impl ToolManager {
         // bootstrap's rebuild instead of a permanent pip-retry loop.
         // RUST-C8: the base can also lose its stdlib while keeping python.exe
         // (same routing, one directory deeper), hence `intact`, not `exists`.
-        self.runtime.ready_flag().exists()
-            && self.runtime.managed_python().exists()
-            && self.runtime.standalone_runtime_intact()
-            && self.runtime.venv_dir.join("pyvenv.cfg").exists()
+        if !self.runtime.ready_flag().exists() {
+            Some("venv READY flag")
+        } else if !self.runtime.managed_python().exists() {
+            Some("venv python")
+        } else if !self.runtime.standalone_runtime_intact() {
+            Some("base interpreter or its stdlib")
+        } else if !self.runtime.venv_dir.join("pyvenv.cfg").exists() {
+            Some("pyvenv.cfg")
+        } else {
+            None
+        }
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -4271,6 +4551,15 @@ impl ToolManager {
             }
 
             for (executable, args) in &startup_variants {
+                // A quit or relaunch mid-startup: stop_headroom's sweep killed
+                // the variant being polled, the loop read that as a failed start
+                // and spawned the next one after the sweep, and that proxy
+                // outlived the app holding the port. On 2026-10-02 (rc.1 ->
+                // rc.3) the new build's own proxy then died "address already in
+                // use" and traffic ran on rc.1's sitecustomize.
+                if crate::SHUTTING_DOWN.load(Ordering::Acquire) {
+                    bail!("{START_CUT_SHORT_BY_EXIT}; not starting the headroom proxy");
+                }
                 let variant = if args.is_empty() {
                     "default".to_string()
                 } else {
@@ -4744,6 +5033,7 @@ impl ToolManager {
                 let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
                 for _ in 0..startup_polls {
                     thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
+                    stop_if_shutting_down(&mut child, &crate::SHUTTING_DOWN)?;
                     if is_local_proxy_reachable() {
                         startup_ok = true;
                         break;
@@ -4894,6 +5184,35 @@ impl ToolManager {
                         }
                         Err(repair_err) => {
                             log::error!("headroom wheel repair failed: {repair_err:#}");
+                        }
+                    }
+                }
+
+                // Same shape, a third-party package (RUST-BA: `httpcore`).
+                // Nothing else ever re-syncs it: the receipt's lock sha still
+                // matches, and reinstalling the app reuses the runtime, so
+                // every launch died on the same import until the user deleted
+                // the runtime by hand. Same once-per-process budget as above.
+                let missing: Vec<String> = failures
+                    .iter()
+                    .flat_map(|f| crate::missing_dependency_modules(&f.log_tail))
+                    .map(str::to_string)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if claim_once(&DEPENDENCY_REPAIR_ATTEMPTED, !missing.is_empty()) {
+                    log::warn!(
+                        "headroom proxy failed on missing dependencies {missing:?}; \
+                         reinstalling them from the lock and retrying"
+                    );
+                    match self.repair_missing_dependencies(&missing) {
+                        Ok(()) => {
+                            log::info!("dependency repair succeeded; retrying startup");
+                            allow_repair = false;
+                            continue 'attempt;
+                        }
+                        Err(repair_err) => {
+                            log::error!("dependency repair failed: {repair_err:#}");
                         }
                     }
                 }
@@ -7592,6 +7911,27 @@ impl ToolManager {
             .context("reinstalling the lock's pydantic and pydantic-core")
     }
 
+    /// Put back the third-party packages behind `modules` (import names the
+    /// proxy could not load). A package whose dist-info outlived its files
+    /// reads as installed to every `pip install` short of `--force-reinstall`,
+    /// so force the lock pin named like each module first. Then re-sync the
+    /// whole lock, which restores whatever else the same interruption took,
+    /// under any import name.
+    fn repair_missing_dependencies(&self, modules: &[String]) -> Result<()> {
+        let lock = bootstrap_requirements_lock();
+        let pinned: Vec<&str> = modules
+            .iter()
+            .map(String::as_str)
+            .filter(|module| !lock_entries_named(lock, module).is_empty())
+            .collect();
+        if !pinned.is_empty() {
+            if let Err(err) = self.reinstall_lock_pins(&pinned, "dependency-repair.lock") {
+                log::warn!("force-reinstalling {pinned:?} failed; re-syncing the lock: {err:#}");
+            }
+        }
+        self.repair_stale_requirements_with_progress(|_| {})
+    }
+
     /// Force-reinstall `names` at the platform lock's pins, hash-checked and
     /// without deps, via a `file_name` requirements file in downloads/.
     fn reinstall_lock_pins(&self, names: &[&str], file_name: &str) -> Result<()> {
@@ -9342,6 +9682,11 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
+        if plugin.id == "chisle" {
+            if let Err(err) = crate::client_adapters::scope_chisle_compression(true) {
+                log::warn!("chisle: scoping its tool-output compression failed: {err:#}");
+            }
+        }
         // At most one: with two hosts, the other one installed.
         Ok(outdated.pop())
     }
@@ -9433,12 +9778,32 @@ impl ToolManager {
                     self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
             }
         }
+        if plugin.id == "chisle" {
+            let _ = crate::client_adapters::scope_chisle_compression(false);
+        }
         let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
         if receipt.exists() {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Name of an enabled addon that shapes the agent's replies itself (every
+    /// plugin addon does), whether Headroom installed it or the user did. The
+    /// output shaper's estimated figure scores replies against a baseline
+    /// learned before install, so it credits Headroom with whatever such an
+    /// addon saves; the dashboard reads this to show the measured figure
+    /// instead (see `output_savings::measured`).
+    pub fn active_reply_addon(&self) -> Option<String> {
+        PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| {
+                self.tool_enabled(plugin.id)
+                    && !matches!(self.detect_status(plugin.id), ToolStatus::NotInstalled)
+            })
+            .and_then(|plugin| self.manifests.iter().find(|m| m.id == plugin.id))
+            .map(|manifest| manifest.name.clone())
     }
 
     /// Registered with a host but never installed by Headroom: the user ran
@@ -9631,19 +9996,22 @@ fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
 }
 
 /// A copy installed without the plugin manager, so the registry never lists
-/// it: `npx skills add <repo> -g` drops `skills/<id>/`, and caveman's own
+/// it: `npx skills add <repo> -g` drops `skills/<id>/`, caveman's own
 /// installer wires `hooks/caveman-activate.js` into settings.json whenever its
-/// plugin install fails. Offering Install on top would fire every hook twice.
+/// plugin install fails, and chisle's (`npx chisle`) does the same from
+/// `chisle-hooks/`. Offering Install on top would fire every hook twice.
 fn claude_standalone_install(plugin: &PluginAddon) -> bool {
     let claude = crate::client_adapters::home_dir().join(".claude");
+    let activate = format!("{}-activate.js", plugin.id);
     claude
         .join("skills")
         .join(plugin.id)
         .join("SKILL.md")
         .exists()
+        || claude.join("hooks").join(&activate).exists()
         || claude
-            .join("hooks")
-            .join(format!("{}-activate.js", plugin.id))
+            .join(format!("{}-hooks", plugin.id))
+            .join(&activate)
             .exists()
 }
 
@@ -11183,6 +11551,24 @@ fn fatal_header_lines(path: &Path) -> Vec<String> {
     kept.into_iter().collect()
 }
 
+/// Leads the error of a start the app's own exit cut short. No failure:
+/// `capture_headroom_start_failure` leaves it out of Sentry.
+pub(crate) const START_CUT_SHORT_BY_EXIT: &str = "app is shutting down";
+
+/// Stops a proxy still starting once the app has begun to exit. The exit does
+/// not wait out a 300s startup, so a child left polling outlives the app and
+/// holds the port the next launch needs (see the startup variant loop).
+fn stop_if_shutting_down(child: &mut Child, shutting_down: &AtomicBool) -> Result<()> {
+    if !shutting_down.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    crate::state::terminate_process_tree(child.id() as i32, true);
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!("{START_CUT_SHORT_BY_EXIT}; stopped the headroom proxy mid-startup")
+}
+
 /// The 80-line tail a startup failure carries to Sentry, led by the fatal
 /// marker lines when the log holds a crash dump (see [`fatal_header_lines`]).
 fn crash_log_excerpt(path: &Path) -> String {
@@ -12189,7 +12575,7 @@ fn headroom_index_requirement(
     Ok(format!("--requirement={}", path.display()))
 }
 
-fn pinned_headroom_release() -> Result<HeadroomRelease> {
+pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
             "https://files.pythonhosted.org/packages/b9/c0/585a2dd630a8936c20bf1062fa76cdbbe3cb4a29a909367f7c040770a1e5/headroom_ai-0.39.0-cp310-abi3-macosx_11_0_arm64.whl",
@@ -15126,6 +15512,10 @@ fn looks_like_corrupt_venv_error(err: &anyhow::Error) -> bool {
 /// a torn install, so the retry-driven start path cannot run pip repeatedly.
 static WHEEL_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
+/// The same budget for the startup path's missing-dependency repair, which
+/// runs a full lock re-sync: once per process, the next launch retries.
+static DEPENDENCY_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
 /// Set once the startup path has asked the onnx probe whether this machine's
 /// `import onnxruntime` is fatal, so the 15s probe runs at most once per
 /// process even though the tray retries a failed start every ~20s.
@@ -16929,6 +17319,227 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn image_memo_behaves_against_the_installed_wheel() {
+        // The same screenshot resent every turn is OCR'd once per process,
+        // with the same text; past the deadline only memoized text comes
+        // back; the handler hands the worker a picklable deadline at 2/3 of
+        // the timeout, which the worker side applies for the one call. An
+        // OCR engine that failed to start or run, or a SigLIP analysis that
+        // failed, is retried next call while "no text" is kept; retained
+        // values stay within the byte budget, and one over it is not kept.
+        // The kill switch restores one OCR per call and no deadline.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-image-memo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import asyncio, pickle, time, sitecustomize as s\n\
+                     import headroom.proxy.image_isolation as m\n\
+                     import headroom.proxy.handlers.anthropic as a\n\
+                     from headroom.image.compressor import ImageCompressor as C\n\
+                     c, n = C(), []\n\
+                     c._ocr_engine = lambda b: (n.append(b), ([(None, 'hi', 0.99)], 0.0))[1]\n\
+                     r = [c._ocr_extract(b) for b in (b'a', b'a', b'b')]\n\
+                     d = getattr(s, '_hd_im_deadline', [None])\n\
+                     d[0] = 0.0\n\
+                     late = [c._ocr_extract(b) for b in (b'a', b'c')]\n\
+                     d[0] = None\n\
+                     c._ocr_extract(b'c')\n\
+                     async def seen(messages, provider, *, timeout): return m._IMAGE_WORKER\n\
+                     s._hd_im_run_orig = seen\n\
+                     wrapped = a.run_image_compression_isolated.__name__ == '_hd_im_run'\n\
+                     w = asyncio.run(a.run_image_compression_isolated([], 'anthropic', timeout=30.0)) if wrapped else None\n\
+                     handed = wrapped and pickle.loads(pickle.dumps(w)).func is s._hd_im_worker and 15 < w.keywords['deadline'] - time.time() <= 20\n\
+                     applied = hasattr(s, '_hd_im_worker') and (setattr(m, '_compress_messages_worker', lambda msgs, p: d[0]) or s._hd_im_worker([], 'x', deadline=5.0)) == 5.0 and d[0] is None\n\
+                     import io, sys, numpy as np, headroom.image.compressor as cm\n\
+                     from PIL import Image\n\
+                     from headroom.image.onnx_router import OnnxTechniqueRouter as R\n\
+                     f, calls = [], []\n\
+                     class E:\n\
+                     \x20   def __init__(self):\n\
+                     \x20       if not f: f.append(1); raise RuntimeError('init')\n\
+                     \x20   def __call__(self, b):\n\
+                     \x20       calls.append(b)\n\
+                     \x20       if len(calls) == 1: raise RuntimeError('run')\n\
+                     \x20       return ([(None, 'ok', 0.99)], 0.0) if b == b'y' else ([], 0.0)\n\
+                     cm._RESOLVED_OCR = (E, 'v1')\n\
+                     c2 = C()\n\
+                     retry = [c2._ocr_extract(b) for b in (b'y', b'y', b'y', b'y', b'z', b'z')]\n\
+                     buf = io.BytesIO()\n\
+                     Image.new('RGB', (2, 2)).save(buf, 'PNG')\n\
+                     rt, runs = R(), []\n\
+                     rt._load_siglip = lambda: None\n\
+                     class S:\n\
+                     \x20   def run(self, out, feeds):\n\
+                     \x20       runs.append(1)\n\
+                     \x20       if len(runs) == 1: raise RuntimeError('siglip')\n\
+                     \x20       return [np.ones((1, 4), dtype=np.float32)]\n\
+                     rt._siglip_session = S()\n\
+                     sig = [rt.analyze_image(buf.getvalue()) is None for _ in range(3)]\n\
+                     bounded = False\n\
+                     if hasattr(s, '_hd_im_budget'):\n\
+                     \x20   t = 'x' * 1000\n\
+                     \x20   s._hd_im_cache.clear(); s._hd_im_bytes[0] = 0; s._hd_im_budget = 3 * sys.getsizeof(t)\n\
+                     \x20   c3 = C()\n\
+                     \x20   c3._ocr_engine = lambda b: ([(None, t * 10 if b == b'huge' else t, 0.99)], 0.0)\n\
+                     \x20   got = [c3._ocr_extract(b) for b in (b'1', b'2', b'3', b'4', b'huge')]\n\
+                     \x20   bounded = got[-1] == t * 10 and len(s._hd_im_cache) == 3 and s._hd_im_bytes[0] == s._hd_im_budget\n\
+                     print(len(n), r == ['hi'] * 3, late, handed, applied, retry, len(calls), sig, len(runs), bounded)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_IMAGE_MEMO", kill)
+                .output()
+                .expect("run image memo probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on,
+            "3 True ['hi', None] True True [None, None, 'ok', 'ok', None, None] 3 [True, False, False] 2 True",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off,
+            "6 True ['hi', 'hi'] False False [None, None, 'ok', 'ok', None, None] 5 [True, False, False] 3 False",
+            "stderr:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn image_worker_reap_behaves_against_the_installed_wheel() {
+        // A timed-out image call forwards the original payload and its worker
+        // dies with the dropped pool; the kill switch leaves it running the
+        // abandoned call.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-image-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        // Spawn workers import their callable by name, so it lives on PYTHONPATH.
+        std::fs::write(
+            dir.join("hd_slow_worker.py"),
+            "import time\ndef slow(messages, provider):\n    time.sleep(60)\n",
+        )
+        .expect("write slow worker");
+        let probe = "import asyncio\n\
+                     from headroom.proxy import image_isolation as m\n\
+                     from hd_slow_worker import slow\n\
+                     msgs = [{'role': 'user', 'content': 'x'}]\n\
+                     async def go():\n\
+                     \x20   m._IMAGE_WORKER = m._success_worker\n\
+                     \x20   await m.run_image_compression_isolated(msgs, 'anthropic', timeout=120)\n\
+                     \x20   (proc,) = m._IMAGE_POOL._processes.values()\n\
+                     \x20   m._IMAGE_WORKER = slow\n\
+                     \x20   out = await m.run_image_compression_isolated(msgs, 'anthropic', timeout=1)\n\
+                     \x20   proc.join(5)\n\
+                     \x20   alive = proc.is_alive()\n\
+                     \x20   proc.kill()\n\
+                     \x20   print(out == (msgs, None), alive)\n\
+                     asyncio.run(go())";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_IMAGE_WORKER_REAP", kill)
+                .output()
+                .expect("run image reap probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True False", "stderr:\n{on_err}");
+        assert_eq!(off, "True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn stream_uncached_input_behaves_against_the_installed_wheel() {
+        // A streamed Anthropic turn records the provider's uncached count, over
+        // and under the local estimate, and the tokenizer derivation when no
+        // usage arrived; the kill switch keeps the derivation throughout.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-stream-uncached-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        // Production figures: Anthropic reported input_tokens=2 on a turn the
+        // wheel logged with 50,663 uncached tokens.
+        let probe = "import asyncio, sitecustomize\n\
+                     from types import SimpleNamespace\n\
+                     from headroom.proxy.server import HeadroomProxy\n\
+                     def go(optimized, reported):\n\
+                     \x20   h = object.__new__(HeadroomProxy)\n\
+                     \x20   h.config = SimpleNamespace(log_full_messages=False)\n\
+                     \x20   out = []\n\
+                     \x20   async def rec(o):\n\
+                     \x20       out.append(o)\n\
+                     \x20   h._record_request_outcome = rec\n\
+                     \x20   st = {'input_tokens': reported, 'output_tokens': 7,\n\
+                     \x20         'cache_read_input_tokens': 360949, 'cache_creation_input_tokens': 840,\n\
+                     \x20         'cache_creation_ephemeral_5m_input_tokens': 0,\n\
+                     \x20         'cache_creation_ephemeral_1h_input_tokens': 840,\n\
+                     \x20         'total_bytes': 100, 'sse_buffer': bytearray(), 'ttfb_ms': 4.0}\n\
+                     \x20   asyncio.run(h._finalize_stream_response(\n\
+                     \x20       body={'messages': [{'role': 'user', 'content': 'x'}]},\n\
+                     \x20       provider='anthropic', model='claude-opus-5-5', request_id='r',\n\
+                     \x20       original_tokens=optimized + 5, optimized_tokens=optimized,\n\
+                     \x20       tokens_saved=5, transforms_applied=[], optimization_latency=1.0,\n\
+                     \x20       stream_state=st, start_time=0.0))\n\
+                     \x20   return out[0].uncached_input_tokens\n\
+                     print(go(412452, 2), go(300000, 2), go(400000, None),\n\
+                     \x20     'stream_uncached_input' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STREAM_UNCACHED_INPUT", kill)
+                .output()
+                .expect("run stream uncached probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: stream uncached input vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "2 2 38211 True", "stderr:\n{on_err}");
+        assert_eq!(off, "50663 0 38211 False", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -20744,6 +21355,33 @@ time.sleep(30)
         );
     }
 
+    /// Regression: a relaunch mid-startup left a proxy polling for readiness
+    /// that outlived the app and held the port (rc.1 -> rc.3, 2026-10-02).
+    #[cfg(unix)]
+    #[test]
+    fn startup_poll_stops_the_proxy_once_the_app_is_exiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let exiting = AtomicBool::new(false);
+        let mut child = crate::proc::command("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+
+        assert!(super::stop_if_shutting_down(&mut child, &exiting).is_ok());
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "stopped while not exiting"
+        );
+
+        exiting.store(true, Ordering::Release);
+        assert!(super::stop_if_shutting_down(&mut child, &exiting).is_err());
+        assert!(
+            child.try_wait().expect("try_wait").is_some(),
+            "still running after exit"
+        );
+    }
+
     /// Regression: `start_headroom_background` previously built `startup_variants`
     /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
     /// the variants still spawned with `--port 6768` and both failed with
@@ -21291,6 +21929,11 @@ Always run the linter first.
             manager.python_runtime_installed(),
             "all markers present must read as installed"
         );
+        assert_eq!(manager.missing_runtime_marker(), None);
+        fs::remove_file(runtime.venv_dir.join("pyvenv.cfg")).expect("remove pyvenv.cfg");
+        assert_eq!(manager.missing_runtime_marker(), Some("pyvenv.cfg"));
+        fs::remove_file(runtime.ready_flag()).expect("remove READY");
+        assert_eq!(manager.missing_runtime_marker(), Some("venv READY flag"));
         fs::remove_file(&landmark).expect("remove landmark");
         assert!(!runtime.standalone_runtime_intact());
     }
@@ -21361,6 +22004,61 @@ Always run the linter first.
     /// bare `pydantic` (whatever PyPI served) and an unhashed pydantic-core,
     /// bypassing the hash-pinned locks. Both must come from the platform lock,
     /// hashes included, in hash-checking mode.
+    /// RUST-BA: httpcore's dist-info can outlive its files, which reads as
+    /// installed to the lock re-sync, so the module's own pin is
+    /// force-reinstalled (hashed) BEFORE the re-sync that restores the rest.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn repair_missing_dependencies_forces_the_modules_pin_then_resyncs_the_lock() {
+        let (root, runtime, manager) = seed_test_runtime("dependency-repair");
+        let _home = HomeGuard::new(&root);
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
+                 for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+        write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0","artifact":{"requirementsLockSha256":"x"},"mcp":{}}"#,
+        )
+        .expect("seed receipt");
+
+        // `_sqlite3` is no lock package: nothing to force, the re-sync still runs.
+        manager
+            .repair_missing_dependencies(&["httpcore".into(), "_sqlite3".into()])
+            .expect("fake pip succeeds");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let argvs: Vec<&str> = calls.lines().filter(|l| l.starts_with("ARGV ")).collect();
+        let force = argvs
+            .iter()
+            .position(|a| a.contains("--force-reinstall") && a.contains("--require-hashes"))
+            .expect("a hashed force-reinstall");
+        let resync = argvs
+            .iter()
+            .position(|a| a.contains("--upgrade") && a.contains("--requirement"))
+            .expect("a lock re-sync");
+        assert!(force < resync, "{argvs:#?}");
+        let entry = super::lock_entries_named(super::bootstrap_requirements_lock(), "httpcore")
+            .into_iter()
+            .next()
+            .expect("lock pins httpcore");
+        assert!(
+            calls.contains(&entry),
+            "httpcore not from its hashed entry:\n{calls}"
+        );
+        assert!(!calls.contains("_sqlite3"), "{calls}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn repair_pydantic_core_installs_the_locks_hashed_pins() {

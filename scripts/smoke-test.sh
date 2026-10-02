@@ -43,6 +43,16 @@ row() { # status, check, detail
 have() { command -v "$1" >/dev/null 2>&1; }
 
 AX() { osascript -e "tell application \"System Events\" to tell process \"headroom-desktop\" $1" 2>&1; }
+# Since 0.9.30-rc.2 the macOS tray icon carries no menu: macOS 27 opened an
+# attached menu on every click, so it is attached only for a right-click. An
+# AXPress on the status item no longer opens it; a real right-click does.
+open_tray_menu() {
+  local p
+  p=$(AX 'to get {position, size} of menu bar item 1 of menu bar 2' | tr -d ' ')
+  [[ "$p" =~ ^([0-9-]+),([0-9-]+),([0-9]+),([0-9]+)$ ]] || return 1
+  # Then put the pointer back where it was: this runs while someone works.
+  cliclick "rc:$(( ${BASH_REMATCH[1]} + ${BASH_REMATCH[3]} / 2 )),$(( ${BASH_REMATCH[2]} + ${BASH_REMATCH[4]} / 2 ))" "m:$(cliclick p)"
+}
 
 # The backend listens on 6768 by default but scans up to 6790 (check 9). 6767 is
 # the desktop's own intercept listener, never the backend, so start the window
@@ -329,7 +339,7 @@ fi
 # --- 5. dashboard opens -----------------------------------------------------
 open -a Headroom >/dev/null 2>&1
 sleep 2
-AX 'to click menu bar item 1 of menu bar 2' >/dev/null
+open_tray_menu
 sleep 1
 menu=$(AX 'to get name of every menu item of menu 1 of menu bar item 1 of menu bar 2')
 AX 'to click menu item "Show Headroom" of menu 1 of menu bar item 1 of menu bar 2' >/dev/null
@@ -388,11 +398,11 @@ else
 
   # --- 6. pause / resume ----------------------------------------------------
   before=$(cat "$HOME/.zprofile" "$HOME/.zshrc" 2>/dev/null | grep -c 'headroom:claude_code')
-  AX 'to click menu bar item 1 of menu bar 2' >/dev/null; sleep 1
+  open_tray_menu; sleep 1
   AX 'to click menu item "Pause Headroom" of menu 1 of menu bar item 1 of menu bar 2' >/dev/null
   sleep 5
   paused=$(cat "$HOME/.zprofile" "$HOME/.zshrc" 2>/dev/null | grep -c 'headroom:claude_code')
-  AX 'to click menu bar item 1 of menu bar 2' >/dev/null; sleep 1
+  open_tray_menu; sleep 1
   AX 'to click menu item "Resume Headroom" of menu 1 of menu bar item 1 of menu bar 2' >/dev/null
   # Resume is start_headroom -> resume_runtime -> ensure_headroom_running, and
   # only then the restore thread, so this waits on a cold Python boot (15-20s

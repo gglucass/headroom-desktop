@@ -19,3 +19,4 @@ CLAUDE.local.md
 
 # AppSumo launch assets (local marketing files, not app code)
 /appsumo-assets/
+__pycache__/

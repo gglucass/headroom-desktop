@@ -7,6 +7,7 @@ import type {
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
   IntroOffer,
+  ManagedTool,
   PlanPrices,
   TierRecommendationSource,
 } from "./types";
@@ -991,4 +992,30 @@ export function authCodeSentMessage(email: string, expirySeconds: number): strin
     `We sent a sign-in code to ${email}. It expires in ${minutes} ${unit}. ` +
     "If you ask for another, only the newest code works."
   );
+}
+
+// Chisle bundles Ponytail's code ladder and Caveman-style terse replies, so
+// running it next to either loads overlapping instructions into every session.
+const REPLY_ADDON_OVERLAPS: Record<string, string[]> = {
+  chisle: ["ponytail", "caveman"],
+  ponytail: ["chisle"],
+  caveman: ["chisle"]
+};
+
+/** Notice for an enabled addon whose instructions overlap another enabled one. */
+export function replyAddonOverlapNotice(
+  tool: Pick<ManagedTool, "id" | "name">,
+  tools: Pick<ManagedTool, "id" | "name" | "status" | "enabled">[]
+): string | null {
+  const overlaps = REPLY_ADDON_OVERLAPS[tool.id] ?? [];
+  const others = tools
+    .filter((t) => overlaps.includes(t.id) && t.status !== "not_installed" && t.enabled)
+    .map((t) => t.name);
+  if (others.length === 0) return null;
+  if (tool.id !== "chisle") {
+    return `Chisle is on too and already covers ${tool.name}, so your agent gets overlapping instructions in every session. Disable one of them.`;
+  }
+  const list = others.join(" and ");
+  const [verb, pronoun] = others.length > 1 ? ["are", "them"] : ["is", "it"];
+  return `${list} ${verb} on too. Chisle already covers ${pronoun}, so your agent gets overlapping instructions in every session. Disable ${list}.`;
 }

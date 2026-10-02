@@ -673,6 +673,9 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
         return;
     }
     let tags = client_adapters::codex_unrouted_diagnostics(since.into());
+    if codex_process_predates_setup(&tags) {
+        return;
+    }
     let enabled = client_adapters::is_codex_enabled();
     sentry::with_scope(
         |scope| {
@@ -691,6 +694,25 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
             );
         },
     );
+}
+
+/// The known straggler, not a routing bug: our config is on disk, yet the
+/// newest thread runs on Codex's built-in `openai` provider and nothing
+/// arrived. A Codex that read the config sends even an `openai` thread to us
+/// (the root `openai_base_url`), so this one is a process started before
+/// setup. The post-install screen and the nudge tell that user to restart,
+/// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
+/// first proxied request landed three minutes after the nudge. A `headroom`
+/// thread, an unrouted config or a CODEX_HOME override still reports.
+fn codex_process_predates_setup(tags: &[(&'static str, String)]) -> bool {
+    let tag = |key: &str| {
+        tags.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, value)| value.as_str())
+    };
+    tag("codex_session_provider") == Some("openai")
+        && tag("codex_config_routed") == Some("true")
+        && tag("codex_home_env") == Some("false")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -1124,7 +1146,119 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
-    install_pending_update(&pending_update.0, emitter).await
+    let installed = install_pending_update(&pending_update.0, emitter).await;
+    // Windows never gets here (the installer exits the app); elsewhere the new
+    // build is on disk and runs at the next restart.
+    if installed.is_ok() {
+        UPDATE_STAGED.store(true, Ordering::Release);
+    }
+    installed
+}
+
+/// Set once an installed update is waiting for the restart that runs it.
+static UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
+
+/// Minutes of awake time without client traffic before a ready update applies
+/// itself. Long enough that an agent between turns is not cut off mid-task.
+const IDLE_UPDATE_MINUTES: u32 = 30;
+
+/// `minutes` of idle so far, one minute later. Any client request or streamed
+/// response restarts the count, and so does a gap in the ticks: a laptop that
+/// just woke has an owner about to use it, however long it slept.
+fn idle_minutes_after(minutes: u32, traffic: bool, slept: bool) -> u32 {
+    if traffic || slept {
+        0
+    } else {
+        minutes.saturating_add(1)
+    }
+}
+
+/// Applies a ready update once Headroom has carried no traffic for
+/// `IDLE_UPDATE_MINUTES` with every window hidden. Updates only take effect
+/// on a restart, and a menu-bar app goes weeks without one: on 2026-10-02,
+/// 59% of macOS and 75% of Windows installs old enough to have been offered
+/// 0.9.29 were still running a build a week or more older, so fixes shipped
+/// to the people who needed them most never reached them.
+///
+/// macOS (and Linux after a user-approved install) restarts into the staged
+/// build through `restart_app`. Windows has no staging: its install runs the
+/// installer, which exits and relaunches the app, so the idle moment is when
+/// it runs. A macOS update that could not stage quietly (read-only bundle, an
+/// admin prompt) is left to the user, never installed from here.
+fn spawn_idle_update_applier(app: AppHandle) {
+    const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+    std::thread::spawn(move || {
+        let mut idle_minutes: u32 = 0;
+        let mut last_requests: Option<u64> = None;
+        let mut last_tick_wall = std::time::SystemTime::now();
+        // One idle install per process: a Windows install that fails
+        // re-downloads the installer each time, and the user's own click and
+        // the next launch both still get theirs.
+        #[cfg(windows)]
+        let mut install_attempted = false;
+        loop {
+            std::thread::sleep(TICK);
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
+            let now = std::time::SystemTime::now();
+            let slept = now
+                .duration_since(last_tick_wall)
+                .map_or(true, |gap| gap > TICK * 3);
+            last_tick_wall = now;
+            let requests: u64 = proxy_intercept::intercept_request_counts().values().sum();
+            let traffic =
+                last_requests != Some(requests) || proxy_intercept::backend_traffic_within(TICK);
+            last_requests = Some(requests);
+            idle_minutes = idle_minutes_after(idle_minutes, traffic, slept);
+            if idle_minutes < IDLE_UPDATE_MINUTES {
+                continue;
+            }
+
+            let state: tauri::State<'_, AppState> = app.state();
+            let windows_hidden = app
+                .webview_windows()
+                .values()
+                .all(|window| !window.is_visible().unwrap_or(false));
+            if !windows_hidden
+                || INSTALLING_UPDATE.load(Ordering::Acquire)
+                || state.runtime_upgrade_in_progress()
+                || state.bootstrap_progress().running
+            {
+                continue;
+            }
+            if UPDATE_STAGED.load(Ordering::Acquire) {
+                log::info!(
+                    "update: idle for {idle_minutes} minutes; restarting into the staged update"
+                );
+                storage::mark_quiet_relaunch(&storage::app_data_dir());
+                tauri::async_runtime::spawn(restart_app(app.clone()));
+                return;
+            }
+            #[cfg(windows)]
+            if !install_attempted && app.state::<PendingAppUpdate>().0.lock().is_some() {
+                install_attempted = true;
+                log::info!(
+                    "update: idle for {idle_minutes} minutes; installing the pending update"
+                );
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let pending = app.state::<PendingAppUpdate>();
+                    // The installer's /R relaunch reuses this process's args.
+                    storage::mark_quiet_relaunch(&storage::app_data_dir());
+                    if let Err(err) =
+                        install_pending_update(&pending.0, Arc::new(|_: AppUpdateProgress| {}))
+                            .await
+                    {
+                        let _ = std::fs::remove_file(storage::quiet_relaunch_path(
+                            &storage::app_data_dir(),
+                        ));
+                        log::info!("update: idle install failed: {err}");
+                    }
+                });
+            }
+        }
+    });
 }
 
 fn store_checked_update<U>(
@@ -1760,16 +1894,16 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
             )
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             let outdated = state
                 .tool_manager
                 .install_plugin(id)
                 .map_err(|err| err.to_string())?;
             if let Some(host) = outdated {
-                let name = if id == "caveman" {
-                    "Caveman"
-                } else {
-                    "Ponytail"
+                let name = match id {
+                    "caveman" => "Caveman",
+                    "chisle" => "Chisle",
+                    _ => "Ponytail",
                 };
                 let other = if host == "Codex" {
                     "Claude Code"
@@ -1846,7 +1980,7 @@ fn set_addon_enabled_blocking(
                 .map_err(|err| err.to_string())?;
             }
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             state
                 .tool_manager
                 .set_plugin_enabled(id, enabled)
@@ -1907,7 +2041,7 @@ fn uninstall_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState,
                 .uninstall_rtk()
                 .map_err(|err| err.to_string())?;
         }
-        "ponytail" | "caveman" => {
+        "ponytail" | "caveman" | "chisle" => {
             state
                 .tool_manager
                 .uninstall_plugin(id)
@@ -2749,6 +2883,13 @@ fn headroom_start_failure_category(reason: &str) -> String {
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
+    // A quit or relaunch during startup stops the proxy being polled, and the
+    // start returns that as an error. Reported, it was an Error-level event
+    // for nothing but the user closing the app.
+    if technical_err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+        return;
+    }
+
     // Environmental failures: another process holds port 6768, or a stale
     // headroom proxy is still bound. The user gets an actionable hint via
     // `state::classify_startup_error` and the persistent-conflict case is
@@ -3019,6 +3160,10 @@ pub(crate) fn startup_error_fingerprint_key(
         // force-reinstalls the pinned wheel, so an event here means that
         // repair did not take. Its own issue, not the exit-1 grab-bag.
         Some("startup_venv_missing_module")
+    } else if !missing_dependency_modules(err).is_empty() {
+        // Same for a third-party package: the in-startup repair re-syncs the
+        // lock, so an event here means that repair did not take either.
+        Some("startup_venv_missing_dependency")
     } else if crate::tool_manager::onnx_probe_crashed(err) {
         // The machine's onnxruntime aborts the interpreter as it loads, so the
         // proxy dies mid-import with no traceback (RUST-C7). The startup path
@@ -3770,6 +3915,24 @@ pub(crate) fn is_loopback_socket_denied_signal(text: &str) -> bool {
 /// `DLL load failed` ImportError (RUST-7W/8V/8W) both stay out of it.
 pub(crate) fn is_missing_headroom_module_signal(text: &str) -> bool {
     text.contains("ModuleNotFoundError: No module named 'headroom")
+}
+
+/// The requirements half of the above: the top-level modules of third-party
+/// packages the venv no longer has. An interrupted pip (an app restart mid
+/// install) takes a package out after the receipt was stamped, so the lock sha
+/// still matches, no maintenance plan re-syncs it, and every launch dies on
+/// the same import (RUST-BA on 0.9.30: `httpcore`, via `upstream_pinning`).
+/// Our own package and the base stdlib's `encodings` have their own repairs.
+pub(crate) fn missing_dependency_modules(text: &str) -> Vec<&str> {
+    const MARKER: &str = "ModuleNotFoundError: No module named '";
+    let mut modules: Vec<&str> = text
+        .match_indices(MARKER)
+        .filter_map(|(at, _)| text[at + MARKER.len()..].split(['\'', '.']).next())
+        .filter(|m| !m.is_empty() && !m.starts_with("headroom") && *m != "encodings")
+        .collect();
+    modules.sort_unstable();
+    modules.dedup();
+    modules
 }
 
 /// True for a `startup_error_fingerprint_key` that names a verdict of the
@@ -6496,7 +6659,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
-        for plugin_id in ["ponytail", "caveman"] {
+        for plugin_id in ["ponytail", "caveman", "chisle"] {
             if let Err(err) = state.tool_manager.uninstall_plugin(plugin_id) {
                 log::warn!("uninstall: removing {plugin_id} plugin failed: {err:#}");
             }
@@ -7299,6 +7462,7 @@ pub fn run() {
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
             spawn_proxy_watchdog(app.handle().clone());
+            spawn_idle_update_applier(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
             spawn_claude_projects_warmer(app.handle().clone());
             wsl_probe::spawn_probe();
@@ -7461,7 +7625,9 @@ pub fn run() {
                 fresh_bearer_tx,
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
-            if state.should_present_on_launch() && !launched_from_autostart {
+            let quiet_relaunch =
+                storage::take_quiet_relaunch(&storage::app_data_dir(), chrono::Utc::now());
+            if state.should_present_on_launch() && !launched_from_autostart && !quiet_relaunch {
                 let _ = show_primary_window(app.handle());
             }
             if state.tool_manager.python_runtime_installed() {
@@ -10041,6 +10207,40 @@ fn auto_resume_backoff(failed_attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Give-ups in a row whose start died before opening its port before the
+/// watchdog rebuilds the runtime: the first plus the 30s, 1m and 2m retries,
+/// so about four minutes of the same death.
+const AUTO_REBUILD_AFTER_STRIKES: u32 = 4;
+
+/// True when the backend's last start exited on its own before it opened its
+/// port, for a reason a fresh runtime can fix. Every self-heal retry repeats
+/// such a death until the runtime is replaced: a package pip lost, a truncated
+/// file, a half-installed wheel, shapes the start path's targeted repairs only
+/// partly name. The machine's own verdicts (endpoint protection, a denied
+/// loopback socket, a port someone else holds) are left out: a rebuild
+/// changes none of them and re-downloads the runtime for nothing.
+pub(crate) fn startup_death_needs_rebuild(last_startup_error: Option<&str>) -> bool {
+    let Some(err) = last_startup_error else {
+        return false;
+    };
+    let key = startup_error_fingerprint_key(Some(err));
+    err.contains("exited with status")
+        && err.contains("before opening port")
+        && !is_environmental_startup_key(key)
+        && key != Some("startup_port_conflict")
+}
+
+/// Claims the watchdog's runtime rebuild once per app version, persisted in
+/// `marker`: a rebuild that did not fix the runtime will not fix it on the next
+/// episode or launch either, and each one re-downloads it. Refuses when the
+/// marker cannot be written, since then nothing would bound it.
+fn claim_auto_rebuild(marker: &std::path::Path, app_version: &str) -> bool {
+    if std::fs::read_to_string(marker).is_ok_and(|claimed| claimed.trim() == app_version) {
+        return false;
+    }
+    client_adapters::atomic_write(marker, app_version.as_bytes()).is_ok()
+}
+
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
@@ -10073,6 +10273,8 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // counts failed attempts to grow the backoff (see `auto_resume_backoff`).
         let mut auto_pause_next_retry: Option<std::time::Instant> = None;
         let mut auto_pause_failed: u32 = 0;
+        // Consecutive give-ups whose last start died before opening its port.
+        let mut rebuild_strikes: u32 = 0;
         // Set after a forced kill+restart of a hung process. Prevents the
         // hung-kill path from looping forever if the new process also hangs:
         // on the second trip through MAX_CONSECUTIVE_FAILURES we fall through
@@ -10215,9 +10417,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             if runtime.proxy_reachable {
                 consecutive_failures = 0;
                 hung_kill_attempted = false;
+                if auto_pause_failed > 0 {
+                    pricing::report_funnel_step(&app, "runtime_auto_recovered");
+                }
                 // Healthy again — reset the self-heal backoff so a future
                 // wedge starts its retries fresh at 30s.
                 auto_pause_failed = 0;
+                rebuild_strikes = 0;
                 auto_pause_next_retry = None;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
@@ -10503,12 +10709,46 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 state.set_runtime_auto_paused(true);
                 state.stop_headroom();
                 analytics::track_event(&app, "runtime_auto_paused", None);
-                let _ = show_notification_impl(
-                    &app,
-                    "Headroom paused",
-                    "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
-                    Some("connectors".into()),
-                );
+                // Once per down episode. Every failed self-heal retry ends back
+                // here, so a backend that never starts re-notified at 30s, 1m,
+                // 2m and then every 5 minutes for as long as the app ran.
+                if auto_pause_failed == 0 {
+                    let _ = show_notification_impl(
+                        &app,
+                        "Headroom paused",
+                        "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
+                        Some("connectors".into()),
+                    );
+                    // Server-side count of machines stuck here; the way out is
+                    // `runtime_auto_recovered` below, or savings landing again.
+                    pricing::report_funnel_step(&app, "runtime_auto_paused");
+                }
+                // Last resort for a runtime that dies the same way at every
+                // start: rebuild it. See `startup_death_needs_rebuild`.
+                let startup_error = state.last_startup_error.lock().clone();
+                rebuild_strikes = if startup_death_needs_rebuild(startup_error.as_deref()) {
+                    rebuild_strikes.saturating_add(1)
+                } else {
+                    0
+                };
+                if rebuild_strikes >= AUTO_REBUILD_AFTER_STRIKES
+                    && claim_auto_rebuild(
+                        &state.tool_manager.logs_dir().join("auto-rebuild.attempted"),
+                        &app.package_info().version.to_string(),
+                    )
+                {
+                    log::warn!(
+                        "watchdog: backend died before opening its port on every start; \
+                         rebuilding the runtime"
+                    );
+                    let app_clone = app.clone();
+                    std::thread::spawn(move || {
+                        let state: tauri::State<'_, AppState> = app_clone.state();
+                        // Owns the lifecycle until it ends; the auto-resume
+                        // above stands down meanwhile and restarts it after.
+                        state.run_upgrade_with_ui(&app_clone, true);
+                    });
+                }
                 // Arm the self-heal: first retry after 30s, backing off on
                 // repeated failures (auto_resume_backoff). The retry runs in the
                 // `runtime.auto_paused` branch at the top of the loop.
@@ -11228,19 +11468,19 @@ mod tests {
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
         learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
-        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
-        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
-        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
-        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        missing_dependency_modules, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, savings_report, select_updater_endpoints,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
@@ -15677,6 +15917,104 @@ Some unrelated content.
     }
 
     #[test]
+    fn only_a_runtime_death_at_startup_earns_the_watchdog_rebuild() {
+        // RUST-BA (0.9.30, macOS) and the Windows spelling of the same death.
+        for death in [
+            "unable to keep headroom running in background: exited with status exit status: 1 \
+             before opening port 6768 (...)\n--- log tail ---\n\
+             ModuleNotFoundError: No module named 'httpcore'",
+            "unable to keep headroom running in background: exited with status exit code: 1 \
+             before opening port 6768",
+        ] {
+            assert!(
+                super::startup_death_needs_rebuild(Some(death)),
+                "for: {death}"
+            );
+        }
+        // The machine's own verdicts: a rebuild changes none of them.
+        for other in [
+            "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+             ImportError: DLL load failed while importing unicodedata: An Application \
+             Control policy has blocked this file.",
+            "exited with status exit status: 1 before opening port 6768\n--- log tail ---\n\
+             Library not loaded: onnxruntime.dylib (code signature invalid)",
+            "headroom proxy already running on port 6768",
+        ] {
+            assert!(
+                !super::startup_death_needs_rebuild(Some(other)),
+                "for: {other}"
+            );
+        }
+        assert!(!super::startup_death_needs_rebuild(None));
+    }
+
+    #[test]
+    fn a_ready_update_waits_for_thirty_quiet_awake_minutes() {
+        let mut minutes = 0;
+        for _ in 0..super::IDLE_UPDATE_MINUTES {
+            minutes = super::idle_minutes_after(minutes, false, false);
+        }
+        assert_eq!(minutes, super::IDLE_UPDATE_MINUTES);
+        // One request, or one wake from sleep, and the clock starts over: the
+        // owner of a laptop that just woke is about to use it.
+        assert_eq!(super::idle_minutes_after(minutes, true, false), 0);
+        assert_eq!(super::idle_minutes_after(minutes, false, true), 0);
+    }
+
+    #[test]
+    fn the_watchdog_rebuild_is_claimed_once_per_app_version() {
+        let dir = std::env::temp_dir().join(format!("auto-rebuild-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("auto-rebuild.attempted");
+        assert!(super::claim_auto_rebuild(&marker, "0.9.31"));
+        assert!(
+            !super::claim_auto_rebuild(&marker, "0.9.31"),
+            "twice in one version"
+        );
+        assert!(
+            super::claim_auto_rebuild(&marker, "0.9.32"),
+            "a new version gets one"
+        );
+        // No marker can be written: no bound, so no rebuild.
+        let unwritable = dir.join("a-directory");
+        std::fs::create_dir_all(&unwritable).unwrap();
+        assert!(!super::claim_auto_rebuild(&unwritable, "0.9.33"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_dependency_modules_names_third_party_packages_only() {
+        // RUST-BA verbatim (0.9.30, macOS): the venv lost httpcore, and the
+        // litellm warning above the traceback names it too without the marker.
+        let tail = "LiteLLM: Failed to fetch remote model cost map: No module named 'httpcore'. \
+                    Falling back to local backup.\n\
+                    File \"~/venv/lib/python3.12/site-packages/headroom/proxy/upstream_pinning.py\", \
+                    line 69, in <module>\n    import httpcore\n\
+                    ModuleNotFoundError: No module named 'httpcore'";
+        assert_eq!(missing_dependency_modules(tail), ["httpcore"]);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(tail)),
+            Some("startup_venv_missing_dependency")
+        );
+        // A submodule maps to its top-level package; repeats collapse.
+        assert_eq!(
+            missing_dependency_modules(
+                "ModuleNotFoundError: No module named 'google.protobuf'\n\
+                 ModuleNotFoundError: No module named 'google'"
+            ),
+            ["google"]
+        );
+        // Our own package and the base stdlib have their own repairs.
+        for own in [
+            "ModuleNotFoundError: No module named 'headroom.providers.claude'",
+            "ModuleNotFoundError: No module named 'encodings'",
+            "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
+        ] {
+            assert!(missing_dependency_modules(own).is_empty(), "for: {own}");
+        }
+    }
+
+    #[test]
     fn startup_error_fingerprint_key_only_names_causes_with_a_remedy() {
         assert_eq!(startup_error_fingerprint_key(None), None);
         assert_eq!(
@@ -15714,11 +16052,14 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(crashed)),
             Some("startup_onnx_native_crash")
         );
-        // A missing or broken module is a venv problem, and it already has a
-        // key of its own -- the wheel repair, not the Kompress retry.
+        // A missing module is a venv problem with a key of its own -- the
+        // dependency repair, not the Kompress retry.
         let missing = "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: \
                        No module named 'onnxruntime')";
-        assert_eq!(startup_error_fingerprint_key(Some(missing)), None);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(missing)),
+            Some("startup_venv_missing_dependency")
+        );
         // A killed probe stays with the endpoint-protection verdict, which
         // names the remedy.
         let killed = "(onnx probe: import onnxruntime failed (killed))";
@@ -16051,6 +16392,69 @@ Some unrelated content.
             since
         ));
         assert!(!claude_sessions_touched_since(&[], since));
+    }
+
+    #[test]
+    fn first_run_codex_report_skips_a_process_that_predates_setup() {
+        let skips = |provider: &str, routed: &str, home_env: &str| {
+            super::codex_process_predates_setup(&[
+                ("codex_session_provider", provider.to_string()),
+                ("codex_config_routed", routed.to_string()),
+                ("codex_home_env", home_env.to_string()),
+            ])
+        };
+        // RUST-KC on 0.9.30: an `openai` thread with our config on disk.
+        assert!(skips("openai", "true", "false"));
+        // Read our config and still never arrived: the routing bug to report.
+        assert!(!skips("headroom", "true", "false"));
+        assert!(!skips("unknown", "true", "false"));
+        assert!(!skips("openai", "false", "false"));
+        assert!(!skips("openai", "true", "true"));
+    }
+
+    #[test]
+    fn a_start_the_apps_own_exit_cut_short_is_not_reported() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        sentry::Hub::run(hub, || {
+            // 2026-10-02, rc.1 -> rc.3: a relaunch while the proxy started.
+            let cut_short = anyhow::anyhow!(
+                "{}; stopped the headroom proxy mid-startup",
+                crate::tool_manager::START_CUT_SHORT_BY_EXIT
+            );
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &cut_short,
+            );
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &anyhow::anyhow!("wait check failed: interrupted"),
+            );
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "only the real failure reports");
+        assert!(events[0]
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("wait check failed")));
     }
 
     #[test]
@@ -16422,6 +16826,7 @@ mod output_reduction_report_tests {
             requests: 19_644,
             coverage_percent: Some(63.5),
             publishable: true,
+            alongside_addon: None,
         }
     }
 

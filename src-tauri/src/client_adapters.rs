@@ -4341,6 +4341,36 @@ pub fn apply_upstream_client_config(
     Ok(())
 }
 
+/// Chisle's PostToolUse hook elides the middle of any tool result over 8k
+/// chars, and by default that includes every `mcp__*` tool. Two of those are
+/// not safe to cut: Serena's symbol and file reads feed its exact-match edit
+/// tools (Chisle exempts `Read` for this reason, not Serena), and
+/// `headroom_retrieve` exists to hand back the original the proxy compressed.
+/// Chisle's own list minus the `mcp__` wildcard keeps its compression for the
+/// tools it was built for. Claude Code passes settings.json `env` to hooks.
+const CHISLE_COMPRESS_TOOLS_KEY: &str = "CHISLE_COMPRESS_TOOLS";
+const CHISLE_COMPRESS_TOOLS_VALUE: &str = "Bash,Agent,WebFetch,WebSearch,Grep,Glob";
+
+/// Plants (or, on uninstall, removes) the list above. A value the user set
+/// themselves wins on install and survives the removal. Not planted without
+/// `~/.claude`: Chisle went into Codex alone (Claude Code's own install leaves
+/// `~/.claude/plugins`), and a settings.json written there would make Claude
+/// Code read as installed (`claude_code_user_state_exists`) for good.
+pub fn scope_chisle_compression(scoped: bool) -> Result<()> {
+    if scoped && !home_dir().join(".claude").is_dir() {
+        return Ok(());
+    }
+    if scoped {
+        configure_claude_settings_env_if_absent(
+            CHISLE_COMPRESS_TOOLS_KEY,
+            CHISLE_COMPRESS_TOOLS_VALUE,
+        )
+        .map(|_| ())
+    } else {
+        remove_claude_settings_env(CHISLE_COMPRESS_TOOLS_KEY, CHISLE_COMPRESS_TOOLS_VALUE, None)
+    }
+}
+
 /// Current value of one `env` key in `~/.claude/settings.json`, if any.
 fn read_claude_settings_env(env_key: &str) -> Result<Option<String>> {
     let settings_path = claude_settings_path();
@@ -13676,6 +13706,44 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .any(|c| c.contains("RTK Claude hook")),
             "verification reports the hook check, got: {:?}",
             verification.checks
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chisle_compression_scope_leaves_a_machine_without_claude_code_alone() {
+        let home = TestHome::new();
+        super::scope_chisle_compression(true).unwrap();
+        assert!(!home.path().join(".claude").exists());
+        assert!(!super::claude_code_user_state_exists(home.path()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chisle_compression_scope_round_trips_and_keeps_other_env() {
+        let home = TestHome::new();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings,
+            r#"{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}"#,
+        )
+        .unwrap();
+
+        super::scope_chisle_compression(true).unwrap();
+        let scoped = super::read_claude_settings_env("CHISLE_COMPRESS_TOOLS")
+            .unwrap()
+            .expect("planted");
+        assert!(!scoped.contains("mcp__"), "{scoped}");
+
+        super::scope_chisle_compression(false).unwrap();
+        assert_eq!(
+            super::read_claude_settings_env("CHISLE_COMPRESS_TOOLS").unwrap(),
+            None
+        );
+        assert_eq!(
+            super::read_claude_settings_env("ANTHROPIC_BASE_URL").unwrap(),
+            Some("http://127.0.0.1:6767".to_string())
         );
     }
 
