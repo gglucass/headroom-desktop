@@ -3924,6 +3924,14 @@ impl ToolManager {
     }
 
     pub fn python_runtime_installed(&self) -> bool {
+        self.missing_runtime_marker().is_none()
+    }
+
+    /// The first runtime file `python_runtime_installed` finds missing, named
+    /// for diagnostics. RUST-MA: a 6-minute requirements repair on Windows
+    /// ended with the runtime gone (AV killed `headroom mcp install` with exit
+    /// 0x4B494C4C, "KILL", 10s earlier) and the event could not say which file.
+    pub fn missing_runtime_marker(&self) -> Option<&'static str> {
         // The base interpreter counts too, not just the venv. A venv's
         // `Scripts/python.exe` is a redirector stub that execs the interpreter
         // recorded in `pyvenv.cfg`; deleting `runtime/python` (AV quarantine,
@@ -3942,10 +3950,17 @@ impl ToolManager {
         // bootstrap's rebuild instead of a permanent pip-retry loop.
         // RUST-C8: the base can also lose its stdlib while keeping python.exe
         // (same routing, one directory deeper), hence `intact`, not `exists`.
-        self.runtime.ready_flag().exists()
-            && self.runtime.managed_python().exists()
-            && self.runtime.standalone_runtime_intact()
-            && self.runtime.venv_dir.join("pyvenv.cfg").exists()
+        if !self.runtime.ready_flag().exists() {
+            Some("venv READY flag")
+        } else if !self.runtime.managed_python().exists() {
+            Some("venv python")
+        } else if !self.runtime.standalone_runtime_intact() {
+            Some("base interpreter or its stdlib")
+        } else if !self.runtime.venv_dir.join("pyvenv.cfg").exists() {
+            Some("pyvenv.cfg")
+        } else {
+            None
+        }
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -21339,6 +21354,11 @@ Always run the linter first.
             manager.python_runtime_installed(),
             "all markers present must read as installed"
         );
+        assert_eq!(manager.missing_runtime_marker(), None);
+        fs::remove_file(runtime.venv_dir.join("pyvenv.cfg")).expect("remove pyvenv.cfg");
+        assert_eq!(manager.missing_runtime_marker(), Some("pyvenv.cfg"));
+        fs::remove_file(runtime.ready_flag()).expect("remove READY");
+        assert_eq!(manager.missing_runtime_marker(), Some("venv READY flag"));
         fs::remove_file(&landmark).expect("remove landmark");
         assert!(!runtime.standalone_runtime_intact());
     }

@@ -673,6 +673,9 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
         return;
     }
     let tags = client_adapters::codex_unrouted_diagnostics(since.into());
+    if codex_process_predates_setup(&tags) {
+        return;
+    }
     let enabled = client_adapters::is_codex_enabled();
     sentry::with_scope(
         |scope| {
@@ -691,6 +694,25 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
             );
         },
     );
+}
+
+/// The known straggler, not a routing bug: our config is on disk, yet the
+/// newest thread runs on Codex's built-in `openai` provider and nothing
+/// arrived. A Codex that read the config sends even an `openai` thread to us
+/// (the root `openai_base_url`), so this one is a process started before
+/// setup. The post-install screen and the nudge tell that user to restart,
+/// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
+/// first proxied request landed three minutes after the nudge. A `headroom`
+/// thread, an unrouted config or a CODEX_HOME override still reports.
+fn codex_process_predates_setup(tags: &[(&'static str, String)]) -> bool {
+    let tag = |key: &str| {
+        tags.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, value)| value.as_str())
+    };
+    tag("codex_session_provider") == Some("openai")
+        && tag("codex_config_routed") == Some("true")
+        && tag("codex_home_env") == Some("false")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -16051,6 +16073,24 @@ Some unrelated content.
             since
         ));
         assert!(!claude_sessions_touched_since(&[], since));
+    }
+
+    #[test]
+    fn first_run_codex_report_skips_a_process_that_predates_setup() {
+        let skips = |provider: &str, routed: &str, home_env: &str| {
+            super::codex_process_predates_setup(&[
+                ("codex_session_provider", provider.to_string()),
+                ("codex_config_routed", routed.to_string()),
+                ("codex_home_env", home_env.to_string()),
+            ])
+        };
+        // RUST-KC on 0.9.30: an `openai` thread with our config on disk.
+        assert!(skips("openai", "true", "false"));
+        // Read our config and still never arrived: the routing bug to report.
+        assert!(!skips("headroom", "true", "false"));
+        assert!(!skips("unknown", "true", "false"));
+        assert!(!skips("openai", "false", "false"));
+        assert!(!skips("openai", "true", "true"));
     }
 
     #[test]

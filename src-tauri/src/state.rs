@@ -427,7 +427,8 @@ fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
 #[derive(Debug, Clone)]
 struct PostSpawnSnapshot {
     tracked_child: bool,
-    python_installed: bool,
+    /// `ToolManager::missing_runtime_marker`; `None` is "installed".
+    missing_runtime: Option<&'static str>,
     proxy_bypass: bool,
     pricing_allows_optimization: bool,
     runtime_paused: bool,
@@ -1179,7 +1180,7 @@ impl AppState {
                 log::warn!(
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
-                let restarted = self.ensure_headroom_running().is_ok();
+                let restarted = self.restart_after_failed_maintenance();
                 self.stop_python_if_any_gate();
                 let hint = crate::classify_upgrade_error(&error);
                 let fallback_hint = match maintenance_kind {
@@ -1289,7 +1290,7 @@ impl AppState {
         // attributable in Sentry instead of surfacing as a blank "Stalled".
         let post_spawn = PostSpawnSnapshot {
             tracked_child: self.headroom_process.lock().is_some(),
-            python_installed: self.tool_manager.python_runtime_installed(),
+            missing_runtime: self.tool_manager.missing_runtime_marker(),
             proxy_bypass: self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire),
             pricing_allows_optimization: self.pricing_allows_optimization(),
             runtime_paused: self.runtime_is_paused(),
@@ -1297,11 +1298,11 @@ impl AppState {
             ensure_error: ensure_err,
         };
         log::info!(
-            "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={} \
+            "run_upgrade_with_ui: post-spawn tracked_child={} missing_runtime={:?} \
              proxy_bypass={} pricing_allows_optimization={} runtime_paused={} \
              proxy_reachable={} ensure_error={:?}",
             post_spawn.tracked_child,
-            post_spawn.python_installed,
+            post_spawn.missing_runtime,
             post_spawn.proxy_bypass,
             post_spawn.pricing_allows_optimization,
             post_spawn.runtime_paused,
@@ -1412,7 +1413,7 @@ impl AppState {
             port_occupant: crate::tool_manager::describe_proxy_port_occupant(
                 crate::backend_port::get(),
             ),
-            python_installed: post_spawn.python_installed,
+            python_installed: post_spawn.missing_runtime.is_none(),
             proxy_bypass: post_spawn.proxy_bypass,
             pricing_allows_optimization: post_spawn.pricing_allows_optimization,
             runtime_paused: post_spawn.runtime_paused,
@@ -1448,12 +1449,16 @@ impl AppState {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
         analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
-        let restarted = self.ensure_headroom_running().is_ok();
+        let restarted = self.restart_after_failed_maintenance();
         self.stop_python_if_any_gate();
 
+        let runtime_note = post_spawn
+            .missing_runtime
+            .map(|marker| format!("\n\n(managed runtime missing after maintenance: {marker})"))
+            .unwrap_or_default();
         let err_msg = match log_tail.as_deref() {
             Some(tail) => format!(
-                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n--- last proxy log lines ---\n{}",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).{runtime_note}\n\n--- last proxy log lines ---\n{}",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -1462,7 +1467,7 @@ impl AppState {
                 tail
             ),
             None => format!(
-                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n(no new proxy log lines written during validation window)",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).{runtime_note}\n\n(no new proxy log lines written during validation window)",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -1491,6 +1496,8 @@ impl AppState {
         // nothing is running.
         let startup_hint = if restarted {
             None
+        } else if !self.tool_manager.python_runtime_installed() {
+            Some(RUNTIME_MISSING_HINT.to_string())
         } else {
             post_spawn
                 .ensure_error
@@ -3427,6 +3434,13 @@ impl AppState {
             );
         }
         installing
+    }
+
+    /// Restart after a failed runtime maintenance. `ensure_headroom_running`
+    /// returns Ok without spawning when the runtime is gone, so Ok alone told
+    /// the user "restarted" while nothing ran (RUST-MA).
+    fn restart_after_failed_maintenance(&self) -> bool {
+        self.ensure_headroom_running().is_ok() && self.tool_manager.python_runtime_installed()
     }
 
     pub fn ensure_headroom_running(&self) -> Result<()> {
@@ -9085,6 +9099,12 @@ pub(crate) fn headroom_proxy_readyz() -> (bool, Option<serde_json::Value>) {
     // when the backend is genuinely slow.
     probe_proxy_readyz(local_proxy_port(), Duration::from_secs(5))
 }
+
+/// Runtime files vanished during maintenance (RUST-MA: AV on Windows). The
+/// launcher's bootstrap reinstalls them; reopening Headroom routes there.
+const RUNTIME_MISSING_HINT: &str = "Some of Headroom's runtime files were removed while it was \
+     updating, usually by antivirus. Reopen Headroom to reinstall them. If this keeps happening, \
+     allow Headroom's folder in your security software.";
 
 /// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
 /// `classify_startup_error`'s reading of the new runtime's spawn error and is
