@@ -110,6 +110,7 @@ import {
   upgradePlanIntentLabel,
   pendingAuthStorageKey,
   restorePendingAuth,
+  replyAddonOverlapNotice,
   type BillingPeriod,
   type PricingAudience,
   type UpgradePlanId
@@ -307,6 +308,17 @@ const addonCopy: Record<string, AddonCopy> = {
     enabling: "Enabling Caveman...",
     disabling: "Disabling Caveman...",
     disabled: "Caveman is off. It stays installed but no longer compresses replies."
+  },
+  chisle: {
+    whatItDoes:
+      "Terse replies and the least code that works, in one plugin. Before writing anything your agent checks whether it needs to exist, is already in the codebase, or comes with the platform. Validation, error handling and security are never cut.",
+    installing: "Registering the Chisle plugin with your agent...",
+    uninstalling: "Removing the Chisle plugin...",
+    uninstalled: "Chisle removed. Your agent writes and replies without the Chisle rules.",
+    installed: "Chisle installed. Start a new agent session to load it.",
+    enabling: "Enabling Chisle...",
+    disabling: "Disabling Chisle...",
+    disabled: "Chisle is off. It stays installed but no longer shapes replies or code."
   },
   serena: {
     whatItDoes:
@@ -915,7 +927,9 @@ function OutputReductionChip({
           </dl>
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
-            {isMeasured
+            {isMeasured && reduction.alongsideAddon
+              ? `Output tokens the model skipped because Headroom asked for shorter replies or less effort, on top of what ${reduction.alongsideAddon} saves. Measured against a control group of conversations Headroom leaves unshaped; ${reduction.alongsideAddon} runs in both.`
+              : isMeasured
               ? "Output tokens the model skipped because Headroom asked for shorter replies or less effort, measured against a control group of unshaped conversations."
               : "Output tokens the model skipped because Headroom asked for shorter replies or less effort. An estimate against a baseline learned from your past replies."}
           </p>
@@ -1401,6 +1415,7 @@ function AddonCard({
   availableVersion,
   unavailableReason,
   managedExternally,
+  overlapNotice,
   children
 }: {
   name: string;
@@ -1431,6 +1446,8 @@ function AddonCard({
   unavailableReason?: string | null;
   /** Installed by the user outside Headroom: show it, but own none of it. */
   managedExternally?: boolean;
+  /** Another enabled addon gives the agent overlapping instructions. */
+  overlapNotice?: string | null;
   children?: ReactNode;
 }) {
   return (
@@ -1478,6 +1495,7 @@ function AddonCard({
             tool you installed it with.
           </p>
         ) : null}
+        {overlapNotice ? <p className="addon-card__notice">{overlapNotice}</p> : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
         ) : resultMessage ? (
@@ -1550,6 +1568,7 @@ function AddonCard({
 
 const ADDON_DISPLAY_ORDER = [
   "ponytail",
+  "chisle",
   "serena",
   "codebase-memory",
   "context7",
@@ -7580,6 +7599,11 @@ export default function App() {
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
                       managedExternally={tool.managedExternally ?? false}
+                      overlapNotice={
+                        installed && tool.enabled
+                          ? replyAddonOverlapNotice(tool, dashboard.tools)
+                          : null
+                      }
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
                           busy: `Updating ${tool.name}...`,
@@ -8432,7 +8456,11 @@ export default function App() {
                             than scored against a global mean. */}
                         <p className="savings-breakdown__note">
                           {dashboard.outputReduction?.method === "measured"
-                            ? `Measured: a small share of conversations run unshaped as a control group, compared with your other replies over ${compactNumber(dashboard.outputReduction.requests)} requests.`
+                            ? `Measured: a small share of conversations run unshaped as a control group, compared with your other replies over ${compactNumber(dashboard.outputReduction.requests)} requests.${
+                                dashboard.outputReduction.alongsideAddon
+                                  ? ` ${dashboard.outputReduction.alongsideAddon} runs in both groups, so this is Headroom's shaping on top of it.`
+                                  : ""
+                              }`
                             : `Estimated: each reply is compared with a baseline learned from your past replies${
                                 dashboard.outputReduction
                                   ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
@@ -8567,7 +8595,7 @@ export default function App() {
                     block from your shell profile
                   </li>
                   <li>
-                    Remove Headroom's addons and MCP servers (ponytail, caveman, serena,
+                    Remove Headroom's addons and MCP servers (ponytail, caveman, chisle, serena,
                     context7, codebase-memory, MarkItDown)
                   </li>
                   <li>

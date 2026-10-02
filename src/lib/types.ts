@@ -102,6 +102,8 @@ export interface DailySavingsPoint {
 // "measured" (A/B holdout); the percentage carries a 95% confidence band.
 export interface OutputReduction {
   method: string;
+  /** Enabled addon that also shapes replies; set only on a measured figure. */
+  alongsideAddon?: string | null;
   reductionPercent: number;
   ciLowPercent: number;
   ciHighPercent: number;

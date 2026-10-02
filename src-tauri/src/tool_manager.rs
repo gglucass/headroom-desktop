@@ -3024,7 +3024,7 @@ struct PluginAddon {
     plugin_ref: &'static str,
 }
 
-static PLUGIN_ADDONS: [PluginAddon; 2] = [
+static PLUGIN_ADDONS: [PluginAddon; 3] = [
     PluginAddon {
         id: "ponytail",
         marketplace: "DietrichGebert/ponytail",
@@ -3036,6 +3036,12 @@ static PLUGIN_ADDONS: [PluginAddon; 2] = [
         marketplace: "JuliusBrussee/caveman",
         marketplace_name: "caveman",
         plugin_ref: "caveman@caveman",
+    },
+    PluginAddon {
+        id: "chisle",
+        marketplace: "JayPokale/Chisle",
+        marketplace_name: "chisle",
+        plugin_ref: "chisle@chisle",
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
@@ -3689,6 +3695,18 @@ impl ToolManager {
                 checksum: None,
                 required: false,
             },
+            ManagedToolManifest {
+                id: "chisle".into(),
+                name: "Chisle".into(),
+                description:
+                    "Plugin that keeps replies terse and code minimal, and trims long command and web output. Covers what Ponytail and Caveman do, so use it instead of them, not alongside. Installs into Claude Code and Codex. Requires their CLI and Node.js on PATH."
+                        .into(),
+                runtime: "plugin".into(),
+                source_url: "https://github.com/JayPokale/Chisle".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
         ];
 
         Self {
@@ -3772,8 +3790,8 @@ impl ToolManager {
     }
 
     /// Chip text for the Addons tab. markitdown and serena are measured
-    /// (shim counter / serena's logs plus its live dashboard stats); ponytail
-    /// and caveman are the plugins' published benchmark medians — their skills
+    /// (shim counter / serena's logs plus its live dashboard stats); ponytail,
+    /// caveman and chisle are the plugins' published benchmark figures — their skills
     /// forbid inventing per-repo figures, so the labels say "benchmark". rtk's
     /// figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
@@ -3793,6 +3811,8 @@ impl ToolManager {
             }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
             "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
+            // Its 2026-10-01 rerun: 83% of a bare model's billed output.
+            "chisle" => Some("~17% fewer output tokens (benchmark)".to_string()),
             _ => None,
         }
     }
@@ -9342,6 +9362,11 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
+        if plugin.id == "chisle" {
+            if let Err(err) = crate::client_adapters::scope_chisle_compression(true) {
+                log::warn!("chisle: scoping its tool-output compression failed: {err:#}");
+            }
+        }
         // At most one: with two hosts, the other one installed.
         Ok(outdated.pop())
     }
@@ -9433,12 +9458,32 @@ impl ToolManager {
                     self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
             }
         }
+        if plugin.id == "chisle" {
+            let _ = crate::client_adapters::scope_chisle_compression(false);
+        }
         let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
         if receipt.exists() {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Name of an enabled addon that shapes the agent's replies itself (every
+    /// plugin addon does), whether Headroom installed it or the user did. The
+    /// output shaper's estimated figure scores replies against a baseline
+    /// learned before install, so it credits Headroom with whatever such an
+    /// addon saves; the dashboard reads this to show the measured figure
+    /// instead (see `output_savings::measured`).
+    pub fn active_reply_addon(&self) -> Option<String> {
+        PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| {
+                self.tool_enabled(plugin.id)
+                    && !matches!(self.detect_status(plugin.id), ToolStatus::NotInstalled)
+            })
+            .and_then(|plugin| self.manifests.iter().find(|m| m.id == plugin.id))
+            .map(|manifest| manifest.name.clone())
     }
 
     /// Registered with a host but never installed by Headroom: the user ran
@@ -9631,19 +9676,22 @@ fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
 }
 
 /// A copy installed without the plugin manager, so the registry never lists
-/// it: `npx skills add <repo> -g` drops `skills/<id>/`, and caveman's own
+/// it: `npx skills add <repo> -g` drops `skills/<id>/`, caveman's own
 /// installer wires `hooks/caveman-activate.js` into settings.json whenever its
-/// plugin install fails. Offering Install on top would fire every hook twice.
+/// plugin install fails, and chisle's (`npx chisle`) does the same from
+/// `chisle-hooks/`. Offering Install on top would fire every hook twice.
 fn claude_standalone_install(plugin: &PluginAddon) -> bool {
     let claude = crate::client_adapters::home_dir().join(".claude");
+    let activate = format!("{}-activate.js", plugin.id);
     claude
         .join("skills")
         .join(plugin.id)
         .join("SKILL.md")
         .exists()
+        || claude.join("hooks").join(&activate).exists()
         || claude
-            .join("hooks")
-            .join(format!("{}-activate.js", plugin.id))
+            .join(format!("{}-hooks", plugin.id))
+            .join(&activate)
             .exists()
 }
 
