@@ -3620,9 +3620,6 @@ pub(crate) fn capture_upgrade_failure(
     // tail's tail (where the panic/error usually lives) survives.
     let log_tail_capped = log_tail.map(|s| tail_bytes_for_sentry(s, SENTRY_EXTRA_TAIL_BYTES));
 
-    let outcome_for_fingerprint = outcome.unwrap_or("none");
-    let fingerprint: [&str; 3] = ["runtime_upgrade", phase, outcome_for_fingerprint];
-
     // Bake diagnostic fields into the message so they appear in the issue
     // title/preview without requiring a drill-down into tags. The first ~400
     // chars of the err chain are usually enough to disambiguate.
@@ -3649,13 +3646,23 @@ pub(crate) fn capture_upgrade_failure(
     // wheel we installed: the same host failed the 0.35.0 rollback exactly as
     // it failed the 0.37.0 target (RUST-2Z's regression). It is already
     // reported once per session with a remedy by
-    // `capture_headroom_start_failure`; the upgrade event keeps its fingerprint
-    // and diagnostics but at Warning, as the watchdog give-up already does.
+    // `capture_headroom_start_failure`; the upgrade event keeps its
+    // diagnostics but at Warning, as the watchdog give-up already does, and
+    // groups apart: sharing the defect's fingerprint, an App Control host
+    // reopened RUST-29 after its WinError 32 fix had shipped.
     let level = if endpoint_protection_suspected || loopback_socket_denied {
         sentry::protocol::Level::Warning
     } else {
         sentry::protocol::Level::Error
     };
+    let fingerprint_cause = if endpoint_protection_suspected {
+        "endpoint_protection"
+    } else if loopback_socket_denied {
+        "loopback_socket_denied"
+    } else {
+        outcome.unwrap_or("none")
+    };
+    let fingerprint: [&str; 3] = ["runtime_upgrade", phase, fingerprint_cause];
 
     sentry::with_scope(
         |scope| {
@@ -6784,6 +6791,9 @@ fn handle_crash_guard_flag() {
         sentry::configure_scope(|scope| {
             scope.set_extra("app_ran_secs", started.elapsed().as_secs().into());
             scope.set_extra("last_exit_step", last_step.into());
+            // Grouped by the attached stacktrace, every OS and build opened
+            // its own issue for this one condition (RUST-KV/KW/MN/MP).
+            scope.set_fingerprint(Some(&["crash-guard-unwired"]));
         });
         let _ = logging::init();
         log::info!("crash guard: unwired {unwired:?}");
