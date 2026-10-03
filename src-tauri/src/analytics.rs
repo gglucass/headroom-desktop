@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -81,6 +82,22 @@ const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 2;
 #[cfg(not(debug_assertions))]
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 60;
 
+/// The user's "Usage analytics and crash reports" setting (Settings), mirrored
+/// from the setup state so Sentry's before_send and every sender read it
+/// without touching disk. Set at launch before Sentry starts, and on toggle.
+static SHARING_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// False once the user turned usage data off: no Aptabase events, no Sentry
+/// events, no funnel steps, and no savings snapshot or analytics-only fields
+/// on account calls. Licensing calls are unaffected.
+pub fn sharing_enabled() -> bool {
+    !SHARING_DISABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_sharing_enabled(enabled: bool) {
+    SHARING_DISABLED.store(!enabled, Ordering::Relaxed);
+}
+
 pub struct AnalyticsClient {
     enabled: bool,
     session: Mutex<TrackingSession>,
@@ -144,7 +161,7 @@ impl AnalyticsClient {
     }
 
     pub fn track_event(&self, name: &str, properties: Option<Value>) -> Result<(), String> {
-        if !self.enabled {
+        if !self.enabled || !sharing_enabled() {
             return Ok(());
         }
 
@@ -382,6 +399,10 @@ fn flush_queue(
     queue: &mut VecDeque<Value>,
     deadline: Option<std::time::Instant>,
 ) {
+    // Events queued before the user turned sharing off are dropped, not sent.
+    if !sharing_enabled() {
+        queue.clear();
+    }
     if queue.is_empty() {
         return;
     }

@@ -685,6 +685,15 @@ fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
         .or_insert_with(|| tier.clone());
 }
 
+/// Sentry's before_send: nothing leaves while the user has usage data off.
+pub(crate) fn before_send(
+    event: sentry::protocol::Event<'static>,
+) -> Option<sentry::protocol::Event<'static>> {
+    crate::analytics::sharing_enabled()
+        .then(|| sanitize_event(event))
+        .flatten()
+}
+
 pub(crate) fn sanitize_event(
     mut event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
