@@ -6431,7 +6431,7 @@ fn toml_basic_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn codex_provider_block_matches() -> Result<bool> {
+pub(crate) fn codex_provider_block_matches() -> Result<bool> {
     let path = codex_config_toml_path();
     if !path.exists() {
         return Ok(false);

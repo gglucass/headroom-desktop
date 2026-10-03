@@ -2578,6 +2578,23 @@ fn report_upstream_error(
     if !should_report_upstream_error(client, status) {
         return;
     }
+    // No bearer although config.toml already carries `requires_openai_auth`:
+    // Codex reads its config when it starts, so this is a Codex process from
+    // before the block was fixed (RUST-C1's only post-0.9.28 event came 66s
+    // after the same host's 0.9.26 one). Restarting Codex fixes it and no
+    // release of ours does. A flagless block that the repair above rewrote
+    // before this check still reaches Sentry, as that repair's own report.
+    // After the throttle, so a retry loop reads config.toml once per interval.
+    if status == 401
+        && client == "codex"
+        && crate::client_adapters::codex_provider_block_matches().unwrap_or(false)
+    {
+        log::info!(
+            "codex 401 without a bearer while config.toml asks for one: \
+             this Codex process predates the config; restart Codex"
+        );
+        return;
+    }
     // Group by client and status so each upstream failure class is its own
     // Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
     // message and collapses 401 noise, 403 challenges and real 502/503
