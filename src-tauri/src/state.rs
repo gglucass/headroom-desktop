@@ -2958,9 +2958,10 @@ impl AppState {
                 .unwrap_or_default(),
             || self.tool_manager.installed_headroom_version(),
         );
-        // Tokens stay input-only: the card is labelled "Total input tokens
-        // saved", and this total also drives the milestone notifications, which
-        // must not jump when a new savings layer starts reporting.
+        // Tokens stay input-only: this total drives the milestone
+        // notifications, which must not jump when a new savings layer starts
+        // reporting, and the telemetry reports. The "Total tokens saved" card
+        // adds output shaping in the frontend, from these same buckets.
         let lifetime_estimated_tokens_saved: u64 = daily_savings
             .iter()
             .map(|point| point.estimated_tokens_saved)

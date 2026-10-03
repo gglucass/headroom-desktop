@@ -5008,6 +5008,14 @@ export default function App() {
       .map((point) => point.date)
       .filter((date) => Boolean(date))
   ).size;
+  // The "Total tokens saved" cards: input compression plus output shaping,
+  // summed from the same buckets as the History headline, so no day can read
+  // above the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
+  // for milestones and telemetry (see state.rs).
+  const lifetimeTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + point.estimatedTokensSaved + (point.outputTokensSaved ?? 0),
+    0
+  );
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
       ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`
@@ -6251,7 +6259,7 @@ export default function App() {
                     <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold" />
                     Tokens saved all-time
                   </span>
-                  <strong className="stat-value--blue">{compactNumber(dashboard.lifetimeEstimatedTokensSaved)}</strong>
+                  <strong className="stat-value--blue">{compactNumber(lifetimeTokensSaved)}</strong>
                   <p>
                     Across {lifetimeDataDays > 0 ? `${lifetimeDataDays} tracked day${lifetimeDataDays === 1 ? "" : "s"}` : "all recorded usage"}
                   </p>
@@ -7008,7 +7016,7 @@ export default function App() {
               >
                 <span className="stat-card__label">
                   <Cpu aria-hidden="true" className="stat-card__icon" size={15} weight="bold"/>
-                  Total input tokens saved
+                  Total tokens saved
                   <button
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
@@ -7020,7 +7028,7 @@ export default function App() {
                 </span>
                 <div className="stat-value-row">
                   <strong className="stat-value--blue">
-                    {compactNumber(dashboard.lifetimeEstimatedTokensSaved)}
+                    {compactNumber(lifetimeTokensSaved)}
                   </strong>
                 </div>
               </article>
