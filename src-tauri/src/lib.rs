@@ -6763,6 +6763,9 @@ fn handle_crash_guard_flag() {
     if !std::env::args().any(|arg| arg == CRASH_GUARD_ARG) {
         return;
     }
+    let log = logging::log_path();
+    let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let started = std::time::Instant::now();
     let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     let unwired = client_adapters::unwire_clients_after_crash(|| {
         let intercept =
@@ -6770,6 +6773,18 @@ fn handle_crash_guard_flag() {
         std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
     });
     if !unwired.is_empty() {
+        // RUST-KV carried nothing else, so a crash, a kill mid-quit (the
+        // relauncher's force-kill, a logout deadline) and a force quit all
+        // read alike. A teardown step logged after we started means the
+        // app was quitting when it died.
+        let last_step = log_text_since(&log, log_start)
+            .as_deref()
+            .and_then(last_exit_step)
+            .map_or_else(|| "none".to_string(), |step| logging::scrub_home(&step));
+        sentry::configure_scope(|scope| {
+            scope.set_extra("app_ran_secs", started.elapsed().as_secs().into());
+            scope.set_extra("last_exit_step", last_step.into());
+        });
         let _ = logging::init();
         log::info!("crash guard: unwired {unwired:?}");
         log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
@@ -6778,6 +6793,34 @@ fn handle_crash_guard_flag() {
         }
     }
     std::process::exit(0);
+}
+
+/// The app log written since `from` (its length when the guard started), at
+/// most the last 256 KiB. A log shorter than `from` was rotated meanwhile, so
+/// all of it is new.
+fn log_text_since(log: &Path, from: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = if len < from { 0 } else { from };
+    file.seek(SeekFrom::Start(from.max(len.saturating_sub(256 * 1024))))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The last quit/restart step the app logged (`run_exit_teardown`'s
+/// `exit: ...` markers, `restart_app`, the idle update applier).
+fn last_exit_step(log: &str) -> Option<String> {
+    const TARGET: &str = "headroom_desktop_lib: ";
+    log.lines().rev().find_map(|line| {
+        let msg = &line[line.find(TARGET)? + TARGET.len()..];
+        ["exit: ", "restart_app: ", "update: idle"]
+            .iter()
+            .any(|marker| msg.starts_with(marker))
+            .then(|| msg.chars().take(200).collect())
+    })
 }
 
 /// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
@@ -16623,6 +16666,41 @@ Some unrelated content.
         }
         let arg = std::fs::read_to_string(&eof).expect("the guard never saw the pipe close");
         assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
+    }
+
+    /// RUST-KV: the guard's report names the quit step the app died in, and
+    /// reads only what this run wrote.
+    #[test]
+    fn crash_guard_reports_the_last_quit_step_of_this_run() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log = dir.path().join("headroom-desktop.log");
+        let earlier =
+            "2026-10-03 07:29:08.306 INFO  headroom_desktop_lib: exit: teardown complete\n";
+        std::fs::write(&log, earlier).expect("write log");
+        let start = earlier.len() as u64;
+        let since = |from| super::log_text_since(&log, from).expect("read log");
+
+        assert_eq!(super::last_exit_step(&since(start)), None);
+        assert_eq!(
+            super::last_exit_step(earlier).as_deref(),
+            Some("exit: teardown complete")
+        );
+
+        let this_run = "2026-10-03 09:00:00.000 INFO  headroom_desktop_lib: restart_app: tearing down for relaunch\n\
+             2026-10-03 09:00:00.100 INFO  headroom_desktop_lib: exit: stop_headroom\n\
+             2026-10-03 09:00:00.200 DEBUG reqwest::connect: exit: not ours\n";
+        std::fs::write(&log, format!("{earlier}{this_run}")).expect("append log");
+        assert_eq!(
+            super::last_exit_step(&since(start)).as_deref(),
+            Some("exit: stop_headroom")
+        );
+
+        // Rotated while the app ran: the shorter file is all new.
+        std::fs::write(&log, this_run).expect("rotate log");
+        assert_eq!(
+            super::last_exit_step(&since(start + 10_000)).as_deref(),
+            Some("exit: stop_headroom")
+        );
     }
 
     #[test]
