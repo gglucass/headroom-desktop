@@ -171,6 +171,14 @@ static CODEX_PROMPT_FAILURE_STREAK: AtomicU64 = AtomicU64::new(0);
 /// Codex retries a 5xx or dropped stream about five times before it gives up on
 /// a turn, so ten in a row is at least one turn the user saw fail.
 const CODEX_FAILURE_STREAK_REPORT_AT: u64 = 10;
+/// Epoch-second until which Codex goes direct because the backend, though up,
+/// answered its own `connection_error`: it could not reach the provider. 0 =
+/// route through the backend. See `note_codex_backend_provider_outcome`.
+static CODEX_BACKEND_NO_PROVIDER_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// Trips since the backend last reached the provider; each doubles the window.
+static CODEX_BACKEND_NO_PROVIDER_TRIPS: AtomicU64 = AtomicU64::new(0);
+const CODEX_BACKEND_NO_PROVIDER_BASE_SECS: u64 = 60;
+const CODEX_BACKEND_NO_PROVIDER_MAX_SECS: u64 = 16 * 60;
 /// Last-reported epoch-seconds per (client, status) for `report_upstream_error`:
 /// one Sentry event per error class per interval. A client looping on a 4xx
 /// (RUST-BT: one host, 472 events of the same 400 in 19h, 4/min in bursts)
@@ -194,8 +202,9 @@ const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secur
 /// True when an upstream error body is the backend's own connection failure on
 /// certificate verification (Python ssl's `CERTIFICATE_VERIFY_FAILED`, or the
 /// self-signed-chain reason it carries). Same signals `classify_bootstrap_failure`
-/// keys on for the install path. Substring match: the body is SSE for Claude
-/// (`event: error\ndata: {...}`) and JSON for Codex.
+/// keys on for the install path. Substring match: the body is SSE on a
+/// streaming request (`event: error\ndata: {...}`, Claude and Codex alike) and
+/// JSON otherwise.
 fn is_tls_interception_error(body: &[u8]) -> bool {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
@@ -1789,6 +1798,26 @@ async fn handle(
         return;
     }
 
+    // The backend is up but cannot reach the provider: it answers its own 502
+    // `connection_error` after its retries, so the backend-down fallback below
+    // never fires (the socket to it opens fine) and every prompt failed
+    // (RUST-KN: a Mac whose Codex had worked direct got `ConnectTimeout` on
+    // ten in a row once routed). Send Codex direct while the window is open:
+    // an uncompressed answer beats a failed turn, and the backend has no cache
+    // to lose when it cannot reach the provider. The models fetch stays on
+    // the backend: a direct catalog skips the responses-lite rewrite, and
+    // Codex would cache the flag that breaks it once routed again.
+    if is_codex
+        && !is_opencode
+        && !is_grok
+        && !is_models_fetch
+        && !is_local_backend_path
+        && codex_backend_cannot_reach_provider()
+    {
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        return;
+    }
+
     // Codex-only gate: keep Codex routed through the Python backend so it can
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
     // but tell it to skip optimization for this request. The account wall
@@ -2268,14 +2297,15 @@ async fn splice_with_codex_capture(
                 _ => 0,
             };
             chunk.truncate(n);
+            error_body = response_error_body(&head, &chunk);
+            // Before the forward, so Codex's retry of this 502 goes direct.
+            note_codex_backend_provider_outcome(Some(status), &error_body);
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
             report_upstream_error("codex", status, req_path, &head, &chunk);
-            if let Some(end) = find_header_end(&head) {
-                error_body.extend_from_slice(&head[(end + 4).min(head.len())..]);
-            }
-            error_body.extend_from_slice(&chunk);
+        } else {
+            note_codex_backend_provider_outcome(status, &[]);
         }
         let monitor_terminal = is_codex_sse_response(&head, req_path);
         let mut streamed = CodexTerminalReader::new(backend_rd);
@@ -2366,9 +2396,15 @@ fn note_codex_prompt_outcome(
     {
         return;
     }
+    // The backend's own `connection_error` is its own kind: it never reached
+    // the provider, so it is no provider 5xx. While Codex goes direct past it
+    // only the backend's re-tries land here, one per breaker window, so ten in
+    // a row is a backend that has not reached the provider for an hour or two.
+    let backend_connection = is_backend_connection_error(error_body);
     let kind = match status {
         None => "no_response",
         Some(200..=299) => "stream_error",
+        Some(_) if backend_connection => "backend_connection_error",
         Some(_) => "status",
     };
     sentry::with_scope(
@@ -2378,6 +2414,9 @@ fn note_codex_prompt_outcome(
                 scope.set_tag("upstream_status", status);
             }
             scope.set_tag("upstream_request_path", req_path);
+            if backend_connection {
+                scope.set_tag("backend_connect_cause", backend_connect_cause(error_body));
+            }
             if !error_body.is_empty() {
                 scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
                 scope.set_extra("error_body", codex_error_summary(error_body).into());
@@ -2393,6 +2432,136 @@ fn note_codex_prompt_outcome(
             );
         },
     );
+}
+
+/// Whether Codex should skip the backend because it cannot reach the provider.
+fn codex_backend_cannot_reach_provider() -> bool {
+    now_epoch_secs() < CODEX_BACKEND_NO_PROVIDER_UNTIL.load(Ordering::Acquire)
+}
+
+/// How long Codex goes direct after the `trips`-th consecutive time the
+/// backend could not reach the provider: 1, 2, 4, 8, then 16 minutes. Short at
+/// first, because a dropped Wi-Fi fails the backend too and every direct
+/// minute is an uncompressed one; long once it persists, because each re-try
+/// through the backend costs a turn its connect timeouts (3 x 10s) before
+/// Codex retries it direct.
+fn codex_backend_no_provider_window_secs(trips: u64) -> u64 {
+    let doublings = trips.saturating_sub(1).min(4) as u32;
+    (CODEX_BACKEND_NO_PROVIDER_BASE_SECS << doublings).min(CODEX_BACKEND_NO_PROVIDER_MAX_SECS)
+}
+
+/// Feed the Codex direct window from one backend response. The backend's own
+/// `connection_error` opens it (or, once it has expired, re-opens it longer);
+/// any other response means the backend reached the provider and closes it.
+/// A failure from a request that was already in flight when the window opened
+/// leaves it as is, so a burst of parallel failures counts as one trip.
+fn note_codex_backend_provider_outcome(status: Option<u16>, error_body: &[u8]) {
+    if status.is_none() {
+        return;
+    }
+    if !is_backend_connection_error(error_body) {
+        CODEX_BACKEND_NO_PROVIDER_UNTIL.store(0, Ordering::Release);
+        if CODEX_BACKEND_NO_PROVIDER_TRIPS.swap(0, Ordering::AcqRel) != 0 {
+            log::info!("codex: backend reaches the provider again; routing Codex through it");
+        }
+        return;
+    }
+    let now = now_epoch_secs();
+    if now < CODEX_BACKEND_NO_PROVIDER_UNTIL.load(Ordering::Acquire) {
+        return;
+    }
+    let trips = CODEX_BACKEND_NO_PROVIDER_TRIPS.fetch_add(1, Ordering::AcqRel) + 1;
+    let window = codex_backend_no_provider_window_secs(trips);
+    CODEX_BACKEND_NO_PROVIDER_UNTIL.store(now + window, Ordering::Release);
+    log::info!(
+        "codex: backend cannot reach the provider ({}); sending Codex direct for {window}s",
+        backend_connect_cause(error_body)
+    );
+}
+
+/// True when an error body is the backend's own failure to reach the provider
+/// (httpx gave up connecting or reading after its retries), not a status the
+/// provider sent: the streaming handler's `event: error` frame or the
+/// passthrough JSON, both `connection_error` with this fixed message.
+fn is_backend_connection_error(body: &[u8]) -> bool {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    contains(body, b"\"connection_error\"") && contains(body, b"Failed to connect to upstream API")
+}
+
+/// Fixed class of the transport failure behind a backend `connection_error`,
+/// read from the httpx exception text the message carries. Only the class
+/// leaves the machine: the text can name hosts and addresses.
+fn backend_connect_cause(body: &[u8]) -> &'static str {
+    const CAUSES: &[(&[u8], &str)] = &[
+        (b"CERTIFICATE_VERIFY_FAILED", "tls_verify"),
+        (b"getaddrinfo failed", "dns"),
+        (b"nodename nor servname", "dns"),
+        (b"Name or service not known", "dns"),
+        (b"Temporary failure in name resolution", "dns"),
+        (b"ConnectTimeout", "connect_timeout"),
+        (b"All connection attempts failed", "connect_failed"),
+        (b"Connection refused", "connect_failed"),
+        (b"ConnectError", "connect_failed"),
+        (b"ReadTimeout", "read_timeout"),
+        (b"ReadError", "read_error"),
+        (b"Connection reset", "read_error"),
+        (b"WriteTimeout", "write_timeout"),
+        (b"WriteError", "write_error"),
+        (b"RemoteProtocolError", "protocol"),
+        (b"Server disconnected", "protocol"),
+        (b"PoolTimeout", "pool_timeout"),
+    ];
+    CAUSES
+        .iter()
+        .find(|(needle, _)| body.windows(needle.len()).any(|w| w == *needle))
+        .map_or("other", |(_, cause)| cause)
+}
+
+/// The error body a response head and its peeked chunk carry, as the backend
+/// wrote it: chunked framing removed when the head declares it. The backend's
+/// own errors on a streaming request are streamed, so `8c\r\nevent: error...`
+/// parsed as nothing (RUST-KN: "unparseable error body (151 bytes)", which was
+/// `Failed to connect to upstream API: ConnectTimeout('')`).
+fn response_error_body(head: &[u8], chunk: &[u8]) -> Vec<u8> {
+    let mut raw = find_header_end(head)
+        .map(|end| head[(end + 4).min(head.len())..].to_vec())
+        .unwrap_or_default();
+    raw.extend_from_slice(chunk);
+    let chunked = extract_header_value(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    if !chunked {
+        return raw;
+    }
+    let mut body = Vec::with_capacity(raw.len());
+    let mut rest = raw.as_slice();
+    loop {
+        let size = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .and_then(|line_end| {
+                let line = std::str::from_utf8(&rest[..line_end]).ok()?;
+                let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+                Some((line_end, size))
+            });
+        // No size line: not chunk framing after all, or the peek ended on a
+        // chunk boundary. Keep what there is.
+        let Some((line_end, size)) = size else {
+            return if body.is_empty() { raw } else { body };
+        };
+        if size == 0 {
+            break;
+        }
+        let data = &rest[line_end + 2..];
+        // The peek is bounded: keep a chunk it cut short.
+        body.extend_from_slice(&data[..size.min(data.len())]);
+        if data.len() <= size {
+            break;
+        }
+        rest = data[size..].strip_prefix(b"\r\n").unwrap_or(&data[size..]);
+    }
+    body
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -2492,12 +2661,7 @@ fn report_upstream_error(
     head: &[u8],
     chunk: &[u8],
 ) {
-    let head_body = find_header_end(head)
-        .map(|e| &head[(e + 4).min(head.len())..])
-        .unwrap_or(&[]);
-    let mut body: Vec<u8> = Vec::with_capacity(head_body.len() + chunk.len());
-    body.extend_from_slice(head_body);
-    body.extend_from_slice(chunk);
+    let body = response_error_body(head, chunk);
     let snippet = codex_error_summary(&body);
     let path = req_path.to_string();
     // The raw body stays on-device: the local log keeps full debugging detail
@@ -2596,7 +2760,8 @@ fn report_upstream_error(
     // shape RUST-4V's 578 events shared was never visible from the issue view.
     // All values are bounded and content-free, so they stay aggregatable.
     // Anthropic's tool-search 400s stream as SSE (event: error\ndata: {...}), so
-    // codex_error_shape_tag's JSON parse yields "non-json" and the RUST-BT bucket
+    // codex_error_shape_tag sees only the envelope ("sse:object{error,type}",
+    // "non-json" before it read SSE) and the RUST-BT bucket
     // ("claude-code 400 on /v1/messages?beta=true") can't tell a tool_reference
     // 400 from any other. Classify by signature first so we can measure what the
     // ENABLE_TOOL_SEARCH rollout is actually costing (the tag value is a fixed
@@ -2674,50 +2839,65 @@ fn response_content_type(head: &[u8]) -> Option<String> {
 /// `error.type` / `error.code` / `error.param`, never free-text (the
 /// `message` field and raw bodies can quote request content).
 fn codex_error_summary(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(json) => {
-            let err = json.get("error").unwrap_or(&json);
-            let field = |key: &str| err.get(key).and_then(|v| v.as_str());
-            let (kind, code, param) = (field("type"), field("code"), field("param"));
-            // All three absent means the body parsed but carried none of the
-            // schema we know how to read, and "type=- code=- param=-" then
-            // says only "something failed" -- RUST-4V collected 578 events
-            // that were all exactly that string and stayed untriageable for
-            // two months. Describe the shape instead, so the next one is a
-            // lead rather than another tally mark.
-            if kind.is_none() && code.is_none() && param.is_none() {
-                let mut summary = format!(
-                    "no structural error fields; shape={} ({} bytes)",
-                    codex_error_body_shape(&json),
-                    body.len()
-                );
-                if let Some(detail) = safe_detail_text(&json) {
-                    summary.push_str(" detail=");
-                    summary.push_str(&detail);
-                }
-                // `{success, error, errorType}` gateways (RUST-FD, opencode)
-                // put the class in `errorType` beside a free-text `error`.
-                // An identifier-shaped value is schema, like a key name.
-                if let Some(kind) = json
-                    .get("errorType")
-                    .and_then(|v| v.as_str())
-                    .filter(|v| is_safe_shape_key(v))
-                {
-                    summary.push_str(" errorType=");
-                    summary.push_str(kind);
-                }
-                return summary;
-            }
-            format!(
-                "type={} code={} param={}",
-                kind.unwrap_or("-"),
-                code.unwrap_or("-"),
-                param.unwrap_or("-")
-            )
-        }
+    match error_body_json(body) {
+        Some((json, false)) => json_error_summary(&json, body.len()),
+        Some((json, true)) => format!("sse {}", json_error_summary(&json, body.len())),
         // Truncated (peek is bounded) or non-JSON body — report size only.
-        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+        None => format!("unparseable error body ({} bytes)", body.len()),
     }
+}
+
+fn json_error_summary(json: &serde_json::Value, body_len: usize) -> String {
+    let err = json.get("error").unwrap_or(json);
+    let field = |key: &str| err.get(key).and_then(|v| v.as_str());
+    let (kind, code, param) = (field("type"), field("code"), field("param"));
+    // All three absent means the body parsed but carried none of the
+    // schema we know how to read, and "type=- code=- param=-" then
+    // says only "something failed" -- RUST-4V collected 578 events
+    // that were all exactly that string and stayed untriageable for
+    // two months. Describe the shape instead, so the next one is a
+    // lead rather than another tally mark.
+    if kind.is_none() && code.is_none() && param.is_none() {
+        let mut summary = format!(
+            "no structural error fields; shape={} ({body_len} bytes)",
+            codex_error_body_shape(json)
+        );
+        if let Some(detail) = safe_detail_text(json) {
+            summary.push_str(" detail=");
+            summary.push_str(&detail);
+        }
+        // `{success, error, errorType}` gateways (RUST-FD, opencode)
+        // put the class in `errorType` beside a free-text `error`.
+        // An identifier-shaped value is schema, like a key name.
+        if let Some(kind) = json
+            .get("errorType")
+            .and_then(|v| v.as_str())
+            .filter(|v| is_safe_shape_key(v))
+        {
+            summary.push_str(" errorType=");
+            summary.push_str(kind);
+        }
+        return summary;
+    }
+    format!(
+        "type={} code={} param={}",
+        kind.unwrap_or("-"),
+        code.unwrap_or("-"),
+        param.unwrap_or("-")
+    )
+}
+
+/// An error body's JSON, and whether it came out of an SSE `data:` line: an
+/// error on a streaming request (the backend's own, or Anthropic's) is an
+/// `event: error` frame, not a JSON document.
+fn error_body_json(body: &[u8]) -> Option<(serde_json::Value, bool)> {
+    if let Ok(json) = serde_json::from_slice(body) {
+        return Some((json, false));
+    }
+    body.split(|&b| b == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data:"))
+        .find_map(|data| serde_json::from_slice(data.trim_ascii()).ok())
+        .map(|json| (json, true))
 }
 
 /// chatgpt.com's Codex backend answers 400 as `{"detail": "<sentence>"}` and
@@ -2797,10 +2977,11 @@ fn is_safe_shape_key(key: &str) -> bool {
 /// which is why RUST-4V's 578 events never revealed that they shared one
 /// shape. A tag makes "which shapes are these?" a single query.
 fn codex_error_shape_tag(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(json) => codex_error_body_shape(&json),
-        Err(_) if body.is_empty() => "empty".to_string(),
-        Err(_) => "non-json".to_string(),
+    match error_body_json(body) {
+        Some((json, false)) => codex_error_body_shape(&json),
+        Some((json, true)) => format!("sse:{}", codex_error_body_shape(&json)),
+        None if body.is_empty() => "empty".to_string(),
+        None => "non-json".to_string(),
     }
 }
 
@@ -5237,6 +5418,134 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn codex_goes_direct_while_the_backend_cannot_reach_the_provider() {
+        // RUST-KN: the backend is up (the socket opens, so the fallback above
+        // never fires) but answers every Codex prompt with its own chunked SSE
+        // 502 `connection_error`. Codex's retry must reach the provider direct.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        super::CODEX_BACKEND_NO_PROVIDER_UNTIL.store(0, Ordering::Relaxed);
+        super::CODEX_BACKEND_NO_PROVIDER_TRIPS.store(0, Ordering::Relaxed);
+
+        let backend_hits = Arc::new(AtomicUsize::new(0));
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let hits = Arc::clone(&backend_hits);
+        let backend_task = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend_listener.accept().await {
+                hits.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async move {
+                    let _ = read_until_header_end(&mut sock).await;
+                    let sse = backend_connection_error_sse("ConnectTimeout('')");
+                    let _ = sock.write_all(CHUNKED_502_HEAD).await;
+                    let _ = sock
+                        .write_all(format!("{:x}\r\n{sse}\r\n", sse.len()).as_bytes())
+                        .await;
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        backend_port::set(backend_addr.port());
+
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
+
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                // Unroutable: only the Codex override above may answer.
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        // One Codex prompt, read to EOF so the splice has finished with it.
+        let prompt = || async {
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                    client = Some(c);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut client = client.expect("intercept reachable");
+            client
+                .write_all(
+                    b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write codex request");
+            let mut response = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+                .await;
+            String::from_utf8_lossy(&response).into_owned()
+        };
+
+        let first = prompt().await;
+        assert!(first.starts_with("HTTP/1.1 502"), "{first:?}");
+        assert!(
+            first.contains("connection_error"),
+            "body forwarded: {first:?}"
+        );
+        assert_eq!(backend_hits.load(Ordering::Acquire), 1);
+
+        let retry = prompt().await;
+        assert!(
+            retry.starts_with("HTTP/1.1 200"),
+            "retry goes direct: {retry:?}"
+        );
+        assert_eq!(backend_hits.load(Ordering::Acquire), 1, "backend skipped");
+
+        // Once the window lapses the backend gets the next prompt again, and
+        // still failing, opens a longer window.
+        super::CODEX_BACKEND_NO_PROVIDER_UNTIL.store(1, Ordering::Relaxed);
+        let after = prompt().await;
+        assert!(after.starts_with("HTTP/1.1 502"), "{after:?}");
+        assert_eq!(backend_hits.load(Ordering::Acquire), 2);
+        assert_eq!(
+            super::CODEX_BACKEND_NO_PROVIDER_TRIPS.load(Ordering::Acquire),
+            2
+        );
+
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+        super::CODEX_BACKEND_NO_PROVIDER_UNTIL.store(0, Ordering::Relaxed);
+        super::CODEX_BACKEND_NO_PROVIDER_TRIPS.store(0, Ordering::Relaxed);
+        run_task.abort();
+        backend_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn intercept_goes_direct_until_the_backend_port_is_selected() {
         // Something already listens where the backend port points (Orca's
         // mobile server, a dev server on 6768) before tool_manager has probed
@@ -5584,6 +5893,165 @@ mod tests {
         assert!(super::is_transient_upstream_status(502));
         assert!(!super::is_transient_upstream_status(400));
         assert!(!super::is_transient_upstream_status(401));
+    }
+
+    /// The backend's own SSE 502 when httpx gives up reaching the provider,
+    /// byte for byte as the 0.39.0 wheel's streaming handler writes it.
+    fn backend_connection_error_sse(cause: &str) -> String {
+        format!(
+            "event: error\ndata: {{\"type\": \"error\", \"error\": {{\"type\": \"connection_error\", \
+             \"message\": \"Failed to connect to upstream API: {cause}\"}}}}\n\n"
+        )
+    }
+
+    const CHUNKED_502_HEAD: &[u8] =
+        b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/event-stream; \
+        charset=utf-8\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    #[test]
+    fn backend_sse_errors_are_read_through_their_chunk_framing() {
+        // RUST-KN's "unparseable error body (151 bytes)": uvicorn sends the
+        // frame as one chunk, and its framed size for ConnectTimeout('') is
+        // exactly 151 (163 for the Russia event's "All connection attempts
+        // failed").
+        let sse = backend_connection_error_sse("ConnectTimeout('')");
+        let chunk = format!("{:x}\r\n{sse}\r\n", sse.len());
+        assert_eq!(chunk.len(), 151);
+        assert_eq!(
+            format!(
+                "{:x}\r\n{}\r\n",
+                backend_connection_error_sse("All connection attempts failed").len(),
+                backend_connection_error_sse("All connection attempts failed")
+            )
+            .len(),
+            163
+        );
+        let body = super::response_error_body(CHUNKED_502_HEAD, chunk.as_bytes());
+        assert_eq!(body, sse.as_bytes());
+        assert_eq!(
+            codex_error_summary(&body),
+            "sse type=connection_error code=- param=-"
+        );
+        assert_eq!(codex_error_shape_tag(&body), "sse:object{error,type}");
+
+        // Head over-read plus the terminator in the peek, and a chunk the
+        // bounded peek cut short, both decode.
+        let mut head = CHUNKED_502_HEAD.to_vec();
+        head.extend_from_slice(&chunk.as_bytes()[..10]);
+        let rest = format!("{}0\r\n\r\n", &chunk[10..]);
+        assert_eq!(
+            super::response_error_body(&head, rest.as_bytes()),
+            sse.as_bytes()
+        );
+        assert_eq!(
+            super::response_error_body(CHUNKED_502_HEAD, &chunk.as_bytes()[..40]),
+            &sse.as_bytes()[..36]
+        );
+
+        // No chunked header: the bytes are the body, framing-looking or not.
+        let plain_head = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(super::response_error_body(plain_head, b"8c\r\n"), b"8c\r\n");
+        // A chunked header over bytes that are not framing keeps the bytes.
+        assert_eq!(
+            super::response_error_body(CHUNKED_502_HEAD, b"<html>502</html>"),
+            b"<html>502</html>"
+        );
+    }
+
+    #[test]
+    fn backend_connection_errors_are_told_from_provider_errors_content_free() {
+        use super::{backend_connect_cause, is_backend_connection_error};
+        let sse = backend_connection_error_sse("ConnectTimeout('')");
+        assert!(is_backend_connection_error(sse.as_bytes()));
+        // The passthrough handler's JSON flavour.
+        let json = br#"{"error": {"type": "connection_error", "message": "Failed to connect to upstream API: [Errno 61] Connection refused"}}"#;
+        assert!(is_backend_connection_error(json));
+        // The provider's own 5xx, and the backend's protocol error (it did
+        // reach the provider, which hung up), are not.
+        assert!(!is_backend_connection_error(
+            b"<html>502 Bad Gateway</html>"
+        ));
+        assert!(!is_backend_connection_error(
+            br#"{"error":{"type":"server_error","code":"proxy_error"}}"#
+        ));
+        assert!(!is_backend_connection_error(
+            br#"{"error": {"type": "upstream_protocol_error", "message": "Upstream closed the connection without sending a complete response."}}"#
+        ));
+        assert!(!is_backend_connection_error(b""));
+
+        for (cause, class) in [
+            ("ConnectTimeout('')", "connect_timeout"),
+            ("All connection attempts failed", "connect_failed"),
+            ("ReadError('')", "read_error"),
+            (
+                "[Errno 8] nodename nor servname provided, or not known",
+                "dns",
+            ),
+            ("[Errno 11001] getaddrinfo failed", "dns"),
+            (
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed (_ssl.c:1010)",
+                "tls_verify",
+            ),
+            ("something new from chatgpt.com 10.0.0.1", "other"),
+        ] {
+            assert_eq!(
+                backend_connect_cause(backend_connection_error_sse(cause).as_bytes()),
+                class,
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_backend_no_provider_window_backs_off_to_a_cap() {
+        let windows: Vec<u64> = (1..=7)
+            .map(super::codex_backend_no_provider_window_secs)
+            .collect();
+        assert_eq!(windows, [60, 120, 240, 480, 960, 960, 960]);
+        assert_eq!(super::codex_backend_no_provider_window_secs(u64::MAX), 960);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_backend_no_provider_window_opens_on_the_backend_error_and_closes_on_reach() {
+        use super::{
+            codex_backend_cannot_reach_provider, note_codex_backend_provider_outcome,
+            CODEX_BACKEND_NO_PROVIDER_TRIPS as TRIPS, CODEX_BACKEND_NO_PROVIDER_UNTIL as UNTIL,
+        };
+        use std::sync::atomic::Ordering;
+        let reset = || {
+            UNTIL.store(0, Ordering::Relaxed);
+            TRIPS.store(0, Ordering::Relaxed);
+        };
+        reset();
+        let sse = backend_connection_error_sse("ConnectTimeout('')");
+        let failed = sse.as_bytes();
+
+        // A provider 5xx or no head at all says nothing about reachability.
+        note_codex_backend_provider_outcome(None, failed);
+        note_codex_backend_provider_outcome(Some(502), b"<html>502</html>");
+        assert!(!codex_backend_cannot_reach_provider());
+
+        note_codex_backend_provider_outcome(Some(502), failed);
+        assert!(codex_backend_cannot_reach_provider());
+        assert_eq!(TRIPS.load(Ordering::Relaxed), 1);
+        // A parallel request failing inside the window is the same trip.
+        note_codex_backend_provider_outcome(Some(502), failed);
+        assert_eq!(TRIPS.load(Ordering::Relaxed), 1);
+
+        // Expired, the re-try through the backend fails again: longer window.
+        UNTIL.store(1, Ordering::Relaxed);
+        assert!(!codex_backend_cannot_reach_provider());
+        let before = super::now_epoch_secs();
+        note_codex_backend_provider_outcome(Some(502), failed);
+        assert_eq!(TRIPS.load(Ordering::Relaxed), 2);
+        assert!(UNTIL.load(Ordering::Relaxed) >= before + 120);
+
+        // Any answer the provider sent closes it and resets the back-off.
+        note_codex_backend_provider_outcome(Some(200), &[]);
+        assert!(!codex_backend_cannot_reach_provider());
+        assert_eq!(TRIPS.load(Ordering::Relaxed), 0);
+        reset();
     }
 
     #[test]
