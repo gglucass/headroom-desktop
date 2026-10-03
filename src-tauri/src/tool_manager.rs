@@ -14768,30 +14768,39 @@ fn http_status_code_in(lower: &str) -> Option<u16> {
 fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     let detail = format!("{err:#}");
     let category = wheel_download_failure_category(&detail);
-    sentry::with_scope(
-        |scope| {
-            scope.set_tag("wheel_download_failure", category);
-            scope.set_extra("wheel_url", url.to_string().into());
-            scope.set_extra(
-                "detail",
-                detail.chars().take(2000).collect::<String>().into(),
-            );
-            scope.set_fingerprint(Some(["wheel-download-fallback", category].as_slice()));
-        },
-        || {
-            sentry::capture_message(
-                &format!(
-                    "headroom wheel download failed ({category}); falling back to the pip index"
-                ),
-                sentry::Level::Warning,
-            );
-        },
-    );
+    if wheel_download_failure_reported(category) {
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("wheel_download_failure", category);
+                scope.set_extra("wheel_url", url.to_string().into());
+                scope.set_extra(
+                    "detail",
+                    detail.chars().take(2000).collect::<String>().into(),
+                );
+                scope.set_fingerprint(Some(["wheel-download-fallback", category].as_slice()));
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "headroom wheel download failed ({category}); falling back to the pip index"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
     // Local only: the fingerprinted capture above is the Sentry path, and the
     // bridged warn would re-open the URL-grouped issue this replaced. The full
     // URL and error chain stay in the file log, where triage can still read
     // them per-machine.
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
+}
+
+/// A host that cannot resolve files.pythonhosted.org is its own network's
+/// problem (RUST-MJ: one Windows DNS blip, the pip fallback installed fine).
+/// If the fallback fails too, pip's own failure report carries it.
+fn wheel_download_failure_reported(category: &str) -> bool {
+    category != "dns"
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -15724,12 +15733,13 @@ mod tests {
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
-        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        wait_for_port_free, wheel_download_failure_category, wheel_download_failure_reported,
+        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
+        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -18955,6 +18965,9 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
                 "for: {detail}"
             );
         }
+        // RUST-MJ: a DNS failure stays local; the rest still report.
+        assert!(!wheel_download_failure_reported("dns"));
+        assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
         assert_eq!(
