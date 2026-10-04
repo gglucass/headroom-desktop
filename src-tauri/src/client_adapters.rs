@@ -10941,7 +10941,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
-    #[cfg(unix)]
     use serde_json::Value;
 
     #[test]
