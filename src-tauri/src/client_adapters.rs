@@ -10334,8 +10334,15 @@ pub(crate) fn claude_desktop_installed() -> bool {
     // former user we cannot work with an app they already deleted. Missing an
     // install in a non-standard location is the safe direction -- the copy is
     // an extra explanation and its absence leaves the correct generic text.
+    //
+    // Claude Desktop now ships on Windows as MSIX only, and the migration
+    // deletes the Squirrel root, so every current install is the package. Its
+    // per-user data dir is keyed by the package family name and Windows removes
+    // it with the package; the versioned `WindowsApps` folder is not listable.
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(base).join("AnthropicClaude"));
+        let base = PathBuf::from(base);
+        candidates.push(base.join("AnthropicClaude"));
+        candidates.push(base.join("Packages").join("Claude_pzs8sxrjxfjjc"));
     }
     candidates.iter().any(|path| path.exists())
 }
