@@ -2323,19 +2323,39 @@ async fn splice_with_codex_capture(
 /// body we built) and drops the user's account (invalid key, plan, rate
 /// limit); counting them here filed RUST-KN as a second issue for RUST-C1's
 /// missing-bearer 401s. A response that never started because the client left
-/// first is a cancel.
+/// first is a cancel. A 5xx the provider wrote itself is its outage, which
+/// Headroom neither caused nor can fix: RUST-KN escalated on 2026-10-04 for
+/// OpenAI's `cave_upstream_unreachable` 502s and a Cloudflare 502 page.
 fn codex_prompt_failed(
     status: Option<u16>,
     stream_failed: bool,
     client_gone: bool,
+    error_body: &[u8],
 ) -> Option<bool> {
     match status {
         Some(200..=299) => Some(stream_failed),
         Some(400..=499) => None,
+        Some(_) if provider_wrote_error(error_body) => None,
         Some(_) => Some(true),
         None if client_gone => None,
         None => Some(true),
     }
+}
+
+/// Whether an error body came from the provider rather than from Headroom: its
+/// JSON error object, or its edge's HTML page. Headroom's own 5xx are the
+/// intercept's empty bodies and the backend's `code: proxy_error` (or a bare
+/// framework 500), and stay counted.
+fn provider_wrote_error(body: &[u8]) -> bool {
+    let body = body.trim_ascii_start();
+    body.starts_with(b"<")
+        || serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|json| json.get("error").cloned())
+            .is_some_and(|err| {
+                err.is_object()
+                    && err.get("code").and_then(|code| code.as_str()) != Some("proxy_error")
+            })
 }
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
@@ -2353,7 +2373,7 @@ fn note_codex_prompt_outcome(
     req_path: &str,
     error_body: &[u8],
 ) {
-    match codex_prompt_failed(status, stream_failed, client_gone) {
+    match codex_prompt_failed(status, stream_failed, client_gone, error_body) {
         None => return,
         Some(false) => {
             CODEX_PROMPT_FAILURE_STREAK.store(0, Ordering::Relaxed);
@@ -5582,17 +5602,42 @@ mod tests {
 
     #[test]
     fn codex_prompt_outcome_counts_only_what_the_user_saw_fail() {
-        // The classes the per-request capture drops are exactly the ones counted.
-        assert_eq!(codex_prompt_failed(Some(502), false, false), Some(true));
-        assert_eq!(codex_prompt_failed(Some(200), true, false), Some(true));
-        assert_eq!(codex_prompt_failed(None, false, false), Some(true));
+        // The classes the per-request capture drops are exactly the ones counted:
+        // a 5xx Headroom wrote (the intercept's empty body, the backend's
+        // proxy_error, a bare framework 500), stream errors and no response.
+        let proxy_error = br#"{"error":{"type":"server_error","code":"proxy_error"}}"#;
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, b""),
+            Some(true)
+        );
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, proxy_error),
+            Some(true)
+        );
+        assert_eq!(
+            codex_prompt_failed(Some(500), false, false, b"Internal Server Error"),
+            Some(true)
+        );
+        assert_eq!(codex_prompt_failed(Some(200), true, false, b""), Some(true));
+        assert_eq!(codex_prompt_failed(None, false, false, b""), Some(true));
         // Success re-arms; a 4xx (report_upstream_error's) and cancels say nothing.
-        assert_eq!(codex_prompt_failed(Some(200), false, false), Some(false));
-        assert_eq!(codex_prompt_failed(Some(429), false, false), None);
-        assert_eq!(codex_prompt_failed(Some(402), false, false), None);
-        assert_eq!(codex_prompt_failed(Some(401), false, false), None);
-        assert_eq!(codex_prompt_failed(Some(400), false, false), None);
-        assert_eq!(codex_prompt_failed(None, false, true), None);
+        assert_eq!(
+            codex_prompt_failed(Some(200), false, false, b""),
+            Some(false)
+        );
+        assert_eq!(codex_prompt_failed(Some(429), false, false, b""), None);
+        assert_eq!(codex_prompt_failed(Some(402), false, false, b""), None);
+        assert_eq!(codex_prompt_failed(Some(401), false, false, b""), None);
+        assert_eq!(codex_prompt_failed(Some(400), false, false, b""), None);
+        assert_eq!(codex_prompt_failed(None, false, true, b""), None);
+        // A provider's own 5xx is its outage (RUST-KN, 2026-10-04): OpenAI's
+        // gateway error object and its edge's HTML 502 page.
+        let gateway =
+            br#"{"error":{"type":"cave_gateway_error","code":"cave_upstream_unreachable"}}"#;
+        assert_eq!(codex_prompt_failed(Some(502), false, false, gateway), None);
+        let edge =
+            b"<html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>";
+        assert_eq!(codex_prompt_failed(Some(502), false, false, edge), None);
     }
 
     #[test]
