@@ -1048,19 +1048,23 @@ function DailySavingsChart({
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
   const liveToday = view === "day" && visibleDay >= today ? savingsToday : null;
-  // Output counts only what the Output chip accounts for (its "Avoided"
-  // row), so this headline is input saved plus that row.
   const chartTokens = Math.max(
     0,
     liveToday !== null && liveSavingsPulse
       ? liveToday.tokens
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0) +
-          (windowOutput?.savedTokens ?? 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
-  // The shaper runs but nothing can score it yet (thin baseline, fresh
-  // install): a chip still says so, without a number. The only figure on
-  // offer there is the backend's global-mean credit (output_savings.rs).
-  const outputMeasuring = windowOutput === null && !outputReduction && outputShaperActive;
+  // Nothing can score the shaper yet (fresh install, or request kinds the
+  // baseline never saw), so the bars' rough estimate is the only output
+  // figure: the chip shows it in tokens and says how rough it is. No
+  // percentage: the only one on offer is the backend's global-mean credit,
+  // which read "Output -100%" on an all-codex machine (output_savings.rs).
+  const roughOutputTokens =
+    windowOutput === null && !outputReduction
+      ? chartData.reduce((s, d) => s + d.outputTokensSaved, 0)
+      : 0;
+  const outputMeasuring =
+    windowOutput === null && !outputReduction && roughOutputTokens <= 0 && outputShaperActive;
   const chartSaved =
     chartMode === "usd"
       ? Math.max(
@@ -1168,6 +1172,7 @@ function DailySavingsChart({
             windowBillable !== null ||
             windowOutput !== null ||
             outputReduction ||
+            roughOutputTokens > 0 ||
             outputMeasuring ? (
               <span
                 className={`savings-chart__overlay-chips${
@@ -1232,6 +1237,17 @@ function DailySavingsChart({
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
+                ) : roughOutputTokens > 0 ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label={`Output −${compactNumber(roughOutputTokens)}`}
+                    title="Output tokens avoided"
+                    badge="rough estimate"
+                    value={`${compactNumber(roughOutputTokens)} tokens`}
+                    rows={[]}
+                    note="Tokens the model didn't have to write because Headroom asked for shorter replies. Rough: there isn't enough of your own usage yet to compare each reply with earlier replies of the same kind, so it is compared with the average length of your past replies. Becomes a percentage once there is."
+                  />
                 ) : outputMeasuring ? (
                   <WindowRateChip
                     dot="output"
@@ -1239,9 +1255,9 @@ function DailySavingsChart({
                     label="Output · measuring"
                     title="Output token reduction"
                     badge="measuring"
-                    value="Not measured yet"
+                    value="Nothing yet"
                     rows={[]}
-                    note="Headroom is asking the model for shorter replies, but there isn't enough of your own usage yet to measure how much that saves: it needs at least 10 earlier replies of the same kind to compare against. Output savings aren't counted in your totals until then."
+                    note="Headroom is asking the model for shorter replies. No output savings were recorded in this period yet."
                   />
                 ) : null}
               </span>
@@ -5046,13 +5062,14 @@ export default function App() {
       .map((point) => point.date)
       .filter((date) => Boolean(date))
   ).size;
-  // The "Total tokens saved" cards: input compression plus the sampled output
-  // series, the same sum as the History headline, so no day can read above
-  // the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
+  // The "Total tokens saved" cards: input compression plus output shaping,
+  // summed from the same buckets as the History headline, so no day can read
+  // above the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
   // for milestones and telemetry (see state.rs).
-  const lifetimeTokensSaved =
-    dashboard.dailySavings.reduce((sum, point) => sum + point.estimatedTokensSaved, 0) +
-    (outputReductionForWindow(dashboard.dailySavings)?.savedTokens ?? 0);
+  const lifetimeTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + point.estimatedTokensSaved + (point.outputTokensSaved ?? 0),
+    0
+  );
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
       ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`

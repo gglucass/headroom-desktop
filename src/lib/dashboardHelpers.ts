@@ -25,11 +25,11 @@ export interface SavingsChartDatum {
   // Output-shaping savings, stacked on top of compression in the chart. Zero
   // for buckets predating the layer, so the bar simply shows one segment.
   outputSavingsUsd: number;
-  // Tokens come from the locally sampled series (the Output chip's numbers),
-  // never the backend's per-bucket figure: that one credits traffic the local
-  // recompute refuses to score, and an addon's shorter replies, so a day
-  // could read above the all-time card. Zero where nothing was sampled.
-  // ponytail: dollars still use the backend figure (audit #50, held).
+  // The backend's per-bucket estimate, shown from the first shaped request
+  // and while an addon shapes replies too. It is rougher than the Output
+  // chip's sampled figure (it scores traffic the local recompute cannot
+  // against the user's overall mean reply length), so the chip says so when
+  // it is the only output figure in a window.
   outputTokensSaved: number;
   // Tool-schema deferral, the third Headroom layer, priced upstream at the
   // cache-read rate. Zero for buckets before per-bucket sampling began
@@ -534,7 +534,7 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     // token figure with the exact per-bucket count when it was sampled.
     compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
-    outputTokensSaved: Math.max(0, point.outputSampledTokensSaved ?? 0),
+    outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
     toolSchemaTokensSaved: point.toolSchemaTokensSaved ?? 0,
     totalCostBeforeOptimization:
@@ -677,7 +677,7 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     // New-input basis (see the monthly builder and newInputSavingsRate).
     compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
-    outputTokensSaved: Math.max(0, point.outputSampledTokensSaved ?? 0),
+    outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
     toolSchemaTokensSaved: point.toolSchemaTokensSaved ?? 0,
     totalCostBeforeOptimization:
