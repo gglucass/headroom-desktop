@@ -2130,21 +2130,9 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 // Dedupe repeat captures per machine: a policy verdict (e.g.
                 // Application Control) fails identically on every relaunch,
                 // and RUST-AN was one machine re-filing it 21 times in a day.
-                // `Other` is a grab-bag split by pip category in the
-                // fingerprint, so the dedupe key carries the category too --
-                // a different cause within 24h must still report.
-                let capture_key = match kind {
-                    BootstrapFailureKind::Other => format!(
-                        "other:{}",
-                        tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(
-                            &err
-                        ))
-                    ),
-                    _ => kind.as_str().to_string(),
-                };
                 if state
                     .tool_manager
-                    .should_capture_bootstrap_failure(&capture_key)
+                    .should_capture_bootstrap_failure(&bootstrap_capture_key(&err, kind))
                 {
                     capture_bootstrap_failure(&err, kind);
                 } else {
@@ -2688,6 +2676,27 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
     }
 }
 
+/// pip's cause class for an `Other` bootstrap failure, read with pip's full
+/// output as the pip runner classifies: the compact tail alone files a starved
+/// or truncated index under `other` (RUST-8K).
+fn bootstrap_other_category(err: &anyhow::Error) -> &'static str {
+    let compact = tool_manager::compact_pip_failure(err);
+    tool_manager::pip_failure_category_with_evidence(
+        &compact,
+        &tool_manager::pip_failure_evidence(err, &compact),
+    )
+}
+
+/// `should_capture_bootstrap_failure`'s key. `Other` is a grab-bag split by
+/// pip category in the fingerprint, so the key carries the same category: a
+/// different cause within 24h must still report.
+fn bootstrap_capture_key(err: &anyhow::Error, kind: BootstrapFailureKind) -> String {
+    match kind {
+        BootstrapFailureKind::Other => format!("other:{}", bootstrap_other_category(err)),
+        _ => kind.as_str().to_string(),
+    }
+}
+
 /// Report a bootstrap failure to Sentry. If the error chain contains a
 /// `CommandFailure`, its full stdout/stderr/exit_code are sent as structured
 /// `extra` fields (which Sentry does NOT truncate at the 8KB message cap),
@@ -2727,15 +2736,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     // (`no-pip`, `missing-file`, ...), so borrow that to split the bucket and
     // let each distinct cause open -- and alert on -- its own issue. The named
     // kinds are already specific; leave their fingerprints alone.
-    // With pip's full output, as the pip runner classifies: the compact tail
-    // alone files a starved or truncated index under `other` (RUST-8K).
-    let other_category = matches!(kind, BootstrapFailureKind::Other).then(|| {
-        let compact = tool_manager::compact_pip_failure(err);
-        tool_manager::pip_failure_category_with_evidence(
-            &compact,
-            &tool_manager::pip_failure_evidence(err, &compact),
-        )
-    });
+    let other_category =
+        matches!(kind, BootstrapFailureKind::Other).then(|| bootstrap_other_category(err));
 
     // Transient network/download failures are self-recoverable via the retry
     // button; report them as warnings so they don't pollute the error feed.
@@ -11543,6 +11545,7 @@ mod tests {
         QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
+    use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
     use super::{
         bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
@@ -13889,6 +13892,34 @@ mod tests {
             classify_bootstrap_failure(&err),
             BootstrapFailureKind::NetworkDownload
         ));
+    }
+
+    /// The dedupe key must carry the fingerprint's category. RUST-6S's cut
+    /// index page is `other/network` by pip's full output but `other` by its
+    /// compact tail, so keyed off the tail it shared `other:other` with a
+    /// genuinely unclassified failure, and whichever came second within 24h
+    /// was suppressed though it was a different Sentry issue.
+    #[test]
+    fn bootstrap_capture_key_matches_the_fingerprint_category() {
+        let err: anyhow::Error = make_command_failure(concat!(
+            "WARNING: Retrying (Retry(total=9)) after connection broken by ",
+            "'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed ",
+            "connection without response'))': /simple/protobuf/\n",
+            "ERROR: Exception:\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\pip\\_internal\\index\\collector.py\", line 231, in parse_links\n",
+            "    data = json.loads(page.content)\n",
+            "  File \"~\\python\\Lib\\json\\decoder.py\", line 354, in raw_decode\n",
+            "    obj, end = self.scan_once(s, idx)\n",
+            "               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "json.decoder.JSONDecodeError: Unterminated string starting at: line 1 column ",
+            "6420301 (char 6420300)\n",
+        ))
+        .into();
+        let kind = classify_bootstrap_failure(&err);
+        assert!(matches!(kind, BootstrapFailureKind::Other));
+        assert_eq!(bootstrap_other_category(&err), "network");
+        assert_eq!(bootstrap_capture_key(&err, kind), "other:network");
     }
 
     #[test]

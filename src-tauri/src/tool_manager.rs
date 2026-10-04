@@ -14472,6 +14472,10 @@ pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
 /// One flat bucket would be the opposite mistake: resolving a shipped fix would
 /// regress the instant an unrelated cause reappeared (RUST-5Q). These classes
 /// match the buckets triage already sorts these into by hand.
+///
+/// Tests only: every reporting path classifies with pip's full output
+/// (`pip_failure_category_with_evidence`).
+#[cfg(test)]
 pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
     pip_failure_category_with_evidence(compact, compact)
 }
