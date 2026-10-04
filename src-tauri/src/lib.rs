@@ -2889,6 +2889,22 @@ fn headroom_start_failure_category(reason: &str) -> String {
     }
 }
 
+/// Logs a failed proxy (re)start. The log bridge sends warn! to Sentry, so a
+/// start the app's own exit cut short goes to info instead, as
+/// `capture_headroom_start_failure` leaves it out (RUST-N0: a quit during the
+/// auto-learn toggle's restart).
+pub(crate) fn log_headroom_start_failure(context: &str, err: &str) {
+    log::log!(start_failure_log_level(err), "{context}: {err}");
+}
+
+fn start_failure_log_level(err: &str) -> log::Level {
+    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    }
+}
+
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
@@ -6525,7 +6541,10 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
     // Paused stays paused: resume spawns the backend with the new flag.
     if !state.runtime_is_paused() {
         if let Err(err) = state.ensure_headroom_running() {
-            log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+            log_headroom_start_failure(
+                "set_auto_learn_enabled: proxy restart failed",
+                &format!("{err:#}"),
+            );
         }
     }
     state.invalidate_runtime_status_cache();
@@ -14586,6 +14605,23 @@ Some unrelated content.
         assert!(is_port_conflict_failure(
             "port 6768 is occupied by a non-headroom process (python3.1 pid 1073); ..."
         ));
+    }
+
+    #[test]
+    fn start_failure_cut_short_by_exit_logs_below_sentry() {
+        // RUST-N0: the auto-learn toggle restarted the proxy as the user quit.
+        assert_eq!(
+            crate::start_failure_log_level(
+                "app is shutting down; stopped the headroom proxy mid-startup"
+            ),
+            log::Level::Info
+        );
+        assert_eq!(
+            crate::start_failure_log_level(
+                "headroom exited with exit status: 1 before opening port 6768"
+            ),
+            log::Level::Warn
+        );
     }
 
     #[test]

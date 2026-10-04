@@ -1296,7 +1296,10 @@ impl AppState {
             .err()
             .map(|err| format!("{err:#}"));
         if let Some(err) = ensure_err.as_deref() {
-            log::warn!("run_upgrade_with_ui: new proxy failed to spawn: {err}");
+            crate::log_headroom_start_failure(
+                "run_upgrade_with_ui: new proxy failed to spawn",
+                err,
+            );
         }
         // Snapshot the conditions that gate ensure_headroom_running so a
         // silent short-circuit ("we returned Ok(()) but never spawned") is
@@ -4203,7 +4206,10 @@ impl AppState {
         log::info!("kompress prefetch: restarting proxy to load cached model");
         self.stop_headroom();
         if let Err(err) = self.ensure_headroom_running() {
-            log::warn!("kompress prefetch: restart after download failed: {err:#}");
+            crate::log_headroom_start_failure(
+                "kompress prefetch: restart after download failed",
+                &format!("{err:#}"),
+            );
         }
         *self.cached_runtime_status.lock() = None;
     }
@@ -4457,7 +4463,10 @@ impl AppState {
             // bring it back so Codex keeps getting optimized.
             if self.proxy_bypass.swap(false, AcqRel) {
                 if let Err(err) = self.ensure_headroom_running() {
-                    log::warn!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
+                    crate::log_headroom_start_failure(
+                        "enter_claude_gate: ensure_headroom_running failed",
+                        &format!("{err:#}"),
+                    );
                     crate::capture_headroom_start_failure("enter_claude_gate", &err);
                 }
             }
@@ -4480,7 +4489,10 @@ impl AppState {
         self.claude_only_bypass.store(false, Release);
         if self.proxy_bypass.swap(false, AcqRel) {
             if let Err(err) = self.ensure_headroom_running() {
-                log::warn!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
+                crate::log_headroom_start_failure(
+                    "exit_claude_gate: ensure_headroom_running failed",
+                    &format!("{err:#}"),
+                );
                 crate::capture_headroom_start_failure("exit_claude_gate", &err);
             }
         }
