@@ -107,6 +107,23 @@ describe("dashboard helpers", () => {
     expect(windowed[28].date).toBe("2024-02-29");
   });
 
+  it("plots output tokens from the sampled series, never the backend's credited figure", () => {
+    const base = { estimatedSavingsUsd: 1, estimatedTokensSaved: 100, actualCostUsd: 1, totalTokensSent: 500, byProvider: [] };
+    const [unscored, sampled, negative] = buildHourlySavingsChartData([
+      // Backend credited 8k, local recompute scored nothing: no output segment.
+      { ...base, hour: "2026-10-03T10:00", outputTokensSaved: 8_000 },
+      { ...base, hour: "2026-10-03T11:00", outputTokensSaved: 8_000, outputSampledTokensSaved: 300, outputBaselineTokens: 900 },
+      { ...base, hour: "2026-10-03T12:00", outputSampledTokensSaved: -50, outputBaselineTokens: 400 }
+    ]);
+    expect(unscored.outputTokensSaved).toBe(0);
+    expect(sampled.outputTokensSaved).toBe(300);
+    expect(negative.outputTokensSaved).toBe(0);
+    const [day] = buildMonthlySavingsChartData([
+      { ...base, date: "2026-10-03", outputTokensSaved: 8_000, outputSampledTokensSaved: 250, outputBaselineTokens: 700 }
+    ]);
+    expect(day.outputTokensSaved).toBe(250);
+  });
+
   it("builds hourly windows and chart data with derived totals", () => {
     const data: HourlySavingsPoint[] = [
       {

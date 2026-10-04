@@ -2696,12 +2696,16 @@ impl AppState {
         let ledger_estimate = ledger_read.scored();
         // An addon shaping replies too (Chisle, Caveman, Ponytail) leaves only
         // the holdout honest: the estimate and the backend's figure both book
-        // the addon's savings as Headroom's. The lifetime dollar row below
-        // keeps `ledger_estimate`; it is floored by the backend's own daily
-        // output buckets, which this cannot reach anyway (audit #50).
+        // the addon's savings as Headroom's. The holdout takes a heavy user
+        // a couple of months, so until it is ready the tile shows the
+        // estimate with `alongside_addon` set and says it includes the addon;
+        // the server report drops that combined figure (lib.rs). The lifetime
+        // dollar row below keeps `ledger_estimate`; it is floored by the
+        // backend's own daily output buckets, which this cannot reach anyway
+        // (audit #50).
         let reply_addon = self.tool_manager.active_reply_addon();
         let tile_estimate = match reply_addon {
-            Some(_) => crate::output_savings::measured(),
+            Some(_) => crate::output_savings::measured().or_else(|| ledger_estimate.clone()),
             None => ledger_estimate.clone(),
         };
         let output_reduction = tile_estimate

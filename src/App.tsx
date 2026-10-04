@@ -851,6 +851,14 @@ function WindowRateChip({
   );
 }
 
+// How much of this machine's shaped traffic an output figure speaks for --
+// the chip's confidence row, shown however thin, so a low number reads as low.
+function outputCoverageRows(reduction: OutputReduction | null) {
+  return reduction?.coveragePercent != null
+    ? [{ dt: "Covers", dd: `${Math.round(reduction.coveragePercent)}% of replies` }]
+    : [];
+}
+
 function OutputReductionChip({
   reduction,
   flip = false,
@@ -924,6 +932,12 @@ function OutputReductionChip({
               <dt>Requests</dt>
               <dd>{compactNumber(reduction.requests)}</dd>
             </div>
+            {outputCoverageRows(reduction).map((row) => (
+              <div key={row.dt}>
+                <dt>{row.dt}</dt>
+                <dd>{row.dd}</dd>
+              </div>
+            ))}
           </dl>
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
@@ -931,6 +945,8 @@ function OutputReductionChip({
               ? `Output tokens the model skipped because Headroom asked for shorter replies or less effort, on top of what ${reduction.alongsideAddon} saves. Measured against a control group of conversations Headroom leaves unshaped; ${reduction.alongsideAddon} runs in both.`
               : isMeasured
               ? "Output tokens the model skipped because Headroom asked for shorter replies or less effort, measured against a control group of unshaped conversations."
+              : reduction.alongsideAddon
+              ? `Output tokens the model skipped because Headroom or ${reduction.alongsideAddon} asked for shorter replies. An estimate against a baseline learned from your past replies, so it includes what ${reduction.alongsideAddon} saves; Headroom's own share is measured once enough conversations run in its control group.`
               : "Output tokens the model skipped because Headroom asked for shorter replies or less effort. An estimate against a baseline learned from your past replies."}
           </p>
         </div>
@@ -946,6 +962,7 @@ function DailySavingsChart({
   chartMode,
   setChartMode,
   outputReduction,
+  outputShaperActive,
   liveSavingsPulse
 }: {
   data: DailySavingsPoint[];
@@ -954,6 +971,7 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
+  outputShaperActive: boolean;
   liveSavingsPulse: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
@@ -1030,12 +1048,19 @@ function DailySavingsChart({
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
   const liveToday = view === "day" && visibleDay >= today ? savingsToday : null;
+  // Output counts only what the Output chip accounts for (its "Avoided"
+  // row), so this headline is input saved plus that row.
   const chartTokens = Math.max(
     0,
     liveToday !== null && liveSavingsPulse
       ? liveToday.tokens
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved, 0) +
+          (windowOutput?.savedTokens ?? 0)
   );
+  // The shaper runs but nothing can score it yet (thin baseline, fresh
+  // install): a chip still says so, without a number. The only figure on
+  // offer there is the backend's global-mean credit (output_savings.rs).
+  const outputMeasuring = windowOutput === null && !outputReduction && outputShaperActive;
   const chartSaved =
     chartMode === "usd"
       ? Math.max(
@@ -1142,7 +1167,8 @@ function DailySavingsChart({
             {windowNewInput !== null ||
             windowBillable !== null ||
             windowOutput !== null ||
-            outputReduction ? (
+            outputReduction ||
+            outputMeasuring ? (
               <span
                 className={`savings-chart__overlay-chips${
                   chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
@@ -1199,12 +1225,24 @@ function DailySavingsChart({
                       { dt: "Baseline", dd: compactNumber(windowOutput.baselineTokens) },
                       ...(outputReduction
                         ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
-                        : [])
+                        : []),
+                      ...outputCoverageRows(outputReduction)
                     ]}
                     note="Estimate vs the shaper's learned baseline, sampled while the app runs."
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
+                ) : outputMeasuring ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label="Output · measuring"
+                    title="Output token reduction"
+                    badge="measuring"
+                    value="Not measured yet"
+                    rows={[]}
+                    note="Headroom is asking the model for shorter replies, but there isn't enough of your own usage yet to measure how much that saves: it needs at least 10 earlier replies of the same kind to compare against. Output savings aren't counted in your totals until then."
+                  />
                 ) : null}
               </span>
             ) : null}
@@ -5008,14 +5046,13 @@ export default function App() {
       .map((point) => point.date)
       .filter((date) => Boolean(date))
   ).size;
-  // The "Total tokens saved" cards: input compression plus output shaping,
-  // summed from the same buckets as the History headline, so no day can read
-  // above the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
+  // The "Total tokens saved" cards: input compression plus the sampled output
+  // series, the same sum as the History headline, so no day can read above
+  // the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
   // for milestones and telemetry (see state.rs).
-  const lifetimeTokensSaved = dashboard.dailySavings.reduce(
-    (sum, point) => sum + point.estimatedTokensSaved + (point.outputTokensSaved ?? 0),
-    0
-  );
+  const lifetimeTokensSaved =
+    dashboard.dailySavings.reduce((sum, point) => sum + point.estimatedTokensSaved, 0) +
+    (outputReductionForWindow(dashboard.dailySavings)?.savedTokens ?? 0);
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
       ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`
@@ -7049,14 +7086,11 @@ export default function App() {
                 chartMode={chartMode}
                 setChartMode={setChartMode}
                 liveSavingsPulse={debugOverrides?.liveSavingsPulse ?? false}
-                // Withheld when the estimate covers too thin a slice of this
-                // machine's traffic to be its headline. The per-window chip is
-                // a different lineage (sampled buckets) and stands either way.
-                outputReduction={
-                  dashboard.outputReduction?.publishable === false
-                    ? null
-                    : dashboard.outputReduction
-                }
+                // Shown however thin the coverage: the chip's "Covers" row
+                // carries the confidence. Only the server report withholds a
+                // thin percentage (lib.rs).
+                outputReduction={dashboard.outputReduction}
+                outputShaperActive={dashboard.outputShaperActive === true}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
@@ -8479,7 +8513,11 @@ export default function App() {
                                 dashboard.outputReduction
                                   ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
                                   : ""
-                              }.`}
+                              }.${
+                                dashboard.outputReduction?.alongsideAddon
+                                  ? ` It includes what ${dashboard.outputReduction.alongsideAddon} saves.`
+                                  : ""
+                              }`}
                         </p>
                       </>
                     ) : null}

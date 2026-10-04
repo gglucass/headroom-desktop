@@ -137,8 +137,10 @@ pub struct OutputReduction {
     /// at twice. The threshold lives in one place, not in every caller.
     pub publishable: bool,
     /// An enabled addon that also shapes replies (Chisle, Caveman, Ponytail).
-    /// Only ever set on a measured figure, which then reads as Headroom's
-    /// shaping on top of that addon (`ToolManager::active_reply_addon`).
+    /// On a measured figure it reads as Headroom's shaping on top of that
+    /// addon; on an estimated one the figure includes the addon's savings, so
+    /// the UI says so and the server report drops it
+    /// (`ToolManager::active_reply_addon`).
     #[serde(default)]
     pub alongside_addon: Option<String>,
 }

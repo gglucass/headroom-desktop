@@ -102,7 +102,8 @@ export interface DailySavingsPoint {
 // "measured" (A/B holdout); the percentage carries a 95% confidence band.
 export interface OutputReduction {
   method: string;
-  /** Enabled addon that also shapes replies; set only on a measured figure. */
+  /** Enabled addon that also shapes replies. On an estimated figure the
+   * percentage includes that addon's savings. */
   alongsideAddon?: string | null;
   reductionPercent: number;
   ciLowPercent: number;
@@ -198,6 +199,8 @@ export interface DashboardState {
   sessionEstimatedTokensSaved: number;
   sessionSavingsPct: number;
   outputReduction: OutputReduction | null;
+  /** The backend's output shaper is switched on; absent when unknown. */
+  outputShaperActive?: boolean | null;
   learnerProgress: LearnerProgress | null;
   savingsBreakdown: SavingsBreakdown | null;
   dailySavings: DailySavingsPoint[];

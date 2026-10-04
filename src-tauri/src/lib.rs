@@ -7924,6 +7924,15 @@ const SAVINGS_REPORT_DAYS: usize = 30;
 ///   separately (see `savings_report`), so the floor can be tuned on real data.
 ///
 /// Unknown rollout state (older wheels without the block) reports as before.
+/// The tile shows an addon user the estimate until the holdout is ready, but
+/// that figure books the addon's savings as Headroom's, so the fleet never
+/// gets it: the report stays what it was before the tile fell back to it.
+fn reportable_output_reduction(
+    reduction: Option<&crate::models::OutputReduction>,
+) -> Option<&crate::models::OutputReduction> {
+    reduction.filter(|o| o.alongside_addon.is_none() || o.method == "measured")
+}
+
 fn reported_output_reduction(
     reduction: Option<&crate::models::OutputReduction>,
     shaper_active: Option<bool>,
@@ -7957,10 +7966,9 @@ fn reported_output_reduction(
 /// the real figures.
 fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> {
     let breakdown = dashboard.savings_breakdown.as_ref()?;
-    let (output_reduction_percent, output_reduction_method) = reported_output_reduction(
-        dashboard.output_reduction.as_ref(),
-        dashboard.output_shaper_active,
-    );
+    let output_reduction = reportable_output_reduction(dashboard.output_reduction.as_ref());
+    let (output_reduction_percent, output_reduction_method) =
+        reported_output_reduction(output_reduction, dashboard.output_shaper_active);
     Some(pricing::SavingsReport {
         lifetime_savings_usd: dashboard.lifetime_estimated_savings_usd,
         lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
@@ -7972,11 +7980,8 @@ fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> 
         output_reduction_method,
         // Unconditional, unlike the percent: a withheld `low_coverage` figure
         // is exactly the case the server needs the denominator for.
-        output_reduction_requests: dashboard.output_reduction.as_ref().map(|o| o.requests),
-        output_reduction_coverage_percent: dashboard
-            .output_reduction
-            .as_ref()
-            .and_then(|o| o.coverage_percent),
+        output_reduction_requests: output_reduction.map(|o| o.requests),
+        output_reduction_coverage_percent: output_reduction.and_then(|o| o.coverage_percent),
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -16940,8 +16945,23 @@ Some unrelated content.
 
 #[cfg(test)]
 mod output_reduction_report_tests {
-    use super::reported_output_reduction;
+    use super::{reportable_output_reduction, reported_output_reduction};
     use crate::models::OutputReduction;
+
+    #[test]
+    fn an_estimate_alongside_an_addon_never_reaches_the_server() {
+        let with_addon = OutputReduction {
+            alongside_addon: Some("Ponytail".to_string()),
+            ..reduction()
+        };
+        assert!(reportable_output_reduction(Some(&with_addon)).is_none());
+        let measured = OutputReduction {
+            method: "measured".to_string(),
+            ..with_addon
+        };
+        assert!(reportable_output_reduction(Some(&measured)).is_some());
+        assert!(reportable_output_reduction(Some(&reduction())).is_some());
+    }
 
     fn reduction() -> OutputReduction {
         OutputReduction {
