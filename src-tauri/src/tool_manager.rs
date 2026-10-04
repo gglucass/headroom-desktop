@@ -14414,11 +14414,15 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     // in it. That is how RUST-82 reached triage: an install-blocking venv
     // failure classified `other`, with nothing in it to act on. Where pip named
     // a reason, start from it; otherwise the tail is still the best guess.
+    // `ERROR: Exception:` names no reason: it is pip's own crash banner, and
+    // the reason is the traceback's LAST line (RUST-6S on 0.9.31 read
+    // "ERROR: Exception: Traceback ... File" and nothing else).
     let from_pip_error = if trimmed.starts_with("ERROR: ") {
         Some(trimmed)
     } else {
         trimmed.find("\nERROR: ").map(|i| &trimmed[i + 1..])
-    };
+    }
+    .filter(|head| !head.starts_with("ERROR: Exception:"));
     let tail = match from_pip_error {
         // Byte offsets, so walk to a char boundary before slicing: pip on a
         // non-English Windows locale emits multi-byte stderr and slicing
@@ -14468,6 +14472,10 @@ pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
 /// One flat bucket would be the opposite mistake: resolving a shipped fix would
 /// regress the instant an unrelated cause reappeared (RUST-5Q). These classes
 /// match the buckets triage already sorts these into by hand.
+///
+/// Tests only: every reporting path classifies with pip's full output
+/// (`pip_failure_category_with_evidence`).
+#[cfg(test)]
 pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
     pip_failure_category_with_evidence(compact, compact)
 }
@@ -14586,6 +14594,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // relabel an unclassified failure as environmental.
         || evidence_lower.contains("temporary failure in name resolution")
         || pip_index_fetch_failed(&evidence_lower)
+        // A connection that closed mid-body: pip's vendored urllib3 does not
+        // enforce Content-Length, so the cut index page reaches its JSON
+        // parser and pip crashes with a traceback (RUST-6S, MSI host, beside
+        // `RemoteDisconnected` retries). `parse_links` pins it to an index
+        // page, not some local JSON file.
+        || (lower.contains("jsondecodeerror") && evidence_lower.contains("in parse_links"))
     {
         "network"
     } else {
@@ -14768,30 +14782,39 @@ fn http_status_code_in(lower: &str) -> Option<u16> {
 fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     let detail = format!("{err:#}");
     let category = wheel_download_failure_category(&detail);
-    sentry::with_scope(
-        |scope| {
-            scope.set_tag("wheel_download_failure", category);
-            scope.set_extra("wheel_url", url.to_string().into());
-            scope.set_extra(
-                "detail",
-                detail.chars().take(2000).collect::<String>().into(),
-            );
-            scope.set_fingerprint(Some(["wheel-download-fallback", category].as_slice()));
-        },
-        || {
-            sentry::capture_message(
-                &format!(
-                    "headroom wheel download failed ({category}); falling back to the pip index"
-                ),
-                sentry::Level::Warning,
-            );
-        },
-    );
+    if wheel_download_failure_reported(category) {
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("wheel_download_failure", category);
+                scope.set_extra("wheel_url", url.to_string().into());
+                scope.set_extra(
+                    "detail",
+                    detail.chars().take(2000).collect::<String>().into(),
+                );
+                scope.set_fingerprint(Some(["wheel-download-fallback", category].as_slice()));
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "headroom wheel download failed ({category}); falling back to the pip index"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
     // Local only: the fingerprinted capture above is the Sentry path, and the
     // bridged warn would re-open the URL-grouped issue this replaced. The full
     // URL and error chain stay in the file log, where triage can still read
     // them per-machine.
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
+}
+
+/// A host that cannot resolve files.pythonhosted.org is its own network's
+/// problem (RUST-MJ: one Windows DNS blip, the pip fallback installed fine).
+/// If the fallback fails too, pip's own failure report carries it.
+fn wheel_download_failure_reported(category: &str) -> bool {
+    category != "dns"
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -15724,12 +15747,13 @@ mod tests {
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
-        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        wait_for_port_free, wheel_download_failure_category, wheel_download_failure_reported,
+        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
+        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -18955,6 +18979,9 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
                 "for: {detail}"
             );
         }
+        // RUST-MJ: a DNS failure stays local; the rest still report.
+        assert!(!wheel_download_failure_reported("dns"));
+        assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
         assert_eq!(
@@ -25283,6 +25310,50 @@ exit 0
             pip_failure_category(&compact),
             "permission",
             "a named cause must not sit in the `other` grab-bag: {compact}"
+        );
+    }
+
+    /// RUST-6S on 0.9.31, abridged from the real stderr: a link dropping
+    /// connections cut an index page short, and pip crashed parsing it. The
+    /// message read "ERROR: Exception: Traceback ... File" and the failure
+    /// sat in the `other` grab-bag.
+    #[test]
+    fn a_pip_crash_reports_its_exception_and_a_cut_index_page_is_network() {
+        let stderr = concat!(
+            "WARNING: Retrying (Retry(total=9)) after connection broken by ",
+            "'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed ",
+            "connection without response'))': /simple/protobuf/\n",
+            "ERROR: Exception:\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages",
+            "\\pip\\_internal\\cli\\base_command.py\", line 106, in _run_wrapper\n",
+            "    status = _inner_run()\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages",
+            "\\pip\\_internal\\index\\collector.py\", line 231, in parse_links\n",
+            "    data = json.loads(page.content)\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\json",
+            "\\decoder.py\", line 354, in raw_decode\n",
+            "    obj, end = self.scan_once(s, idx)\n",
+            "               ^^^^^^^^^^^^^^^^^^^^^^\n",
+            "json.decoder.JSONDecodeError: Unterminated string starting at: line 1 column ",
+            "6420301 (char 6420300)\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        assert!(
+            compact.ends_with("(char 6420300)"),
+            "the exception line must survive: {compact}"
+        );
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "network"
+        );
+        // A JSONDecodeError outside pip's index parser stays unclassified.
+        let local = "exit=2; stderr tail: json.decoder.JSONDecodeError: Expecting value";
+        assert_eq!(
+            super::pip_failure_category_with_evidence(local, local),
+            "other"
         );
     }
 

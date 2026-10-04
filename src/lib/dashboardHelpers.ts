@@ -25,6 +25,11 @@ export interface SavingsChartDatum {
   // Output-shaping savings, stacked on top of compression in the chart. Zero
   // for buckets predating the layer, so the bar simply shows one segment.
   outputSavingsUsd: number;
+  // The backend's per-bucket estimate, shown from the first shaped request
+  // and while an addon shapes replies too. It is rougher than the Output
+  // chip's sampled figure (it scores traffic the local recompute cannot
+  // against the user's overall mean reply length), so the chip says so when
+  // it is the only output figure in a window.
   outputTokensSaved: number;
   // Tool-schema deferral, the third Headroom layer, priced upstream at the
   // cache-read rate. Zero for buckets before per-bucket sampling began

@@ -42,9 +42,10 @@ const ADMIN_PROMPT_COPY =
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
-// "error decoding response body" = the body stopped arriving mid-transfer).
+// "error decoding response body" = the body stopped arriving mid-transfer),
+// and github.com answering that download with a 5xx (RUST-MQ: a 503).
 const TRANSPORT_FAILURE =
-  /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON/i;
+  /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON|failed with status: 5\d\d/i;
 
 // Releases are quiet by default: no dialog, no notification, and (on macOS)
 // a silent background install that only asks for a restart. A release that

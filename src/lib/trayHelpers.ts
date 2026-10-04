@@ -108,6 +108,38 @@ export function whenWindowVisible(poll: () => void | Promise<void>): () => Promi
   };
 }
 
+/// Gate for the post_install traffic-verification poll (1s ticks). Closing the
+/// launcher only hides it, and a first-run user often closes it and goes off to
+/// send the test prompt; skipping every hidden tick (0.9.27) meant their rows
+/// never verified, so proxy_verified and the main window's verified marker
+/// never landed (23% -> 7% of new signups). Hidden, it checks every 10th tick
+/// until verified, for 30 minutes only: returning launches park this webview
+/// hidden on post_install all session.
+export function launcherVerifyTickDue(
+  visible: boolean,
+  tick: number,
+  elapsedMs: number,
+  verified: boolean
+): boolean {
+  if (visible) return true;
+  return !verified && elapsedMs < 30 * 60_000 && tick % 10 === 0;
+}
+
+/// Per-run state for launcherVerifyTickDue. The persisted traffic marker is read
+/// once, at start: the main window's own verify poller sets it on the same
+/// test prompt, often before the hidden launcher's next 10th tick, and reading
+/// it per tick then stopped the launcher before its rows verified, so
+/// proxy_verified never landed for exactly the user this gate is for.
+export function launcherVerifyGate(
+  markerSet: () => boolean,
+  startedAt = Date.now()
+): (visible: boolean, launcherVerified: boolean, now?: number) => boolean {
+  const verifiedAtStart = markerSet();
+  let tick = 0;
+  return (visible, launcherVerified, now = Date.now()) =>
+    launcherVerifyTickDue(visible, tick++, now - startedAt, launcherVerified || verifiedAtStart);
+}
+
 /// Home dashboard poll gate, or null when it should not run. The tray hides on
 /// blur, so focus stands in for visibility there. The launcher stays visible
 /// while a first-run user is off in their terminal sending the test prompt,

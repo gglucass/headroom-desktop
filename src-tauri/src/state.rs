@@ -1296,7 +1296,10 @@ impl AppState {
             .err()
             .map(|err| format!("{err:#}"));
         if let Some(err) = ensure_err.as_deref() {
-            log::warn!("run_upgrade_with_ui: new proxy failed to spawn: {err}");
+            crate::log_headroom_start_failure(
+                "run_upgrade_with_ui: new proxy failed to spawn",
+                err,
+            );
         }
         // Snapshot the conditions that gate ensure_headroom_running so a
         // silent short-circuit ("we returned Ok(()) but never spawned") is
@@ -2696,12 +2699,16 @@ impl AppState {
         let ledger_estimate = ledger_read.scored();
         // An addon shaping replies too (Chisle, Caveman, Ponytail) leaves only
         // the holdout honest: the estimate and the backend's figure both book
-        // the addon's savings as Headroom's. The lifetime dollar row below
-        // keeps `ledger_estimate`; it is floored by the backend's own daily
-        // output buckets, which this cannot reach anyway (audit #50).
+        // the addon's savings as Headroom's. The holdout takes a heavy user
+        // a couple of months, so until it is ready the tile shows the
+        // estimate with `alongside_addon` set and says it includes the addon;
+        // the server report drops that combined figure (lib.rs). The lifetime
+        // dollar row below keeps `ledger_estimate`; it is floored by the
+        // backend's own daily output buckets, which this cannot reach anyway
+        // (audit #50).
         let reply_addon = self.tool_manager.active_reply_addon();
         let tile_estimate = match reply_addon {
-            Some(_) => crate::output_savings::measured(),
+            Some(_) => crate::output_savings::measured().or_else(|| ledger_estimate.clone()),
             None => ledger_estimate.clone(),
         };
         let output_reduction = tile_estimate
@@ -2958,9 +2965,10 @@ impl AppState {
                 .unwrap_or_default(),
             || self.tool_manager.installed_headroom_version(),
         );
-        // Tokens stay input-only: the card is labelled "Total input tokens
-        // saved", and this total also drives the milestone notifications, which
-        // must not jump when a new savings layer starts reporting.
+        // Tokens stay input-only: this total drives the milestone
+        // notifications, which must not jump when a new savings layer starts
+        // reporting, and the telemetry reports. The "Total tokens saved" card
+        // adds output shaping in the frontend, from these same buckets.
         let lifetime_estimated_tokens_saved: u64 = daily_savings
             .iter()
             .map(|point| point.estimated_tokens_saved)
@@ -3355,8 +3363,6 @@ impl AppState {
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
     )> {
-        // Read before the lock: a few small file reads per poll.
-        let reply_addon_active = self.tool_manager.active_reply_addon().is_some();
         let mut tracker = self.savings_tracker.lock();
         // Concurrent builders (tray updater, dashboard poll) can finish out of
         // order: one holding a retained or cached payload records after
@@ -3370,9 +3376,6 @@ impl AppState {
                 return None;
             }
             *last = Some(fetched_at);
-        }
-        if reply_addon_active {
-            tracker.pause_output_sampling();
         }
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
@@ -4203,7 +4206,10 @@ impl AppState {
         log::info!("kompress prefetch: restarting proxy to load cached model");
         self.stop_headroom();
         if let Err(err) = self.ensure_headroom_running() {
-            log::warn!("kompress prefetch: restart after download failed: {err:#}");
+            crate::log_headroom_start_failure(
+                "kompress prefetch: restart after download failed",
+                &format!("{err:#}"),
+            );
         }
         *self.cached_runtime_status.lock() = None;
     }
@@ -4457,7 +4463,10 @@ impl AppState {
             // bring it back so Codex keeps getting optimized.
             if self.proxy_bypass.swap(false, AcqRel) {
                 if let Err(err) = self.ensure_headroom_running() {
-                    log::warn!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
+                    crate::log_headroom_start_failure(
+                        "enter_claude_gate: ensure_headroom_running failed",
+                        &format!("{err:#}"),
+                    );
                     crate::capture_headroom_start_failure("enter_claude_gate", &err);
                 }
             }
@@ -4480,7 +4489,10 @@ impl AppState {
         self.claude_only_bypass.store(false, Release);
         if self.proxy_bypass.swap(false, AcqRel) {
             if let Err(err) = self.ensure_headroom_running() {
-                log::warn!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
+                crate::log_headroom_start_failure(
+                    "exit_claude_gate: ensure_headroom_running failed",
+                    &format!("{err:#}"),
+                );
                 crate::capture_headroom_start_failure("exit_claude_gate", &err);
             }
         }
@@ -6611,20 +6623,6 @@ impl SavingsTracker {
             entry.saved_tokens += delta_saved;
             entry.baseline_tokens += delta_baseline;
         }
-    }
-
-    /// Called before every observe while an addon shapes replies too (Chisle,
-    /// Caveman, Ponytail). The sampled series is the synthetic-control estimate,
-    /// which books that addon's savings as Headroom's, so nothing is sampled
-    /// meanwhile. Dropping the mark rather than holding it makes the next
-    /// reading a seed: holding it would bill the whole paused stretch to the
-    /// first bucket after the addon goes off.
-    ///
-    /// ponytail: pauses rather than sampling the measured figure, whose
-    /// cumulative moves with the control mean and would need its own mark.
-    /// Sample it if addon users ask for output bars.
-    fn pause_output_sampling(&mut self) {
-        self.output_sample_watermark = None;
     }
 
     /// A readable ledger that scores no strata convicts this machine's entire
@@ -12386,25 +12384,6 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
-    }
-
-    #[test]
-    fn a_reply_addon_pause_books_nothing_and_resumes_without_a_spike() {
-        let mut tracker = make_tracker();
-        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        tracker.sample_output_reduction(Some((1_000, 3_000)));
-        tracker.sample_output_reduction(Some((1_400, 4_000)));
-        // Addon on: every poll pauses first, so its readings only seed.
-        for reading in [(5_000, 9_000), (9_000, 15_000)] {
-            tracker.pause_output_sampling();
-            tracker.sample_output_reduction(Some(reading));
-        }
-        assert_eq!(tracker.output_daily_samples[&day_key].saved_tokens, 400);
-        // Addon off: only work after the last paused reading is booked.
-        tracker.sample_output_reduction(Some((9_300, 16_000)));
-        let day = tracker.output_daily_samples[&day_key];
-        assert_eq!(day.saved_tokens, 700);
-        assert_eq!(day.baseline_tokens, 2_000);
     }
 
     #[test]

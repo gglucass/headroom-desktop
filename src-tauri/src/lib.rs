@@ -2130,21 +2130,9 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 // Dedupe repeat captures per machine: a policy verdict (e.g.
                 // Application Control) fails identically on every relaunch,
                 // and RUST-AN was one machine re-filing it 21 times in a day.
-                // `Other` is a grab-bag split by pip category in the
-                // fingerprint, so the dedupe key carries the category too --
-                // a different cause within 24h must still report.
-                let capture_key = match kind {
-                    BootstrapFailureKind::Other => format!(
-                        "other:{}",
-                        tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(
-                            &err
-                        ))
-                    ),
-                    _ => kind.as_str().to_string(),
-                };
                 if state
                     .tool_manager
-                    .should_capture_bootstrap_failure(&capture_key)
+                    .should_capture_bootstrap_failure(&bootstrap_capture_key(&err, kind))
                 {
                     capture_bootstrap_failure(&err, kind);
                 } else {
@@ -2688,6 +2676,27 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
     }
 }
 
+/// pip's cause class for an `Other` bootstrap failure, read with pip's full
+/// output as the pip runner classifies: the compact tail alone files a starved
+/// or truncated index under `other` (RUST-8K).
+fn bootstrap_other_category(err: &anyhow::Error) -> &'static str {
+    let compact = tool_manager::compact_pip_failure(err);
+    tool_manager::pip_failure_category_with_evidence(
+        &compact,
+        &tool_manager::pip_failure_evidence(err, &compact),
+    )
+}
+
+/// `should_capture_bootstrap_failure`'s key. `Other` is a grab-bag split by
+/// pip category in the fingerprint, so the key carries the same category: a
+/// different cause within 24h must still report.
+fn bootstrap_capture_key(err: &anyhow::Error, kind: BootstrapFailureKind) -> String {
+    match kind {
+        BootstrapFailureKind::Other => format!("other:{}", bootstrap_other_category(err)),
+        _ => kind.as_str().to_string(),
+    }
+}
+
 /// Report a bootstrap failure to Sentry. If the error chain contains a
 /// `CommandFailure`, its full stdout/stderr/exit_code are sent as structured
 /// `extra` fields (which Sentry does NOT truncate at the 8KB message cap),
@@ -2727,8 +2736,8 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     // (`no-pip`, `missing-file`, ...), so borrow that to split the bucket and
     // let each distinct cause open -- and alert on -- its own issue. The named
     // kinds are already specific; leave their fingerprints alone.
-    let other_category = matches!(kind, BootstrapFailureKind::Other)
-        .then(|| tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(err)));
+    let other_category =
+        matches!(kind, BootstrapFailureKind::Other).then(|| bootstrap_other_category(err));
 
     // Transient network/download failures are self-recoverable via the retry
     // button; report them as warnings so they don't pollute the error feed.
@@ -2877,6 +2886,22 @@ fn headroom_start_failure_category(reason: &str) -> String {
         "startup-timeout".to_string()
     } else {
         "other".to_string()
+    }
+}
+
+/// Logs a failed proxy (re)start. The log bridge sends warn! to Sentry, so a
+/// start the app's own exit cut short goes to info instead, as
+/// `capture_headroom_start_failure` leaves it out (RUST-N0: a quit during the
+/// auto-learn toggle's restart).
+pub(crate) fn log_headroom_start_failure(context: &str, err: &str) {
+    log::log!(start_failure_log_level(err), "{context}: {err}");
+}
+
+fn start_failure_log_level(err: &str) -> log::Level {
+    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+        log::Level::Info
+    } else {
+        log::Level::Warn
     }
 }
 
@@ -3620,9 +3645,6 @@ pub(crate) fn capture_upgrade_failure(
     // tail's tail (where the panic/error usually lives) survives.
     let log_tail_capped = log_tail.map(|s| tail_bytes_for_sentry(s, SENTRY_EXTRA_TAIL_BYTES));
 
-    let outcome_for_fingerprint = outcome.unwrap_or("none");
-    let fingerprint: [&str; 3] = ["runtime_upgrade", phase, outcome_for_fingerprint];
-
     // Bake diagnostic fields into the message so they appear in the issue
     // title/preview without requiring a drill-down into tags. The first ~400
     // chars of the err chain are usually enough to disambiguate.
@@ -3649,13 +3671,23 @@ pub(crate) fn capture_upgrade_failure(
     // wheel we installed: the same host failed the 0.35.0 rollback exactly as
     // it failed the 0.37.0 target (RUST-2Z's regression). It is already
     // reported once per session with a remedy by
-    // `capture_headroom_start_failure`; the upgrade event keeps its fingerprint
-    // and diagnostics but at Warning, as the watchdog give-up already does.
+    // `capture_headroom_start_failure`; the upgrade event keeps its
+    // diagnostics but at Warning, as the watchdog give-up already does, and
+    // groups apart: sharing the defect's fingerprint, an App Control host
+    // reopened RUST-29 after its WinError 32 fix had shipped.
     let level = if endpoint_protection_suspected || loopback_socket_denied {
         sentry::protocol::Level::Warning
     } else {
         sentry::protocol::Level::Error
     };
+    let fingerprint_cause = if endpoint_protection_suspected {
+        "endpoint_protection"
+    } else if loopback_socket_denied {
+        "loopback_socket_denied"
+    } else {
+        outcome.unwrap_or("none")
+    };
+    let fingerprint: [&str; 3] = ["runtime_upgrade", phase, fingerprint_cause];
 
     sentry::with_scope(
         |scope| {
@@ -6509,7 +6541,10 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
     // Paused stays paused: resume spawns the backend with the new flag.
     if !state.runtime_is_paused() {
         if let Err(err) = state.ensure_headroom_running() {
-            log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
+            log_headroom_start_failure(
+                "set_auto_learn_enabled: proxy restart failed",
+                &format!("{err:#}"),
+            );
         }
     }
     state.invalidate_runtime_status_cache();
@@ -6763,6 +6798,9 @@ fn handle_crash_guard_flag() {
     if !std::env::args().any(|arg| arg == CRASH_GUARD_ARG) {
         return;
     }
+    let log = logging::log_path();
+    let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let started = std::time::Instant::now();
     let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     let unwired = client_adapters::unwire_clients_after_crash(|| {
         let intercept =
@@ -6770,6 +6808,21 @@ fn handle_crash_guard_flag() {
         std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
     });
     if !unwired.is_empty() {
+        // RUST-KV carried nothing else, so a crash, a kill mid-quit (the
+        // relauncher's force-kill, a logout deadline) and a force quit all
+        // read alike. A teardown step logged after we started means the
+        // app was quitting when it died.
+        let last_step = log_text_since(&log, log_start)
+            .as_deref()
+            .and_then(last_exit_step)
+            .map_or_else(|| "none".to_string(), |step| logging::scrub_home(&step));
+        sentry::configure_scope(|scope| {
+            scope.set_extra("app_ran_secs", started.elapsed().as_secs().into());
+            scope.set_extra("last_exit_step", last_step.into());
+            // Grouped by the attached stacktrace, every OS and build opened
+            // its own issue for this one condition (RUST-KV/KW/MN/MP).
+            scope.set_fingerprint(Some(&["crash-guard-unwired"]));
+        });
         let _ = logging::init();
         log::info!("crash guard: unwired {unwired:?}");
         log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
@@ -6778,6 +6831,34 @@ fn handle_crash_guard_flag() {
         }
     }
     std::process::exit(0);
+}
+
+/// The app log written since `from` (its length when the guard started), at
+/// most the last 256 KiB. A log shorter than `from` was rotated meanwhile, so
+/// all of it is new.
+fn log_text_since(log: &Path, from: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = if len < from { 0 } else { from };
+    file.seek(SeekFrom::Start(from.max(len.saturating_sub(256 * 1024))))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The last quit/restart step the app logged (`run_exit_teardown`'s
+/// `exit: ...` markers, `restart_app`, the idle update applier).
+fn last_exit_step(log: &str) -> Option<String> {
+    const TARGET: &str = "headroom_desktop_lib: ";
+    log.lines().rev().find_map(|line| {
+        let msg = &line[line.find(TARGET)? + TARGET.len()..];
+        ["exit: ", "restart_app: ", "update: idle"]
+            .iter()
+            .any(|marker| msg.starts_with(marker))
+            .then(|| msg.chars().take(200).collect())
+    })
 }
 
 /// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
@@ -7862,6 +7943,15 @@ const SAVINGS_REPORT_DAYS: usize = 30;
 ///   separately (see `savings_report`), so the floor can be tuned on real data.
 ///
 /// Unknown rollout state (older wheels without the block) reports as before.
+/// The tile shows an addon user the estimate until the holdout is ready, but
+/// that figure books the addon's savings as Headroom's, so the fleet never
+/// gets it: the report stays what it was before the tile fell back to it.
+fn reportable_output_reduction(
+    reduction: Option<&crate::models::OutputReduction>,
+) -> Option<&crate::models::OutputReduction> {
+    reduction.filter(|o| o.alongside_addon.is_none() || o.method == "measured")
+}
+
 fn reported_output_reduction(
     reduction: Option<&crate::models::OutputReduction>,
     shaper_active: Option<bool>,
@@ -7895,10 +7985,9 @@ fn reported_output_reduction(
 /// the real figures.
 fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> {
     let breakdown = dashboard.savings_breakdown.as_ref()?;
-    let (output_reduction_percent, output_reduction_method) = reported_output_reduction(
-        dashboard.output_reduction.as_ref(),
-        dashboard.output_shaper_active,
-    );
+    let output_reduction = reportable_output_reduction(dashboard.output_reduction.as_ref());
+    let (output_reduction_percent, output_reduction_method) =
+        reported_output_reduction(output_reduction, dashboard.output_shaper_active);
     Some(pricing::SavingsReport {
         lifetime_savings_usd: dashboard.lifetime_estimated_savings_usd,
         lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
@@ -7910,11 +7999,8 @@ fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> 
         output_reduction_method,
         // Unconditional, unlike the percent: a withheld `low_coverage` figure
         // is exactly the case the server needs the denominator for.
-        output_reduction_requests: dashboard.output_reduction.as_ref().map(|o| o.requests),
-        output_reduction_coverage_percent: dashboard
-            .output_reduction
-            .as_ref()
-            .and_then(|o| o.coverage_percent),
+        output_reduction_requests: output_reduction.map(|o| o.requests),
+        output_reduction_coverage_percent: output_reduction.and_then(|o| o.coverage_percent),
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -11483,6 +11569,7 @@ mod tests {
         QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
+    use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
     use super::{
         bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
@@ -13831,6 +13918,34 @@ mod tests {
         ));
     }
 
+    /// The dedupe key must carry the fingerprint's category. RUST-6S's cut
+    /// index page is `other/network` by pip's full output but `other` by its
+    /// compact tail, so keyed off the tail it shared `other:other` with a
+    /// genuinely unclassified failure, and whichever came second within 24h
+    /// was suppressed though it was a different Sentry issue.
+    #[test]
+    fn bootstrap_capture_key_matches_the_fingerprint_category() {
+        let err: anyhow::Error = make_command_failure(concat!(
+            "WARNING: Retrying (Retry(total=9)) after connection broken by ",
+            "'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed ",
+            "connection without response'))': /simple/protobuf/\n",
+            "ERROR: Exception:\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\pip\\_internal\\index\\collector.py\", line 231, in parse_links\n",
+            "    data = json.loads(page.content)\n",
+            "  File \"~\\python\\Lib\\json\\decoder.py\", line 354, in raw_decode\n",
+            "    obj, end = self.scan_once(s, idx)\n",
+            "               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "json.decoder.JSONDecodeError: Unterminated string starting at: line 1 column ",
+            "6420301 (char 6420300)\n",
+        ))
+        .into();
+        let kind = classify_bootstrap_failure(&err);
+        assert!(matches!(kind, BootstrapFailureKind::Other));
+        assert_eq!(bootstrap_other_category(&err), "network");
+        assert_eq!(bootstrap_capture_key(&err, kind), "other:network");
+    }
+
     #[test]
     fn classify_bootstrap_failure_returns_other_for_unrelated_command_errors() {
         let err: anyhow::Error =
@@ -14490,6 +14605,23 @@ Some unrelated content.
         assert!(is_port_conflict_failure(
             "port 6768 is occupied by a non-headroom process (python3.1 pid 1073); ..."
         ));
+    }
+
+    #[test]
+    fn start_failure_cut_short_by_exit_logs_below_sentry() {
+        // RUST-N0: the auto-learn toggle restarted the proxy as the user quit.
+        assert_eq!(
+            crate::start_failure_log_level(
+                "app is shutting down; stopped the headroom proxy mid-startup"
+            ),
+            log::Level::Info
+        );
+        assert_eq!(
+            crate::start_failure_log_level(
+                "headroom exited with exit status: 1 before opening port 6768"
+            ),
+            log::Level::Warn
+        );
     }
 
     #[test]
@@ -16625,6 +16757,41 @@ Some unrelated content.
         assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
     }
 
+    /// RUST-KV: the guard's report names the quit step the app died in, and
+    /// reads only what this run wrote.
+    #[test]
+    fn crash_guard_reports_the_last_quit_step_of_this_run() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log = dir.path().join("headroom-desktop.log");
+        let earlier =
+            "2026-10-03 07:29:08.306 INFO  headroom_desktop_lib: exit: teardown complete\n";
+        std::fs::write(&log, earlier).expect("write log");
+        let start = earlier.len() as u64;
+        let since = |from| super::log_text_since(&log, from).expect("read log");
+
+        assert_eq!(super::last_exit_step(&since(start)), None);
+        assert_eq!(
+            super::last_exit_step(earlier).as_deref(),
+            Some("exit: teardown complete")
+        );
+
+        let this_run = "2026-10-03 09:00:00.000 INFO  headroom_desktop_lib: restart_app: tearing down for relaunch\n\
+             2026-10-03 09:00:00.100 INFO  headroom_desktop_lib: exit: stop_headroom\n\
+             2026-10-03 09:00:00.200 DEBUG reqwest::connect: exit: not ours\n";
+        std::fs::write(&log, format!("{earlier}{this_run}")).expect("append log");
+        assert_eq!(
+            super::last_exit_step(&since(start)).as_deref(),
+            Some("exit: stop_headroom")
+        );
+
+        // Rotated while the app ran: the shorter file is all new.
+        std::fs::write(&log, this_run).expect("rotate log");
+        assert_eq!(
+            super::last_exit_step(&since(start + 10_000)).as_deref(),
+            Some("exit: stop_headroom")
+        );
+    }
+
     #[test]
     fn tray_usage_lines_show_each_plan_that_reported() {
         let now = 1_790_000_000;
@@ -16814,8 +16981,23 @@ Some unrelated content.
 
 #[cfg(test)]
 mod output_reduction_report_tests {
-    use super::reported_output_reduction;
+    use super::{reportable_output_reduction, reported_output_reduction};
     use crate::models::OutputReduction;
+
+    #[test]
+    fn an_estimate_alongside_an_addon_never_reaches_the_server() {
+        let with_addon = OutputReduction {
+            alongside_addon: Some("Ponytail".to_string()),
+            ..reduction()
+        };
+        assert!(reportable_output_reduction(Some(&with_addon)).is_none());
+        let measured = OutputReduction {
+            method: "measured".to_string(),
+            ..with_addon
+        };
+        assert!(reportable_output_reduction(Some(&measured)).is_some());
+        assert!(reportable_output_reduction(Some(&reduction())).is_some());
+    }
 
     fn reduction() -> OutputReduction {
         OutputReduction {

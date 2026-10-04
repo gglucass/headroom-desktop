@@ -107,6 +107,18 @@ describe("dashboard helpers", () => {
     expect(windowed[28].date).toBe("2024-02-29");
   });
 
+  it("plots the backend's output estimate whether or not the bucket was sampled", () => {
+    const base = { estimatedSavingsUsd: 1, estimatedTokensSaved: 100, actualCostUsd: 1, totalTokensSent: 500, byProvider: [] };
+    const [unscored, sampled, none] = buildHourlySavingsChartData([
+      { ...base, hour: "2026-10-03T10:00", outputTokensSaved: 8_000 },
+      { ...base, hour: "2026-10-03T11:00", outputTokensSaved: 8_000, outputSampledTokensSaved: 300, outputBaselineTokens: 900 },
+      { ...base, hour: "2026-10-03T12:00" }
+    ]);
+    expect(unscored.outputTokensSaved).toBe(8_000);
+    expect(sampled.outputTokensSaved).toBe(8_000);
+    expect(none.outputTokensSaved).toBe(0);
+  });
+
   it("builds hourly windows and chart data with derived totals", () => {
     const data: HourlySavingsPoint[] = [
       {

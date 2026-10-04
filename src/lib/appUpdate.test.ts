@@ -400,11 +400,14 @@ describe("app update helpers", () => {
     });
   });
 
-  it("re-downloads once after a dropped download instead of reporting it (RUST-HS)", async () => {
+  it.each([
+    "error decoding response body", // RUST-HS
+    "Download request failed with status: 503 Service Unavailable", // RUST-MQ
+  ])("re-downloads once after a failed download instead of reporting it: %s", async (failure) => {
     vi.mocked(Sentry.captureException).mockClear();
     const invokeFn = vi
       .fn()
-      .mockRejectedValueOnce("error decoding response body")
+      .mockRejectedValueOnce(failure)
       .mockResolvedValueOnce(availableUpdate)
       .mockResolvedValueOnce(undefined);
 

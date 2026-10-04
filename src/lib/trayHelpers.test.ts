@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityFeedSignature,
   homeDashboardPoll,
+  launcherVerifyGate,
+  launcherVerifyTickDue,
   loadDashboard,
   runtimeStatusPollMs,
   useWindowFocused,
@@ -202,6 +204,37 @@ describe("whenWindowVisible", () => {
     isVisibleMock.mockResolvedValue(true);
     await gated();
     expect(poll).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("launcherVerifyTickDue", () => {
+  it("polls every tick while shown, and slowly while hidden until verified", () => {
+    expect(launcherVerifyTickDue(true, 3, 0, true)).toBe(true);
+    // The user closed onboarding to send the test prompt: keep checking.
+    expect(launcherVerifyTickDue(false, 0, 0, false)).toBe(true);
+    expect(launcherVerifyTickDue(false, 3, 0, false)).toBe(false);
+    expect(launcherVerifyTickDue(false, 10, 0, false)).toBe(true);
+    expect(launcherVerifyTickDue(false, 10, 0, true)).toBe(false);
+    // A returning launch parks the launcher hidden all session: stop.
+    expect(launcherVerifyTickDue(false, 10, 30 * 60_000, false)).toBe(false);
+  });
+});
+
+describe("launcherVerifyGate", () => {
+  it("keeps polling hidden when the main window sets the marker mid-run", () => {
+    let marker = false;
+    const due = launcherVerifyGate(() => marker, 0);
+    expect(due(false, false, 0)).toBe(true);
+    // The main window's poller saw the test prompt first.
+    marker = true;
+    for (let i = 1; i < 10; i++) due(false, false, i * 1000);
+    expect(due(false, false, 10_000)).toBe(true);
+  });
+
+  it("stays quiet hidden on a launch that was already verified", () => {
+    const due = launcherVerifyGate(() => true, 0);
+    expect(due(false, false, 0)).toBe(false);
+    expect(due(true, false, 1000)).toBe(true);
   });
 });
 
