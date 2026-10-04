@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityFeedSignature,
   homeDashboardPoll,
+  launcherVerifyGate,
   launcherVerifyTickDue,
   loadDashboard,
   runtimeStatusPollMs,
@@ -216,6 +217,24 @@ describe("launcherVerifyTickDue", () => {
     expect(launcherVerifyTickDue(false, 10, 0, true)).toBe(false);
     // A returning launch parks the launcher hidden all session: stop.
     expect(launcherVerifyTickDue(false, 10, 30 * 60_000, false)).toBe(false);
+  });
+});
+
+describe("launcherVerifyGate", () => {
+  it("keeps polling hidden when the main window sets the marker mid-run", () => {
+    let marker = false;
+    const due = launcherVerifyGate(() => marker, 0);
+    expect(due(false, false, 0)).toBe(true);
+    // The main window's poller saw the test prompt first.
+    marker = true;
+    for (let i = 1; i < 10; i++) due(false, false, i * 1000);
+    expect(due(false, false, 10_000)).toBe(true);
+  });
+
+  it("stays quiet hidden on a launch that was already verified", () => {
+    const due = launcherVerifyGate(() => true, 0);
+    expect(due(false, false, 0)).toBe(false);
+    expect(due(true, false, 1000)).toBe(true);
   });
 });
 
