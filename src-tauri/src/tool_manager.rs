@@ -14600,6 +14600,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // `RemoteDisconnected` retries). `parse_links` pins it to an index
         // page, not some local JSON file.
         || (lower.contains("jsondecodeerror") && evidence_lower.contains("in parse_links"))
+        // TLS broke while pip read a download's body (`[SSL] record layer
+        // failure`, RUST-6S on 0.9.32, Mac): urllib3 raises it from the
+        // `_error_catcher` around a response read, after a handshake that
+        // succeeded, so the link failed mid-transfer. A certificate pip cannot
+        // verify fails the handshake instead and reaches `could not fetch url`.
+        || (lower.contains("sslerror") && evidence_lower.contains("in _error_catcher"))
     {
         "network"
     } else {
@@ -25353,6 +25359,27 @@ exit 0
         let local = "exit=2; stderr tail: json.decoder.JSONDecodeError: Expecting value";
         assert_eq!(
             super::pip_failure_category_with_evidence(local, local),
+            "other"
+        );
+    }
+
+    #[test]
+    fn pip_tls_failure_mid_download_is_network() {
+        // RUST-6S on 0.9.32 (Mac): the exact tail the event carried.
+        let tail = concat!(
+            "exit=2; stderr tail:   File \"~/Library/Application Support/Headroom/headroom/",
+            "runtime/venv/lib/python3.12/site-packages/pip/_vendor/urllib3/response.py\", ",
+            "line 449, in _error_catcher\n    raise SSLError(e)\n",
+            "pip._vendor.urllib3.exceptions.SSLError: [SSL] record layer failure (_ssl.c:2580)",
+        );
+        assert_eq!(
+            super::pip_failure_category_with_evidence(tail, tail),
+            "network"
+        );
+        // An SSLError raised anywhere else keeps its own reading.
+        let elsewhere = "exit=1; stderr tail: ssl.SSLError: [SSL] unknown error";
+        assert_eq!(
+            super::pip_failure_category_with_evidence(elsewhere, elsewhere),
             "other"
         );
     }
