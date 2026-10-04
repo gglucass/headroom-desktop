@@ -1233,7 +1233,11 @@ function DailySavingsChart({
                         : []),
                       ...outputCoverageRows(outputReduction)
                     ]}
-                    note="Estimate vs the shaper's learned baseline, sampled while the app runs."
+                    note={`Estimate vs the shaper's learned baseline, sampled while the app runs.${
+                      outputReduction?.alongsideAddon
+                        ? ` Includes what ${outputReduction.alongsideAddon} saves.`
+                        : ""
+                    }`}
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip allTimeFallback flip reduction={outputReduction} />

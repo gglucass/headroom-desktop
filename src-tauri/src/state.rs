@@ -3360,8 +3360,6 @@ impl AppState {
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
     )> {
-        // Read before the lock: a few small file reads per poll.
-        let reply_addon_active = self.tool_manager.active_reply_addon().is_some();
         let mut tracker = self.savings_tracker.lock();
         // Concurrent builders (tray updater, dashboard poll) can finish out of
         // order: one holding a retained or cached payload records after
@@ -3375,9 +3373,6 @@ impl AppState {
                 return None;
             }
             *last = Some(fetched_at);
-        }
-        if reply_addon_active {
-            tracker.pause_output_sampling();
         }
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
@@ -6616,20 +6611,6 @@ impl SavingsTracker {
             entry.saved_tokens += delta_saved;
             entry.baseline_tokens += delta_baseline;
         }
-    }
-
-    /// Called before every observe while an addon shapes replies too (Chisle,
-    /// Caveman, Ponytail). The sampled series is the synthetic-control estimate,
-    /// which books that addon's savings as Headroom's, so nothing is sampled
-    /// meanwhile. Dropping the mark rather than holding it makes the next
-    /// reading a seed: holding it would bill the whole paused stretch to the
-    /// first bucket after the addon goes off.
-    ///
-    /// ponytail: pauses rather than sampling the measured figure, whose
-    /// cumulative moves with the control mean and would need its own mark.
-    /// Sample it if addon users ask for output bars.
-    fn pause_output_sampling(&mut self) {
-        self.output_sample_watermark = None;
     }
 
     /// A readable ledger that scores no strata convicts this machine's entire
@@ -12391,25 +12372,6 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
-    }
-
-    #[test]
-    fn a_reply_addon_pause_books_nothing_and_resumes_without_a_spike() {
-        let mut tracker = make_tracker();
-        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        tracker.sample_output_reduction(Some((1_000, 3_000)));
-        tracker.sample_output_reduction(Some((1_400, 4_000)));
-        // Addon on: every poll pauses first, so its readings only seed.
-        for reading in [(5_000, 9_000), (9_000, 15_000)] {
-            tracker.pause_output_sampling();
-            tracker.sample_output_reduction(Some(reading));
-        }
-        assert_eq!(tracker.output_daily_samples[&day_key].saved_tokens, 400);
-        // Addon off: only work after the last paused reading is booked.
-        tracker.sample_output_reduction(Some((9_300, 16_000)));
-        let day = tracker.output_daily_samples[&day_key];
-        assert_eq!(day.saved_tokens, 700);
-        assert_eq!(day.baseline_tokens, 2_000);
     }
 
     #[test]
