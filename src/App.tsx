@@ -199,6 +199,7 @@ import {
 import {
   activityFeedSignature,
   homeDashboardPoll,
+  launcherVerifyTickDue,
   loadDashboard,
   runtimeStatusPollMs,
   serializeState,
@@ -2550,7 +2551,12 @@ export default function App() {
     }
 
     let active = true;
-    const poll = whenWindowVisible(async () => {
+    const startedAt = Date.now();
+    let tick = 0;
+    const poll = async () => {
+      const visible = await getCurrentWindow().isVisible().catch(() => false);
+      const verified = proxyVerifiedReportedRef.current || isConnectorTrafficVerified();
+      if (!launcherVerifyTickDue(visible, tick++, Date.now() - startedAt, verified)) return;
       try {
         // Counts come from the Rust intercept, never from the backend's
         // /stats: that endpoint rebuilds its whole payload per call and a
@@ -2621,7 +2627,7 @@ export default function App() {
           setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
         }
       }
-    });
+    };
     void poll();
     const interval = window.setInterval(() => void poll(), 1000);
 

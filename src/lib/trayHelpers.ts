@@ -108,6 +108,23 @@ export function whenWindowVisible(poll: () => void | Promise<void>): () => Promi
   };
 }
 
+/// Gate for the post_install traffic-verification poll (1s ticks). Closing the
+/// launcher only hides it, and a first-run user often closes it and goes off to
+/// send the test prompt; skipping every hidden tick (0.9.27) meant their rows
+/// never verified, so proxy_verified and the main window's verified marker
+/// never landed (23% -> 7% of new signups). Hidden, it checks every 10th tick
+/// until verified, for 30 minutes only: returning launches park this webview
+/// hidden on post_install all session.
+export function launcherVerifyTickDue(
+  visible: boolean,
+  tick: number,
+  elapsedMs: number,
+  verified: boolean
+): boolean {
+  if (visible) return true;
+  return !verified && elapsedMs < 30 * 60_000 && tick % 10 === 0;
+}
+
 /// Home dashboard poll gate, or null when it should not run. The tray hides on
 /// blur, so focus stands in for visibility there. The launcher stays visible
 /// while a first-run user is off in their terminal sending the test prompt,

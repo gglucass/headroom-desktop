@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityFeedSignature,
   homeDashboardPoll,
+  launcherVerifyTickDue,
   loadDashboard,
   runtimeStatusPollMs,
   useWindowFocused,
@@ -202,6 +203,19 @@ describe("whenWindowVisible", () => {
     isVisibleMock.mockResolvedValue(true);
     await gated();
     expect(poll).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("launcherVerifyTickDue", () => {
+  it("polls every tick while shown, and slowly while hidden until verified", () => {
+    expect(launcherVerifyTickDue(true, 3, 0, true)).toBe(true);
+    // The user closed onboarding to send the test prompt: keep checking.
+    expect(launcherVerifyTickDue(false, 0, 0, false)).toBe(true);
+    expect(launcherVerifyTickDue(false, 3, 0, false)).toBe(false);
+    expect(launcherVerifyTickDue(false, 10, 0, false)).toBe(true);
+    expect(launcherVerifyTickDue(false, 10, 0, true)).toBe(false);
+    // A returning launch parks the launcher hidden all session: stop.
+    expect(launcherVerifyTickDue(false, 10, 30 * 60_000, false)).toBe(false);
   });
 });
 
