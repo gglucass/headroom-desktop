@@ -928,17 +928,39 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 /// Scans at most once per hour per process: verification reads a handful of
 /// files (and the codex arm spawns a detached `codex doctor`), and a repair
 /// that cannot stick (read-only fs, ancient CLI) must not churn on every
-/// watchdog tick.
+/// watchdog tick. The exception is `~/.claude/settings.json` changing on disk:
+/// a Claude Code process holding a pre-wiring copy writes the whole file back
+/// and drops our env (RUST-KH), and every session started before the hourly
+/// scan ran went direct. That file alone is re-verified on the next tick
+/// (5 minutes) after it changes; verify-first means a clean file is not
+/// rewritten, so our own repair write does not loop.
 pub fn repair_client_setups() -> Vec<String> {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     // ponytail: process-wide hourly throttle; split per client if support
     // traffic ever shows one client's broken repair starving another's.
     static LAST_SCAN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    static CLAUDE_SETTINGS_MTIME: Mutex<Option<SystemTime>> = Mutex::new(None);
+    let mtime = std::fs::metadata(claude_settings_path())
+        .and_then(|meta| meta.modified())
+        .ok();
+    let claude_settings_changed = {
+        let mut seen = CLAUDE_SETTINGS_MTIME.lock().unwrap();
+        let changed = seen.is_some() && *seen != mtime;
+        *seen = mtime;
+        changed
+    };
     {
         let mut last = LAST_SCAN.get_or_init(|| Mutex::new(None)).lock().unwrap();
         if last.is_some_and(|at| at.elapsed() < Duration::from_secs(3600)) {
-            return Vec::new();
+            return if claude_settings_changed
+                && is_configured(&load_setup_state(), "claude_code")
+                && repair_client_setup_now("claude_code")
+            {
+                vec!["claude_code".to_string()]
+            } else {
+                Vec::new()
+            };
         }
         *last = Some(Instant::now());
     }

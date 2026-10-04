@@ -2,6 +2,8 @@ import { useState, type ReactNode } from "react";
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { openLinkFromClick } from "../lib/externalLink";
+
 import headroomLogo from "../assets/headroom-logo.svg";
 
 export interface TermsGateProps {
@@ -78,7 +80,7 @@ export function TermsGate({
             <button
               type="button"
               className="link-button"
-              onClick={() => void invoke("open_external_link", { url: termsUrl })}
+              onClick={() => openLinkFromClick(termsUrl)}
             >
               Terms of Service
             </button>

@@ -672,16 +672,20 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
     if state.runtime_is_paused() || state.proxy_bypass.load(Ordering::Acquire) {
         return;
     }
+    // Connector off is no route at all, so direct traffic is the intended
+    // state (RUST-KC on 0.9.30 and 0.9.32-rc.5: enabled=false and an unrouted
+    // config). The funnel beacon still counts it.
+    if !client_adapters::is_codex_enabled() {
+        return;
+    }
     let tags = client_adapters::codex_unrouted_diagnostics(since.into());
     if codex_process_predates_setup(&tags) {
         return;
     }
-    let enabled = client_adapters::is_codex_enabled();
     sentry::with_scope(
         |scope| {
             scope.set_tag("flow", "unrouted_client_first_run");
             scope.set_tag("client", "codex");
-            scope.set_tag("enabled", enabled);
             for (key, value) in tags {
                 scope.set_tag(key, value);
             }
@@ -5574,8 +5578,11 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
         command
     };
 
+    // Every opener gets its turn: one that exists but cannot run (RUST-N4:
+    // kde-open5 EACCES) used to end the search before wslview or the rest.
     #[cfg(target_os = "linux")]
     {
+        let mut last_error = None;
         for opener in ["xdg-open", "gio", "kde-open5", "wslview"] {
             let mut command = crate::proc::command(opener);
             if opener == "gio" {
@@ -5585,18 +5592,17 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
             }
             match command.status() {
                 Ok(status) if status.success() => return Ok(()),
-                Ok(_) => continue,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(format!(
-                        "Could not launch external link with {opener}: {err}"
-                    ))
-                }
+                Ok(status) => last_error = Some(format!("{opener} exited with {status}")),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => last_error = Some(format!("{opener}: {err}")),
             }
         }
-        return Err(
-            "No URL opener found. Install xdg-utils (provides xdg-open) to open links.".into(),
-        );
+        return Err(match last_error {
+            Some(err) => format!("Could not open the link ({err})."),
+            None => {
+                "No URL opener found. Install xdg-utils (provides xdg-open) to open links.".into()
+            }
+        });
     }
 
     // Never route this through `cmd /C start`: cmd re-parses its command line,

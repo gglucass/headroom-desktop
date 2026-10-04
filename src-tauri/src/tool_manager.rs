@@ -2633,6 +2633,54 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: a CLI that exits before reading the prompt says why (diagnostics) --
+# The claude-cli path writes the whole prompt to the child's stdin before it
+# starts reading the child's output, so a CLI that exits first (an old CLI
+# refusing a flag, a shim cmd.exe could not start) fails that write: EINVAL on
+# Windows, BrokenPipeError elsewhere. The analysis then reported only
+# "[Errno 22] Invalid argument", with the CLI's own stderr and exit code never
+# read (RUST-MZ, 0.7s into every run on one Windows machine). A write to a
+# child that is already gone is dropped instead, so the analyzer reads the exit
+# and reports the CLI's own error. Not version-gated: a wheel that stops
+# writing this way leaves nothing to catch. Kill switch:
+# HEADROOM_LEARN_STDIN_EARLY_EXIT=0.
+_hd_lse_flag = _hd_os.environ.get("HEADROOM_LEARN_STDIN_EARLY_EXIT", "1")
+if _hd_lse_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.learn import analyzer as _hd_lse_mod
+
+        _hd_lse_orig = _hd_lse_mod.Popen
+
+        class _hd_lse_stdin:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def write(self, data):
+                try:
+                    return self._raw.write(data)
+                except OSError:
+                    return 0
+
+            def close(self):
+                try:
+                    self._raw.close()
+                except OSError:
+                    pass
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+        def _hd_lse_popen(*args, **kwargs):
+            proc = _hd_lse_orig(*args, **kwargs)
+            if proc.stdin is not None:
+                proc.stdin = _hd_lse_stdin(proc.stdin)
+            return proc
+
+        _hd_lse_mod.Popen = _hd_lse_popen
+        _hd_bound.add("learn_stdin_early_exit")
+    except Exception:
+        pass
+
 # --- Image memo: OCR and SigLIP once per image, not once per turn (CPU) -------
 # Every turn resends the whole conversation, so the image-isolation worker
 # re-ran RapidOCR on every screenshot in history whenever a turn routed to
@@ -2910,6 +2958,7 @@ _HD_VENDORS = (
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_prompt_echo",
+    "learn_stdin_early_exit",
     "image_memo",
     "image_worker_reap",
     "stream_uncached_input",
@@ -6823,8 +6872,31 @@ impl ToolManager {
     /// proxy-startup repair in `start_headroom_proxy_with_repair` so the same
     /// recoverable failure doesn't fail an in-flight upgrade and force a
     /// rollback.
+    ///
+    /// A timeout gets one retry at markitdown's 60s: the first import after an
+    /// install pays Gatekeeper/EDR scanning of every freshly written `.so`
+    /// (RUST-29 on 0.9.29: killed at 15s, a working upgrade rolled back), and
+    /// the retry runs with those scans cached. Only a repeat is a real hang.
     pub fn smoke_test_headroom(&self) -> Result<()> {
-        match self.smoke_test_headroom_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT) {
+        self.smoke_test_headroom_first_within(HEADROOM_SMOKE_TEST_TIMEOUT)
+    }
+
+    fn smoke_test_headroom_first_within(&self, first_timeout: Duration) -> Result<()> {
+        let first = self
+            .smoke_test_headroom_with_timeout(first_timeout)
+            .or_else(|err| {
+                let timed_out = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<CommandFailure>()
+                        .is_some_and(|f| f.stderr.contains("command timed out after"))
+                });
+                if !timed_out {
+                    return Err(err);
+                }
+                log::warn!("smoke test timed out on a cold import; retrying once with 60s");
+                self.smoke_test_headroom_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
+            });
+        match first {
             Ok(()) => Ok(()),
             Err(err) => {
                 let target = err
@@ -17352,6 +17424,47 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     }
 
     #[test]
+    fn learn_stdin_early_exit_behaves_against_the_installed_wheel() {
+        // RUST-MZ: a claude CLI that exits before reading the prompt fails the
+        // analyzer's stdin write; the CLI's own error comes back instead of
+        // the write's OSError. The kill switch restores the bare OSError.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-se-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sys\n\
+                     from headroom.learn import analyzer as a\n\
+                     cli = \"import sys; sys.stderr.write('error: unknown option --tools\\\\n'); sys.exit(1)\"\n\
+                     try:\n\
+                     \x20   a._call_claude_cli_streaming([sys.executable, '-c', cli], 'x' * 4_000_000, hard_cap=60, idle_cap=60)\n\
+                     except Exception as e:\n\
+                     \x20   print(type(e).__name__, 'unknown option --tools' in str(e))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_STDIN_EARLY_EXIT", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "RuntimeError True", "stderr:\n{on_err}");
+        assert_eq!(off, "BrokenPipeError False", "stderr:\n{off_err}");
+    }
+
+    #[test]
     fn image_memo_behaves_against_the_installed_wheel() {
         // The same screenshot resent every turn is OCR'd once per process,
         // with the same text; past the deadline only memoized text comes
@@ -24920,6 +25033,25 @@ exit 0
             1,
             "non-skew failures should not retry"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn smoke_test_headroom_retries_a_cold_import_timeout_once() {
+        // RUST-29: the first import after an install outran the timeout.
+        let (root, runtime, manager) = seed_test_runtime("smoke-cold-retry");
+        let state_file = root.join("attempts");
+        let script = format!(
+            "#!/bin/sh\nif [ -f '{state}' ]; then exit 0; fi\ntouch '{state}'\nsleep 2\n",
+            state = state_file.display(),
+        );
+        write_executable(&runtime.managed_python(), &script);
+
+        manager
+            .smoke_test_headroom_first_within(Duration::from_millis(200))
+            .expect("the retry with warm caches passes");
 
         let _ = fs::remove_dir_all(root);
     }

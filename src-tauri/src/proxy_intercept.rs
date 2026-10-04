@@ -752,6 +752,21 @@ pub(crate) enum PortProbe {
 const UNIDENTIFIED_HOLDER: &str =
     "a program Headroom cannot identify, such as another signed-in user's Headroom";
 
+/// `UNIDENTIFIED_HOLDER` inside WSL2, whose mirrored networking shares
+/// localhost ports with Windows, where `ss` cannot see the holder. RUST-N3/N5
+/// had 6767 and 6768 both held that way: Headroom's own pair, running on the
+/// Windows side.
+fn unidentified_holder() -> &'static str {
+    let wsl = cfg!(target_os = "linux")
+        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
+    if wsl {
+        "a program on the Windows side of WSL, such as Headroom for Windows"
+    } else {
+        UNIDENTIFIED_HOLDER
+    }
+}
+
 /// The `bind_error` holder for a `HeldPortVerdict::Foreign` that is another
 /// copy of Headroom this same user runs (see
 /// `tool_manager::pid_is_same_user_headroom_desktop`), the one holder the bind
@@ -1300,7 +1315,8 @@ pub fn spawn(
                                             "[proxy_intercept] port {INTERCEPT_PORT} has a live listener that could not be identified; retrying in 15s ({e})"
                                         );
                                         *bind_error.lock() = Some(format!(
-                                            "port {INTERCEPT_PORT} is held by {UNIDENTIFIED_HOLDER}"
+                                            "port {INTERCEPT_PORT} is held by {}",
+                                            unidentified_holder()
                                         ));
                                         if reported_errors.insert(format!("unidentified:{key}")) {
                                             sentry::with_scope(
