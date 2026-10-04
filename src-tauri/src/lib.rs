@@ -2727,8 +2727,15 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     // (`no-pip`, `missing-file`, ...), so borrow that to split the bucket and
     // let each distinct cause open -- and alert on -- its own issue. The named
     // kinds are already specific; leave their fingerprints alone.
-    let other_category = matches!(kind, BootstrapFailureKind::Other)
-        .then(|| tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(err)));
+    // With pip's full output, as the pip runner classifies: the compact tail
+    // alone files a starved or truncated index under `other` (RUST-8K).
+    let other_category = matches!(kind, BootstrapFailureKind::Other).then(|| {
+        let compact = tool_manager::compact_pip_failure(err);
+        tool_manager::pip_failure_category_with_evidence(
+            &compact,
+            &tool_manager::pip_failure_evidence(err, &compact),
+        )
+    });
 
     // Transient network/download failures are self-recoverable via the retry
     // button; report them as warnings so they don't pollute the error feed.

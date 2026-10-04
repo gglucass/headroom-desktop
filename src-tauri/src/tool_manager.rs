@@ -14414,11 +14414,15 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     // in it. That is how RUST-82 reached triage: an install-blocking venv
     // failure classified `other`, with nothing in it to act on. Where pip named
     // a reason, start from it; otherwise the tail is still the best guess.
+    // `ERROR: Exception:` names no reason: it is pip's own crash banner, and
+    // the reason is the traceback's LAST line (RUST-6S on 0.9.31 read
+    // "ERROR: Exception: Traceback ... File" and nothing else).
     let from_pip_error = if trimmed.starts_with("ERROR: ") {
         Some(trimmed)
     } else {
         trimmed.find("\nERROR: ").map(|i| &trimmed[i + 1..])
-    };
+    }
+    .filter(|head| !head.starts_with("ERROR: Exception:"));
     let tail = match from_pip_error {
         // Byte offsets, so walk to a char boundary before slicing: pip on a
         // non-English Windows locale emits multi-byte stderr and slicing
@@ -14586,6 +14590,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // relabel an unclassified failure as environmental.
         || evidence_lower.contains("temporary failure in name resolution")
         || pip_index_fetch_failed(&evidence_lower)
+        // A connection that closed mid-body: pip's vendored urllib3 does not
+        // enforce Content-Length, so the cut index page reaches its JSON
+        // parser and pip crashes with a traceback (RUST-6S, MSI host, beside
+        // `RemoteDisconnected` retries). `parse_links` pins it to an index
+        // page, not some local JSON file.
+        || (lower.contains("jsondecodeerror") && evidence_lower.contains("in parse_links"))
     {
         "network"
     } else {
@@ -25296,6 +25306,50 @@ exit 0
             pip_failure_category(&compact),
             "permission",
             "a named cause must not sit in the `other` grab-bag: {compact}"
+        );
+    }
+
+    /// RUST-6S on 0.9.31, abridged from the real stderr: a link dropping
+    /// connections cut an index page short, and pip crashed parsing it. The
+    /// message read "ERROR: Exception: Traceback ... File" and the failure
+    /// sat in the `other` grab-bag.
+    #[test]
+    fn a_pip_crash_reports_its_exception_and_a_cut_index_page_is_network() {
+        let stderr = concat!(
+            "WARNING: Retrying (Retry(total=9)) after connection broken by ",
+            "'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed ",
+            "connection without response'))': /simple/protobuf/\n",
+            "ERROR: Exception:\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages",
+            "\\pip\\_internal\\cli\\base_command.py\", line 106, in _run_wrapper\n",
+            "    status = _inner_run()\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages",
+            "\\pip\\_internal\\index\\collector.py\", line 231, in parse_links\n",
+            "    data = json.loads(page.content)\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\json",
+            "\\decoder.py\", line 354, in raw_decode\n",
+            "    obj, end = self.scan_once(s, idx)\n",
+            "               ^^^^^^^^^^^^^^^^^^^^^^\n",
+            "json.decoder.JSONDecodeError: Unterminated string starting at: line 1 column ",
+            "6420301 (char 6420300)\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        assert!(
+            compact.ends_with("(char 6420300)"),
+            "the exception line must survive: {compact}"
+        );
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "network"
+        );
+        // A JSONDecodeError outside pip's index parser stays unclassified.
+        let local = "exit=2; stderr tail: json.decoder.JSONDecodeError: Expecting value";
+        assert_eq!(
+            super::pip_failure_category_with_evidence(local, local),
+            "other"
         );
     }
 
