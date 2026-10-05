@@ -2176,6 +2176,41 @@ pub(crate) fn reactivate_subscription_with_base_url(base_url: &str) -> Result<()
     Ok(())
 }
 
+/// Adds a paying friend's referral code to the signed-in account (paid
+/// referral program). The server's refusal reason is shown as is.
+pub fn apply_referral_code(code: &str) -> Result<(), String> {
+    apply_referral_code_with_base_url(&api_base_url(), code)
+}
+
+pub(crate) fn apply_referral_code_with_base_url(base_url: &str, code: &str) -> Result<(), String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before adding a referral code.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/account/referral"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "code": code.trim() }))
+        .send()
+        .map_err(|err| transport_failure("add your referral code", &err))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not add the referral code (status {status}).")));
+    }
+
+    Ok(())
+}
+
 pub fn get_billing_portal_url(target: Option<String>) -> Result<String, String> {
     get_billing_portal_url_with_base_url(&api_base_url(), target.as_deref())
 }
@@ -7586,6 +7621,27 @@ mod tests {
         )
         .unwrap();
         assert!(stored.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_referral_code_succeeds_and_surfaces_refusals() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "account": {} }), "HTTP/1.1 200 OK");
+        super::apply_referral_code_with_base_url(&format!("http://127.0.0.1:{port}"), " AB12CD34 ")
+            .expect("accepted");
+        server.join().unwrap();
+
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "Referral codes are for new subscribers." }),
+            "HTTP/1.1 422 Unprocessable Entity",
+        );
+        let err =
+            super::apply_referral_code_with_base_url(&format!("http://127.0.0.1:{port}"), "X")
+                .expect_err("refused");
+        server.join().unwrap();
+        assert_eq!(err, "Referral codes are for new subscribers.");
     }
 
     #[test]

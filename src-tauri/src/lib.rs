@@ -4778,6 +4778,13 @@ async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> 
 }
 
 #[tauri::command]
+async fn apply_headroom_referral_code(app: AppHandle, code: String) -> Result<(), String> {
+    pricing::apply_referral_code(&code)?;
+    analytics::track_event(&app, "referral_code_applied", None);
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<String, String> {
     pricing::get_billing_portal_url(target)
 }
@@ -7858,6 +7865,7 @@ pub fn run() {
             create_headroom_checkout_session,
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
+            apply_headroom_referral_code,
             get_headroom_billing_portal_url,
             submit_headroom_cancellation_intent,
             get_activity_feed,

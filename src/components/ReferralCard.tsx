@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { CopySimple } from "@phosphor-icons/react";
 
 // Paid referral program. Shown only to a subscriber who can refer: the server
@@ -50,5 +51,61 @@ export function ReferralCard({ code, rewardsEarned, rewardPending }: ReferralCar
         <p>Your own free month, from the friend who invited you, arrives once you've been subscribed for a month.</p>
       ) : null}
     </section>
+  );
+}
+
+// For a signed-in user who hasn't paid and wasn't referred at sign-in: the
+// one place to add a friend's code later. The server decides validity.
+export function ReferralCodeEntry({ onApplied }: { onApplied: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <button className="link-button paywall__referral-toggle" onClick={() => setOpen(true)} type="button">
+        Have a referral code from a friend?
+      </button>
+    );
+  }
+
+  async function apply() {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("apply_headroom_referral_code", { code });
+      onApplied();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="referral-card__link">
+        <input
+          aria-label="Referral code"
+          className="paywall__auth-input"
+          onChange={(event) => {
+            setCode(event.target.value);
+            setError(null);
+          }}
+          placeholder="Referral code"
+          value={code}
+        />
+        <button
+          className="secondary-button secondary-button--small"
+          disabled={!code.trim() || busy}
+          onClick={() => void apply()}
+          type="button"
+        >
+          {busy ? "Adding..." : "Add code"}
+        </button>
+      </div>
+      {error ? <p className="install-progress__error">{error}</p> : null}
+    </>
   );
 }

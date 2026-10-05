@@ -211,7 +211,7 @@ import {
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
-import { ReferralCard } from "./components/ReferralCard";
+import { ReferralCard, ReferralCodeEntry } from "./components/ReferralCard";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
 import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
@@ -7848,6 +7848,8 @@ export default function App() {
                     <p className="upgrade-trial-callout__message">
                       You were invited by a friend: subscribe and you both get a free month.
                     </p>
+                  ) : pricingStatus?.authenticated ? (
+                    <ReferralCodeEntry onApplied={() => void refreshPricingStatus(true)} />
                   ) : null}
                 </div>
                 {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (

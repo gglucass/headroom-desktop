@@ -28,6 +28,7 @@ const ALLOWED_EVENTS: &[&str] = &[
     "subscription_plan_changed",
     "subscription_reactivated",
     "invite_code_used",
+    "referral_code_applied",
     "lifetime_tokens_saved_milestone_reached",
     // At most once per install (persisted flag); measures how many users hit
     // the "setup finished but no traffic ever" state.
