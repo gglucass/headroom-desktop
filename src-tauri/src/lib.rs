@@ -4476,14 +4476,16 @@ pub struct DebugOverrides {
 }
 
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
-/// a fresh first launch does not miss its server bucket. `async` so that fetch
-/// never runs on the main thread: both windows call this at startup, and on a
-/// network that drops extraheadroom.com each call froze the UI for 8s.
-#[tauri::command(async)]
-fn get_launch_flags() -> LaunchFlags {
-    LaunchFlags {
+/// a fresh first launch does not miss its server bucket. On the blocking pool:
+/// both windows call this at startup, and on a network that drops
+/// extraheadroom.com each call froze the UI for 8s as a sync command.
+#[tauri::command]
+async fn get_launch_flags() -> Result<LaunchFlags, String> {
+    tauri::async_runtime::spawn_blocking(|| LaunchFlags {
         paywall_first: pricing::paywall_first_flag_or_refresh(),
-    }
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -4521,8 +4523,13 @@ async fn get_claude_code_projects(
 }
 
 #[tauri::command]
-async fn get_claude_usage(state: State<'_, AppState>) -> Result<ClaudeUsage, String> {
-    pricing::fetch_claude_usage(&state)
+async fn get_claude_usage(app: AppHandle) -> Result<ClaudeUsage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        pricing::fetch_claude_usage(&state)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -4663,69 +4670,83 @@ fn take_pending_magic_link() -> Option<(String, String)> {
 #[tauri::command]
 async fn request_headroom_auth_code(
     app: AppHandle,
-    state: State<'_, AppState>,
     email: String,
 ) -> Result<HeadroomAuthCodeRequest, String> {
-    let request = pricing::request_auth_code(&state, &email)?;
-    analytics::track_event(&app, "auth_code_requested", None);
-    Ok(request)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let request = pricing::request_auth_code(&state, &email)?;
+        analytics::track_event(&app, "auth_code_requested", None);
+        Ok(request)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
 async fn verify_headroom_auth_code(
     app: AppHandle,
-    state: State<'_, AppState>,
     email: String,
     code: String,
 ) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::verify_auth_code(&state, &email, &code)?;
-    // Reconcile the runtime with the freshly evaluated status. Mirrors
-    // `get_headroom_pricing_status` so a user who signs up after grace
-    // expiry doesn't have to wait for the next 60s pricing poll for
-    // Python to come back online.
-    //
-    // On a worker thread, not inline: a gate flip here starts or stops the
-    // Python backend, and `ensure_headroom_running` blocks across a full
-    // cold boot (`start_headroom_background` waits up to
-    // HEADROOM_STARTUP_TIMEOUT_MS = 5min per spawn variant, longer on a
-    // Windows first launch with Defender scanning the venv). Awaiting that
-    // kept the sign-in button on "Verifying..." for minutes after the
-    // account was already connected. Same idiom as
-    // `handle_headroom_deep_link`.
-    {
-        let app_handle = app.clone();
-        let status = status.clone();
-        std::thread::spawn(move || {
-            let state: tauri::State<'_, AppState> = app_handle.state();
-            state.apply_pricing_gates(&status);
-        });
-    }
-    analytics::track_event(&app, "auth_verified", None);
-    // Pricing status is per-window UI state, so the window that did not run
-    // the sign-in keeps rendering the signed-out code form until its own poll
-    // ticks. Broadcast so every window re-reads it now.
-    let _ = app.emit("pricing-refreshed", &status);
-    Ok(status)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let status = pricing::verify_auth_code(&state, &email, &code)?;
+        // Reconcile the runtime with the freshly evaluated status. Mirrors
+        // `get_headroom_pricing_status` so a user who signs up after grace
+        // expiry doesn't have to wait for the next 60s pricing poll for
+        // Python to come back online.
+        //
+        // On a worker thread, not inline: a gate flip here starts or stops the
+        // Python backend, and `ensure_headroom_running` blocks across a full
+        // cold boot (`start_headroom_background` waits up to
+        // HEADROOM_STARTUP_TIMEOUT_MS = 5min per spawn variant, longer on a
+        // Windows first launch with Defender scanning the venv). Awaiting that
+        // kept the sign-in button on "Verifying..." for minutes after the
+        // account was already connected. Same idiom as
+        // `handle_headroom_deep_link`.
+        {
+            let app_handle = app.clone();
+            let status = status.clone();
+            std::thread::spawn(move || {
+                let state: tauri::State<'_, AppState> = app_handle.state();
+                state.apply_pricing_gates(&status);
+            });
+        }
+        analytics::track_event(&app, "auth_verified", None);
+        // Pricing status is per-window UI state, so the window that did not run
+        // the sign-in keeps rendering the signed-out code form until its own poll
+        // ticks. Broadcast so every window re-reads it now.
+        let _ = app.emit("pricing-refreshed", &status);
+        Ok(status)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
 async fn sign_out_headroom_account(app: AppHandle) -> Result<(), String> {
-    pricing::sign_out()?;
-    // Same broadcast as verify: the other window must not keep showing the
-    // account as signed in.
-    let _ = app.emit("pricing-refreshed", ());
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        pricing::sign_out()?;
+        // Same broadcast as verify: the other window must not keep showing the
+        // account as signed in.
+        let _ = app.emit("pricing-refreshed", ());
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-async fn activate_headroom_account(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<HeadroomPricingStatus, String> {
-    let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
-    let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
-    analytics::track_event(&app, "account_activated", None);
-    Ok(status)
+async fn activate_headroom_account(app: AppHandle) -> Result<HeadroomPricingStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
+        let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
+        analytics::track_event(&app, "account_activated", None);
+        Ok(status)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -4734,15 +4755,19 @@ async fn create_headroom_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<String, String> {
-    let url = pricing::create_checkout_session(subscription_tier, billing_period)?;
-    analytics::track_event(
-        &app,
-        "checkout_started",
-        Some(json!({
-            "subscription_tier": subscription_tier_label(&subscription_tier)
-        })),
-    );
-    Ok(url)
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = pricing::create_checkout_session(subscription_tier, billing_period)?;
+        analytics::track_event(
+            &app,
+            "checkout_started",
+            Some(json!({
+                "subscription_tier": subscription_tier_label(&subscription_tier)
+            })),
+        );
+        Ok(url)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -4751,34 +4776,48 @@ async fn change_headroom_subscription_plan(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<(), String> {
-    pricing::change_subscription_plan(subscription_tier, billing_period)?;
-    analytics::track_event(
-        &app,
-        "subscription_plan_changed",
-        Some(json!({
-            "subscription_tier": subscription_tier_label(&subscription_tier)
-        })),
-    );
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        pricing::change_subscription_plan(subscription_tier, billing_period)?;
+        analytics::track_event(
+            &app,
+            "subscription_plan_changed",
+            Some(json!({
+                "subscription_tier": subscription_tier_label(&subscription_tier)
+            })),
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
 async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> {
-    pricing::reactivate_subscription()?;
-    analytics::track_event(&app, "subscription_reactivated", None);
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        pricing::reactivate_subscription()?;
+        analytics::track_event(&app, "subscription_reactivated", None);
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
 async fn apply_headroom_referral_code(app: AppHandle, code: String) -> Result<(), String> {
-    pricing::apply_referral_code(&code)?;
-    analytics::track_event(&app, "referral_code_applied", None);
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        pricing::apply_referral_code(&code)?;
+        analytics::track_event(&app, "referral_code_applied", None);
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
 async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<String, String> {
-    pricing::get_billing_portal_url(target)
+    tauri::async_runtime::spawn_blocking(move || pricing::get_billing_portal_url(target))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 /// Step one of cancelling: record the reason before the client opens the
@@ -4788,7 +4827,11 @@ async fn submit_headroom_cancellation_intent(
     reason: String,
     note: Option<String>,
 ) -> Result<(), String> {
-    pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
+    tauri::async_runtime::spawn_blocking(move || {
+        pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -4821,11 +4864,15 @@ async fn get_headroom_learn_prereq_status(
 #[tauri::command]
 async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedResponse {
     let limit = limit.unwrap_or(50).min(100);
-    fetch_transformations_feed(limit).unwrap_or_else(|_| TransformationFeedResponse {
-        log_full_messages: false,
-        transformations: Vec::new(),
-        proxy_reachable: false,
-    })
+    tauri::async_runtime::spawn_blocking(move || fetch_transformations_feed(limit))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| TransformationFeedResponse {
+            log_full_messages: false,
+            transformations: Vec::new(),
+            proxy_reachable: false,
+        })
 }
 
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
@@ -6100,10 +6147,14 @@ async fn detect_oss_remnants() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn get_client_connectors(
-    state: State<'_, AppState>,
-) -> Result<Vec<ClientConnectorStatus>, String> {
-    client_adapters::list_client_connectors(&state.cached_clients()).map_err(|err| err.to_string())
+async fn get_client_connectors(app: AppHandle) -> Result<Vec<ClientConnectorStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        client_adapters::list_client_connectors(&state.cached_clients())
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -14547,6 +14598,46 @@ Some unrelated content.
             attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
             "the installer must run on the blocking pool: {attr}{body}"
         );
+    }
+
+    /// reqwest's blocking client panics on an async worker in a debug build
+    /// (RUST-NA/NB/NC, "Cannot drop a runtime in a context where blocking is
+    /// not allowed") and parks the worker for the whole request in release.
+    /// Every async command that reaches a blocking HTTP call leaves the worker.
+    #[test]
+    fn async_commands_keep_blocking_http_off_async_workers() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests")];
+        let blocking_http = [
+            "pricing::",
+            "fetch_transformations_feed(",
+            "list_client_connectors(",
+            ".dashboard()",
+        ];
+        let mut checked = Vec::new();
+        for (at, _) in source.match_indices("#[tauri::command") {
+            let fn_at = at + source[at..].find("fn ").expect("command fn");
+            let end = fn_at + source[fn_at..].find("\n}\n").expect("command end");
+            let (attr, body) = (&source[at..fn_at], &source[fn_at..end]);
+            let is_async = attr.contains("(async)") || attr.trim_end().ends_with("async");
+            // Fire-and-forget: posts from its own thread.
+            let scanned = body.replace("pricing::report_funnel_step", "");
+            if !is_async || !blocking_http.iter().any(|m| scanned.contains(m)) {
+                continue;
+            }
+            assert!(
+                body.contains("spawn_blocking(") || body.contains("std::thread::spawn("),
+                "blocking HTTP on an async worker: {body}"
+            );
+            checked.push(&body[3..body.find('(').expect("fn name")]);
+        }
+        for name in [
+            "get_launch_flags",
+            "get_client_connectors",
+            "activate_headroom_account",
+        ] {
+            assert!(checked.contains(&name), "{name} not scanned: {checked:?}");
+        }
     }
 
     #[test]
