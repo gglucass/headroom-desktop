@@ -24,8 +24,10 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
-/// AppSumo accounts are pushed to upgrade faster: the clamp fires on their 4th
-/// active day (a local day with savings), capped by the calendar grace above.
+/// AppSumo free-year accounts (the $0 tier 1 for Plus members) are pushed to
+/// upgrade faster: the clamp fires on their 4th active day (a local day with
+/// savings), capped by the calendar grace above. Paid lifetime tiers get the
+/// calendar grace like everyone else (Garm, 2026-10-05).
 /// Active rather than calendar days so a Friday purchase isn't clamped by an
 /// idle weekend.
 const APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS: usize = 3;
@@ -137,7 +139,7 @@ struct IdentityPayload {
     claude_usage_windows: Option<String>,
     /// When the local tier-mismatch clock started, if a mismatch is currently
     /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this (sooner for
-    /// AppSumo accounts, see `APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS`), so the
+    /// AppSumo free-year accounts, see `APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS`), so the
     /// server can derive the mismatch cohort and most of who is clamped.
     #[serde(skip_serializing_if = "Option::is_none")]
     tier_mismatch_since: Option<String>,
@@ -2600,8 +2602,7 @@ fn resolve_tier_mismatch(
         }
     };
 
-    // `upgrade_action` is set only for AppSumo-entitled accounts.
-    let appsumo = account.is_some_and(|a| a.upgrade_action.is_some());
+    let appsumo = account.is_some_and(appsumo_free_year);
     let computed = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
     let clamped_at = latch_clamp_start(
         local.mismatch_clamped_at,
@@ -2635,8 +2636,17 @@ fn resolve_tier_mismatch(
     })
 }
 
+/// Whether the account is on the AppSumo free year, the only AppSumo license
+/// clamped on active days. `upgrade_action` is set only for AppSumo-entitled
+/// accounts, and of those only the free year carries an end date
+/// (headroom-web `AppsumoLicense#apply_entitlement!`); a free year later
+/// topped up with a paid license is rewritten without one.
+fn appsumo_free_year(account: &HeadroomAccountProfile) -> bool {
+    account.upgrade_action.is_some() && account.subscription_ends_at.is_some()
+}
+
 /// When the tier-mismatch grace ends (or ended: the UI shows it as the day
-/// metering started). AppSumo: local midnight of the first active day past the
+/// metering started). AppSumo free year: local midnight of the first active day past the
 /// allowance, if that comes before the calendar cap. `active_day_keys` must be
 /// ascending `YYYY-MM-DD` local day keys.
 fn tier_mismatch_grace_ends_at(
@@ -7914,6 +7924,26 @@ mod tests {
                 .is_none()
         );
         assert_eq!(persisted(), (None, None));
+    }
+
+    #[test]
+    fn only_the_appsumo_free_year_is_clamped_on_active_days() {
+        let mut lifetime = active_subscriber(HeadroomSubscriptionTier::Pro);
+        lifetime.subscription_billing_period = Some("lifetime".into());
+        lifetime.upgrade_action = Some("appsumo".into());
+        assert!(!super::appsumo_free_year(&lifetime), "paid lifetime tier");
+
+        let mut free_year = lifetime.clone();
+        free_year.subscription_cancel_at_period_end = true;
+        free_year.subscription_ends_at = Some(Utc::now() + Duration::days(365));
+        assert!(super::appsumo_free_year(&free_year), "free year");
+
+        let mut polar = active_subscriber(HeadroomSubscriptionTier::Pro);
+        polar.subscription_ends_at = Some(Utc::now() + Duration::days(20));
+        assert!(
+            !super::appsumo_free_year(&polar),
+            "cancelled Polar subscription"
+        );
     }
 
     #[test]
