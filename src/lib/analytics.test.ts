@@ -43,6 +43,21 @@ describe("analytics helpers", () => {
     Reflect.deleteProperty(globalThis, "localStorage");
   });
 
+  it("sends Sentry envelopes only while usage data is on", async () => {
+    const send = vi.fn().mockResolvedValue({ statusCode: 200 });
+    const { gateOnUsageData } = await import("./analytics");
+    const transport = gateOnUsageData({ send, flush: vi.fn() });
+
+    invokeMock.mockResolvedValueOnce(false);
+    await expect(transport.send("event")).resolves.toEqual({});
+    expect(send).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("get_usage_data_enabled");
+
+    invokeMock.mockResolvedValueOnce(true);
+    await expect(transport.send("session")).resolves.toEqual({ statusCode: 200 });
+    expect(send).toHaveBeenCalledWith("session");
+  });
+
   it("tracks analytics events and swallows invoke failures", async () => {
     invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("bridge offline"));
