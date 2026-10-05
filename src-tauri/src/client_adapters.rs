@@ -8495,7 +8495,9 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// usage Claude Code passes in `rate_limits` (Pro and Max, once the session has
 /// had a response): "| usage: 5h 34%, week 62%", a window at 80% or more in yellow
 /// with its reset time, a window past its reset at 0. Silent until there is
-/// either, and on any error.
+/// either, and on any error. While the pricing gate pauses Claude traffic, the
+/// gate's notice (`paused` in the state file) replaces the saving, in yellow,
+/// in every conversation: walled users rarely opened the app to find out.
 ///
 /// Percentages are cut to whole numbers as strings: bash's float printf reads
 /// "23.5" as invalid under a comma-decimal locale.
@@ -8548,9 +8550,12 @@ fmt() {{
   else fmt_out="$(( t / 10 )).$(( t % 10 ))$u"; fi
 }}
 saved=
-if [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] && [ -r "$state_file" ]; then
+state=
+if [ -r "$state_file" ]; then IFS= read -r -d '' state < "$state_file"; fi
+if [[ $state =~ \"paused\":\"([^\"]*)\" ]]; then
+  saved=$'\033[33m'"${{BASH_REMATCH[1]}}"$'\033[0m'
+elif [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]]; then
   sid=${{BASH_REMATCH[1]}}
-  IFS= read -r -d '' state < "$state_file"
   if [[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]]; then
     total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
     fmt "$total"
@@ -17776,6 +17781,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 seven_day: None,
             }),
             codex_plan_usage: None,
+            paused: None,
         };
         // Plus an entry as the previous build wrote it, without lastRequestAtMs.
         let json = serde_json::to_string(&persisted).unwrap().replacen(
@@ -17862,6 +17868,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 &limits("12", now + 3_600, "40", now + 300_000).replace("bbbb-quiet", "unknown")
             ),
             "usage: 5h 12%, week 40%\n"
+        );
+
+        // Gated: the notice replaces the saving in every conversation, usage stays.
+        let paused = Persisted {
+            paused: Some(
+                crate::claude_statusline::paused_notice(Some(
+                    &crate::models::PricingGateReason::TrialEnded,
+                ))
+                .to_string(),
+            ),
+            ..persisted
+        };
+        std::fs::write(&state, serde_json::to_string(&paused).unwrap()).unwrap();
+        let notice =
+            "\x1b[33mHeadroom paused: trial ended. Upgrade in the Headroom app to resume\x1b[0m";
+        assert_eq!(
+            render(r#"{"session_id":"aaaa-just-saved"}"#),
+            format!("{notice}\n")
+        );
+        assert_eq!(render("not json"), format!("{notice}\n"));
+        assert_eq!(
+            render(&limits("12", now + 3_600, "40", now + 300_000)),
+            format!("{notice} | usage: 5h 12%, week 40%\n")
         );
     }
 

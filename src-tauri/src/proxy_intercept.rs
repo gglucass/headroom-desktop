@@ -757,14 +757,17 @@ const UNIDENTIFIED_HOLDER: &str =
 /// had 6767 and 6768 both held that way: Headroom's own pair, running on the
 /// Windows side.
 fn unidentified_holder() -> &'static str {
-    let wsl = cfg!(target_os = "linux")
-        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
-    if wsl {
+    if is_wsl() {
         "a program on the Windows side of WSL, such as Headroom for Windows"
     } else {
         UNIDENTIFIED_HOLDER
     }
+}
+
+pub(crate) fn is_wsl() -> bool {
+    cfg!(target_os = "linux")
+        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
 /// The `bind_error` holder for a `HeldPortVerdict::Foreign` that is another

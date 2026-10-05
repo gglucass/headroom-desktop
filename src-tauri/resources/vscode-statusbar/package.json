@@ -1,8 +1,8 @@
 {
   "name": "headroom-status",
   "displayName": "Headroom",
-  "description": "Shows what Headroom saved in your Claude Code conversation, and your Claude plan usage, in the status bar. Installed and updated by Headroom Desktop.",
-  "version": "0.3.0",
+  "description": "Shows what Headroom saved in your Claude Code conversation, your Claude plan usage, and when Headroom is paused, in the status bar. Installed and updated by Headroom Desktop.",
+  "version": "0.4.0",
   "publisher": "headroom",
   "engines": {
     "vscode": "^1.75.0"

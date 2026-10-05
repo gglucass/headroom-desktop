@@ -14570,6 +14570,11 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
             "PIP_CONFIG_FILE",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         );
+    if args.starts_with(&["-m", "pip"]) {
+        if let Some(dir) = pip_net_hook_dir(binary) {
+            command.env("PYTHONPATH", dir);
+        }
+    }
     strip_unusable_sslkeylogfile(&mut command);
     strip_socks_proxy_env(&mut command);
     command
@@ -15290,6 +15295,75 @@ const PIP_UNPACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 /// dies: 11% of Windows installs never complete it against 4% on macOS, and
 /// pip failures run 7 Windows users to 2.
 const PIP_RETRY_BACKOFFS_SECS: &[u64] = &[2, 5];
+
+/// `sitecustomize.py` for every `-m pip` run (see `pip_net_hook_dir`): wraps
+/// pip's vendored urllib3 `create_connection` to alternate address families
+/// and cap every connect attempt but the last at 10s. pip has no Happy
+/// Eyeballs: it tries each resolved address in order with the full
+/// `--timeout` (180s), and pypi.org publishes four AAAA records, so where IPv6
+/// is configured but routes nowhere (WSL2 is the usual case) a new connection
+/// sat silent for 4 x 180s before reaching IPv4, past the 600s silence
+/// watchdog every attempt. Reads keep the full timeout. If pip's vendored
+/// urllib3 ever moves, the patch is skipped and pip runs unchanged. Loaded
+/// from PYTHONPATH rather than a `-c` wrapper so pip's argv stays
+/// `-m pip ...`, which `state::kill_venv_lock_holders` matches on.
+const PIP_NET_SITECUSTOMIZE: &str = r#"
+import socket
+try:
+    from itertools import zip_longest
+    from pip._vendor.urllib3.util import connection as _conn
+
+    _create = _conn.create_connection
+
+    def _create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, *args, **kwargs):
+        if not isinstance(timeout, (int, float)):
+            return _create(address, timeout, *args, **kwargs)
+        host, port = address
+        try:
+            infos = socket.getaddrinfo(
+                host.strip("[]"), port, _conn.allowed_gai_family(), socket.SOCK_STREAM
+            )
+        except (OSError, UnicodeError):
+            return _create(address, timeout, *args, **kwargs)
+        if len(infos) < 2:
+            return _create(address, timeout, *args, **kwargs)
+        first = [i for i in infos if i[0] == infos[0][0]]
+        other = [i for i in infos if i[0] != infos[0][0]]
+        ordered = [i for pair in zip_longest(first, other) for i in pair if i]
+        for info in ordered[:-1]:
+            try:
+                sock = _create((info[4][0], port), min(timeout, 10), *args, **kwargs)
+            except OSError:
+                continue
+            sock.settimeout(timeout)
+            return sock
+        return _create((ordered[-1][4][0], port), timeout, *args, **kwargs)
+
+    _conn.create_connection = _create_connection
+except Exception:
+    pass
+"#;
+
+/// Directory holding `PIP_NET_SITECUSTOMIZE`, beside the venv `python` belongs
+/// to: inside Headroom's own data dir, never a shared temp dir another user
+/// could plant a sitecustomize in. `None` (pip runs unpatched) if it cannot be
+/// written.
+fn pip_net_hook_dir(python: &Path) -> Option<PathBuf> {
+    let dir = python.parent()?.parent()?.parent()?.join("pip-net-hook");
+    let file = dir.join("sitecustomize.py");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(PIP_NET_SITECUSTOMIZE) {
+        let written = std::fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                crate::client_adapters::atomic_write(&file, PIP_NET_SITECUSTOMIZE.as_bytes())
+            });
+        if let Err(err) = written {
+            log::info!("[tool_manager] pip runs without the IPv6 fallback hook: {err:#}");
+            return None;
+        }
+    }
+    Some(dir)
+}
 const PIP_SHARING_VIOLATION_BACKOFFS_SECS: &[u64] = &[2, 5, 10, 20, 30];
 
 fn pip_retry_backoff(failed_attempt: u32, failure_text: &str) -> Option<Duration> {
@@ -23229,6 +23303,28 @@ Always run the linter first.
         let orphaned = listed_tool(&manager, "markitdown");
         assert_eq!(orphaned.version, MARKITDOWN_PINNED_VERSION);
         assert!(!orphaned.update_available);
+    }
+
+    #[test]
+    fn pip_runs_load_the_ipv6_fallback_hook_from_beside_their_venv() {
+        let (_root, runtime, _manager) = seed_test_runtime("pip-net-hook");
+        let python = runtime.managed_python();
+        let pythonpath = |args: &[&str]| {
+            build_command(&python, args, &runtime.root_dir)
+                .get_envs()
+                .find(|(key, _)| *key == "PYTHONPATH")
+                .and_then(|(_, value)| value.map(PathBuf::from))
+        };
+
+        let hook = pythonpath(&["-m", "pip", "install", "x"]).expect("pip gets the hook");
+        let venv = python.parent().and_then(Path::parent).expect("venv dir");
+        assert_eq!(hook, venv.with_file_name("pip-net-hook"));
+        assert_eq!(
+            fs::read_to_string(hook.join("sitecustomize.py")).expect("hook written"),
+            super::PIP_NET_SITECUSTOMIZE
+        );
+        // Everything else keeps PYTHONPATH stripped (the proxy, smoke tests).
+        assert_eq!(pythonpath(&["-c", "import headroom"]), None);
     }
 
     #[test]

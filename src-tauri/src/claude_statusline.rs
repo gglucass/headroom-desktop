@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ClaudePlanUsage, LabeledPlanWindow};
+use crate::models::{ClaudePlanUsage, LabeledPlanWindow, PricingGateReason};
 
 /// Conversations kept; the least recently active is dropped first. Every
 /// Claude Code session is booked (VS Code panel chats, headless `claude -p`
@@ -70,6 +70,12 @@ pub(crate) struct Persisted {
     pub(crate) plan_usage: Option<ClaudePlanUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) codex_plan_usage: Option<Vec<LabeledPlanWindow>>,
+    /// Set while the pricing gate keeps Claude traffic unoptimized: the line
+    /// the statusline and the VS Code item show in place of the savings, so
+    /// the gate is seen where the user works. Our own ASCII text, no quotes:
+    /// the script reads it with a regex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) paused: Option<String>,
 }
 
 static STATE: Mutex<Option<Persisted>> = Mutex::new(None);
@@ -164,6 +170,7 @@ fn persist() {
             sessions: state.sessions.clone(),
             plan_usage: state.plan_usage,
             codex_plan_usage: state.codex_plan_usage.clone(),
+            paused: state.paused.clone(),
         })
         .unwrap_or_default()
     };
@@ -222,6 +229,31 @@ pub fn record_codex_plan_usage(windows: Vec<LabeledPlanWindow>) {
         };
         let changed = state.codex_plan_usage.as_deref().map(shown) != Some(shown(&windows));
         state.codex_plan_usage = Some(windows);
+        changed
+    });
+}
+
+/// What the statusline says while the Claude gate is on, by gate reason.
+pub(crate) fn paused_notice(reason: Option<&PricingGateReason>) -> &'static str {
+    match reason {
+        Some(PricingGateReason::TrialEnded) => {
+            "Headroom paused: trial ended. Upgrade in the Headroom app to resume"
+        }
+        Some(PricingGateReason::WeeklyUsageLimitReached) => {
+            "Headroom paused: weekly limit reached. Upgrade in the Headroom app to resume"
+        }
+        Some(PricingGateReason::SignInRequired) => {
+            "Headroom paused: sign in to the Headroom app to resume"
+        }
+        _ => "Headroom paused. Open the Headroom app to resume",
+    }
+}
+
+/// The Claude gate's notice, or None once it lifts. Written only on a change.
+pub fn set_paused(notice: Option<&str>) {
+    update(|state, _| {
+        let changed = state.paused.as_deref() != notice;
+        state.paused = notice.map(str::to_string);
         changed
     });
 }
@@ -328,6 +360,7 @@ mod tests {
                 label: "week".into(),
                 window,
             }]),
+            paused: None,
         };
         let json = serde_json::to_string(&persisted).unwrap();
         assert!(
@@ -340,6 +373,28 @@ mod tests {
 
         let old: Persisted = serde_json::from_str(r#"{"schemaVersion":1,"sessions":{}}"#).unwrap();
         assert!(old.plan_usage.is_none() && old.codex_plan_usage.is_none());
+        assert!(old.paused.is_none() && !json.contains("paused"));
+    }
+
+    #[test]
+    fn the_paused_notice_names_the_gate_and_stays_regex_safe() {
+        use crate::models::PricingGateReason::*;
+        for reason in [
+            Some(TrialEnded),
+            Some(WeeklyUsageLimitReached),
+            Some(SignInRequired),
+            Some(CodexWeeklyUsageLimitReached),
+            None,
+        ] {
+            let notice = paused_notice(reason.as_ref());
+            assert!(notice.starts_with("Headroom paused"), "{notice}");
+            // The script reads it with `"paused":"([^"]*)"`, the item prints it raw.
+            assert!(
+                notice.is_ascii() && !notice.contains(['"', '\\']),
+                "{notice}"
+            );
+        }
+        assert!(paused_notice(Some(&TrialEnded)).contains("trial ended"));
     }
 
     #[test]

@@ -1805,6 +1805,13 @@ fn show_app_update_notification_impl(app: &AppHandle, version: &str) -> Result<(
     )
 }
 
+/// The last notification's action and when it showed. No platform tells us
+/// about a click (macOS ones are fire-and-forget, see show_notification_impl),
+/// so the window open that follows a notification stands in for it: the main
+/// window takes the action on focus and opens its view ("billing" -> Upgrade).
+static LAST_NOTIFICATION_ACTION: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+const NOTIFICATION_ACTION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 #[tauri::command]
 fn show_notification(
     app: AppHandle,
@@ -1812,7 +1819,27 @@ fn show_notification(
     body: String,
     action: Option<String>,
 ) -> Result<(), String> {
-    show_notification_impl(&app, &title, &body, action)
+    show_notification_impl(&app, &title, &body, action.clone())?;
+    if let Some(action) = action {
+        *LAST_NOTIFICATION_ACTION.lock() = Some((action, std::time::Instant::now()));
+    }
+    Ok(())
+}
+
+/// The action of a notification shown in the last 15 minutes, once.
+#[tauri::command]
+fn take_notification_action() -> Option<String> {
+    take_fresh_notification_action(&LAST_NOTIFICATION_ACTION, std::time::Instant::now())
+}
+
+fn take_fresh_notification_action(
+    slot: &Mutex<Option<(String, std::time::Instant)>>,
+    now: std::time::Instant,
+) -> Option<String> {
+    slot.lock()
+        .take()
+        .filter(|(_, at)| now.saturating_duration_since(*at) < NOTIFICATION_ACTION_TTL)
+        .map(|(action, _)| action)
 }
 
 #[cfg(target_os = "macos")]
@@ -7878,6 +7905,7 @@ pub fn run() {
             restart_app,
             show_app_update_notification,
             show_notification,
+            take_notification_action,
             install_addon,
             set_addon_enabled,
             uninstall_addon,
@@ -11165,6 +11193,11 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
             if INSTALLING_UPDATE.load(Ordering::Acquire) {
                 return;
             }
+            // WSLg has no system tray, so a window hidden on blur had no way
+            // back short of relaunching from a terminal.
+            if proxy_intercept::is_wsl() {
+                return;
+            }
             if window.label() == "main" {
                 let window = window.clone();
                 std::thread::spawn(move || {
@@ -11710,6 +11743,7 @@ mod tests {
     use super::{
         bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
     };
+    use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -12629,6 +12663,31 @@ mod tests {
         assert_eq!(
             app_update_notification_body("   "),
             "A Headroom update is ready to install. Open Headroom to review the release and install it."
+        );
+    }
+
+    #[test]
+    fn a_notification_action_is_taken_once_and_only_while_fresh() {
+        let shown = std::time::Instant::now();
+        let slot = Mutex::new(Some(("billing".to_string(), shown)));
+        assert_eq!(
+            take_fresh_notification_action(&slot, shown + std::time::Duration::from_secs(60)),
+            Some("billing".to_string())
+        );
+        assert_eq!(
+            take_fresh_notification_action(&slot, shown),
+            None,
+            "taken once"
+        );
+
+        let stale = Mutex::new(Some(("billing".to_string(), shown)));
+        assert_eq!(
+            take_fresh_notification_action(&stale, shown + NOTIFICATION_ACTION_TTL),
+            None
+        );
+        assert!(
+            stale.lock().is_none(),
+            "a stale action is dropped, not kept"
         );
     }
 

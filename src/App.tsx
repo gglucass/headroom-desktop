@@ -65,6 +65,7 @@ import {
   type AppUpdateStatePatch,
 } from "./lib/appUpdate";
 import { maybeFireTrialNotifications } from "./lib/trialNotifications";
+import { takeUpgradeLanding } from "./lib/upgradeLanding";
 import { openLinkFromClick } from "./lib/externalLink";
 import {
   fireUpsellNudge,
@@ -1958,6 +1959,8 @@ export default function App() {
   // unpaid user has zero savings by design, and both states already fire their
   // own daily notification. Undefined until pricing status first loads.
   const optimizationBlockedRef = useRef<boolean | undefined>(undefined);
+  // For the main window's focus listener, which is registered once.
+  const pricingStatusRef = useRef<HeadroomPricingStatus | null>(null);
   // Mirrors connector status for the same closure. Undefined until the startup
   // fetch lands, which keeps the no-traffic branch quiet rather than guessing.
   // Staleness in the "became verified" direction is harmless: that only happens
@@ -2798,6 +2801,9 @@ export default function App() {
   useEffect(() => {
     optimizationBlockedRef.current = optimizationBlocked;
   }, [optimizationBlocked]);
+  useEffect(() => {
+    pricingStatusRef.current = pricingStatus;
+  }, [pricingStatus]);
 
   // Test overrides (HEADROOM_FAKE_* env vars, RC builds only). Null on every
   // shipped stable build and on any RC launched without the vars, so this
@@ -2959,6 +2965,14 @@ export default function App() {
           mainWindowLastSeenDayRef.current = nowDayKey;
           return;
         }
+
+        void invoke<string | null>("take_notification_action")
+          .catch(() => null)
+          .then((action) => {
+            if (takeUpgradeLanding(pricingStatusRef.current, action)) {
+              setActiveView("upgrade");
+            }
+          });
 
         const inactiveForMs = mainWindowLastBlurAtRef.current
           ? now.getTime() - mainWindowLastBlurAtRef.current

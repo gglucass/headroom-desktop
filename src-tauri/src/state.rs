@@ -4418,11 +4418,15 @@ impl AppState {
             // enable state changed while already gated.
             self.enter_claude_gate(codex_keep_alive);
             crate::proxy_intercept::set_account_gate(account_wall);
+            crate::claude_statusline::set_paused(Some(crate::claude_statusline::paused_notice(
+                status.gate_reason.as_ref(),
+            )));
         } else {
             // Any ungated reading clears the debounce window so a later
             // gated reading starts it over.
             *self.pricing_gate_first_gated_at.lock() = None;
             crate::proxy_intercept::set_account_gate(false);
+            crate::claude_statusline::set_paused(None);
             if was_bypassed {
                 log::info!("pricing_gate: leaving bypass (optimization allowed)");
                 self.exit_claude_gate();
