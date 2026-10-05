@@ -3349,6 +3349,11 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 const RTK_VERSION: &str = "0.48.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
+/// Serena runs its Python language servers (pyright, basedpyright, ty,
+/// pyrefly) through `uvx`, found via `$UVX` or PATH. Without uv every Python
+/// symbol query failed after a clean install, so uv lives in serena's venv and
+/// the MCP entry points `UVX` at it.
+const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
 const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
@@ -3373,7 +3378,7 @@ const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rust. Mirrors upstream `_setup_serena_mcp` / `_remove_headroom_installed_serena_mcp`
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
-/// argv: `register <serena-bin>` | `unregister`.
+/// argv: `register <serena-bin> [<uvx>]` | `unregister`.
 const SERENA_MCP_HELPER: &str = r#"
 import sys
 
@@ -3392,6 +3397,7 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+env = {"UVX": sys.argv[3]} if len(sys.argv) > 3 else {}
 failures = []
 # Claude/Codex only: serena's --context values are named profiles and no
 # grok/opencode context has been validated against serena yet.
@@ -3411,6 +3417,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
                 "--open-web-dashboard",
                 "False",
             ),
+            env=env,
         )
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
@@ -4280,6 +4287,10 @@ impl ToolManager {
                 let pending = enabled
                     .then(|| {
                         pending_addon_update(&manifest.id, installed.as_deref(), &manifest.version)
+                            .or_else(|| {
+                                (manifest.id == "serena" && self.serena_lacks_uvx())
+                                    .then(String::new)
+                            })
                     })
                     .flatten();
                 let update_available = pending.is_some();
@@ -9362,6 +9373,21 @@ impl ToolManager {
         self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
+    pub fn serena_uvx(&self) -> PathBuf {
+        let name = if cfg!(target_os = "windows") {
+            "uvx.exe"
+        } else {
+            "uvx"
+        };
+        self.serena_venv_dir().join(bin_subdir()).join(name)
+    }
+
+    /// An install from before uv was bundled: Python symbol tools fail unless
+    /// the user has uv on PATH. Offered as an Update, which reinstalls.
+    fn serena_lacks_uvx(&self) -> bool {
+        self.serena_installed() && !self.serena_uvx().exists()
+    }
+
     pub fn serena_installed(&self) -> bool {
         self.runtime.tools_dir.join("serena.json").exists() && self.serena_entrypoint().exists()
     }
@@ -9395,15 +9421,18 @@ impl ToolManager {
                 "--retries",
                 "10",
                 &format!("serena-agent=={SERENA_PINNED_VERSION}"),
+                &format!("uv=={SERENA_UV_PINNED_VERSION}"),
             ],
             &self.runtime.root_dir,
             |line| log_pip_line("serena pip", line),
         )?;
-        if !self.serena_entrypoint().exists() {
-            bail!(
-                "serena install completed but {} was not found",
-                self.serena_entrypoint().display()
-            );
+        for bin in [self.serena_entrypoint(), self.serena_uvx()] {
+            if !bin.exists() {
+                bail!(
+                    "serena install completed but {} was not found",
+                    bin.display()
+                );
+            }
         }
         run_command_with_timeout(
             &self.serena_entrypoint(),
@@ -9476,7 +9505,13 @@ impl ToolManager {
     fn register_serena_mcp(&self) -> Result<()> {
         set_serena_browser_dashboard();
         let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
-        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "register", &entrypoint])
+        let uvx = self.serena_uvx().to_string_lossy().into_owned();
+        let mut args = vec!["-c", SERENA_MCP_HELPER, "register", &entrypoint];
+        // A pre-uv venv keeps registering without it, as before.
+        if self.serena_uvx().exists() {
+            args.push(&uvx);
+        }
+        self.run_mcp_helper(&args)
             .context("registering serena MCP server")
     }
 
@@ -16086,7 +16121,7 @@ mod tests {
         ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
         HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
         PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        UNKNOWN_OCCUPANT,
+        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -23194,6 +23229,28 @@ Always run the linter first.
         let orphaned = listed_tool(&manager, "markitdown");
         assert_eq!(orphaned.version, MARKITDOWN_PINNED_VERSION);
         assert!(!orphaned.update_available);
+    }
+
+    #[test]
+    fn serena_without_bundled_uvx_offers_an_update_that_reinstalls_it() {
+        let (_root, runtime, manager) = seed_test_runtime("serena-uvx");
+        let entrypoint = manager.serena_entrypoint();
+        fs::create_dir_all(entrypoint.parent().expect("bin parent")).expect("bin dir");
+        fs::write(&entrypoint, b"#!/bin/sh\n").expect("entrypoint");
+        fs::write(
+            runtime.tools_dir.join("serena.json"),
+            format!(r#"{{"version":"{SERENA_PINNED_VERSION}","enabled":true}}"#).as_bytes(),
+        )
+        .expect("receipt");
+
+        // At the pin but installed before uv was bundled: Python symbol tools
+        // are broken, so offer a plain "Update" (no version to move to).
+        let legacy = listed_tool(&manager, "serena");
+        assert!(legacy.update_available);
+        assert!(legacy.available_version.is_none());
+
+        fs::write(manager.serena_uvx(), b"#!/bin/sh\n").expect("uvx");
+        assert!(!listed_tool(&manager, "serena").update_available);
     }
 
     #[test]

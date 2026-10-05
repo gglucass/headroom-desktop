@@ -10,7 +10,7 @@
 >
 > **Windows:** Windows 10 or later, x64
 >
-> **Linux:** x86_64, glibc 2.39 or newer (Ubuntu 24.04, Debian 13), plus a running secret-service keyring provider (gnome-keyring or kwallet) for sign-in
+> **Linux (preview):** x86_64, glibc 2.39 or newer (Ubuntu 24.04, Debian 13), plus a running secret-service keyring provider (gnome-keyring or kwallet) for sign-in. Linux builds ship with every stable release, but the platform is still in preview and the app says so
 
 ### Install
 
@@ -30,7 +30,7 @@ brew install --cask headroom
 
 Headroom is signed and notarized on macOS, so it opens without Gatekeeper warnings. All install paths self-update via the app's built-in updater; the Homebrew cask stays current with each release too.
 
-Every stable release ships all three platforms from the same tag. The Linux runtime installs a proxy-focused subset of the Python stack, so the memory and ML extras that the macOS and Windows builds ship are absent there.
+Every stable release ships all three platforms from the same tag; Linux is still in preview. The Linux runtime installs a proxy-focused subset of the Python stack, so the memory and ML extras that the macOS and Windows builds ship are absent there.
 
 ### For AI agents
 
@@ -50,7 +50,7 @@ If you are a coding agent installing or diagnosing Headroom for your user, follo
 
 > **Note:** Headroom supports **Claude Code**, **ChatGPT Codex** (CLI and desktop app), **OpenCode**, and **Grok Build**. Support for additional clients is planned.
 
-Headroom is a local-first desktop tray app that routes your coding clients through a local optimization pipeline. Stable builds ship for macOS, Windows, and Linux. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics - all without touching your system environment.
+Headroom is a local-first desktop tray app that routes your coding clients through a local optimization pipeline. Stable builds ship for macOS, Windows, and Linux (preview). It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics - all without touching your system environment.
 
 ## How it works
 
