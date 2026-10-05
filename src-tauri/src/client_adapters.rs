@@ -225,6 +225,18 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&state)
 }
 
+/// True when the user turned usage analytics and crash reports off.
+pub fn is_usage_data_disabled() -> bool {
+    load_setup_state().usage_data_disabled
+}
+
+pub fn set_usage_data_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    state.usage_data_disabled = !enabled;
+    write_setup_state(&state)
+}
+
 /// True when the user turned the Claude Code savings statusline off.
 pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
@@ -2776,6 +2788,10 @@ struct ClientSetupState {
     /// true, client setup skips installing it.
     #[serde(default)]
     statusline_disabled: bool,
+    /// User turned usage analytics and crash reports off in Settings
+    /// (`analytics::sharing_enabled`).
+    #[serde(default)]
+    usage_data_disabled: bool,
     /// App version that last wrote each client's managed files (scripts,
     /// hooks, shell blocks, commands), keyed by client state id. An update
     /// changes what setup writes but nothing re-ran setup, so users kept
@@ -11229,6 +11245,7 @@ mod tests {
             rtk_disabled: false,
             auto_learn_disabled: false,
             statusline_disabled: false,
+            usage_data_disabled: false,
             setup_versions: BTreeMap::new(),
         };
 
@@ -14675,12 +14692,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let tools = home.path().to_path_buf();
         assert_waits_for_setup_writes(|| super::set_statusline_enabled(false).unwrap());
         assert_waits_for_setup_writes(|| super::set_auto_learn_enabled(false).unwrap());
+        assert_waits_for_setup_writes(|| super::set_usage_data_enabled(false).unwrap());
         assert_waits_for_setup_writes(move || {
             super::set_rtk_enabled(false, &tools, &tools).unwrap()
         });
         assert_waits_for_setup_writes(|| super::disable_client_setup("claude_code").unwrap());
         let state = super::load_setup_state();
         assert!(state.statusline_disabled && state.auto_learn_disabled && state.rtk_disabled);
+        assert!(super::is_usage_data_disabled());
     }
 
     #[test]
