@@ -880,6 +880,8 @@ struct RemoteAccountResponse {
     recommended_tier: Option<HeadroomSubscriptionTier>,
     #[serde(default)]
     grandfathered: bool,
+    #[serde(default)]
+    payment_failed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3514,6 +3516,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         appsumo_lifetime_tier: value.appsumo_lifetime_tier,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
+        payment_failed: value.payment_failed,
     }
 }
 
@@ -4477,6 +4480,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
         }
     }
 
@@ -5129,6 +5133,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
         }
     }
 
@@ -5161,6 +5166,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
         }
     }
 
@@ -5864,6 +5870,19 @@ mod tests {
     }
 
     #[test]
+    fn remote_account_carries_payment_failed_and_defaults_it_off() {
+        let parse = |extra: &str| {
+            let json = format!(
+                r#"{{"email":"a@b","trialActive":false,"subscriptionActive":false,"acceptedInvitesCount":0,"inviteBonusPercent":0{extra}}}"#
+            );
+            super::remote_account_to_profile(serde_json::from_str(&json).unwrap())
+        };
+        assert!(parse(r#","paymentFailed":true"#).payment_failed);
+        // Servers before the field existed.
+        assert!(!parse("").payment_failed);
+    }
+
+    #[test]
     fn remote_account_clamps_invite_bonus_to_50() {
         let raw = RemoteAccountResponse {
             email: "a@b".into(),
@@ -5893,6 +5912,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
     }
@@ -5927,6 +5947,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
     }

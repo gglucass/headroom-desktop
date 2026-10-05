@@ -674,6 +674,10 @@ export interface HeadroomAccountProfile {
   /** The AppSumo lifetime tier under a Polar subscription bought on top of
    * it. Absent unless they hold both. */
   appsumoLifetimeTier?: HeadroomSubscriptionTier | null;
+  /** A renewal charge failed and Polar is still retrying it. The account
+   * already reads as free, so this is the only sign a card update would
+   * bring the subscription back. */
+  paymentFailed?: boolean;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;

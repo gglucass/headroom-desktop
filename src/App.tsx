@@ -1926,7 +1926,7 @@ export default function App() {
   const [uninstallError, setUninstallError] = useState<string | null>(null);
   // "cancel" is not a plan: it is the cancel-subscription action, which shares the
   // busy state so only the button that was clicked reads "Opening...".
-  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | null>(null);
+  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | "billing" | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
     fromTier: HeadroomSubscriptionTier;
@@ -4850,6 +4850,18 @@ export default function App() {
     await openExternalLink(url);
   }
 
+  async function handleUpdatePaymentMethod() {
+    setUpgradeActionBusy("billing");
+    setUpgradeActionError(null);
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(describeInvokeError(error, "Could not open billing portal."));
+    } finally {
+      setUpgradeActionBusy(null);
+    }
+  }
+
   function openCancelReason() {
     setCancelReason("");
     setCancelNote("");
@@ -5076,10 +5088,15 @@ export default function App() {
   // summed from the same buckets as the History headline, so no day can read
   // above the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
   // for milestones and telemetry (see state.rs).
-  const lifetimeTokensSaved = dashboard.dailySavings.reduce(
-    (sum, point) => sum + point.estimatedTokensSaved + (point.outputTokensSaved ?? 0),
+  const lifetimeInputTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + point.estimatedTokensSaved,
     0
   );
+  const lifetimeOutputTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + (point.outputTokensSaved ?? 0),
+    0
+  );
+  const lifetimeTokensSaved = lifetimeInputTokensSaved + lifetimeOutputTokensSaved;
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
       ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`
@@ -6900,6 +6917,33 @@ export default function App() {
         {/* Outside every tray-content pane on purpose: the clamp applies wherever
             the user is, so the notice does too. Home-only meant a user parked on
             Activity or Settings was metered with nothing on screen saying so. */}
+        {/* A failed renewal drops the account to free while Polar retries the
+            card for three weeks. Without this the app just looked free, with
+            nothing saying why or what fixes it. Shares the tier-mismatch
+            banner's look: same kind of standing account notice. */}
+        {pricingStatus?.account?.paymentFailed ? (
+          <section className="tier-mismatch-banner" role="status">
+            <div className="tier-mismatch-banner__body">
+              <h2 className="tier-mismatch-banner__title">Your Headroom payment didn't go through</h2>
+              <p className="tier-mismatch-banner__message">
+                Your card was declined at renewal, so you're on the free plan for now. Update your card and the next retry brings your subscription back.
+              </p>
+              {upgradeActionError && upgradeActionBusy === null ? (
+                <p className="tier-mismatch-banner__error" role="status">
+                  {upgradeActionError}
+                </p>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className="tier-mismatch-banner__action"
+              disabled={upgradeActionBusy === "billing"}
+              onClick={() => void handleUpdatePaymentMethod()}
+            >
+              {upgradeActionBusy === "billing" ? "Opening…" : "Update card"}
+            </button>
+          </section>
+        ) : null}
         {tierMismatch ? (
           <section
             className={`tier-mismatch-banner${tierMismatch.clamped ? " tier-mismatch-banner--clamped" : ""}`}
@@ -7079,7 +7123,7 @@ export default function App() {
                     className="stat-card__info-button"
                     onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
                     type="button"
-                    aria-label="Cache hits and compression by period"
+                    aria-label="What the tokens saved figure includes"
                   >
                     <Info size={13} weight="bold" />
                   </button>
@@ -8603,6 +8647,21 @@ export default function App() {
               onClick={() => setShowCacheInfo(false)}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3>Tokens saved</h3>
+                {/* The card's figure, split by layer: same buckets as
+                    lifetimeTokensSaved, so the rows add up to the card. */}
+                <div className="savings-breakdown">
+                  <div className="savings-breakdown__row">
+                    <span>Input compression (Headroom)</span>
+                    <strong>{compactNumber(lifetimeInputTokensSaved)}</strong>
+                  </div>
+                  {lifetimeOutputTokensSaved > 0 ? (
+                    <div className="savings-breakdown__row">
+                      <span>Output shaping (Headroom, estimated)</span>
+                      <strong>{compactNumber(lifetimeOutputTokensSaved)}</strong>
+                    </div>
+                  ) : null}
+                </div>
                 <h3>Cache hits &amp; compression</h3>
                 <p>
                   Most of your input is re-sent conversation history that your AI client serves

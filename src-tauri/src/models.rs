@@ -1324,6 +1324,11 @@ pub struct HeadroomAccountProfile {
     // older cached payloads (no field) still deserialize.
     #[serde(default)]
     pub grandfathered: bool,
+    /// A renewal charge failed and Polar is still retrying it. The server
+    /// already dropped the account to free, so this is the only sign a
+    /// subscription exists that a card update would bring back.
+    #[serde(default)]
+    pub payment_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
