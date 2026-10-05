@@ -5,8 +5,7 @@ import type {
   HeadroomPricingStatus,
   HourlySavingsPoint,
   ProviderSavingsPoint,
-  RuntimeStatus,
-  SavingsBreakdown
+  RuntimeStatus
 } from "./types";
 
 export interface SavingsChartDatum {
@@ -96,57 +95,6 @@ export function savingsRate(saved: number, spent: number) {
   return Math.round((Math.max(0, saved) / baseline) * 100);
 }
 
-/** Cache-hit / compression pair over a window of savings buckets.
- *
- * Only buckets that carry cache data count (backend rollup coverage, archived
- * durably at ingest since 0.8.3; buckets only the local tracker observed and
- * days that aged out before ever being archived have none), so both rates
- * describe the same covered slice of the window. Null when no bucket in the
- * window has coverage. `hitPct` is the share of forwarded input served
- * from the provider's prompt cache; `compressedPct` is the share of the
- * REMAINING (compressible) input Headroom removed.
- *
- * Priced in dollars for the reason documented on
- * `compressibleInputSavingsRate` below: cacheReadTokens (provider count) and
- * totalTokensSent (our tokenizer) must never be differenced or ratioed, and
- * on real data reads exceed forwarded input, which pinned the token form of
- * this pair at a meaningless "100% hits / 100% compressed". The read
- * discount (`cacheSavingsUsd`), the read cost (`readCostUsd`) and the bucket's
- * input cost come from one pricing function, and the reads' full-price value
- * is exactly read cost + discount. */
-export function cacheHitPair(
-  points: Array<{
-    cacheSavingsUsd?: number | null;
-    cacheReadCostUsd?: number | null;
-    actualCostUsd: number;
-    estimatedSavingsUsd: number;
-  }>
-) {
-  let cacheSavings = 0;
-  let readCost = 0;
-  let actual = 0;
-  let saved = 0;
-  for (const point of points) {
-    if (point.cacheSavingsUsd == null) continue;
-    cacheSavings += Math.max(0, point.cacheSavingsUsd);
-    readCost += readCostUsd(point);
-    actual += Math.max(0, point.actualCostUsd);
-    saved += Math.max(0, point.estimatedSavingsUsd);
-  }
-  // Full-price value of the window's input: what was paid plus the discount
-  // the cache earned.
-  const fullPriceInput = actual + cacheSavings;
-  if (fullPriceInput <= 0) return null;
-  const hitPct = Math.min(100, ((readCost + cacheSavings) / fullPriceInput) * 100);
-  // What survived the cache and was paid at full input price.
-  const rest = Math.max(0, actual - readCost);
-  const baseline = saved + rest;
-  // A fully-cached window leaves nothing to compress: report 0% of an empty
-  // remainder rather than hiding the (excellent) hit rate.
-  const compressedPct = baseline > 0 ? Math.min(100, (saved / baseline) * 100) : 0;
-  return { hitPct, compressedPct };
-}
-
 /** What a bucket's cache reads cost. The backend rollup's own figure when it
  * has one (priced per request by model, the same way `actualCostUsd` was);
  * otherwise recovered from the read discount as `discount / 9`, which assumes
@@ -162,51 +110,6 @@ export function readCostUsd(point: {
   return Math.max(0, point.cacheSavingsUsd ?? 0) / 9;
 }
 
-/** The all-time cache-hit pair, from the lifetime breakdown rather than a
- * window of buckets. Null when the client has never cached anything: there is
- * no hit rate to report, and `cacheHitPair` would be dividing into an empty
- * window.
- *
- * `compressionSavingsUsd` is INPUT COMPRESSION ALONE, and must be: the
- * denominator here is an input-cost one, so pairing it with
- * `lifetimeEstimatedSavingsUsd` (which also carries output shaping and tool-
- * schema deferral, neither of which removes input) made the all-time row read
- * above the windowed rows beside it -- 17.0% against 11.6% on the same machine,
- * measured 2026-09-10. Named for the field, not for "lifetime savings", so the
- * broader figure cannot be passed back in by accident.
- *
- * The lifetime breakdown carries no read cost, so it is priced at the
- * read-cost-to-discount ratio of the `pricedBuckets` whose reads the rollup
- * priced exactly; `discount / 9` only when none did. Without that the all-time
- * row kept the /9 overstatement the windowed rows beside it dropped (4.3x on
- * claude-fable-5-1 reads) and read above them again. */
-export function allTimeCacheHitPair(
-  breakdown: SavingsBreakdown | null | undefined,
-  compressionSavingsUsd: number,
-  pricedBuckets: ReadonlyArray<{
-    cacheSavingsUsd?: number | null;
-    cacheReadCostUsd?: number | null;
-  }> = []
-) {
-  if (!breakdown || breakdown.cacheReadTokens <= 0) return null;
-  let readCost = 0;
-  let discount = 0;
-  for (const bucket of pricedBuckets) {
-    if (bucket.cacheReadCostUsd == null || bucket.cacheSavingsUsd == null) continue;
-    readCost += Math.max(0, bucket.cacheReadCostUsd);
-    discount += Math.max(0, bucket.cacheSavingsUsd);
-  }
-  return cacheHitPair([
-    {
-      cacheSavingsUsd: breakdown.cacheSavingsUsd,
-      cacheReadCostUsd:
-        discount > 0 ? (Math.max(0, breakdown.cacheSavingsUsd) * readCost) / discount : null,
-      actualCostUsd: breakdown.totalInputCostUsd,
-      estimatedSavingsUsd: compressionSavingsUsd
-    }
-  ]);
-}
-
 /** Billable-dollar input-compression rate: the share of the COMPRESSIBLE
  * input spend Headroom removed. Cache reads are excluded from the denominator
  * (they bill at ~0.1x and Headroom deliberately never touches the cached
@@ -218,7 +121,7 @@ export function allTimeCacheHitPair(
  * always be computed for them). Priced in dollars because only the dollar
  * figures are on one scale: `totalTokensSent` is our own tokenizer's count
  * while `cacheReadTokens` is the provider's ("must never be differenced",
- * proxy/outcome.py; see cacheHitPair). The read cost (`readCostUsd`) is
+ * proxy/outcome.py; on real data reads exceed forwarded input). The read cost (`readCostUsd`) is
  * subtracted from the bucket's actual input cost -- both from one pricing
  * function, so the subtraction is sound.
  *
@@ -273,7 +176,7 @@ export function compressibleInputSavingsRate(
  * rate toward zero as sessions grew (2026-09-02 fleet analysis: displayed ~5%
  * while compression of actually-touchable input ran ~30%). Both counts come
  * from the proxy's own tokenizer, so unlike `cacheReadTokens` they may be
- * summed and ratioed (that provider-scale ban is documented on `cacheHitPair`).
+ * summed and ratioed (that provider-scale ban is documented on `compressibleInputSavingsRate`).
  *
  * Only buckets with sampled coverage count -- numerator included, so both
  * sides always describe the same slice; null when the window has none.

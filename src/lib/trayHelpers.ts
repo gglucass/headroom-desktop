@@ -15,6 +15,7 @@ export type TrayView =
   | "addons"
   | "upgrade"
   | "upgradeAuth"
+  | "invite"
   | "settings";
 
 /// The dashboard read. It rejects on failure on purpose: each caller decides

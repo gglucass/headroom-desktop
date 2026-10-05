@@ -4086,6 +4086,8 @@ impl AppState {
                 }
             }
         }
+        #[cfg(unix)]
+        reap_orphaned_multiprocessing_helpers(&managed_python);
         log::info!("stop_headroom: done");
     }
 
@@ -7372,6 +7374,13 @@ fn warn_stats_fetch_failed(reason: &str) {
             stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
         let tasks =
             matches!(category.as_str(), "timeout" | "transport").then(|| backend_tasks(backend));
+        let stall = recent_loop_stall(
+            &crate::client_adapters::home_dir()
+                .join(".headroom")
+                .join("logs")
+                .join("loop-stall.txt"),
+            std::time::SystemTime::now(),
+        );
         sentry::with_scope(
             |scope| {
                 scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
@@ -7379,6 +7388,10 @@ fn warn_stats_fetch_failed(reason: &str) {
                 scope.set_extra("requests_since_last_ok", requests_since_ok.into());
                 if let Some(tasks) = &tasks {
                     scope.set_extra("backend_tasks", tasks.clone().into());
+                }
+                if let Some((age, stacks)) = &stall {
+                    scope.set_extra("loop_stall_age_secs", (*age).into());
+                    scope.set_extra("loop_stall_stacks", stacks.clone().into());
                 }
             },
             || {
@@ -7391,6 +7404,34 @@ fn warn_stats_fetch_failed(reason: &str) {
     // readiness verdict rides along so a support log still says which half of
     // the gate suppressed the event.
     log::warn!("{message} (backend_ready={backend_ready})");
+}
+
+/// The newest event-loop stall dump the sitecustomize `loop_stall_dump` wrote,
+/// with its age in seconds, when it is recent enough to be the stall this
+/// `/stats` timeout hit. The `/debug/tasks` snapshot is taken after the stall
+/// and cannot say what blocked the loop; this is faulthandler's dump of every
+/// Python thread taken during it. The serving loop runs on the main thread,
+/// which faulthandler prints last, so it goes first here: the blocker is in
+/// its stack unless another thread held the GIL, which is why the rest follow.
+pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Option<(u64, String)> {
+    const FRESH: Duration = Duration::from_secs(120);
+    const MAX_CHARS: usize = 12_000;
+    let age = now
+        .duration_since(std::fs::metadata(path).ok()?.modified().ok()?)
+        .unwrap_or_default();
+    if age > FRESH {
+        return None;
+    }
+    let dump = std::fs::read_to_string(path).ok()?;
+    // Each dump opens with `Timeout (0:00:05)!`, then one block per thread.
+    let newest = &dump[dump.rfind("Timeout (")?..];
+    let mut threads: Vec<&str> = newest.split_once('\n')?.1.trim().split("\n\n").collect();
+    let main = threads.pop()?;
+    let stacks = std::iter::once(main)
+        .chain(threads)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((age.as_secs(), stacks.chars().take(MAX_CHARS).collect()))
 }
 
 /// What is piled up on the backend when a `/stats` read just failed: requests
@@ -9795,6 +9836,81 @@ enum SweepParents {
     Any,
 }
 
+/// Whether `pid` is its own process-group leader. A `ps` that cannot run
+/// answers no, which keeps the sweep's old per-pid signal.
+#[cfg(unix)]
+fn leads_own_process_group(pid: u32) -> bool {
+    crate::proc::command("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        == Some(pid)
+}
+
+/// Reaps multiprocessing helpers (image-isolation pool workers, the resource
+/// tracker) of a managed-runtime python that is gone. They outlive their
+/// parent: before the sweep signalled a stray proxy's group, every proxy it
+/// reaped left its helpers behind (2026-10-05: four, ~1.4 GB, from proxies
+/// swept on Oct 2 and Oct 3, still running). A helper whose parent is a live
+/// process of the same runtime (a running proxy, a learn run, an MCP server)
+/// belongs to it and stays; any other parent (pid 1, launchd, a `systemd
+/// --user` subreaper) means the owner exited. Windows reaps these through
+/// `reap_orphaned_venv_processes`.
+#[cfg(unix)]
+fn reap_orphaned_multiprocessing_helpers(managed_python: &std::path::Path) {
+    let Some(venv_dir) = managed_python.parent().and_then(|bin| bin.parent()) else {
+        return;
+    };
+    let venv = venv_dir.display().to_string();
+    let pattern = format!("{} -s -c from multiprocessing", managed_python.display());
+    let Ok(found) = crate::proc::command("pgrep")
+        .args(["-f", &pattern])
+        .output()
+    else {
+        return;
+    };
+    let pids: Vec<String> = String::from_utf8_lossy(&found.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    let Ok(listed) = crate::proc::command("ps")
+        .args(["-o", "pid=,ppid=", "-p", &pids.join(",")])
+        .output()
+    else {
+        return;
+    };
+    for (pid, ppid) in parse_pid_ppid(&String::from_utf8_lossy(&listed.stdout)) {
+        let parent_in_runtime = ppid > 1
+            && crate::proc::command("ps")
+                .args(["-o", "command=", "-p", &ppid.to_string()])
+                .output()
+                // A `ps` that cannot run spares the helper.
+                .map_or(true, |out| {
+                    String::from_utf8_lossy(&out.stdout).contains(&venv)
+                });
+        if parent_in_runtime {
+            continue;
+        }
+        log::info!("process sweep: -TERM orphaned multiprocessing helper {pid} (parent {ppid})");
+        note_app_kill(
+            "process_sweep",
+            format!("-TERM orphaned multiprocessing helper {pid} (parent {ppid})"),
+        );
+        let _ = crate::proc::command("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
 /// Parses `ps -o pid=,ppid=` output into `(pid, ppid)` pairs; junk lines skip.
 fn parse_pid_ppid(output: &str) -> Vec<(u32, u32)> {
     output
@@ -9865,10 +9981,20 @@ fn kill_processes_by_command_pattern(
                 );
                 continue;
             }
-            log::info!("process sweep: -TERM pid {pid} (parent {ppid}) for '{pattern}'");
-            note_app_kill("process_sweep", format!("-TERM pid {pid} (parent {ppid})"));
+            // A backend we spawned leads its own process group (process_group(0)),
+            // and its multiprocessing helpers (image-isolation workers, the
+            // resource tracker) live in that group and do not exit with it: a
+            // stray proxy SIGTERMed by pid alone left ~680 MB of them running
+            // for days. Signal the whole group when the match leads one.
+            let target = if leads_own_process_group(pid) {
+                group_kill_target(pid as i32).unwrap_or_else(|| pid.to_string())
+            } else {
+                pid.to_string()
+            };
+            log::info!("process sweep: -TERM {target} (parent {ppid}) for '{pattern}'");
+            note_app_kill("process_sweep", format!("-TERM {target} (parent {ppid})"));
             let _ = crate::proc::command("/bin/kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-TERM", &target])
                 .status();
         }
         Ok(())
@@ -13033,6 +13159,92 @@ mod tests {
         false
     }
 
+    /// A stray backend's multiprocessing helpers share its process group and
+    /// outlive a per-pid SIGTERM; the sweep signals the group so they go too.
+    #[cfg(unix)]
+    #[test]
+    fn unix_sweep_signals_a_group_leading_backends_whole_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let venv = tempfile::tempdir().expect("tempdir");
+        let bin = venv.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let python = bin.join("python3");
+        let helper_file = venv.path().join("helper");
+        // Bounded sleeps so a failing run leaves nothing behind for long.
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nsleep 20 &\necho $! > '{}'\nwait\n",
+                helper_file.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut backend = crate::proc::command(&python)
+            .args(["-m", "headroom.proxy.server"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn backend");
+        let helper = wait_for_pid_file(&helper_file);
+        super::kill_processes_by_command_pattern(
+            &python,
+            "-m headroom.proxy.server",
+            super::SweepParents::Orphans { own_children: true },
+        )
+        .expect("sweep");
+        let _ = backend.wait();
+        assert!(
+            pid_exits_within(helper, std::time::Duration::from_secs(5)),
+            "sweep left the backend's group member {helper} running"
+        );
+    }
+
+    /// A helper whose parent is a live process of the same runtime is that
+    /// process's (spared); one under any other parent is an orphan (reaped).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_multiprocessing_helpers_are_reaped_and_live_ones_spared() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        let spawn_helper = |parent_argv_has_venv: bool| {
+            let _ = std::fs::remove_file(&pid_file);
+            // The parent's own argv carries the venv path only via $0.
+            let script = "\"$P\" -s -c 'from multiprocessing.spawn import spawn_main'; true";
+            let mut command = crate::proc::command("/bin/sh");
+            command.args(["-c", script]).env("P", &python);
+            if parent_argv_has_venv {
+                command.arg(&python);
+            }
+            let parent = command.spawn().expect("spawn parent");
+            (parent, wait_for_pid_file(&pid_file))
+        };
+
+        let (mut live_parent, kept) = spawn_helper(true);
+        super::reap_orphaned_multiprocessing_helpers(&python);
+        let spared = !pid_exits_within(kept, std::time::Duration::from_millis(500));
+        let _ = live_parent.kill();
+        let _ = live_parent.wait();
+        let _ = crate::proc::command("/bin/kill")
+            .args(["-TERM", &kept.to_string()])
+            .status();
+
+        let (mut other_parent, orphan) = spawn_helper(false);
+        super::reap_orphaned_multiprocessing_helpers(&python);
+        let reaped = pid_exits_within(orphan, std::time::Duration::from_secs(5));
+        let _ = other_parent.kill();
+        let _ = other_parent.wait();
+
+        assert!(
+            spared,
+            "reaped helper {kept} whose parent runs from the runtime"
+        );
+        assert!(
+            reaped,
+            "spared helper {orphan} under a parent outside the runtime"
+        );
+    }
+
     /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
     /// live parent that is not a Headroom desktop must not spare a match: the
     /// orphan backend then survived every quit and upgrade until reboot.
@@ -15024,6 +15236,26 @@ mod tests {
             "RequestResponseCycle.run_asgi x2, trim_periodically x1"
         );
         assert_eq!(super::summarize_backend_tasks("not json"), "");
+    }
+
+    #[test]
+    fn loop_stall_dump_reports_the_newest_dump_main_thread_first() {
+        // faulthandler's real layout: header, one block per thread, the main
+        // (serving) thread last.
+        let dump = "Timeout (0:00:05)!\nThread 0x1 (most recent call first):\n  File \"a.py\", line 1 in old_blocker\n\n\
+                    Timeout (0:00:05)!\nThread 0x2 (most recent call first):\n  File \"threading.py\", line 3 in wait\n\n\
+                    Thread 0x3 (most recent call first):\n  File \"b.py\", line 4 in new_blocker\n  File \"cli.py\", line 9 in <module>\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop-stall.txt");
+        std::fs::write(&path, dump).unwrap();
+        let now = std::time::SystemTime::now();
+        let (age, stacks) = super::recent_loop_stall(&path, now).expect("fresh dump");
+        assert!(age < 5);
+        assert!(stacks.starts_with("Thread 0x3"), "{stacks}");
+        assert!(stacks.contains("new_blocker") && stacks.contains("in wait"));
+        assert!(!stacks.contains("old_blocker"));
+        assert!(super::recent_loop_stall(&path, now + Duration::from_secs(300)).is_none());
+        assert!(super::recent_loop_stall(&dir.path().join("missing.txt"), now).is_none());
     }
 
     #[test]

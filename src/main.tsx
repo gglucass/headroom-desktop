@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
 import App from "./App";
 import { CrashFallback } from "./components/CrashFallback";
+import { gateOnUsageData } from "./lib/analytics";
 import "./styles.css";
 
 // Only macOS puts a vibrancy layer behind the webview. Elsewhere the window is
@@ -27,6 +28,7 @@ if (import.meta.env.PROD) {
     dsn: import.meta.env.VITE_SENTRY_DSN,
     release: `headroom-desktop@${__APP_VERSION__}`,
     integrations: [],
+    transport: (options) => gateOnUsageData(Sentry.makeFetchTransport(options)),
   });
 }
 

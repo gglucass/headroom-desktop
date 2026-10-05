@@ -61,7 +61,7 @@ fn editors() -> Vec<Editor> {
 }
 
 /// Where VS Code and its forks keep their `User` folder on this OS.
-fn editor_data_root(home: &Path) -> PathBuf {
+pub(crate) fn editor_data_root(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support")
     } else if cfg!(windows) {

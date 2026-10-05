@@ -1324,6 +1324,26 @@ pub struct HeadroomAccountProfile {
     // older cached payloads (no field) still deserialize.
     #[serde(default)]
     pub grandfathered: bool,
+    /// A renewal charge failed and Polar is still retrying it. The server
+    /// already dropped the account to free, so this is the only sign a
+    /// subscription exists that a card update would bring back.
+    #[serde(default)]
+    pub payment_failed: bool,
+    /// Paid referral program: the code a paying subscriber shares. The server
+    /// sends it only to someone who can refer, so its presence is the gate.
+    #[serde(default)]
+    pub referral_code: Option<String>,
+    /// The invite card's overview: friends who signed up with the code, how
+    /// many subscribed, and free months earned (own invitee month included).
+    #[serde(default)]
+    pub referral_signups: usize,
+    #[serde(default)]
+    pub referral_subscribed: usize,
+    #[serde(default)]
+    pub referral_free_months: usize,
+    /// Signed up through a referral; their own free month is not in yet.
+    #[serde(default)]
+    pub referral_reward_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

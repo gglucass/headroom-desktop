@@ -103,7 +103,11 @@ def main():
             calls.clear()
             started = time.perf_counter()
             try:
-                result = await run(proxy, source)
+                # The fixed budget is min(120ms, 0.75 * timeout) either way; a
+                # 2s outer timeout only gives a starved runner slack to merge
+                # (rc10 CI: 0.42s for 100 units). `changed < count` still proves
+                # the budget cut the work. The control needs the tight timeout.
+                result = await run(proxy, source, timeout=0.5 if args.disabled else 2.0)
             except asyncio.TimeoutError:
                 assert args.disabled, "fixed request still timed out"
                 assert proxy._compression_timed_out_in_flight > 0

@@ -674,9 +674,23 @@ export interface HeadroomAccountProfile {
   /** The AppSumo lifetime tier under a Polar subscription bought on top of
    * it. Absent unless they hold both. */
   appsumoLifetimeTier?: HeadroomSubscriptionTier | null;
+  /** A renewal charge failed and Polar is still retrying it. The account
+   * already reads as free, so this is the only sign a card update would
+   * bring the subscription back. */
+  paymentFailed?: boolean;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;
+  /** Paid referral program: present only for someone who can refer (an
+   * active Polar subscriber), so it gates the invite card. */
+  referralCode?: string | null;
+  /** Invite card overview: friends signed up with the code, how many
+   * subscribed, free months earned (own invitee month included). */
+  referralSignups?: number;
+  referralSubscribed?: number;
+  referralFreeMonths?: number;
+  /** Signed up through a referral; their own free month is not in yet. */
+  referralRewardPending?: boolean;
 }
 
 export interface HeadroomPricingStatus {

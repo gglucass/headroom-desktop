@@ -878,6 +878,71 @@ pub fn spawn(
     fresh_bearer_tx: FreshBearerNotifier,
     bind_error: BindErrorSlot,
 ) {
+    std::thread::Builder::new()
+        .name("proxy-intercept-supervisor".into())
+        .spawn(move || {
+            supervise_intercept(
+                || {
+                    serve(
+                        token_slot.clone(),
+                        codex_slot.clone(),
+                        codex_plan_slot.clone(),
+                        bypass.clone(),
+                        claude_only_bypass.clone(),
+                        codex_bypass.clone(),
+                        fresh_bearer_tx.clone(),
+                        bind_error.clone(),
+                    )
+                },
+                std::time::Duration::from_secs(2),
+            )
+        })
+        .expect("spawn proxy intercept supervisor");
+}
+
+/// Restart the intercept thread whenever it dies, until it returns normally.
+///
+/// The runtime can die under the server: tokio panics on any I/O driver poll
+/// error, and Windows returns one when the kernel runs out of resources (os
+/// error 1450, RUST-N9). mio leaves its selector unusable after that error, so
+/// a fresh runtime is the only way back. Before this the panic ended the
+/// thread and the app's front door stayed shut until relaunch. The panic hook
+/// has already reported the panic, so the restart only logs locally. The
+/// delay doubles while the machine keeps failing (each panic is a Sentry
+/// event) and resets after a run that held up.
+fn supervise_intercept(
+    mut serve: impl FnMut() -> std::io::Result<std::thread::JoinHandle<()>>,
+    first_delay: std::time::Duration,
+) {
+    const HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(600);
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+    let mut delay = first_delay;
+    loop {
+        let started = std::time::Instant::now();
+        match serve().map(|worker| worker.join()) {
+            Ok(Ok(())) => return,
+            Ok(Err(_)) => log::info!("[proxy_intercept] runtime panicked; restarting"),
+            Err(e) => log::info!("[proxy_intercept] could not start the server thread: {e}"),
+        }
+        if started.elapsed() >= HEALTHY_RUN {
+            delay = first_delay;
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    token_slot: SharedToken,
+    codex_slot: CodexRateLimitSlot,
+    codex_plan_slot: CodexPlanSlot,
+    bypass: BypassFlag,
+    claude_only_bypass: BypassFlag,
+    codex_bypass: BypassFlag,
+    fresh_bearer_tx: FreshBearerNotifier,
+    bind_error: BindErrorSlot,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
     std::thread::Builder::new()
         .name("proxy-intercept".into())
@@ -1408,7 +1473,6 @@ pub fn spawn(
                 }
             });
         })
-        .expect("spawn proxy intercept thread");
 }
 
 /// A dead app's listener can outlive it in an orphaned child: see
@@ -7917,5 +7981,26 @@ mod tests {
             .unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0]["tool_name"], "kept");
+    }
+
+    /// RUST-N9: a tokio I/O driver panic used to end the intercept thread for
+    /// good. The supervisor must bring the server back after a panic and stop
+    /// once it exits cleanly.
+    #[test]
+    fn intercept_supervisor_restarts_after_a_runtime_panic() {
+        let mut runs = 0;
+        super::supervise_intercept(
+            || {
+                runs += 1;
+                let first = runs == 1;
+                std::thread::Builder::new().spawn(move || {
+                    if first {
+                        panic!("unexpected error when polling the I/O driver");
+                    }
+                })
+            },
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(runs, 2);
     }
 }

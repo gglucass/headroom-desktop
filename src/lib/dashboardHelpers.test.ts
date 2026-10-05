@@ -11,8 +11,6 @@ import {
   readCostUsd,
   newInputSavingsRate,
   newInputTokensForBar,
-  allTimeCacheHitPair,
-  cacheHitPair,
   calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
@@ -705,105 +703,6 @@ describe("readCostUsd", () => {
     expect(compressibleSpend({ ...bucket, totalTokensSent: 0 }).compressibleCostUsd).toBeCloseTo(
       54.48 - 8.33
     );
-    const pair = cacheHitPair([bucket])!;
-    expect(pair.hitPct).toBeCloseTo(((8.33 + 324.72) / (54.48 + 324.72)) * 100);
-    expect(pair.compressedPct).toBeCloseTo((7.23 / (7.23 + 54.48 - 8.33)) * 100);
-  });
-});
-
-describe("cacheHitPair", () => {
-  it("computes both rates in dollars over covered buckets only", () => {
-    const pair = cacheHitPair([
-      // Read discount $9 -> read cost $1, reads' full-price value $10.
-      { cacheSavingsUsd: 9, actualCostUsd: 3, estimatedSavingsUsd: 0.5 },
-      // No cache coverage: excluded from BOTH rates, not just the hit rate.
-      { actualCostUsd: 50, estimatedSavingsUsd: 999 },
-      { cacheSavingsUsd: 4.5, actualCostUsd: 2.5, estimatedSavingsUsd: 1.5 }
-    ]);
-    expect(pair).not.toBeNull();
-    // reads at full price 15 / full-price input (5.5 + 13.5)
-    expect(pair!.hitPct).toBeCloseTo((15 / 19) * 100);
-    // saved 2 / (saved 2 + rest (5.5 - 1.5))
-    expect(pair!.compressedPct).toBeCloseTo((2 / 6) * 100);
-  });
-
-  it("returns null when no bucket carries cache data", () => {
-    expect(cacheHitPair([{ actualCostUsd: 3, estimatedSavingsUsd: 1 }])).toBeNull();
-    expect(cacheHitPair([])).toBeNull();
-  });
-
-  it("does not saturate when provider cache reads exceed our token count", () => {
-    // The 2026-08-17 regression: the token form of this pair ratioed the
-    // provider's cache reads against our own tokenizer's forwarded count;
-    // reads exceeded input, pinning the display at "100% hits, 100% of the
-    // rest compressed". The dollar form has no cross-tokenizer ratio at all.
-    const pair = cacheHitPair([
-      { cacheSavingsUsd: 9, actualCostUsd: 3, estimatedSavingsUsd: 0.5 }
-    ]);
-    expect(pair!.hitPct).toBeCloseTo((10 / 12) * 100);
-    expect(pair!.compressedPct).toBeCloseTo(20);
-  });
-
-  it("reports a fully-cached window as 0% of an empty remainder", () => {
-    const pair = cacheHitPair([
-      // Actual cost is exactly the read cost: nothing was left to compress.
-      { cacheSavingsUsd: 9, actualCostUsd: 1, estimatedSavingsUsd: 0 }
-    ]);
-    expect(pair!.hitPct).toBe(100);
-    expect(pair!.compressedPct).toBe(0);
-  });
-});
-
-describe("allTimeCacheHitPair", () => {
-  const breakdown = {
-    compressionSavingsUsd: 4,
-    outputSavingsUsd: 0,
-    cacheSavingsUsd: 9, // read discount $9 -> read cost $1
-    cacheReadTokens: 900,
-    totalInputTokens: 1000,
-    totalInputCostUsd: 3 // $1 reads + $2 billable
-  };
-
-  it("prices the lifetime breakdown as one synthetic bucket", () => {
-    const pair = allTimeCacheHitPair(breakdown, 4);
-    const direct = cacheHitPair([
-      {
-        cacheSavingsUsd: breakdown.cacheSavingsUsd,
-        actualCostUsd: breakdown.totalInputCostUsd,
-        estimatedSavingsUsd: 4
-      }
-    ]);
-    expect(pair).toEqual(direct);
-    expect(pair!.hitPct).toBeCloseTo(83.33, 2);
-    // $4 saved against $4 saved + $2 paid at full price.
-    expect(pair!.compressedPct).toBeCloseTo(66.67, 2);
-  });
-
-  it("prices lifetime reads at the ratio of exactly priced buckets", () => {
-    // Buckets billed reads at 0.025x list: $0.25 read cost per $9.75 discount.
-    const priced = [
-      { cacheSavingsUsd: 9.75, cacheReadCostUsd: 0.25 },
-      { cacheSavingsUsd: 5, cacheReadCostUsd: null }
-    ];
-    const pair = allTimeCacheHitPair(breakdown, 4, priced);
-    const direct = cacheHitPair([
-      {
-        cacheSavingsUsd: breakdown.cacheSavingsUsd,
-        cacheReadCostUsd: (9 * 0.25) / 9.75,
-        actualCostUsd: breakdown.totalInputCostUsd,
-        estimatedSavingsUsd: 4
-      }
-    ]);
-    expect(pair).toEqual(direct);
-    expect(pair!.compressedPct).toBeLessThan(allTimeCacheHitPair(breakdown, 4)!.compressedPct);
-  });
-
-  it("is null without cache coverage, whatever the dollars say", () => {
-    // cacheReadTokens is the existence signal: no reads means no hit rate to
-    // report, even though cacheSavingsUsd would divide fine.
-    expect(allTimeCacheHitPair({ ...breakdown, cacheReadTokens: 0 }, 4)).toBeNull();
-    expect(allTimeCacheHitPair(null, 4)).toBeNull();
-    expect(allTimeCacheHitPair(undefined, 4)).toBeNull();
   });
 });
 

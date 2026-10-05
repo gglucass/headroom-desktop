@@ -21,6 +21,7 @@ import {
   Info,
   EnvelopeSimple,
   GearSix,
+  Gift,
   House,
   Key,
   PuzzlePiece,
@@ -85,6 +86,7 @@ import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
+import { UsageDataPanel } from "./components/UsageDataPanel";
 import {
   authCodeSentMessage,
   buildInstallFailureMailto,
@@ -132,8 +134,6 @@ import {
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
   newInputSavingsRate,
-  allTimeCacheHitPair,
-  cacheHitPair,
   calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
@@ -211,6 +211,7 @@ import {
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
+import { ReferralCard, ReferralCodeEntry } from "./components/ReferralCard";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
 import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
@@ -1911,7 +1912,7 @@ export default function App() {
   // chart anyway after this delay rather than spinning forever.
   const [historyLoadTimedOut, setHistoryLoadTimedOut] = useState(false);
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
-  const [showCacheInfo, setShowCacheInfo] = useState(false);
+  const [showTokensInfo, setShowTokensInfo] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
   // Onboarding's open-at-login switch: on by default, applied on Continue so
@@ -1925,7 +1926,7 @@ export default function App() {
   const [uninstallError, setUninstallError] = useState<string | null>(null);
   // "cancel" is not a plan: it is the cancel-subscription action, which shares the
   // busy state so only the button that was clicked reads "Opening...".
-  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | null>(null);
+  const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | "cancel" | "billing" | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
   const [pendingPlanChange, setPendingPlanChange] = useState<{
     fromTier: HeadroomSubscriptionTier;
@@ -4539,8 +4540,7 @@ export default function App() {
     try {
       const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
         email,
-        code,
-        inviteCode: null
+        code
       });
       pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
@@ -4609,6 +4609,19 @@ export default function App() {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [windowLabel]);
+
+  // The tray menu's "Invite friends" item shows the window, then asks for the
+  // Invite view.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("open-view", (event) => {
+      if (event.payload === "invite") {
+        setActiveView("invite");
+      }
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   async function confirmMagicLinkSignIn() {
     if (!magicLinkPending) {
@@ -4849,6 +4862,18 @@ export default function App() {
     await openExternalLink(url);
   }
 
+  async function handleUpdatePaymentMethod() {
+    setUpgradeActionBusy("billing");
+    setUpgradeActionError(null);
+    try {
+      await openBillingPortal();
+    } catch (error) {
+      setUpgradeActionError(describeInvokeError(error, "Could not open billing portal."));
+    } finally {
+      setUpgradeActionBusy(null);
+    }
+  }
+
   function openCancelReason() {
     setCancelReason("");
     setCancelNote("");
@@ -5023,41 +5048,6 @@ export default function App() {
 
   const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
   const headroomVersion = headroomTool?.version ?? "Unknown";
-  // Paired context for the savings headline. The headline rate dilutes as the
-  // client's prompt caching improves, because cache reads sit in its
-  // denominator while compression deliberately never touches the cached
-  // prefix -- so a healthier cache reads as a Headroom regression. Show the
-  // two forces side by side instead: how much of lifetime input the client's
-  // cache served (cheap, never claimed by Headroom), and how much of the
-  // REMAINING (compressible) input Headroom removed.
-  // All three rows go through cacheHitPair, which prices both rates in
-  // dollars (see its doc for why tokens are invalid here). The all-time row
-  // feeds it the lifetime breakdown as a single synthetic bucket;
-  // cacheReadTokens is used only as an existence signal for coverage, never
-  // ratioed against our own token counts.
-  //
-  // The numerator is compression ALONE, not lifetimeEstimatedSavingsUsd. That
-  // three-layer total also carries output shaping and tool-schema deferral,
-  // neither of which removes input, so pairing it with an input-cost
-  // denominator made all-time read above the two rows beside it (measured
-  // 2026-09-10: 17.0% against 11.6% this month, 2.2pp of the gap being the
-  // extra layers rather than better compression). Same layer as the windowed
-  // rows now, so the three are comparable.
-  const cachePairAllTime = allTimeCacheHitPair(
-    dashboard.savingsBreakdown,
-    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0,
-    dashboard.dailySavings
-  );
-  // Same pair for the shorter windows, from the buckets that carry cache
-  // coverage (backend history checkpoints; local-tracker buckets and days
-  // aged out of retention are excluded from both rates). The all-time row
-  // above uses the true lifetime breakdown instead, which predates coverage.
-  const cachePairToday = cacheHitPair(
-    buildHourlySavingsWindow(dashboard.hourlySavings, new Date())
-  );
-  const cachePairMonth = cacheHitPair(
-    buildMonthlySavingsWindow(dashboard.dailySavings, new Date())
-  );
   const rtkAvgSavingsPct =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalCommands ?? 0) > 0
       ? runtimeStatus.rtk.avgSavingsPct ?? 0
@@ -5075,10 +5065,15 @@ export default function App() {
   // summed from the same buckets as the History headline, so no day can read
   // above the all-time figure. `lifetimeEstimatedTokensSaved` stays input-only
   // for milestones and telemetry (see state.rs).
-  const lifetimeTokensSaved = dashboard.dailySavings.reduce(
-    (sum, point) => sum + point.estimatedTokensSaved + (point.outputTokensSaved ?? 0),
+  const lifetimeInputTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + point.estimatedTokensSaved,
     0
   );
+  const lifetimeOutputTokensSaved = dashboard.dailySavings.reduce(
+    (sum, point) => sum + (point.outputTokensSaved ?? 0),
+    0
+  );
+  const lifetimeTokensSaved = lifetimeInputTokensSaved + lifetimeOutputTokensSaved;
   const lifetimeDataDaysLabel =
     lifetimeDataDays > 0
       ? `Based on ${lifetimeDataDays} day${lifetimeDataDays === 1 ? "" : "s"} of data`
@@ -6859,6 +6854,21 @@ export default function App() {
               </span>
             </button>
           ))}
+          {/* Paid referral program: only someone who can refer gets a code. */}
+          {pricingStatus?.account?.referralCode ? (
+            <button
+              className={`tray-nav__item${activeView === "invite" ? " is-active" : ""}`}
+              onMouseDown={() => setActiveView("invite")}
+              type="button"
+            >
+              <span className="tray-nav__icon" aria-hidden="true">
+                <Gift className="tray-nav__icon-svg" size={26} weight={activeView === "invite" ? "fill" : "regular"} />
+              </span>
+              <span className="tray-nav__text">
+                <strong>Invite friends</strong>
+              </span>
+            </button>
+          ) : null}
           <button
             className="tray-nav__item"
             onClick={() => openLinkFromClick(DOCS_URL)}
@@ -6899,6 +6909,33 @@ export default function App() {
         {/* Outside every tray-content pane on purpose: the clamp applies wherever
             the user is, so the notice does too. Home-only meant a user parked on
             Activity or Settings was metered with nothing on screen saying so. */}
+        {/* A failed renewal drops the account to free while Polar retries the
+            card for three weeks. Without this the app just looked free, with
+            nothing saying why or what fixes it. Shares the tier-mismatch
+            banner's look: same kind of standing account notice. */}
+        {pricingStatus?.account?.paymentFailed ? (
+          <section className="tier-mismatch-banner" role="status">
+            <div className="tier-mismatch-banner__body">
+              <h2 className="tier-mismatch-banner__title">Your Headroom payment didn't go through</h2>
+              <p className="tier-mismatch-banner__message">
+                Your card was declined at renewal, so you're on the free plan for now. Update your card and the next retry brings your subscription back.
+              </p>
+              {upgradeActionError && upgradeActionBusy === null ? (
+                <p className="tier-mismatch-banner__error" role="status">
+                  {upgradeActionError}
+                </p>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className="tier-mismatch-banner__action"
+              disabled={upgradeActionBusy === "billing"}
+              onClick={() => void handleUpdatePaymentMethod()}
+            >
+              {upgradeActionBusy === "billing" ? "Opening…" : "Update card"}
+            </button>
+          </section>
+        ) : null}
         {tierMismatch ? (
           <section
             className={`tier-mismatch-banner${tierMismatch.clamped ? " tier-mismatch-banner--clamped" : ""}`}
@@ -7076,9 +7113,9 @@ export default function App() {
                   Total tokens saved
                   <button
                     className="stat-card__info-button"
-                    onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
+                    onClick={(e) => { e.stopPropagation(); setShowTokensInfo(true); }}
                     type="button"
-                    aria-label="Cache hits and compression by period"
+                    aria-label="What tokens saved includes"
                   >
                     <Info size={13} weight="bold" />
                   </button>
@@ -7793,6 +7830,13 @@ export default function App() {
                   <p className="upgrade-trial-callout__message">
                     {upgradeTrialCallout.message}
                   </p>
+                  {pricingStatus?.account?.referralRewardPending ? (
+                    <p className="upgrade-trial-callout__message">
+                      You were invited by a friend: subscribe and you both get a free month.
+                    </p>
+                  ) : pricingStatus?.authenticated ? (
+                    <ReferralCodeEntry onApplied={() => void refreshPricingStatus(true)} />
+                  ) : null}
                 </div>
                 {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (
                   <button
@@ -8062,6 +8106,20 @@ export default function App() {
             </div>
             {pricingAuthCard}
           </section>
+        </div>
+
+        <div className="tray-content" hidden={activeView !== "invite"}>
+          {pricingStatus?.account?.referralCode ? (
+            <ReferralCard
+              code={pricingStatus.account.referralCode}
+              signups={pricingStatus.account.referralSignups ?? 0}
+              subscribed={pricingStatus.account.referralSubscribed ?? 0}
+              freeMonths={pricingStatus.account.referralFreeMonths ?? 0}
+              rewardPending={pricingStatus.account.referralRewardPending === true}
+            />
+          ) : (
+            <p>Inviting friends is for subscribers.</p>
+          )}
         </div>
 
         <div className="tray-content" hidden={activeView !== "settings"}>
@@ -8394,6 +8452,8 @@ export default function App() {
                 </div>
               </article>
 
+              <UsageDataPanel />
+
               {/* Power-user settings almost nobody needs, collapsed so they do
                   not crowd out the ones people came here for. New ones go
                   inside; the disclosure state is the browser's own. */}
@@ -8592,49 +8652,42 @@ export default function App() {
             </div>
           )}
 
-          {showCacheInfo && (
+          {showTokensInfo && (
             <div
               className="modal-backdrop"
               role="dialog"
               aria-modal="true"
-              onClick={() => setShowCacheInfo(false)}
+              onClick={() => setShowTokensInfo(false)}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                <h3>Cache hits &amp; compression</h3>
-                <p>
-                  Most of your input is re-sent conversation history that your AI client serves
-                  from the provider&apos;s prompt cache at ~10% of the input price. Headroom
-                  deliberately leaves that cached prefix untouched (compressing it would break the
-                  discount), so its compression works on the rest. A healthier cache makes blended
-                  savings rates look smaller while your actual bill shrinks.
-                </p>
+                <h3>Tokens saved</h3>
+                {/* The card's figure, split by layer: same buckets as
+                    lifetimeTokensSaved, so the rows add up to the card. */}
                 <div className="savings-breakdown">
-                  {[
-                    { label: "Today", pair: cachePairToday },
-                    { label: "This month", pair: cachePairMonth },
-                    { label: "All time", pair: cachePairAllTime }
-                  ].map(({ label, pair }) => (
-                    <div className="savings-breakdown__row" key={label}>
-                      <span>{label}</span>
-                      <strong>
-                        {pair
-                          ? `${Math.round(pair.hitPct)}% cache hits · ${Math.round(
-                              pair.compressedPct
-                            )}% of the rest compressed`
-                          : "No cache data"}
-                      </strong>
-                    </div>
-                  ))}
+                  <div className="savings-breakdown__row">
+                    <span>Input compression</span>
+                    <strong>{compactNumber(lifetimeInputTokensSaved)}</strong>
+                  </div>
+                  <p className="savings-breakdown__note">
+                    Tokens Headroom removed from your requests before they reached the model.
+                  </p>
+                  {lifetimeOutputTokensSaved > 0 ? (
+                    <>
+                      <div className="savings-breakdown__row">
+                        <span>Output shaping</span>
+                        <strong>{compactNumber(lifetimeOutputTokensSaved)}</strong>
+                      </div>
+                      <p className="savings-breakdown__note">
+                        Tokens the model didn&apos;t have to write because Headroom asked for
+                        shorter replies. An estimate against your past replies.
+                      </p>
+                    </>
+                  ) : null}
                 </div>
-                <p className="savings-breakdown__note">
-                  Today and this month cover the part of the period with cache data (the backend
-                  keeps a limited history of cache checkpoints). Output shaping is a separate
-                  layer and is not part of these rates.
-                </p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"
-                    onClick={() => setShowCacheInfo(false)}
+                    onClick={() => setShowTokensInfo(false)}
                     type="button"
                   >
                     Got it

@@ -4677,12 +4677,8 @@ async fn verify_headroom_auth_code(
     state: State<'_, AppState>,
     email: String,
     code: String,
-    invite_code: Option<String>,
 ) -> Result<HeadroomPricingStatus, String> {
-    let used_invite_code = invite_code
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty());
-    let status = pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())?;
+    let status = pricing::verify_auth_code(&state, &email, &code)?;
     // Reconcile the runtime with the freshly evaluated status. Mirrors
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
@@ -4704,11 +4700,7 @@ async fn verify_headroom_auth_code(
             state.apply_pricing_gates(&status);
         });
     }
-    analytics::track_event(
-        &app,
-        "auth_verified",
-        Some(json!({ "invite_code_used": used_invite_code })),
-    );
+    analytics::track_event(&app, "auth_verified", None);
     // Pricing status is per-window UI state, so the window that did not run
     // the sign-in keeps rendering the signed-out code form until its own poll
     // ticks. Broadcast so every window re-reads it now.
@@ -4774,6 +4766,13 @@ async fn change_headroom_subscription_plan(
 async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> {
     pricing::reactivate_subscription()?;
     analytics::track_event(&app, "subscription_reactivated", None);
+    Ok(())
+}
+
+#[tauri::command]
+async fn apply_headroom_referral_code(app: AppHandle, code: String) -> Result<(), String> {
+    pricing::apply_referral_code(&code)?;
+    analytics::track_event(&app, "referral_code_applied", None);
     Ok(())
 }
 
@@ -6510,6 +6509,20 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn get_usage_data_enabled() -> bool {
+    !client_adapters::is_usage_data_disabled()
+}
+
+/// Settings > Usage analytics and crash reports. Takes effect at once: every
+/// sender checks `analytics::sharing_enabled` before it sends.
+#[tauri::command]
+fn set_usage_data_enabled(enabled: bool) -> Result<bool, String> {
+    client_adapters::set_usage_data_enabled(enabled).map_err(|err| err.to_string())?;
+    analytics::set_sharing_enabled(enabled);
+    Ok(!client_adapters::is_usage_data_disabled())
+}
+
+#[tauri::command]
 fn get_claude_statusline_enabled() -> bool {
     !client_adapters::is_statusline_disabled()
 }
@@ -6830,6 +6843,9 @@ fn handle_crash_guard_flag() {
             scope.set_fingerprint(Some(&["crash-guard-unwired"]));
         });
         let _ = logging::init();
+        // The guard read the setting at launch; the user may have changed it
+        // since, in the app it has been idling beside.
+        analytics::set_sharing_enabled(!client_adapters::is_usage_data_disabled());
         log::info!("crash guard: unwired {unwired:?}");
         log::warn!("crash guard: Headroom exited without quitting; unwired its clients");
         if let Some(client) = sentry::Hub::current().client() {
@@ -7287,12 +7303,14 @@ pub fn run() {
             .exec();
     }
 
+    // Before Sentry: its before_send reads this for every event.
+    analytics::set_sharing_enabled(!client_adapters::is_usage_data_disabled());
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
         sentry::ClientOptions {
             release: sentry::release_name!(),
             attach_stacktrace: true,
-            before_send: Some(std::sync::Arc::new(logging::sanitize_event)),
+            before_send: Some(std::sync::Arc::new(logging::before_send)),
             ..Default::default()
         },
     ));
@@ -7839,6 +7857,7 @@ pub fn run() {
             create_headroom_checkout_session,
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
+            apply_headroom_referral_code,
             get_headroom_billing_portal_url,
             submit_headroom_cancellation_intent,
             get_activity_feed,
@@ -7881,6 +7900,8 @@ pub fn run() {
             get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
+            get_usage_data_enabled,
+            set_usage_data_enabled,
             uninstall_and_quit,
             quit_headroom,
             #[cfg(debug_assertions)]
@@ -8596,6 +8617,9 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // manage usage credits at claude.ai/settings/usage ...` -- a credit
         // ceiling worded without "limit" at all.
         "out of usage credits",
+        // RUST-M8: `You're out of extra usage · resets 1:40pm
+        // (Europe/Lisbon)` -- the extra-usage pool, same family.
+        "out of extra usage",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -8645,6 +8669,10 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // is the exhausted-balance line above; this one fires with a full
             // balance and no long-context entitlement.
             || lower.contains("credits are required")
+            // RUST-M8: `Your account is on hold and can't use Claude Code.
+            // View details or appeal: https://claude.ai/restricted` -- an
+            // account restriction, and the line carries its own appeal link.
+            || lower.contains("account is on hold")
     })
 }
 
@@ -9746,6 +9774,42 @@ fn update_tray_menu_info(
 /// label. `TrayIcon` has no menu getter.
 static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
+/// Whether the signed-in account can refer friends (the server sent it a
+/// referral code). Written by every pricing refresh, read by the tray loop.
+pub(crate) static TRAY_REFERRAL_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Shows the tray's invite item exactly while the account can refer, so a free
+/// user is never offered an invite they cannot send. `item` is the one shown.
+fn sync_tray_invite_item(
+    app: &AppHandle,
+    item: &mut Option<tauri::menu::MenuItem<tauri::Wry>>,
+) -> tauri::Result<()> {
+    let Some(menu) = TRAY_MENU.get() else {
+        return Ok(());
+    };
+    match (TRAY_REFERRAL_AVAILABLE.load(Ordering::Relaxed), item.take()) {
+        (true, None) => {
+            let invite = tauri::menu::MenuItem::with_id(
+                app,
+                "invite",
+                "Invite friends, get a free month",
+                true,
+                None::<&str>,
+            )?;
+            let after_pause = menu
+                .items()?
+                .iter()
+                .position(|existing| existing.id() == "pause")
+                .map_or(0, |pos| pos + 1);
+            menu.insert(&invite, after_pause)?;
+            *item = Some(invite);
+        }
+        (false, Some(shown)) => menu.remove(&shown)?,
+        (_, unchanged) => *item = unchanged,
+    }
+    Ok(())
+}
+
 /// The tray menu and its savings line, for `update_tray_menu_info`.
 static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync::OnceLock::new();
 static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
@@ -9833,6 +9897,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                         log::warn!("tray pause toggle failed: {err}");
                     }
                 });
+            }
+            "invite" => {
+                if show_primary_window(app).unwrap_or(false) {
+                    let _ = app.emit("open-view", "invite");
+                }
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
@@ -9995,6 +10064,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_pause_label: Option<&str> = None;
         let mut last_menu_info: Option<(String, Vec<String>)> = None;
         let mut usage_items: Vec<tauri::menu::MenuItem<tauri::Wry>> = Vec::new();
+        let mut invite_item: Option<tauri::menu::MenuItem<tauri::Wry>> = None;
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -10103,6 +10173,9 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         log::warn!("tray menu info update failed: {err}");
                     }
                     last_menu_info = Some(menu_info);
+                }
+                if let Err(err) = sync_tray_invite_item(&app, &mut invite_item) {
+                    log::warn!("tray invite item update failed: {err}");
                 }
 
                 let mut icon_changed = false;
@@ -15185,6 +15258,9 @@ Some unrelated content.
         // RUST-FV verbatim: no "limit" in it at all.
         let credits = "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
         assert_eq!(learn_failure_agent_limit_line(credits), Some(credits));
+        // RUST-M8 verbatim.
+        let extra = "You're out of extra usage \u{b7} resets 1:40pm (Europe/Lisbon)";
+        assert_eq!(learn_failure_agent_limit_line(extra), Some(extra));
     }
 
     #[test]
@@ -15203,6 +15279,8 @@ Some unrelated content.
             // CLI asked for. Our digest is capped well under that, so the
             // entitlement is the whole cause.
             "Usage credits are required for long context requests.",
+            // RUST-M8 verbatim: an account restriction with its own appeal link.
+            "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(

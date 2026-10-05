@@ -298,8 +298,15 @@ if [ -f "$PRE/meta.json" ]; then
     # resets all-time records for every user.
     a=$(jq -c '{t:.allTimeRecordTokens,r:.lastWeeklyRecapWeekKey}' "$CFG/activity-facts.json" 2>/dev/null)
     b=$(jq -c '{t:.allTimeRecordTokens,r:.lastWeeklyRecapWeekKey}' "$PRE/activity-facts.json" 2>/dev/null)
-    [ "$a" = "$b" ] && row PASS "14 records/recap" "$a" \
-      || row FAIL "14 records/recap" "now $a, was $b"
+    # A wipe shows as a lower record or a changed recap key. Traffic between the
+    # snapshot and this run may raise the record (0.9.34-rc.11 guest: 0 -> 367
+    # from the train's own requests), which is not one.
+    if [ "$(jq -n --argjson a "${a:-null}" --argjson b "${b:-null}" \
+      '$a != null and $b != null and $a.r == $b.r and ($a.t // 0) >= ($b.t // 0)')" = true ]; then
+      row PASS "14 records/recap" "$a (was $b)"
+    else
+      row FAIL "14 records/recap" "now $a, was $b"
+    fi
   fi
 else
   row FAIL "14 snapshot freshness" "no $PRE/meta.json (build <0.9.3, or first launch never happened)"
@@ -442,6 +449,17 @@ else
   if [ "$QUICK" = 1 ]; then
     : # SIGUSR1 already reported as skipped above
   else
+    # A fresh backend (checks 6 and 9 just restarted it) warms Kompress on a
+    # background thread, and faulthandler's all-threads dump segfaults the
+    # process when another thread is inside torch (rc9 and rc11 guest runs:
+    # "torch/_ops.py ... Fatal Python error: Segmentation fault", reported
+    # here as "never imported"). Wait for this boot's warm-up to finish.
+    for _ in $(seq 1 45); do
+      case "$(grep -E 'Kompress: (DEFERRED|warmed)' "$PROXY_LOG" 2>/dev/null | tail -1)" in
+        *DEFERRED*) sleep 2 ;;
+        *) break ;;
+      esac
+    done
     # Definitive proof sitecustomize was IMPORTED, not merely present. The dump
     # lands in the per-boot log, not ~/.headroom/logs/proxy.log. Destructive
     # when injection did not happen: Python has no handler and the OS default

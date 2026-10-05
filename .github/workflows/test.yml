@@ -300,9 +300,10 @@ jobs:
         # exact pin every vendor must bind, and after a wheel bump a skip is
         # the cue to drop or re-pin that vendor (Wheel Bump Rules, CLAUDE.md).
         # macOS because the truststore vendor runs only here and on Windows.
-        # One test at a time: each spawns a Python probe with sub-second
-        # deadlines, and fourteen at once on a 3-vCPU runner starve the
+        # The two probes with sub-second deadlines run alone, after the rest:
+        # fourteen probes at once on a 3-vCPU runner starved the
         # responses-budget probe into a false "fixed request still timed out".
+        # The others have no tight deadline and run three at a time.
         shell: bash
         env:
           HEADROOM_DATA_DIR: ${{ runner.temp }}/headroom-wheel
@@ -320,15 +321,25 @@ jobs:
             "$py" -m pip install --quiet --no-deps --only-binary=:all: "headroom-ai==$pin"
           ) &
           runtime=$!
-          cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run
+          # Run the built binary rather than a second `cargo test`, which
+          # recompiles the crate (~40s): generate_context! writes Info.plist
+          # into OUT_DIR mid-build, so a cold build is stale on the next call.
+          bin=$(cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.executable != null) | .executable')
+          test -x "$bin"
           wait "$runtime"
-          cargo test --manifest-path src-tauri/Cargo.toml --lib against_the_installed_wheel \
-            -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
+          cd src-tauri
+          {
+            "$bin" against_the_installed_wheel --skip responses_shared_budget \
+              --skip quarantine_spare_capacity --nocapture --test-threads=3
+            "$bin" responses_shared_budget_behaves quarantine_spare_capacity_vendor_behaves \
+              --nocapture --test-threads=1
+          } 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
           if grep 'skipping:' "$RUNNER_TEMP/wheel-tests.log"; then
             echo "::error::a vendor test skipped against headroom-ai $pin"
             exit 1
           fi
-          grep -qE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/wheel-tests.log"
+          test "$(grep -cE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/wheel-tests.log")" -eq 2
 
   macos-intel-lock:
     # Intel Macs still receive the shipped app: the release builds

@@ -395,6 +395,10 @@ untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
 Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
 that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
 Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
+
+Can also write the serving loop's stack to logs/loop-stall.txt when the
+event loop stalls (desktop diagnostic, RUST-86). Off unless
+HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
 """
 import faulthandler
 import signal
@@ -2923,6 +2927,251 @@ else:
         # Fail-open to the wheel's tokenizer derivation (the pre-vendor behaviour).
         pass
 
+# --- CCR retrieve tool enters on the first request (vendor, upstream #3810) ---
+# apply_session_sticky_ccr_tool adds headroom_retrieve to `tools` at a
+# session's FIRST compression, typically many turns in. `tools` is the head of
+# Anthropic's cache key, so that one change invalidates the whole warm prefix:
+# on 2026-10-05 seven such requests on one machine lost 519,933 cached tokens to
+# save 6,683, and a SWE-bench pilot run lost 32,501 to save 1,231. #3810 (merged
+# 2026-09-28, unreleased) injects the ~119-token definition on the session's
+# first request instead, when the client already sends tools, so the array
+# never changes again. Its hunks are applied verbatim to the installed
+# function's source (comments shortened). Both 0.39.0 call sites (anthropic and
+# openai chat) sit inside `not _bypass` and import the function at call time;
+# #3810 passes allow_eager = optimize and not bypass, so the rebound name
+# defaults allow_eager to "--no-optimize not on the command line". Streaming
+# is unchanged: a resident tool without a redeemable marker keeps the streaming
+# path (#3071). A live session that never compressed loses its cache once, on
+# its first request after the update. Exact-pin gated to wheel 0.39.0;
+# self-neutralizes when the wheel ships get_ccr_tool_injection_mode or a hunk's
+# old text is gone. Kill switch: HEADROOM_CCR_TOOL_INJECTION=lazy (#3810's own
+# name; any value but "eager" keeps the wheel's function).
+_hd_cte_flag = (_hd_os.environ.get("HEADROOM_CCR_TOOL_INJECTION") or "eager").strip().lower()
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_flag == "eager":
+    try:
+        import importlib.metadata as _hd_cte_meta
+
+        if _hd_cte_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_cte_inspect
+
+            from headroom.proxy import helpers as _hd_cte_mod
+
+            _hd_cte_hunks = (
+                (
+                    "    history_has_ccr_reference: bool = False,\n) -> tuple[",
+                    "    history_has_ccr_reference: bool = False,\n"
+                    "    allow_eager: bool = False,\n) -> tuple[",
+                ),
+                (
+                    "        if not (has_compressed_content_this_turn or history_has_ccr_reference):\n",
+                    '        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"\n'
+                    "        if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):\n",
+                ),
+                (
+                    '            else "inject_history_reference",\n',
+                    '            else ("inject_history_reference" if history_has_ccr_reference else "inject_eager"),\n',
+                ),
+                (
+                    "\n    if not has_compressed_content_this_turn:\n",
+                    "\n    # headroom-desktop vendor of #3810: enter the tools array cold.\n"
+                    '    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"\n'
+                    "    if not (eager or has_compressed_content_this_turn):\n",
+                ),
+                (
+                    '        decision="inject_first_time",\n',
+                    '        decision="inject_first_time" if has_compressed_content_this_turn else "inject_eager",\n',
+                ),
+            )
+            _hd_cte_src = _hd_cte_inspect.getsource(_hd_cte_mod.apply_session_sticky_ccr_tool)
+            if not hasattr(_hd_cte_mod, "get_ccr_tool_injection_mode") and all(
+                _hd_cte_src.count(old) == 1 for old, _ in _hd_cte_hunks
+            ):
+                for _hd_cte_old, _hd_cte_new in _hd_cte_hunks:
+                    _hd_cte_src = _hd_cte_src.replace(_hd_cte_old, _hd_cte_new)
+
+                def _hd_cte_mode():
+                    raw = (_hd_os.environ.get("HEADROOM_CCR_TOOL_INJECTION") or "").strip().lower()
+                    return "lazy" if raw == "lazy" else "eager"
+
+                _hd_cte_ns = {}
+                exec(
+                    compile(_hd_cte_src, "<headroom-desktop ccr tool eager>", "exec"),
+                    _hd_cte_mod.__dict__,
+                    _hd_cte_ns,
+                )
+                _hd_cte_fn = _hd_cte_ns["apply_session_sticky_ccr_tool"]
+                _hd_cte_allow = "--no-optimize" not in _hd_sys.argv
+
+                def _hd_cte_apply(**kwargs):
+                    kwargs.setdefault("allow_eager", _hd_cte_allow)
+                    return _hd_cte_fn(**kwargs)
+
+                _hd_cte_apply.__doc__ = _hd_cte_fn.__doc__
+                _hd_cte_mod.get_ccr_tool_injection_mode = _hd_cte_mode
+                _hd_cte_mod.apply_session_sticky_ccr_tool = _hd_cte_apply
+                _hd_bound.add("ccr_tool_eager")
+    except Exception:
+        # Fail-open to the wheel's first-compression injection (pre-vendor).
+        pass
+
+# --- Read maturation: cache the tail over a held Read (vendor) ------------------
+# read_maturation (HEADROOM_READ_MATURATION, desktop default since 0.9.7) holds
+# a fresh Read result of >= 2048 bytes out of the provider cache until its
+# file has been quiet 5 assistant turns (cap 25): relocate_cache_breakpoint
+# strips every message breakpoint from the held Read onward and re-anchors one
+# on the message before it. Claude Code marks the last two messages, so its
+# tail marker is always stripped (the cache_breakpoints log line says
+# dropped=true) and
+# nothing after the Read is cache-written until it matures. 2026-10-05,
+# proxy-6768.log: 37 of 1,353 requests in 8 holds; one 2,545-byte Read the
+# model kept editing held for 13 requests with cache_read pinned at 176,693 and
+# cache_write 0 while the uncached tail grew 3,879 -> 14,639 tokens a request.
+# The hold saves one cache write of the Read and costs a full-price resend of
+# the Read plus everything after it on every held turn (5 at least), and the
+# maturing turn writes from the Read onward either way. So the relocation
+# forwards the breakpoints the wheel's cache_control normalizer already put at the
+# client's positions (never adds or moves one). With the tail cached, the
+# provider-confirmed prefix soon passes the held Read and the wheel's `i <
+# frozen_message_count` gate keeps it verbatim: that is intended. rc.5-rc.9 also
+# kept such a Read maturable, and a week's replay of this machine's traffic
+# priced that at -23.7M base-input tokens a week: a median maturation rewrote
+# 19.2k cached tokens at the 1h write price to drop a 2.1k-token Read read at
+# 0.1x over a median 36 remaining turns (live: 151,528 rewritten for ~600 saved).
+# A Read still in the live zone at quiesce matures as before. Tokens saved from
+# maturation drop by design. The handler imports relocate_cache_breakpoint at
+# call time, so rebinding the module attribute reaches it. Exact-pin gated to
+# wheel 0.39.0; self-neutralizes when the wheel stops stripping a held Read's
+# breakpoint.
+# Kill switch: HEADROOM_HELD_READ_BREAKPOINT=0.
+_hd_hrb_flag = _hd_os.environ.get("HEADROOM_HELD_READ_BREAKPOINT", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_hrb_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_hrb_meta
+
+        if _hd_hrb_meta.version("headroom-ai") == "0.39.0":
+            import logging as _hd_hrb_logging
+
+            from headroom.transforms import read_maturation as _hd_hrb_mod
+
+            _hd_hrb_orig_relocate = _hd_hrb_mod.relocate_cache_breakpoint
+            _hd_hrb_log = _hd_hrb_logging.getLogger("headroom.proxy")
+
+            def _hd_hrb_relocate(messages, holding_msg_indices):
+                if holding_msg_indices:
+                    _hd_hrb_log.info(
+                        "event=held_read_breakpoint holding=%d", len(holding_msg_indices)
+                    )
+                return messages
+
+            def _hd_hrb_needed():
+                # The incident's shape: does the wheel still strip the client's
+                # marker off a held Read's tool_result?
+                out = _hd_hrb_orig_relocate(
+                    [
+                        {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "r",
+                                    "content": "x",
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        },
+                    ],
+                    [1],
+                )
+                return "cache_control" not in out[1]["content"][0]
+
+            if _hd_hrb_needed():
+                _hd_hrb_mod.relocate_cache_breakpoint = _hd_hrb_relocate
+                _hd_bound.add("held_read_breakpoint")
+    except Exception:
+        # Fail-open to the wheel's relocation (the pre-vendor behaviour).
+        pass
+
+# --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
+# /stats on the backend port times out after 15s while /readyz answers right
+# after, on idle hosts as often as busy ones: something holds the event loop
+# and is gone before anything outside the process can look (the watchdog's
+# SIGUSR1 dump only runs on a wedge, and never on Windows). A 1s heartbeat on
+# the serving loop keeps re-arming faulthandler's timer; a loop stalled for
+# HEADROOM_LOOP_STALL_DUMP seconds misses the re-arm and faulthandler's own C
+# thread writes every Python thread's stack to logs/loop-stall.txt. Armed after
+# startup (the lifespan boot blocks the loop by design), disarmed on shutdown.
+# The desktop attaches the loop thread's stack to the next RUST-86 event.
+# OFF BY DEFAULT (0), opt-in for one machine at a time: that dump reads other
+# threads' frames without the GIL, and on 2026-10-05 it segfaulted a backend
+# whose Kompress warm-up thread was inside torch, and in a scratch repro spun
+# forever in dump_frame while the next re-arm (cancel_dump_traceback_later,
+# GIL held) waited on it, wedging the process. A stall is when other threads
+# are busy, so the fleet's ~45 RUST-86 stalls a day would each risk that.
+# A safe form samples sys._current_frames() from a Python thread holding the
+# GIL. Diagnostic only: nothing the proxy forwards changes.
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        _hd_ls_secs = float(_hd_os.environ.get("HEADROOM_LOOP_STALL_DUMP", "0"))
+        if _hd_ls_secs > 0:
+            import headroom.paths as _hd_ls_paths
+            import uvicorn.server as _hd_ls_uv
+
+            _hd_ls_orig_startup = _hd_ls_uv.Server.startup
+            _hd_ls_orig_shutdown = _hd_ls_uv.Server.shutdown
+            _hd_ls_armed = [False]
+
+            async def _hd_ls_startup(self, *args, **kwargs):
+                result = await _hd_ls_orig_startup(self, *args, **kwargs)
+                if self.should_exit:
+                    return result
+                try:
+                    import asyncio as _hd_ls_asyncio
+
+                    loop = _hd_ls_asyncio.get_running_loop()
+                    path = _hd_ls_paths.log_dir() / "loop-stall.txt"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    # O_BINARY: a Windows text-mode fd would turn each "\n"
+                    # into "\r\n" and blur the blank line between threads.
+                    fd = _hd_os.open(
+                        str(path),
+                        _hd_os.O_WRONLY
+                        | _hd_os.O_CREAT
+                        | _hd_os.O_TRUNC
+                        | getattr(_hd_os, "O_BINARY", 0),
+                        0o600,
+                    )
+                    _hd_ls_armed[0] = True
+
+                    def beat():
+                        if not _hd_ls_armed[0]:
+                            return
+                        # One dump is a few KB; the cap only bites on a loop
+                        # that stalls every few seconds for hours.
+                        if _hd_os.lseek(fd, 0, _hd_os.SEEK_CUR) > 262144:
+                            _hd_os.ftruncate(fd, 0)
+                            _hd_os.lseek(fd, 0, _hd_os.SEEK_SET)
+                        faulthandler.dump_traceback_later(_hd_ls_secs, file=fd)
+                        loop.call_later(1.0, beat)
+
+                    beat()
+                except Exception:
+                    pass
+                return result
+
+            async def _hd_ls_shutdown(self, *args, **kwargs):
+                _hd_ls_armed[0] = False
+                faulthandler.cancel_dump_traceback_later()
+                return await _hd_ls_orig_shutdown(self, *args, **kwargs)
+
+            _hd_ls_uv.Server.startup = _hd_ls_startup
+            _hd_ls_uv.Server.shutdown = _hd_ls_shutdown
+            _hd_bound.add("loop_stall_dump")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2962,6 +3211,9 @@ _HD_VENDORS = (
     "image_memo",
     "image_worker_reap",
     "stream_uncached_input",
+    "ccr_tool_eager",
+    "held_read_breakpoint",
+    "loop_stall_dump",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -2982,7 +3234,10 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.ar
 /// Requested for every install since 0.9.7-rc.1 (2026-09-02): the 0.37.0
 /// freeze policy caps tail-only compression at ~1-2% on big sessions, and
 /// read_maturation is the cache-safe recovery leg (holds Read results out of
-/// the provider cache until they quiesce; never mutates a cached byte). It is
+/// the provider cache until they quiesce; never mutates a cached byte). Since
+/// 0.9.34-rc.5 the `held_read_breakpoint` vendor caches the tail over a held
+/// Read instead; from rc.10 a Read the cached prefix has passed stays verbatim,
+/// since maturing it would rewrite every cached byte after it. It is
 /// still cache-breakpoint machinery -- the class that cost 89 installs ~17pp
 /// on 0.9.4 -- so the falsey spellings of `HEADROOM_READ_MATURATION` stay a
 /// no-rebuild kill switch, and the rc does not promote to stable until
@@ -16396,6 +16651,72 @@ mod tests {
         assert!(tail.contains("INFO:headroom.desktop:sitecustomize vendors bound="));
     }
 
+    /// RUST-86: a stalled backend loop must leave its stack where the
+    /// `/stats` timeout report can pick it up. Real uvicorn server, real
+    /// faulthandler timer, a 2.5s block of the serving loop.
+    #[test]
+    fn loop_stall_dump_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = dir.path().join("probe.py");
+        std::fs::write(
+            &probe,
+            r#"import asyncio, time, uvicorn
+
+async def app(scope, receive, send):
+    while scope["type"] == "lifespan":
+        message = await receive()
+        if message["type"] == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+
+def hd_probe_blocks_the_loop():
+    time.sleep(2.5)
+
+async def main():
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(1.5)
+    hd_probe_blocks_the_loop()
+    server.should_exit = True
+    await serving
+
+asyncio.run(main())
+"#,
+        )
+        .unwrap();
+        let workspace = dir.path().join("workspace");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("HEADROOM_WORKSPACE_DIR", &workspace)
+            .env("HEADROOM_LOOP_STALL_DUMP", "1")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run probe");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(stderr.contains("loop_stall_dump"), "{stderr}");
+        let (_, stacks) = crate::state::recent_loop_stall(
+            &workspace.join("logs").join("loop-stall.txt"),
+            std::time::SystemTime::now(),
+        )
+        .expect("a stalled loop leaves a dump");
+        let main = stacks.split("\n\n").next().unwrap();
+        assert!(main.contains("hd_probe_blocks_the_loop"), "{stacks}");
+    }
+
     #[test]
     fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
         let python =
@@ -16428,6 +16749,8 @@ mod tests {
         let (bound, skipped) = proxy[0].split_once(" skipped=").unwrap();
         assert!(bound.contains("ccr_repair_order"), "{}", proxy[0]);
         assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
+        // Opt-in only: its all-threads dump can crash or wedge a busy backend.
+        assert!(skipped.contains("loop_stall_dump"), "{}", proxy[0]);
         let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
         assert!(
             off.len() == 1
@@ -17683,6 +18006,124 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         }
         assert_eq!(on, "2 2 38211 True", "stderr:\n{on_err}");
         assert_eq!(off, "50663 0 38211 False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn ccr_tool_eager_behaves_against_the_installed_wheel() {
+        // Called the way both handlers call it (no allow_eager): a session's
+        // first request with client tools already carries headroom_retrieve,
+        // and the array is byte-identical at the first compression. A request
+        // with no tools is never armed; `--no-optimize` and the kill switch
+        // keep the wheel's wait-for-the-first-compression gate.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-ccr-eager-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, sitecustomize\n\
+                     from headroom.proxy import helpers as h\n\
+                     from headroom.ccr.tool_injection import CCR_TOOL_NAME\n\
+                     T = [{'name': 'Read', 'description': 'r', 'input_schema': {'type': 'object'}}]\n\
+                     def go(sid, comp, tools=T):\n\
+                     \x20   out, _ = h.apply_session_sticky_ccr_tool(provider='anthropic',\n\
+                     \x20       session_id=sid, request_id='r', existing_tools=list(tools),\n\
+                     \x20       has_compressed_content_this_turn=comp)\n\
+                     \x20   return out\n\
+                     has = lambda t: CCR_TOOL_NAME in [x.get('name') for x in t]\n\
+                     first, at_compression = go('s1', False), go('s1', True)\n\
+                     print(has(first), json.dumps(first) == json.dumps(at_compression),\n\
+                     \x20     has(go('s2', False, [])), has(go(None, False)),\n\
+                     \x20     'ccr_tool_eager' in sitecustomize._hd_bound)";
+        let run = |mode: &str, argv: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .args(argv)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CCR_TOOL_INJECTION", mode)
+                .output()
+                .expect("run ccr tool eager probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("eager", &[]);
+        let (no_opt, no_opt_err) = run("eager", &["--no-optimize"]);
+        let (off, off_err) = run("lazy", &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: ccr tool eager vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True True False True True", "stderr:\n{on_err}");
+        assert_eq!(
+            no_opt, "False False False False True",
+            "stderr:\n{no_opt_err}"
+        );
+        assert_eq!(off, "False False False False False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn held_read_breakpoint_behaves_against_the_installed_wheel() {
+        // Drives the installed wheel's real Anthropic handler for 8 turns over a
+        // held Read (scripts/verify-held-read-breakpoint.py): every turn keeps
+        // the client's 4 breakpoints, a Read the cached prefix has passed stays
+        // verbatim, and a held Read still in the live zone matures.
+        // Self-skips when the vendor does not bind, so green is NOT evidence
+        // after a bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-held-read-breakpoint.py");
+        if !python.exists() || !probe.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-hrb-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_HELD_READ_BREAKPOINT", flag)
+                .output()
+                .expect("run held read breakpoint probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if stdout.contains("FAIL hrb bound") {
+            eprintln!("skipping: held read breakpoint vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "held read breakpoint probe failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // With the switch off the wheel strips the client's tail marker on every
+        // held turn, which is also what proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL hrb bound")
+                && off_stdout.contains("FAIL every turn keeps the client's breakpoints"),
+            "HEADROOM_HELD_READ_BREAKPOINT=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
     }
 
     #[test]

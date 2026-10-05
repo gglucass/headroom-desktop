@@ -24,8 +24,10 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
-/// AppSumo accounts are pushed to upgrade faster: the clamp fires on their 4th
-/// active day (a local day with savings), capped by the calendar grace above.
+/// AppSumo free-year accounts (the $0 tier 1 for Plus members) are pushed to
+/// upgrade faster: the clamp fires on their 4th active day (a local day with
+/// savings), capped by the calendar grace above. Paid lifetime tiers get the
+/// calendar grace like everyone else (Garm, 2026-10-05).
 /// Active rather than calendar days so a Friday purchase isn't clamped by an
 /// idle weekend.
 const APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS: usize = 3;
@@ -137,7 +139,7 @@ struct IdentityPayload {
     claude_usage_windows: Option<String>,
     /// When the local tier-mismatch clock started, if a mismatch is currently
     /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this (sooner for
-    /// AppSumo accounts, see `APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS`), so the
+    /// AppSumo free-year accounts, see `APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS`), so the
     /// server can derive the mismatch cohort and most of who is clamped.
     #[serde(skip_serializing_if = "Option::is_none")]
     tier_mismatch_since: Option<String>,
@@ -197,20 +199,25 @@ const FILTER_DROP_HINT: &str =
 
 /// RUST-78: a macOS content filter that drops a flow defuncts the socket, and
 /// XNU's `sodefunct` sets `so_error = EBADF`, so the connect fails with "Bad
-/// file descriptor (os error 9)". Nothing in this process produces that, and
-/// the rule is per app: curl from Terminal still reaches us, which is why the
+/// file descriptor (os error 9)". A filter that blocks before the SYN goes out
+/// does it through an NECP drop policy instead, which `tcp_output` fails with
+/// EHOSTUNREACH, "No route to host (os error 65)" (the same host flipped from
+/// one to the other on 0.9.32, still 1574h silent while Terminal curl worked).
+/// The rule is per app: curl from Terminal still reaches us, which is why the
 /// generic "check your connection" sent the user in circles for six weeks.
 fn is_local_filter_drop(err: &reqwest::Error) -> bool {
-    err.is_connect() && chain_has_ebadf(err)
+    err.is_connect() && chain_has_filter_errno(err)
 }
 
-fn chain_has_ebadf(err: &(dyn std::error::Error + 'static)) -> bool {
+fn chain_has_filter_errno(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(err);
     while let Some(cause) = source {
         let errno = cause
             .downcast_ref::<std::io::Error>()
             .and_then(|e| e.raw_os_error());
-        if cfg!(target_os = "macos") && errno == Some(libc::EBADF) {
+        if cfg!(target_os = "macos")
+            && matches!(errno, Some(libc::EBADF) | Some(libc::EHOSTUNREACH))
+        {
             return true;
         }
         source = cause.source();
@@ -375,11 +382,33 @@ impl IdentityPayload {
             payload.tier_mismatch_since = local.mismatch_since.map(|at| at.to_rfc3339());
             payload.tier_mismatch_clamped_at = local.mismatch_clamped_at.map(|at| at.to_rfc3339());
         }
-        payload
+        payload.without_analytics_unless_shared()
     }
 
     fn device_only() -> Self {
-        Self::build(None, None)
+        Self::build(None, None).without_analytics_unless_shared()
+    }
+
+    /// Drops the fields only the admin's fleet views read (usage windows, the
+    /// Claude Desktop and WSL buckets) while the user has usage data off. What
+    /// licensing reads (device, accounts, plan tiers, the tier-mismatch clock,
+    /// terms) stays.
+    fn without_analytics_unless_shared(self) -> Self {
+        if crate::analytics::sharing_enabled() {
+            self
+        } else {
+            self.without_analytics()
+        }
+    }
+
+    fn without_analytics(self) -> Self {
+        Self {
+            codex_usage_windows: None,
+            claude_usage_windows: None,
+            claude_desktop: None,
+            wsl_agents: None,
+            ..self
+        }
     }
 
     fn build(claude: Option<&ClaudeAccountProfile>, codex: Option<&CodexAccountProfile>) -> Self {
@@ -509,6 +538,9 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
 /// on that thread too: callers include sync commands on the main thread.
 pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
     use tauri::Manager;
+    if !crate::analytics::sharing_enabled() {
+        return;
+    }
     let app = app.clone();
     spawn_funnel_step(
         move || IdentityPayload::for_state(&app.state::<AppState>()),
@@ -521,6 +553,9 @@ pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {
+    if !crate::analytics::sharing_enabled() {
+        return;
+    }
     spawn_funnel_step(
         IdentityPayload::device_only,
         step,
@@ -852,6 +887,18 @@ struct RemoteAccountResponse {
     recommended_tier: Option<HeadroomSubscriptionTier>,
     #[serde(default)]
     grandfathered: bool,
+    #[serde(default)]
+    payment_failed: bool,
+    #[serde(default)]
+    referral_code: Option<String>,
+    #[serde(default)]
+    referral_signups: usize,
+    #[serde(default)]
+    referral_subscribed: usize,
+    #[serde(default)]
+    referral_free_months: usize,
+    #[serde(default)]
+    referral_reward_pending: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -927,7 +974,6 @@ struct RequestCodePayload<'a> {
 struct VerifyCodePayload<'a> {
     email: &'a str,
     code: &'a str,
-    invite_code: Option<&'a str>,
     #[serde(flatten)]
     identity: IdentityPayload,
 }
@@ -1078,6 +1124,13 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // anywhere in the process (notably the proxy watchdog's auto-pause event)
     // carry the user's plan. Global scope: persists until overwritten.
     set_sentry_tier(status.account.as_ref());
+    crate::TRAY_REFERRAL_AVAILABLE.store(
+        status
+            .account
+            .as_ref()
+            .is_some_and(|a| a.referral_code.is_some()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(status)
 }
 
@@ -1516,9 +1569,8 @@ pub fn verify_auth_code(
     state: &AppState,
     email: &str,
     code: &str,
-    invite_code: Option<&str>,
 ) -> Result<HeadroomPricingStatus, String> {
-    verify_auth_code_with_base_url(state, email, code, invite_code, &api_base_url())
+    verify_auth_code_with_base_url(state, email, code, &api_base_url())
 }
 
 /// Test-only seam: `verify_auth_code` against a parameterized base URL so a
@@ -1527,7 +1579,6 @@ pub(crate) fn verify_auth_code_with_base_url(
     state: &AppState,
     email: &str,
     code: &str,
-    invite_code: Option<&str>,
     base_url: &str,
 ) -> Result<HeadroomPricingStatus, String> {
     let trimmed_email = email.trim().to_ascii_lowercase();
@@ -1544,7 +1595,6 @@ pub(crate) fn verify_auth_code_with_base_url(
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
-            invite_code: invite_code.map(str::trim).filter(|value| !value.is_empty()),
             identity: IdentityPayload::for_state(state),
         })
         .send()
@@ -1895,7 +1945,9 @@ pub fn report_milestone(milestone_tokens_saved: u64, savings: Option<&SavingsRep
         .apply_headers(builder)
         .json(&serde_json::json!({
             "milestone_tokens_saved": milestone_tokens_saved,
-            "savings": savings,
+            // The token count is the account's activation and referral credit;
+            // the snapshot only feeds the admin profile.
+            "savings": savings.filter(|_| crate::analytics::sharing_enabled()),
         }))
         .send();
 }
@@ -2121,6 +2173,41 @@ pub(crate) fn reactivate_subscription_with_base_url(base_url: &str) -> Result<()
             .filter(|value| !value.trim().is_empty());
         return Err(api_error
             .unwrap_or_else(|| format!("Could not reactivate subscription (status {status}).")));
+    }
+
+    Ok(())
+}
+
+/// Adds a paying friend's referral code to the signed-in account (paid
+/// referral program). The server's refusal reason is shown as is.
+pub fn apply_referral_code(code: &str) -> Result<(), String> {
+    apply_referral_code_with_base_url(&api_base_url(), code)
+}
+
+pub(crate) fn apply_referral_code_with_base_url(base_url: &str, code: &str) -> Result<(), String> {
+    let token = read_session_token()?
+        .ok_or_else(|| "Sign in to Headroom before adding a referral code.".to_string())?;
+    let response = http_client()?
+        .post(join_url(base_url, "desktop/account/referral"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "code": code.trim() }))
+        .send()
+        .map_err(|err| transport_failure("add your referral code", &err))?;
+
+    if response.status().as_u16() == 401 {
+        clear_session_token()?;
+        return Err("Your Headroom session expired. Sign in again.".into());
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let api_error = response
+            .json::<ApiErrorResponse>()
+            .ok()
+            .and_then(|body| body.error)
+            .filter(|value| !value.trim().is_empty());
+        return Err(api_error
+            .unwrap_or_else(|| format!("Could not add the referral code (status {status}).")));
     }
 
     Ok(())
@@ -2515,8 +2602,7 @@ fn resolve_tier_mismatch(
         }
     };
 
-    // `upgrade_action` is set only for AppSumo-entitled accounts.
-    let appsumo = account.is_some_and(|a| a.upgrade_action.is_some());
+    let appsumo = account.is_some_and(appsumo_free_year);
     let computed = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
     let clamped_at = latch_clamp_start(
         local.mismatch_clamped_at,
@@ -2550,8 +2636,17 @@ fn resolve_tier_mismatch(
     })
 }
 
+/// Whether the account is on the AppSumo free year, the only AppSumo license
+/// clamped on active days. `upgrade_action` is set only for AppSumo-entitled
+/// accounts, and of those only the free year carries an end date
+/// (headroom-web `AppsumoLicense#apply_entitlement!`); a free year later
+/// topped up with a paid license is rewritten without one.
+fn appsumo_free_year(account: &HeadroomAccountProfile) -> bool {
+    account.upgrade_action.is_some() && account.subscription_ends_at.is_some()
+}
+
 /// When the tier-mismatch grace ends (or ended: the UI shows it as the day
-/// metering started). AppSumo: local midnight of the first active day past the
+/// metering started). AppSumo free year: local midnight of the first active day past the
 /// allowance, if that comes before the calendar cap. `active_day_keys` must be
 /// ascending `YYYY-MM-DD` local day keys.
 fn tier_mismatch_grace_ends_at(
@@ -3484,6 +3579,12 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         appsumo_lifetime_tier: value.appsumo_lifetime_tier,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
+        payment_failed: value.payment_failed,
+        referral_code: value.referral_code,
+        referral_signups: value.referral_signups,
+        referral_subscribed: value.referral_subscribed,
+        referral_free_months: value.referral_free_months,
+        referral_reward_pending: value.referral_reward_pending,
     }
 }
 
@@ -4447,6 +4548,12 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
+            referral_code: None,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -4479,6 +4586,39 @@ mod tests {
             "unexpected verdict: {}",
             json["claudeDesktop"]
         );
+    }
+
+    #[test]
+    fn identity_payload_without_analytics_keeps_only_what_licensing_reads() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            claude_email: Some("me@example.com".into()),
+            claude_plan_tier: Some(ClaudePlanTier::Max5x),
+            tier_mismatch_since: Some("2026-10-01T00:00:00Z".into()),
+            claude_usage_windows: Some("five_hour=12@300".into()),
+            codex_usage_windows: Some("primary=99@43200".into()),
+            wsl_agents: Some("none".into()),
+            claude_desktop: Some("absent"),
+            ..Default::default()
+        }
+        .without_analytics();
+        let json = serde_json::to_value(&identity).unwrap();
+        for kept in [
+            "deviceId",
+            "claudeEmail",
+            "claudePlanTier",
+            "tierMismatchSince",
+        ] {
+            assert!(json.get(kept).is_some(), "{kept} dropped: {json}");
+        }
+        for dropped in [
+            "claudeUsageWindows",
+            "codexUsageWindows",
+            "wslAgents",
+            "claudeDesktop",
+        ] {
+            assert!(json.get(dropped).is_none(), "{dropped} sent: {json}");
+        }
     }
 
     #[test]
@@ -5066,6 +5206,12 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
+            referral_code: None,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -5098,6 +5244,12 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
+            referral_code: None,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -5801,6 +5953,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_account_carries_payment_failed_and_defaults_it_off() {
+        let parse = |extra: &str| {
+            let json = format!(
+                r#"{{"email":"a@b","trialActive":false,"subscriptionActive":false,"acceptedInvitesCount":0,"inviteBonusPercent":0{extra}}}"#
+            );
+            super::remote_account_to_profile(serde_json::from_str(&json).unwrap())
+        };
+        assert!(parse(r#","paymentFailed":true"#).payment_failed);
+        // Servers before the field existed.
+        assert!(!parse("").payment_failed);
+    }
+
+    #[test]
+    fn remote_account_carries_referral_fields_through_to_the_webview() {
+        let json = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0,"referralCode":"AB12CD34","referralSignups":5,"referralSubscribed":3,"referralFreeMonths":4,"referralRewardPending":true}"#;
+        let profile = super::remote_account_to_profile(serde_json::from_str(json).unwrap());
+        let out = serde_json::to_value(&profile).unwrap();
+        assert_eq!(out["referralCode"], "AB12CD34");
+        assert_eq!(out["referralSignups"], 5);
+        assert_eq!(out["referralSubscribed"], 3);
+        assert_eq!(out["referralFreeMonths"], 4);
+        assert_eq!(out["referralRewardPending"], true);
+
+        // Servers before the program existed.
+        let old = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0}"#;
+        let profile = super::remote_account_to_profile(serde_json::from_str(old).unwrap());
+        assert!(profile.referral_code.is_none());
+        assert!(!profile.referral_reward_pending);
+    }
+
+    #[test]
     fn remote_account_clamps_invite_bonus_to_50() {
         let raw = RemoteAccountResponse {
             email: "a@b".into(),
@@ -5830,6 +6013,12 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
+            referral_code: None,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
+            referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
     }
@@ -5864,6 +6053,12 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            payment_failed: false,
+            referral_code: None,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
+            referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
     }
@@ -6754,7 +6949,6 @@ mod tests {
             &state,
             "user@example.com",
             "123456",
-            None,
             &format!("http://127.0.0.1:{port}"),
         )
         .expect("verify_auth_code succeeds");
@@ -6841,7 +7035,6 @@ mod tests {
             &state,
             "user@example.com",
             "   ",
-            None,
             "http://127.0.0.1:1",
         )
         .expect_err("blank code rejected");
@@ -6861,7 +7054,6 @@ mod tests {
             &state,
             "user@example.com",
             "123456",
-            None,
             "http://127.0.0.1:1", // nothing listens here
         )
         .expect_err("unreachable server surfaces as error");
@@ -7158,14 +7350,22 @@ mod tests {
         );
     }
 
-    /// RUST-78 (0.9.26 event): "tcp connect error <- Bad file descriptor (os
-    /// error 9)" is a macOS content filter's drop, and only that errno is.
+    /// RUST-78: "Bad file descriptor (os error 9)" (0.9.26 event) and "No
+    /// route to host (os error 65)" (0.9.32 event) are a macOS content filter's
+    /// drop; a refusal or timeout is not.
     #[test]
     fn filter_drop_is_recognized_by_errno() {
-        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-        assert_eq!(super::chain_has_ebadf(&ebadf), cfg!(target_os = "macos"));
-        let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
-        assert!(!super::chain_has_ebadf(&refused));
+        for errno in [libc::EBADF, libc::EHOSTUNREACH] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                super::chain_has_filter_errno(&err),
+                cfg!(target_os = "macos")
+            );
+        }
+        for errno in [libc::ECONNREFUSED, libc::ETIMEDOUT, libc::ENETUNREACH] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert!(!super::chain_has_filter_errno(&err));
+        }
     }
 
     /// RUST-78: the server-silent alarm's `error` extra is fetch_grace_start's
@@ -7446,6 +7646,27 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn apply_referral_code_succeeds_and_surfaces_refusals() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "account": {} }), "HTTP/1.1 200 OK");
+        super::apply_referral_code_with_base_url(&format!("http://127.0.0.1:{port}"), " AB12CD34 ")
+            .expect("accepted");
+        server.join().unwrap();
+
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "Referral codes are for new subscribers." }),
+            "HTTP/1.1 422 Unprocessable Entity",
+        );
+        let err =
+            super::apply_referral_code_with_base_url(&format!("http://127.0.0.1:{port}"), "X")
+                .expect_err("refused");
+        server.join().unwrap();
+        assert_eq!(err, "Referral codes are for new subscribers.");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn get_billing_portal_url_returns_url_from_response() {
         let _env = AuthedTestEnv::new("session-xyz");
         let (port, server) = spawn_canned_response_server(
@@ -7703,6 +7924,26 @@ mod tests {
                 .is_none()
         );
         assert_eq!(persisted(), (None, None));
+    }
+
+    #[test]
+    fn only_the_appsumo_free_year_is_clamped_on_active_days() {
+        let mut lifetime = active_subscriber(HeadroomSubscriptionTier::Pro);
+        lifetime.subscription_billing_period = Some("lifetime".into());
+        lifetime.upgrade_action = Some("appsumo".into());
+        assert!(!super::appsumo_free_year(&lifetime), "paid lifetime tier");
+
+        let mut free_year = lifetime.clone();
+        free_year.subscription_cancel_at_period_end = true;
+        free_year.subscription_ends_at = Some(Utc::now() + Duration::days(365));
+        assert!(super::appsumo_free_year(&free_year), "free year");
+
+        let mut polar = active_subscriber(HeadroomSubscriptionTier::Pro);
+        polar.subscription_ends_at = Some(Utc::now() + Duration::days(20));
+        assert!(
+            !super::appsumo_free_year(&polar),
+            "cancelled Polar subscription"
+        );
     }
 
     #[test]
