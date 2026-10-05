@@ -7821,16 +7821,6 @@ export default function App() {
             ) : null}
           </section>
 
-          {pricingStatus?.account?.referralCode ? (
-            <ReferralCard
-              code={pricingStatus.account.referralCode}
-              signups={pricingStatus.account.referralSignups ?? 0}
-              subscribed={pricingStatus.account.referralSubscribed ?? 0}
-              freeMonths={pricingStatus.account.referralFreeMonths ?? 0}
-              rewardPending={pricingStatus.account.referralRewardPending === true}
-            />
-          ) : null}
-
           {!pricingStatus?.account?.subscriptionActive ? (
             <>
               <section
