@@ -4086,6 +4086,8 @@ impl AppState {
                 }
             }
         }
+        #[cfg(unix)]
+        reap_orphaned_multiprocessing_helpers(&managed_python);
         log::info!("stop_headroom: done");
     }
 
@@ -9795,6 +9797,81 @@ enum SweepParents {
     Any,
 }
 
+/// Whether `pid` is its own process-group leader. A `ps` that cannot run
+/// answers no, which keeps the sweep's old per-pid signal.
+#[cfg(unix)]
+fn leads_own_process_group(pid: u32) -> bool {
+    crate::proc::command("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        == Some(pid)
+}
+
+/// Reaps multiprocessing helpers (image-isolation pool workers, the resource
+/// tracker) of a managed-runtime python that is gone. They outlive their
+/// parent: before the sweep signalled a stray proxy's group, every proxy it
+/// reaped left its helpers behind (2026-10-05: four, ~1.4 GB, from proxies
+/// swept on Oct 2 and Oct 3, still running). A helper whose parent is a live
+/// process of the same runtime (a running proxy, a learn run, an MCP server)
+/// belongs to it and stays; any other parent (pid 1, launchd, a `systemd
+/// --user` subreaper) means the owner exited. Windows reaps these through
+/// `reap_orphaned_venv_processes`.
+#[cfg(unix)]
+fn reap_orphaned_multiprocessing_helpers(managed_python: &std::path::Path) {
+    let Some(venv_dir) = managed_python.parent().and_then(|bin| bin.parent()) else {
+        return;
+    };
+    let venv = venv_dir.display().to_string();
+    let pattern = format!("{} -s -c from multiprocessing", managed_python.display());
+    let Ok(found) = crate::proc::command("pgrep")
+        .args(["-f", &pattern])
+        .output()
+    else {
+        return;
+    };
+    let pids: Vec<String> = String::from_utf8_lossy(&found.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    let Ok(listed) = crate::proc::command("ps")
+        .args(["-o", "pid=,ppid=", "-p", &pids.join(",")])
+        .output()
+    else {
+        return;
+    };
+    for (pid, ppid) in parse_pid_ppid(&String::from_utf8_lossy(&listed.stdout)) {
+        let parent_in_runtime = ppid > 1
+            && crate::proc::command("ps")
+                .args(["-o", "command=", "-p", &ppid.to_string()])
+                .output()
+                // A `ps` that cannot run spares the helper.
+                .map_or(true, |out| {
+                    String::from_utf8_lossy(&out.stdout).contains(&venv)
+                });
+        if parent_in_runtime {
+            continue;
+        }
+        log::info!("process sweep: -TERM orphaned multiprocessing helper {pid} (parent {ppid})");
+        note_app_kill(
+            "process_sweep",
+            format!("-TERM orphaned multiprocessing helper {pid} (parent {ppid})"),
+        );
+        let _ = crate::proc::command("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
 /// Parses `ps -o pid=,ppid=` output into `(pid, ppid)` pairs; junk lines skip.
 fn parse_pid_ppid(output: &str) -> Vec<(u32, u32)> {
     output
@@ -9865,10 +9942,20 @@ fn kill_processes_by_command_pattern(
                 );
                 continue;
             }
-            log::info!("process sweep: -TERM pid {pid} (parent {ppid}) for '{pattern}'");
-            note_app_kill("process_sweep", format!("-TERM pid {pid} (parent {ppid})"));
+            // A backend we spawned leads its own process group (process_group(0)),
+            // and its multiprocessing helpers (image-isolation workers, the
+            // resource tracker) live in that group and do not exit with it: a
+            // stray proxy SIGTERMed by pid alone left ~680 MB of them running
+            // for days. Signal the whole group when the match leads one.
+            let target = if leads_own_process_group(pid) {
+                group_kill_target(pid as i32).unwrap_or_else(|| pid.to_string())
+            } else {
+                pid.to_string()
+            };
+            log::info!("process sweep: -TERM {target} (parent {ppid}) for '{pattern}'");
+            note_app_kill("process_sweep", format!("-TERM {target} (parent {ppid})"));
             let _ = crate::proc::command("/bin/kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-TERM", &target])
                 .status();
         }
         Ok(())
@@ -13034,6 +13121,92 @@ mod tests {
     }
 
     /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
+    /// A stray backend's multiprocessing helpers share its process group and
+    /// outlive a per-pid SIGTERM; the sweep signals the group so they go too.
+    #[cfg(unix)]
+    #[test]
+    fn unix_sweep_signals_a_group_leading_backends_whole_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let venv = tempfile::tempdir().expect("tempdir");
+        let bin = venv.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let python = bin.join("python3");
+        let helper_file = venv.path().join("helper");
+        // Bounded sleeps so a failing run leaves nothing behind for long.
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nsleep 20 &\necho $! > '{}'\nwait\n",
+                helper_file.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut backend = crate::proc::command(&python)
+            .args(["-m", "headroom.proxy.server"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn backend");
+        let helper = wait_for_pid_file(&helper_file);
+        super::kill_processes_by_command_pattern(
+            &python,
+            "-m headroom.proxy.server",
+            super::SweepParents::Orphans { own_children: true },
+        )
+        .expect("sweep");
+        let _ = backend.wait();
+        assert!(
+            pid_exits_within(helper, std::time::Duration::from_secs(5)),
+            "sweep left the backend's group member {helper} running"
+        );
+    }
+
+    /// A helper whose parent is a live process of the same runtime is that
+    /// process's (spared); one under any other parent is an orphan (reaped).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_multiprocessing_helpers_are_reaped_and_live_ones_spared() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        let spawn_helper = |parent_argv_has_venv: bool| {
+            let _ = std::fs::remove_file(&pid_file);
+            // The parent's own argv carries the venv path only via $0.
+            let script = "\"$P\" -s -c 'from multiprocessing.spawn import spawn_main'; true";
+            let mut command = crate::proc::command("/bin/sh");
+            command.args(["-c", script]).env("P", &python);
+            if parent_argv_has_venv {
+                command.arg(&python);
+            }
+            let parent = command.spawn().expect("spawn parent");
+            (parent, wait_for_pid_file(&pid_file))
+        };
+
+        let (mut live_parent, kept) = spawn_helper(true);
+        super::reap_orphaned_multiprocessing_helpers(&python);
+        let spared = !pid_exits_within(kept, std::time::Duration::from_millis(500));
+        let _ = live_parent.kill();
+        let _ = live_parent.wait();
+        let _ = crate::proc::command("/bin/kill")
+            .args(["-TERM", &kept.to_string()])
+            .status();
+
+        let (mut other_parent, orphan) = spawn_helper(false);
+        super::reap_orphaned_multiprocessing_helpers(&python);
+        let reaped = pid_exits_within(orphan, std::time::Duration::from_secs(5));
+        let _ = other_parent.kill();
+        let _ = other_parent.wait();
+
+        assert!(
+            spared,
+            "reaped helper {kept} whose parent runs from the runtime"
+        );
+        assert!(
+            reaped,
+            "spared helper {orphan} under a parent outside the runtime"
+        );
+    }
+
     /// live parent that is not a Headroom desktop must not spare a match: the
     /// orphan backend then survived every quit and upgrade until reboot.
     #[cfg(unix)]
