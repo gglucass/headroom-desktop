@@ -4572,9 +4572,11 @@ fn remove_legacy_vscode_base_url_keys() -> (Vec<String>, Vec<String>) {
 /// A settings.json our parsers refuse but VS Code applies (a missing comma,
 /// RUST-M2/M3/M4) is the user's file, and the best-effort VS Code edits leave
 /// it untouched: local log only, since every distinct parse error message was
-/// its own Sentry issue. Any other failure still warns.
+/// its own Sentry issue. So is one the OS will not let us read or write
+/// (EPERM on macOS, RUST-N7/N8): no change here can grant that access. Any
+/// other failure still warns.
 fn vscode_settings_failure_level(err: &anyhow::Error) -> log::Level {
-    if err.chain().any(|cause| cause.is::<json5::Error>()) {
+    if err.chain().any(|cause| cause.is::<json5::Error>()) || is_permission_denied(err) {
         log::Level::Info
     } else {
         log::Level::Warn
@@ -11282,6 +11284,13 @@ mod tests {
 
         let io = anyhow::Error::from(std::io::Error::other("denied")).context("writing settings");
         assert_eq!(vscode_settings_failure_level(&io), log::Level::Warn);
+
+        // RUST-N7/N8: macOS refused the read with EPERM.
+        let eperm = anyhow::Error::from(std::io::Error::from_raw_os_error(
+            super::PERMISSION_DENIED_OS_ERRORS[0],
+        ))
+        .context("reading settings.json");
+        assert_eq!(vscode_settings_failure_level(&eperm), log::Level::Info);
     }
 
     #[test]
