@@ -7374,6 +7374,13 @@ fn warn_stats_fetch_failed(reason: &str) {
             stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
         let tasks =
             matches!(category.as_str(), "timeout" | "transport").then(|| backend_tasks(backend));
+        let stall = recent_loop_stall(
+            &crate::client_adapters::home_dir()
+                .join(".headroom")
+                .join("logs")
+                .join("loop-stall.txt"),
+            std::time::SystemTime::now(),
+        );
         sentry::with_scope(
             |scope| {
                 scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
@@ -7381,6 +7388,10 @@ fn warn_stats_fetch_failed(reason: &str) {
                 scope.set_extra("requests_since_last_ok", requests_since_ok.into());
                 if let Some(tasks) = &tasks {
                     scope.set_extra("backend_tasks", tasks.clone().into());
+                }
+                if let Some((age, stacks)) = &stall {
+                    scope.set_extra("loop_stall_age_secs", (*age).into());
+                    scope.set_extra("loop_stall_stacks", stacks.clone().into());
                 }
             },
             || {
@@ -7393,6 +7404,34 @@ fn warn_stats_fetch_failed(reason: &str) {
     // readiness verdict rides along so a support log still says which half of
     // the gate suppressed the event.
     log::warn!("{message} (backend_ready={backend_ready})");
+}
+
+/// The newest event-loop stall dump the sitecustomize `loop_stall_dump` wrote,
+/// with its age in seconds, when it is recent enough to be the stall this
+/// `/stats` timeout hit. The `/debug/tasks` snapshot is taken after the stall
+/// and cannot say what blocked the loop; this is faulthandler's dump of every
+/// Python thread taken during it. The serving loop runs on the main thread,
+/// which faulthandler prints last, so it goes first here: the blocker is in
+/// its stack unless another thread held the GIL, which is why the rest follow.
+pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Option<(u64, String)> {
+    const FRESH: Duration = Duration::from_secs(120);
+    const MAX_CHARS: usize = 12_000;
+    let age = now
+        .duration_since(std::fs::metadata(path).ok()?.modified().ok()?)
+        .unwrap_or_default();
+    if age > FRESH {
+        return None;
+    }
+    let dump = std::fs::read_to_string(path).ok()?;
+    // Each dump opens with `Timeout (0:00:05)!`, then one block per thread.
+    let newest = &dump[dump.rfind("Timeout (")?..];
+    let mut threads: Vec<&str> = newest.split_once('\n')?.1.trim().split("\n\n").collect();
+    let main = threads.pop()?;
+    let stacks = std::iter::once(main)
+        .chain(threads)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((age.as_secs(), stacks.chars().take(MAX_CHARS).collect()))
 }
 
 /// What is piled up on the backend when a `/stats` read just failed: requests
@@ -15197,6 +15236,26 @@ mod tests {
             "RequestResponseCycle.run_asgi x2, trim_periodically x1"
         );
         assert_eq!(super::summarize_backend_tasks("not json"), "");
+    }
+
+    #[test]
+    fn loop_stall_dump_reports_the_newest_dump_main_thread_first() {
+        // faulthandler's real layout: header, one block per thread, the main
+        // (serving) thread last.
+        let dump = "Timeout (0:00:05)!\nThread 0x1 (most recent call first):\n  File \"a.py\", line 1 in old_blocker\n\n\
+                    Timeout (0:00:05)!\nThread 0x2 (most recent call first):\n  File \"threading.py\", line 3 in wait\n\n\
+                    Thread 0x3 (most recent call first):\n  File \"b.py\", line 4 in new_blocker\n  File \"cli.py\", line 9 in <module>\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop-stall.txt");
+        std::fs::write(&path, dump).unwrap();
+        let now = std::time::SystemTime::now();
+        let (age, stacks) = super::recent_loop_stall(&path, now).expect("fresh dump");
+        assert!(age < 5);
+        assert!(stacks.starts_with("Thread 0x3"), "{stacks}");
+        assert!(stacks.contains("new_blocker") && stacks.contains("in wait"));
+        assert!(!stacks.contains("old_blocker"));
+        assert!(super::recent_loop_stall(&path, now + Duration::from_secs(300)).is_none());
+        assert!(super::recent_loop_stall(&dir.path().join("missing.txt"), now).is_none());
     }
 
     #[test]

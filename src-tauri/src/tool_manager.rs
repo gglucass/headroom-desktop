@@ -395,6 +395,10 @@ untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
 Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
 that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
 Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
+
+Also writes the serving loop's stack to logs/loop-stall.txt when the event
+loop stalls (desktop diagnostic, RUST-86). Kill switch:
+HEADROOM_LOOP_STALL_DUMP=0.
 """
 import faulthandler
 import signal
@@ -3090,6 +3094,78 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's relocation (the pre-vendor behaviour).
         pass
 
+# --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
+# /stats on the backend port times out after 15s while /readyz answers right
+# after, on idle hosts as often as busy ones: something holds the event loop
+# and is gone before anything outside the process can look (the watchdog's
+# SIGUSR1 dump only runs on a wedge, and never on Windows). A 1s heartbeat on
+# the serving loop keeps re-arming faulthandler's timer; a loop stalled for
+# HEADROOM_LOOP_STALL_DUMP seconds (default 5, 0 disables) misses the re-arm
+# and faulthandler's own C thread writes every Python thread's stack to
+# logs/loop-stall.txt, no GIL needed. Armed after startup (the lifespan boot
+# blocks the loop by design), disarmed on shutdown. The desktop attaches the
+# loop thread's stack to the next RUST-86 event. Diagnostic only: nothing
+# the proxy forwards changes.
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        _hd_ls_secs = float(_hd_os.environ.get("HEADROOM_LOOP_STALL_DUMP", "5"))
+        if _hd_ls_secs > 0:
+            import headroom.paths as _hd_ls_paths
+            import uvicorn.server as _hd_ls_uv
+
+            _hd_ls_orig_startup = _hd_ls_uv.Server.startup
+            _hd_ls_orig_shutdown = _hd_ls_uv.Server.shutdown
+            _hd_ls_armed = [False]
+
+            async def _hd_ls_startup(self, *args, **kwargs):
+                result = await _hd_ls_orig_startup(self, *args, **kwargs)
+                if self.should_exit:
+                    return result
+                try:
+                    import asyncio as _hd_ls_asyncio
+
+                    loop = _hd_ls_asyncio.get_running_loop()
+                    path = _hd_ls_paths.log_dir() / "loop-stall.txt"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    # O_BINARY: a Windows text-mode fd would turn each "\n"
+                    # into "\r\n" and blur the blank line between threads.
+                    fd = _hd_os.open(
+                        str(path),
+                        _hd_os.O_WRONLY
+                        | _hd_os.O_CREAT
+                        | _hd_os.O_TRUNC
+                        | getattr(_hd_os, "O_BINARY", 0),
+                        0o600,
+                    )
+                    _hd_ls_armed[0] = True
+
+                    def beat():
+                        if not _hd_ls_armed[0]:
+                            return
+                        # One dump is a few KB; the cap only bites on a loop
+                        # that stalls every few seconds for hours.
+                        if _hd_os.lseek(fd, 0, _hd_os.SEEK_CUR) > 262144:
+                            _hd_os.ftruncate(fd, 0)
+                            _hd_os.lseek(fd, 0, _hd_os.SEEK_SET)
+                        faulthandler.dump_traceback_later(_hd_ls_secs, file=fd)
+                        loop.call_later(1.0, beat)
+
+                    beat()
+                except Exception:
+                    pass
+                return result
+
+            async def _hd_ls_shutdown(self, *args, **kwargs):
+                _hd_ls_armed[0] = False
+                faulthandler.cancel_dump_traceback_later()
+                return await _hd_ls_orig_shutdown(self, *args, **kwargs)
+
+            _hd_ls_uv.Server.startup = _hd_ls_startup
+            _hd_ls_uv.Server.shutdown = _hd_ls_shutdown
+            _hd_bound.add("loop_stall_dump")
+    except Exception:
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -3131,6 +3207,7 @@ _HD_VENDORS = (
     "stream_uncached_input",
     "ccr_tool_eager",
     "held_read_breakpoint",
+    "loop_stall_dump",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -16566,6 +16643,72 @@ mod tests {
         assert!(tail.contains(r#"_hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
         assert!(tail.contains(r#"_hd_sys.argv[:1] != ["-c"]"#));
         assert!(tail.contains("INFO:headroom.desktop:sitecustomize vendors bound="));
+    }
+
+    /// RUST-86: a stalled backend loop must leave its stack where the
+    /// `/stats` timeout report can pick it up. Real uvicorn server, real
+    /// faulthandler timer, a 2.5s block of the serving loop.
+    #[test]
+    fn loop_stall_dump_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = dir.path().join("probe.py");
+        std::fs::write(
+            &probe,
+            r#"import asyncio, time, uvicorn
+
+async def app(scope, receive, send):
+    while scope["type"] == "lifespan":
+        message = await receive()
+        if message["type"] == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+
+def hd_probe_blocks_the_loop():
+    time.sleep(2.5)
+
+async def main():
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(1.5)
+    hd_probe_blocks_the_loop()
+    server.should_exit = True
+    await serving
+
+asyncio.run(main())
+"#,
+        )
+        .unwrap();
+        let workspace = dir.path().join("workspace");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("HEADROOM_WORKSPACE_DIR", &workspace)
+            .env("HEADROOM_LOOP_STALL_DUMP", "1")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run probe");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(stderr.contains("loop_stall_dump"), "{stderr}");
+        let (_, stacks) = crate::state::recent_loop_stall(
+            &workspace.join("logs").join("loop-stall.txt"),
+            std::time::SystemTime::now(),
+        )
+        .expect("a stalled loop leaves a dump");
+        let main = stacks.split("\n\n").next().unwrap();
+        assert!(main.contains("hd_probe_blocks_the_loop"), "{stacks}");
     }
 
     #[test]
