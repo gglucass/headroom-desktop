@@ -972,7 +972,6 @@ struct RequestCodePayload<'a> {
 struct VerifyCodePayload<'a> {
     email: &'a str,
     code: &'a str,
-    invite_code: Option<&'a str>,
     #[serde(flatten)]
     identity: IdentityPayload,
 }
@@ -1568,9 +1567,8 @@ pub fn verify_auth_code(
     state: &AppState,
     email: &str,
     code: &str,
-    invite_code: Option<&str>,
 ) -> Result<HeadroomPricingStatus, String> {
-    verify_auth_code_with_base_url(state, email, code, invite_code, &api_base_url())
+    verify_auth_code_with_base_url(state, email, code, &api_base_url())
 }
 
 /// Test-only seam: `verify_auth_code` against a parameterized base URL so a
@@ -1579,7 +1577,6 @@ pub(crate) fn verify_auth_code_with_base_url(
     state: &AppState,
     email: &str,
     code: &str,
-    invite_code: Option<&str>,
     base_url: &str,
 ) -> Result<HeadroomPricingStatus, String> {
     let trimmed_email = email.trim().to_ascii_lowercase();
@@ -1596,7 +1593,6 @@ pub(crate) fn verify_auth_code_with_base_url(
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
-            invite_code: invite_code.map(str::trim).filter(|value| !value.is_empty()),
             identity: IdentityPayload::for_state(state),
         })
         .send()
@@ -6943,7 +6939,6 @@ mod tests {
             &state,
             "user@example.com",
             "123456",
-            None,
             &format!("http://127.0.0.1:{port}"),
         )
         .expect("verify_auth_code succeeds");
@@ -7030,7 +7025,6 @@ mod tests {
             &state,
             "user@example.com",
             "   ",
-            None,
             "http://127.0.0.1:1",
         )
         .expect_err("blank code rejected");
@@ -7050,7 +7044,6 @@ mod tests {
             &state,
             "user@example.com",
             "123456",
-            None,
             "http://127.0.0.1:1", // nothing listens here
         )
         .expect_err("unreachable server surfaces as error");

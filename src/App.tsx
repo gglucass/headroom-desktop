@@ -1844,7 +1844,6 @@ export default function App() {
   // status with its own stale signed-out one.
   const pricingStatusOrderRef = useRef(createPricingStatusOrder());
   const [authEmail, setAuthEmail] = useState("");
-  const [authReferralCode, setAuthReferralCode] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
   const [authRequestBusy, setAuthRequestBusy] = useState(false);
@@ -4541,8 +4540,7 @@ export default function App() {
     try {
       const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
         email,
-        code,
-        inviteCode: authReferralCode.trim() || null
+        code
       });
       pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
@@ -5210,8 +5208,6 @@ export default function App() {
                 success={authFlowSuccess}
                 onRequestCode={() => void handleRequestAuthCode()}
                 onVerify={() => void handleVerifyAuthCode()}
-                referralCode={authReferralCode}
-                onReferralCodeChange={setAuthReferralCode}
               />
             )
           ) : undefined
@@ -6060,8 +6056,6 @@ export default function App() {
               success={authFlowSuccess}
               onRequestCode={() => void handleRequestAuthCode()}
               onVerify={() => void handleVerifyAuthCode()}
-              referralCode={authReferralCode}
-              onReferralCodeChange={setAuthReferralCode}
             />
           ) : null}
           <div className="paywall__plans">

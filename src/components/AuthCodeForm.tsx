@@ -1,5 +1,3 @@
-import { useState } from "react";
-
 // Email + one-time-code sign-in block. Controlled by App state/handlers so the
 // same form renders inside TermsGate (paywall-first onboarding) and the
 // launcher paywall stage without duplicating auth logic.
@@ -17,10 +15,6 @@ export interface AuthCodeFormProps {
   success: string | null;
   onRequestCode: () => void;
   onVerify: () => void;
-  /** A paying friend's referral code, sent with the verify call. Collapsed
-   * behind a link: most people have none, and this is the signup gate. */
-  referralCode?: string;
-  onReferralCodeChange?: (value: string) => void;
 }
 
 export function AuthCodeForm({
@@ -36,11 +30,8 @@ export function AuthCodeForm({
   error,
   success,
   onRequestCode,
-  onVerify,
-  referralCode,
-  onReferralCodeChange
+  onVerify
 }: AuthCodeFormProps) {
-  const [referralOpen, setReferralOpen] = useState(Boolean(referralCode));
   return (
     <div className="paywall__auth soft-card">
       {lead ? <p className="paywall__auth-lead">{lead}</p> : null}
@@ -79,27 +70,6 @@ export function AuthCodeForm({
             {verifyBusy ? "Verifying…" : "Verify"}
           </button>
         </div>
-      ) : null}
-      {onReferralCodeChange ? (
-        referralOpen ? (
-          <div className="paywall__auth-row paywall__auth-reveal">
-            <input
-              aria-label="Referral code"
-              className="paywall__auth-input"
-              onChange={(event) => onReferralCodeChange(event.target.value)}
-              placeholder="Referral code"
-              value={referralCode ?? ""}
-            />
-          </div>
-        ) : (
-          <button
-            className="link-button paywall__referral-toggle"
-            onClick={() => setReferralOpen(true)}
-            type="button"
-          >
-            Have a referral code?
-          </button>
-        )
       ) : null}
       {error ? <p className="install-progress__error">{error}</p> : null}
       {success && !error ? (

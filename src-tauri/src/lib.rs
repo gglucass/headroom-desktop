@@ -4677,12 +4677,8 @@ async fn verify_headroom_auth_code(
     state: State<'_, AppState>,
     email: String,
     code: String,
-    invite_code: Option<String>,
 ) -> Result<HeadroomPricingStatus, String> {
-    let used_invite_code = invite_code
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty());
-    let status = pricing::verify_auth_code(&state, &email, &code, invite_code.as_deref())?;
+    let status = pricing::verify_auth_code(&state, &email, &code)?;
     // Reconcile the runtime with the freshly evaluated status. Mirrors
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
@@ -4704,11 +4700,7 @@ async fn verify_headroom_auth_code(
             state.apply_pricing_gates(&status);
         });
     }
-    analytics::track_event(
-        &app,
-        "auth_verified",
-        Some(json!({ "invite_code_used": used_invite_code })),
-    );
+    analytics::track_event(&app, "auth_verified", None);
     // Pricing status is per-window UI state, so the window that did not run
     // the sign-in keeps rendering the signed-out code form until its own poll
     // ticks. Broadcast so every window re-reads it now.
