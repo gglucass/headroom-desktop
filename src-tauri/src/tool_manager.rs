@@ -396,9 +396,9 @@ Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
 that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
 Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
 
-Also writes the serving loop's stack to logs/loop-stall.txt when the event
-loop stalls (desktop diagnostic, RUST-86). Kill switch:
-HEADROOM_LOOP_STALL_DUMP=0.
+Can also write the serving loop's stack to logs/loop-stall.txt when the
+event loop stalls (desktop diagnostic, RUST-86). Off unless
+HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
 """
 import faulthandler
 import signal
@@ -3100,15 +3100,21 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # and is gone before anything outside the process can look (the watchdog's
 # SIGUSR1 dump only runs on a wedge, and never on Windows). A 1s heartbeat on
 # the serving loop keeps re-arming faulthandler's timer; a loop stalled for
-# HEADROOM_LOOP_STALL_DUMP seconds (default 5, 0 disables) misses the re-arm
-# and faulthandler's own C thread writes every Python thread's stack to
-# logs/loop-stall.txt, no GIL needed. Armed after startup (the lifespan boot
-# blocks the loop by design), disarmed on shutdown. The desktop attaches the
-# loop thread's stack to the next RUST-86 event. Diagnostic only: nothing
-# the proxy forwards changes.
+# HEADROOM_LOOP_STALL_DUMP seconds misses the re-arm and faulthandler's own C
+# thread writes every Python thread's stack to logs/loop-stall.txt. Armed after
+# startup (the lifespan boot blocks the loop by design), disarmed on shutdown.
+# The desktop attaches the loop thread's stack to the next RUST-86 event.
+# OFF BY DEFAULT (0), opt-in for one machine at a time: that dump reads other
+# threads' frames without the GIL, and on 2026-10-05 it segfaulted a backend
+# whose Kompress warm-up thread was inside torch, and in a scratch repro spun
+# forever in dump_frame while the next re-arm (cancel_dump_traceback_later,
+# GIL held) waited on it, wedging the process. A stall is when other threads
+# are busy, so the fleet's ~45 RUST-86 stalls a day would each risk that.
+# A safe form samples sys._current_frames() from a Python thread holding the
+# GIL. Diagnostic only: nothing the proxy forwards changes.
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
-        _hd_ls_secs = float(_hd_os.environ.get("HEADROOM_LOOP_STALL_DUMP", "5"))
+        _hd_ls_secs = float(_hd_os.environ.get("HEADROOM_LOOP_STALL_DUMP", "0"))
         if _hd_ls_secs > 0:
             import headroom.paths as _hd_ls_paths
             import uvicorn.server as _hd_ls_uv
@@ -16743,6 +16749,8 @@ asyncio.run(main())
         let (bound, skipped) = proxy[0].split_once(" skipped=").unwrap();
         assert!(bound.contains("ccr_repair_order"), "{}", proxy[0]);
         assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
+        // Opt-in only: its all-threads dump can crash or wedge a busy backend.
+        assert!(skipped.contains("loop_stall_dump"), "{}", proxy[0]);
         let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
         assert!(
             off.len() == 1
