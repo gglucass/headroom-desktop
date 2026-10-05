@@ -890,7 +890,11 @@ struct RemoteAccountResponse {
     #[serde(default)]
     referral_code: Option<String>,
     #[serde(default)]
-    referral_rewards_earned: usize,
+    referral_signups: usize,
+    #[serde(default)]
+    referral_subscribed: usize,
+    #[serde(default)]
+    referral_free_months: usize,
     #[serde(default)]
     referral_reward_pending: bool,
 }
@@ -3571,7 +3575,9 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         grandfathered: value.grandfathered,
         payment_failed: value.payment_failed,
         referral_code: value.referral_code,
-        referral_rewards_earned: value.referral_rewards_earned,
+        referral_signups: value.referral_signups,
+        referral_subscribed: value.referral_subscribed,
+        referral_free_months: value.referral_free_months,
         referral_reward_pending: value.referral_reward_pending,
     }
 }
@@ -4538,7 +4544,9 @@ mod tests {
             grandfathered: false,
             payment_failed: false,
             referral_code: None,
-            referral_rewards_earned: 0,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
             referral_reward_pending: false,
         }
     }
@@ -5194,7 +5202,9 @@ mod tests {
             grandfathered: false,
             payment_failed: false,
             referral_code: None,
-            referral_rewards_earned: 0,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
             referral_reward_pending: false,
         }
     }
@@ -5230,7 +5240,9 @@ mod tests {
             grandfathered: false,
             payment_failed: false,
             referral_code: None,
-            referral_rewards_earned: 0,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
             referral_reward_pending: false,
         }
     }
@@ -5949,11 +5961,13 @@ mod tests {
 
     #[test]
     fn remote_account_carries_referral_fields_through_to_the_webview() {
-        let json = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0,"referralCode":"AB12CD34","referralRewardsEarned":3,"referralRewardPending":true}"#;
+        let json = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0,"referralCode":"AB12CD34","referralSignups":5,"referralSubscribed":3,"referralFreeMonths":4,"referralRewardPending":true}"#;
         let profile = super::remote_account_to_profile(serde_json::from_str(json).unwrap());
         let out = serde_json::to_value(&profile).unwrap();
         assert_eq!(out["referralCode"], "AB12CD34");
-        assert_eq!(out["referralRewardsEarned"], 3);
+        assert_eq!(out["referralSignups"], 5);
+        assert_eq!(out["referralSubscribed"], 3);
+        assert_eq!(out["referralFreeMonths"], 4);
         assert_eq!(out["referralRewardPending"], true);
 
         // Servers before the program existed.
@@ -5995,7 +6009,9 @@ mod tests {
             grandfathered: false,
             payment_failed: false,
             referral_code: None,
-            referral_rewards_earned: 0,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
             referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
@@ -6033,7 +6049,9 @@ mod tests {
             grandfathered: false,
             payment_failed: false,
             referral_code: None,
-            referral_rewards_earned: 0,
+            referral_signups: 0,
+            referral_subscribed: 0,
+            referral_free_months: 0,
             referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);

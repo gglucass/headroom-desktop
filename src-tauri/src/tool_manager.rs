@@ -3010,6 +3010,126 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_fl
         # Fail-open to the wheel's first-compression injection (pre-vendor).
         pass
 
+# --- Read maturation: cache the tail over a held Read (vendor) ------------------
+# read_maturation (HEADROOM_READ_MATURATION, desktop default since 0.9.7) holds
+# a fresh Read result of >= 2048 bytes out of the provider cache until its
+# file has been quiet 5 assistant turns (cap 25): relocate_cache_breakpoint
+# strips every message breakpoint from the held Read onward and re-anchors one
+# on the message before it. Claude Code marks the last two messages, so its
+# tail marker is always stripped (event=cache_breakpoints dropped=true) and
+# nothing after the Read is cache-written until it matures. 2026-10-05,
+# proxy-6768.log: 37 of 1,353 requests in 8 holds; one 2,545-byte Read the
+# model kept editing held for 13 requests with cache_read pinned at 176,693 and
+# cache_write 0 while the uncached tail grew 3,879 -> 14,639 tokens a request.
+# The hold saves one cache write of the Read and costs a full-price resend of
+# the Read plus everything after it on every held turn (5 at least), and the
+# maturing turn writes from the Read onward either way. So (1) the relocation
+# forwards the breakpoints normalize_message_cache_control already put at the
+# client's positions (never adds or moves one), and (2) a Read seen holding
+# stays eligible for maturation after the now-cached tail pushes the
+# provider-confirmed prefix past it; without (2) the wheel's `i <
+# frozen_message_count` gate keeps that Read verbatim for good (probe: never
+# matures). Below that prefix only held Reads may change. Reads still mature on
+# the quiesce schedule; the maturing turn now rewrites cached bytes instead of
+# writing uncached ones. The handler imports relocate_cache_breakpoint at call
+# time, so rebinding the module attribute reaches it. Exact-pin gated to wheel
+# 0.39.0; self-neutralizes when the wheel stops stripping a held Read's
+# breakpoint.
+# Kill switch: HEADROOM_HELD_READ_BREAKPOINT=0.
+_hd_hrb_flag = _hd_os.environ.get("HEADROOM_HELD_READ_BREAKPOINT", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_hrb_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_hrb_meta
+
+        if _hd_hrb_meta.version("headroom-ai") == "0.39.0":
+            import logging as _hd_hrb_logging
+
+            from headroom.transforms import read_maturation as _hd_hrb_mod
+
+            _hd_hrb_orig_relocate = _hd_hrb_mod.relocate_cache_breakpoint
+            _hd_hrb_orig_apply = _hd_hrb_mod.ReadMaturationManager.apply
+            _hd_hrb_log = _hd_hrb_logging.getLogger("headroom.proxy")
+
+            def _hd_hrb_ids(msg):
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    return set()
+                return {
+                    b.get("tool_use_id")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                }
+
+            def _hd_hrb_relocate(messages, holding_msg_indices):
+                return messages
+
+            def _hd_hrb_apply(self, messages, frozen_message_count=0):
+                held = getattr(self, "_hd_hrb_held", None) or set()
+                frozen = frozen_message_count or 0
+                floor = frozen
+                for i in range(min(frozen, len(messages))):
+                    if _hd_hrb_ids(messages[i]) & held:
+                        floor = i
+                        break
+                res = _hd_hrb_orig_apply(
+                    self, messages, frozen_message_count=floor
+                )
+                if floor < frozen and res.messages is not messages:
+                    out = list(res.messages)
+                    for i in range(floor, frozen):
+                        if not (_hd_hrb_ids(messages[i]) & held):
+                            out[i] = messages[i]
+                    res.messages = out
+                # Forget this conversation's Reads that stopped holding (matured,
+                # stale-marked); keep ids a parallel conversation on the same
+                # manager is still holding.
+                seen = set().union(*(_hd_hrb_ids(m) for m in messages[floor:]))
+                self._hd_hrb_held = (held - seen) | set().union(
+                    *(_hd_hrb_ids(res.messages[i]) for i in res.holding_msg_indices)
+                )
+                if res.holding_msg_indices or floor < frozen:
+                    _hd_hrb_log.info(
+                        "event=held_read_breakpoint holding=%d frozen=%d floor=%d "
+                        "matured=%d",
+                        len(res.holding_msg_indices),
+                        frozen,
+                        floor,
+                        res.newly_matured,
+                    )
+                return res
+
+            def _hd_hrb_needed():
+                # The incident's shape: does the wheel still strip the client's
+                # marker off a held Read's tool_result?
+                out = _hd_hrb_orig_relocate(
+                    [
+                        {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "r",
+                                    "content": "x",
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        },
+                    ],
+                    [1],
+                )
+                return "cache_control" not in out[1]["content"][0]
+
+            if _hd_hrb_needed():
+                _hd_hrb_mod.relocate_cache_breakpoint = _hd_hrb_relocate
+                _hd_hrb_mod.ReadMaturationManager.apply = _hd_hrb_apply
+                _hd_bound.add("held_read_breakpoint")
+    except Exception:
+        # Fail-open to the wheel's relocation (the pre-vendor behaviour).
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -3050,6 +3170,7 @@ _HD_VENDORS = (
     "image_worker_reap",
     "stream_uncached_input",
     "ccr_tool_eager",
+    "held_read_breakpoint",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -3070,7 +3191,10 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.ar
 /// Requested for every install since 0.9.7-rc.1 (2026-09-02): the 0.37.0
 /// freeze policy caps tail-only compression at ~1-2% on big sessions, and
 /// read_maturation is the cache-safe recovery leg (holds Read results out of
-/// the provider cache until they quiesce; never mutates a cached byte). It is
+/// the provider cache until they quiesce; never mutates a cached byte). Since
+/// 0.9.34-rc.5 the `held_read_breakpoint` vendor caches the tail over a held
+/// Read instead, so a maturing turn rewrites cached bytes from the Read onward
+/// (the wheel wrote that same region uncached). It is
 /// still cache-breakpoint machinery -- the class that cost 89 installs ~17pp
 /// on 0.9.4 -- so the falsey spellings of `HEADROOM_READ_MATURATION` stay a
 /// no-rebuild kill switch, and the rc does not promote to stable until
@@ -17832,6 +17956,62 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
             "stderr:\n{no_opt_err}"
         );
         assert_eq!(off, "False False False False False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn held_read_breakpoint_behaves_against_the_installed_wheel() {
+        // Drives the installed wheel's real Anthropic handler for 8 turns over a
+        // held Read (scripts/verify-held-read-breakpoint.py): every turn keeps
+        // the client's 4 breakpoints and the Read still matures on turn 5.
+        // Self-skips when the vendor does not bind, so green is NOT evidence
+        // after a bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-held-read-breakpoint.py");
+        if !python.exists() || !probe.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-hrb-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_HELD_READ_BREAKPOINT", flag)
+                .output()
+                .expect("run held read breakpoint probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if stdout.contains("FAIL hrb bound") {
+            eprintln!("skipping: held read breakpoint vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "held read breakpoint probe failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // With the switch off the wheel strips the client's tail marker on every
+        // held turn, which is also what proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL hrb bound")
+                && off_stdout.contains("FAIL every turn keeps the client's breakpoints"),
+            "HEADROOM_HELD_READ_BREAKPOINT=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
     }
 
     #[test]

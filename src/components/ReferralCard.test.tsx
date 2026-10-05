@@ -13,20 +13,21 @@ describe("ReferralCard", () => {
   it("shows the share link and copies it", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    render(<ReferralCard code="AB12CD34" rewardsEarned={0} rewardPending={false} />);
+    render(<ReferralCard code="AB12CD34" signups={0} subscribed={0} freeMonths={0} rewardPending={false} />);
 
     expect(screen.getByText("https://extraheadroom.com/r/AB12CD34")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Copy link/ }));
 
     expect(writeText).toHaveBeenCalledWith("https://extraheadroom.com/r/AB12CD34");
     expect(await screen.findByRole("button", { name: /Copied/ })).toBeInTheDocument();
-    expect(screen.queryByText(/subscribed so far/)).not.toBeInTheDocument();
   });
 
-  it("counts converted friends and mentions the user's own pending month", () => {
-    render(<ReferralCard code="AB12CD34" rewardsEarned={2} rewardPending />);
+  it("shows the referral overview and mentions the user's own pending month", () => {
+    render(<ReferralCard code="AB12CD34" signups={5} subscribed={3} freeMonths={4} rewardPending />);
 
-    expect(screen.getByText(/2 friends subscribed so far/)).toBeInTheDocument();
+    expect(screen.getByText("Friends signed up").nextSibling).toHaveTextContent("5");
+    expect(screen.getByText("Subscribed").nextSibling).toHaveTextContent("3");
+    expect(screen.getByText("Free months earned").nextSibling).toHaveTextContent("4");
     expect(screen.getByText(/arrives once you\x27ve been subscribed for a month/)).toBeInTheDocument();
   });
 

@@ -7830,7 +7830,9 @@ export default function App() {
           {pricingStatus?.account?.referralCode ? (
             <ReferralCard
               code={pricingStatus.account.referralCode}
-              rewardsEarned={pricingStatus.account.referralRewardsEarned ?? 0}
+              signups={pricingStatus.account.referralSignups ?? 0}
+              subscribed={pricingStatus.account.referralSubscribed ?? 0}
+              freeMonths={pricingStatus.account.referralFreeMonths ?? 0}
               rewardPending={pricingStatus.account.referralRewardPending === true}
             />
           ) : null}
@@ -8126,7 +8128,9 @@ export default function App() {
           {pricingStatus?.account?.referralCode ? (
             <ReferralCard
               code={pricingStatus.account.referralCode}
-              rewardsEarned={pricingStatus.account.referralRewardsEarned ?? 0}
+              signups={pricingStatus.account.referralSignups ?? 0}
+              subscribed={pricingStatus.account.referralSubscribed ?? 0}
+              freeMonths={pricingStatus.account.referralFreeMonths ?? 0}
               rewardPending={pricingStatus.account.referralRewardPending === true}
             />
           ) : (

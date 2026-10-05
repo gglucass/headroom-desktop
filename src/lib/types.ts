@@ -684,7 +684,11 @@ export interface HeadroomAccountProfile {
   /** Paid referral program: present only for someone who can refer (an
    * active Polar subscriber), so it gates the invite card. */
   referralCode?: string | null;
-  referralRewardsEarned?: number;
+  /** Invite card overview: friends signed up with the code, how many
+   * subscribed, free months earned (own invitee month included). */
+  referralSignups?: number;
+  referralSubscribed?: number;
+  referralFreeMonths?: number;
   /** Signed up through a referral; their own free month is not in yet. */
   referralRewardPending?: boolean;
 }

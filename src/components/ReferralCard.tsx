@@ -7,13 +7,15 @@ import { CopySimple } from "@phosphor-icons/react";
 // (headroom-web ReferralRewardJob) once the friend has paid for a month.
 export interface ReferralCardProps {
   code: string;
-  rewardsEarned: number;
+  signups: number;
+  subscribed: number;
+  freeMonths: number;
   rewardPending: boolean;
 }
 
 export const referralUrl = (code: string) => `https://extraheadroom.com/r/${code}`;
 
-export function ReferralCard({ code, rewardsEarned, rewardPending }: ReferralCardProps) {
+export function ReferralCard({ code, signups, subscribed, freeMonths, rewardPending }: ReferralCardProps) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
   const url = referralUrl(code);
 
@@ -43,10 +45,21 @@ export function ReferralCard({ code, rewardsEarned, rewardPending }: ReferralCar
       </div>
       <p>
         Or they can enter code <strong>{code}</strong> when they sign in.
-        {rewardsEarned > 0
-          ? ` ${rewardsEarned} friend${rewardsEarned === 1 ? "" : "s"} subscribed so far.`
-          : ""}
       </p>
+      <dl className="referral-card__stats">
+        <div>
+          <dt>Friends signed up</dt>
+          <dd>{signups}</dd>
+        </div>
+        <div>
+          <dt>Subscribed</dt>
+          <dd>{subscribed}</dd>
+        </div>
+        <div>
+          <dt>Free months earned</dt>
+          <dd>{freeMonths}</dd>
+        </div>
+      </dl>
       {rewardPending ? (
         <p>Your own free month, from the friend who invited you, arrives once you've been subscribed for a month.</p>
       ) : null}

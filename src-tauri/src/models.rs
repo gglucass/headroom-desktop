@@ -1333,8 +1333,14 @@ pub struct HeadroomAccountProfile {
     /// sends it only to someone who can refer, so its presence is the gate.
     #[serde(default)]
     pub referral_code: Option<String>,
+    /// The invite card's overview: friends who signed up with the code, how
+    /// many subscribed, and free months earned (own invitee month included).
     #[serde(default)]
-    pub referral_rewards_earned: usize,
+    pub referral_signups: usize,
+    #[serde(default)]
+    pub referral_subscribed: usize,
+    #[serde(default)]
+    pub referral_free_months: usize,
     /// Signed up through a referral; their own free month is not in yet.
     #[serde(default)]
     pub referral_reward_pending: bool,
