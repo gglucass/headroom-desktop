@@ -3016,7 +3016,8 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_fl
 # file has been quiet 5 assistant turns (cap 25): relocate_cache_breakpoint
 # strips every message breakpoint from the held Read onward and re-anchors one
 # on the message before it. Claude Code marks the last two messages, so its
-# tail marker is always stripped (event=cache_breakpoints dropped=true) and
+# tail marker is always stripped (the cache_breakpoints log line says
+# dropped=true) and
 # nothing after the Read is cache-written until it matures. 2026-10-05,
 # proxy-6768.log: 37 of 1,353 requests in 8 holds; one 2,545-byte Read the
 # model kept editing held for 13 requests with cache_read pinned at 176,693 and
@@ -3024,7 +3025,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_fl
 # The hold saves one cache write of the Read and costs a full-price resend of
 # the Read plus everything after it on every held turn (5 at least), and the
 # maturing turn writes from the Read onward either way. So (1) the relocation
-# forwards the breakpoints normalize_message_cache_control already put at the
+# forwards the breakpoints the wheel's cache_control normalizer already put at the
 # client's positions (never adds or moves one), and (2) a Read seen holding
 # stays eligible for maturation after the now-cached tail pushes the
 # provider-confirmed prefix past it; without (2) the wheel's `i <
