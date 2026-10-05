@@ -8617,6 +8617,9 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // manage usage credits at claude.ai/settings/usage ...` -- a credit
         // ceiling worded without "limit" at all.
         "out of usage credits",
+        // RUST-M8: `You're out of extra usage · resets 1:40pm
+        // (Europe/Lisbon)` -- the extra-usage pool, same family.
+        "out of extra usage",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -8666,6 +8669,10 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // is the exhausted-balance line above; this one fires with a full
             // balance and no long-context entitlement.
             || lower.contains("credits are required")
+            // RUST-M8: `Your account is on hold and can't use Claude Code.
+            // View details or appeal: https://claude.ai/restricted` -- an
+            // account restriction, and the line carries its own appeal link.
+            || lower.contains("account is on hold")
     })
 }
 
@@ -15206,6 +15213,9 @@ Some unrelated content.
         // RUST-FV verbatim: no "limit" in it at all.
         let credits = "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
         assert_eq!(learn_failure_agent_limit_line(credits), Some(credits));
+        // RUST-M8 verbatim.
+        let extra = "You're out of extra usage \u{b7} resets 1:40pm (Europe/Lisbon)";
+        assert_eq!(learn_failure_agent_limit_line(extra), Some(extra));
     }
 
     #[test]
@@ -15224,6 +15234,8 @@ Some unrelated content.
             // CLI asked for. Our digest is capped well under that, so the
             // entitlement is the whole cause.
             "Usage credits are required for long context requests.",
+            // RUST-M8 verbatim: an account restriction with its own appeal link.
+            "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
