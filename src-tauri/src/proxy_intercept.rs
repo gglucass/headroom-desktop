@@ -2316,7 +2316,12 @@ async fn splice_with_codex_capture(
         // `no_response` by `note_codex_prompt_outcome` (RUST-KG) and its
         // rate-limit headers were never read.
         let mut head = Vec::with_capacity(4096);
+        let head_started = std::time::Instant::now();
         let read_head = read_http_headers(&mut backend_rd, &mut head).await;
+        let head_failure = read_head
+            .as_ref()
+            .err()
+            .map(|err| (err.kind(), head_started.elapsed()));
 
         if read_head.is_ok() {
             stamp_backend_traffic();
@@ -2392,6 +2397,7 @@ async fn splice_with_codex_capture(
                 client_gone.load(Ordering::Relaxed),
                 req_path,
                 &error_body,
+                head_failure,
             );
         }
         let _ = client_wr.shutdown().await;
@@ -2426,23 +2432,24 @@ fn codex_prompt_failed(
 }
 
 /// Whether an error body came from the provider rather than from Headroom: its
-/// JSON error object, or its edge's HTML page. Headroom's own 5xx are the
+/// JSON error object, or any non-JSON page. Headroom's own 5xx are the
 /// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
-/// and a bare framework 500, and stay counted.
+/// and a bare framework 500, and stay counted, as does a `{` the bounded peek
+/// cut short. Anything else non-JSON was written past the backend: RUST-KN
+/// reopened on 0.9.34 for a 187-byte 502 that was neither JSON nor HTML.
 fn provider_wrote_error(body: &[u8]) -> bool {
-    let body = body.trim_ascii_start();
-    body.starts_with(b"<")
-        || serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|json| json.get("error").cloned())
-            .is_some_and(|err| {
-                err.is_object()
-                    && !["type", "code"].iter().any(|key| {
-                        err.get(*key)
-                            .and_then(|id| id.as_str())
-                            .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
-                    })
-            })
+    let body = body.trim_ascii();
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => json.get("error").is_some_and(|err| {
+            err.is_object()
+                && !["type", "code"].iter().any(|key| {
+                    err.get(*key)
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
+                })
+        }),
+        Err(_) => !body.is_empty() && !body.starts_with(b"{") && body != b"Internal Server Error",
+    }
 }
 
 /// The `type`/`code` of every 5xx error object the backend writes on the
@@ -2463,12 +2470,19 @@ const HEADROOM_ERROR_IDS: &[&str] = &[
 /// prompt failed with no trace at all (user 3277, 2026-09-29: one RUST-KC,
 /// then nothing). An unbroken run is the signal: report once when the run
 /// reaches the threshold, and the next success re-arms it.
+///
+/// `head_failure` is how the backend dropped a `no_response` prompt and after
+/// how long: an instant `UnexpectedEof` is the backend closing it, a reset
+/// after a long wait is a stalled backend the watchdog killed (RUST-KG's
+/// first post-fix event came from a Windows host whose feed pulls through
+/// 6767 were failing at the same time, the RUST-86 stall shape).
 fn note_codex_prompt_outcome(
     status: Option<u16>,
     stream_failed: bool,
     client_gone: bool,
     req_path: &str,
     error_body: &[u8],
+    head_failure: Option<(std::io::ErrorKind, Duration)>,
 ) {
     match codex_prompt_failed(status, stream_failed, client_gone, error_body) {
         None => return,
@@ -2498,6 +2512,10 @@ fn note_codex_prompt_outcome(
             if !error_body.is_empty() {
                 scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
                 scope.set_extra("error_body", codex_error_summary(error_body).into());
+            }
+            if let Some((err_kind, waited)) = head_failure {
+                scope.set_extra("head_error", format!("{err_kind:?}").into());
+                scope.set_extra("head_wait_ms", (waited.as_millis() as u64).into());
             }
             scope.set_fingerprint(Some(&["codex-prompts-failing", kind]));
         },
@@ -5746,6 +5764,15 @@ mod tests {
         let edge =
             b"<html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>";
         assert_eq!(codex_prompt_failed(Some(502), false, false, edge), None);
+        // Nor a gateway's plain-text 502 (RUST-KN, 0.9.34). A cut-short JSON
+        // body is anyone's, so it stays counted.
+        let text = b"upstream connect error or disconnect/reset before headers";
+        assert_eq!(codex_prompt_failed(Some(502), false, false, text), None);
+        let cut = br#"{"error":{"type":"connection_error","message":"Fail"#;
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, cut),
+            Some(true)
+        );
     }
 
     #[test]

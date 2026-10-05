@@ -260,7 +260,7 @@ fn transport_kind_slug(err: &reqwest::Error) -> &'static str {
 /// apart from a captive portal. Carried as an extra, never a tag or
 /// fingerprint component, so grouping is unaffected. Bounded because a chain
 /// is attacker-agnostic but not length-bounded.
-fn transport_cause_chain(err: &reqwest::Error) -> String {
+pub(crate) fn transport_cause_chain(err: &reqwest::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {

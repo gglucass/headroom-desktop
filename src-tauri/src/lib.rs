@@ -8505,11 +8505,20 @@ fn fetch_transformations_feed_from(
     // wheel without it ignores the parameter and sends bodies as
     // before, which the deserializer already tolerates.
     let url = format!("{base_url}/transformations/feed?limit={limit}&include_messages=0");
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
+    // The cause chain, not `to_string()`: reqwest's top line for a timeout,
+    // a refusal and a reset alike is "error sending request for url", so the
+    // canary's "timed out" check never matched and RUST-DT filed stalls as
+    // "other" with nothing saying which.
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|err| crate::pricing::transport_cause_chain(&err))?;
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let mut raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    let mut raw: RawTransformationsFeedResponse = response
+        .json()
+        .map_err(|err| crate::pricing::transport_cause_chain(&err))?;
     // One basis for every consumer (tiles, records, canary): see the method.
     for event in &mut raw.transformations {
         event.apply_new_input_basis();
@@ -13719,7 +13728,8 @@ mod tests {
 
         let err =
             fetch_transformations_feed_from(&format!("http://127.0.0.1:{port}"), 50).unwrap_err();
-        assert!(!err.is_empty(), "expected a non-empty error message");
+        // The cause chain, so a refusal is told apart from a timeout.
+        assert!(err.contains(" <- "), "expected the cause chain, got: {err}");
     }
 
     // ── classify_bootstrap_failure ───────────────────────────────────────────
