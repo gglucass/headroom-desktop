@@ -5846,7 +5846,13 @@ async fn apply_client_setup(
         .await?;
     }
     let state: tauri::State<'_, AppState> = app.state();
-    match client_adapters::apply_client_setup(&client_id) {
+    // On the blocking pool: verification probes the proxy over blocking HTTP.
+    let id = client_id.clone();
+    let applied =
+        tauri::async_runtime::spawn_blocking(move || client_adapters::apply_client_setup(&id))
+            .await
+            .map_err(|err| err.to_string())?;
+    match applied {
         Ok(mut result) => {
             if resume_after_write && needs_resume(&state) {
                 // Verification probed the proxy before this resume brought it
@@ -14612,6 +14618,8 @@ Some unrelated content.
             "pricing::",
             "fetch_transformations_feed(",
             "list_client_connectors(",
+            "client_adapters::apply_client_setup(",
+            "verify_client_setup(",
             ".dashboard()",
         ];
         let mut checked = Vec::new();
@@ -14635,6 +14643,7 @@ Some unrelated content.
             "get_launch_flags",
             "get_client_connectors",
             "activate_headroom_account",
+            "apply_client_setup",
         ] {
             assert!(checked.contains(&name), "{name} not scanned: {checked:?}");
         }
