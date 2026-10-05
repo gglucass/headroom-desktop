@@ -3024,17 +3024,19 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_fl
 # cache_write 0 while the uncached tail grew 3,879 -> 14,639 tokens a request.
 # The hold saves one cache write of the Read and costs a full-price resend of
 # the Read plus everything after it on every held turn (5 at least), and the
-# maturing turn writes from the Read onward either way. So (1) the relocation
+# maturing turn writes from the Read onward either way. So the relocation
 # forwards the breakpoints the wheel's cache_control normalizer already put at the
-# client's positions (never adds or moves one), and (2) a Read seen holding
-# stays eligible for maturation after the now-cached tail pushes the
-# provider-confirmed prefix past it; without (2) the wheel's `i <
-# frozen_message_count` gate keeps that Read verbatim for good (probe: never
-# matures). Below that prefix only held Reads may change. Reads still mature on
-# the quiesce schedule; the maturing turn now rewrites cached bytes instead of
-# writing uncached ones. The handler imports relocate_cache_breakpoint at call
-# time, so rebinding the module attribute reaches it. Exact-pin gated to wheel
-# 0.39.0; self-neutralizes when the wheel stops stripping a held Read's
+# client's positions (never adds or moves one). With the tail cached, the
+# provider-confirmed prefix soon passes the held Read and the wheel's `i <
+# frozen_message_count` gate keeps it verbatim: that is intended. rc.5-rc.9 also
+# kept such a Read maturable, and a week's replay of this machine's traffic
+# priced that at -23.7M base-input tokens a week: a median maturation rewrote
+# 19.2k cached tokens at the 1h write price to drop a 2.1k-token Read read at
+# 0.1x over a median 36 remaining turns (live: 151,528 rewritten for ~600 saved).
+# A Read still in the live zone at quiesce matures as before. Tokens saved from
+# maturation drop by design. The handler imports relocate_cache_breakpoint at
+# call time, so rebinding the module attribute reaches it. Exact-pin gated to
+# wheel 0.39.0; self-neutralizes when the wheel stops stripping a held Read's
 # breakpoint.
 # Kill switch: HEADROOM_HELD_READ_BREAKPOINT=0.
 _hd_hrb_flag = _hd_os.environ.get("HEADROOM_HELD_READ_BREAKPOINT", "1")
@@ -3050,56 +3052,14 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
             from headroom.transforms import read_maturation as _hd_hrb_mod
 
             _hd_hrb_orig_relocate = _hd_hrb_mod.relocate_cache_breakpoint
-            _hd_hrb_orig_apply = _hd_hrb_mod.ReadMaturationManager.apply
             _hd_hrb_log = _hd_hrb_logging.getLogger("headroom.proxy")
 
-            def _hd_hrb_ids(msg):
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if not isinstance(content, list):
-                    return set()
-                return {
-                    b.get("tool_use_id")
-                    for b in content
-                    if isinstance(b, dict) and b.get("type") == "tool_result"
-                }
-
             def _hd_hrb_relocate(messages, holding_msg_indices):
-                return messages
-
-            def _hd_hrb_apply(self, messages, frozen_message_count=0):
-                held = getattr(self, "_hd_hrb_held", None) or set()
-                frozen = frozen_message_count or 0
-                floor = frozen
-                for i in range(min(frozen, len(messages))):
-                    if _hd_hrb_ids(messages[i]) & held:
-                        floor = i
-                        break
-                res = _hd_hrb_orig_apply(
-                    self, messages, frozen_message_count=floor
-                )
-                if floor < frozen and res.messages is not messages:
-                    out = list(res.messages)
-                    for i in range(floor, frozen):
-                        if not (_hd_hrb_ids(messages[i]) & held):
-                            out[i] = messages[i]
-                    res.messages = out
-                # Forget this conversation's Reads that stopped holding (matured,
-                # stale-marked); keep ids a parallel conversation on the same
-                # manager is still holding.
-                seen = set().union(*(_hd_hrb_ids(m) for m in messages[floor:]))
-                self._hd_hrb_held = (held - seen) | set().union(
-                    *(_hd_hrb_ids(res.messages[i]) for i in res.holding_msg_indices)
-                )
-                if res.holding_msg_indices or floor < frozen:
+                if holding_msg_indices:
                     _hd_hrb_log.info(
-                        "event=held_read_breakpoint holding=%d frozen=%d floor=%d "
-                        "matured=%d",
-                        len(res.holding_msg_indices),
-                        frozen,
-                        floor,
-                        res.newly_matured,
+                        "event=held_read_breakpoint holding=%d", len(holding_msg_indices)
                     )
-                return res
+                return messages
 
             def _hd_hrb_needed():
                 # The incident's shape: does the wheel still strip the client's
@@ -3125,7 +3085,6 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 
             if _hd_hrb_needed():
                 _hd_hrb_mod.relocate_cache_breakpoint = _hd_hrb_relocate
-                _hd_hrb_mod.ReadMaturationManager.apply = _hd_hrb_apply
                 _hd_bound.add("held_read_breakpoint")
     except Exception:
         # Fail-open to the wheel's relocation (the pre-vendor behaviour).
@@ -3194,8 +3153,8 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.ar
 /// read_maturation is the cache-safe recovery leg (holds Read results out of
 /// the provider cache until they quiesce; never mutates a cached byte). Since
 /// 0.9.34-rc.5 the `held_read_breakpoint` vendor caches the tail over a held
-/// Read instead, so a maturing turn rewrites cached bytes from the Read onward
-/// (the wheel wrote that same region uncached). It is
+/// Read instead; from rc.10 a Read the cached prefix has passed stays verbatim,
+/// since maturing it would rewrite every cached byte after it. It is
 /// still cache-breakpoint machinery -- the class that cost 89 installs ~17pp
 /// on 0.9.4 -- so the falsey spellings of `HEADROOM_READ_MATURATION` stay a
 /// no-rebuild kill switch, and the rc does not promote to stable until
@@ -17963,7 +17922,8 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     fn held_read_breakpoint_behaves_against_the_installed_wheel() {
         // Drives the installed wheel's real Anthropic handler for 8 turns over a
         // held Read (scripts/verify-held-read-breakpoint.py): every turn keeps
-        // the client's 4 breakpoints and the Read still matures on turn 5.
+        // the client's 4 breakpoints, a Read the cached prefix has passed stays
+        // verbatim, and a held Read still in the live zone matures.
         // Self-skips when the vendor does not bind, so green is NOT evidence
         // after a bump.
         let python =

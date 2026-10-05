@@ -67,7 +67,7 @@ TOOLS = [
 # Line-numbered source like a Claude Code Read, over the 2048-byte hold floor.
 READ = "".join(f"{i:>6}\tfn adapter_{i}(x: u32) -> u32 {{ x * {i} + {i * 7} }}\n" for i in range(1, 60))
 READ_AT = 10  # message index of the Read's tool_result
-TURNS = 8  # quiesce_turns=5: held on turns 0-4, matures on turn 5
+TURNS = 8  # quiesce_turns=5: the Read is held on turns 0-4, then quiet
 
 
 def convo(quiet: int) -> list[dict]:
@@ -185,37 +185,30 @@ for turn, (msgs, body) in enumerate(zip(sent, forwarded)):
 
 check(len(forwarded) == TURNS, f"all {TURNS} turns forwarded")
 check(kept, "every turn keeps the client's breakpoints")
-check(forms == ["verbatim"] * 5 + ["matured"] * (TURNS - 5), "Read held 5 turns, then matures")
+# Once the tail is cached the confirmed prefix passes the held Read and it stays
+# verbatim: maturing a cached Read rewrites everything after it (see the vendor).
+check(forms == ["verbatim"] * TURNS, "a Read inside the cached prefix stays verbatim")
 check(
     any(f > READ_AT for f in frozen_seen[:5]),
     "fixture pushes the confirmed prefix past the held Read",
 )
 
-# Below the confirmed prefix only a Read this manager saw holding may change:
-# an old Read that was cached verbatim before maturation saw it stays put.
+# A held Read still in the live zone (past the confirmed prefix) matures on the
+# quiesce schedule as before.
 from headroom.config import ReadMaturationConfig
 
 rm.ReadMaturationManager.apply = _apply
 mgr = rm.ReadMaturationManager(ReadMaturationConfig(enabled=True, quiesce_turns=1, max_hold_turns=25, min_size_bytes=2048))
-
-
-def _pair(tid: str, path: str) -> list[dict]:
-    return [
-        {"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": "Read", "input": {"file_path": path}}]},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": READ}]},
-    ]
-
-
-held, unseen = _pair("toolu_held", "/repo/held.rs"), _pair("toolu_unseen", "/repo/unseen.rs")
+held = [
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_held", "name": "Read", "input": {"file_path": "/repo/held.rs"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_held", "content": READ}]},
+]
 quiet = [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}, {"role": "user", "content": [{"type": "text", "text": "go on"}]}]
-first = mgr.apply(held, frozen_message_count=0)  # toolu_held seen holding
-# Both quiet now and both inside the confirmed prefix; toolu_unseen was never
-# seen by maturation, so it must come through untouched.
-later = mgr.apply(held + unseen + quiet, frozen_message_count=4)
+first = mgr.apply(held, frozen_message_count=0)
+later = mgr.apply(held + quiet, frozen_message_count=0)
 check(
     first.holding_msg_indices == [1]
-    and "Retrieve original: hash=" in later.messages[1]["content"][0]["content"]
-    and later.messages[3] == unseen[1],
-    "only the held Read matures inside the confirmed prefix",
+    and "Retrieve original: hash=" in later.messages[1]["content"][0]["content"],
+    "a held Read in the live zone still matures",
 )
 sys.exit(1 if failures else 0)
