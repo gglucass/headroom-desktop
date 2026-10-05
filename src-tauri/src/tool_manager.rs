@@ -2923,6 +2923,93 @@ else:
         # Fail-open to the wheel's tokenizer derivation (the pre-vendor behaviour).
         pass
 
+# --- CCR retrieve tool enters on the first request (vendor, upstream #3810) ---
+# apply_session_sticky_ccr_tool adds headroom_retrieve to `tools` at a
+# session's FIRST compression, typically many turns in. `tools` is the head of
+# Anthropic's cache key, so that one change invalidates the whole warm prefix:
+# on 2026-10-05 seven such requests on one machine lost 519,933 cached tokens to
+# save 6,683, and a SWE-bench pilot run lost 32,501 to save 1,231. #3810 (merged
+# 2026-09-28, unreleased) injects the ~119-token definition on the session's
+# first request instead, when the client already sends tools, so the array
+# never changes again. Its hunks are applied verbatim to the installed
+# function's source (comments shortened). Both 0.39.0 call sites (anthropic and
+# openai chat) sit inside `not _bypass` and import the function at call time;
+# #3810 passes allow_eager = optimize and not bypass, so the rebound name
+# defaults allow_eager to "--no-optimize not on the command line". Streaming
+# is unchanged: a resident tool without a redeemable marker keeps the streaming
+# path (#3071). A live session that never compressed loses its cache once, on
+# its first request after the update. Exact-pin gated to wheel 0.39.0;
+# self-neutralizes when the wheel ships get_ccr_tool_injection_mode or a hunk's
+# old text is gone. Kill switch: HEADROOM_CCR_TOOL_INJECTION=lazy (#3810's own
+# name; any value but "eager" keeps the wheel's function).
+_hd_cte_flag = (_hd_os.environ.get("HEADROOM_CCR_TOOL_INJECTION") or "eager").strip().lower()
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_cte_flag == "eager":
+    try:
+        import importlib.metadata as _hd_cte_meta
+
+        if _hd_cte_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_cte_inspect
+
+            from headroom.proxy import helpers as _hd_cte_mod
+
+            _hd_cte_hunks = (
+                (
+                    "    history_has_ccr_reference: bool = False,\n) -> tuple[",
+                    "    history_has_ccr_reference: bool = False,\n"
+                    "    allow_eager: bool = False,\n) -> tuple[",
+                ),
+                (
+                    "        if not (has_compressed_content_this_turn or history_has_ccr_reference):\n",
+                    '        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"\n'
+                    "        if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):\n",
+                ),
+                (
+                    '            else "inject_history_reference",\n',
+                    '            else ("inject_history_reference" if history_has_ccr_reference else "inject_eager"),\n',
+                ),
+                (
+                    "\n    if not has_compressed_content_this_turn:\n",
+                    "\n    # headroom-desktop vendor of #3810: enter the tools array cold.\n"
+                    '    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"\n'
+                    "    if not (eager or has_compressed_content_this_turn):\n",
+                ),
+                (
+                    '        decision="inject_first_time",\n',
+                    '        decision="inject_first_time" if has_compressed_content_this_turn else "inject_eager",\n',
+                ),
+            )
+            _hd_cte_src = _hd_cte_inspect.getsource(_hd_cte_mod.apply_session_sticky_ccr_tool)
+            if not hasattr(_hd_cte_mod, "get_ccr_tool_injection_mode") and all(
+                _hd_cte_src.count(old) == 1 for old, _ in _hd_cte_hunks
+            ):
+                for _hd_cte_old, _hd_cte_new in _hd_cte_hunks:
+                    _hd_cte_src = _hd_cte_src.replace(_hd_cte_old, _hd_cte_new)
+
+                def _hd_cte_mode():
+                    raw = (_hd_os.environ.get("HEADROOM_CCR_TOOL_INJECTION") or "").strip().lower()
+                    return "lazy" if raw == "lazy" else "eager"
+
+                _hd_cte_ns = {}
+                exec(
+                    compile(_hd_cte_src, "<headroom-desktop ccr tool eager>", "exec"),
+                    _hd_cte_mod.__dict__,
+                    _hd_cte_ns,
+                )
+                _hd_cte_fn = _hd_cte_ns["apply_session_sticky_ccr_tool"]
+                _hd_cte_allow = "--no-optimize" not in _hd_sys.argv
+
+                def _hd_cte_apply(**kwargs):
+                    kwargs.setdefault("allow_eager", _hd_cte_allow)
+                    return _hd_cte_fn(**kwargs)
+
+                _hd_cte_apply.__doc__ = _hd_cte_fn.__doc__
+                _hd_cte_mod.get_ccr_tool_injection_mode = _hd_cte_mode
+                _hd_cte_mod.apply_session_sticky_ccr_tool = _hd_cte_apply
+                _hd_bound.add("ccr_tool_eager")
+    except Exception:
+        # Fail-open to the wheel's first-compression injection (pre-vendor).
+        pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
@@ -2962,6 +3049,7 @@ _HD_VENDORS = (
     "image_memo",
     "image_worker_reap",
     "stream_uncached_input",
+    "ccr_tool_eager",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -17683,6 +17771,67 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         }
         assert_eq!(on, "2 2 38211 True", "stderr:\n{on_err}");
         assert_eq!(off, "50663 0 38211 False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn ccr_tool_eager_behaves_against_the_installed_wheel() {
+        // Called the way both handlers call it (no allow_eager): a session's
+        // first request with client tools already carries headroom_retrieve,
+        // and the array is byte-identical at the first compression. A request
+        // with no tools is never armed; `--no-optimize` and the kill switch
+        // keep the wheel's wait-for-the-first-compression gate.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-ccr-eager-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, sitecustomize\n\
+                     from headroom.proxy import helpers as h\n\
+                     from headroom.ccr.tool_injection import CCR_TOOL_NAME\n\
+                     T = [{'name': 'Read', 'description': 'r', 'input_schema': {'type': 'object'}}]\n\
+                     def go(sid, comp, tools=T):\n\
+                     \x20   out, _ = h.apply_session_sticky_ccr_tool(provider='anthropic',\n\
+                     \x20       session_id=sid, request_id='r', existing_tools=list(tools),\n\
+                     \x20       has_compressed_content_this_turn=comp)\n\
+                     \x20   return out\n\
+                     has = lambda t: CCR_TOOL_NAME in [x.get('name') for x in t]\n\
+                     first, at_compression = go('s1', False), go('s1', True)\n\
+                     print(has(first), json.dumps(first) == json.dumps(at_compression),\n\
+                     \x20     has(go('s2', False, [])), has(go(None, False)),\n\
+                     \x20     'ccr_tool_eager' in sitecustomize._hd_bound)";
+        let run = |mode: &str, argv: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .args(argv)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CCR_TOOL_INJECTION", mode)
+                .output()
+                .expect("run ccr tool eager probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("eager", &[]);
+        let (no_opt, no_opt_err) = run("eager", &["--no-optimize"]);
+        let (off, off_err) = run("lazy", &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: ccr tool eager vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True True False True True", "stderr:\n{on_err}");
+        assert_eq!(
+            no_opt, "False False False False True",
+            "stderr:\n{no_opt_err}"
+        );
+        assert_eq!(off, "False False False False False", "stderr:\n{off_err}");
     }
 
     #[test]

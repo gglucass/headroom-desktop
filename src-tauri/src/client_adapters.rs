@@ -7649,10 +7649,17 @@ fn claude_remote_control_wrapper_path() -> PathBuf {
 }
 
 /// What the Windows panel command runs: the wrapper's own confirm step, since
-/// Windows gets no relaunch script. `~` because Git Bash and PowerShell both
-/// expand it, and an unquoted home path with a space would split.
-const WINDOWS_REMOTE_CONTROL_CONFIRM: &str =
-    "~/.claude/hooks/headroom-claude-wrapper.exe --confirm";
+/// Windows gets no relaunch script. Absolute and double-quoted, never `~`: the
+/// Bash tool is Git Bash, which expands `~` from HOME, and a user's HOME can
+/// point away from the profile `home_dir` (and Claude Code) put the wrapper in,
+/// which left the command "not found" (exit 127). The msys form has no colon to
+/// trip the command's YAML front matter.
+fn windows_remote_control_confirm(wrapper: &Path) -> String {
+    format!(
+        "\"{}\" --confirm",
+        shell_double_quote(&msys_path(&wrapper.to_string_lossy()))
+    )
+}
 
 /// The VS Code extension's Claude process wrapper setting: an executable it
 /// launches the CLI through as `<wrapper> <claude-binary> <args...>`.
@@ -8031,7 +8038,7 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     let command = claude_remote_control_panel_command_path();
     let content = build_claude_remote_control_command_with(
         CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION,
-        WINDOWS_REMOTE_CONTROL_CONFIRM,
+        &windows_remote_control_confirm(&wrapper),
     );
     if std::fs::read_to_string(&command)
         .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
@@ -11112,8 +11119,9 @@ mod tests {
         retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
         serialize_paths, shell_block_contains_in_files, shell_block_contains_text_in_files,
         shell_double_quote, strip_headroom_hook_from_settings, upsert_managed_block,
-        vscode_settings_failure_level, write_file_if_changed, ClientSetupState, ShellFamily,
-        NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
+        vscode_settings_failure_level, windows_remote_control_confirm, write_file_if_changed,
+        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
+        VSCODE_PROCESS_WRAPPER_KEY,
     };
     use super::{build_claude_remote_control_wrapper, build_windows_wrapper_exe};
     #[cfg(unix)]
@@ -13242,6 +13250,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(msys_path("E:"), "/e");
         assert_eq!(msys_path("/usr/local/bin"), "/usr/local/bin");
         assert_eq!(msys_path("relative/C:/x"), "relative/C:/x");
+    }
+
+    #[test]
+    fn windows_remote_control_confirm_names_the_wrapper_by_absolute_path() {
+        // Never `~`: Git Bash takes it from HOME, which may not be the profile.
+        assert_eq!(
+            windows_remote_control_confirm(Path::new(
+                r"C:\Users\Jane Doe\.claude\hooks\headroom-claude-wrapper.exe"
+            )),
+            "\"/c/Users/Jane Doe/.claude/hooks/headroom-claude-wrapper.exe\" --confirm"
+        );
+        assert_eq!(
+            windows_remote_control_confirm(Path::new(r"C:\Users\a$b\w.exe")),
+            "\"/c/Users/a\\$b/w.exe\" --confirm"
+        );
     }
 
     #[test]
