@@ -64,6 +64,7 @@ import {
   type AppUpdateStatePatch,
 } from "./lib/appUpdate";
 import { maybeFireTrialNotifications } from "./lib/trialNotifications";
+import { openLinkFromClick } from "./lib/externalLink";
 import {
   fireUpsellNudge,
   maybeFireUrgentPricingNotifications,
@@ -4063,14 +4064,14 @@ export default function App() {
     const report = await invoke<BootstrapFailureReport | null>(
       "get_bootstrap_failure_report"
     ).catch(() => null);
-    await invoke("open_external_link", {
-      url: buildInstallFailureMailto({
+    openLinkFromClick(
+      buildInstallFailureMailto({
         kind: report?.kind ?? null,
         detail: report?.detail ?? null,
         appVersion: appSemver,
         platform: runtimeStatus?.platform ?? "unknown",
-      }),
-    });
+      })
+    );
   }
 
   function restartIntoInstalledUpdate() {
@@ -5325,9 +5326,7 @@ export default function App() {
                 type="button"
                 className="secondary-button secondary-button--small"
                 onClick={() =>
-                  void invoke("open_external_link", {
-                    url: buildUpgradeIssueMailto(upgradeFailure),
-                  }).catch(() => {})
+                  openLinkFromClick(buildUpgradeIssueMailto(upgradeFailure))
                 }
               >
                 Report issue
@@ -5464,9 +5463,7 @@ export default function App() {
                   type="button"
                   className="secondary-button secondary-button--small"
                   onClick={() =>
-                    void invoke("open_external_link", {
-                      url: buildUpgradeIssueMailto(upgradeFailure),
-                    }).catch(() => {})
+                    openLinkFromClick(buildUpgradeIssueMailto(upgradeFailure))
                   }
                 >
                   Report issue
@@ -6113,7 +6110,7 @@ export default function App() {
           <p className="paywall__footnote">
             <button
               className="link-button"
-              onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/features" })}
+              onClick={() => openLinkFromClick("https://extraheadroom.com/features")}
               type="button"
             >
               See all Headroom features
@@ -6765,9 +6762,9 @@ export default function App() {
           </div>
           <p className="pricing-auth-card__legal">
             {"By signing in, you agree to our "}
-            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/terms" })} type="button">Terms of Service</button>
+            <button className="link-button" onClick={() => openLinkFromClick("https://extraheadroom.com/terms")} type="button">Terms of Service</button>
             {" and "}
-            <button className="link-button" onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/privacy" })} type="button">Privacy Policy</button>
+            <button className="link-button" onClick={() => openLinkFromClick("https://extraheadroom.com/privacy")} type="button">Privacy Policy</button>
             {"."}
           </p>
         </>
@@ -6864,7 +6861,7 @@ export default function App() {
           ))}
           <button
             className="tray-nav__item"
-            onClick={() => void openExternalLink(DOCS_URL)}
+            onClick={() => openLinkFromClick(DOCS_URL)}
             type="button"
           >
             <span className="tray-nav__icon" aria-hidden="true">
@@ -6970,13 +6967,11 @@ export default function App() {
                       type="button"
                       className="link-button"
                       onClick={() =>
-                        void invoke("open_external_link", {
-                          url: platformPreviewSupportMailto({
+                        openLinkFromClick(platformPreviewSupportMailto({
                             platform: runtimeStatus?.platform,
                             appVersion: appSemver,
                             headroomVersion,
-                          }),
-                        }).catch(() => {})
+                          }))
                       }
                     >
                       {PREVIEW_SUPPORT_EMAIL}
@@ -7148,7 +7143,7 @@ export default function App() {
                         <button
                           className="link-button"
                           onClick={() =>
-                            void openExternalLink(`${DOCS_URL}/how-learning-works`)
+                            openLinkFromClick(`${DOCS_URL}/how-learning-works`)
                           }
                           type="button"
                         >
@@ -7410,7 +7405,7 @@ export default function App() {
                                   <button
                                     className="install-prompt__link"
                                     type="button"
-                                    onClick={() => void openExternalLink(CODEX_INSTALL_DOCS_URL)}
+                                    onClick={() => openLinkFromClick(CODEX_INSTALL_DOCS_URL)}
                                   >
                                     Open install docs
                                   </button>
@@ -7621,7 +7616,7 @@ export default function App() {
                 <button
                   type="button"
                   className="addon-card__link"
-                  onClick={() => void openExternalLink(`${DOCS_URL}/add-ons`)}
+                  onClick={() => openLinkFromClick(`${DOCS_URL}/add-ons`)}
                 >
                   What each addon does
                 </button>
@@ -7629,7 +7624,7 @@ export default function App() {
                 <button
                   type="button"
                   className="addon-card__link"
-                  onClick={() => void openExternalLink(buildAddonRequestMailto())}
+                  onClick={() => openLinkFromClick(buildAddonRequestMailto())}
                 >
                   Request an addon
                 </button>
@@ -7663,7 +7658,7 @@ export default function App() {
                       }
                       onDismissResult={() => setAddonResult(null)}
                       sourceUrl={tool.sourceUrl}
-                      onOpenSource={() => void openExternalLink(tool.sourceUrl)}
+                      onOpenSource={() => openLinkFromClick(tool.sourceUrl)}
                       connectors={connectors}
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
@@ -7717,7 +7712,7 @@ export default function App() {
                   "https://github.com/rtk-ai/rtk"
                 }
                 onOpenSource={() =>
-                  void openExternalLink(
+                  openLinkFromClick(
                     dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
                       "https://github.com/rtk-ai/rtk"
                   )
@@ -8437,7 +8432,7 @@ export default function App() {
 
               <button
                 className="contact-link"
-                onClick={() => void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
+                onClick={() => openLinkFromClick("mailto:support@extraheadroom.com")}
                 type="button"
               >
                 Contact us
@@ -8461,14 +8456,12 @@ export default function App() {
                 setActiveView("settings");
               }}
               onContact={() => {
-                void invoke("open_external_link", {
-                  url: buildSetupStallMailto(setupStall.kind, {
+                openLinkFromClick(buildSetupStallMailto(setupStall.kind, {
                     appVersion: appSemver,
                     lifetimeRequests: dashboard.lifetimeRequests,
                     runtime: runtimeStatus,
                     connectors
-                  })
-                });
+                  }));
               }}
             />
           )}
@@ -8581,7 +8574,7 @@ export default function App() {
                   <button
                     className="link-button"
                     onClick={() =>
-                      void openExternalLink(`${DOCS_URL}/how-savings-are-measured`)
+                      openLinkFromClick(`${DOCS_URL}/how-savings-are-measured`)
                     }
                     type="button"
                   >

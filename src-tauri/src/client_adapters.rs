@@ -773,10 +773,21 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
 
-            if claude_guard_hook_path().exists() && claude_guard_registered()? {
+            // Three cases, worded apart because they are different bugs
+            // (RUST-GS grouped them all as "not found"). A guard registered
+            // under the other interpreter is not lost: `guard_python_command`
+            // re-probes `/usr/bin/python3` every process, so installing or
+            // removing the Command Line Tools, or one probe timing out, changes
+            // the expected command. It still runs, so it verifies, and repair
+            // re-applies it as stale without reporting it.
+            if !claude_guard_hook_path().exists() {
+                failures.push(CLAUDE_GUARD_SCRIPT_MISSING.into());
+            } else if claude_guard_registered()? {
                 checks.push(
                     "Found Headroom routing guard registered in ~/.claude/settings.json.".into(),
                 );
+            } else if claude_guard_registered_any_interpreter()? {
+                checks.push(CLAUDE_GUARD_STALE_COMMAND.into());
             } else {
                 failures.push(
                     "Headroom routing guard was not found in ~/.claude/settings.json.".into(),
@@ -928,17 +939,39 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 /// Scans at most once per hour per process: verification reads a handful of
 /// files (and the codex arm spawns a detached `codex doctor`), and a repair
 /// that cannot stick (read-only fs, ancient CLI) must not churn on every
-/// watchdog tick.
+/// watchdog tick. The exception is `~/.claude/settings.json` changing on disk:
+/// a Claude Code process holding a pre-wiring copy writes the whole file back
+/// and drops our env (RUST-KH), and every session started before the hourly
+/// scan ran went direct. That file alone is re-verified on the next tick
+/// (5 minutes) after it changes; verify-first means a clean file is not
+/// rewritten, so our own repair write does not loop.
 pub fn repair_client_setups() -> Vec<String> {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     // ponytail: process-wide hourly throttle; split per client if support
     // traffic ever shows one client's broken repair starving another's.
     static LAST_SCAN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    static CLAUDE_SETTINGS_MTIME: Mutex<Option<SystemTime>> = Mutex::new(None);
+    let mtime = std::fs::metadata(claude_settings_path())
+        .and_then(|meta| meta.modified())
+        .ok();
+    let claude_settings_changed = {
+        let mut seen = CLAUDE_SETTINGS_MTIME.lock().unwrap();
+        let changed = seen.is_some() && *seen != mtime;
+        *seen = mtime;
+        changed
+    };
     {
         let mut last = LAST_SCAN.get_or_init(|| Mutex::new(None)).lock().unwrap();
         if last.is_some_and(|at| at.elapsed() < Duration::from_secs(3600)) {
-            return Vec::new();
+            return if claude_settings_changed
+                && is_configured(&load_setup_state(), "claude_code")
+                && repair_client_setup_now("claude_code")
+            {
+                vec!["claude_code".to_string()]
+            } else {
+                Vec::new()
+            };
         }
         *last = Some(Instant::now());
     }
@@ -1015,10 +1048,10 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
 /// re-applies too but returns false: it is every client on every update, so
 /// counting it would bury the real repairs in the auto-repaired metric.
 fn repair_client_setup_now(client_id: &str) -> bool {
-    let mut broken = match verify_client_setup(client_id) {
-        Ok(verification) => verification.failures,
+    let (mut broken, checks) = match verify_client_setup(client_id) {
+        Ok(verification) => (verification.failures, verification.checks),
         // Ids verification doesn't support are ids repair can't help.
-        Err(_) => Vec::new(),
+        Err(_) => (Vec::new(), Vec::new()),
     };
     // Only a failed check means a config broke silently. A version restamp
     // is every client on every update, and its text carries the version, so
@@ -1032,6 +1065,14 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             "Managed files were written by Headroom {stale}; running {}.",
             env!("CARGO_PKG_VERSION")
         ));
+    }
+    // Verifies, but the next session start runs an interpreter this build
+    // would not pick; re-apply like a restamp, unreported.
+    if checks
+        .iter()
+        .any(|check| check == CLAUDE_GUARD_STALE_COMMAND)
+    {
+        broken.push(CLAUDE_GUARD_STALE_COMMAND.into());
     }
     if broken.is_empty() {
         return false;
@@ -4531,9 +4572,11 @@ fn remove_legacy_vscode_base_url_keys() -> (Vec<String>, Vec<String>) {
 /// A settings.json our parsers refuse but VS Code applies (a missing comma,
 /// RUST-M2/M3/M4) is the user's file, and the best-effort VS Code edits leave
 /// it untouched: local log only, since every distinct parse error message was
-/// its own Sentry issue. Any other failure still warns.
+/// its own Sentry issue. So is one the OS will not let us read or write
+/// (EPERM on macOS, RUST-N7/N8): no change here can grant that access. Any
+/// other failure still warns.
 fn vscode_settings_failure_level(err: &anyhow::Error) -> log::Level {
-    if err.chain().any(|cause| cause.is::<json5::Error>()) {
+    if err.chain().any(|cause| cause.is::<json5::Error>()) || is_permission_denied(err) {
         log::Level::Info
     } else {
         log::Level::Warn
@@ -7371,6 +7414,19 @@ fn report_unparseable_guard_command(command: &str) {
 fn claude_guard_registered() -> Result<bool> {
     guard_registered_in_hooks(&claude_settings_path(), &claude_guard_command())
 }
+
+/// Registered by script path, whatever interpreter runs it.
+fn claude_guard_registered_any_interpreter() -> Result<bool> {
+    guard_registered_in_hooks(
+        &claude_settings_path(),
+        &claude_guard_hook_path().display().to_string(),
+    )
+}
+
+const CLAUDE_GUARD_SCRIPT_MISSING: &str =
+    "Headroom routing guard script was missing from ~/.claude/hooks.";
+const CLAUDE_GUARD_STALE_COMMAND: &str =
+    "Headroom routing guard in ~/.claude/settings.json runs under a different Python; re-applying.";
 
 /// Strip the Claude guard from every settings candidate and delete the script.
 /// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
@@ -10887,7 +10943,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
-    #[cfg(unix)]
     use serde_json::Value;
 
     #[test]
@@ -11229,6 +11284,13 @@ mod tests {
 
         let io = anyhow::Error::from(std::io::Error::other("denied")).context("writing settings");
         assert_eq!(vscode_settings_failure_level(&io), log::Level::Warn);
+
+        // RUST-N7/N8: macOS refused the read with EPERM.
+        let eperm = anyhow::Error::from(std::io::Error::from_raw_os_error(
+            super::PERMISSION_DENIED_OS_ERRORS[0],
+        ))
+        .context("reading settings.json");
+        assert_eq!(vscode_settings_failure_level(&eperm), log::Level::Info);
     }
 
     #[test]
@@ -14710,6 +14772,60 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             verification.failures.iter().all(|f| !f.contains("RTK")),
             "no RTK failures reported when RTK is disabled, got: {:?}",
             verification.failures
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_guard_under_another_python_is_stale_not_missing() {
+        // RUST-GS: the expected guard command embeds the interpreter, which
+        // `guard_python_command` re-probes each process. A guard written under
+        // the other one still runs: it must verify, and repair must rewrite it
+        // without reporting it, while a deleted script still fails.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::write(&settings, r#"{"hooks": {}}"#).unwrap();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
+
+        let current = super::claude_guard_command();
+        let raw = fs::read_to_string(&settings).unwrap();
+        let script = super::claude_guard_hook_path().display().to_string();
+        let other = super::join_guard_command("\"/other/python3\"", &script, false, false);
+        let mut value: Value = serde_json::from_str(&raw).unwrap();
+        for entry in value["hooks"]["SessionStart"].as_array_mut().unwrap() {
+            for hook in entry["hooks"].as_array_mut().unwrap() {
+                if hook["command"] == Value::String(current.clone()) {
+                    hook["command"] = Value::String(other.clone());
+                }
+            }
+        }
+        fs::write(&settings, value.to_string()).unwrap();
+
+        let stale = super::verify_client_setup("claude_code").expect("verify runs");
+        assert!(stale.failures.is_empty(), "{:?}", stale.failures);
+        assert!(stale
+            .checks
+            .iter()
+            .any(|c| c == super::CLAUDE_GUARD_STALE_COMMAND));
+        assert!(
+            !super::repair_client_setup_now("claude_code"),
+            "re-applied unreported"
+        );
+        assert!(
+            super::claude_guard_registered().unwrap(),
+            "current command back"
+        );
+        assert!(!fs::read_to_string(&settings)
+            .unwrap()
+            .contains("/other/python3"));
+
+        fs::remove_file(super::claude_guard_hook_path()).unwrap();
+        let missing = super::verify_client_setup("claude_code").expect("verify runs");
+        assert_eq!(
+            missing.failures,
+            vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()]
         );
     }
 
