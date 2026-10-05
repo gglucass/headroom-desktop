@@ -13159,7 +13159,6 @@ mod tests {
         false
     }
 
-    /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
     /// A stray backend's multiprocessing helpers share its process group and
     /// outlive a per-pid SIGTERM; the sweep signals the group so they go too.
     #[cfg(unix)]
@@ -13246,6 +13245,7 @@ mod tests {
         );
     }
 
+    /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
     /// live parent that is not a Headroom desktop must not spare a match: the
     /// orphan backend then survived every quit and upgrade until reboot.
     #[cfg(unix)]
