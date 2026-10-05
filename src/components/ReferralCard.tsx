@@ -44,7 +44,7 @@ export function ReferralCard({ code, signups, subscribed, freeMonths, rewardPend
         </button>
       </div>
       <p>
-        Or they can enter code <strong>{code}</strong> when they sign in.
+        Or, once they've signed in to Headroom, they can add code <strong>{code}</strong> under Upgrade.
       </p>
       <dl className="referral-card__stats">
         <div>

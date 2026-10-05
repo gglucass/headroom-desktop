@@ -16,6 +16,8 @@ describe("ReferralCard", () => {
     render(<ReferralCard code="AB12CD34" signups={0} subscribed={0} freeMonths={0} rewardPending={false} />);
 
     expect(screen.getByText("https://extraheadroom.com/r/AB12CD34")).toBeInTheDocument();
+    // Sign-in has no code field since rc7; the code goes in Upgrade afterwards.
+    expect(screen.getByText(/once they've signed in to Headroom, they can add code/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Copy link/ }));
 
     expect(writeText).toHaveBeenCalledWith("https://extraheadroom.com/r/AB12CD34");
