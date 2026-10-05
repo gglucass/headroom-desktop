@@ -133,8 +133,6 @@ import {
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
   newInputSavingsRate,
-  allTimeCacheHitPair,
-  cacheHitPair,
   calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
@@ -1912,7 +1910,7 @@ export default function App() {
   // chart anyway after this delay rather than spinning forever.
   const [historyLoadTimedOut, setHistoryLoadTimedOut] = useState(false);
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
-  const [showCacheInfo, setShowCacheInfo] = useState(false);
+  const [showTokensInfo, setShowTokensInfo] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
   // Onboarding's open-at-login switch: on by default, applied on Continue so
@@ -5036,41 +5034,6 @@ export default function App() {
 
   const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
   const headroomVersion = headroomTool?.version ?? "Unknown";
-  // Paired context for the savings headline. The headline rate dilutes as the
-  // client's prompt caching improves, because cache reads sit in its
-  // denominator while compression deliberately never touches the cached
-  // prefix -- so a healthier cache reads as a Headroom regression. Show the
-  // two forces side by side instead: how much of lifetime input the client's
-  // cache served (cheap, never claimed by Headroom), and how much of the
-  // REMAINING (compressible) input Headroom removed.
-  // All three rows go through cacheHitPair, which prices both rates in
-  // dollars (see its doc for why tokens are invalid here). The all-time row
-  // feeds it the lifetime breakdown as a single synthetic bucket;
-  // cacheReadTokens is used only as an existence signal for coverage, never
-  // ratioed against our own token counts.
-  //
-  // The numerator is compression ALONE, not lifetimeEstimatedSavingsUsd. That
-  // three-layer total also carries output shaping and tool-schema deferral,
-  // neither of which removes input, so pairing it with an input-cost
-  // denominator made all-time read above the two rows beside it (measured
-  // 2026-09-10: 17.0% against 11.6% this month, 2.2pp of the gap being the
-  // extra layers rather than better compression). Same layer as the windowed
-  // rows now, so the three are comparable.
-  const cachePairAllTime = allTimeCacheHitPair(
-    dashboard.savingsBreakdown,
-    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0,
-    dashboard.dailySavings
-  );
-  // Same pair for the shorter windows, from the buckets that carry cache
-  // coverage (backend history checkpoints; local-tracker buckets and days
-  // aged out of retention are excluded from both rates). The all-time row
-  // above uses the true lifetime breakdown instead, which predates coverage.
-  const cachePairToday = cacheHitPair(
-    buildHourlySavingsWindow(dashboard.hourlySavings, new Date())
-  );
-  const cachePairMonth = cacheHitPair(
-    buildMonthlySavingsWindow(dashboard.dailySavings, new Date())
-  );
   const rtkAvgSavingsPct =
     runtimeStatus?.rtk.installed && (runtimeStatus.rtk.totalCommands ?? 0) > 0
       ? runtimeStatus.rtk.avgSavingsPct ?? 0
@@ -7121,9 +7084,9 @@ export default function App() {
                   Total tokens saved
                   <button
                     className="stat-card__info-button"
-                    onClick={(e) => { e.stopPropagation(); setShowCacheInfo(true); }}
+                    onClick={(e) => { e.stopPropagation(); setShowTokensInfo(true); }}
                     type="button"
-                    aria-label="What the tokens saved figure includes"
+                    aria-label="What tokens saved includes"
                   >
                     <Info size={13} weight="bold" />
                   </button>
@@ -8639,12 +8602,12 @@ export default function App() {
             </div>
           )}
 
-          {showCacheInfo && (
+          {showTokensInfo && (
             <div
               className="modal-backdrop"
               role="dialog"
               aria-modal="true"
-              onClick={() => setShowCacheInfo(false)}
+              onClick={() => setShowTokensInfo(false)}
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>Tokens saved</h3>
@@ -8652,51 +8615,29 @@ export default function App() {
                     lifetimeTokensSaved, so the rows add up to the card. */}
                 <div className="savings-breakdown">
                   <div className="savings-breakdown__row">
-                    <span>Input compression (Headroom)</span>
+                    <span>Input compression</span>
                     <strong>{compactNumber(lifetimeInputTokensSaved)}</strong>
                   </div>
+                  <p className="savings-breakdown__note">
+                    Tokens Headroom removed from your requests before they reached the model.
+                  </p>
                   {lifetimeOutputTokensSaved > 0 ? (
-                    <div className="savings-breakdown__row">
-                      <span>Output shaping (Headroom, estimated)</span>
-                      <strong>{compactNumber(lifetimeOutputTokensSaved)}</strong>
-                    </div>
+                    <>
+                      <div className="savings-breakdown__row">
+                        <span>Output shaping</span>
+                        <strong>{compactNumber(lifetimeOutputTokensSaved)}</strong>
+                      </div>
+                      <p className="savings-breakdown__note">
+                        Tokens the model didn&apos;t have to write because Headroom asked for
+                        shorter replies. An estimate against your past replies.
+                      </p>
+                    </>
                   ) : null}
                 </div>
-                <h3>Cache hits &amp; compression</h3>
-                <p>
-                  Most of your input is re-sent conversation history that your AI client serves
-                  from the provider&apos;s prompt cache at ~10% of the input price. Headroom
-                  deliberately leaves that cached prefix untouched (compressing it would break the
-                  discount), so its compression works on the rest. A healthier cache makes blended
-                  savings rates look smaller while your actual bill shrinks.
-                </p>
-                <div className="savings-breakdown">
-                  {[
-                    { label: "Today", pair: cachePairToday },
-                    { label: "This month", pair: cachePairMonth },
-                    { label: "All time", pair: cachePairAllTime }
-                  ].map(({ label, pair }) => (
-                    <div className="savings-breakdown__row" key={label}>
-                      <span>{label}</span>
-                      <strong>
-                        {pair
-                          ? `${Math.round(pair.hitPct)}% cache hits · ${Math.round(
-                              pair.compressedPct
-                            )}% of the rest compressed`
-                          : "No cache data"}
-                      </strong>
-                    </div>
-                  ))}
-                </div>
-                <p className="savings-breakdown__note">
-                  Today and this month cover the part of the period with cache data (the backend
-                  keeps a limited history of cache checkpoints). Output shaping is a separate
-                  layer and is not part of these rates.
-                </p>
                 <div className="modal-actions">
                   <button
                     className="button button--primary"
-                    onClick={() => setShowCacheInfo(false)}
+                    onClick={() => setShowTokensInfo(false)}
                     type="button"
                   >
                     Got it
