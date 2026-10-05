@@ -1329,6 +1329,15 @@ pub struct HeadroomAccountProfile {
     /// subscription exists that a card update would bring back.
     #[serde(default)]
     pub payment_failed: bool,
+    /// Paid referral program: the code a paying subscriber shares. The server
+    /// sends it only to someone who can refer, so its presence is the gate.
+    #[serde(default)]
+    pub referral_code: Option<String>,
+    #[serde(default)]
+    pub referral_rewards_earned: usize,
+    /// Signed up through a referral; their own free month is not in yet.
+    #[serde(default)]
+    pub referral_reward_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

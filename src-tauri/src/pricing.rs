@@ -197,20 +197,25 @@ const FILTER_DROP_HINT: &str =
 
 /// RUST-78: a macOS content filter that drops a flow defuncts the socket, and
 /// XNU's `sodefunct` sets `so_error = EBADF`, so the connect fails with "Bad
-/// file descriptor (os error 9)". Nothing in this process produces that, and
-/// the rule is per app: curl from Terminal still reaches us, which is why the
+/// file descriptor (os error 9)". A filter that blocks before the SYN goes out
+/// does it through an NECP drop policy instead, which `tcp_output` fails with
+/// EHOSTUNREACH, "No route to host (os error 65)" (the same host flipped from
+/// one to the other on 0.9.32, still 1574h silent while Terminal curl worked).
+/// The rule is per app: curl from Terminal still reaches us, which is why the
 /// generic "check your connection" sent the user in circles for six weeks.
 fn is_local_filter_drop(err: &reqwest::Error) -> bool {
-    err.is_connect() && chain_has_ebadf(err)
+    err.is_connect() && chain_has_filter_errno(err)
 }
 
-fn chain_has_ebadf(err: &(dyn std::error::Error + 'static)) -> bool {
+fn chain_has_filter_errno(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(err);
     while let Some(cause) = source {
         let errno = cause
             .downcast_ref::<std::io::Error>()
             .and_then(|e| e.raw_os_error());
-        if cfg!(target_os = "macos") && errno == Some(libc::EBADF) {
+        if cfg!(target_os = "macos")
+            && matches!(errno, Some(libc::EBADF) | Some(libc::EHOSTUNREACH))
+        {
             return true;
         }
         source = cause.source();
@@ -882,6 +887,12 @@ struct RemoteAccountResponse {
     grandfathered: bool,
     #[serde(default)]
     payment_failed: bool,
+    #[serde(default)]
+    referral_code: Option<String>,
+    #[serde(default)]
+    referral_rewards_earned: usize,
+    #[serde(default)]
+    referral_reward_pending: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1108,6 +1119,13 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // anywhere in the process (notably the proxy watchdog's auto-pause event)
     // carry the user's plan. Global scope: persists until overwritten.
     set_sentry_tier(status.account.as_ref());
+    crate::TRAY_REFERRAL_AVAILABLE.store(
+        status
+            .account
+            .as_ref()
+            .is_some_and(|a| a.referral_code.is_some()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(status)
 }
 
@@ -3517,6 +3535,9 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
         payment_failed: value.payment_failed,
+        referral_code: value.referral_code,
+        referral_rewards_earned: value.referral_rewards_earned,
+        referral_reward_pending: value.referral_reward_pending,
     }
 }
 
@@ -4481,6 +4502,9 @@ mod tests {
             recommended_tier: None,
             grandfathered: false,
             payment_failed: false,
+            referral_code: None,
+            referral_rewards_earned: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -5134,6 +5158,9 @@ mod tests {
             recommended_tier: None,
             grandfathered: false,
             payment_failed: false,
+            referral_code: None,
+            referral_rewards_earned: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -5167,6 +5194,9 @@ mod tests {
             recommended_tier: None,
             grandfathered: false,
             payment_failed: false,
+            referral_code: None,
+            referral_rewards_earned: 0,
+            referral_reward_pending: false,
         }
     }
 
@@ -5883,6 +5913,22 @@ mod tests {
     }
 
     #[test]
+    fn remote_account_carries_referral_fields_through_to_the_webview() {
+        let json = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0,"referralCode":"AB12CD34","referralRewardsEarned":3,"referralRewardPending":true}"#;
+        let profile = super::remote_account_to_profile(serde_json::from_str(json).unwrap());
+        let out = serde_json::to_value(&profile).unwrap();
+        assert_eq!(out["referralCode"], "AB12CD34");
+        assert_eq!(out["referralRewardsEarned"], 3);
+        assert_eq!(out["referralRewardPending"], true);
+
+        // Servers before the program existed.
+        let old = r#"{"email":"a@b","trialActive":false,"subscriptionActive":true,"acceptedInvitesCount":0,"inviteBonusPercent":0}"#;
+        let profile = super::remote_account_to_profile(serde_json::from_str(old).unwrap());
+        assert!(profile.referral_code.is_none());
+        assert!(!profile.referral_reward_pending);
+    }
+
+    #[test]
     fn remote_account_clamps_invite_bonus_to_50() {
         let raw = RemoteAccountResponse {
             email: "a@b".into(),
@@ -5913,6 +5959,9 @@ mod tests {
             recommended_tier: None,
             grandfathered: false,
             payment_failed: false,
+            referral_code: None,
+            referral_rewards_earned: 0,
+            referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
     }
@@ -5948,6 +5997,9 @@ mod tests {
             recommended_tier: None,
             grandfathered: false,
             payment_failed: false,
+            referral_code: None,
+            referral_rewards_earned: 0,
+            referral_reward_pending: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
     }
@@ -7242,14 +7294,22 @@ mod tests {
         );
     }
 
-    /// RUST-78 (0.9.26 event): "tcp connect error <- Bad file descriptor (os
-    /// error 9)" is a macOS content filter's drop, and only that errno is.
+    /// RUST-78: "Bad file descriptor (os error 9)" (0.9.26 event) and "No
+    /// route to host (os error 65)" (0.9.32 event) are a macOS content filter's
+    /// drop; a refusal or timeout is not.
     #[test]
     fn filter_drop_is_recognized_by_errno() {
-        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-        assert_eq!(super::chain_has_ebadf(&ebadf), cfg!(target_os = "macos"));
-        let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
-        assert!(!super::chain_has_ebadf(&refused));
+        for errno in [libc::EBADF, libc::EHOSTUNREACH] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                super::chain_has_filter_errno(&err),
+                cfg!(target_os = "macos")
+            );
+        }
+        for errno in [libc::ECONNREFUSED, libc::ETIMEDOUT, libc::ENETUNREACH] {
+            let err = std::io::Error::from_raw_os_error(errno);
+            assert!(!super::chain_has_filter_errno(&err));
+        }
     }
 
     /// RUST-78: the server-silent alarm's `error` extra is fetch_grace_start's

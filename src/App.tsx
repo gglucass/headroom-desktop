@@ -21,6 +21,7 @@ import {
   Info,
   EnvelopeSimple,
   GearSix,
+  Gift,
   House,
   Key,
   PuzzlePiece,
@@ -210,6 +211,7 @@ import {
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
+import { ReferralCard } from "./components/ReferralCard";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
 import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
@@ -1842,6 +1844,7 @@ export default function App() {
   // status with its own stale signed-out one.
   const pricingStatusOrderRef = useRef(createPricingStatusOrder());
   const [authEmail, setAuthEmail] = useState("");
+  const [authReferralCode, setAuthReferralCode] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
   const [authRequestBusy, setAuthRequestBusy] = useState(false);
@@ -4539,7 +4542,7 @@ export default function App() {
       const status = await invoke<HeadroomPricingStatus>("verify_headroom_auth_code", {
         email,
         code,
-        inviteCode: null
+        inviteCode: authReferralCode.trim() || null
       });
       pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
@@ -4608,6 +4611,19 @@ export default function App() {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [windowLabel]);
+
+  // The tray menu's "Invite friends" item shows the window, then asks for the
+  // Invite view.
+  useEffect(() => {
+    const unlistenPromise = listen<string>("open-view", (event) => {
+      if (event.payload === "invite") {
+        setActiveView("invite");
+      }
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   async function confirmMagicLinkSignIn() {
     if (!magicLinkPending) {
@@ -5194,6 +5210,8 @@ export default function App() {
                 success={authFlowSuccess}
                 onRequestCode={() => void handleRequestAuthCode()}
                 onVerify={() => void handleVerifyAuthCode()}
+                referralCode={authReferralCode}
+                onReferralCodeChange={setAuthReferralCode}
               />
             )
           ) : undefined
@@ -6042,6 +6060,8 @@ export default function App() {
               success={authFlowSuccess}
               onRequestCode={() => void handleRequestAuthCode()}
               onVerify={() => void handleVerifyAuthCode()}
+              referralCode={authReferralCode}
+              onReferralCodeChange={setAuthReferralCode}
             />
           ) : null}
           <div className="paywall__plans">
@@ -6840,6 +6860,21 @@ export default function App() {
               </span>
             </button>
           ))}
+          {/* Paid referral program: only someone who can refer gets a code. */}
+          {pricingStatus?.account?.referralCode ? (
+            <button
+              className={`tray-nav__item${activeView === "invite" ? " is-active" : ""}`}
+              onMouseDown={() => setActiveView("invite")}
+              type="button"
+            >
+              <span className="tray-nav__icon" aria-hidden="true">
+                <Gift className="tray-nav__icon-svg" size={26} weight={activeView === "invite" ? "fill" : "regular"} />
+              </span>
+              <span className="tray-nav__text">
+                <strong>Invite friends</strong>
+              </span>
+            </button>
+          ) : null}
           <button
             className="tray-nav__item"
             onClick={() => openLinkFromClick(DOCS_URL)}
@@ -7792,6 +7827,14 @@ export default function App() {
             ) : null}
           </section>
 
+          {pricingStatus?.account?.referralCode ? (
+            <ReferralCard
+              code={pricingStatus.account.referralCode}
+              rewardsEarned={pricingStatus.account.referralRewardsEarned ?? 0}
+              rewardPending={pricingStatus.account.referralRewardPending === true}
+            />
+          ) : null}
+
           {!pricingStatus?.account?.subscriptionActive ? (
             <>
               <section
@@ -7801,6 +7844,11 @@ export default function App() {
                   <p className="upgrade-trial-callout__message">
                     {upgradeTrialCallout.message}
                   </p>
+                  {pricingStatus?.account?.referralRewardPending ? (
+                    <p className="upgrade-trial-callout__message">
+                      You were invited by a friend: subscribe and you both get a free month.
+                    </p>
+                  ) : null}
                 </div>
                 {upgradeTrialCallout.actionLabel && upgradeTrialCallout.onAction ? (
                   <button
@@ -8070,6 +8118,18 @@ export default function App() {
             </div>
             {pricingAuthCard}
           </section>
+        </div>
+
+        <div className="tray-content" hidden={activeView !== "invite"}>
+          {pricingStatus?.account?.referralCode ? (
+            <ReferralCard
+              code={pricingStatus.account.referralCode}
+              rewardsEarned={pricingStatus.account.referralRewardsEarned ?? 0}
+              rewardPending={pricingStatus.account.referralRewardPending === true}
+            />
+          ) : (
+            <p>Inviting friends is for subscribers.</p>
+          )}
         </div>
 
         <div className="tray-content" hidden={activeView !== "settings"}>

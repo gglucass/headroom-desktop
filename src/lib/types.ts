@@ -681,6 +681,12 @@ export interface HeadroomAccountProfile {
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;
+  /** Paid referral program: present only for someone who can refer (an
+   * active Polar subscriber), so it gates the invite card. */
+  referralCode?: string | null;
+  referralRewardsEarned?: number;
+  /** Signed up through a referral; their own free month is not in yet. */
+  referralRewardPending?: boolean;
 }
 
 export interface HeadroomPricingStatus {

@@ -57,4 +57,13 @@ describe("UsageDataPanel", () => {
     expect(consoleError).toHaveBeenCalled();
     consoleError.mockRestore();
   });
+
+  it("hides the explanation behind the info button", async () => {
+    invokeMock.mockResolvedValue(true);
+    render(<UsageDataPanel />);
+
+    expect(screen.queryByText(/does not affect your account/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /show details/i }));
+    expect(screen.getByText(/does not affect your account/)).toBeInTheDocument();
+  });
 });

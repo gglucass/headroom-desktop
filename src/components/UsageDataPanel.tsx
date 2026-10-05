@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 export function UsageDataPanel() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -32,11 +33,24 @@ export function UsageDataPanel() {
     <article className="soft-card panel-card">
       <div className="panel-card__header">
         <div>
-          <h3>Usage analytics and crash reports</h3>
-          <p className="panel-card__subtitle">
-            Send anonymous usage events and crash reports so we can find and fix problems. Turning
-            this off does not affect your account or license checks.
-          </p>
+          <h3 className="usage-data-title">
+            Usage analytics and crash reports
+            <button
+              aria-expanded={infoOpen}
+              aria-label="Show details for usage analytics and crash reports"
+              className="connector-help"
+              onClick={() => setInfoOpen((open) => !open)}
+              type="button"
+            >
+              i
+            </button>
+          </h3>
+          {infoOpen ? (
+            <p className="connector-tooltip">
+              Send anonymous usage events and crash reports so we can find and fix problems. Turning
+              this off does not affect your account or license checks.
+            </p>
+          ) : null}
         </div>
         <button
           aria-checked={enabled ?? true}

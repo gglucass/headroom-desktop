@@ -9774,6 +9774,42 @@ fn update_tray_menu_info(
 /// label. `TrayIcon` has no menu getter.
 static TRAY_PAUSE_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
+/// Whether the signed-in account can refer friends (the server sent it a
+/// referral code). Written by every pricing refresh, read by the tray loop.
+pub(crate) static TRAY_REFERRAL_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Shows the tray's invite item exactly while the account can refer, so a free
+/// user is never offered an invite they cannot send. `item` is the one shown.
+fn sync_tray_invite_item(
+    app: &AppHandle,
+    item: &mut Option<tauri::menu::MenuItem<tauri::Wry>>,
+) -> tauri::Result<()> {
+    let Some(menu) = TRAY_MENU.get() else {
+        return Ok(());
+    };
+    match (TRAY_REFERRAL_AVAILABLE.load(Ordering::Relaxed), item.take()) {
+        (true, None) => {
+            let invite = tauri::menu::MenuItem::with_id(
+                app,
+                "invite",
+                "Invite friends, get a free month",
+                true,
+                None::<&str>,
+            )?;
+            let after_pause = menu
+                .items()?
+                .iter()
+                .position(|existing| existing.id() == "pause")
+                .map_or(0, |pos| pos + 1);
+            menu.insert(&invite, after_pause)?;
+            *item = Some(invite);
+        }
+        (false, Some(shown)) => menu.remove(&shown)?,
+        (_, unchanged) => *item = unchanged,
+    }
+    Ok(())
+}
+
 /// The tray menu and its savings line, for `update_tray_menu_info`.
 static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync::OnceLock::new();
 static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
@@ -9861,6 +9897,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                         log::warn!("tray pause toggle failed: {err}");
                     }
                 });
+            }
+            "invite" => {
+                if show_primary_window(app).unwrap_or(false) {
+                    let _ = app.emit("open-view", "invite");
+                }
             }
             "quit" => {
                 exit_headroom(app, QuitSource::TrayMenu);
@@ -10023,6 +10064,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_pause_label: Option<&str> = None;
         let mut last_menu_info: Option<(String, Vec<String>)> = None;
         let mut usage_items: Vec<tauri::menu::MenuItem<tauri::Wry>> = Vec::new();
+        let mut invite_item: Option<tauri::menu::MenuItem<tauri::Wry>> = None;
         let mut unhealthy_streak: u8 = 0;
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
@@ -10131,6 +10173,9 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         log::warn!("tray menu info update failed: {err}");
                     }
                     last_menu_info = Some(menu_info);
+                }
+                if let Err(err) = sync_tray_invite_item(&app, &mut invite_item) {
+                    log::warn!("tray invite item update failed: {err}");
                 }
 
                 let mut icon_changed = false;

@@ -1446,50 +1446,6 @@ select {
   color: #544c47;
 }
 
-.pricing-status-card__invite {
-  display: flex;
-  justify-content: space-between;
-  gap: 14px;
-  align-items: center;
-  padding: 14px 16px;
-  border-radius: 10px;
-  background: rgba(79, 158, 145, 0.09);
-}
-
-.pricing-status-card__invite strong,
-.pricing-status-card__invite span,
-.pricing-status-card__invite p {
-  display: block;
-}
-
-.pricing-status-card__invite-label {
-  margin: 0 0 4px;
-  font-size: var(--text-xs);
-  font-weight: 600;
-  color: #44766c;
-}
-
-.pricing-status-card__invite span {
-  margin-top: 3px;
-  color: #5d5550;
-  font-size: var(--text-sm);
-}
-
-.pricing-status-card__invite-actions {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.pricing-status-card__invite-actions code {
-  padding: 10px 12px;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.88);
-  border: 1px solid var(--border-subtle);
-  color: var(--text-primary);
-  font-weight: 700;
-}
-
 .pricing-auth-card__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1634,6 +1590,57 @@ select {
   margin: 6px 0 0;
   color: var(--text-secondary);
   font-size: var(--text-sm);
+}
+
+.referral-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--accent-tint);
+}
+
+.referral-card h2 {
+  margin: 0;
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+.referral-card p {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.referral-card__link {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.referral-card__link code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+
+.referral-card__link .secondary-button--small {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.paywall__referral-toggle {
+  align-self: center;
+  margin-left: 0;
 }
 
 .upgrade-trial-callout {
@@ -2487,6 +2494,12 @@ select {
 
 .panel-card__header h3 {
   margin: 0;
+}
+
+.usage-data-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .activity-list,
@@ -4207,11 +4220,6 @@ html.window-hiding {
     grid-template-columns: 1fr;
   }
 
-  .pricing-status-card__invite {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
 }
 
 @media (max-width: 560px) {
@@ -4355,21 +4363,6 @@ html.window-hiding {
     border-color: rgba(255, 255, 255, 0.12);
   }
 
-  /* Invite section */
-  .pricing-status-card__invite-label {
-    color: #6cbf9b;
-  }
-
-  .pricing-status-card__invite span {
-    color: rgba(242, 237, 232, 0.6);
-  }
-
-  .pricing-status-card__invite-actions code {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.1);
-    color: #f2ede8;
-  }
-
   .settings-action-card {
     background: rgba(255, 255, 255, 0.07);
     border-color: rgba(255, 255, 255, 0.08);
@@ -4455,10 +4448,6 @@ html.window-hiding {
   /* Misc */
   .pricing-metric {
     background: rgba(255, 255, 255, 0.06);
-  }
-
-  .pricing-status-card__invite {
-    background: rgba(95, 166, 136, 0.12);
   }
 
   /* Text: primary */

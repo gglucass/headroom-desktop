@@ -20,3 +20,7 @@ CLAUDE.local.md
 # AppSumo launch assets (local marketing files, not app code)
 /appsumo-assets/
 __pycache__/
+
+# Benchmark venvs and run output (transcripts, patches); the harness itself is tracked
+.venv/
+/bench/*/results/

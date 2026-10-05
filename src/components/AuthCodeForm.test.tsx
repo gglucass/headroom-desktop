@@ -87,4 +87,21 @@ describe("AuthCodeForm", () => {
 
     expect(screen.getByText("Check your email")).toBeInTheDocument();
   });
+
+  it("keeps the referral code behind a link until asked for", async () => {
+    const onReferralCodeChange = vi.fn();
+    renderForm({ referralCode: "", onReferralCodeChange });
+
+    expect(screen.queryByLabelText("Referral code")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Have a referral code?" }));
+    await userEvent.type(screen.getByLabelText("Referral code"), "A");
+
+    expect(onReferralCodeChange).toHaveBeenLastCalledWith("A");
+  });
+
+  it("offers no referral field where the caller does not take one", () => {
+    renderForm();
+
+    expect(screen.queryByRole("button", { name: "Have a referral code?" })).not.toBeInTheDocument();
+  });
 });
