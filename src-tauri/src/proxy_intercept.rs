@@ -2360,8 +2360,8 @@ fn codex_prompt_failed(
 
 /// Whether an error body came from the provider rather than from Headroom: its
 /// JSON error object, or its edge's HTML page. Headroom's own 5xx are the
-/// intercept's empty bodies and the backend's `code: proxy_error` (or a bare
-/// framework 500), and stay counted.
+/// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
+/// and a bare framework 500, and stay counted.
 fn provider_wrote_error(body: &[u8]) -> bool {
     let body = body.trim_ascii_start();
     body.starts_with(b"<")
@@ -2370,9 +2370,23 @@ fn provider_wrote_error(body: &[u8]) -> bool {
             .and_then(|json| json.get("error").cloned())
             .is_some_and(|err| {
                 err.is_object()
-                    && err.get("code").and_then(|code| code.as_str()) != Some("proxy_error")
+                    && !["type", "code"].iter().any(|key| {
+                        err.get(*key)
+                            .and_then(|id| id.as_str())
+                            .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
+                    })
             })
 }
+
+/// The `type`/`code` of every 5xx error object the backend writes on the
+/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`), so a
+/// backend that cannot reach the provider (`connection_error`) still counts.
+const HEADROOM_ERROR_IDS: &[&str] = &[
+    "proxy_error",
+    "backend_error",
+    "connection_error",
+    "upstream_protocol_error",
+];
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
 /// or a dropped stream on its own and, once that budget is spent, shows a bare
@@ -5634,6 +5648,17 @@ mod tests {
             codex_prompt_failed(Some(500), false, false, b"Internal Server Error"),
             Some(true)
         );
+        // The backend's own passthrough failures, which carry no proxy_error code.
+        for body in [
+            &br#"{"error":{"type":"connection_error","message":"Failed to connect"}}"#[..],
+            br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#,
+            br#"{"error":{"type":"api_error","code":"backend_error","message":"x"}}"#,
+        ] {
+            assert_eq!(
+                codex_prompt_failed(Some(502), false, false, body),
+                Some(true)
+            );
+        }
         assert_eq!(codex_prompt_failed(Some(200), true, false, b""), Some(true));
         assert_eq!(codex_prompt_failed(None, false, false, b""), Some(true));
         // Success re-arms; a 4xx (report_upstream_error's) and cancels say nothing.
