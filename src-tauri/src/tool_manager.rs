@@ -9393,6 +9393,7 @@ impl ToolManager {
     }
 
     pub fn install_serena(&self) -> Result<()> {
+        retire_venv(&self.serena_venv_dir())?;
         // --clear so a retry after a partial install starts from a clean venv.
         run_command_with_timeout(
             &self.runtime.standalone_python(),
@@ -9472,28 +9473,10 @@ impl ToolManager {
         // agent session spawn a failing server.
         self.unregister_serena_mcp()?;
         set_serena_global_gitignore(false);
-        let venv = self.serena_venv_dir();
-        if venv.exists() {
-            // Retrying helper, not a bare remove_dir_all: it clears read-only
-            // bits across the tree, which is the half of Windows "Access is
-            // denied" we can actually fix (Sentry RUST-6T).
-            crate::client_adapters::remove_dir_all_retry(&venv).map_err(|err| {
-                // The other half is an open handle -- an agent session still
-                // running serena's MCP server out of this venv. We will not kill
-                // a user's editor to win a delete, so name the cause instead: a
-                // bare "Access is denied" leaves them with nothing to act on.
-                if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    anyhow!(
-                        "removing {} was denied. Serena may still be running as an MCP server \
-                         in an open Claude Code or Codex session -- close those and uninstall \
-                         again. Underlying error: {err}",
-                        venv.display()
-                    )
-                } else {
-                    anyhow::Error::new(err).context(format!("removing {}", venv.display()))
-                }
-            })?;
-        }
+        // Aside, not in place: an open session's serena server holds files a
+        // delete cannot remove on Windows (Sentry RUST-6T), and retire_venv
+        // clears the read-only bits that are the other half of that error.
+        retire_venv(&self.serena_venv_dir())?;
         let receipt = self.runtime.tools_dir.join("serena.json");
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -15051,6 +15034,40 @@ fn moved_lock_packages(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Moves `venv` aside and deletes it as far as that goes, instead of deleting
+/// it in place. Windows will not delete a DLL a running process has loaded, so
+/// `venv --clear` or `remove_dir_all` on a venv serena's MCP server runs from
+/// (an open Claude Code or Codex session) stopped partway: on win-test
+/// (2026-10-06) an Update deleted 2,571 of 8,121 files, then "Access is
+/// denied", leaving the live server and every new session on a broken install.
+/// Windows does let the directory be renamed while the server runs (checked on
+/// win-test the same day), so the venv path is free for a fresh install at
+/// once. The server keeps the files it holds, and those are retried on the
+/// next install or uninstall.
+fn retire_venv(venv: &Path) -> Result<()> {
+    let (Some(parent), Some(name)) = (venv.parent(), venv.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!("{}.old-", name.to_string_lossy());
+    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = crate::client_adapters::remove_dir_all_retry(&entry.path());
+        }
+    }
+    if !venv.exists() {
+        return Ok(());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let aside = parent.join(format!("{prefix}{stamp}"));
+    std::fs::rename(venv, &aside)
+        .with_context(|| format!("moving {} aside to replace it", venv.display()))?;
+    let _ = crate::client_adapters::remove_dir_all_retry(&aside);
+    Ok(())
 }
 
 /// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
@@ -23347,6 +23364,59 @@ Always run the linter first.
 
         fs::write(manager.serena_uvx(), b"#!/bin/sh\n").expect("uvx");
         assert!(!listed_tool(&manager, "serena").update_available);
+    }
+
+    fn retired_leftovers(parent: &Path) -> usize {
+        fs::read_dir(parent)
+            .expect("read parent")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("serena-venv.old-")
+            })
+            .count()
+    }
+
+    #[test]
+    fn retiring_a_venv_frees_its_path_and_clears_earlier_leftovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let venv = dir.path().join("serena-venv");
+        fs::create_dir_all(venv.join("bin")).expect("venv");
+        fs::write(venv.join("bin").join("serena"), b"x").expect("entrypoint");
+        // One a running server held through an earlier update.
+        fs::create_dir_all(dir.path().join("serena-venv.old-1").join("bin")).expect("leftover");
+
+        super::retire_venv(&venv).expect("retire");
+        assert!(!venv.exists());
+        assert_eq!(retired_leftovers(dir.path()), 0);
+        super::retire_venv(&venv).expect("nothing to retire is fine");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retiring_a_venv_a_running_server_holds_frees_its_path_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let venv = dir.path().join("serena-venv");
+        fs::create_dir_all(venv.join("Scripts")).expect("venv");
+        // Stand-in for serena's MCP server: an executable running out of the venv.
+        let exe = venv.join("Scripts").join("ping.exe");
+        fs::copy(r"C:\Windows\System32\PING.EXE", &exe).expect("copy ping");
+        let mut server = std::process::Command::new(&exe)
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let retired = super::retire_venv(&venv);
+        let freed = !venv.exists();
+        server.kill().expect("kill");
+        server.wait().expect("wait");
+        retired.expect("a running server does not stop the move aside");
+        assert!(freed, "the venv path is free while the server runs");
+
+        // The next install retries whatever the server held.
+        super::retire_venv(&venv).expect("retire again");
+        assert_eq!(retired_leftovers(dir.path()), 0);
     }
 
     #[test]
