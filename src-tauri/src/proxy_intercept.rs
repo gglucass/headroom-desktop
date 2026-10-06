@@ -2601,6 +2601,7 @@ fn codex_prompt_failed(
         Some(200..=299) => Some(stream_failed),
         Some(400..=499) => None,
         Some(_) if provider_wrote_error(error_body) => None,
+        Some(_) if backend_could_not_reach_provider(error_body) => None,
         Some(_) => Some(true),
         None if client_gone => None,
         None => Some(true),
@@ -2612,12 +2613,10 @@ fn codex_prompt_failed(
 /// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
 /// and a bare framework 500, and stay counted, as does a `{` the bounded peek
 /// cut short and the backend's own stream errors: an `event: error` SSE frame
-/// on a 502 (`connection_error` when it cannot reach the provider, the
-/// residual-CCR fail-closed), chunked behind a size line, so never JSON.
-/// RUST-KN's 151/163/187-byte "non-json" 502s on 0.9.27-0.9.34 were exactly
-/// that frame. Anything else non-JSON was written past the backend.
+/// on a 502 (the residual-CCR fail-closed; a `connection_error` one is
+/// `backend_could_not_reach_provider`'s), chunked behind a size line, so never
+/// JSON. Anything else non-JSON was written past the backend.
 fn provider_wrote_error(body: &[u8]) -> bool {
-    const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
     let body = body.trim_ascii();
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(json) => json.get("error").is_some_and(|err| {
@@ -2639,9 +2638,35 @@ fn provider_wrote_error(body: &[u8]) -> bool {
     }
 }
 
+/// The backend's streaming error frame, chunked by uvicorn so never JSON.
+const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
+
+/// The backend could not reach the provider at all: wheel 0.39.0's
+/// `connection_error`, on its passthrough JSON 502 or its streaming
+/// `event: error` frame, for any httpx transport failure (DNS, refused or
+/// reset connections, timeouts). That is the user's network, not Headroom, so
+/// it neither counts toward a failing run nor breaks one (Garm, 2026-10-06;
+/// RUST-KN's 151/163/187-byte bodies were all this). A TLS-intercepting proxy
+/// is the exception: it fails only Headroom's own trust store, so it counts.
+fn backend_could_not_reach_provider(body: &[u8]) -> bool {
+    let body = body.trim_ascii();
+    let json = match body
+        .windows(BACKEND_SSE_ERROR.len())
+        .position(|w| w == BACKEND_SSE_ERROR)
+    {
+        Some(at) => body[at + BACKEND_SSE_ERROR.len()..]
+            .split(|&b| b == b'\n')
+            .next()
+            .unwrap_or_default(),
+        None => body,
+    };
+    serde_json::from_slice::<serde_json::Value>(json)
+        .is_ok_and(|v| v["error"]["type"] == "connection_error")
+        && !is_tls_interception_error(body)
+}
+
 /// The `type`/`code` of every 5xx error object the backend writes on the
-/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`), so a
-/// backend that cannot reach the provider (`connection_error`) still counts.
+/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`).
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
@@ -6176,8 +6201,7 @@ mod tests {
         );
         // The backend's own passthrough failures, which carry no proxy_error code.
         for body in [
-            &br#"{"error":{"type":"connection_error","message":"Failed to connect"}}"#[..],
-            br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#,
+            &br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#[..],
             br#"{"error":{"type":"api_error","code":"backend_error","message":"x"}}"#,
         ] {
             assert_eq!(
@@ -6214,18 +6238,24 @@ mod tests {
             codex_prompt_failed(Some(502), false, false, cut),
             Some(true)
         );
-        // The backend's own stream error, chunked as uvicorn sends it: its
-        // `connection_error` when it cannot reach the provider (this exact
-        // 187-byte body was RUST-KN's 0.9.34 event) and the residual-CCR
-        // fail-closed both stay counted.
+        // The backend could not reach the provider: the user's network, on
+        // the passthrough JSON 502 and on the stream error chunked as uvicorn
+        // sends it (this exact 187-byte body was RUST-KN's 0.9.34 event).
+        let offline = br#"{"error":{"type":"connection_error","message":"Failed to connect"}}"#;
+        assert_eq!(codex_prompt_failed(Some(502), false, false, offline), None);
         let event = br#"{"type": "error", "error": {"type": "connection_error", "message": "Failed to connect to upstream API: [Errno 8] nodename nor servname provided, or not known"}}"#;
         let sse = [b"event: error\ndata: ".as_slice(), event, b"\n\n"].concat();
         let chunked = [format!("{:x}\r\n", sse.len()).as_bytes(), &sse, b"\r\n"].concat();
         assert_eq!(chunked.len(), 187);
+        assert_eq!(codex_prompt_failed(Some(502), false, false, &chunked), None);
+        // Unless only Headroom's trust store fails it: a TLS-intercepting proxy.
+        let intercepted = b"event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect to upstream API: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1010)\"}}\n\n";
         assert_eq!(
-            codex_prompt_failed(Some(502), false, false, &chunked),
+            codex_prompt_failed(Some(502), false, false, intercepted),
             Some(true)
         );
+        // The backend's other stream errors stay counted: the residual-CCR
+        // fail-closed.
         let residual = b"6f\r\nevent: error\ndata: {\"type\": \"error\", \"error\": {\"message\": \"Unable to safely complete streamed CCR retrieval.\"}}\n\n\r\n0\r\n\r\n";
         assert_eq!(
             codex_prompt_failed(Some(502), false, false, residual),
