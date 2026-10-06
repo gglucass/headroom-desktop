@@ -154,6 +154,32 @@ static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 /// funnel tail into "launched an agent once" vs "actually prompted one".
 static FIRST_PROMPT_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Connections `handle` accepted, and those that closed before their request
+/// head arrived, for `note_head_read_failure`. A healthy machine sees only the
+/// odd bare TCP probe here (the guard hooks connect and close). On one Windows
+/// machine with ESET (2026-10-06) two thirds of 6767 connections were reset or
+/// hung while the backend on 6768 answered every request, and `handle` left no
+/// trace of either.
+static CONNECTIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static HEAD_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HEAD_READ_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// `/readyz` requests relayed to the backend, and those whose answer never
+/// reached the client (see `note_readyz_relay`). Same machine: the backend
+/// logged the timed-out status probes and answered each in under a
+/// millisecond, so the answer was lost inside this relay.
+static READYZ_RELAYS: AtomicU64 = AtomicU64::new(0);
+static READYZ_RELAY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static READYZ_RELAY_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Local log lines per failure kind and process before going quiet; Sentry
+/// carries the totals.
+const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
+
+/// The status probe's own budget (`state::headroom_proxy_readyz`): a `/readyz`
+/// relay still running past it has already failed from the app's side.
+const READYZ_RELAY_STALL: Duration = Duration::from_secs(5);
+
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
 /// but nothing when the backend finally comes up, so "did the runtime finish
@@ -303,6 +329,108 @@ fn report_codex_reconnect_incident(
             );
         },
     );
+}
+
+/// `ErrorKind` plus the raw OS code, which on Windows tells a reset (10054)
+/// from an abort (10053) where the kind alone does not.
+fn describe_io_error(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("{:?} (os error {code})", e.kind()),
+        None => format!("{:?}", e.kind()),
+    }
+}
+
+/// Log why an accepted connection closed before sending its request head
+/// (`err` None = `HEADER_READ_TIMEOUT`): the client's request was lost on the
+/// way in, which no other signal sees.
+fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Duration) {
+    let failures = HEAD_READ_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    let accepted = CONNECTIONS_ACCEPTED.load(Ordering::Relaxed);
+    let detail = err.map_or_else(|| "timed out".to_string(), describe_io_error);
+    // info, not warn: the log bridge ships warn to Sentry per line.
+    if failures <= INTERCEPT_FAILURE_LOG_LINES {
+        log::info!(
+            "[proxy_intercept] connection closed before its request head: {detail} after {}ms, {bytes} bytes read ({failures} of {accepted} connections)",
+            waited.as_millis()
+        );
+    }
+    report_intercept_failures_once(
+        "request head read",
+        &HEAD_READ_FAILURES_REPORTED,
+        failures,
+        accepted,
+        format!(
+            "{detail} after {}ms, {bytes} bytes read",
+            waited.as_millis()
+        ),
+    );
+}
+
+/// Record a `/readyz` relayed to the backend. `failure` is why its answer never
+/// reached the client (None = delivered); `head_read` is how long the request
+/// head took to arrive after accept, which tells a relay that stalled from one
+/// whose request was already slow to come in.
+fn note_readyz_relay(failure: Option<String>, head_read: Duration, total: Duration) {
+    let relays = READYZ_RELAYS.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(failure) = failure else {
+        return;
+    };
+    let failures = READYZ_RELAY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures <= INTERCEPT_FAILURE_LOG_LINES {
+        log::info!(
+            "[proxy_intercept] /readyz answer not delivered: {failure} after {}ms, request head read after {}ms ({failures} of {relays} relays)",
+            total.as_millis(),
+            head_read.as_millis()
+        );
+    }
+    report_intercept_failures_once(
+        "readyz relay",
+        &READYZ_RELAY_FAILURES_REPORTED,
+        failures,
+        relays,
+        format!(
+            "{failure} after {}ms, head read after {}ms",
+            total.as_millis(),
+            head_read.as_millis()
+        ),
+    );
+}
+
+/// One Sentry event per kind and process once `failures` are systemic: then
+/// the intercept is losing its clients' traffic, the status banner flaps, and
+/// the dashboard has no way to say why.
+fn report_intercept_failures_once(
+    kind: &'static str,
+    reported: &AtomicBool,
+    failures: u64,
+    total: u64,
+    last: String,
+) {
+    if !intercept_failures_are_systemic(failures, total) || reported.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("intercept_failure", kind);
+            scope.set_extra("failures", (failures as i64).into());
+            scope.set_extra("total", (total as i64).into());
+            scope.set_extra("last", last.into());
+            scope.set_fingerprint(Some(&["intercept-local-failures", kind]));
+        },
+        || {
+            sentry::capture_message(
+                &format!("intercept: {kind} failing on a large share of connections"),
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
+
+/// Enough failures to rule out a burst of bare probes (one per agent session
+/// start), and at least a quarter of the total: the status poll alone makes a
+/// healthy request every few seconds.
+fn intercept_failures_are_systemic(failures: u64, total: u64) -> bool {
+    failures >= 30 && failures.saturating_mul(4) >= total
 }
 
 /// Record the backend's reachability and log only when it changes. Called on
@@ -1632,6 +1760,8 @@ async fn handle(
     // treat it as down. Loaded before the port, see `backend_port::selected`.
     let backend_selected = backend_port::selected();
     let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
+    let accepted_at = std::time::Instant::now();
+    CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
     // `Expect: 100-continue` request flows.
@@ -1643,8 +1773,16 @@ async fn handle(
     .await
     {
         Ok(Ok(())) => {}
-        _ => return,
+        Ok(Err(e)) => {
+            note_head_read_failure(Some(&e), buf.len(), accepted_at.elapsed());
+            return;
+        }
+        Err(_) => {
+            note_head_read_failure(None, buf.len(), accepted_at.elapsed());
+            return;
+        }
     }
+    let head_read = accepted_at.elapsed();
 
     // Reject requests that didn't target the loopback listener or that carry
     // a browser Origin. This blocks DNS-rebinding attacks where an attacker
@@ -2054,10 +2192,37 @@ async fn handle(
             }
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path)
                 .with_savings_session(savings_session);
-            let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
+            let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
+            copied
         };
-        tokio::join!(upstream, downstream);
+        let relay = async { tokio::join!(upstream, downstream).1 };
+        let is_readyz = parsed_head
+            .as_ref()
+            .is_some_and(|head| head.path == "/readyz" || head.path.starts_with("/readyz?"));
+        if !is_readyz {
+            let _ = relay.await;
+            return;
+        }
+        // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
+        // still running then is a failure even if it never ends. Watch it
+        // without cutting it short: the relay itself behaves exactly as before.
+        tokio::pin!(relay);
+        let mut stalled = false;
+        let copied = tokio::select! {
+            copied = &mut relay => copied,
+            () = tokio::time::sleep(READYZ_RELAY_STALL) => {
+                stalled = true;
+                relay.await
+            }
+        };
+        let failure = match copied {
+            _ if stalled => Some("stalled".to_string()),
+            Ok(0) => Some("backend sent nothing".to_string()),
+            Ok(_) => None,
+            Err(e) => Some(describe_io_error(&e)),
+        };
+        note_readyz_relay(failure, head_read, accepted_at.elapsed());
     }
 }
 
@@ -4463,6 +4628,17 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intercept_failures_count_only_when_common() {
+        // A handful of bare probes, however early in the process.
+        assert!(!super::intercept_failures_are_systemic(29, 29));
+        // Plenty of failures, but a small share of a busy process.
+        assert!(!super::intercept_failures_are_systemic(30, 121));
+        assert!(super::intercept_failures_are_systemic(30, 120));
+        // The ESET machine: two of every three connections.
+        assert!(super::intercept_failures_are_systemic(40, 60));
+    }
+
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
@@ -5201,6 +5377,104 @@ mod tests {
             "/stats is the app polling itself, not client traffic"
         );
 
+        run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// Watching a `/readyz` relay must not change it: the answer still reaches
+    /// the client, a delivered one is not counted as a failure, and an answer
+    /// the backend never sent is.
+    #[tokio::test]
+    #[serial]
+    async fn readyz_relay_is_delivered_and_an_empty_answer_counts_as_failed() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            drop(sock);
+            // Second probe: the backend hangs up without answering.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+        });
+        backend_port::set(backend_addr.port());
+
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let probe = || async move {
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(stream) = TcpStream::connect(intercept_addr).await {
+                    client = Some(stream);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut client = client.expect("connect to intercept");
+            client
+                .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .expect("write readyz probe");
+            let _ = client.shutdown().await;
+            let mut answer = Vec::new();
+            let _ = client.read_to_end(&mut answer).await;
+            answer
+        };
+        let settled = |relays: u64| async move {
+            for _ in 0..100 {
+                if super::READYZ_RELAYS.load(Ordering::Acquire) >= relays {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("relay {relays} was never recorded");
+        };
+
+        let relays = super::READYZ_RELAYS.load(Ordering::Acquire);
+        let failures = super::READYZ_RELAY_FAILURES.load(Ordering::Acquire);
+
+        let answer = probe().await;
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+        settled(relays + 1).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures
+        );
+
+        assert!(probe().await.is_empty());
+        settled(relays + 2).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        backend_task.await.expect("backend served both probes");
         run_task.abort();
         backend_port::reset_for_tests();
     }
