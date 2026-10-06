@@ -9661,6 +9661,10 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
         // gentler stop would have run. Bounded like the sweep: taskkill
         // enumerates the tree through the same machinery a wedged WMI stalls.
         let _ = force;
+        note_app_kill(
+            "terminate_process_tree",
+            format!("taskkill /T /F pid {pid}"),
+        );
         let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T", "/F"]);
         let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
@@ -9820,11 +9824,16 @@ fn windows_process_sweep_script(
     // the command line can fall back to Get-Process's image path, which
     // catches the launcher (headroom.exe, venv python.exe); the launcher's job
     // object takes its base-python child down with it.
+    //
+    // Each kill prints "<pid> <ppid>" first (0 when Get-Process cannot say),
+    // so the caller can put it in `recent_app_kills`: a Stop-Process victim
+    // exits 0xffffffff with nothing in its log, and without the ring an app
+    // kill and an AV kill look the same (RUST-C7 on 0.9.30).
     let fallback = if matches!(parents, SweepParents::Any) && args_pattern.is_empty() {
         format!(
             "try {{ Get-Process -ErrorAction Stop \
              | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }} \
-             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
+             | ForEach-Object {{ '{{0}} 0' -f $_.Id; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
              catch {{ }} "
         )
     } else {
@@ -9835,7 +9844,8 @@ fn windows_process_sweep_script(
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
-         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
+         | ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, $_.ParentProcessId; \
+         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ {fallback}exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
 }
@@ -10087,7 +10097,18 @@ fn kill_processes_by_command_pattern(
         // `.status()` waiting forever: "Not responding" on quit, the update
         // installer never launched, the upgrade stuck on "Preparing update".
         let status = match crate::proc::output_with_timeout(command, PS_SWEEP_TIMEOUT) {
-            Ok(output) => output.status,
+            Ok(output) => {
+                for (pid, ppid) in parse_pid_ppid(&String::from_utf8_lossy(&output.stdout)) {
+                    log::info!(
+                        "process sweep: Stop-Process {pid} (parent {ppid}) for '{args_pattern}'"
+                    );
+                    note_app_kill(
+                        "process_sweep",
+                        format!("Stop-Process {pid} (parent {ppid})"),
+                    );
+                }
+                output.status
+            }
             Err(crate::proc::OutputError::TimedOut) => {
                 return Err(anyhow!(
                     "powershell sweep timed out after {}s for exe '{}' args '{}'",
@@ -15075,7 +15096,8 @@ mod tests {
         );
         // RUST-HY: the venv-lock sweep drops the parent rule entirely.
         let any = windows_process_sweep_script(exe, "", 4242, super::SweepParents::Any);
-        assert!(!any.contains("ParentProcessId"), "{any}");
+        assert!(!any.contains("ParentProcessId -eq"), "{any}");
+        assert!(!any.contains("Get-Process -Id $_.ParentProcessId"), "{any}");
         assert!(any.contains("-and $true }"), "{any}");
         // RUST-29: a holder launched by bare name off PATH shows the venv only
         // in its image path, and an empty args pattern adds no clause that a
@@ -15091,13 +15113,20 @@ mod tests {
             any.contains(&format!(
                 "catch {{ try {{ Get-Process -ErrorAction Stop | Where-Object {{ $_.Id -ne $PID \
                  -and $_.Id -ne $me -and $_.Path -like '*C:\\Users\\a\\venv\\Scripts\\headroom.exe*' }} \
-                 | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
+                 | ForEach-Object {{ '{{0}} 0' -f $_.Id; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
                  exit 0 }} catch {{ }} exit {} }}; exit 0",
                 super::PS_SWEEP_ENUMERATION_FAILED
             )),
             "{any}"
         );
         assert_eq!(any.matches('{').count(), any.matches('}').count(), "{any}");
+        // RUST-C7: every kill names its pid first, for `recent_app_kills`.
+        assert!(
+            held.contains(
+                "ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.ParentProcessId; Stop-Process"
+            ),
+            "{held}"
+        );
         // Parent-checked sweeps keep refusing: Get-Process has no parent pid.
         assert!(!held.contains("Get-Process -ErrorAction Stop"), "{held}");
         assert!(

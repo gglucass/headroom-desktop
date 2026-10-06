@@ -11571,6 +11571,10 @@ fn kill_pid(pid: u32, force: bool) {
     {
         // `/T` takes the subtree with it: the backend spawns helpers, and a
         // survivor holds the port just as well as its parent did.
+        crate::state::note_app_kill(
+            "kill_pid",
+            format!("taskkill /T{} pid {pid}", if force { " /F" } else { "" }),
+        );
         let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T"]);
         if force {
@@ -14035,7 +14039,7 @@ fn busiest_claude_project_cwd() -> Option<String> {
 }
 
 fn busiest_claude_project_cwd_in(projects_dir: &Path, max_bytes: u64) -> Option<String> {
-    let mut best: Option<(u64, PathBuf)> = None;
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
@@ -14052,12 +14056,18 @@ fn busiest_claude_project_cwd_in(projects_dir: &Path, max_bytes: u64) -> Option<
                 }
             }
         }
-        if bytes > 0 && bytes <= max_bytes && best.as_ref().is_none_or(|(b, _)| bytes > *b) {
-            best = Some((bytes, dir));
+        if bytes > 0 && bytes <= max_bytes {
+            candidates.push((bytes, dir));
         }
     }
-
-    project_cwd_from_transcript_dir(&best?.1)
+    // Busiest first, passing over projects whose folder is gone: a deleted
+    // Claude desktop scratch workspace made `headroom learn --project` exit 2
+    // on every launch, so the baseline was never seeded.
+    candidates.sort_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
+    candidates
+        .iter()
+        .filter_map(|(_, dir)| project_cwd_from_transcript_dir(dir))
+        .find(|cwd| Path::new(cwd).is_dir())
 }
 
 /// Pull the `cwd` field from the first transcript line that has one. Reads at
@@ -22499,29 +22509,39 @@ Always run the linter first.
     }
 
     #[test]
-    fn busiest_claude_project_cwd_skips_projects_over_the_seed_byte_cap() {
+    fn busiest_claude_project_cwd_skips_oversized_and_deleted_projects() {
         let root = unique_temp_dir("headroom-seed-pick");
-        for (dir, cwd, size) in [("-big", "/big", 3000), ("-small", "/small", 1000)] {
-            let line = format!("{{\"cwd\":\"{cwd}\"}}\n");
-            fs::create_dir_all(root.join(dir)).expect("create project dir");
+        let projects = root.join("projects");
+        let cwd = |name: &str| root.join(name).to_string_lossy().into_owned();
+        for (dir, name, size, exists) in [
+            ("-gone", "gone", 5000, false),
+            ("-big", "big", 3000, true),
+            ("-small", "small", 1000, true),
+        ] {
+            if exists {
+                fs::create_dir_all(root.join(name)).expect("create project cwd");
+            }
+            let line = format!("{}\n", serde_json::json!({ "cwd": cwd(name) }));
+            fs::create_dir_all(projects.join(dir)).expect("create project dir");
             fs::write(
-                root.join(dir).join("s.jsonl"),
+                projects.join(dir).join("s.jsonl"),
                 format!("{line}{}", " ".repeat(size - line.len())),
             )
             .expect("write transcript");
         }
-        // The busiest project wins while it fits the cap...
+        // The busiest project wins while it fits the cap and its folder still
+        // exists; the deleted one would fail `headroom learn` every launch...
         assert_eq!(
-            super::busiest_claude_project_cwd_in(&root, 10_000).as_deref(),
-            Some("/big")
+            super::busiest_claude_project_cwd_in(&projects, 10_000),
+            Some(cwd("big"))
         );
-        // ...but one the seed run could not finish in time is passed over for
+        // ...and one the seed run could not finish in time is passed over for
         // the busiest one that fits, instead of timing out on every launch.
         assert_eq!(
-            super::busiest_claude_project_cwd_in(&root, 2000).as_deref(),
-            Some("/small")
+            super::busiest_claude_project_cwd_in(&projects, 2000),
+            Some(cwd("small"))
         );
-        assert_eq!(super::busiest_claude_project_cwd_in(&root, 500), None);
+        assert_eq!(super::busiest_claude_project_cwd_in(&projects, 500), None);
         let _ = fs::remove_dir_all(&root);
     }
 
