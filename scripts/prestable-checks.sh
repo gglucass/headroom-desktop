@@ -29,13 +29,23 @@ ln -s /etc/hosts "$P/z.txt"
 echo "== A. build + artifacts"
 V=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Applications/Headroom.app/Contents/Info.plist)
 [ -n "$EXPECT_VERSION" ] && chk "installed version" "$V" "$EXPECT_VERSION" || echo "  info  installed $V"
-chk "rtk hook runs python -X utf8"          "$(grep -c -- '-X utf8' "$RH_REAL")" 2
-chk "rtk hook strips cwd from sys.path"     "$(grep -c 'sys.path\[:\] = \[p for p' "$RH_REAL" | awk '{print ($1>=2)}')" 1
-chk "rtk hook: glob refused for all cmds"   "$(grep -c 'symlink out of the project' "$RH_REAL")" 1
-chk "rtk hook: attached short-flag paths"   "$(grep -c 'A short flag takes its value' "$RH_REAL")" 1
-chk "shim: realpath cwd (case-safe)"        "$(grep -c 'realpath . && echo' "$SHIM")" 1
-chk "rtk hook: RC relaunch settings ignored" "$(grep -c 'remote-control relaunch' "$RH_REAL")" 1
-[ -x "$SHIM" ] && ok "shim at ~/.headroom/bin" || bad "shim at ~/.headroom/bin" missing
+# Opt-in add-ons: disabling rtk deletes its hook, and only an installed
+# markitdown (its receipt) owns the shim.
+if [ -f "$RH_REAL" ]; then
+  chk "rtk hook runs python -X utf8"          "$(grep -c -- '-X utf8' "$RH_REAL")" 2
+  chk "rtk hook strips cwd from sys.path"     "$(grep -c 'sys.path\[:\] = \[p for p' "$RH_REAL" | awk '{print ($1>=2)}')" 1
+  chk "rtk hook: glob refused for all cmds"   "$(grep -c 'symlink out of the project' "$RH_REAL")" 1
+  chk "rtk hook: attached short-flag paths"   "$(grep -c 'A short flag takes its value' "$RH_REAL")" 1
+  chk "rtk hook: RC relaunch settings ignored" "$(grep -c 'remote-control relaunch' "$RH_REAL")" 1
+else
+  skip "rtk hook artifacts" "rtk not installed or disabled"
+fi
+if [ -f "$AS/headroom/tools/markitdown.json" ]; then
+  [ -x "$SHIM" ] && ok "shim at ~/.headroom/bin" || bad "shim at ~/.headroom/bin" missing
+  chk "shim: realpath cwd (case-safe)"        "$(grep -c 'realpath . && echo' "$SHIM" 2>/dev/null)" 1
+else
+  skip "markitdown shim artifacts" "markitdown not installed"
+fi
 # Every quit/pause strips the Read hook's settings entry; launch must re-add it.
 if [ -f "$MH_REAL" ]; then
   grep -q 'headroom-markitdown-read.sh' ~/.claude/settings.json \
@@ -148,6 +158,9 @@ fi
 
 echo "== E. guards survive non-UTF-8 config (the CP950 report, macOS stand-in)"
 G="$W/g"; mkdir -p "$G/cx" "$G/prøj/.claude"
+# A fresh debounce stamp beside the copied guards, or the deliberately broken
+# config pops a real "config.toml is missing or unreadable" notification.
+touch "$G/.headroom-guard-notified"
 if [ -f ~/.codex/hooks/headroom-codex-guard.py ]; then
   cp ~/.codex/hooks/headroom-codex-guard.py "$G/"
   printf 'model_provider = "\xff\xfe"\n' > "$G/cx/config.toml"
