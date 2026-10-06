@@ -15064,6 +15064,7 @@ fn retire_venv(venv: &Path) -> Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let aside = parent.join(format!("{prefix}{stamp}"));
+    // direct-write: directory swap inside Headroom's managed runtime
     std::fs::rename(venv, &aside)
         .with_context(|| format!("moving {} aside to replace it", venv.display()))?;
     let _ = crate::client_adapters::remove_dir_all_retry(&aside);
@@ -23402,7 +23403,7 @@ Always run the linter first.
         // Stand-in for serena's MCP server: an executable running out of the venv.
         let exe = venv.join("Scripts").join("ping.exe");
         fs::copy(r"C:\Windows\System32\PING.EXE", &exe).expect("copy ping");
-        let mut server = std::process::Command::new(&exe)
+        let mut server = crate::proc::command(&exe)
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
