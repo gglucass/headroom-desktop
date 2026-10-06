@@ -1677,8 +1677,7 @@ async fn handle(
     // (verified against grok 0.2.112); the backend's own UA map expects the
     // older `grok/`, so match both and rely on the explicit X-Client stamp
     // below for backend classification.
-    let is_grok = extract_header_value(&buf, "user-agent")
-        .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"));
+    let is_grok = is_grok_request(&buf);
 
     // One classification for the process counters, the per-day usage
     // counters, and the 429 sniffers below. Same keys as
@@ -1740,6 +1739,18 @@ async fn handle(
         let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
         stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
+        // Only inference needs the backend. Its other routes ignore
+        // `x-headroom-base-url`: GET /v1/models went to api.openai.com with
+        // the grok token (401 invalid_issuer), so grok fell back to a built-in
+        // model list without its default model. Everything else goes where
+        // the CLI sends it without Headroom.
+        if !parsed_head
+            .as_ref()
+            .is_some_and(|head| is_grok_inference_path(&head.path))
+        {
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+            return;
+        }
     }
 
     // Codex fetches its model catalog via `GET <base_url>/models` and caches it
@@ -4166,6 +4177,27 @@ fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
     stamp_request_header(buf, "x-client", header_line);
 }
 
+/// Whether a request came from Grok Build. The UA covers the CLI's own
+/// requests; its OTel trace exporter sends `OTel-OTLP-Exporter-Rust/` with the
+/// same xAI headers and the grok token, and was routed to Anthropic as Claude
+/// Code (verified against grok 1.0.46).
+fn is_grok_request(buf: &[u8]) -> bool {
+    extract_header_value(buf, "user-agent")
+        .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"))
+        || request_has_header(buf, "x-grok-client-version")
+        || request_has_header(buf, "x-xai-token-auth")
+}
+
+/// The grok endpoints the backend compresses (`api_backend` = responses,
+/// chat_completions or messages). Exact paths: sub-resources go direct.
+fn is_grok_inference_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/v1/responses" | "/v1/chat/completions" | "/v1/messages"
+    )
+}
+
 /// The upstream a Grok Build request belongs to, keyed on its credential.
 /// `grok login` stores an auth.x.ai OIDC session token (a JWT) and the CLI's
 /// own default base for that mode is `cli-chat-proxy.grok.com/v1`; api.x.ai
@@ -4438,9 +4470,9 @@ mod tests {
         find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
         is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
         is_codex_sse_response, is_compression_refused_error, is_geo_blocked_codex_error,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -5416,6 +5448,83 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn grok_sends_only_inference_to_the_backend() {
+        // The backend's /v1/models route ignores x-headroom-base-url and sent
+        // grok's catalog fetch to api.openai.com with the grok token.
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend_listener.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let head = read_until_header_end(&mut sock).await;
+                    let line = String::from_utf8_lossy(&head);
+                    let _ = seen_tx.send(line.lines().next().unwrap_or("").to_string());
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        backend_port::set(backend_addr.port());
+
+        // A loopback upstream, which the direct forwarder refuses (503), so the
+        // direct path is observable without touching the network.
+        let send = |request: &'static [u8]| async move {
+            let (intercept_listener, intercept_addr) = bind_ephemeral().await;
+            let mut client = TcpStream::connect(intercept_addr)
+                .await
+                .expect("client connect");
+            let (accepted, _) = intercept_listener.accept().await.expect("accept");
+            let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+            tokio::spawn(super::handle(
+                accepted,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("https://api.anthropic.com".to_string()),
+            ));
+            client.write_all(request).await.expect("write request");
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+            response
+        };
+
+        let models = send(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\nx-headroom-base-url: http://127.0.0.1:9\r\n\r\n").await;
+        let traces = send(b"POST /v1/traces HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-headroom-base-url: http://127.0.0.1:9\r\nContent-Length: 0\r\n\r\n").await;
+        let inference = send(b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\nx-headroom-base-url: http://127.0.0.1:9\r\nContent-Length: 0\r\n\r\n").await;
+        backend_port::reset_for_tests();
+
+        assert!(
+            models.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&models)
+        );
+        assert!(
+            traces.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&traces)
+        );
+        assert!(
+            inference.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&inference)
+        );
+        let mut seen = Vec::new();
+        while let Ok(line) = seen_rx.try_recv() {
+            seen.push(line);
+        }
+        assert_eq!(seen, vec!["POST /v1/responses HTTP/1.1".to_string()]);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn intercept_goes_direct_until_the_backend_port_is_selected() {
         // Something already listens where the backend port points (Orca's
         // mobile server, a dev server on 6768) before tool_manager has probed
@@ -5617,6 +5726,37 @@ mod tests {
         let counts = intercept_request_counts();
         for key in ["claude-code", "codex", "opencode", "grok-build"] {
             assert!(counts.contains_key(key), "missing agent key {key}");
+        }
+    }
+
+    #[test]
+    fn grok_trace_exporter_is_grok_and_only_inference_reaches_the_backend() {
+        // Grok 1.0.46's OTel exporter: no grok UA, but the xAI headers and the
+        // grok token, which went to Anthropic as Claude Code.
+        let traces = b"POST /v1/traces HTTP/1.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-grok-client-version: 1.0.46\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n";
+        assert!(is_grok_request(traces));
+        assert!(is_grok_request(
+            b"GET /v1/models HTTP/1.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\n\r\n"
+        ));
+        assert!(!is_grok_request(
+            b"POST /v1/messages HTTP/1.1\r\nUser-Agent: claude-cli/2.1.289 (external, cli)\r\n\r\n"
+        ));
+
+        for path in [
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/messages?beta=true",
+        ] {
+            assert!(is_grok_inference_path(path), "{path}");
+        }
+        for path in [
+            "/v1/models",
+            "/v1/models/grok-4.7",
+            "/v1/traces",
+            "/v1/settings",
+            "/v1/responses/compact",
+        ] {
+            assert!(!is_grok_inference_path(path), "{path}");
         }
     }
 
