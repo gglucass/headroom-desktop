@@ -2435,9 +2435,13 @@ fn codex_prompt_failed(
 /// JSON error object, or any non-JSON page. Headroom's own 5xx are the
 /// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
 /// and a bare framework 500, and stay counted, as does a `{` the bounded peek
-/// cut short. Anything else non-JSON was written past the backend: RUST-KN
-/// reopened on 0.9.34 for a 187-byte 502 that was neither JSON nor HTML.
+/// cut short and the backend's own stream errors: an `event: error` SSE frame
+/// on a 502 (`connection_error` when it cannot reach the provider, the
+/// residual-CCR fail-closed), chunked behind a size line, so never JSON.
+/// RUST-KN's 151/163/187-byte "non-json" 502s on 0.9.27-0.9.34 were exactly
+/// that frame. Anything else non-JSON was written past the backend.
 fn provider_wrote_error(body: &[u8]) -> bool {
+    const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
     let body = body.trim_ascii();
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(json) => json.get("error").is_some_and(|err| {
@@ -2448,7 +2452,14 @@ fn provider_wrote_error(body: &[u8]) -> bool {
                         .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
                 })
         }),
-        Err(_) => !body.is_empty() && !body.starts_with(b"{") && body != b"Internal Server Error",
+        Err(_) => {
+            !body.is_empty()
+                && !body.starts_with(b"{")
+                && body != b"Internal Server Error"
+                && !body
+                    .windows(BACKEND_SSE_ERROR.len())
+                    .any(|w| w == BACKEND_SSE_ERROR)
+        }
     }
 }
 
@@ -5787,6 +5798,23 @@ mod tests {
         let cut = br#"{"error":{"type":"connection_error","message":"Fail"#;
         assert_eq!(
             codex_prompt_failed(Some(502), false, false, cut),
+            Some(true)
+        );
+        // The backend's own stream error, chunked as uvicorn sends it: its
+        // `connection_error` when it cannot reach the provider (this exact
+        // 187-byte body was RUST-KN's 0.9.34 event) and the residual-CCR
+        // fail-closed both stay counted.
+        let event = br#"{"type": "error", "error": {"type": "connection_error", "message": "Failed to connect to upstream API: [Errno 8] nodename nor servname provided, or not known"}}"#;
+        let sse = [b"event: error\ndata: ".as_slice(), event, b"\n\n"].concat();
+        let chunked = [format!("{:x}\r\n", sse.len()).as_bytes(), &sse, b"\r\n"].concat();
+        assert_eq!(chunked.len(), 187);
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, &chunked),
+            Some(true)
+        );
+        let residual = b"6f\r\nevent: error\ndata: {\"type\": \"error\", \"error\": {\"message\": \"Unable to safely complete streamed CCR retrieval.\"}}\n\n\r\n0\r\n\r\n";
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, residual),
             Some(true)
         );
     }
