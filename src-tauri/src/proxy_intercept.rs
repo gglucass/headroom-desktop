@@ -2690,6 +2690,14 @@ fn report_upstream_error(
     if status == 413 && !is_compression_refused_error(&body) {
         return;
     }
+    // A 404 on the backend's own CCR retrieve route never came from a
+    // provider: the entry outlived the wheel's CCR TTL, or the in-memory store
+    // was lost to a backend restart. The model gets the miss in its tool
+    // result and nothing on our side brings the entry back. Half of RUST-BS
+    // (100 events, 45 hosts in a week) was this, filed as "upstream error".
+    if status == 404 && is_ccr_retrieve_path(&path) {
+        return;
+    }
     // Codex sent no bearer: the flagless provider block. Repair it now (own
     // thread: this runs on the forwarding task) rather than within the hour;
     // the user is failing every prompt until it lands. Before the Sentry
@@ -2811,6 +2819,13 @@ fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
 fn is_compression_refused_error(body: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"\"compression_refused\"";
     body.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+}
+
+/// The backend's CCR retrieve route (`/v1/retrieve`, `/v1/retrieve/<hash>`,
+/// `/v1/retrieve/tool_call`), which the backend answers itself.
+fn is_ccr_retrieve_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path == "/v1/retrieve" || path.starts_with("/v1/retrieve/")
 }
 
 /// The response's media type with any parameters (`; charset=...`) stripped, so
@@ -4410,10 +4425,11 @@ mod tests {
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
         find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
-        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
-        is_compression_refused_error, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
-        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
+        is_codex_sse_response, is_compression_refused_error, is_geo_blocked_codex_error,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -7884,6 +7900,17 @@ mod tests {
             br#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#
         ));
         assert!(!is_compression_refused_error(b""));
+    }
+
+    #[test]
+    fn ccr_retrieve_path_matches_only_the_backends_route() {
+        assert!(is_ccr_retrieve_path("/v1/retrieve"));
+        assert!(is_ccr_retrieve_path(
+            "/v1/retrieve/f2ac2682a439084659cd6201"
+        ));
+        assert!(is_ccr_retrieve_path("/v1/retrieve/tool_call?x=1"));
+        assert!(!is_ccr_retrieve_path("/v1/retrieved"));
+        assert!(!is_ccr_retrieve_path("/v1/messages?beta=true"));
     }
 
     #[test]
