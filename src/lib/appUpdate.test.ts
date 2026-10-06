@@ -476,6 +476,18 @@ describe("app update helpers", () => {
     expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
 
+  it("points a failed .deb privilege prompt at the manual download (RUST-MB)", async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      invokeFn: vi.fn().mockRejectedValueOnce("Failed to install package"),
+    });
+
+    expect(result.statusCopy).toMatch(/extraheadroom\.com\/dl\/linux_deb/);
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
   it("re-checks and retries once when the staged update was already consumed", async () => {
     const invokeFn = vi
       .fn()

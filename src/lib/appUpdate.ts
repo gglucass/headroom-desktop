@@ -39,6 +39,20 @@ const ADMIN_PROMPT_COPY =
   "Headroom needs an administrator password to replace itself in its folder. " +
   "Install again and approve the password prompt, or ask an administrator to update Headroom.";
 
+// The Linux .deb counterpart: tauri-plugin-updater runs `dpkg -i` through
+// pkexec, then a zenity/kdialog password box, then bare `sudo`, and reports
+// only the last failure. With no polkit agent and no zenity the whole chain
+// fails in under a second without ever showing a prompt (RUST-MB), so "approve
+// the prompt" would send the user round the same loop. Only reached after a
+// click: `silent_install_supported` never stages a .deb quietly.
+const PACKAGE_INSTALL_FAILED = /Failed to install package/;
+const PACKAGE_INSTALL_COPY =
+  "Headroom needs administrator rights to install this update, and the password prompt " +
+  "was cancelled or could not be shown. Download the newest .deb from " +
+  "https://extraheadroom.com/dl/linux_deb and install it over this one, or switch to the " +
+  "AppImage (https://extraheadroom.com/dl/linux_appimage), which updates itself without a " +
+  "password. Your settings are kept either way.";
+
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
@@ -372,9 +386,10 @@ export async function runAppUpdateInstall({
     const detail = describeInvokeError(error, "");
     const transport = TRANSPORT_FAILURE.test(detail);
     const adminPrompt = ADMIN_PROMPT_FAILED.test(detail);
+    const packagePrompt = PACKAGE_INSTALL_FAILED.test(detail);
     // A quiet install reaching the admin prompt means the writability gate
     // missed a case, so that one still reports.
-    if (!READ_ONLY_BUNDLE.test(detail) && !(adminPrompt && !quiet)) {
+    if (!READ_ONLY_BUNDLE.test(detail) && !((adminPrompt || packagePrompt) && !quiet)) {
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",
         tags: { flow: "app_update_install" },
@@ -385,7 +400,9 @@ export async function runAppUpdateInstall({
         ? "Could not download the update: the connection dropped. Try again."
         : adminPrompt
           ? ADMIN_PROMPT_COPY
-          : describeInvokeError(error, "Could not install the update."),
+          : packagePrompt
+            ? PACKAGE_INSTALL_COPY
+            : describeInvokeError(error, "Could not install the update."),
     };
   } finally {
     unlisten?.();
