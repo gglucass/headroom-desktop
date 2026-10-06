@@ -6034,6 +6034,12 @@ mod tests {
         // grok token, which went to Anthropic as Claude Code.
         let traces = b"POST /v1/traces HTTP/1.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-grok-client-version: 1.0.46\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n";
         assert!(is_grok_request(traces));
+        // The interactive TUI prefixes its client name, so a `grok-shell/`
+        // prefix check sent its inference to OpenAI (401 invalid_issuer,
+        // user report 2026-10-06). Headers as captured from grok 1.0.46.
+        assert!(is_grok_request(
+            b"POST /v1/responses HTTP/1.1\r\nUser-Agent: grok-pager/1.0.46 grok-shell/1.0.46 (windows; x86_64)\r\nx-grok-client-version: 1.0.46\r\nx-grok-client-mode: interactive\r\nx-xai-token-auth: xai-grok-cli\r\n\r\n"
+        ));
         assert!(is_grok_request(
             b"GET /v1/models HTTP/1.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\n\r\n"
         ));
