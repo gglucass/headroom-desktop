@@ -49,9 +49,18 @@ export const INSTALL_WIZARD_STEPS = [
 export type InstallWizardStep = (typeof INSTALL_WIZARD_STEPS)[number];
 
 // Billing funnel steps, same beacon, mirror of DesktopFunnelStep::BILLING in
-// headroom-web: the upgrade view was opened, a plan's checkout button clicked.
-// The Polar checkout itself is in Polar's checkout list, keyed by email.
-export const BILLING_FUNNEL_STEPS = ["upgrade_view_opened", "checkout_clicked"] as const;
+// headroom-web: the upgrade view was opened, a plan's checkout button clicked,
+// any click on the view, the billing toggle, a plan click sent to sign-in, and
+// a checkout the app could not create (reported from Rust). The Polar checkout
+// itself is in Polar's checkout list, keyed by email.
+export const BILLING_FUNNEL_STEPS = [
+  "upgrade_view_opened",
+  "checkout_clicked",
+  "upgrade_page_clicked",
+  "billing_period_toggled",
+  "checkout_sign_in_detour",
+  "checkout_failed"
+] as const;
 
 export type FunnelStep = InstallWizardStep | (typeof BILLING_FUNNEL_STEPS)[number];
 

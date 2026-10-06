@@ -24,7 +24,14 @@ import type { ClientConnectorStatus } from "./types";
 describe("install-wizard funnel steps", () => {
   // MUST match DesktopFunnelStep::BILLING in headroom-web, or the server drops them.
   it("pins the billing steps shared with the server", () => {
-    expect([...BILLING_FUNNEL_STEPS]).toEqual(["upgrade_view_opened", "checkout_clicked"]);
+    expect([...BILLING_FUNNEL_STEPS]).toEqual([
+      "upgrade_view_opened",
+      "checkout_clicked",
+      "upgrade_page_clicked",
+      "billing_period_toggled",
+      "checkout_sign_in_detour",
+      "checkout_failed"
+    ]);
   });
 
   // Pins the ordered step list. MUST stay in sync with DesktopFunnelStep::ORDER

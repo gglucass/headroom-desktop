@@ -1961,6 +1961,8 @@ export default function App() {
   const optimizationBlockedRef = useRef<boolean | undefined>(undefined);
   // For the main window's focus listener, which is registered once.
   const pricingStatusRef = useRef<HeadroomPricingStatus | null>(null);
+  // One upgrade_page_clicked beacon per visit to the Upgrade view.
+  const upgradePageClickedRef = useRef(false);
   // Mirrors connector status for the same closure. Undefined until the startup
   // fetch lands, which keeps the no-traffic branch quiet rather than guessing.
   // Staleness in the "became verified" direction is harmless: that only happens
@@ -3361,6 +3363,7 @@ export default function App() {
     if (activeView !== "upgrade") {
       setUpgradeActionError(null);
     } else {
+      upgradePageClickedRef.current = false;
       reportFunnelStep("upgrade_view_opened");
     }
   }, [activeView]);
@@ -4759,6 +4762,9 @@ export default function App() {
     }
 
     if (!pricingStatus?.authenticated) {
+      if (action.kind === "checkout") {
+        reportFunnelStep("checkout_sign_in_detour");
+      }
       openUpgradeAuthView(planId);
       return;
     }
@@ -7813,7 +7819,15 @@ export default function App() {
             </ul>
         </div>
 
-        <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
+        <div
+          className="tray-content tray-content--upgrade"
+          hidden={activeView !== "upgrade"}
+          onPointerDownCapture={() => {
+            if (upgradePageClickedRef.current) return;
+            upgradePageClickedRef.current = true;
+            reportFunnelStep("upgrade_page_clicked");
+          }}
+        >
           <section className="upgrade-hero">
             <h1>Plans based on your AI subscription</h1>
             {pricingAudience === "individual" &&
@@ -7823,7 +7837,10 @@ export default function App() {
                   <button
                     key={period}
                     className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
-                    onClick={() => setBillingPeriod(period)}
+                    onClick={() => {
+                      if (period !== billingPeriod) reportFunnelStep("billing_period_toggled");
+                      setBillingPeriod(period);
+                    }}
                     type="button"
                   >
                     {period === "annual" ? (

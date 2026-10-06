@@ -4783,7 +4783,15 @@ async fn create_headroom_checkout_session(
     billing_period: BillingPeriod,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let url = pricing::create_checkout_session(subscription_tier, billing_period)?;
+        // A failure here can happen before any request reaches the server
+        // (no session token, a dead network), leaving no trace there or in
+        // Polar: count it in the billing funnel and say why in Sentry.
+        let url = pricing::create_checkout_session(subscription_tier, billing_period).inspect_err(
+            |err| {
+                pricing::report_funnel_step(&app, "checkout_failed");
+                log::warn!("checkout could not be started: {err}");
+            },
+        )?;
         analytics::track_event(
             &app,
             "checkout_started",
