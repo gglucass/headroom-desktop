@@ -47,9 +47,9 @@ const ADMIN_PROMPT_COPY =
 const TRANSPORT_FAILURE =
   /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON|failed with status: 5\d\d/i;
 
-// Releases are quiet by default: no dialog, no notification, and (on macOS)
-// a silent background install that only asks for a restart. A release that
-// users must take promptly opts back into the old loud flow by carrying this
+// Releases are quiet by default: no dialog, no notification, and (on macOS
+// and a Linux AppImage) a silent background install that only asks for a
+// restart. A release that users must take promptly opts back into the old loud flow by carrying this
 // marker anywhere in its release notes (put `<!-- headroom:loud -->` in
 // .github/release-notes/<VERSION>.md; it flows into latest.json `notes`).
 export const LOUD_UPDATE_MARKER = "headroom:loud";
@@ -132,7 +132,7 @@ export async function runAppUpdateCheck({
     if (update) {
       // Background-found updates only interrupt when the release is marked
       // loud; quiet releases surface passively (Settings copy, stale nag,
-      // and on macOS a silent install). Manual checks always show the dialog.
+      // and on macOS or an AppImage a silent install). Manual checks always show the dialog.
       const shouldShowDialog =
         !background || (isLoudAppUpdate(update) && update.version !== knownUpdateVersion);
       return {
@@ -241,9 +241,10 @@ function writeWaitingUpdate(record: WaitingUpdateRecord): void {
 // published yesterday, so `ageDays < 5` and nothing ever fired. Every release
 // reset the clock for everyone, including the people furthest behind (gaps
 // between 0.9.15 and 0.9.19 were 7, 4, 0 and 1 days). Since the quiet-update
-// default landed in 0.9.8 this nag is the only thing that reaches Windows and
-// Linux at all -- neither can install without the user, so a quiet release is
-// otherwise invisible there.
+// default landed in 0.9.8 this nag was the only thing that reached Windows and
+// Linux. Windows now installs when idle and an AppImage stages like macOS, so
+// it is left for a .deb (which cannot install without the user's password) and
+// for installs whose quiet path keeps failing.
 export async function maybeFireStaleAppUpdateNotification(
   availableUpdate: AvailableAppUpdate | null,
   invokeFn: AppUpdateInvoker = invoke

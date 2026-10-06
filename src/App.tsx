@@ -3979,9 +3979,10 @@ export default function App() {
       applyAppUpdatePatch(patch);
 
       if (background && patch.availableUpdate) {
-        // Quiet releases on macOS stage themselves: silent download+install,
-        // then only a passive "restart to finish" state. No dialog, no
-        // notification. Loud releases keep the interrupting flow.
+        // Quiet releases on macOS and a Linux AppImage stage themselves:
+        // silent download+install, then only a passive "restart to finish"
+        // state. No dialog, no notification. Loud releases keep the
+        // interrupting flow.
         if (
           !isLoudAppUpdate(patch.availableUpdate) &&
           config.silentInstallSupported &&
