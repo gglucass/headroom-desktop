@@ -33,6 +33,12 @@
 #     0.38.0 below). All pure-Python wheel swaps; requires_dist unchanged except
 #     litellm 1.88.6's aiohttp>=3.14.2, already met by the 3.14.3 pin. No package
 #     is added to or removed from the installed set.
+#   - 2026-10-06 (no wheel change): fsspec 2026.4.0 -> 2026.6.0
+#     (CVE-2026-104851) and multidict 6.7.1 -> 6.9.1 (CVE-2026-104874), both
+#     published overnight and failing CI's pip-audit on every lock. fsspec is
+#     pure-Python with no deps and 2026.6.0 is exactly datasets 5.0.1's
+#     ceiling; multidict is a native wheel swap (cp312 wheels for every
+#     platform), inside aiohttp's <7.0, no new deps on cp312.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
@@ -186,8 +192,8 @@ frozenlist==1.8.0 \
     --hash=sha256:229bf37d2e4acdaf808fd3f06e854a4a7a3661e871b10dc1f8f1896a3b05f18b \
     --hash=sha256:78f7b9e5d6f2fdb88cdde9440dc147259b62b9d3b019924def9f6478be254ac1 \
     --hash=sha256:f833670942247a14eafbb675458b4e61c82e002a148f49e68257b79296e865c4
-fsspec==2026.4.0 \
-    --hash=sha256:11ef7bb35dab8a394fde6e608221d5cf3e8499401c249bebaeaad760a1a8dec2
+fsspec==2026.6.0 \
+    --hash=sha256:02e0b71817df9b2169dc30a16832045764def1191b43dcff5bb85bdee212d2a1
 googleapis-common-protos==1.75.0 \
     --hash=sha256:961ed60399c457ceb0ee8f285a84c870aabc9c6a832b9d37bb281b5bebde43ed
 h11==0.16.0 \
@@ -259,11 +265,11 @@ mmh3==5.2.1 \
     --hash=sha256:eee884572b06bbe8a2b54f424dbd996139442cf83c76478e1ec162512e0dd2c7
 mpmath==1.3.0 \
     --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
-multidict==6.7.1 \
-    --hash=sha256:3fccb473e87eaa1382689053e4a4618e7ba7b9b9b8d6adf2027ee474597128cd \
-    --hash=sha256:55d97cc6dae627efa6a6e548885712d4864b81110ac76fa4e534c03819fa4a56 \
-    --hash=sha256:a90f75c956e32891a4eda3639ce6dd86e87105271f43d43442a3aedf3cddf172 \
-    --hash=sha256:b0fa96985700739c4c7853a43c0b3e169360d6855780021bfc6d0f1ce7c123e7
+multidict==6.9.1 \
+    --hash=sha256:19e31815d41cefc365489e591d105d2baceb2f65aa75d29471fbdbda8651e006 \
+    --hash=sha256:29138fef49828542e859828107e42e50d0e587c513b7eb4b2d92bade2b0860fe \
+    --hash=sha256:6ed30be8918e18c8bed0a2e8b70639ecf02feb61ed00ca2e41cfcb2a50fa3f42 \
+    --hash=sha256:7bf6478188f4e47bf5686e8a33da4ae28bf43b1b2528d9ee144d28492bfac60b
 multiprocess==0.70.19 \
     --hash=sha256:0d4b4397ed669d371c81dcd1ef33fd384a44d6c3de1bd0ca7ac06d837720d3c5 \
     --hash=sha256:3a56c0e85dd5025161bac5ce138dcac1e49174c7d8e74596537e729fd5c53c28 \

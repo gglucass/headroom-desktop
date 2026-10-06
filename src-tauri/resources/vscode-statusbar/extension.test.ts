@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 // `activate` (which needs the vscode API) is exercised in a real editor.
 import ext from "./extension.cjs";
 
-const { combine, fmt, pickSession, projectDirs, projectSlug, routed, usageView, view } = ext;
+const { combine, fmt, pausedView, pickSession, projectDirs, projectSlug, routed, usageView, view } =
+  ext;
 
 describe("vscode status bar extension", () => {
   it("rounds like the terminal statusline", () => {
@@ -94,6 +95,29 @@ describe("vscode status bar extension", () => {
     expect(combine(null, shown)?.text).toBe("$(zap) usage: 5h 34%, week 62%");
     expect(combine(saving, null)?.text).toBe("$(zap) Headroom saved 31k");
     expect(combine(null, null)).toBeNull();
+  });
+
+  it("shows Headroom's pause notice in yellow, its advice as the tooltip", () => {
+    expect(pausedView(null)).toBeNull();
+    const paused = pausedView(
+      "Headroom paused: trial ended. Upgrade in the Headroom app to resume"
+    );
+    expect(paused).toEqual({
+      text: "$(debug-pause) Headroom paused: trial ended",
+      highlight: false,
+      warn: true,
+      tooltip: "Upgrade in the Headroom app to resume"
+    });
+    expect(pausedView("Headroom paused: sign in to the Headroom app to resume")?.tooltip).toBe(
+      "Headroom paused: sign in to the Headroom app to resume"
+    );
+    const usage = { text: "usage: 5h 34%", warn: false, tooltip: "Claude plan usage" };
+    expect(combine(paused, usage)).toEqual({
+      text: "$(debug-pause) Headroom paused: trial ended | usage: 5h 34%",
+      highlight: false,
+      warn: true,
+      tooltip: "Upgrade in the Headroom app to resume\nClaude plan usage"
+    });
   });
 
   it("hides once Headroom removed its statusline script (pause, quit, disconnect)", () => {

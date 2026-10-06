@@ -757,14 +757,17 @@ const UNIDENTIFIED_HOLDER: &str =
 /// had 6767 and 6768 both held that way: Headroom's own pair, running on the
 /// Windows side.
 fn unidentified_holder() -> &'static str {
-    let wsl = cfg!(target_os = "linux")
-        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
-    if wsl {
+    if is_wsl() {
         "a program on the Windows side of WSL, such as Headroom for Windows"
     } else {
         UNIDENTIFIED_HOLDER
     }
+}
+
+pub(crate) fn is_wsl() -> bool {
+    cfg!(target_os = "linux")
+        && std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
 /// The `bind_error` holder for a `HeldPortVerdict::Foreign` that is another
@@ -1674,8 +1677,7 @@ async fn handle(
     // (verified against grok 0.2.112); the backend's own UA map expects the
     // older `grok/`, so match both and rely on the explicit X-Client stamp
     // below for backend classification.
-    let is_grok = extract_header_value(&buf, "user-agent")
-        .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"));
+    let is_grok = is_grok_request(&buf);
 
     // One classification for the process counters, the per-day usage
     // counters, and the 429 sniffers below. Same keys as
@@ -1737,6 +1739,18 @@ async fn handle(
         let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
         stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
+        // Only inference needs the backend. Its other routes ignore
+        // `x-headroom-base-url`: GET /v1/models went to api.openai.com with
+        // the grok token (401 invalid_issuer), so grok fell back to a built-in
+        // model list without its default model. Everything else goes where
+        // the CLI sends it without Headroom.
+        if !parsed_head
+            .as_ref()
+            .is_some_and(|head| is_grok_inference_path(&head.path))
+        {
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+            return;
+        }
     }
 
     // Codex fetches its model catalog via `GET <base_url>/models` and caches it
@@ -2313,7 +2327,12 @@ async fn splice_with_codex_capture(
         // `no_response` by `note_codex_prompt_outcome` (RUST-KG) and its
         // rate-limit headers were never read.
         let mut head = Vec::with_capacity(4096);
+        let head_started = std::time::Instant::now();
         let read_head = read_http_headers(&mut backend_rd, &mut head).await;
+        let head_failure = read_head
+            .as_ref()
+            .err()
+            .map(|err| (err.kind(), head_started.elapsed()));
 
         if read_head.is_ok() {
             stamp_backend_traffic();
@@ -2389,6 +2408,7 @@ async fn splice_with_codex_capture(
                 client_gone.load(Ordering::Relaxed),
                 req_path,
                 &error_body,
+                head_failure,
             );
         }
         let _ = client_wr.shutdown().await;
@@ -2423,23 +2443,35 @@ fn codex_prompt_failed(
 }
 
 /// Whether an error body came from the provider rather than from Headroom: its
-/// JSON error object, or its edge's HTML page. Headroom's own 5xx are the
+/// JSON error object, or any non-JSON page. Headroom's own 5xx are the
 /// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
-/// and a bare framework 500, and stay counted.
+/// and a bare framework 500, and stay counted, as does a `{` the bounded peek
+/// cut short and the backend's own stream errors: an `event: error` SSE frame
+/// on a 502 (`connection_error` when it cannot reach the provider, the
+/// residual-CCR fail-closed), chunked behind a size line, so never JSON.
+/// RUST-KN's 151/163/187-byte "non-json" 502s on 0.9.27-0.9.34 were exactly
+/// that frame. Anything else non-JSON was written past the backend.
 fn provider_wrote_error(body: &[u8]) -> bool {
-    let body = body.trim_ascii_start();
-    body.starts_with(b"<")
-        || serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|json| json.get("error").cloned())
-            .is_some_and(|err| {
-                err.is_object()
-                    && !["type", "code"].iter().any(|key| {
-                        err.get(*key)
-                            .and_then(|id| id.as_str())
-                            .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
-                    })
-            })
+    const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
+    let body = body.trim_ascii();
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => json.get("error").is_some_and(|err| {
+            err.is_object()
+                && !["type", "code"].iter().any(|key| {
+                    err.get(*key)
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|id| HEADROOM_ERROR_IDS.contains(&id))
+                })
+        }),
+        Err(_) => {
+            !body.is_empty()
+                && !body.starts_with(b"{")
+                && body != b"Internal Server Error"
+                && !body
+                    .windows(BACKEND_SSE_ERROR.len())
+                    .any(|w| w == BACKEND_SSE_ERROR)
+        }
+    }
 }
 
 /// The `type`/`code` of every 5xx error object the backend writes on the
@@ -2460,12 +2492,19 @@ const HEADROOM_ERROR_IDS: &[&str] = &[
 /// prompt failed with no trace at all (user 3277, 2026-09-29: one RUST-KC,
 /// then nothing). An unbroken run is the signal: report once when the run
 /// reaches the threshold, and the next success re-arms it.
+///
+/// `head_failure` is how the backend dropped a `no_response` prompt and after
+/// how long: an instant `UnexpectedEof` is the backend closing it, a reset
+/// after a long wait is a stalled backend the watchdog killed (RUST-KG's
+/// first post-fix event came from a Windows host whose feed pulls through
+/// 6767 were failing at the same time, the RUST-86 stall shape).
 fn note_codex_prompt_outcome(
     status: Option<u16>,
     stream_failed: bool,
     client_gone: bool,
     req_path: &str,
     error_body: &[u8],
+    head_failure: Option<(std::io::ErrorKind, Duration)>,
 ) {
     match codex_prompt_failed(status, stream_failed, client_gone, error_body) {
         None => return,
@@ -2495,6 +2534,10 @@ fn note_codex_prompt_outcome(
             if !error_body.is_empty() {
                 scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
                 scope.set_extra("error_body", codex_error_summary(error_body).into());
+            }
+            if let Some((err_kind, waited)) = head_failure {
+                scope.set_extra("head_error", format!("{err_kind:?}").into());
+                scope.set_extra("head_wait_ms", (waited.as_millis() as u64).into());
             }
             scope.set_fingerprint(Some(&["codex-prompts-failing", kind]));
         },
@@ -2669,6 +2712,14 @@ fn report_upstream_error(
     if status == 413 && !is_compression_refused_error(&body) {
         return;
     }
+    // A 404 on the backend's own CCR retrieve route never came from a
+    // provider: the entry outlived the wheel's CCR TTL, or the in-memory store
+    // was lost to a backend restart. The model gets the miss in its tool
+    // result and nothing on our side brings the entry back. Half of RUST-BS
+    // (100 events, 45 hosts in a week) was this, filed as "upstream error".
+    if status == 404 && is_ccr_retrieve_path(&path) {
+        return;
+    }
     // Codex sent no bearer: the flagless provider block. Repair it now (own
     // thread: this runs on the forwarding task) rather than within the hour;
     // the user is failing every prompt until it lands. Before the Sentry
@@ -2790,6 +2841,13 @@ fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
 fn is_compression_refused_error(body: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"\"compression_refused\"";
     body.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+}
+
+/// The backend's CCR retrieve route (`/v1/retrieve`, `/v1/retrieve/<hash>`,
+/// `/v1/retrieve/tool_call`), which the backend answers itself.
+fn is_ccr_retrieve_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path == "/v1/retrieve" || path.starts_with("/v1/retrieve/")
 }
 
 /// The response's media type with any parameters (`; charset=...`) stripped, so
@@ -4119,6 +4177,27 @@ fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
     stamp_request_header(buf, "x-client", header_line);
 }
 
+/// Whether a request came from Grok Build. The UA covers the CLI's own
+/// requests; its OTel trace exporter sends `OTel-OTLP-Exporter-Rust/` with the
+/// same xAI headers and the grok token, and was routed to Anthropic as Claude
+/// Code (verified against grok 1.0.46).
+fn is_grok_request(buf: &[u8]) -> bool {
+    extract_header_value(buf, "user-agent")
+        .is_some_and(|ua| ua.starts_with("grok-shell/") || ua.starts_with("grok/"))
+        || request_has_header(buf, "x-grok-client-version")
+        || request_has_header(buf, "x-xai-token-auth")
+}
+
+/// The grok endpoints the backend compresses (`api_backend` = responses,
+/// chat_completions or messages). Exact paths: sub-resources go direct.
+fn is_grok_inference_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/v1/responses" | "/v1/chat/completions" | "/v1/messages"
+    )
+}
+
 /// The upstream a Grok Build request belongs to, keyed on its credential.
 /// `grok login` stores an auth.x.ai OIDC session token (a JWT) and the CLI's
 /// own default base for that mode is `cli-chat-proxy.grok.com/v1`; api.x.ai
@@ -4389,8 +4468,9 @@ mod tests {
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
         find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
-        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
-        is_compression_refused_error, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
+        is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
+        is_codex_sse_response, is_compression_refused_error, is_geo_blocked_codex_error,
+        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
         is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
         is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
@@ -5368,6 +5448,83 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn grok_sends_only_inference_to_the_backend() {
+        // The backend's /v1/models route ignores x-headroom-base-url and sent
+        // grok's catalog fetch to api.openai.com with the grok token.
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend_listener.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let head = read_until_header_end(&mut sock).await;
+                    let line = String::from_utf8_lossy(&head);
+                    let _ = seen_tx.send(line.lines().next().unwrap_or("").to_string());
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        backend_port::set(backend_addr.port());
+
+        // A loopback upstream, which the direct forwarder refuses (503), so the
+        // direct path is observable without touching the network.
+        let send = |request: &'static [u8]| async move {
+            let (intercept_listener, intercept_addr) = bind_ephemeral().await;
+            let mut client = TcpStream::connect(intercept_addr)
+                .await
+                .expect("client connect");
+            let (accepted, _) = intercept_listener.accept().await.expect("accept");
+            let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+            tokio::spawn(super::handle(
+                accepted,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("https://api.anthropic.com".to_string()),
+            ));
+            client.write_all(request).await.expect("write request");
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+            response
+        };
+
+        let models = send(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\nx-headroom-base-url: http://127.0.0.1:9\r\n\r\n").await;
+        let traces = send(b"POST /v1/traces HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-headroom-base-url: http://127.0.0.1:9\r\nContent-Length: 0\r\n\r\n").await;
+        let inference = send(b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\nx-headroom-base-url: http://127.0.0.1:9\r\nContent-Length: 0\r\n\r\n").await;
+        backend_port::reset_for_tests();
+
+        assert!(
+            models.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&models)
+        );
+        assert!(
+            traces.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&traces)
+        );
+        assert!(
+            inference.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&inference)
+        );
+        let mut seen = Vec::new();
+        while let Ok(line) = seen_rx.try_recv() {
+            seen.push(line);
+        }
+        assert_eq!(seen, vec!["POST /v1/responses HTTP/1.1".to_string()]);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn intercept_goes_direct_until_the_backend_port_is_selected() {
         // Something already listens where the backend port points (Orca's
         // mobile server, a dev server on 6768) before tool_manager has probed
@@ -5573,6 +5730,37 @@ mod tests {
     }
 
     #[test]
+    fn grok_trace_exporter_is_grok_and_only_inference_reaches_the_backend() {
+        // Grok 1.0.46's OTel exporter: no grok UA, but the xAI headers and the
+        // grok token, which went to Anthropic as Claude Code.
+        let traces = b"POST /v1/traces HTTP/1.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-grok-client-version: 1.0.46\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n";
+        assert!(is_grok_request(traces));
+        assert!(is_grok_request(
+            b"GET /v1/models HTTP/1.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\n\r\n"
+        ));
+        assert!(!is_grok_request(
+            b"POST /v1/messages HTTP/1.1\r\nUser-Agent: claude-cli/2.1.289 (external, cli)\r\n\r\n"
+        ));
+
+        for path in [
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/messages?beta=true",
+        ] {
+            assert!(is_grok_inference_path(path), "{path}");
+        }
+        for path in [
+            "/v1/models",
+            "/v1/models/grok-4.7",
+            "/v1/traces",
+            "/v1/settings",
+            "/v1/responses/compact",
+        ] {
+            assert!(!is_grok_inference_path(path), "{path}");
+        }
+    }
+
+    #[test]
     fn grok_upstream_follows_the_credential_kind() {
         // `grok login` session token (auth.x.ai JWT): the CLI's own default.
         assert_eq!(
@@ -5743,6 +5931,32 @@ mod tests {
         let edge =
             b"<html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>";
         assert_eq!(codex_prompt_failed(Some(502), false, false, edge), None);
+        // Nor a gateway's plain-text 502 (RUST-KN, 0.9.34). A cut-short JSON
+        // body is anyone's, so it stays counted.
+        let text = b"upstream connect error or disconnect/reset before headers";
+        assert_eq!(codex_prompt_failed(Some(502), false, false, text), None);
+        let cut = br#"{"error":{"type":"connection_error","message":"Fail"#;
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, cut),
+            Some(true)
+        );
+        // The backend's own stream error, chunked as uvicorn sends it: its
+        // `connection_error` when it cannot reach the provider (this exact
+        // 187-byte body was RUST-KN's 0.9.34 event) and the residual-CCR
+        // fail-closed both stay counted.
+        let event = br#"{"type": "error", "error": {"type": "connection_error", "message": "Failed to connect to upstream API: [Errno 8] nodename nor servname provided, or not known"}}"#;
+        let sse = [b"event: error\ndata: ".as_slice(), event, b"\n\n"].concat();
+        let chunked = [format!("{:x}\r\n", sse.len()).as_bytes(), &sse, b"\r\n"].concat();
+        assert_eq!(chunked.len(), 187);
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, &chunked),
+            Some(true)
+        );
+        let residual = b"6f\r\nevent: error\ndata: {\"type\": \"error\", \"error\": {\"message\": \"Unable to safely complete streamed CCR retrieval.\"}}\n\n\r\n0\r\n\r\n";
+        assert_eq!(
+            codex_prompt_failed(Some(502), false, false, residual),
+            Some(true)
+        );
     }
 
     #[test]
@@ -7854,6 +8068,17 @@ mod tests {
             br#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#
         ));
         assert!(!is_compression_refused_error(b""));
+    }
+
+    #[test]
+    fn ccr_retrieve_path_matches_only_the_backends_route() {
+        assert!(is_ccr_retrieve_path("/v1/retrieve"));
+        assert!(is_ccr_retrieve_path(
+            "/v1/retrieve/f2ac2682a439084659cd6201"
+        ));
+        assert!(is_ccr_retrieve_path("/v1/retrieve/tool_call?x=1"));
+        assert!(!is_ccr_retrieve_path("/v1/retrieved"));
+        assert!(!is_ccr_retrieve_path("/v1/messages?beta=true"));
     }
 
     #[test]

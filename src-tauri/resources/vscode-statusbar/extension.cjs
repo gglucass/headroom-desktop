@@ -7,7 +7,8 @@
 // file (claude_statusline.rs) and shows this workspace's most recently active
 // Claude Code conversation in the window's status bar. A workspace's
 // conversations are the transcripts under ~/.claude/projects/<its slug>/.
-// After it, Claude's plan usage, which Headroom keeps in the same file.
+// After it, Claude's plan usage, which Headroom keeps in the same file. While
+// Headroom's pricing gate pauses Claude traffic, its notice replaces the saving.
 "use strict";
 
 const fs = require("fs");
@@ -105,6 +106,15 @@ function view(session, now) {
   return null;
 }
 
+/** The gate's notice ("Headroom paused: trial ended. Upgrade in the Headroom
+ *  app to resume"), its first sentence on the bar and the rest as the tooltip;
+ *  null when Claude traffic is not paused. */
+function pausedView(paused) {
+  if (!paused) return null;
+  const [head, ...rest] = paused.split(". ");
+  return { text: `$(debug-pause) ${head}`, highlight: false, warn: true, tooltip: rest.join(". ") || head };
+}
+
 /** "usage: 5h 34%, week 62%" from the plan usage Headroom keeps, or null without
  *  any. A window past its reset is back at 0, as in the tray. */
 function usageView(usage, now) {
@@ -134,8 +144,10 @@ function combine(saving, usage) {
   return {
     text: saving ? (usage ? `${saving.text} | ${usage.text}` : saving.text) : `$(zap) ${usage.text}`,
     highlight: Boolean(saving && saving.highlight),
-    warn: Boolean(usage && usage.warn),
-    tooltip: usage ? `${SAVINGS_TOOLTIP}\n${usage.tooltip}` : SAVINGS_TOOLTIP
+    warn: Boolean((usage && usage.warn) || (saving && saving.warn)),
+    tooltip: [(saving && saving.tooltip) || SAVINGS_TOOLTIP, usage && usage.tooltip]
+      .filter(Boolean)
+      .join("\n")
   };
 }
 
@@ -174,6 +186,7 @@ function activate(context) {
   let mtime = -1;
   let session = null;
   let planUsage = null;
+  let paused = null;
   const belongs = (id) => {
     if (known.has(id)) return true;
     if (!dirs.some((dir) => fs.existsSync(path.join(dir, `${id}.jsonl`)))) return false;
@@ -194,15 +207,17 @@ function activate(context) {
         const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
         session = pickSession(state.sessions, belongs);
         planUsage = state.planUsage || null;
+        paused = state.paused || null;
       }
     } catch {
       mtime = -1;
       session = null;
       planUsage = null;
+      paused = null;
     }
     const now = Date.now();
     const shown = routed(scriptPath, fs.existsSync)
-      ? combine(view(session, now), usageView(planUsage, now))
+      ? combine(pausedView(paused) || view(session, now), usageView(planUsage, now))
       : null;
     if (!shown) {
       item.hide();
@@ -234,6 +249,7 @@ module.exports = {
   deactivate,
   combine,
   fmt,
+  pausedView,
   pickSession,
   projectDirs,
   projectSlug,

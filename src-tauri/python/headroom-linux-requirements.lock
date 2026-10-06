@@ -17,6 +17,8 @@
 # proxy extra), the way the macOS and Windows locks already are.
 # transformers 5.8.1 -> 5.12.1 (2026-09-23): matches the macOS lock and clears
 # PYSEC-2026-3929 (tokenizer save_pretrained path traversal, fixed in 5.10.0).
+# fsspec 2026.4.0 -> 2026.6.0 and multidict 6.7.1 -> 6.9.1 (2026-10-06): the
+# same CVE top-up as the macOS lock (see its lineage).
 ast-grep-cli==0.42.2 \
     --hash=sha256:26adbb32aed0093a37128cc7fa0230b13dc5f1b806e3b526479f55bef65946d2 \
     --hash=sha256:a2f4728d6cc75a67265afa0801dade15649eb9a5188333d1b0c51b4833f975d3
@@ -134,8 +136,8 @@ frozenlist==1.8.0 \
     --hash=sha256:0c18a16eab41e82c295618a77502e17b195883241c563b00f0aa5106fc4eaa0d \
     --hash=sha256:494a5952b1c597ba44e0e78113a7266e656b9794eec897b19ead706bd7074383 \
     --hash=sha256:96f423a119f4777a4a056b66ce11527366a8bb92f54e541ade21f2374433f6d4
-fsspec==2026.4.0 \
-    --hash=sha256:11ef7bb35dab8a394fde6e608221d5cf3e8499401c249bebaeaad760a1a8dec2
+fsspec==2026.6.0 \
+    --hash=sha256:02e0b71817df9b2169dc30a16832045764def1191b43dcff5bb85bdee212d2a1
 h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 h2==4.4.1 \
@@ -173,10 +175,10 @@ markupsafe==3.0.3 \
     --hash=sha256:d6dd0be5b5b189d31db7cda48b91d7e0a9795f31430b7f271219ab30f1d3ac9d
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
-multidict==6.7.1 \
-    --hash=sha256:55d97cc6dae627efa6a6e548885712d4864b81110ac76fa4e534c03819fa4a56 \
-    --hash=sha256:bfde23ef6ed9db7eaee6c37dcec08524cb43903c60b285b172b6c094711b3961 \
-    --hash=sha256:eb0ce7b2a32d09892b3dd6cc44877a0d02a33241fafca5f25c8b6b62374f8b75
+multidict==6.9.1 \
+    --hash=sha256:35fc236507fb1b3138f0af5ecd5f94ed752d4d6d826248eae425f86204013eea \
+    --hash=sha256:7bf6478188f4e47bf5686e8a33da4ae28bf43b1b2528d9ee144d28492bfac60b \
+    --hash=sha256:976fd7689d69ec78d67d31d38d396d8adb562f7e8368279f76aed4aa451fa06d
 numpy==2.5.0 \
     --hash=sha256:a1a4874217b36d5ac8fc876f52e39df56f8182c88463e9e2dceabf7ca8b7efb8 \
     --hash=sha256:aaa760137137e8d3c920d27927748215b56014f92667dc9b6c27dfc61249255a
