@@ -7094,6 +7094,8 @@ fn spawn_crash_guard_process(exe: &Path) -> std::io::Result<std::process::ChildS
 ///   NSIS uninstaller is the only uninstall a user gets, and everything it
 ///   cannot reach itself (the multi-GB managed runtime, model caches,
 ///   ~\.headroom) would otherwise survive and be inherited by a reinstall.
+///   The installer's own uninstall-before-upgrade step does not call it (see
+///   installer/hooks.nsh), so a manual upgrade keeps the user's data.
 ///
 /// Quitting a *running* instance already reverts the routing layer via
 /// `clear_client_setups`, so this mainly covers the case where the app was
