@@ -679,7 +679,7 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
         return;
     }
     let tags = client_adapters::codex_unrouted_diagnostics(since.into());
-    if codex_process_predates_setup(&tags) {
+    if codex_unrouted_is_expected(&tags) {
         return;
     }
     sentry::with_scope(
@@ -708,15 +708,21 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
 /// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
 /// first proxied request landed three minutes after the nudge. A `headroom`
 /// thread, an unrouted config or a CODEX_HOME override still reports.
-fn codex_process_predates_setup(tags: &[(&'static str, String)]) -> bool {
+///
+/// Nor is a thread on a provider of the user's own (`--oss`, a custom
+/// `model_providers` entry): Headroom routes only `openai` and `headroom`,
+/// which is all Codex records for a routed thread (0.160 included), so
+/// "other" went where the user sent it. RUST-KC on 0.9.35 was one.
+fn codex_unrouted_is_expected(tags: &[(&'static str, String)]) -> bool {
     let tag = |key: &str| {
         tags.iter()
             .find(|(k, _)| *k == key)
             .map(|(_, value)| value.as_str())
     };
-    tag("codex_session_provider") == Some("openai")
+    let predates_setup = tag("codex_session_provider") == Some("openai")
         && tag("codex_config_routed") == Some("true")
-        && tag("codex_home_env") == Some("false")
+        && tag("codex_home_env") == Some("false");
+    predates_setup || tag("codex_session_provider") == Some("other")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -16811,9 +16817,9 @@ Some unrelated content.
     }
 
     #[test]
-    fn first_run_codex_report_skips_a_process_that_predates_setup() {
+    fn first_run_codex_report_skips_expected_direct_traffic() {
         let skips = |provider: &str, routed: &str, home_env: &str| {
-            super::codex_process_predates_setup(&[
+            super::codex_unrouted_is_expected(&[
                 ("codex_session_provider", provider.to_string()),
                 ("codex_config_routed", routed.to_string()),
                 ("codex_home_env", home_env.to_string()),
@@ -16821,6 +16827,9 @@ Some unrelated content.
         };
         // RUST-KC on 0.9.30: an `openai` thread with our config on disk.
         assert!(skips("openai", "true", "false"));
+        // RUST-KC on 0.9.35: the user's own provider, routed config or not.
+        assert!(skips("other", "true", "false"));
+        assert!(skips("other", "false", "true"));
         // Read our config and still never arrived: the routing bug to report.
         assert!(!skips("headroom", "true", "false"));
         assert!(!skips("unknown", "true", "false"));
