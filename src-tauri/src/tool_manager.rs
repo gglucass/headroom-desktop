@@ -10016,6 +10016,11 @@ impl ToolManager {
         if hosts.is_empty() {
             bail!(NO_PLUGIN_HOST_CLI);
         }
+        // The install itself never runs node, so without this it "succeeded"
+        // and the plugin's hooks then failed in every agent session.
+        if crate::claude_cli::detect_node().is_none() {
+            bail!(NO_NODE_FOR_PLUGIN);
+        }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
             hosts
@@ -10220,6 +10225,8 @@ impl ToolManager {
         }
     }
 }
+
+const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 

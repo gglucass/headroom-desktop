@@ -22,17 +22,15 @@ pub fn detect_codex_cli() -> Option<PathBuf> {
 fn bundled_codex_candidates() -> Vec<PathBuf> {
     let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
     let mut candidates = Vec::new();
-    if let Some(app) = crate::client_adapters::chatgpt_app_path() {
-        candidates.push(if cfg!(windows) {
-            // ponytail: Windows layout guessed from the macOS bundle; a miss only
-            // falls through to the extensions. Confirm on win-test.
-            app.with_file_name("resources")
-                .join("codex-cli")
-                .join("bin")
-                .join(exe)
-        } else {
-            app.join("Contents/Resources/codex-cli/bin").join(exe)
-        });
+    if cfg!(windows) {
+        // The Store app runs from WindowsApps and first copies its codex.exe
+        // here, the path its own resolver launches (ChatGPT app, 2026-10).
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"));
+        candidates.push(local.join("OpenAI").join("Codex").join("bin").join(exe));
+    } else if let Some(app) = crate::client_adapters::chatgpt_app_path() {
+        candidates.push(app.join("Contents/Resources/codex-cli/bin").join(exe));
     }
     candidates.extend(extension_codex_candidates(&home_dir(), exe));
     candidates
@@ -64,6 +62,16 @@ fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
         .filter_map(|(_, dir)| std::fs::read_dir(dir.join("bin")).ok())
         .flat_map(|platforms| platforms.flatten().map(|entry| entry.path().join(exe)))
         .collect()
+}
+
+/// Plugin addons' hooks run `node`. Also tries the Windows installer's default
+/// dir: Headroom's own PATH predates a Node installed after launch, so "install
+/// Node.js, then try again" would otherwise keep failing until a restart.
+pub fn detect_node() -> Option<PathBuf> {
+    detect_cli("node").or_else(|| {
+        let dir = PathBuf::from(std::env::var_os("ProgramFiles")?).join("nodejs");
+        first_runnable(std::iter::once(dir.join("node.exe")))
+    })
 }
 
 pub fn detect_npx() -> Option<PathBuf> {
