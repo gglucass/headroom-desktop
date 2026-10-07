@@ -2479,6 +2479,21 @@ fn is_app_control_signal(text: &str) -> bool {
         || lower.contains("control de aplicaciones bloque")
 }
 
+/// True when a venv's `python.exe` redirector ran but Windows refused to start
+/// the base interpreter it points at. CPython's venv launcher prints `Unable to
+/// create process using '"<home>\python.exe" ...'` and exits 101 without the
+/// Windows reason (RUST-29/6S: an App Control host whose `_core` DLL and venv
+/// exe had been blocked on earlier days). A missing base is exit 103 / `No
+/// Python at`, so the file is there and Windows declined to run it. distlib's
+/// script launcher (`headroom.exe`) prints the same words after `Fatal error in
+/// launcher:`, usually because the venv's python is gone, so that line is not
+/// this.
+pub(crate) fn is_venv_base_spawn_refused_signal(text: &str) -> bool {
+    text.to_ascii_lowercase().lines().any(|line| {
+        line.contains("unable to create process using") && !line.contains("fatal error in launcher")
+    })
+}
+
 /// True when Windows refused to load one of the bundled interpreter's own
 /// extension DLLs.
 ///
@@ -3970,6 +3985,9 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // "Zugriff verweigert" matches too. Scoped to the spawn context so a
     // denied write elsewhere in a chain does not read as AV.
     if lower.contains("starting headroom background process:") && lower.contains("(os error 5)") {
+        return true;
+    }
+    if is_venv_base_spawn_refused_signal(&lower) {
         return true;
     }
     if lower.contains("import onnxruntime failed (killed)") {
@@ -16529,6 +16547,16 @@ Some unrelated content.
         // A denied WRITE elsewhere in a chain is a permissions problem, not AV.
         assert!(!is_endpoint_protection_signal(
             "writing ~\\AppData\\Local\\Headroom\\state.json: Access is denied. (os error 5)"
+        ));
+        // RUST-29 on 0.9.36 verbatim: the venv redirector ran, the base
+        // interpreter it execs did not (exit 101, no Windows reason).
+        assert!(is_endpoint_protection_signal(
+            "repairing stale headroom requirements: command failed (exit 101): ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe -m pip install --upgrade\nstdout:\n\nstderr:\nUnable to create process using '\"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\python.exe\" -m pip install --upgrade'\n"
+        ));
+        // distlib's headroom.exe launcher, same words: the venv python is
+        // missing, a broken install of ours, not a block.
+        assert!(!is_endpoint_protection_signal(
+            "Fatal error in launcher: Unable to create process using '\"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"  \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe\" proxy': The system cannot find the file specified."
         ));
     }
 

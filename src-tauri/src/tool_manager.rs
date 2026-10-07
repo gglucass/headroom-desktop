@@ -14962,6 +14962,10 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     } else if lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
         || crate::is_blocked_runtime_dll_signal(&lower)
+        // The venv redirector could not start the base interpreter (exit
+        // 101). Read from the evidence: the 300-byte tail starts mid-line and
+        // drops the launcher's words (RUST-6S on 0.9.36 read "ll --timeout").
+        || crate::is_venv_base_spawn_refused_signal(&evidence_lower)
     {
         // Windows Application Control (Smart App Control / WDAC / AppLocker)
         // blocked a freshly-extracted file (RUST-8K, third cause). Windows
@@ -26202,6 +26206,33 @@ exit 0
             super::pip_failure_category_with_evidence(&compact, &evidence),
             "network",
             "a starved index must not be filed as a bad pin in our lock"
+        );
+    }
+
+    /// RUST-6S on 0.9.36: the venv redirector could not start the base
+    /// interpreter, and the tail cut the launcher's words off, so the event
+    /// read `[other]` with only pip's own arguments in it.
+    #[test]
+    fn a_refused_base_interpreter_is_app_control_not_other() {
+        let stderr = concat!(
+            "Unable to create process using '\"~\\AppData\\Local\\Headroom\\headroom\\runtime\\",
+            "python\\python.exe\" -m pip install --timeout 180 --retries 10 --only-binary=:all: ",
+            "--find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/",
+            "vendor-wheels-v1 --extra-index-url https://pypi.org/simple --upgrade --requirement ",
+            "~\\AppData\\Local\\Headroom\\headroom\\downloads\\headroom-requirements.lock'\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        assert!(
+            !compact
+                .to_ascii_lowercase()
+                .contains("unable to create process"),
+            "test no longer reproduces the truncation: {compact}"
+        );
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "app-control"
         );
     }
 
