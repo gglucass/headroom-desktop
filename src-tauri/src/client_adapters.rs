@@ -10979,7 +10979,7 @@ fn codex_user_state_exists() -> bool {
 /// it on 2026-07-09; the bundle id stays com.openai.codex). Its Codex mode
 /// reads ~/.codex/config.toml, so app presence alone makes the connector
 /// configurable without the CLI binary on disk.
-fn chatgpt_app_path() -> Option<PathBuf> {
+pub(crate) fn chatgpt_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         [

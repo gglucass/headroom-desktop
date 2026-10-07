@@ -12,7 +12,58 @@ pub fn detect_claude_cli() -> Option<PathBuf> {
 }
 
 pub fn detect_codex_cli() -> Option<PathBuf> {
-    detect_cli("codex")
+    detect_cli("codex").or_else(|| first_runnable(bundled_codex_candidates().into_iter()))
+}
+
+/// The ChatGPT desktop app and the Codex editor extension each ship their own
+/// `codex` and put neither on PATH. Someone who only runs Codex there has a
+/// working Codex the connector detects, yet plugin addons and Learn failed with
+/// "not found on PATH" (a Windows user, 2026-10-07), so fall back to those.
+fn bundled_codex_candidates() -> Vec<PathBuf> {
+    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let mut candidates = Vec::new();
+    if let Some(app) = crate::client_adapters::chatgpt_app_path() {
+        candidates.push(if cfg!(windows) {
+            // ponytail: Windows layout guessed from the macOS bundle; a miss only
+            // falls through to the extensions. Confirm on win-test.
+            app.with_file_name("resources")
+                .join("codex-cli")
+                .join("bin")
+                .join(exe)
+        } else {
+            app.join("Contents/Resources/codex-cli/bin").join(exe)
+        });
+    }
+    candidates.extend(extension_codex_candidates(&home_dir(), exe));
+    candidates
+}
+
+/// `<editor>/extensions/openai.chatgpt-<version>-<platform>/bin/<os>-<arch>/codex`,
+/// newest install first: an editor keeps the old version's folder until restart.
+fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
+    let mut installs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for editor in [".vscode", ".vscode-insiders", ".cursor", ".windsurf"] {
+        let Ok(entries) = std::fs::read_dir(home.join(editor).join("extensions")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("openai.chatgpt-")
+            {
+                continue;
+            }
+            let modified = entry.metadata().and_then(|meta| meta.modified());
+            installs.push((modified.unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+        }
+    }
+    installs.sort_by(|a, b| b.0.cmp(&a.0));
+    installs
+        .into_iter()
+        .filter_map(|(_, dir)| std::fs::read_dir(dir.join("bin")).ok())
+        .flat_map(|platforms| platforms.flatten().map(|entry| entry.path().join(exe)))
+        .collect()
 }
 
 pub fn detect_npx() -> Option<PathBuf> {
@@ -689,6 +740,27 @@ mod tests {
         assert_eq!(
             candidates.first().and_then(|path| path.parent()),
             Some(Path::new("/Users/test/.local/bin")),
+        );
+    }
+
+    #[test]
+    fn extension_codex_candidates_find_the_bundled_binary_newest_first() {
+        let tmp = ScopedTempDir::new("ext_codex");
+        let exts = tmp.path().join(".vscode").join("extensions");
+        let old = exts.join("openai.chatgpt-26.930.1-darwin-arm64");
+        fs::create_dir_all(old.join("bin").join("macos-aarch64")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let new = exts.join("openai.chatgpt-26.1002.1-darwin-arm64");
+        fs::create_dir_all(new.join("bin").join("macos-aarch64")).unwrap();
+        fs::create_dir_all(exts.join("ms-python.python-1").join("bin").join("x")).unwrap();
+
+        let candidates = extension_codex_candidates(tmp.path(), "codex");
+        assert_eq!(
+            candidates,
+            vec![
+                new.join("bin").join("macos-aarch64").join("codex"),
+                old.join("bin").join("macos-aarch64").join("codex"),
+            ],
         );
     }
 
