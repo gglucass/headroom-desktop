@@ -201,6 +201,17 @@ n=5 proves nothing statistically. What the pilot does show:
 - The treatment's first call reads a slightly shorter shared prefix from cache (10,776 vs
   11,903 tokens) because the output shaper rewrites part of the system prompt.
 
+Long-task run (2026-10-05, 0.9.35-rc.3, 6 "1-4 hours"/">4 hours" tasks, `results/long/`): 4/6
+resolved in both arms, on different tasks; treatment cost +54%, all of it django-10554, where
+the treatment agent spent 31 calls (repro tests, `find /` and `mdfind` for another copy of
+compiler.py, `pip download django==3.0`) and then wrote the upstream fix byte-for-byte,
+comment included, from memory. Headroom only trimmed ~450 system-prompt tokens per request
+there and the cache scaled normally, so that task measures model recall, not Headroom.
+Excluding it: $1.11 control, $1.06 treatment. Headroom saved 1.8% of input. Two lessons: even
+the longest Verified tasks are short agent sessions with little to compress, and frontier
+models have memorized Verified fixes. Gold-check checkouts (which carry the fix) are now
+deleted after selection; the git mirrors and network access remain possible leak paths.
+
 To point the treatment arm at another Headroom (for example a scratch proxy running a
 candidate sitecustomize), set `HEADROOM_BENCH_PROXY=http://127.0.0.1:<port>`; routing checks
 follow that port.

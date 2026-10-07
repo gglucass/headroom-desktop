@@ -154,6 +154,32 @@ static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 /// funnel tail into "launched an agent once" vs "actually prompted one".
 static FIRST_PROMPT_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Connections `handle` accepted, and those that closed before their request
+/// head arrived, for `note_head_read_failure`, neither counting a bare probe
+/// (`is_bare_probe`). A healthy machine sees almost none. On one Windows
+/// machine with ESET (2026-10-06) two thirds of 6767 connections were reset or
+/// hung while the backend on 6768 answered every request, and `handle` left no
+/// trace of either.
+static CONNECTIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static HEAD_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HEAD_READ_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// `/readyz` requests relayed to the backend, and those whose answer never
+/// reached the client (see `note_readyz_relay`). Same machine: the backend
+/// logged the timed-out status probes and answered each in under a
+/// millisecond, so the answer was lost inside this relay.
+static READYZ_RELAYS: AtomicU64 = AtomicU64::new(0);
+static READYZ_RELAY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static READYZ_RELAY_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Local log lines per failure kind and process before going quiet; Sentry
+/// carries the totals.
+const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
+
+/// The status probe's own budget (`state::headroom_proxy_readyz`): a `/readyz`
+/// relay still running past it has already failed from the app's side.
+const READYZ_RELAY_STALL: Duration = Duration::from_secs(5);
+
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
 /// but nothing when the backend finally comes up, so "did the runtime finish
@@ -303,6 +329,123 @@ fn report_codex_reconnect_incident(
             );
         },
     );
+}
+
+/// `ErrorKind` plus the raw OS code, which on Windows tells a reset (10054)
+/// from an abort (10053) where the kind alone does not.
+fn describe_io_error(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("{:?} (os error {code})", e.kind()),
+        None => format!("{:?}", e.kind()),
+    }
+}
+
+/// Log why an accepted connection closed before sending its request head
+/// (`err` None = `HEADER_READ_TIMEOUT`): the client's request was lost on the
+/// way in, which no other signal sees. A bare probe is not a lost request and
+/// counts as neither a failure nor a connection.
+fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Duration) {
+    if is_bare_probe(err, bytes) {
+        CONNECTIONS_ACCEPTED.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    let failures = HEAD_READ_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    let accepted = CONNECTIONS_ACCEPTED.load(Ordering::Relaxed);
+    let detail = err.map_or_else(|| "timed out".to_string(), describe_io_error);
+    // info, not warn: the log bridge ships warn to Sentry per line.
+    if failures <= INTERCEPT_FAILURE_LOG_LINES {
+        log::info!(
+            "[proxy_intercept] connection closed before its request head: {detail} after {}ms, {bytes} bytes read ({failures} of {accepted} connections)",
+            waited.as_millis()
+        );
+    }
+    report_intercept_failures_once(
+        "request head read",
+        &HEAD_READ_FAILURES_REPORTED,
+        failures,
+        accepted,
+        format!(
+            "{detail} after {}ms, {bytes} bytes read",
+            waited.as_millis()
+        ),
+    );
+}
+
+/// Record a `/readyz` relayed to the backend. `failure` is why its answer never
+/// reached the client (None = delivered); `head_read` is how long the request
+/// head took to arrive after accept, which tells a relay that stalled from one
+/// whose request was already slow to come in.
+fn note_readyz_relay(failure: Option<String>, head_read: Duration, total: Duration) {
+    let relays = READYZ_RELAYS.fetch_add(1, Ordering::Relaxed) + 1;
+    let Some(failure) = failure else {
+        return;
+    };
+    let failures = READYZ_RELAY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures <= INTERCEPT_FAILURE_LOG_LINES {
+        log::info!(
+            "[proxy_intercept] /readyz answer not delivered: {failure} after {}ms, request head read after {}ms ({failures} of {relays} relays)",
+            total.as_millis(),
+            head_read.as_millis()
+        );
+    }
+    report_intercept_failures_once(
+        "readyz relay",
+        &READYZ_RELAY_FAILURES_REPORTED,
+        failures,
+        relays,
+        format!(
+            "{failure} after {}ms, head read after {}ms",
+            total.as_millis(),
+            head_read.as_millis()
+        ),
+    );
+}
+
+/// One Sentry event per kind and process once `failures` are systemic: then
+/// the intercept is losing its clients' traffic, the status banner flaps, and
+/// the dashboard has no way to say why.
+fn report_intercept_failures_once(
+    kind: &'static str,
+    reported: &AtomicBool,
+    failures: u64,
+    total: u64,
+    last: String,
+) {
+    if !intercept_failures_are_systemic(failures, total) || reported.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("intercept_failure", kind);
+            scope.set_extra("failures", (failures as i64).into());
+            scope.set_extra("total", (total as i64).into());
+            scope.set_extra("last", last.into());
+            scope.set_fingerprint(Some(&["intercept-local-failures", kind]));
+        },
+        || {
+            sentry::capture_message(
+                &format!("intercept: {kind} failing on a large share of connections"),
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
+
+/// A clean close before the first byte: our own liveness probes connect and
+/// hang up, the shell blocks' `__headroom_up` in every new shell and every
+/// `claude`/`codex` call, the guard hooks and the crash guard. An HTTP client
+/// writes its head as soon as it connects, so a lost request shows up as a
+/// reset, a timeout or a partial head instead. RUST-NJ on 0.9.36-rc.6: a test
+/// guest restoring ~28 Terminal windows at login sent 55 probes in 10s.
+fn is_bare_probe(err: Option<&std::io::Error>, bytes: usize) -> bool {
+    bytes == 0 && err.is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+/// Enough failures to rule out a stray burst (a client killed mid-connect),
+/// and at least a quarter of the total: the status poll alone makes a
+/// healthy request every few seconds.
+fn intercept_failures_are_systemic(failures: u64, total: u64) -> bool {
+    failures >= 30 && failures.saturating_mul(4) >= total
 }
 
 /// Record the backend's reachability and log only when it changes. Called on
@@ -1632,6 +1775,8 @@ async fn handle(
     // treat it as down. Loaded before the port, see `backend_port::selected`.
     let backend_selected = backend_port::selected();
     let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
+    let accepted_at = std::time::Instant::now();
+    CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
     // `Expect: 100-continue` request flows.
@@ -1643,8 +1788,16 @@ async fn handle(
     .await
     {
         Ok(Ok(())) => {}
-        _ => return,
+        Ok(Err(e)) => {
+            note_head_read_failure(Some(&e), buf.len(), accepted_at.elapsed());
+            return;
+        }
+        Err(_) => {
+            note_head_read_failure(None, buf.len(), accepted_at.elapsed());
+            return;
+        }
     }
+    let head_read = accepted_at.elapsed();
 
     // Reject requests that didn't target the loopback listener or that carry
     // a browser Origin. This blocks DNS-rebinding attacks where an attacker
@@ -2054,10 +2207,37 @@ async fn handle(
             }
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path)
                 .with_savings_session(savings_session);
-            let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
+            let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
+            copied
         };
-        tokio::join!(upstream, downstream);
+        let relay = async { tokio::join!(upstream, downstream).1 };
+        let is_readyz = parsed_head
+            .as_ref()
+            .is_some_and(|head| head.path == "/readyz" || head.path.starts_with("/readyz?"));
+        if !is_readyz {
+            let _ = relay.await;
+            return;
+        }
+        // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
+        // still running then is a failure even if it never ends. Watch it
+        // without cutting it short: the relay itself behaves exactly as before.
+        tokio::pin!(relay);
+        let mut stalled = false;
+        let copied = tokio::select! {
+            copied = &mut relay => copied,
+            () = tokio::time::sleep(READYZ_RELAY_STALL) => {
+                stalled = true;
+                relay.await
+            }
+        };
+        let failure = match copied {
+            _ if stalled => Some("stalled".to_string()),
+            Ok(0) => Some("backend sent nothing".to_string()),
+            Ok(_) => None,
+            Err(e) => Some(describe_io_error(&e)),
+        };
+        note_readyz_relay(failure, head_read, accepted_at.elapsed());
     }
 }
 
@@ -2436,6 +2616,7 @@ fn codex_prompt_failed(
         Some(200..=299) => Some(stream_failed),
         Some(400..=499) => None,
         Some(_) if provider_wrote_error(error_body) => None,
+        Some(_) if backend_could_not_reach_provider(error_body) => None,
         Some(_) => Some(true),
         None if client_gone => None,
         None => Some(true),
@@ -2447,12 +2628,10 @@ fn codex_prompt_failed(
 /// intercept's empty bodies, the backend's error objects (`HEADROOM_ERROR_IDS`)
 /// and a bare framework 500, and stay counted, as does a `{` the bounded peek
 /// cut short and the backend's own stream errors: an `event: error` SSE frame
-/// on a 502 (`connection_error` when it cannot reach the provider, the
-/// residual-CCR fail-closed), chunked behind a size line, so never JSON.
-/// RUST-KN's 151/163/187-byte "non-json" 502s on 0.9.27-0.9.34 were exactly
-/// that frame. Anything else non-JSON was written past the backend.
+/// on a 502 (the residual-CCR fail-closed; a `connection_error` one is
+/// `backend_could_not_reach_provider`'s), chunked behind a size line, so never
+/// JSON. Anything else non-JSON was written past the backend.
 fn provider_wrote_error(body: &[u8]) -> bool {
-    const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
     let body = body.trim_ascii();
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(json) => json.get("error").is_some_and(|err| {
@@ -2474,9 +2653,35 @@ fn provider_wrote_error(body: &[u8]) -> bool {
     }
 }
 
+/// The backend's streaming error frame, chunked by uvicorn so never JSON.
+const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
+
+/// The backend could not reach the provider at all: wheel 0.39.0's
+/// `connection_error`, on its passthrough JSON 502 or its streaming
+/// `event: error` frame, for any httpx transport failure (DNS, refused or
+/// reset connections, timeouts). That is the user's network, not Headroom, so
+/// it neither counts toward a failing run nor breaks one (Garm, 2026-10-06;
+/// RUST-KN's 151/163/187-byte bodies were all this). A TLS-intercepting proxy
+/// is the exception: it fails only Headroom's own trust store, so it counts.
+fn backend_could_not_reach_provider(body: &[u8]) -> bool {
+    let body = body.trim_ascii();
+    let json = match body
+        .windows(BACKEND_SSE_ERROR.len())
+        .position(|w| w == BACKEND_SSE_ERROR)
+    {
+        Some(at) => body[at + BACKEND_SSE_ERROR.len()..]
+            .split(|&b| b == b'\n')
+            .next()
+            .unwrap_or_default(),
+        None => body,
+    };
+    serde_json::from_slice::<serde_json::Value>(json)
+        .is_ok_and(|v| v["error"]["type"] == "connection_error")
+        && !is_tls_interception_error(body)
+}
+
 /// The `type`/`code` of every 5xx error object the backend writes on the
-/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`), so a
-/// backend that cannot reach the provider (`connection_error`) still counts.
+/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`).
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
@@ -4463,6 +4668,32 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bare_probe_is_not_a_lost_request() {
+        use std::io::{Error, ErrorKind};
+        let eof = Error::new(ErrorKind::UnexpectedEof, "client closed connection");
+        // `__headroom_up`, the guard hooks, the crash guard: connect, close.
+        assert!(super::is_bare_probe(Some(&eof), 0));
+        // Lost on the way in: a partial head, a reset, a hang.
+        assert!(!super::is_bare_probe(Some(&eof), 17));
+        assert!(!super::is_bare_probe(
+            Some(&Error::from(ErrorKind::ConnectionReset)),
+            0
+        ));
+        assert!(!super::is_bare_probe(None, 0));
+    }
+
+    #[test]
+    fn intercept_failures_count_only_when_common() {
+        // A handful of bare probes, however early in the process.
+        assert!(!super::intercept_failures_are_systemic(29, 29));
+        // Plenty of failures, but a small share of a busy process.
+        assert!(!super::intercept_failures_are_systemic(30, 121));
+        assert!(super::intercept_failures_are_systemic(30, 120));
+        // The ESET machine: two of every three connections.
+        assert!(super::intercept_failures_are_systemic(40, 60));
+    }
+
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
@@ -5205,6 +5436,104 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
+    /// Watching a `/readyz` relay must not change it: the answer still reaches
+    /// the client, a delivered one is not counted as a failure, and an answer
+    /// the backend never sent is.
+    #[tokio::test]
+    #[serial]
+    async fn readyz_relay_is_delivered_and_an_empty_answer_counts_as_failed() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            drop(sock);
+            // Second probe: the backend hangs up without answering.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+        });
+        backend_port::set(backend_addr.port());
+
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let probe = || async move {
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(stream) = TcpStream::connect(intercept_addr).await {
+                    client = Some(stream);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut client = client.expect("connect to intercept");
+            client
+                .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .expect("write readyz probe");
+            let _ = client.shutdown().await;
+            let mut answer = Vec::new();
+            let _ = client.read_to_end(&mut answer).await;
+            answer
+        };
+        let settled = |relays: u64| async move {
+            for _ in 0..100 {
+                if super::READYZ_RELAYS.load(Ordering::Acquire) >= relays {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("relay {relays} was never recorded");
+        };
+
+        let relays = super::READYZ_RELAYS.load(Ordering::Acquire);
+        let failures = super::READYZ_RELAY_FAILURES.load(Ordering::Acquire);
+
+        let answer = probe().await;
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+        settled(relays + 1).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures
+        );
+
+        assert!(probe().await.is_empty());
+        settled(relays + 2).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        backend_task.await.expect("backend served both probes");
+        run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
     /// A Codex WebSocket handshake gets 426, Codex's cue to use HTTPS for the
     /// session, and never reaches the backend.
     #[tokio::test]
@@ -5735,6 +6064,12 @@ mod tests {
         // grok token, which went to Anthropic as Claude Code.
         let traces = b"POST /v1/traces HTTP/1.1\r\nUser-Agent: OTel-OTLP-Exporter-Rust/0.32.0\r\nx-xai-token-auth: xai-grok-cli\r\nx-grok-client-version: 1.0.46\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n";
         assert!(is_grok_request(traces));
+        // The interactive TUI prefixes its client name, so a `grok-shell/`
+        // prefix check sent its inference to OpenAI (401 invalid_issuer,
+        // user report 2026-10-06). Headers as captured from grok 1.0.46.
+        assert!(is_grok_request(
+            b"POST /v1/responses HTTP/1.1\r\nUser-Agent: grok-pager/1.0.46 grok-shell/1.0.46 (windows; x86_64)\r\nx-grok-client-version: 1.0.46\r\nx-grok-client-mode: interactive\r\nx-xai-token-auth: xai-grok-cli\r\n\r\n"
+        ));
         assert!(is_grok_request(
             b"GET /v1/models HTTP/1.1\r\nUser-Agent: grok-shell/1.0.46 (windows; x86_64)\r\n\r\n"
         ));
@@ -5902,8 +6237,7 @@ mod tests {
         );
         // The backend's own passthrough failures, which carry no proxy_error code.
         for body in [
-            &br#"{"error":{"type":"connection_error","message":"Failed to connect"}}"#[..],
-            br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#,
+            &br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#[..],
             br#"{"error":{"type":"api_error","code":"backend_error","message":"x"}}"#,
         ] {
             assert_eq!(
@@ -5940,18 +6274,24 @@ mod tests {
             codex_prompt_failed(Some(502), false, false, cut),
             Some(true)
         );
-        // The backend's own stream error, chunked as uvicorn sends it: its
-        // `connection_error` when it cannot reach the provider (this exact
-        // 187-byte body was RUST-KN's 0.9.34 event) and the residual-CCR
-        // fail-closed both stay counted.
+        // The backend could not reach the provider: the user's network, on
+        // the passthrough JSON 502 and on the stream error chunked as uvicorn
+        // sends it (this exact 187-byte body was RUST-KN's 0.9.34 event).
+        let offline = br#"{"error":{"type":"connection_error","message":"Failed to connect"}}"#;
+        assert_eq!(codex_prompt_failed(Some(502), false, false, offline), None);
         let event = br#"{"type": "error", "error": {"type": "connection_error", "message": "Failed to connect to upstream API: [Errno 8] nodename nor servname provided, or not known"}}"#;
         let sse = [b"event: error\ndata: ".as_slice(), event, b"\n\n"].concat();
         let chunked = [format!("{:x}\r\n", sse.len()).as_bytes(), &sse, b"\r\n"].concat();
         assert_eq!(chunked.len(), 187);
+        assert_eq!(codex_prompt_failed(Some(502), false, false, &chunked), None);
+        // Unless only Headroom's trust store fails it: a TLS-intercepting proxy.
+        let intercepted = b"event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect to upstream API: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1010)\"}}\n\n";
         assert_eq!(
-            codex_prompt_failed(Some(502), false, false, &chunked),
+            codex_prompt_failed(Some(502), false, false, intercepted),
             Some(true)
         );
+        // The backend's other stream errors stay counted: the residual-CCR
+        // fail-closed.
         let residual = b"6f\r\nevent: error\ndata: {\"type\": \"error\", \"error\": {\"message\": \"Unable to safely complete streamed CCR retrieval.\"}}\n\n\r\n0\r\n\r\n";
         assert_eq!(
             codex_prompt_failed(Some(502), false, false, residual),

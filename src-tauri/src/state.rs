@@ -8541,42 +8541,114 @@ fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoin
             .get("output_tokens_saved_delta")
             .and_then(parse_u64_value)
             .unwrap_or_default(),
-        by_provider: parse_rollup_by_provider(map.get("by_provider")),
+        by_provider: parse_rollup_by_provider(map.get("by_provider"), map.get("by_model")),
     })
 }
 
 /// Parse the upstream `by_provider` map (`{ "anthropic": { tokens_saved, ... }, ... }`)
 /// into a deterministically-ordered list. Missing/empty yields an empty Vec, so
 /// pre-feature buckets carry no provider breakdown.
-fn parse_rollup_by_provider(value: Option<&Value>) -> Vec<ProviderRollupDelta> {
+///
+/// Grok Build is served by the backend's OpenAI handler, which records every
+/// request as `openai`, so Grok showed as ChatGPT Codex (user report
+/// 2026-10-06). The bucket's `by_model` map has the same fields, and grok
+/// models are all `grok-*`: their slice moves from `openai` to `xai`, the key
+/// the display already labels Grok Build. Skipped once the backend reports
+/// `xai` itself, which would otherwise count it twice.
+fn parse_rollup_by_provider(
+    value: Option<&Value>,
+    by_model: Option<&Value>,
+) -> Vec<ProviderRollupDelta> {
     let Some(Value::Object(providers)) = value else {
         return Vec::new();
     };
     let mut out: Vec<ProviderRollupDelta> = providers
         .iter()
-        .map(|(provider, entry)| {
-            let get_u64 = |key: &str| entry.get(key).and_then(parse_u64_value).unwrap_or_default();
-            let get_f64 = |key: &str| {
-                entry
-                    .get(key)
-                    .and_then(parse_f64_value)
-                    .unwrap_or_default()
-                    .max(0.0)
-            };
-            let cache = rollup_cache_fields(entry);
-            ProviderRollupDelta {
-                provider: provider.clone(),
-                tokens_saved: get_u64("tokens_saved"),
-                compression_savings_usd_delta: get_f64("compression_savings_usd_delta"),
-                total_input_tokens_delta: get_u64("total_input_tokens_delta"),
-                total_input_cost_usd_delta: get_f64("total_input_cost_usd_delta"),
-                cache_savings_usd_delta: cache.1,
-                cache_read_cost_usd_delta: cache.2,
-            }
-        })
+        .map(|(provider, entry)| parse_rollup_delta(provider, entry))
         .collect();
+    if !providers.contains_key("xai") {
+        if let Some(openai) = out.iter_mut().find(|p| p.provider == "openai") {
+            let grok = grok_rollup_delta(by_model);
+            if let Some(grok) =
+                grok.filter(|g| g.total_input_tokens_delta > 0 || g.tokens_saved > 0)
+            {
+                openai.tokens_saved = openai.tokens_saved.saturating_sub(grok.tokens_saved);
+                openai.compression_savings_usd_delta = (openai.compression_savings_usd_delta
+                    - grok.compression_savings_usd_delta)
+                    .max(0.0);
+                openai.total_input_tokens_delta = openai
+                    .total_input_tokens_delta
+                    .saturating_sub(grok.total_input_tokens_delta);
+                openai.total_input_cost_usd_delta =
+                    (openai.total_input_cost_usd_delta - grok.total_input_cost_usd_delta).max(0.0);
+                let minus =
+                    |a: Option<f64>, b: Option<f64>| a.zip(b).map(|(a, b)| (a - b).max(0.0));
+                openai.cache_savings_usd_delta =
+                    minus(openai.cache_savings_usd_delta, grok.cache_savings_usd_delta);
+                openai.cache_read_cost_usd_delta = minus(
+                    openai.cache_read_cost_usd_delta,
+                    grok.cache_read_cost_usd_delta,
+                );
+                // A bucket of grok traffic alone keeps no empty Codex row.
+                let emptied = openai.total_input_tokens_delta == 0 && openai.tokens_saved == 0;
+                out.push(grok);
+                if emptied {
+                    out.retain(|p| p.provider != "openai");
+                }
+            }
+        }
+    }
     out.sort_by(|a, b| a.provider.cmp(&b.provider));
     out
+}
+
+fn parse_rollup_delta(provider: &str, entry: &Value) -> ProviderRollupDelta {
+    let get_u64 = |key: &str| entry.get(key).and_then(parse_u64_value).unwrap_or_default();
+    let get_f64 = |key: &str| {
+        entry
+            .get(key)
+            .and_then(parse_f64_value)
+            .unwrap_or_default()
+            .max(0.0)
+    };
+    let cache = rollup_cache_fields(entry);
+    ProviderRollupDelta {
+        provider: provider.to_string(),
+        tokens_saved: get_u64("tokens_saved"),
+        compression_savings_usd_delta: get_f64("compression_savings_usd_delta"),
+        total_input_tokens_delta: get_u64("total_input_tokens_delta"),
+        total_input_cost_usd_delta: get_f64("total_input_cost_usd_delta"),
+        cache_savings_usd_delta: cache.1,
+        cache_read_cost_usd_delta: cache.2,
+    }
+}
+
+/// The bucket's `grok-*` models summed as one `xai` slice. Cache fields stay
+/// exact only when every grok model priced its reads.
+fn grok_rollup_delta(by_model: Option<&Value>) -> Option<ProviderRollupDelta> {
+    let Some(Value::Object(models)) = by_model else {
+        return None;
+    };
+    let mut rows = models
+        .iter()
+        .filter(|(model, _)| model.to_ascii_lowercase().starts_with("grok-"))
+        .map(|(_, entry)| parse_rollup_delta("xai", entry));
+    let first = rows.next()?;
+    Some(rows.fold(first, |mut sum, row| {
+        sum.tokens_saved += row.tokens_saved;
+        sum.compression_savings_usd_delta += row.compression_savings_usd_delta;
+        sum.total_input_tokens_delta += row.total_input_tokens_delta;
+        sum.total_input_cost_usd_delta += row.total_input_cost_usd_delta;
+        sum.cache_savings_usd_delta = sum
+            .cache_savings_usd_delta
+            .zip(row.cache_savings_usd_delta)
+            .map(|(a, b)| a + b);
+        sum.cache_read_cost_usd_delta = sum
+            .cache_read_cost_usd_delta
+            .zip(row.cache_read_cost_usd_delta)
+            .map(|(a, b)| a + b);
+        sum
+    }))
 }
 
 /// A rollup entry's (bucket's or provider's) cache reads, read discount and
@@ -9589,6 +9661,10 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
         // gentler stop would have run. Bounded like the sweep: taskkill
         // enumerates the tree through the same machinery a wedged WMI stalls.
         let _ = force;
+        note_app_kill(
+            "terminate_process_tree",
+            format!("taskkill /T /F pid {pid}"),
+        );
         let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T", "/F"]);
         let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
@@ -9748,11 +9824,16 @@ fn windows_process_sweep_script(
     // the command line can fall back to Get-Process's image path, which
     // catches the launcher (headroom.exe, venv python.exe); the launcher's job
     // object takes its base-python child down with it.
+    //
+    // Each kill prints "<pid> <ppid>" first (0 when Get-Process cannot say),
+    // so the caller can put it in `recent_app_kills`: a Stop-Process victim
+    // exits 0xffffffff with nothing in its log, and without the ring an app
+    // kill and an AV kill look the same (RUST-C7 on 0.9.30).
     let fallback = if matches!(parents, SweepParents::Any) && args_pattern.is_empty() {
         format!(
             "try {{ Get-Process -ErrorAction Stop \
              | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }} \
-             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
+             | ForEach-Object {{ '{{0}} 0' -f $_.Id; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
              catch {{ }} "
         )
     } else {
@@ -9763,7 +9844,8 @@ fn windows_process_sweep_script(
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
-         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
+         | ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, $_.ParentProcessId; \
+         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ {fallback}exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
 }
@@ -10015,7 +10097,18 @@ fn kill_processes_by_command_pattern(
         // `.status()` waiting forever: "Not responding" on quit, the update
         // installer never launched, the upgrade stuck on "Preparing update".
         let status = match crate::proc::output_with_timeout(command, PS_SWEEP_TIMEOUT) {
-            Ok(output) => output.status,
+            Ok(output) => {
+                for (pid, ppid) in parse_pid_ppid(&String::from_utf8_lossy(&output.stdout)) {
+                    log::info!(
+                        "process sweep: Stop-Process {pid} (parent {ppid}) for '{args_pattern}'"
+                    );
+                    note_app_kill(
+                        "process_sweep",
+                        format!("Stop-Process {pid} (parent {ppid})"),
+                    );
+                }
+                output.status
+            }
             Err(crate::proc::OutputError::TimedOut) => {
                 return Err(anyhow!(
                     "powershell sweep timed out after {}s for exe '{}' args '{}'",
@@ -15003,7 +15096,8 @@ mod tests {
         );
         // RUST-HY: the venv-lock sweep drops the parent rule entirely.
         let any = windows_process_sweep_script(exe, "", 4242, super::SweepParents::Any);
-        assert!(!any.contains("ParentProcessId"), "{any}");
+        assert!(!any.contains("ParentProcessId -eq"), "{any}");
+        assert!(!any.contains("Get-Process -Id $_.ParentProcessId"), "{any}");
         assert!(any.contains("-and $true }"), "{any}");
         // RUST-29: a holder launched by bare name off PATH shows the venv only
         // in its image path, and an empty args pattern adds no clause that a
@@ -15019,13 +15113,20 @@ mod tests {
             any.contains(&format!(
                 "catch {{ try {{ Get-Process -ErrorAction Stop | Where-Object {{ $_.Id -ne $PID \
                  -and $_.Id -ne $me -and $_.Path -like '*C:\\Users\\a\\venv\\Scripts\\headroom.exe*' }} \
-                 | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
+                 | ForEach-Object {{ '{{0}} 0' -f $_.Id; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
                  exit 0 }} catch {{ }} exit {} }}; exit 0",
                 super::PS_SWEEP_ENUMERATION_FAILED
             )),
             "{any}"
         );
         assert_eq!(any.matches('{').count(), any.matches('}').count(), "{any}");
+        // RUST-C7: every kill names its pid first, for `recent_app_kills`.
+        assert!(
+            held.contains(
+                "ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.ParentProcessId; Stop-Process"
+            ),
+            "{held}"
+        );
         // Parent-checked sweeps keep refusing: Get-Process has no parent pid.
         assert!(!held.contains("Get-Process -ErrorAction Stop"), "{held}");
         assert!(
@@ -15965,6 +16066,76 @@ mod tests {
             anthropic.estimated_tokens_saved + openai.estimated_tokens_saved,
             hourly_points[0].estimated_tokens_saved
         );
+    }
+
+    #[test]
+    fn grok_models_move_from_openai_to_xai() {
+        // The backend records grok (served by its OpenAI handler) as openai;
+        // a Grok-only user saw it all under ChatGPT Codex (2026-10-06).
+        let bucket = |providers: &str, models: &str| {
+            parse_headroom_stats_history_from_json(&format!(
+                r#"{{"series":{{"hourly":[{{"timestamp":"2026-10-06T12:00:00Z",
+                "tokens_saved":50,"total_input_tokens_delta":1000,
+                "by_provider":{{{providers}}},"by_model":{{{models}}}}}]}}}}"#
+            ))
+            .expect("parsed history")
+            .hourly
+            .remove(0)
+            .by_provider
+        };
+        let row = |saved: u64, input: u64, read_cost: &str| {
+            format!(
+                r#"{{"tokens_saved":{saved},"compression_savings_usd_delta":0.01,"total_input_tokens_delta":{input},"total_input_cost_usd_delta":0.5,"cache_read_tokens_delta":10,"cache_savings_usd_delta":0.2,"cache_read_cost_usd_delta":{read_cost}}}"#
+            )
+        };
+
+        // Codex and grok in one bucket: grok's slice moves, Codex keeps the rest.
+        let mixed = bucket(
+            &format!(r#""openai":{}"#, row(50, 1000, "0.03")),
+            &format!(
+                r#""gpt-5.5":{},"grok-4.7":{},"grok-4.6":{}"#,
+                row(30, 600, "0.01"),
+                row(15, 300, "0.01"),
+                row(5, 100, "0.01")
+            ),
+        );
+        assert_eq!(mixed.len(), 2);
+        let (openai, xai) = (&mixed[0], &mixed[1]);
+        assert_eq!(
+            (openai.provider.as_str(), xai.provider.as_str()),
+            ("openai", "xai")
+        );
+        assert_eq!(
+            (openai.tokens_saved, openai.total_input_tokens_delta),
+            (30, 600)
+        );
+        assert_eq!((xai.tokens_saved, xai.total_input_tokens_delta), (20, 400));
+        assert!((xai.cache_read_cost_usd_delta.unwrap() - 0.02).abs() < 1e-9);
+        assert!((openai.cache_read_cost_usd_delta.unwrap() - 0.01).abs() < 1e-9);
+
+        // Grok alone: no empty Codex row left behind.
+        let grok_only = bucket(
+            &format!(r#""openai":{}"#, row(20, 400, "0.02")),
+            &format!(r#""grok-4.7":{}"#, row(20, 400, "0.02")),
+        );
+        assert_eq!(grok_only.len(), 1);
+        assert_eq!(grok_only[0].provider, "xai");
+
+        // A backend that reports xai itself is left alone (no double count).
+        let native = bucket(
+            &format!(
+                r#""openai":{},"xai":{}"#,
+                row(30, 600, "0.01"),
+                row(20, 400, "0.02")
+            ),
+            &format!(
+                r#""gpt-5.5":{},"grok-4.7":{}"#,
+                row(30, 600, "0.01"),
+                row(20, 400, "0.02")
+            ),
+        );
+        assert_eq!(native[0].total_input_tokens_delta, 600);
+        assert_eq!(native[1].total_input_tokens_delta, 400);
     }
 
     #[test]

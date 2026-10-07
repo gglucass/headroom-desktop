@@ -39,6 +39,20 @@ const ADMIN_PROMPT_COPY =
   "Headroom needs an administrator password to replace itself in its folder. " +
   "Install again and approve the password prompt, or ask an administrator to update Headroom.";
 
+// The Linux .deb counterpart: tauri-plugin-updater runs `dpkg -i` through
+// pkexec, then a zenity/kdialog password box, then bare `sudo`, and reports
+// only the last failure. With no polkit agent and no zenity the whole chain
+// fails in under a second without ever showing a prompt (RUST-MB), so "approve
+// the prompt" would send the user round the same loop. Only reached after a
+// click: `silent_install_supported` never stages a .deb quietly.
+const PACKAGE_INSTALL_FAILED = /Failed to install package/;
+const PACKAGE_INSTALL_COPY =
+  "Headroom needs administrator rights to install this update, and the password prompt " +
+  "was cancelled or could not be shown. Download the newest .deb from " +
+  "https://extraheadroom.com/dl/linux_deb and install it over this one, or switch to the " +
+  "AppImage (https://extraheadroom.com/dl/linux_appimage), which updates itself without a " +
+  "password. Your settings are kept either way.";
+
 // Anything that failed on the way to or from github.com rather than in our
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
@@ -47,9 +61,9 @@ const ADMIN_PROMPT_COPY =
 const TRANSPORT_FAILURE =
   /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON|failed with status: 5\d\d/i;
 
-// Releases are quiet by default: no dialog, no notification, and (on macOS)
-// a silent background install that only asks for a restart. A release that
-// users must take promptly opts back into the old loud flow by carrying this
+// Releases are quiet by default: no dialog, no notification, and (on macOS
+// and a Linux AppImage) a silent background install that only asks for a
+// restart. A release that users must take promptly opts back into the old loud flow by carrying this
 // marker anywhere in its release notes (put `<!-- headroom:loud -->` in
 // .github/release-notes/<VERSION>.md; it flows into latest.json `notes`).
 export const LOUD_UPDATE_MARKER = "headroom:loud";
@@ -132,7 +146,7 @@ export async function runAppUpdateCheck({
     if (update) {
       // Background-found updates only interrupt when the release is marked
       // loud; quiet releases surface passively (Settings copy, stale nag,
-      // and on macOS a silent install). Manual checks always show the dialog.
+      // and on macOS or an AppImage a silent install). Manual checks always show the dialog.
       const shouldShowDialog =
         !background || (isLoudAppUpdate(update) && update.version !== knownUpdateVersion);
       return {
@@ -241,9 +255,10 @@ function writeWaitingUpdate(record: WaitingUpdateRecord): void {
 // published yesterday, so `ageDays < 5` and nothing ever fired. Every release
 // reset the clock for everyone, including the people furthest behind (gaps
 // between 0.9.15 and 0.9.19 were 7, 4, 0 and 1 days). Since the quiet-update
-// default landed in 0.9.8 this nag is the only thing that reaches Windows and
-// Linux at all -- neither can install without the user, so a quiet release is
-// otherwise invisible there.
+// default landed in 0.9.8 this nag was the only thing that reached Windows and
+// Linux. Windows now installs when idle and an AppImage stages like macOS, so
+// it is left for a .deb (which cannot install without the user's password) and
+// for installs whose quiet path keeps failing.
 export async function maybeFireStaleAppUpdateNotification(
   availableUpdate: AvailableAppUpdate | null,
   invokeFn: AppUpdateInvoker = invoke
@@ -371,9 +386,10 @@ export async function runAppUpdateInstall({
     const detail = describeInvokeError(error, "");
     const transport = TRANSPORT_FAILURE.test(detail);
     const adminPrompt = ADMIN_PROMPT_FAILED.test(detail);
+    const packagePrompt = PACKAGE_INSTALL_FAILED.test(detail);
     // A quiet install reaching the admin prompt means the writability gate
     // missed a case, so that one still reports.
-    if (!READ_ONLY_BUNDLE.test(detail) && !(adminPrompt && !quiet)) {
+    if (!READ_ONLY_BUNDLE.test(detail) && !((adminPrompt || packagePrompt) && !quiet)) {
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",
         tags: { flow: "app_update_install" },
@@ -384,7 +400,9 @@ export async function runAppUpdateInstall({
         ? "Could not download the update: the connection dropped. Try again."
         : adminPrompt
           ? ADMIN_PROMPT_COPY
-          : describeInvokeError(error, "Could not install the update."),
+          : packagePrompt
+            ? PACKAGE_INSTALL_COPY
+            : describeInvokeError(error, "Could not install the update."),
     };
   } finally {
     unlisten?.();

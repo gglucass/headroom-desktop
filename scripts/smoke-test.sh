@@ -145,15 +145,20 @@ else
 fi
 
 # --- 2. proxy is intercepting ----------------------------------------------
-if [ -f "$CFG/activity-facts.json" ]; then
-  age=$(( $(date +%s) - $(stat -f %m "$CFG/activity-facts.json") ))
-  if [ "$age" -lt 120 ]; then
-    row PASS "2 intercepting" "activity-facts ${age}s old"
-  else
-    row FAIL "2 intercepting" "activity-facts ${age}s old (needs a live client session)"
-  fi
+# The newest request in the proxy's own feed. activity-facts.json's mtime was
+# the heartbeat until a331976 made it rewrite only when a tile changes, after
+# which a trivial prompt left it alone and this FAILed on a live session.
+newest=$(curl -s --max-time 5 "http://127.0.0.1:6767/transformations/feed?limit=100&include_messages=0" \
+  | jq -r '[.transformations[]?.timestamp | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601] | max // empty' 2>/dev/null)
+if [ -z "$newest" ]; then
+  row FAIL "2 intercepting" "no request in the proxy's feed (needs a live client session)"
 else
-  row FAIL "2 intercepting" "activity-facts.json missing"
+  age=$(( $(date +%s) - newest ))
+  if [ "$age" -lt 120 ]; then
+    row PASS "2 intercepting" "newest proxied request ${age}s old"
+  else
+    row FAIL "2 intercepting" "newest proxied request ${age}s old (needs a live client session)"
+  fi
 fi
 
 # --- 3. RTK (opt-in addon; absent is the correct state) ---------------------
@@ -181,7 +186,9 @@ else
 fi
 rec=$(jq -r .version "$HR/tools/markitdown.json" 2>/dev/null)
 art=$("$venv/bin/markitdown" --version 2>&1 | awk '{print $NF}')
-if [ -n "$rec" ] && [ "$rec" = "$art" ]; then
+if [ -z "$rec" ]; then
+  row SKIP "8 addon receipts" "markitdown not installed (opt-in)"
+elif [ "$rec" = "$art" ]; then
   row PASS "8 addon receipts" "markitdown $rec == $art"
 else
   row FAIL "8 addon receipts" "markitdown receipt $rec != artifact $art"

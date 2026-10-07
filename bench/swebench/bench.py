@@ -177,6 +177,9 @@ def cmd_select(a):
                     entry["gold_resolved_locally"] = not entry["unpatched_resolved_locally"]
             except subprocess.CalledProcessError as e:
                 entry["gold_resolved_locally"], entry["setup_error"] = False, (e.stderr or "")[-500:]
+            # The checkout carries the reference fix, and agents search the disk for other
+            # copies of the file they are fixing (django-10554 ran `find /` for compiler.py).
+            shutil.rmtree(WORK / "goldcheck" / inst["instance_id"], ignore_errors=True)
             print(f"  -> {entry['gold_resolved_locally']}", flush=True)
         considered.append(entry)
         if entry.get("gold_resolved_locally", True):

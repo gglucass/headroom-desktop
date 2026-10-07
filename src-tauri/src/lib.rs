@@ -220,8 +220,8 @@ struct AppUpdateConfiguration {
     configuration_error: Option<String>,
     beta_channel_enabled: bool,
     // Whether the frontend may stage updates with no click. Only a macOS
-    // bundle that it and its folder can move without admin rights qualifies:
-    // see silent_install_supported.
+    // bundle or a Linux AppImage that it and its folder can replace without
+    // admin rights qualifies: see silent_install_supported.
     silent_install_supported: bool,
 }
 
@@ -679,7 +679,7 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
         return;
     }
     let tags = client_adapters::codex_unrouted_diagnostics(since.into());
-    if codex_process_predates_setup(&tags) {
+    if codex_unrouted_is_expected(&tags) {
         return;
     }
     sentry::with_scope(
@@ -708,15 +708,21 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
 /// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
 /// first proxied request landed three minutes after the nudge. A `headroom`
 /// thread, an unrouted config or a CODEX_HOME override still reports.
-fn codex_process_predates_setup(tags: &[(&'static str, String)]) -> bool {
+///
+/// Nor is a thread on a provider of the user's own (`--oss`, a custom
+/// `model_providers` entry): Headroom routes only `openai` and `headroom`,
+/// which is all Codex records for a routed thread (0.160 included), so
+/// "other" went where the user sent it. RUST-KC on 0.9.35 was one.
+fn codex_unrouted_is_expected(tags: &[(&'static str, String)]) -> bool {
     let tag = |key: &str| {
         tags.iter()
             .find(|(k, _)| *k == key)
             .map(|(_, value)| value.as_str())
     };
-    tag("codex_session_provider") == Some("openai")
+    let predates_setup = tag("codex_session_provider") == Some("openai")
         && tag("codex_config_routed") == Some("true")
-        && tag("codex_home_env") == Some("false")
+        && tag("codex_home_env") == Some("false");
+    predates_setup || tag("codex_session_provider") == Some("other")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -1184,10 +1190,13 @@ fn idle_minutes_after(minutes: u32, traffic: bool, slept: bool) -> u32 {
 /// 0.9.29 were still running a build a week or more older, so fixes shipped
 /// to the people who needed them most never reached them.
 ///
-/// macOS (and Linux after a user-approved install) restarts into the staged
-/// build through `restart_app`. Windows has no staging: its install runs the
+/// macOS and Linux restart into the staged build through `restart_app` (a
+/// .deb stages only after a user-approved install, see
+/// `silent_install_supported`). Windows has no staging: its install runs the
 /// installer, which exits and relaunches the app, so the idle moment is when
-/// it runs. A macOS update that could not stage quietly (read-only bundle, an
+/// it runs. It runs with no window (`installMode: quiet` in tauri.conf.json,
+/// NSIS `/S`), which needs no UAC because the app installs per user. A macOS
+/// or AppImage update that could not stage quietly (read-only bundle, an
 /// admin prompt) is left to the user, never installed from here.
 fn spawn_idle_update_applier(app: AppHandle) {
     const TICK: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1460,7 +1469,7 @@ fn dir_is_read_only(dir: &std::path::Path) -> bool {
 
 /// Creates and removes a throwaway file in `dir`: the only honest answer to
 /// "can this folder be written", since mode bits miss read-only mounts and ACLs.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn probe_dir_write(dir: &std::path::Path) -> std::io::Result<()> {
     let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
     // direct-write: throwaway write probe, removed right after
@@ -1477,15 +1486,31 @@ fn is_read_only_filesystem(err: &std::io::Error) -> bool {
 }
 
 /// Whether the frontend may stage an update with no click. Windows install()
-/// exits the app to run the installer and Linux .deb raises a polkit prompt, so
-/// both stay behind an explicit click; macOS qualifies only when the in-place
-/// swap needs no privileges.
+/// exits the app to run the installer (the idle applier runs it instead) and
+/// Linux .deb raises a polkit prompt, so a quiet hourly install would ask for
+/// a root password every hour; both stay behind an explicit click. macOS and a
+/// Linux AppImage qualify only when the in-place swap needs no privileges.
 fn silent_install_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
         bundle_folder_accepts_writes(current_app_bundle_path().as_deref())
     }
-    #[cfg(not(target_os = "macos"))]
+    // The plugin renames the image aside and writes the new one at `APPIMAGE`,
+    // the path it installs to. Keyed on the bundle type, not on `APPIMAGE`
+    // alone: a shell started from another AppImage leaks it into a .deb launch
+    // (RUST-CN), and the .deb installer is the one that prompts.
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            tauri::utils::platform::bundle_type(),
+            Some(tauri::utils::config::BundleType::AppImage)
+        ) && bundle_folder_accepts_writes(
+            std::env::var_os("APPIMAGE")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         false
     }
@@ -1504,7 +1529,11 @@ fn silent_install_supported() -> bool {
 /// `..` entry), so a 755 bundle owned by another admin or by root (a pkg or
 /// MDM deploy) hits the same prompt from a writable folder. `access(W_OK)`
 /// asks without writing into the signed bundle and honours ACLs like rename.
-#[cfg(target_os = "macos")]
+///
+/// A Linux AppImage is a single file and its rename needs only the folder, but
+/// it gets the same check: an image this user cannot write is one they did not
+/// put there, and declining only costs a click.
+#[cfg(unix)]
 fn bundle_folder_accepts_writes(bundle: Option<&std::path::Path>) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
@@ -11717,6 +11746,8 @@ fn compute_tray_window_position(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::bundle_folder_accepts_writes;
     use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
@@ -11757,9 +11788,7 @@ mod tests {
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
-    use super::{
-        bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem, symlink_free_exe,
-    };
+    use super::{dir_is_read_only, is_read_only_filesystem, symlink_free_exe};
     use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -16788,9 +16817,9 @@ Some unrelated content.
     }
 
     #[test]
-    fn first_run_codex_report_skips_a_process_that_predates_setup() {
+    fn first_run_codex_report_skips_expected_direct_traffic() {
         let skips = |provider: &str, routed: &str, home_env: &str| {
-            super::codex_process_predates_setup(&[
+            super::codex_unrouted_is_expected(&[
                 ("codex_session_provider", provider.to_string()),
                 ("codex_config_routed", routed.to_string()),
                 ("codex_home_env", home_env.to_string()),
@@ -16798,6 +16827,9 @@ Some unrelated content.
         };
         // RUST-KC on 0.9.30: an `openai` thread with our config on disk.
         assert!(skips("openai", "true", "false"));
+        // RUST-KC on 0.9.35: the user's own provider, routed config or not.
+        assert!(skips("other", "true", "false"));
+        assert!(skips("other", "false", "true"));
         // Read our config and still never arrived: the routing bug to report.
         assert!(!skips("headroom", "true", "false"));
         assert!(!skips("unknown", "true", "false"));
@@ -17202,7 +17234,7 @@ Some unrelated content.
 
     /// The counterpart of the guard above: EACCES does install, but only
     /// through the plugin's admin prompt, so it must never be the silent path.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn silent_install_needs_a_bundle_folder_that_takes_writes() {
         use std::os::unix::fs::PermissionsExt;
@@ -17211,6 +17243,12 @@ Some unrelated content.
         let bundle = dir.path().join("Headroom.app");
         std::fs::create_dir(&bundle).expect("create");
         assert!(bundle_folder_accepts_writes(Some(&bundle)));
+        let image = dir.path().join("Headroom.AppImage");
+        std::fs::File::create(&image).expect("create");
+        assert!(
+            bundle_folder_accepts_writes(Some(&image)),
+            "a Linux AppImage is a file, checked the same way"
+        );
 
         // A bundle another admin (or a pkg, as root) installed sits 755 in a
         // folder this user can write, but the plugin's swap renames it into
