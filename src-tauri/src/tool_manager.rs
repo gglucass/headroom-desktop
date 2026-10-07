@@ -3278,6 +3278,19 @@ fn pre_upstream_concurrency() -> usize {
     (cores * 2).clamp(8, 64)
 }
 
+/// `default` for an engine switch the desktop sets, unless the user exported
+/// `name` themselves (launchctl setenv, a Windows user variable, the shell
+/// that starts the Linux app): a non-empty value passes through for the wheel
+/// to parse. `HEADROOM_DEDUPE=0` plus `HEADROOM_COLD_RECOMPACT=0` turns the
+/// cross-turn "same as msg M" pointer off without a rebuild; both are needed,
+/// because cold-prefix recompaction builds its own router with dedupe forced on.
+fn user_env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Interval estimate of OpenAI's prompt-cache TTL from the backend's
 /// `cache_ttl_observations.jsonl` (written under HEADROOM_CACHE_TTL_LEARN):
 /// hit idles bound the TTL from below (cache proven alive), `ttl_expiry` miss
@@ -5083,10 +5096,13 @@ impl ToolManager {
                     // is 100% client-driven; cache mode only avoids busting it and
                     // adds no compression), leaving the savings chart flat.
                     .env("HEADROOM_MODE", "token")
-                    .env("HEADROOM_DEDUPE", "1")
+                    .env("HEADROOM_DEDUPE", user_env_or("HEADROOM_DEDUPE", "1"))
                     .env(
                         "HEADROOM_COLD_RECOMPACT",
-                        if cold_recompact { "1" } else { "0" },
+                        user_env_or(
+                            "HEADROOM_COLD_RECOMPACT",
+                            if cold_recompact { "1" } else { "0" },
+                        ),
                     )
                     .env(
                         "HEADROOM_CACHE_TTL_LEARN",
