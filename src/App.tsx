@@ -7022,7 +7022,7 @@ export default function App() {
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
-                {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded") ? (
+                {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded" || calloutBanner.tone === "auto-paused") ? (
                   <p className="callout-banner__subtitle">{runtimeIssueDetail}</p>
                 ) : null}
                 {platformPreviewNotice ? (

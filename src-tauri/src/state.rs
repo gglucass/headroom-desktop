@@ -9274,6 +9274,10 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // app-side cause, dlopen-not-permitted, fresh-extension permission
     // denial, etc. Defer to the shared matcher in lib.rs so this list
     // doesn't drift from the install-time classifier.
+    // App Control first: it is a subset with a specific setting to change.
+    if crate::is_windows_app_control_block(raw) {
+        return Some(crate::app_control_hint_runtime());
+    }
     if crate::is_endpoint_protection_signal(raw) {
         return Some(crate::endpoint_protection_hint_runtime());
     }
@@ -12044,12 +12048,30 @@ mod tests {
                    Control de aplicaciones bloqueó este archivo.\n--- end log ---";
         let hint = classify_startup_error(raw).expect("blocked DLL should classify");
         assert!(
-            hint.contains("endpoint protection"),
-            "expected the endpoint-protection hint, got: {hint}"
+            hint.contains("Smart App Control settings and turn it off"),
+            "expected the App Control hint, got: {hint}"
         );
         assert!(
             !hint.contains("see the traceback"),
             "generic branch won: {hint}"
+        );
+        // RUST-29 on 0.9.36: the venv redirector could not start the base
+        // interpreter. Same block, same remedy.
+        let redirector = "unable to keep headroom running in background: exited with status \
+                          exit code: 101 before opening port 6768\n--- log tail ---\nUnable to \
+                          create process using '\"~\\AppData\\Local\\Headroom\\headroom\\runtime\\\
+                          python\\python.exe\" -m headroom.proxy.server --port 6768'\n--- end log ---";
+        assert_eq!(
+            classify_startup_error(redirector),
+            Some(crate::app_control_hint_runtime())
+        );
+        // Antivirus or EDR, not App Control, keeps the generic text.
+        let denied =
+            "starting headroom background process: ~\\AppData\\Local\\Headroom\\headroom\\\
+                      runtime\\venv\\Scripts\\headroom.exe proxy: Access is denied. (os error 5)";
+        assert_eq!(
+            classify_startup_error(denied),
+            Some(crate::endpoint_protection_hint_runtime())
         );
     }
 

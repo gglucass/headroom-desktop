@@ -2434,7 +2434,7 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if is_ssl_library_conflict_signal(&haystack) {
         BootstrapFailureKind::SslLibraryConflict
-    } else if is_app_control_signal(&haystack) || is_blocked_runtime_dll_signal(&haystack) {
+    } else if is_windows_app_control_block(&haystack) {
         BootstrapFailureKind::AppControlBlocked
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
@@ -2492,6 +2492,14 @@ pub(crate) fn is_venv_base_spawn_refused_signal(text: &str) -> bool {
     text.to_ascii_lowercase().lines().any(|line| {
         line.contains("unable to create process using") && !line.contains("fatal error in launcher")
     })
+}
+
+/// Every shape a Windows App Control block (Smart App Control, WDAC,
+/// AppLocker) takes in our errors, as opposed to antivirus or EDR.
+pub(crate) fn is_windows_app_control_block(text: &str) -> bool {
+    is_app_control_signal(text)
+        || is_blocked_runtime_dll_signal(text)
+        || is_venv_base_spawn_refused_signal(text)
 }
 
 /// True when Windows refused to load one of the bundled interpreter's own
@@ -2731,8 +2739,9 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
             "Installation failed: Windows Application Control (Smart App Control, \
              AppLocker, or a company WDAC policy) blocked the files Headroom just \
              installed, and clicking Try again will keep hitting the same block. \
-             On a personal PC, check Windows Security > App & browser control. On \
-             a work PC, ask your IT team to allow Headroom's install folder \
+             On a personal PC this is usually Smart App Control: open Windows \
+             Security > App & browser control > Smart App Control settings and \
+             turn it off. On a work PC, ask your IT team to allow Headroom's install folder \
              (%LOCALAPPDATA%\\Headroom). Use Contact support below and we'll read \
              the details it sends."
         }
@@ -4100,6 +4109,21 @@ const ENDPOINT_PROTECTION_HINT_RUNTIME_WINDOWS: &str =
      acting on freshly-installed files. On a personal PC, check Windows Security > App & browser control; \
      on a work PC, ask IT to allow %LOCALAPPDATA%\\Headroom. Then click Retry. If nothing is \
      blocking it, reinstall the runtime from Settings > Advanced.";
+
+/// A Windows App Control verdict specifically, not antivirus: on a personal
+/// PC that is Smart App Control, which turns itself on when its evaluation
+/// period ends and then blocks the unsigned runtime (python-build-standalone
+/// and PyPI binaries). The generic text above sent those users to "check" a
+/// settings page without saying what to change there.
+const APP_CONTROL_HINT_RUNTIME: &str =
+    "Windows is blocking Headroom's runtime, so Headroom can't start and your agents run \
+     without compression. This is usually Smart App Control: open Windows Security > App & \
+     browser control > Smart App Control settings and turn it off. On a work PC, ask IT to \
+     allow %LOCALAPPDATA%\\Headroom in its App Control policy. Then restart Headroom.";
+
+pub(crate) fn app_control_hint_runtime() -> String {
+    APP_CONTROL_HINT_RUNTIME.to_string()
+}
 
 pub(crate) fn endpoint_protection_hint_install() -> String {
     ENDPOINT_PROTECTION_HINT_INSTALL.to_string()
@@ -10557,6 +10581,25 @@ fn claim_auto_rebuild(marker: &std::path::Path, app_version: &str) -> bool {
     client_adapters::atomic_write(marker, app_version.as_bytes()).is_ok()
 }
 
+/// The auto-pause notification. "It keeps retrying, or click Resume" is the
+/// wrong advice when the machine itself refuses the runtime (App Control,
+/// antivirus, a denied socket): no retry gets past that, so name the cause
+/// and send the user to the in-app hint that says what to change.
+fn auto_pause_notification_body(startup_error: Option<&str>) -> String {
+    let hint = startup_error
+        .filter(|err| is_environmental_startup_key(startup_error_fingerprint_key(Some(err))))
+        .and_then(state::classify_startup_error);
+    match hint {
+        Some(hint) => {
+            let lead = hint.find(". ").map_or(hint.as_str(), |end| &hint[..=end]);
+            format!("{lead} Open Headroom to see how to fix it.")
+        }
+        None => "Headroom couldn't restart its proxy, so requests pass through unoptimized. \
+                 It keeps retrying, or open Headroom and click Resume."
+            .to_string(),
+    }
+}
+
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
@@ -11028,11 +11071,12 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // Once per down episode. Every failed self-heal retry ends back
                 // here, so a backend that never starts re-notified at 30s, 1m,
                 // 2m and then every 5 minutes for as long as the app ran.
+                let startup_error = state.last_startup_error.lock().clone();
                 if auto_pause_failed == 0 {
                     let _ = show_notification_impl(
                         &app,
                         "Headroom paused",
-                        "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
+                        &auto_pause_notification_body(startup_error.as_deref()),
                         Some("connectors".into()),
                     );
                     // Server-side count of machines stuck here; the way out is
@@ -11041,7 +11085,6 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 }
                 // Last resort for a runtime that dies the same way at every
                 // start: rebuild it. See `startup_death_needs_rebuild`.
-                let startup_error = state.last_startup_error.lock().clone();
                 rebuild_strikes = if startup_death_needs_rebuild(startup_error.as_deref()) {
                     rebuild_strikes.saturating_add(1)
                 } else {
@@ -16388,6 +16431,25 @@ Some unrelated content.
             );
         }
         assert!(!super::startup_death_needs_rebuild(None));
+    }
+
+    #[test]
+    fn the_auto_pause_notification_names_a_machine_block() {
+        let blocked = "unable to keep headroom running in background: exited with status exit \
+                       code: 1 before opening port 6768\n--- log tail ---\nImportError: DLL load \
+                       failed while importing _core: An Application Control policy has blocked \
+                       this file.\n--- end log ---";
+        assert_eq!(
+            super::auto_pause_notification_body(Some(blocked)),
+            "Windows is blocking Headroom's runtime, so Headroom can't start and your agents \
+             run without compression. Open Headroom to see how to fix it."
+        );
+        // Ours to fix, so the retry advice stands.
+        let crashed = "python.exe -m headroom.proxy.server exited with status exit code: 1 \
+                       before opening port 6768";
+        for err in [Some(crashed), None] {
+            assert!(super::auto_pause_notification_body(err).contains("click Resume"));
+        }
     }
 
     #[test]
