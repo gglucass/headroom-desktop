@@ -155,8 +155,8 @@ static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 static FIRST_PROMPT_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Connections `handle` accepted, and those that closed before their request
-/// head arrived, for `note_head_read_failure`. A healthy machine sees only the
-/// odd bare TCP probe here (the guard hooks connect and close). On one Windows
+/// head arrived, for `note_head_read_failure`, neither counting a bare probe
+/// (`is_bare_probe`). A healthy machine sees almost none. On one Windows
 /// machine with ESET (2026-10-06) two thirds of 6767 connections were reset or
 /// hung while the backend on 6768 answered every request, and `handle` left no
 /// trace of either.
@@ -342,8 +342,13 @@ fn describe_io_error(e: &std::io::Error) -> String {
 
 /// Log why an accepted connection closed before sending its request head
 /// (`err` None = `HEADER_READ_TIMEOUT`): the client's request was lost on the
-/// way in, which no other signal sees.
+/// way in, which no other signal sees. A bare probe is not a lost request and
+/// counts as neither a failure nor a connection.
 fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Duration) {
+    if is_bare_probe(err, bytes) {
+        CONNECTIONS_ACCEPTED.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
     let failures = HEAD_READ_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
     let accepted = CONNECTIONS_ACCEPTED.load(Ordering::Relaxed);
     let detail = err.map_or_else(|| "timed out".to_string(), describe_io_error);
@@ -426,8 +431,18 @@ fn report_intercept_failures_once(
     );
 }
 
-/// Enough failures to rule out a burst of bare probes (one per agent session
-/// start), and at least a quarter of the total: the status poll alone makes a
+/// A clean close before the first byte: our own liveness probes connect and
+/// hang up, the shell blocks' `__headroom_up` in every new shell and every
+/// `claude`/`codex` call, the guard hooks and the crash guard. An HTTP client
+/// writes its head as soon as it connects, so a lost request shows up as a
+/// reset, a timeout or a partial head instead. RUST-NJ on 0.9.36-rc.6: a test
+/// guest restoring ~28 Terminal windows at login sent 55 probes in 10s.
+fn is_bare_probe(err: Option<&std::io::Error>, bytes: usize) -> bool {
+    bytes == 0 && err.is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+/// Enough failures to rule out a stray burst (a client killed mid-connect),
+/// and at least a quarter of the total: the status poll alone makes a
 /// healthy request every few seconds.
 fn intercept_failures_are_systemic(failures: u64, total: u64) -> bool {
     failures >= 30 && failures.saturating_mul(4) >= total
@@ -4653,6 +4668,21 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bare_probe_is_not_a_lost_request() {
+        use std::io::{Error, ErrorKind};
+        let eof = Error::new(ErrorKind::UnexpectedEof, "client closed connection");
+        // `__headroom_up`, the guard hooks, the crash guard: connect, close.
+        assert!(super::is_bare_probe(Some(&eof), 0));
+        // Lost on the way in: a partial head, a reset, a hang.
+        assert!(!super::is_bare_probe(Some(&eof), 17));
+        assert!(!super::is_bare_probe(
+            Some(&Error::from(ErrorKind::ConnectionReset)),
+            0
+        ));
+        assert!(!super::is_bare_probe(None, 0));
+    }
+
     #[test]
     fn intercept_failures_count_only_when_common() {
         // A handful of bare probes, however early in the process.
