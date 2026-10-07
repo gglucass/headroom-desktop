@@ -3114,12 +3114,38 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         |err| {
             let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
             anyhow!(
-                "renaming {} -> {}: {err}",
+                "renaming {} -> {}: {err}{}",
                 tmp_path.display(),
-                path.display()
+                path.display(),
+                if is_locked_file(path) {
+                    LOCKED_FILE_NOTE
+                } else {
+                    ""
+                }
             )
         },
     )
+}
+
+/// Appended to a failed write whose destination the user locked. Matched by
+/// `logging::is_unreportable`, so keep the wording in sync.
+pub(crate) const LOCKED_FILE_NOTE: &str =
+    " (the file is locked: Finder Get Info > Locked, or chflags uchg)";
+
+/// The destination carries an immutable or append-only flag, which fails the
+/// rename with EPERM however often it is retried (RUST-4W/RUST-NQ on 0.9.35:
+/// a locked headroom-pricing-state.json). The user set it; we do not undo it.
+#[cfg(target_os = "macos")]
+fn is_locked_file(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    let locked = libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+    std::fs::metadata(path).is_ok_and(|meta| meta.st_flags() & locked != 0)
+}
+
+// ponytail: macOS only; Linux `chattr +i` needs an ioctl, add it if a Linux host reports this.
+#[cfg(not(target_os = "macos"))]
+fn is_locked_file(_path: &Path) -> bool {
+    false
 }
 
 /// Follows `path` through any symlinks to the file a write should land in.
