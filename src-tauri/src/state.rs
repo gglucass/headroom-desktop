@@ -3812,6 +3812,8 @@ impl AppState {
             upstream_tls_interception_hint: crate::proxy_intercept::upstream_tls_interception_hint(
             )
             .map(str::to_string),
+            local_connection_filter_hint: crate::proxy_intercept::local_connection_filter_hint()
+                .map(str::to_string),
             runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,

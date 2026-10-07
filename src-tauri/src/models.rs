@@ -517,6 +517,10 @@ pub struct RuntimeStatus {
     /// the provider (TLS-inspecting network); `None` once the failures age out.
     #[serde(default)]
     pub upstream_tls_interception_hint: Option<String>,
+    /// Prose hint while something (a traffic filter such as AdGuard) is
+    /// resetting connections to the intercept; `None` once that stops.
+    #[serde(default)]
+    pub local_connection_filter_hint: Option<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }

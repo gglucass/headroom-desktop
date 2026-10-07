@@ -6381,6 +6381,12 @@ export default function App() {
   );
 
   const runtimeIssues: string[] = [];
+  // A traffic filter resetting 6767 flaps the status probe, so "runtime
+  // offline" and "proxy unreachable" would come and go while the runtime is
+  // fine (RUST-NG). This names the actual cause, so it goes first.
+  if (runtimeStatus?.localConnectionFilterHint) {
+    runtimeIssues.push(runtimeStatus.localConnectionFilterHint);
+  }
   if (runtimeStatus?.installed === false) {
     runtimeIssues.push("runtime not installed");
   }
@@ -6416,6 +6422,7 @@ export default function App() {
       runtimeStatus.proxyReachable &&
       runtimeStatus.mcpConfigured !== false &&
       !runtimeStatus.upstreamTlsInterceptionHint &&
+      !runtimeStatus.localConnectionFilterHint &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice = platformPreviewNoticeFor(

@@ -172,6 +172,21 @@ static READYZ_RELAYS: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// `/readyz` relays torn by a socket error within `READYZ_FILTER_RESET_WINDOW`
+/// of accept, and the epoch-second they last made up a systemic share of all
+/// relays (0 = never). That is a traffic filter cutting the 6767 front door:
+/// AdGuard for Windows on RUST-NG (Costa, 2026-10-06; disabling it stopped
+/// it), with the backend answering every probe and 6768 never failing. The
+/// dashboard otherwise flaps "runtime offline, proxy unreachable" and points
+/// at the runtime.
+static READYZ_RELAY_FAST_RESETS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_CONNECTION_FILTER_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Under the watchdog's 1.5s probe budget (`state::is_headroom_proxy_reachable`),
+/// so a client that gave up on a slow backend never counts as a filter.
+const READYZ_FILTER_RESET_WINDOW: Duration = Duration::from_secs(1);
+const LOCAL_CONNECTION_FILTER_HINT_TTL_SECS: u64 = 15 * 60;
+const LOCAL_CONNECTION_FILTER_HINT: &str = "Something on this computer is cutting your coding tools' connections to Headroom on port 6767, so some of their requests fail. This is usually a traffic filter such as AdGuard (App management) or antivirus web protection: turn off filtering for Headroom in it, then restart Headroom. Contact support@extraheadroom.com if you need help.";
+
 /// Local log lines per failure kind and process before going quiet; Sentry
 /// carries the totals.
 const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
@@ -245,9 +260,26 @@ fn is_untrusted_certificate_error(err: &(dyn std::error::Error + 'static)) -> bo
 /// User-facing hint while certificate-verification failures are recent (within
 /// the TTL), `None` otherwise so a fixed network clears the banner on its own.
 pub fn upstream_tls_interception_hint() -> Option<&'static str> {
-    let seen = UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.load(Ordering::Relaxed);
-    (seen != 0 && now_epoch_secs().saturating_sub(seen) < UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS)
-        .then_some(UPSTREAM_TLS_INTERCEPTION_HINT)
+    seen_within(
+        &UPSTREAM_TLS_INTERCEPTION_LAST_SEEN,
+        UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS,
+    )
+    .then_some(UPSTREAM_TLS_INTERCEPTION_HINT)
+}
+
+/// User-facing hint while a traffic filter is resetting the intercept's
+/// connections (see `READYZ_RELAY_FAST_RESETS`), `None` once it stops.
+pub fn local_connection_filter_hint() -> Option<&'static str> {
+    seen_within(
+        &LOCAL_CONNECTION_FILTER_LAST_SEEN,
+        LOCAL_CONNECTION_FILTER_HINT_TTL_SECS,
+    )
+    .then_some(LOCAL_CONNECTION_FILTER_HINT)
+}
+
+fn seen_within(last_seen: &AtomicU64, ttl_secs: u64) -> bool {
+    let seen = last_seen.load(Ordering::Relaxed);
+    seen != 0 && now_epoch_secs().saturating_sub(seen) < ttl_secs
 }
 
 /// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
@@ -374,13 +406,25 @@ fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Du
 /// Record a `/readyz` relayed to the backend. `failure` is why its answer never
 /// reached the client (None = delivered); `head_read` is how long the request
 /// head took to arrive after accept, which tells a relay that stalled from one
-/// whose request was already slow to come in.
-fn note_readyz_relay(failure: Option<String>, head_read: Duration, total: Duration) {
+/// whose request was already slow to come in. `socket_error` is a failure the
+/// socket itself raised (a reset), as opposed to a stall or an empty answer.
+fn note_readyz_relay(
+    failure: Option<String>,
+    socket_error: bool,
+    head_read: Duration,
+    total: Duration,
+) {
     let relays = READYZ_RELAYS.fetch_add(1, Ordering::Relaxed) + 1;
     let Some(failure) = failure else {
         return;
     };
     let failures = READYZ_RELAY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if socket_error && total < READYZ_FILTER_RESET_WINDOW {
+        let resets = READYZ_RELAY_FAST_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+        if intercept_failures_are_systemic(resets, relays) {
+            LOCAL_CONNECTION_FILTER_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+        }
+    }
     if failures <= INTERCEPT_FAILURE_LOG_LINES {
         log::info!(
             "[proxy_intercept] /readyz answer not delivered: {failure} after {}ms, request head read after {}ms ({failures} of {relays} relays)",
@@ -2231,13 +2275,14 @@ async fn handle(
                 relay.await
             }
         };
+        let socket_error = !stalled && copied.is_err();
         let failure = match copied {
             _ if stalled => Some("stalled".to_string()),
             Ok(0) => Some("backend sent nothing".to_string()),
             Ok(_) => None,
             Err(e) => Some(describe_io_error(&e)),
         };
-        note_readyz_relay(failure, head_read, accepted_at.elapsed());
+        note_readyz_relay(failure, socket_error, head_read, accepted_at.elapsed());
     }
 }
 
@@ -4692,6 +4737,51 @@ mod tests {
         assert!(super::intercept_failures_are_systemic(30, 120));
         // The ESET machine: two of every three connections.
         assert!(super::intercept_failures_are_systemic(40, 60));
+    }
+
+    /// RUST-NG: resets ~10ms after accept on most relays name a traffic filter.
+    /// A slow backend that our own 1.5s probe gave up on, a stall, or an empty
+    /// answer must not.
+    #[test]
+    #[serial]
+    fn fast_readyz_resets_raise_the_traffic_filter_hint() {
+        use std::sync::atomic::Ordering;
+        let reset = || {
+            super::READYZ_RELAYS.store(0, Ordering::Relaxed);
+            super::READYZ_RELAY_FAILURES.store(0, Ordering::Relaxed);
+            super::READYZ_RELAY_FAST_RESETS.store(0, Ordering::Relaxed);
+            super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(0, Ordering::Relaxed);
+        };
+        let relay = |failure: Option<&str>, socket_error: bool, total_ms: u64| {
+            super::note_readyz_relay(
+                failure.map(str::to_string),
+                socket_error,
+                Duration::from_millis(5),
+                Duration::from_millis(total_ms),
+            )
+        };
+
+        reset();
+        for _ in 0..40 {
+            relay(Some("ConnectionReset (os error 10054)"), true, 2_000);
+            relay(Some("stalled"), false, 5_000);
+            relay(Some("backend sent nothing"), false, 10);
+        }
+        assert!(super::local_connection_filter_hint().is_none());
+
+        reset();
+        for _ in 0..30 {
+            relay(Some("ConnectionReset (os error 10054)"), true, 12);
+            relay(None, false, 3);
+        }
+        assert!(super::local_connection_filter_hint().is_some_and(|h| h.contains("AdGuard")));
+
+        super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(
+            super::now_epoch_secs() - super::LOCAL_CONNECTION_FILTER_HINT_TTL_SECS - 1,
+            Ordering::Relaxed,
+        );
+        assert!(super::local_connection_filter_hint().is_none());
+        reset();
     }
 
     use super::{
