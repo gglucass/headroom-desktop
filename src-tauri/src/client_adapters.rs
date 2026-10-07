@@ -837,9 +837,16 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Headroom-managed provider block in ~/.codex/config.toml is missing or stale (e.g. Codex login state changed since it was written).".into(),
                 );
             }
-            if codex_guard_hook_path().exists() && codex_guard_registered()? {
+            // Same three cases as the Claude guard (RUST-KA was RUST-GS for
+            // Codex: an update that changed the interpreter or its quoting
+            // reported every such install as silently broken).
+            if !codex_guard_hook_path().exists() {
+                failures.push(CODEX_GUARD_SCRIPT_MISSING.into());
+            } else if codex_guard_registered()? {
                 checks
                     .push("Found Headroom routing guard registered in ~/.codex/hooks.json.".into());
+            } else if codex_guard_registered_any_interpreter()? {
+                checks.push(CODEX_GUARD_STALE_COMMAND.into());
             } else {
                 failures
                     .push("Headroom routing guard was not found in ~/.codex/hooks.json.".into());
@@ -1080,11 +1087,11 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     }
     // Verifies, but the next session start runs an interpreter this build
     // would not pick; re-apply like a restamp, unreported.
-    if checks
+    if let Some(stale) = checks
         .iter()
-        .any(|check| check == CLAUDE_GUARD_STALE_COMMAND)
+        .find(|check| *check == CLAUDE_GUARD_STALE_COMMAND || *check == CODEX_GUARD_STALE_COMMAND)
     {
-        broken.push(CLAUDE_GUARD_STALE_COMMAND.into());
+        broken.push(stale.clone());
     }
     if broken.is_empty() {
         return false;
@@ -7108,6 +7115,19 @@ fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
 fn codex_guard_registered() -> Result<bool> {
     guard_registered_in_hooks(&codex_hooks_json_path(), &codex_guard_command())
 }
+
+/// Registered by script path, whatever interpreter runs it.
+fn codex_guard_registered_any_interpreter() -> Result<bool> {
+    guard_registered_in_hooks(
+        &codex_hooks_json_path(),
+        &codex_guard_hook_path().display().to_string(),
+    )
+}
+
+const CODEX_GUARD_SCRIPT_MISSING: &str =
+    "Headroom routing guard script was missing from ~/.codex/hooks.";
+const CODEX_GUARD_STALE_COMMAND: &str =
+    "Headroom routing guard in ~/.codex/hooks.json runs under a different Python; re-applying.";
 
 fn remove_codex_guard_hook() -> Result<()> {
     let script_path = codex_guard_hook_path();
@@ -15066,6 +15086,55 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(
             missing.failures,
             vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_guard_under_another_python_is_stale_not_missing() {
+        // RUST-KA: the Codex twin of RUST-GS. An update from 0.9.25 found the
+        // guard registered under the old interpreter and reported a repair.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let hooks = super::codex_hooks_json_path();
+        let current = super::codex_guard_command();
+        let script = super::codex_guard_hook_path().display().to_string();
+        let other = super::join_guard_command("\"/other/python3\"", &script, false, true);
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+        for entry in value["hooks"]["SessionStart"].as_array_mut().unwrap() {
+            for hook in entry["hooks"].as_array_mut().unwrap() {
+                if hook["command"] == Value::String(current.clone()) {
+                    hook["command"] = Value::String(other.clone());
+                }
+            }
+        }
+        fs::write(&hooks, value.to_string()).unwrap();
+
+        let stale = super::verify_client_setup("codex").expect("verify runs");
+        assert!(stale.failures.is_empty(), "{:?}", stale.failures);
+        assert!(stale
+            .checks
+            .iter()
+            .any(|c| c == super::CODEX_GUARD_STALE_COMMAND));
+        assert!(
+            !super::repair_client_setup_now("codex_cli"),
+            "re-applied unreported"
+        );
+        assert!(
+            super::codex_guard_registered().unwrap(),
+            "current command back"
+        );
+        assert!(!fs::read_to_string(&hooks)
+            .unwrap()
+            .contains("/other/python3"));
+
+        fs::remove_file(super::codex_guard_hook_path()).unwrap();
+        let missing = super::verify_client_setup("codex").expect("verify runs");
+        assert_eq!(
+            missing.failures,
+            vec![super::CODEX_GUARD_SCRIPT_MISSING.to_string()]
         );
     }
 
