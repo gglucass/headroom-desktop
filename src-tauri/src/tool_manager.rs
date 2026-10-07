@@ -8562,6 +8562,8 @@ impl ToolManager {
                 Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
             )
         {
+            // Heals entries registered before the install path set it.
+            turn_off_claude_mcp_beacon();
             return Ok(());
         }
         let method = match self.install_headroom_mcp() {
@@ -8731,6 +8733,7 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+        turn_off_claude_mcp_beacon();
         crate::client_adapters::protect_foreign_mcp_tables();
 
         // Ground truth: did Claude Code actually see the server? The Python
@@ -10820,15 +10823,76 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
         // to it; the proxy runs with it off (see HEADROOM_BEACON there).
         "env": { "HEADROOM_PROXY_URL": proxy_url, "HEADROOM_BEACON": "off" },
     });
+    update_claude_json_at(path, |config| {
+        if config
+            .get("mcpServers")
+            .and_then(|servers| servers.get("headroom"))
+            == Some(&desired)
+        {
+            return Ok(false);
+        }
+        config
+            .as_object_mut()
+            .context("~/.claude.json root is not a JSON object")?
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("~/.claude.json mcpServers is not a JSON object")?
+            .insert("headroom".into(), desired.clone());
+        Ok(true)
+    })
+}
 
+/// Best-effort [`turn_off_claude_mcp_beacon_at`] on the real `~/.claude.json`.
+fn turn_off_claude_mcp_beacon() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    if let Err(err) = turn_off_claude_mcp_beacon_at(&home.join(".claude.json")) {
+        // info, not warn: warn is bridged to Sentry and an unparsable
+        // ~/.claude.json would re-report on every launch.
+        log::info!("[tool_manager] could not turn the MCP beacon off in ~/.claude.json: {err:#}");
+    }
+}
+
+/// Sets `HEADROOM_BEACON=off` in Claude Code's existing `headroom` MCP entry.
+/// The registrar's usual path (`claude mcp add`) writes no such env, so the
+/// MCP server ran with the upstream beacon at its default (on) and uploaded a
+/// session summary after any `headroom_compress` call. Codex and Grok get the
+/// same key from `pin_toml_mcp_command`. Touches only that key, and nothing
+/// without an entry or with a non-object `env`.
+fn turn_off_claude_mcp_beacon_at(path: &Path) -> Result<()> {
+    update_claude_json_at(path, |config| {
+        let Some(env) = config
+            .pointer_mut("/mcpServers/headroom")
+            .and_then(Value::as_object_mut)
+            .map(|entry| entry.entry("env").or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        if env.get("HEADROOM_BEACON").and_then(Value::as_str) == Some("off") {
+            return Ok(false);
+        }
+        env.insert("HEADROOM_BEACON".into(), json!("off"));
+        Ok(true)
+    })
+}
+
+/// Read-modify-write of `~/.claude.json` at `path`. `mutate` edits the parsed
+/// config and returns whether it changed anything; false skips the publish.
+fn update_claude_json_at(
+    path: &Path,
+    mut mutate: impl FnMut(&mut Value) -> Result<bool>,
+) -> Result<()> {
     let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
 
     // ~/.claude.json holds OAuth state and per-project settings, and Claude
     // Code rewrites it frequently — often while this runs (bootstrap,
     // upgrade, requirements repair). Two defenses against reverting a
     // concurrent Claude Code write with our stale snapshot: skip the publish
-    // entirely when our entry is already present and correct (the common
-    // case on every repair), and re-check the file's mtime just before the
+    // entirely when `mutate` changes nothing (the common case on every
+    // repair), and re-check the file's mtime just before the
     // rename, retrying the whole read-modify-write if it moved.
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
@@ -10854,23 +10918,9 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             json!({})
         };
 
-        if config
-            .get("mcpServers")
-            .and_then(|servers| servers.get("headroom"))
-            == Some(&desired)
-        {
+        if !mutate(&mut config)? {
             return Ok(());
         }
-
-        let root = config
-            .as_object_mut()
-            .context("~/.claude.json root is not a JSON object")?;
-
-        root.entry("mcpServers")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .context("~/.claude.json mcpServers is not a JSON object")?
-            .insert("headroom".into(), desired.clone());
 
         let _ = crate::client_adapters::backup_if_exists(path)?;
 
@@ -25874,6 +25924,57 @@ exit 0
         assert_eq!(after["oauthAccount"]["id"], "abc");
         assert!(after["projects"]["/x"].is_object());
         assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
+    }
+
+    #[test]
+    fn claude_mcp_beacon_is_turned_off_in_a_cli_registered_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        // What `claude mcp add` leaves behind: no HEADROOM_BEACON.
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"mcpServers":{"headroom":{"type":"stdio","command":"/u/.local/bin/headroom","args":["mcp","serve"],"env":{"HEADROOM_PROXY_URL":"http://127.0.0.1:6767"}},"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
+
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let entry = &after["mcpServers"]["headroom"];
+        assert_eq!(entry["env"]["HEADROOM_BEACON"], "off");
+        assert_eq!(entry["env"]["HEADROOM_PROXY_URL"], "http://127.0.0.1:6767");
+        assert_eq!(entry["command"], "/u/.local/bin/headroom");
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(after["mcpServers"]["other"]["command"], "x");
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+
+        // An explicit "on" is overridden, as the Codex/Grok TOML pin does.
+        let on = fs::read_to_string(&path)
+            .unwrap()
+            .replace(r#""HEADROOM_BEACON": "off""#, r#""HEADROOM_BEACON": "on""#);
+        fs::write(&path, &on).unwrap();
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["headroom"]["env"]["HEADROOM_BEACON"],
+            "off"
+        );
+    }
+
+    #[test]
+    fn claude_mcp_beacon_repair_leaves_a_file_without_our_entry_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        let original = r#"{"mcpServers":{"other":{"command":"x"}}}"#;
+        fs::write(&path, original).unwrap();
+
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        super::turn_off_claude_mcp_beacon_at(&dir.path().join("missing.json")).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.path().join("missing.json").exists());
+        let entries = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "no backup or tmp file for a no-op");
     }
 
     #[test]
