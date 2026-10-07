@@ -58,7 +58,7 @@ fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
             installs.push((modified.unwrap_or(std::time::UNIX_EPOCH), entry.path()));
         }
     }
-    installs.sort_by(|a, b| b.0.cmp(&a.0));
+    installs.sort_by_key(|install| std::cmp::Reverse(install.0));
     installs
         .into_iter()
         .filter_map(|(_, dir)| std::fs::read_dir(dir.join("bin")).ok())
