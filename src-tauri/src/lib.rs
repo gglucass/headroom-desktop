@@ -1919,7 +1919,13 @@ fn show_notification_impl(
 #[tauri::command]
 async fn install_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
     // pip, npx and asset downloads run for minutes; see run_lifecycle_command.
-    run_lifecycle_command(app, move |app| install_addon_blocking(&app, &id)).await
+    run_lifecycle_command(app, move |app| {
+        // The reason reached only the UI, so a user who missed it left a log
+        // with nothing in it (no node, no CLI found: both fail before any run).
+        install_addon_blocking(&app, &id)
+            .inspect_err(|err| log::info!("addon {id}: install failed: {err}"))
+    })
+    .await
 }
 
 fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
