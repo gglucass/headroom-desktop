@@ -15194,7 +15194,11 @@ fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
 /// neither changes when the pin does.
 fn wheel_download_failure_category(detail: &str) -> &'static str {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("operation timed out") || lower.contains("timed out") {
+    if lower.contains("(connect)") && lower.contains("timed out") {
+        // The TCP connect never completed: the host cannot reach the CDN at
+        // all, like `dns` (RUST-NN). A slow download times out on a read.
+        "connect-timeout"
+    } else if lower.contains("operation timed out") || lower.contains("timed out") {
         "timeout"
     } else if let Some(code) = http_status_code_in(&lower) {
         // A status the CDN actually answered with: 403 is a corporate proxy
@@ -15280,11 +15284,12 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// A host that cannot resolve files.pythonhosted.org is its own network's
-/// problem (RUST-MJ: one Windows DNS blip, the pip fallback installed fine).
-/// If the fallback fails too, pip's own failure report carries it.
+/// A host that cannot resolve or connect to files.pythonhosted.org is its own
+/// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
+/// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
+/// same CDN, so if it fails too, pip's own failure report carries it.
 fn wheel_download_failure_reported(category: &str) -> bool {
-    category != "dns"
+    !matches!(category, "dns" | "connect-timeout")
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -19725,6 +19730,10 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let cases = [
             ("downloading https://files.pythonhosted.org/a.whl: operation timed out", "timeout"),
             (
+                "downloading https://files.pythonhosted.org/a.whl: error sending request for url (https://files.pythonhosted.org/a.whl): client error (Connect): operation timed out",
+                "connect-timeout",
+            ),
+            (
                 "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (403 Forbidden) for url (https://files.pythonhosted.org/a.whl)",
                 "http-403",
             ),
@@ -19747,6 +19756,8 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         }
         // RUST-MJ: a DNS failure stays local; the rest still report.
         assert!(!wheel_download_failure_reported("dns"));
+        assert!(!wheel_download_failure_reported("connect-timeout"));
+        assert!(wheel_download_failure_reported("timeout"));
         assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
