@@ -332,6 +332,9 @@ export interface RuntimeStatus {
   /** Prose hint while the backend is failing certificate verification against
    *  the provider (TLS-inspecting network); cleared once the failures age out. */
   upstreamTlsInterceptionHint?: string | null;
+  /** Prose hint while a traffic filter (AdGuard, antivirus web protection) is
+   *  resetting connections to port 6767; cleared once the resets age out. */
+  localConnectionFilterHint?: string | null;
   runtimeUpgradeFailure?: RuntimeUpgradeFailure | null;
   rtk: {
     installed: boolean;

@@ -963,9 +963,14 @@ export function calloutBannerFor({
 
   if (runtimeStatus.paused) {
     if (runtimeStatus.autoPaused) {
+      // A known cause (App Control, antivirus) leads; its remedy renders
+      // underneath. "Stopped unexpectedly" plus Resume hid it, and Resume
+      // cannot get past a machine that refuses the runtime.
       return {
         tone: "auto-paused",
-        title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
+        title: primaryIssue?.detail
+          ? primaryIssue.lead
+          : "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
       };
     }
     return {

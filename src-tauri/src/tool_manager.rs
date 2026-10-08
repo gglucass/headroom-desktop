@@ -3278,6 +3278,19 @@ fn pre_upstream_concurrency() -> usize {
     (cores * 2).clamp(8, 64)
 }
 
+/// `default` for an engine switch the desktop sets, unless the user exported
+/// `name` themselves (launchctl setenv, a Windows user variable, the shell
+/// that starts the Linux app): a non-empty value passes through for the wheel
+/// to parse. `HEADROOM_DEDUPE=0` plus `HEADROOM_COLD_RECOMPACT=0` turns the
+/// cross-turn "same as msg M" pointer off without a rebuild; both are needed,
+/// because cold-prefix recompaction builds its own router with dedupe forced on.
+fn user_env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Interval estimate of OpenAI's prompt-cache TTL from the backend's
 /// `cache_ttl_observations.jsonl` (written under HEADROOM_CACHE_TTL_LEARN):
 /// hit idles bound the TTL from below (cache proven alive), `ttl_expiry` miss
@@ -5083,10 +5096,13 @@ impl ToolManager {
                     // is 100% client-driven; cache mode only avoids busting it and
                     // adds no compression), leaving the savings chart flat.
                     .env("HEADROOM_MODE", "token")
-                    .env("HEADROOM_DEDUPE", "1")
+                    .env("HEADROOM_DEDUPE", user_env_or("HEADROOM_DEDUPE", "1"))
                     .env(
                         "HEADROOM_COLD_RECOMPACT",
-                        if cold_recompact { "1" } else { "0" },
+                        user_env_or(
+                            "HEADROOM_COLD_RECOMPACT",
+                            if cold_recompact { "1" } else { "0" },
+                        ),
                     )
                     .env(
                         "HEADROOM_CACHE_TTL_LEARN",
@@ -8546,6 +8562,8 @@ impl ToolManager {
                 Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
             )
         {
+            // Heals entries registered before the install path set it.
+            turn_off_claude_mcp_beacon();
             return Ok(());
         }
         let method = match self.install_headroom_mcp() {
@@ -8715,6 +8733,7 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+        turn_off_claude_mcp_beacon();
         crate::client_adapters::protect_foreign_mcp_tables();
 
         // Ground truth: did Claude Code actually see the server? The Python
@@ -9997,6 +10016,11 @@ impl ToolManager {
         if hosts.is_empty() {
             bail!(NO_PLUGIN_HOST_CLI);
         }
+        // The install itself never runs node, so without this it "succeeded"
+        // and the plugin's hooks then failed in every agent session.
+        if crate::claude_cli::detect_node().is_none() {
+            bail!(NO_NODE_FOR_PLUGIN);
+        }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
             hosts
@@ -10201,6 +10225,8 @@ impl ToolManager {
         }
     }
 }
+
+const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -10804,15 +10830,76 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
         // to it; the proxy runs with it off (see HEADROOM_BEACON there).
         "env": { "HEADROOM_PROXY_URL": proxy_url, "HEADROOM_BEACON": "off" },
     });
+    update_claude_json_at(path, |config| {
+        if config
+            .get("mcpServers")
+            .and_then(|servers| servers.get("headroom"))
+            == Some(&desired)
+        {
+            return Ok(false);
+        }
+        config
+            .as_object_mut()
+            .context("~/.claude.json root is not a JSON object")?
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("~/.claude.json mcpServers is not a JSON object")?
+            .insert("headroom".into(), desired.clone());
+        Ok(true)
+    })
+}
 
+/// Best-effort [`turn_off_claude_mcp_beacon_at`] on the real `~/.claude.json`.
+fn turn_off_claude_mcp_beacon() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    if let Err(err) = turn_off_claude_mcp_beacon_at(&home.join(".claude.json")) {
+        // info, not warn: warn is bridged to Sentry and an unparsable
+        // ~/.claude.json would re-report on every launch.
+        log::info!("[tool_manager] could not turn the MCP beacon off in ~/.claude.json: {err:#}");
+    }
+}
+
+/// Sets `HEADROOM_BEACON=off` in Claude Code's existing `headroom` MCP entry.
+/// The registrar's usual path (`claude mcp add`) writes no such env, so the
+/// MCP server ran with the upstream beacon at its default (on) and uploaded a
+/// session summary after any `headroom_compress` call. Codex and Grok get the
+/// same key from `pin_toml_mcp_command`. Touches only that key, and nothing
+/// without an entry or with a non-object `env`.
+fn turn_off_claude_mcp_beacon_at(path: &Path) -> Result<()> {
+    update_claude_json_at(path, |config| {
+        let Some(env) = config
+            .pointer_mut("/mcpServers/headroom")
+            .and_then(Value::as_object_mut)
+            .map(|entry| entry.entry("env").or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        if env.get("HEADROOM_BEACON").and_then(Value::as_str) == Some("off") {
+            return Ok(false);
+        }
+        env.insert("HEADROOM_BEACON".into(), json!("off"));
+        Ok(true)
+    })
+}
+
+/// Read-modify-write of `~/.claude.json` at `path`. `mutate` edits the parsed
+/// config and returns whether it changed anything; false skips the publish.
+fn update_claude_json_at(
+    path: &Path,
+    mut mutate: impl FnMut(&mut Value) -> Result<bool>,
+) -> Result<()> {
     let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
 
     // ~/.claude.json holds OAuth state and per-project settings, and Claude
     // Code rewrites it frequently — often while this runs (bootstrap,
     // upgrade, requirements repair). Two defenses against reverting a
     // concurrent Claude Code write with our stale snapshot: skip the publish
-    // entirely when our entry is already present and correct (the common
-    // case on every repair), and re-check the file's mtime just before the
+    // entirely when `mutate` changes nothing (the common case on every
+    // repair), and re-check the file's mtime just before the
     // rename, retrying the whole read-modify-write if it moved.
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
@@ -10838,23 +10925,9 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             json!({})
         };
 
-        if config
-            .get("mcpServers")
-            .and_then(|servers| servers.get("headroom"))
-            == Some(&desired)
-        {
+        if !mutate(&mut config)? {
             return Ok(());
         }
-
-        let root = config
-            .as_object_mut()
-            .context("~/.claude.json root is not a JSON object")?;
-
-        root.entry("mcpServers")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .context("~/.claude.json mcpServers is not a JSON object")?
-            .insert("headroom".into(), desired.clone());
 
         let _ = crate::client_adapters::backup_if_exists(path)?;
 
@@ -12286,7 +12359,7 @@ pub(crate) fn cc_switch_captured_upstream() -> Option<String> {
 }
 
 pub(crate) fn clear_cc_switch_capture() {
-    remove_cc_switch_file(&cc_switch_capture_path());
+    crate::client_adapters::remove_owned_script(&cc_switch_capture_path());
 }
 
 /// Present while Headroom routes Claude Code's settings.json (the Claude Code
@@ -12302,18 +12375,10 @@ pub(crate) fn cc_switch_routed_path() -> PathBuf {
 pub(crate) fn set_cc_switch_routed(routed: bool) {
     let path = cc_switch_routed_path();
     if !routed {
-        return remove_cc_switch_file(&path);
+        return crate::client_adapters::remove_owned_script(&path);
     }
     if let Err(err) = crate::client_adapters::atomic_write(&path, b"") {
         log::warn!("writing {} failed: {err:#}", path.display());
-    }
-}
-
-fn remove_cc_switch_file(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("removing {} failed: {err}", path.display());
-        }
     }
 }
 
@@ -14896,6 +14961,10 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     } else if lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
         || crate::is_blocked_runtime_dll_signal(&lower)
+        // The venv redirector could not start the base interpreter (exit
+        // 101). Read from the evidence: the 300-byte tail starts mid-line and
+        // drops the launcher's words (RUST-6S on 0.9.36 read "ll --timeout").
+        || crate::is_venv_base_spawn_refused_signal(&evidence_lower)
     {
         // Windows Application Control (Smart App Control / WDAC / AppLocker)
         // blocked a freshly-extracted file (RUST-8K, third cause). Windows
@@ -15125,7 +15194,11 @@ fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
 /// neither changes when the pin does.
 fn wheel_download_failure_category(detail: &str) -> &'static str {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("operation timed out") || lower.contains("timed out") {
+    if lower.contains("(connect)") && lower.contains("timed out") {
+        // The TCP connect never completed: the host cannot reach the CDN at
+        // all, like `dns` (RUST-NN). A slow download times out on a read.
+        "connect-timeout"
+    } else if lower.contains("operation timed out") || lower.contains("timed out") {
         "timeout"
     } else if let Some(code) = http_status_code_in(&lower) {
         // A status the CDN actually answered with: 403 is a corporate proxy
@@ -15211,11 +15284,12 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// A host that cannot resolve files.pythonhosted.org is its own network's
-/// problem (RUST-MJ: one Windows DNS blip, the pip fallback installed fine).
-/// If the fallback fails too, pip's own failure report carries it.
+/// A host that cannot resolve or connect to files.pythonhosted.org is its own
+/// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
+/// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
+/// same CDN, so if it fails too, pip's own failure report carries it.
 fn wheel_download_failure_reported(category: &str) -> bool {
-    category != "dns"
+    !matches!(category, "dns" | "connect-timeout")
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -15927,7 +16001,22 @@ fn settle_plugin_hosts(
         let mut msg = if errors.is_empty() {
             String::new()
         } else {
-            format!("installing the {id} plugin failed: {}. ", errors.join("; "))
+            let detail = errors.join("; ");
+            // A failure on every host only reached the UI, so a user stuck on
+            // it left nothing in Sentry. Same per-category split as the
+            // partial path in `install_plugin`; a too-old CLI alone is not an
+            // error and stays out.
+            let category = plugin_install_failure_category(&detail);
+            sentry::with_scope(
+                |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
+                || {
+                    sentry::capture_message(
+                        &format!("{id} install failed on every host [{category}]: {detail}"),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            format!("installing the {id} plugin failed: {detail}. ")
         };
         if !outdated.is_empty() {
             let names = outdated.join(" and ");
@@ -19656,6 +19745,10 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let cases = [
             ("downloading https://files.pythonhosted.org/a.whl: operation timed out", "timeout"),
             (
+                "downloading https://files.pythonhosted.org/a.whl: error sending request for url (https://files.pythonhosted.org/a.whl): client error (Connect): operation timed out",
+                "connect-timeout",
+            ),
+            (
                 "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (403 Forbidden) for url (https://files.pythonhosted.org/a.whl)",
                 "http-403",
             ),
@@ -19678,6 +19771,8 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         }
         // RUST-MJ: a DNS failure stays local; the rest still report.
         assert!(!wheel_download_failure_reported("dns"));
+        assert!(!wheel_download_failure_reported("connect-timeout"));
+        assert!(wheel_download_failure_reported("timeout"));
         assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
@@ -25861,6 +25956,57 @@ exit 0
     }
 
     #[test]
+    fn claude_mcp_beacon_is_turned_off_in_a_cli_registered_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        // What `claude mcp add` leaves behind: no HEADROOM_BEACON.
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"mcpServers":{"headroom":{"type":"stdio","command":"/u/.local/bin/headroom","args":["mcp","serve"],"env":{"HEADROOM_PROXY_URL":"http://127.0.0.1:6767"}},"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
+
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let entry = &after["mcpServers"]["headroom"];
+        assert_eq!(entry["env"]["HEADROOM_BEACON"], "off");
+        assert_eq!(entry["env"]["HEADROOM_PROXY_URL"], "http://127.0.0.1:6767");
+        assert_eq!(entry["command"], "/u/.local/bin/headroom");
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(after["mcpServers"]["other"]["command"], "x");
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+
+        // An explicit "on" is overridden, as the Codex/Grok TOML pin does.
+        let on = fs::read_to_string(&path)
+            .unwrap()
+            .replace(r#""HEADROOM_BEACON": "off""#, r#""HEADROOM_BEACON": "on""#);
+        fs::write(&path, &on).unwrap();
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["headroom"]["env"]["HEADROOM_BEACON"],
+            "off"
+        );
+    }
+
+    #[test]
+    fn claude_mcp_beacon_repair_leaves_a_file_without_our_entry_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        let original = r#"{"mcpServers":{"other":{"command":"x"}}}"#;
+        fs::write(&path, original).unwrap();
+
+        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        super::turn_off_claude_mcp_beacon_at(&dir.path().join("missing.json")).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.path().join("missing.json").exists());
+        let entries = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "no backup or tmp file for a no-op");
+    }
+
+    #[test]
     fn claude_json_write_refuses_to_clobber_unparseable_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
@@ -26085,6 +26231,33 @@ exit 0
             super::pip_failure_category_with_evidence(&compact, &evidence),
             "network",
             "a starved index must not be filed as a bad pin in our lock"
+        );
+    }
+
+    /// RUST-6S on 0.9.36: the venv redirector could not start the base
+    /// interpreter, and the tail cut the launcher's words off, so the event
+    /// read `[other]` with only pip's own arguments in it.
+    #[test]
+    fn a_refused_base_interpreter_is_app_control_not_other() {
+        let stderr = concat!(
+            "Unable to create process using '\"~\\AppData\\Local\\Headroom\\headroom\\runtime\\",
+            "python\\python.exe\" -m pip install --timeout 180 --retries 10 --only-binary=:all: ",
+            "--find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/",
+            "vendor-wheels-v1 --extra-index-url https://pypi.org/simple --upgrade --requirement ",
+            "~\\AppData\\Local\\Headroom\\headroom\\downloads\\headroom-requirements.lock'\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        assert!(
+            !compact
+                .to_ascii_lowercase()
+                .contains("unable to create process"),
+            "test no longer reproduces the truncation: {compact}"
+        );
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "app-control"
         );
     }
 

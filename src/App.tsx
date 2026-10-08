@@ -589,6 +589,8 @@ const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
 const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
 
 const DOCS_URL = "https://extraheadroom.com/docs";
+const CONNECTION_TROUBLESHOOTING_URL =
+  "https://extraheadroom.com/docs/troubleshooting#connections-cut";
 
 const APPSUMO_ACCOUNT_URL = "https://appsumo.com/account/products/";
 
@@ -6381,6 +6383,12 @@ export default function App() {
   );
 
   const runtimeIssues: string[] = [];
+  // A traffic filter resetting 6767 flaps the status probe, so "runtime
+  // offline" and "proxy unreachable" would come and go while the runtime is
+  // fine (RUST-NG). This names the actual cause, so it goes first.
+  if (runtimeStatus?.localConnectionFilterHint) {
+    runtimeIssues.push(runtimeStatus.localConnectionFilterHint);
+  }
   if (runtimeStatus?.installed === false) {
     runtimeIssues.push("runtime not installed");
   }
@@ -6416,6 +6424,7 @@ export default function App() {
       runtimeStatus.proxyReachable &&
       runtimeStatus.mcpConfigured !== false &&
       !runtimeStatus.upstreamTlsInterceptionHint &&
+      !runtimeStatus.localConnectionFilterHint &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice = platformPreviewNoticeFor(
@@ -7015,8 +7024,25 @@ export default function App() {
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
-                {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded") ? (
-                  <p className="callout-banner__subtitle">{runtimeIssueDetail}</p>
+                {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded" || calloutBanner.tone === "auto-paused") ? (
+                  <p className="callout-banner__subtitle">
+                    {runtimeIssueDetail}
+                    {/* The causes and their fixes change faster than releases, so they live in the docs. */}
+                    {runtimeStatus?.localConnectionFilterHint &&
+                    runtimeIssues[0] === runtimeStatus.localConnectionFilterHint ? (
+                      <>
+                        {" "}
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => openLinkFromClick(CONNECTION_TROUBLESHOOTING_URL)}
+                        >
+                          See Troubleshooting
+                        </button>
+                        .
+                      </>
+                    ) : null}
+                  </p>
                 ) : null}
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">

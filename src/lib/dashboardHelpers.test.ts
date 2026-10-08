@@ -901,6 +901,8 @@ describe("calloutBannerFor", () => {
     const cases: [Parameters<typeof calloutBannerFor>[0], string, string][] = [
       [{ ...healthy, runtimeStatus: null, pricingStatus: null }, "disconnected", "Headroom status is unavailable."],
       [{ ...healthy, runtimeStatus: runtime({ paused: true, autoPaused: true }), pricingStatus: null }, "auto-paused", "Headroom stopped unexpectedly. Traffic is passing through unoptimized."],
+      // A machine that refuses the runtime: the cause leads, not "click Resume".
+      [{ ...healthy, runtimeStatus: runtime({ paused: true, autoPaused: true }), runtimeIssues: ["Windows is blocking Headroom's runtime, so Headroom can't start. This is usually Smart App Control."], pricingStatus: null }, "auto-paused", "Windows is blocking Headroom's runtime, so Headroom can't start."],
       [{ ...healthy, runtimeStatus: runtime({ paused: true }), pricingStatus: null }, "paused", "Headroom is paused."],
       [{ ...healthy, runtimeStatus: runtime({ starting: true, interceptBindFailed: true }), pricingStatus: null }, "starting", "Headroom is starting up."],
       [{ ...healthy, runtimeStatus: runtime(), pricingStatus: pricing({ needsAuthentication: true, gateMessage: "Sign in." }) }, "degraded", "Sign in."],

@@ -12,7 +12,66 @@ pub fn detect_claude_cli() -> Option<PathBuf> {
 }
 
 pub fn detect_codex_cli() -> Option<PathBuf> {
-    detect_cli("codex")
+    detect_cli("codex").or_else(|| first_runnable(bundled_codex_candidates().into_iter()))
+}
+
+/// The ChatGPT desktop app and the Codex editor extension each ship their own
+/// `codex` and put neither on PATH. Someone who only runs Codex there has a
+/// working Codex the connector detects, yet plugin addons and Learn failed with
+/// "not found on PATH" (a Windows user, 2026-10-07), so fall back to those.
+fn bundled_codex_candidates() -> Vec<PathBuf> {
+    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        // The Store app runs from WindowsApps and first copies its codex.exe
+        // here, the path its own resolver launches (ChatGPT app, 2026-10).
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"));
+        candidates.push(local.join("OpenAI").join("Codex").join("bin").join(exe));
+    } else if let Some(app) = crate::client_adapters::chatgpt_app_path() {
+        candidates.push(app.join("Contents/Resources/codex-cli/bin").join(exe));
+    }
+    candidates.extend(extension_codex_candidates(&home_dir(), exe));
+    candidates
+}
+
+/// `<editor>/extensions/openai.chatgpt-<version>-<platform>/bin/<os>-<arch>/codex`,
+/// newest install first: an editor keeps the old version's folder until restart.
+fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
+    let mut installs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for editor in [".vscode", ".vscode-insiders", ".cursor", ".windsurf"] {
+        let Ok(entries) = std::fs::read_dir(home.join(editor).join("extensions")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("openai.chatgpt-")
+            {
+                continue;
+            }
+            let modified = entry.metadata().and_then(|meta| meta.modified());
+            installs.push((modified.unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+        }
+    }
+    installs.sort_by_key(|install| std::cmp::Reverse(install.0));
+    installs
+        .into_iter()
+        .filter_map(|(_, dir)| std::fs::read_dir(dir.join("bin")).ok())
+        .flat_map(|platforms| platforms.flatten().map(|entry| entry.path().join(exe)))
+        .collect()
+}
+
+/// Plugin addons' hooks run `node`. Also tries the Windows installer's default
+/// dir: Headroom's own PATH predates a Node installed after launch, so "install
+/// Node.js, then try again" would otherwise keep failing until a restart.
+pub fn detect_node() -> Option<PathBuf> {
+    detect_cli("node").or_else(|| {
+        let dir = PathBuf::from(std::env::var_os("ProgramFiles")?).join("nodejs");
+        first_runnable(std::iter::once(dir.join("node.exe")))
+    })
 }
 
 pub fn detect_npx() -> Option<PathBuf> {
@@ -689,6 +748,27 @@ mod tests {
         assert_eq!(
             candidates.first().and_then(|path| path.parent()),
             Some(Path::new("/Users/test/.local/bin")),
+        );
+    }
+
+    #[test]
+    fn extension_codex_candidates_find_the_bundled_binary_newest_first() {
+        let tmp = ScopedTempDir::new("ext_codex");
+        let exts = tmp.path().join(".vscode").join("extensions");
+        let old = exts.join("openai.chatgpt-26.930.1-darwin-arm64");
+        fs::create_dir_all(old.join("bin").join("macos-aarch64")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let new = exts.join("openai.chatgpt-26.1002.1-darwin-arm64");
+        fs::create_dir_all(new.join("bin").join("macos-aarch64")).unwrap();
+        fs::create_dir_all(exts.join("ms-python.python-1").join("bin").join("x")).unwrap();
+
+        let candidates = extension_codex_candidates(tmp.path(), "codex");
+        assert_eq!(
+            candidates,
+            vec![
+                new.join("bin").join("macos-aarch64").join("codex"),
+                old.join("bin").join("macos-aarch64").join("codex"),
+            ],
         );
     }
 

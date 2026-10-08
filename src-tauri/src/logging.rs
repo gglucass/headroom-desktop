@@ -143,7 +143,10 @@ fn is_system_fd_exhaustion(msg: &str) -> bool {
 // Environmental or otherwise unfixable-by-release: keep the local log, never
 // send. One predicate so panics and log records answer it the same way.
 fn is_unreportable(msg: &str) -> bool {
-    is_disk_full(msg) || is_system_fd_exhaustion(msg) || is_windows_session_end_panic(msg)
+    is_disk_full(msg)
+        || is_system_fd_exhaustion(msg)
+        || is_windows_session_end_panic(msg)
+        || msg.contains(crate::client_adapters::LOCKED_FILE_NOTE)
 }
 
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
@@ -1802,6 +1805,36 @@ mod tests {
         let mut other = sentry::protocol::Event::new();
         other.message = Some("Could not persist reconciled grace state: Permission denied".into());
         assert!(super::sanitize_event(other).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sanitize_event_drops_writes_to_a_locked_file() {
+        // RUST-4W on 0.9.35: the user locked headroom-pricing-state.json, so
+        // every rename onto it fails EPERM.
+        let dir = std::env::temp_dir().join(format!("locked_write_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let chflags = |flag: &str| {
+            assert!(crate::proc::command("chflags")
+                .arg(flag)
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success());
+        };
+        chflags("uchg");
+        let err = crate::client_adapters::atomic_write(&path, b"{\"a\":1}").unwrap_err();
+        chflags("nouchg");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut locked = sentry::protocol::Event::new();
+        locked.message = Some(format!(
+            "Could not persist reconciled grace state: Failed to write pricing state: {err:#}"
+        ));
+        assert!(super::sanitize_event(locked).is_none(), "{err:#}");
     }
 
     #[test]

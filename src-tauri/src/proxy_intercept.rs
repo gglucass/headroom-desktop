@@ -172,6 +172,25 @@ static READYZ_RELAYS: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// `/readyz` relays torn by a socket error within `READYZ_FILTER_RESET_WINDOW`
+/// of accept, and the epoch-second they last made up a systemic share of all
+/// relays (0 = never). That is a traffic filter cutting the 6767 front door:
+/// AdGuard for Windows on RUST-NG (Costa, 2026-10-06; disabling it stopped
+/// it), with the backend answering every probe and 6768 never failing. The
+/// dashboard otherwise flaps "runtime offline, proxy unreachable" and points
+/// at the runtime.
+static READYZ_RELAY_FAST_RESETS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_CONNECTION_FILTER_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Under the watchdog's 1.5s probe budget (`state::is_headroom_proxy_reachable`),
+/// so a client that gave up on a slow backend never counts as a filter.
+const READYZ_FILTER_RESET_WINDOW: Duration = Duration::from_secs(1);
+const LOCAL_CONNECTION_FILTER_HINT_TTL_SECS: u64 = 15 * 60;
+/// Says only what was measured; the dashboard links docs/troubleshooting for
+/// the per-product fixes. Those live on the website because they change faster
+/// than releases: the first in-app fix ("exclude Headroom in AdGuard") turned
+/// out not to work two days later, the network driver did.
+const LOCAL_CONNECTION_FILTER_HINT: &str = "Something on this computer is cutting your coding tools' connections to Headroom, so some of their requests fail. A traffic filter, antivirus or VPN is the usual cause.";
+
 /// Local log lines per failure kind and process before going quiet; Sentry
 /// carries the totals.
 const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
@@ -245,9 +264,26 @@ fn is_untrusted_certificate_error(err: &(dyn std::error::Error + 'static)) -> bo
 /// User-facing hint while certificate-verification failures are recent (within
 /// the TTL), `None` otherwise so a fixed network clears the banner on its own.
 pub fn upstream_tls_interception_hint() -> Option<&'static str> {
-    let seen = UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.load(Ordering::Relaxed);
-    (seen != 0 && now_epoch_secs().saturating_sub(seen) < UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS)
-        .then_some(UPSTREAM_TLS_INTERCEPTION_HINT)
+    seen_within(
+        &UPSTREAM_TLS_INTERCEPTION_LAST_SEEN,
+        UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS,
+    )
+    .then_some(UPSTREAM_TLS_INTERCEPTION_HINT)
+}
+
+/// User-facing hint while a traffic filter is resetting the intercept's
+/// connections (see `READYZ_RELAY_FAST_RESETS`), `None` once it stops.
+pub fn local_connection_filter_hint() -> Option<&'static str> {
+    seen_within(
+        &LOCAL_CONNECTION_FILTER_LAST_SEEN,
+        LOCAL_CONNECTION_FILTER_HINT_TTL_SECS,
+    )
+    .then_some(LOCAL_CONNECTION_FILTER_HINT)
+}
+
+fn seen_within(last_seen: &AtomicU64, ttl_secs: u64) -> bool {
+    let seen = last_seen.load(Ordering::Relaxed);
+    seen != 0 && now_epoch_secs().saturating_sub(seen) < ttl_secs
 }
 
 /// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
@@ -374,13 +410,25 @@ fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Du
 /// Record a `/readyz` relayed to the backend. `failure` is why its answer never
 /// reached the client (None = delivered); `head_read` is how long the request
 /// head took to arrive after accept, which tells a relay that stalled from one
-/// whose request was already slow to come in.
-fn note_readyz_relay(failure: Option<String>, head_read: Duration, total: Duration) {
+/// whose request was already slow to come in. `socket_error` is a failure the
+/// socket itself raised (a reset), as opposed to a stall or an empty answer.
+fn note_readyz_relay(
+    failure: Option<String>,
+    socket_error: bool,
+    head_read: Duration,
+    total: Duration,
+) {
     let relays = READYZ_RELAYS.fetch_add(1, Ordering::Relaxed) + 1;
     let Some(failure) = failure else {
         return;
     };
     let failures = READYZ_RELAY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if socket_error && total < READYZ_FILTER_RESET_WINDOW {
+        let resets = READYZ_RELAY_FAST_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+        if intercept_failures_are_systemic(resets, relays) {
+            LOCAL_CONNECTION_FILTER_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+        }
+    }
     if failures <= INTERCEPT_FAILURE_LOG_LINES {
         log::info!(
             "[proxy_intercept] /readyz answer not delivered: {failure} after {}ms, request head read after {}ms ({failures} of {relays} relays)",
@@ -707,7 +755,14 @@ struct CodexTerminalReader<R> {
     tail: Vec<u8>,
     saw_terminal: bool,
     failed: bool,
+    /// The failure frame from its `event:` line on, kept only once `failed`
+    /// is set, until its `data:` line ends (see `failure_body`).
+    failure_frame: Vec<u8>,
 }
+
+/// Bound on the failure frame kept: a `response.failed` echoes the whole
+/// response object (instructions, tools), tens of KB on a Codex turn.
+const FAILURE_FRAME_CAP: usize = 1 << 20;
 
 impl<R> CodexTerminalReader<R> {
     fn new(inner: R) -> Self {
@@ -716,11 +771,39 @@ impl<R> CodexTerminalReader<R> {
             tail: Vec::new(),
             saw_terminal: false,
             failed: false,
+            failure_frame: Vec::new(),
         }
     }
 
+    fn keep_failure_frame(&mut self, bytes: &[u8]) {
+        let room = FAILURE_FRAME_CAP.saturating_sub(self.failure_frame.len());
+        self.failure_frame
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// Whether the kept frame reached the blank line ending its event. The raw
+    /// bytes still carry chunk framing (see `unchunk`), which never holds
+    /// `\n\n`, so this can overshoot (bounded by the cap) but never stop
+    /// before the data line ends.
+    fn failure_frame_complete(&self) -> bool {
+        let frame = &self.failure_frame;
+        frame
+            .windows(5)
+            .position(|w| w == b"data:")
+            .is_some_and(|at| frame[at..].windows(2).any(|w| w == b"\n\n"))
+    }
+
     fn observe(&mut self, bytes: &[u8]) {
-        if self.saw_terminal || bytes.is_empty() {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.saw_terminal {
+            if self.failed
+                && self.failure_frame.len() < FAILURE_FRAME_CAP
+                && !self.failure_frame_complete()
+            {
+                self.keep_failure_frame(bytes);
+            }
             return;
         }
         const TERMINAL_EVENTS: &[&[u8]] = &[
@@ -753,6 +836,23 @@ impl<R> CodexTerminalReader<R> {
         };
         self.saw_terminal = hit(TERMINAL_EVENTS);
         self.failed = self.saw_terminal && hit(FAILURE_EVENTS);
+        if self.failed {
+            // From the start of the line naming the failure: its `event:` line.
+            let at = FAILURE_EVENTS
+                .iter()
+                .filter_map(|needle| {
+                    combined
+                        .windows(needle.len())
+                        .position(|window| window == *needle)
+                })
+                .min()
+                .unwrap_or(0);
+            let line = combined[..at]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            self.keep_failure_frame(&combined[line..]);
+        }
         let keep_from = combined.len().saturating_sub(TAIL_BYTES);
         self.tail.clear();
         self.tail.extend_from_slice(&combined[keep_from..]);
@@ -765,6 +865,58 @@ impl<R> CodexTerminalReader<R> {
     fn failed(&self) -> bool {
         self.failed
     }
+
+    /// The failure frame's error as JSON `codex_error_summary` reads, so a
+    /// stream_error run says who failed the turn (RUST-NY: 38 hosts on every
+    /// release at once, no code): `{"error": response.error}` for a
+    /// `response.failed`, else the frame's data as sent (OpenAI's in-band
+    /// `error` event, or the backend's `{"type":"error","error":{...}}`).
+    fn failure_body(&self) -> Vec<u8> {
+        let frame = unchunk(&self.failure_frame);
+        let Some(data) = sse_data_line(&frame) else {
+            return self.failure_frame.clone();
+        };
+        match serde_json::from_slice::<serde_json::Value>(data) {
+            Ok(json) if json["type"] == "response.failed" => {
+                serde_json::json!({ "error": json["response"]["error"] })
+                    .to_string()
+                    .into_bytes()
+            }
+            _ => data.to_vec(),
+        }
+    }
+}
+
+/// The first SSE `data:` line in `frame`, once its newline arrived.
+fn sse_data_line(frame: &[u8]) -> Option<&[u8]> {
+    let at = frame.windows(5).position(|w| w == b"data:")? + 5;
+    let len = frame[at..].iter().position(|&b| b == b'\n')?;
+    Some(frame[at..at + len].trim_ascii())
+}
+
+/// `bytes` without HTTP/1.1 chunk framing. The backend streams SSE chunked,
+/// one chunk per upstream read, so a `response.failed` data line tens of KB
+/// long arrives with `\r\n<size>\r\n` inside it and reading to the first
+/// newline cut its JSON there. SSE fields always carry a `:`, so a line of
+/// hex digits between CRLFs can only be a chunk size.
+fn unchunk(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\r\n") {
+            let digits = bytes[i + 2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            if digits > 0 && bytes[i + 2 + digits..].starts_with(b"\r\n") {
+                i += digits + 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for CodexTerminalReader<R> {
@@ -2231,13 +2383,14 @@ async fn handle(
                 relay.await
             }
         };
+        let socket_error = !stalled && copied.is_err();
         let failure = match copied {
             _ if stalled => Some("stalled".to_string()),
             Ok(0) => Some("backend sent nothing".to_string()),
             Ok(_) => None,
             Err(e) => Some(describe_io_error(&e)),
         };
-        note_readyz_relay(failure, head_read, accepted_at.elapsed());
+        note_readyz_relay(failure, socket_error, head_read, accepted_at.elapsed());
     }
 }
 
@@ -2580,6 +2733,10 @@ async fn splice_with_codex_capture(
             && should_report_throttled(&CODEX_STREAM_NO_TERMINAL_LAST_REPORTED)
         {
             report_codex_stream_without_terminal(req_path, copy_result.unwrap_or(0));
+        }
+        // Report only: a 2xx outcome never reads the body (codex_prompt_failed).
+        if status.is_some_and(|s| (200..300).contains(&s)) && streamed.failed() {
+            error_body = streamed.failure_body();
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -4694,6 +4851,54 @@ mod tests {
         assert!(super::intercept_failures_are_systemic(40, 60));
     }
 
+    /// RUST-NG: resets ~10ms after accept on most relays name a traffic filter.
+    /// A slow backend that our own 1.5s probe gave up on, a stall, or an empty
+    /// answer must not.
+    #[test]
+    #[serial]
+    fn fast_readyz_resets_raise_the_traffic_filter_hint() {
+        use std::sync::atomic::Ordering;
+        let reset = || {
+            super::READYZ_RELAYS.store(0, Ordering::Relaxed);
+            super::READYZ_RELAY_FAILURES.store(0, Ordering::Relaxed);
+            super::READYZ_RELAY_FAST_RESETS.store(0, Ordering::Relaxed);
+            super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(0, Ordering::Relaxed);
+        };
+        let relay = |failure: Option<&str>, socket_error: bool, total_ms: u64| {
+            super::note_readyz_relay(
+                failure.map(str::to_string),
+                socket_error,
+                Duration::from_millis(5),
+                Duration::from_millis(total_ms),
+            )
+        };
+
+        reset();
+        for _ in 0..40 {
+            relay(Some("ConnectionReset (os error 10054)"), true, 2_000);
+            relay(Some("stalled"), false, 5_000);
+            relay(Some("backend sent nothing"), false, 10);
+        }
+        assert!(super::local_connection_filter_hint().is_none());
+
+        reset();
+        for _ in 0..30 {
+            relay(Some("ConnectionReset (os error 10054)"), true, 12);
+            relay(None, false, 3);
+        }
+        assert_eq!(
+            super::local_connection_filter_hint(),
+            Some(super::LOCAL_CONNECTION_FILTER_HINT)
+        );
+
+        super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(
+            super::now_epoch_secs() - super::LOCAL_CONNECTION_FILTER_HINT_TTL_SECS - 1,
+            Ordering::Relaxed,
+        );
+        assert!(super::local_connection_filter_hint().is_none());
+        reset();
+    }
+
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
@@ -6215,6 +6420,57 @@ mod tests {
         assert!(errored.saw_terminal());
         assert!(errored.failed());
         assert!(!reader.failed(), "response.completed is not a failure");
+    }
+
+    #[test]
+    fn codex_terminal_reader_keeps_the_failure_code_only() {
+        // RUST-NY: a split `response.failed` frame reduces to its error code;
+        // the echoed instructions and the message never reach the summary.
+        let mut failed = CodexTerminalReader::new(tokio::io::empty());
+        failed.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\nevent: response.fa");
+        failed
+            .observe(b"iled\ndata: {\"type\":\"response.failed\",\"response\":{\"instructions\":");
+        failed.observe(
+            b"\"secret prompt\",\"error\":{\"code\":\"server_error\",\"message\":\"m\"}}}\n\n",
+        );
+        failed.observe(b"data: {\"type\":\"later\"}\n\n");
+        assert!(failed.failed());
+        let body = failed.failure_body();
+        assert_eq!(
+            codex_error_summary(&body),
+            "type=- code=server_error param=-"
+        );
+        assert_eq!(codex_error_shape_tag(&body), "object{error}");
+
+        // The backend's own frame keeps its type.
+        let mut errored = CodexTerminalReader::new(tokio::io::empty());
+        errored.observe(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"x\"}}\n\n");
+        assert_eq!(
+            codex_error_summary(&errored.failure_body()),
+            "type=api_error code=- param=-"
+        );
+
+        // OpenAI's in-band error event carries its code at the top level.
+        let mut inband = CodexTerminalReader::new(tokio::io::empty());
+        inband.observe(b"event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"x\",\"param\":null}\n\n");
+        assert_eq!(
+            codex_error_summary(&inband.failure_body()),
+            "type=error code=rate_limit_exceeded param=-"
+        );
+
+        // The backend streams chunked, one HTTP chunk per upstream read, so a
+        // long data line carries `\r\n<size>\r\n`, and a read can end on the
+        // CRLF before the size line.
+        let mut chunked = CodexTerminalReader::new(tokio::io::empty());
+        chunked.observe(b"1f\r\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"instructions\":\"x\"");
+        chunked.observe(b"\r\n");
+        chunked
+            .observe(b"2a\r\n,\"error\":{\"code\":\"server_error\",\"message\":\"m\"}}}\n\n\r\n");
+        chunked.observe(b"0\r\n\r\n");
+        assert_eq!(
+            codex_error_summary(&chunked.failure_body()),
+            "type=- code=server_error param=-"
+        );
     }
 
     #[test]
