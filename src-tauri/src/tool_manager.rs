@@ -1805,6 +1805,184 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
 
+# --- headroom_retrieve alongside client tools: serve it (vendor) -------------
+# A model that calls headroom_retrieve in parallel with client tools (a Claude
+# Code subagent grepping and reading several files in one turn) got the whole
+# turn handed back by CCRResponseHandler.handle_response (#839) for the client
+# to resolve, and the client has no headroom_retrieve: Claude Code answers
+# "No such tool available: headroom_retrieve" and the model never gets the
+# content. On one machine 484 of 501 such leaks were mixed turns, 435 of them
+# in subagents. The client calls have not run yet, so drop them, serve the
+# retrieval in the continuation as for a lone call, and let the model re-issue
+# them there. They count as delivered only when a continuation re-issues every
+# one with the same name and arguments; otherwise (text answer, changed input,
+# failed continuation) the client gets the model's own turn back, the wheel's
+# behaviour, so no client call is lost. A headroom_retrieve without a valid
+# hash keeps the turn unchanged. Anthropic and OpenAI chat only (a Responses
+# function_call or a Gemini functionCall part can be load-bearing for
+# reasoning). Upstream PR #4034's hunks applied verbatim to the installed
+# method's source, its tool_calls helpers copied below. Fewer leaked pairs
+# also means fewer [text, tool_result] repairs for ccr_repair_order.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel ships
+# drop_tool_calls or a hunk's old text is gone. Kill switch:
+# HEADROOM_CCR_MIXED_TURN=0.
+_hd_cmt_flag = _hd_os.environ.get("HEADROOM_CCR_MIXED_TURN", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_cmt_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_cmt_meta
+
+        if _hd_cmt_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_cmt_inspect
+            import textwrap as _hd_cmt_textwrap
+
+            from headroom.ccr import response_handler as _hd_cmt_mod
+            from headroom.ccr import tool_calls as _hd_cmt_tc
+
+            _hd_cmt_hunks = (
+                (
+                    "    rounds = 0\n",
+                    "    rounds = 0\n"
+                    "    # A mixed turn whose client calls were dropped, and those calls, until\n"
+                    "    # a continuation re-issues them.\n"
+                    "    mixed_turn: dict[str, Any] | None = None\n"
+                    "    reissue: list[str] = []\n",
+                ),
+                (
+                    "        # If the model called CCR alongside non-CCR tools, we cannot build\n"
+                    "        # a valid continuation \u2014 every tool_use in the assistant message\n"
+                    "        # requires a matching tool_result, but we only have CCR results.\n"
+                    "        # Skip CCR handling and let the client resolve all tool calls.\n"
+                    "        if other_calls:\n"
+                    "            logger.warning(\n"
+                    '                "CCR: Skipping CCR handling \u2014 model called %d non-CCR tool(s) "\n'
+                    '                "alongside headroom_retrieve. Cannot create a valid continuation "\n'
+                    '                "without results for the other tools. Client must handle all tool calls.",\n'
+                    "                len(other_calls),\n"
+                    "            )\n"
+                    "            break\n",
+                    "        # The model called CCR alongside client tools. The client has no\n"
+                    '        # headroom_retrieve (Claude Code answers "No such tool available:\n'
+                    '        # headroom_retrieve", so the model never gets the content), and a\n'
+                    "        # continuation needs a tool_result for every tool_use. The client\n"
+                    "        # calls have not run yet, so drop them and serve the retrieval now;\n"
+                    "        # the model re-issues them, content in hand, in the continuation.\n"
+                    "        # They count as delivered only if it re-issues every one unchanged;\n"
+                    "        # otherwise the client gets this turn back below. A CCR-named call\n"
+                    "        # without a valid hash, or a provider where dropping a sibling is\n"
+                    "        # not safe (see drop_tool_calls), keeps the turn as it is for the\n"
+                    "        # client to resolve.\n"
+                    "        if other_calls:\n"
+                    "            trimmed = (\n"
+                    "                current_response\n"
+                    "                if any(is_ccr_tool_call(c) for c in other_calls)\n"
+                    "                else drop_tool_calls(current_response, provider, other_calls)\n"
+                    "            )\n"
+                    "            if trimmed is current_response:\n"
+                    "                logger.warning(\n"
+                    '                    "CCR: Skipping CCR handling \u2014 model called %d non-CCR tool(s) "\n'
+                    '                    "alongside headroom_retrieve. Cannot create a valid continuation "\n'
+                    '                    "without results for the other tools. Client must handle all tool calls.",\n'
+                    "                    len(other_calls),\n"
+                    "                )\n"
+                    "                break\n"
+                    "            logger.info(\n"
+                    '                "CCR: model called headroom_retrieve alongside %d client tool(s); "\n'
+                    '                "serving the retrieval and dropping the unrun client call(s) "\n'
+                    '                "for the model to re-issue",\n'
+                    "                len(other_calls),\n"
+                    "            )\n"
+                    "            mixed_turn = current_response\n"
+                    "            reissue = [tool_call_signature(c) for c in other_calls]\n"
+                    "            current_response = trimmed\n",
+                ),
+                (
+                    "            break\n\n    if rounds >= self.config.max_retrieval_rounds:\n",
+                    "            break\n\n"
+                    "        if reissue:\n"
+                    "            _, reissued = self._parse_ccr_tool_calls(current_response, provider)\n"
+                    "            if not reissues_tool_calls(reissued, reissue):\n"
+                    "                break\n"
+                    "            reissue = []\n\n"
+                    "    if reissue and mixed_turn is not None:\n"
+                    "        logger.info(\n"
+                    '            "CCR: the client call(s) dropped for retrieval were not re-issued; "\n'
+                    '            "returning the model\'s own turn for the client to resolve"\n'
+                    "        )\n"
+                    "        return mixed_turn\n\n"
+                    "    if rounds >= self.config.max_retrieval_rounds:\n",
+                ),
+            )
+            _hd_cmt_src = _hd_cmt_textwrap.dedent(
+                _hd_cmt_inspect.getsource(_hd_cmt_mod.CCRResponseHandler.handle_response)
+            )
+            if not hasattr(_hd_cmt_mod, "drop_tool_calls") and all(
+                _hd_cmt_src.count(old) == 1 for old, _ in _hd_cmt_hunks
+            ):
+                import json as _hd_cmt_json
+                from collections import Counter as _hd_cmt_counter
+
+                # #4034's ccr.tool_calls helpers, verbatim.
+                def _hd_cmt_drop(response, provider, calls):
+                    drop = {id(call) for call in calls}
+                    if provider == "anthropic":
+                        content = response.get("content")
+                        if isinstance(content, list):
+                            return {**response, "content": [b for b in content if id(b) not in drop]}
+                    elif provider == "openai":
+                        choices = response.get("choices")
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            message = choices[0].get("message")
+                            if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
+                                tool_calls = [c for c in message["tool_calls"] if id(c) not in drop]
+                                first = {**choices[0], "message": {**message, "tool_calls": tool_calls}}
+                                return {**response, "choices": [first, *choices[1:]]}
+                    return response
+
+                def _hd_cmt_signature(tool_call):
+                    function = tool_call.get("function")
+                    if isinstance(function, dict):
+                        name, arguments = function.get("name"), function.get("arguments")
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = _hd_cmt_json.loads(arguments)
+                            except ValueError:
+                                pass
+                    else:
+                        name, arguments = tool_call.get("name"), tool_call.get("input")
+                    return _hd_cmt_json.dumps([name, arguments], sort_keys=True, default=str)
+
+                def _hd_cmt_reissues(calls, signatures):
+                    return not (
+                        _hd_cmt_counter(signatures)
+                        - _hd_cmt_counter(_hd_cmt_signature(c) for c in calls)
+                    )
+
+                for _hd_cmt_old, _hd_cmt_new in _hd_cmt_hunks:
+                    _hd_cmt_src = _hd_cmt_src.replace(_hd_cmt_old, _hd_cmt_new)
+                _hd_cmt_ns = {}
+                exec(
+                    compile(_hd_cmt_src, "<headroom-desktop ccr mixed turn>", "exec"),
+                    _hd_cmt_mod.__dict__,
+                    _hd_cmt_ns,
+                )
+                _hd_cmt_mod.drop_tool_calls = _hd_cmt_drop
+                _hd_cmt_mod.tool_call_signature = _hd_cmt_signature
+                _hd_cmt_mod.reissues_tool_calls = _hd_cmt_reissues
+                _hd_cmt_mod.is_ccr_tool_call = _hd_cmt_tc.is_ccr_tool_call
+                _hd_cmt_mod.CCRResponseHandler.handle_response = _hd_cmt_ns["handle_response"]
+                _hd_bound.add("ccr_mixed_turn")
+    except Exception:
+        # Fail-open to the wheel's pass-through (the pre-vendor behaviour).
+        pass
+
 # --- Kompress fallback judged in tokens (vendor, upstream #3881) --------------
 # The code_aware branch of ContentRouter._apply_strategy_to_content records a
 # WORD count as compressed_tokens (content_router.py:3707), and the no-savings
@@ -3303,6 +3481,7 @@ _HD_VENDORS = (
     "message_window",
     "quarantine_spare_capacity",
     "ccr_repair_order",
+    "ccr_mixed_turn",
     "kompress_fallback_units",
     "kompress_waste",
     "token_read_window",
@@ -17001,6 +17180,21 @@ mod tests {
         assert!(py.contains("_hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip"));
     }
 
+    #[test]
+    fn sitecustomize_vendors_ccr_mixed_turn() {
+        // headroom_retrieve called alongside client tools reached Claude Code
+        // as "No such tool available". Behaviour is proven by
+        // ccr_mixed_turn_behaves_against_the_installed_wheel; this pins the
+        // gate, the kill switch, the self-neutralization probe and the rebind.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CCR_MIXED_TURN"));
+        assert!(py.contains(r#"_hd_cmt_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#"not hasattr(_hd_cmt_mod, "drop_tool_calls")"#));
+        assert!(py.contains(
+            r#"_hd_cmt_mod.CCRResponseHandler.handle_response = _hd_cmt_ns["handle_response"]"#
+        ));
+    }
+
     /// Vendor names the summary line reports: every `_hd_bound.add("x")` and
     /// the `_HD_VENDORS` tuple must name the same set, or a vendor drops out
     /// of the line.
@@ -18861,6 +19055,74 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(on, "2 True True 0 ['b', 'x', 'go']", "stderr:\n{on_err}");
         assert_eq!(
             off, "2 True True 0 ['x', 'b', 'go']",
+            "kill switch did not unbind:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn ccr_mixed_turn_behaves_against_the_installed_wheel() {
+        // A Claude Code subagent's turn: headroom_retrieve plus a Read in
+        // parallel. The wheel hands both back (Claude Code: "No such tool
+        // available: headroom_retrieve"); the vendor serves the retrieval in a
+        // continuation carrying only the retrieve pair and returns the
+        // continuation, where the model re-issued the Read. A continuation
+        // that answers without re-issuing it hands back the model's own turn,
+        // so the Read still reaches the client. A Responses turn keeps the
+        // pass-through; the kill switch restores the wheel's.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = "import asyncio, json\n\
+                     from headroom.cache.backends import InMemoryBackend\n\
+                     from headroom.cache.compression_store import get_compression_store\n\
+                     from headroom.ccr.response_handler import CCRResponseHandler\n\
+                     h = get_compression_store(backend=InMemoryBackend()).store(original='[1,2,3]', compressed='[]')\n\
+                     def tu(i, n):\n\
+                     \x20   return {'type': 'tool_use', 'id': i, 'name': n, 'input': {'hash': h}}\n\
+                     mixed = {'content': [tu('r', 'headroom_retrieve'), tu('b', 'Read')], 'stop_reason': 'tool_use'}\n\
+                     sent = []\n\
+                     async def call(m, t):\n\
+                     \x20   sent.append(m)\n\
+                     \x20   return {'content': [tu('b2', 'Read')], 'stop_reason': 'tool_use'}\n\
+                     out = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, call, 'anthropic'))\n\
+                     fc = lambda i, n: {'type': 'function_call', 'call_id': i, 'name': n, 'arguments': json.dumps({'hash': h})}\n\
+                     resp = {'output': [fc('b', 'Read'), fc('r', 'headroom_retrieve')]}\n\
+                     kept = asyncio.run(CCRResponseHandler().handle_response(resp, [], None, call, 'openai_responses'))\n\
+                     async def done(m, t):\n\
+                     \x20   return {'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}\n\
+                     back = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, done, 'anthropic'))\n\
+                     print(len(sent), [b['id'] for b in out['content']],\n\
+                     [b['id'] for b in sent[0][0]['content']] if sent else '-',\n\
+                     '[1,2,3]' in json.dumps(sent[0][1:]) if sent else '-', kept is resp, back is mixed)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CCR_MIXED_TURN", kill)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run ccr mixed-turn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let served = "1 ['b2'] ['r'] True True True";
+        if off == served {
+            eprintln!("skipping: the wheel already serves a mixed retrieve; drop the vendor");
+            return;
+        }
+        assert_eq!(on, served, "stderr:\n{on_err}");
+        assert_eq!(
+            off, "0 ['r', 'b'] - - True True",
             "kill switch did not unbind:\n{off_err}"
         );
     }
