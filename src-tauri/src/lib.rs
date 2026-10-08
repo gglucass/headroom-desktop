@@ -8990,6 +8990,14 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
     if text.contains("produced no output for") {
         return true;
     }
+    // RUST-P2: codex's own give-up once `learn_codex_retries` bounds its
+    // connection retries; unbounded, the same run waited out the 900s cap.
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("ERROR: Connection failed:"))
+    {
+        return true;
+    }
     let mut statusless = false;
     for line in text
         .lines()
@@ -15701,6 +15709,20 @@ Some unrelated content.
         // RUST-F4 verbatim: upstream's own idle timeout, no CLI output at all.
         assert!(learn_failure_is_agent_api_unreachable(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose` produced no output for 180s. Check network connectivity, raise HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
+        ));
+    }
+
+    #[test]
+    fn learn_failure_is_agent_api_unreachable_matches_codex_giving_up() {
+        // RUST-P2: codex 0.160.0 against a dead route with its retries
+        // bounded, verbatim after the analyzer's marker and the prompt elision.
+        assert!(learn_failure_is_agent_api_unreachable(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nReading prompt from stdin...\n[prompt omitted]\nERROR: Reconnecting... 5/5\nERROR: Connection failed: error sending request\n"
+        ));
+        // The unbounded run is still reported: past the bound, a 900s
+        // timeout is a codex that was busy, not one that could not connect.
+        assert!(!learn_failure_is_agent_api_unreachable(
+            "LLM analysis failed: `codex exec --skip-git-repo-check` did not respond within 900s. Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
         ));
     }
 

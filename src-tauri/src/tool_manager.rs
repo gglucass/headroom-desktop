@@ -418,6 +418,10 @@ Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
 that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
 Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
 
+Also bounds learn's `codex exec` connection retries, so a dead route fails
+in seconds with codex's own reason instead of waiting out the 900s cap
+(RUST-P2). Kill switch: HEADROOM_LEARN_CODEX_RETRIES=0.
+
 Can also write the serving loop's stack to logs/loop-stall.txt when the
 event loop stalls (desktop diagnostic, RUST-86). Off unless
 HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
@@ -2676,6 +2680,30 @@ if _hd_lnt_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: `codex exec` gives up on a dead route (posture) --------------------
+# Codex ships `unbounded_connection_retries` on (0.156.1 and the ChatGPT app's
+# 0.160.0 both do): when it cannot connect to its provider it prints
+# "Reconnecting... waiting for network" and never exits. The analyzer runs
+# `codex exec` under a wall clock only and drops its output on timeout, so the
+# scan sat out the full 900s and reported only "did not respond within 900s"
+# (RUST-P2). Bounded, the same dead route ends in ~25s with codex's own
+# "Connection failed" line. `-c`, not `--disable`: an older codex refuses an
+# unknown `--disable` name but ignores an unknown config key. Not
+# version-gated: a wheel that passes the override itself is left alone. Kill
+# switch: HEADROOM_LEARN_CODEX_RETRIES=0.
+_hd_lcr_flag = _hd_os.environ.get("HEADROOM_LEARN_CODEX_RETRIES", "1")
+if _hd_lcr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.learn import analyzer as _hd_lcr_mod
+
+        _hd_lcr_arg = "features.unbounded_connection_retries=false"
+        for _hd_lcr_name, _hd_lcr_model, _hd_lcr_cmd in _hd_lcr_mod._CLI_BACKENDS:
+            if _hd_lcr_model == "codex-cli" and _hd_lcr_arg not in _hd_lcr_cmd:
+                _hd_lcr_cmd.extend(["-c", _hd_lcr_arg])
+                _hd_bound.add("learn_codex_retries")
+    except Exception:
+        pass
+
 # --- Learn: drop the prompt a failed CLI echoed to stderr (diagnostics) --------
 # `codex exec` prints the whole prompt to stderr ahead of its own error, and the
 # analyzer keeps only the first 2000 chars of a failed CLI's stderr, so every
@@ -3286,6 +3314,7 @@ _HD_VENDORS = (
     "learn_worktree_merge",
     "learn_drop_error_recovery",
     "learn_no_tools",
+    "learn_codex_retries",
     "learn_prompt_echo",
     "learn_stdin_early_exit",
     "image_memo",
@@ -18184,6 +18213,50 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
             "stderr:\n{on_err}"
         );
         assert_eq!(off, "0 -", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_codex_retries_behaves_against_the_installed_wheel() {
+        // RUST-P2: the codex-cli analysis command bounds codex's connection
+        // retries exactly once and leaves claude-cli alone; the kill switch
+        // restores the wheel's command.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-cr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn.analyzer import _CLI_BACKENDS as b\n\
+                     c = {m: c for _, m, c in b}\n\
+                     print(c['codex-cli'], c['claude-cli'].count('-c'))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_CODEX_RETRIES", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on,
+            "['codex', 'exec', '--skip-git-repo-check', '-c', 'features.unbounded_connection_retries=false'] 0",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off, "['codex', 'exec', '--skip-git-repo-check'] 0",
+            "stderr:\n{off_err}"
+        );
     }
 
     #[test]
