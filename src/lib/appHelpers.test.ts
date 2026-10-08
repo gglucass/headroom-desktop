@@ -23,6 +23,7 @@ import {
   recentDailySavingsUsd,
   restorePendingAuth,
   setServerPlanPrices,
+  trialSavingsLabel,
   unsavedWhileBlockedLabel,
   upgradePlanIntentLabel,
 } from "./appHelpers";
@@ -75,6 +76,43 @@ describe("app helpers", () => {
     expect(label).not.toContain("trial");
     // Below the floor (10k tokens) -> null, so a trickle never nags.
     expect(unsavedWhileBlockedLabel(40_000, history)).toBeNull();
+  });
+
+  it("quotes the ended trial's savings against the plan, or stays quiet", () => {
+    const on = (date: string, usd: number, tokens: number) => ({
+      ...daily(usd),
+      date,
+      estimatedTokensSaved: tokens
+    });
+    // Local noon keeps the day keys stable in any test timezone.
+    const start = new Date(2026, 8, 1, 12).toISOString();
+    const end = new Date(2026, 8, 8, 12).toISOString();
+    const trial = [
+      on("2026-08-31", 500, 50_000_000), // before the trial: not counted
+      on("2026-09-01", 300, 30_000_000),
+      on("2026-09-08", 100, 10_000_000),
+      { ...on("2026-09-05", 10, 1_000_000), outputSavingsUsd: 20 },
+      on("2026-09-09", 900, 90_000_000) // after the wall: not counted
+    ];
+    // $430 incl. output against Max x20's $40 list -> 10 months, floored.
+    expect(trialSavingsLabel(trial, start, end, "max20x")).toBe(
+      "Over your trial, Headroom saved you 41M tokens, about $430 at API prices. Max x20 is $40/month, so the trial alone covered about 10 months of it."
+    );
+    // Covers exactly one month -> "a month".
+    expect(trialSavingsLabel([on("2026-09-02", 4.5, 2_000_000)], start, end, "pro")).toContain(
+      "covered a month of it"
+    );
+    // Covers less than a month -> savings only, no months claim.
+    expect(trialSavingsLabel([on("2026-09-02", 30, 2_000_000)], start, end, "max20x")).toBe(
+      "Over your trial, Headroom saved you 2M tokens, about $30 at API prices."
+    );
+    // Big token count, tiny dollars -> tokens only.
+    expect(trialSavingsLabel([on("2026-09-02", 0.4, 1_500_000)], start, end, "max20x")).toBe(
+      "Over your trial, Headroom saved you 1.5M tokens."
+    );
+    // A trickle (under 1M tokens and under $1) argues against upgrading -> null.
+    expect(trialSavingsLabel([on("2026-09-02", 0.5, 200_000)], start, end, "max20x")).toBeNull();
+    expect(trialSavingsLabel([], start, end, "max20x")).toBeNull();
   });
 
   it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {

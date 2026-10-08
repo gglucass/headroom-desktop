@@ -14,6 +14,7 @@ import type {
 import {
   addDays,
   compactNumber,
+  currency,
   currencyExact,
   formatDayKey,
   parseDayKey,
@@ -300,6 +301,33 @@ export function forgoneSavingsLabel(
   const forgone = recentDailySavingsUsd * daysUntilReset;
   if (forgone < 1) return null;
   return `You'll miss out on about ${currencyExact(forgone)} in savings this week unless you upgrade.`;
+}
+
+/// Item 3 - what the ended trial saved, against the plan the Upgrade button
+/// buys. Items 1-2 price RECENT savings, which the wall stops, so a week past
+/// it both are gone; this one stays. Mirrors the web "paused" email
+/// (TrialEndingMailer#paused): tokens only from 1M, dollars only from $1,
+/// months only when the trial covered at least one, at the monthly list
+/// price. Local history only, so another machine's trial days are missing:
+/// it can understate, never overstate.
+export function trialSavingsLabel(
+  daily: DailySavingsPoint[],
+  trialStartedAt: string,
+  trialEndsAt: string,
+  planId: HeadroomSubscriptionTier | null
+): string | null {
+  const from = formatDayKey(new Date(trialStartedAt));
+  const to = formatDayKey(new Date(trialEndsAt));
+  const trial = daily.filter((p) => p.date >= from && p.date <= to);
+  const tokens = trial.reduce((sum, p) => sum + p.estimatedTokensSaved, 0);
+  const usd = trial.reduce((sum, p) => sum + p.estimatedSavingsUsd + (p.outputSavingsUsd ?? 0), 0);
+  if (tokens <= 0 || (usd < 1 && tokens < 1_000_000)) return null;
+  const saved = `Over your trial, Headroom saved you ${compactNumber(tokens)} tokens${usd >= 1 ? `, about ${currency(usd)} at API prices` : ""}.`;
+  if (!planId) return saved;
+  const price = planPrice(planId, "monthly");
+  const months = price.fullCents > 0 ? Math.floor((usd * 100) / price.fullCents) : 0;
+  if (months < 1) return saved;
+  return `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so the trial alone covered ${months === 1 ? "a month" : `about ${months} months`} of it.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";

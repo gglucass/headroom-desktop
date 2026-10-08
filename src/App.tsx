@@ -106,6 +106,7 @@ import {
   matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
+  trialSavingsLabel,
   recentDailySavingsUsd,
   unsavedWhileBlockedLabel,
   setServerPlanPrices,
@@ -6554,6 +6555,20 @@ export default function App() {
     inUpgradeMoment && paybackPlanId
       ? paybackLabel(recentDailySavings * 30, paybackPlanId, billingPeriod)
       : null;
+  // Item 3 - what the ended trial saved; still there once items 1-2 decay.
+  const trialSavedLabel =
+    pricingStatus?.account &&
+    !pricingStatus.account.trialActive &&
+    !pricingStatus.account.subscriptionActive &&
+    pricingStatus.account.trialStartedAt &&
+    pricingStatus.account.trialEndsAt
+      ? trialSavingsLabel(
+          dashboard.dailySavings,
+          pricingStatus.account.trialStartedAt,
+          pricingStatus.account.trialEndsAt,
+          paybackPlanId
+        )
+      : null;
   // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
   const weeklyGateForgoneLabel = (() => {
     if (!inUpgradeMoment || !pricingStatus) return null;
@@ -6579,7 +6594,7 @@ export default function App() {
     !!pricingStatus &&
     (!pricingStatus.optimizationAllowed || pricingStatus.codex?.optimizationAllowed === false);
   const upgradeSavingsLine = isHardGate
-    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel)
+    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel ?? (inUpgradeMoment ? trialSavedLabel : null))
     : (upgradePaybackLabel ?? weeklyGateForgoneLabel);
   // Only show it when the pricing gate/nudge banner actually wins: a startup,
   // paused, or disconnected banner takes precedence over the upsell, so the
@@ -6744,7 +6759,7 @@ export default function App() {
     const unsaved = unsavedWhileBlockedLabel(gatedBypassBytes, dashboard.dailySavings);
     return {
       tone: "expired" as const,
-      message: `Your trial has ended.${unsaved ? ` ${unsaved}` : ""} Upgrade to keep Headroom optimizing your prompts.`,
+      message: `Your trial has ended.${trialSavedLabel ? ` ${trialSavedLabel}` : ""}${unsaved ? ` ${unsaved}` : ""} Upgrade to keep Headroom optimizing your prompts.`,
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };
