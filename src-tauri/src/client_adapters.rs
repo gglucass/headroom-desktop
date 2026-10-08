@@ -6521,7 +6521,15 @@ fn protect_foreign_mcp_tables_unlocked() {
     let heal = claim_mcp_span_heal();
     for path in [codex_config_toml_path(), grok_config_toml_path()] {
         if let Err(err) = protect_foreign_mcp_tables_in(&path, heal) {
-            log::warn!(
+            // EPERM reading the config (RUST-NK) is the OS refusing access,
+            // which no change here can grant: local log only.
+            let level = if is_permission_denied(&err) {
+                log::Level::Info
+            } else {
+                log::Level::Warn
+            };
+            log::log!(
+                level,
                 "protecting foreign MCP tables in {} failed: {err:#}",
                 path.display()
             );
@@ -8798,15 +8806,29 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
-/// Remove a script we own once its settings entry is already gone. Claude Code
+/// Remove a file we own once its settings entry is already gone. Claude Code
 /// may be executing it at that moment, which Windows refuses to delete; the
 /// entry is what mattered, so a file that survives the retries is logged and
 /// left for next time rather than failing a disable the user already got.
-fn remove_owned_script(path: &Path) {
+/// A denial that outlasts the retries is the OS refusing (a locked file on
+/// macOS, RUST-NS..NX), which no change here can lift: local log only.
+pub(crate) fn remove_owned_script(path: &Path) {
     match retry_transient_denied(|| std::fs::remove_file(path)) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => log::warn!("removing {} failed: {err}", path.display()),
+        Err(err) => log::log!(
+            owned_removal_failure_level(&err),
+            "removing {} failed: {err}",
+            path.display()
+        ),
+    }
+}
+
+fn owned_removal_failure_level(err: &std::io::Error) -> log::Level {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        log::Level::Info
+    } else {
+        log::Level::Warn
     }
 }
 
@@ -11313,6 +11335,19 @@ mod tests {
         assert!(!is_permission_denied(&not_found));
 
         assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
+    }
+
+    /// RUST-NS..NX: a locked owned file fails its removal with EPERM (os
+    /// error 1) on macOS, which stays in the local log.
+    #[test]
+    fn owned_removal_denial_is_local_only() {
+        let denied = std::io::Error::from_raw_os_error(if cfg!(windows) { 5 } else { 1 });
+        assert_eq!(
+            super::owned_removal_failure_level(&denied),
+            log::Level::Info
+        );
+        let other = std::io::Error::other("disk on fire");
+        assert_eq!(super::owned_removal_failure_level(&other), log::Level::Warn);
     }
 
     /// RUST-D2: `atomic_write` bakes the io cause into its message and carries

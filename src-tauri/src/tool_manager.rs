@@ -12359,7 +12359,7 @@ pub(crate) fn cc_switch_captured_upstream() -> Option<String> {
 }
 
 pub(crate) fn clear_cc_switch_capture() {
-    remove_cc_switch_file(&cc_switch_capture_path());
+    crate::client_adapters::remove_owned_script(&cc_switch_capture_path());
 }
 
 /// Present while Headroom routes Claude Code's settings.json (the Claude Code
@@ -12375,18 +12375,10 @@ pub(crate) fn cc_switch_routed_path() -> PathBuf {
 pub(crate) fn set_cc_switch_routed(routed: bool) {
     let path = cc_switch_routed_path();
     if !routed {
-        return remove_cc_switch_file(&path);
+        return crate::client_adapters::remove_owned_script(&path);
     }
     if let Err(err) = crate::client_adapters::atomic_write(&path, b"") {
         log::warn!("writing {} failed: {err:#}", path.display());
-    }
-}
-
-fn remove_cc_switch_file(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("removing {} failed: {err}", path.display());
-        }
     }
 }
 
