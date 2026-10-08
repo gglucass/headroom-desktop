@@ -10381,19 +10381,21 @@ impl ToolManager {
             // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
             // install path -- see `plugin_install_failure_category`.
             let category = plugin_install_failure_category(&detail);
-            sentry::with_scope(
-                |scope| {
-                    scope.set_fingerprint(Some(&["plugin-install-partial", category]));
-                },
-                || {
-                    sentry::capture_message(
-                        &format!(
-                            "{id} installed for some hosts but not all [{category}]: {detail}"
-                        ),
-                        sentry::Level::Warning,
-                    );
-                },
-            );
+            if plugin_install_failure_reported(category) {
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_fingerprint(Some(&["plugin-install-partial", category]));
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!(
+                                "{id} installed for some hosts but not all [{category}]: {detail}"
+                            ),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+            }
             log::warn!("{id} installed for some hosts but not all: {detail}");
         }
         let version =
@@ -10575,6 +10577,8 @@ impl ToolManager {
 }
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
+
+const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code needs it to download this addon: install it from https://git-scm.com, then try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -15670,6 +15674,11 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
+/// The user's machine lacks git; the UI says so and nothing we ship fixes it.
+fn plugin_install_failure_reported(category: &str) -> bool {
+    category != "git-missing"
+}
+
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
 /// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
 /// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
@@ -15686,7 +15695,13 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("not found in marketplace") {
+    if lower.contains("'git' not found") {
+        // Claude Code clones a marketplace with git, and the host has none
+        // (RUST-P0: Windows, "Command 'git' not found or is in an unsafe
+        // location"). Checked first: the install that follows then fails
+        // "not found in marketplace", which names only the consequence.
+        "git-missing"
+    } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
         "marketplace-missing"
@@ -16393,16 +16408,22 @@ fn settle_plugin_hosts(
             // partial path in `install_plugin`; a too-old CLI alone is not an
             // error and stays out.
             let category = plugin_install_failure_category(&detail);
-            sentry::with_scope(
-                |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
-                || {
-                    sentry::capture_message(
-                        &format!("{id} install failed on every host [{category}]: {detail}"),
-                        sentry::Level::Warning,
-                    );
-                },
-            );
-            format!("installing the {id} plugin failed: {detail}. ")
+            if plugin_install_failure_reported(category) {
+                sentry::with_scope(
+                    |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
+                    || {
+                        sentry::capture_message(
+                            &format!("{id} install failed on every host [{category}]: {detail}"),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+            }
+            if category == "git-missing" {
+                format!("{NO_GIT_FOR_PLUGIN} ")
+            } else {
+                format!("installing the {id} plugin failed: {detail}. ")
+            }
         };
         if !outdated.is_empty() {
             let names = outdated.join(" and ");
@@ -27477,6 +27498,17 @@ exit 0
                  \"caveman@caveman\" at user scope\u{2026}\n\nstderr:\n\n[headroom] killed: no \
                  output for 180s (stalled installer)\n",
                 "host-cli-stalled",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JayPokale/Chisle\nstdout:\n\
+                 Adding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add marketplace: Failed \
+                 to clone marketplace repository: Command 'git' not found or is in an unsafe \
+                 location (current directory)\n: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin install chisle@chisle\nstdout:\n\nstderr:\n\
+                 \u{d7} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" not found \
+                 in marketplace \"chisle\".",
+                "git-missing",
             ),
             ("Codex: something we have not seen", "other"),
         ];
