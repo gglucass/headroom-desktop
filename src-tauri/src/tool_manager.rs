@@ -17152,12 +17152,14 @@ async def main():
     # A child Python must not inherit the proxy's timer.
     assert "HEADROOM_STARTUP_STALL_DUMP" not in os.environ
     fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND)
-    faulthandler.dump_traceback_later(3.0, file=fd)
+    # Long enough that a loaded machine binds first (3s flaked in a full
+    # suite at load ~45); the sleep below outlasts it, so a missed cancel dumps.
+    faulthandler.dump_traceback_later(10.0, file=fd)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
     serving = asyncio.create_task(server.serve())
     while not server.started:
         await asyncio.sleep(0.05)
-    time.sleep(4.0)
+    time.sleep(11.0)
     server.should_exit = True
     await serving
 
