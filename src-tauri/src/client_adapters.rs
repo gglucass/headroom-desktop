@@ -5041,7 +5041,9 @@ fn rescue_foreign_toml_from_block(
 /// lines, a table is kept when `owns` accepts its header; `root_keys_only`
 /// also moves out any root key that is not one of [`CODEX_ROOT_KEYS`].
 /// Moved lines land after the block's end marker, or with `before_start` just
-/// before its start marker.
+/// before its start marker, with the keys TOML scopes to them (RUST-NP: a key
+/// below the end marker belongs to the block's last table, one right below
+/// the start marker to the table above the block).
 fn rescue_foreign_toml(
     content: &str,
     start: &str,
@@ -5072,12 +5074,23 @@ fn rescue_foreign_toml(
     let mut out: Vec<&str> = Vec::new();
     let mut rescued: Vec<&str> = Vec::new();
     let mut in_block = false;
+    let mut in_table = false;
     let mut in_foreign_table = false;
+    // After an end marker, until the next header: TOML gives these keys to
+    // the block's last table, so when that table moves they go with it.
+    let mut trailing = false;
     let mut start_at = 0;
     for line in content.lines() {
         let trimmed = line.trim();
+        let code = line.split('#').next().unwrap_or("").trim();
+        let is_header = code.starts_with('[') && code.ends_with(']');
+        if trailing && (is_header || trimmed == start) {
+            trailing = false;
+            place(&mut out, &mut rescued, Some(start_at));
+        }
         if trimmed == start {
             in_block = true;
+            in_table = false;
             in_foreign_table = false;
             start_at = out.len();
             out.push(line);
@@ -5086,13 +5099,28 @@ fn rescue_foreign_toml(
         if trimmed == end {
             in_block = false;
             out.push(line);
-            place(&mut out, &mut rescued, before_start.then_some(start_at));
+            if before_start && in_foreign_table {
+                trailing = true;
+            } else {
+                place(&mut out, &mut rescued, before_start.then_some(start_at));
+            }
+            continue;
+        }
+        if trailing && !code.is_empty() {
+            rescued.push(line);
             continue;
         }
         if in_block {
-            let code = line.split('#').next().unwrap_or("").trim();
-            if code.starts_with('[') && code.ends_with(']') {
+            if is_header {
+                in_table = true;
                 in_foreign_table = !owns(code);
+            } else if before_start && !in_table && !code.is_empty() {
+                // A key between the start marker and the block's first header
+                // belongs to the table above the block: keep it above the
+                // marker, so the tables moved there do not take it.
+                out.insert(start_at, line);
+                start_at += 1;
+                continue;
             }
             // Codex's TOML writer appends a new root key (/model's `model`,
             // `model_reasoning_effort`) after the last root key -- our
@@ -20553,6 +20581,45 @@ sys.exit(3)
         );
         // Idempotent once clean.
         assert!(!super::protect_foreign_mcp_tables_in(&config, false).unwrap());
+    }
+
+    /// RUST-NP: a key appended below the span (`echo ... >> config.toml`) is
+    /// TOML's to the span's last table, and one right below the start marker
+    /// to the table above it. Moving the trapped table alone changed that, so
+    /// the evacuation was refused and the table stayed in the wheel's reach.
+    /// Each key now moves with the table it belongs to.
+    #[test]
+    #[serial_test::serial]
+    fn keys_scoped_across_the_span_markers_keep_their_table() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        let pinned = "/Apps/Headroom/venv/bin/headroom";
+        let trapped = codex_config_with_trapped_node_repl(pinned);
+        let below_end = format!("{trapped}model_reasoning_effort = \"high\"\n");
+        let below_start = trapped.replace(
+            "# --- Headroom MCP server ---\n",
+            "# --- Headroom MCP server ---\nanimations = false\n",
+        );
+        for before in [below_end, below_start] {
+            std::fs::write(&config, &before).unwrap();
+            assert!(
+                super::protect_foreign_mcp_tables_in(&config, false).unwrap(),
+                "left in the span:\n{before}"
+            );
+            let after = std::fs::read_to_string(&config).unwrap();
+            assert_node_repl_intact(&after);
+            assert_eq!(
+                toml::from_str::<toml::Value>(&after).unwrap(),
+                toml::from_str::<toml::Value>(&before).unwrap()
+            );
+            let reinstalled = wheel_force_register(&after, WHEEL_BLOCK);
+            assert!(
+                reinstalled.contains("[mcp_servers.node_repl]"),
+                "{reinstalled}"
+            );
+        }
     }
 
     /// Heal for machines rc11 already damaged: a `.headroom-backup-*` still
