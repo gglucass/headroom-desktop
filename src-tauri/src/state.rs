@@ -7421,7 +7421,6 @@ fn warn_stats_fetch_failed(reason: &str) {
 /// its stack unless another thread held the GIL, which is why the rest follow.
 pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Option<(u64, String)> {
     const FRESH: Duration = Duration::from_secs(120);
-    const MAX_CHARS: usize = 12_000;
     let age = now
         .duration_since(std::fs::metadata(path).ok()?.modified().ok()?)
         .unwrap_or_default();
@@ -7429,6 +7428,13 @@ pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Opti
         return None;
     }
     let dump = std::fs::read_to_string(path).ok()?;
+    Some((age.as_secs(), stall_dump_stacks(&dump)?))
+}
+
+/// The newest faulthandler `dump_traceback_later` dump in `dump`, main thread
+/// first and capped, or `None` when it holds none.
+pub(crate) fn stall_dump_stacks(dump: &str) -> Option<String> {
+    const MAX_CHARS: usize = 12_000;
     // Each dump opens with `Timeout (0:00:05)!`, then one block per thread.
     let newest = &dump[dump.rfind("Timeout (")?..];
     let mut threads: Vec<&str> = newest.split_once('\n')?.1.trim().split("\n\n").collect();
@@ -7437,7 +7443,7 @@ pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Opti
         .chain(threads)
         .collect::<Vec<_>>()
         .join("\n\n");
-    Some((age.as_secs(), stacks.chars().take(MAX_CHARS).collect()))
+    Some(stacks.chars().take(MAX_CHARS).collect())
 }
 
 /// What is piled up on the backend when a `/stats` read just failed: requests
@@ -9308,12 +9314,19 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
         );
     }
     if raw.contains("never opened port") {
-        return Some(
-            "The Headroom runtime took too long to start. \
-             On first launch, macOS Gatekeeper can scan the bundled Python runtime for ~1-2 minutes. \
+        // RUST-P1: a Windows user was told about macOS Gatekeeper.
+        let scan = if cfg!(target_os = "macos") {
+            "On first launch, macOS Gatekeeper can scan the bundled Python runtime for ~1-2 minutes. "
+        } else if cfg!(windows) {
+            "On first launch, antivirus such as Microsoft Defender can scan the bundled Python \
+             runtime for several minutes. "
+        } else {
+            ""
+        };
+        return Some(format!(
+            "The Headroom runtime took too long to start. {scan}\
              Wait a moment and click Retry. If it keeps failing, open Headroom logs from Settings."
-                .into(),
-        );
+        ));
     }
     // Incomplete/corrupted runtime: a headroom.* module is missing from the
     // installed venv (interrupted upgrade or partial extraction left an import
@@ -11809,7 +11822,13 @@ mod tests {
             /Users/x/venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms): \
             /Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 never opened port 6768 within 60000ms";
         let hint = classify_startup_error(raw).expect("timeout should classify");
-        assert!(hint.contains("Gatekeeper"), "got: {hint}");
+        // Each platform names its own scanner, never another's (RUST-P1).
+        assert_eq!(
+            hint.contains("Gatekeeper"),
+            cfg!(target_os = "macos"),
+            "got: {hint}"
+        );
+        assert_eq!(hint.contains("Defender"), cfg!(windows), "got: {hint}");
         assert!(hint.contains("Retry"));
     }
 

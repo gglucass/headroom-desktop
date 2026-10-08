@@ -109,6 +109,28 @@ impl McpInstallMethod {
 }
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
+/// When a backend that has not bound its port dumps its stacks: inside the
+/// startup timeout, with room for the interpreter's own start before the
+/// sitecustomize arms the timer.
+const STARTUP_STALL_DUMP_SECS: u64 = HEADROOM_STARTUP_TIMEOUT_MS / 1000 - 30;
+
+/// The env that arms the sitecustomize `startup_stall_dump` (RUST-P1). Windows
+/// only: unix takes the same stacks with the SIGABRT sent at the startup
+/// timeout. The dump reads other threads' frames without the GIL (why
+/// `loop_stall_dump` is opt-in), so it fires only in a backend that has not
+/// bound for `STARTUP_STALL_DUMP_SECS` and is killed at the timeout anyway.
+fn startup_stall_dump_env(stall_path: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    vec![
+        ("HEADROOM_STARTUP_STALL_DUMP", stall_path.into()),
+        (
+            "HEADROOM_STARTUP_STALL_DUMP_SECS",
+            STARTUP_STALL_DUMP_SECS.to_string().into(),
+        ),
+    ]
+}
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
@@ -399,9 +421,15 @@ Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
 Can also write the serving loop's stack to logs/loop-stall.txt when the
 event loop stalls (desktop diagnostic, RUST-86). Off unless
 HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
+
+Can also write every thread's stack to HEADROOM_STARTUP_STALL_DUMP when the
+proxy has not bound its port HEADROOM_STARTUP_STALL_DUMP_SECS after start
+(desktop diagnostic, RUST-P1). The desktop sets both on Windows only.
 """
 import faulthandler
+import os as _hd_os
 import signal
+import sys as _hd_sys
 
 # No chain=True: SIGUSR1's default disposition is terminate, and chaining
 # falls through to it after the dump -- the process must survive the dump so
@@ -414,6 +442,61 @@ except Exception:
 # Names of the patches below that bound in this process; summarized once at
 # the end (see _HD_VENDORS).
 _hd_bound = set()
+
+# --- Pre-bind stall dump (desktop diagnostic, RUST-P1) ------------------------
+# A backend that never binds its port is killed at the desktop's startup
+# timeout. On unix that kill starts with SIGABRT, so faulthandler leaves every
+# thread's stack in the log; Windows has no such signal, and RUST-P1 arrived
+# with a banner and nothing after it (the wheel sends its own records after
+# create_app only to ~/.headroom/logs/proxy-<port>.log). faulthandler's C
+# timer writes the stacks to the desktop's file instead, unless uvicorn's
+# startup returns first (port bound), which cancels it. Armed here, before any
+# vendor below imports headroom, so a stall in those imports is covered too.
+# One-shot, and it fires only in a backend that has not bound for 270s, which
+# the desktop then kills (taskkill /F), so the crash risk that keeps
+# loop_stall_dump opt-in costs nothing here; the wedge risk is handled where
+# startup cancels it.
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        # Popped: this process's timer only, never a child Python's.
+        _hd_ss_path = _hd_os.environ.pop("HEADROOM_STARTUP_STALL_DUMP", "")
+        _hd_ss_secs = _hd_os.environ.pop("HEADROOM_STARTUP_STALL_DUMP_SECS", "")
+        if _hd_ss_path:
+            # O_BINARY: see loop_stall_dump.
+            _hd_ss_fd = _hd_os.open(
+                _hd_ss_path,
+                _hd_os.O_WRONLY | _hd_os.O_CREAT | _hd_os.O_TRUNC | getattr(_hd_os, "O_BINARY", 0),
+                0o600,
+            )
+            faulthandler.dump_traceback_later(float(_hd_ss_secs), file=_hd_ss_fd)
+            import uvicorn.server as _hd_ss_uv
+
+            _hd_ss_orig_startup = _hd_ss_uv.Server.startup
+
+            async def _hd_ss_startup(self, *args, **kwargs):
+                try:
+                    return await _hd_ss_orig_startup(self, *args, **kwargs)
+                finally:
+                    # Not once the dump has begun: its GIL-free frame walk can
+                    # spin forever on a main thread that is busy running Python
+                    # (seen mid-import), and cancel waits on it with the GIL
+                    # held, which would wedge a backend that bound late. A late
+                    # bind after a spun dump keeps the spinning thread instead.
+                    # ponytail: that thread burns a core until the process
+                    # exits; a GIL-holding sampler cannot see a GIL-holding
+                    # native stall (a DLL load), which is the case this is for.
+                    try:
+                        fired = _hd_os.fstat(_hd_ss_fd).st_size > 0
+                    except OSError:
+                        fired = False
+                    if not fired:
+                        faulthandler.cancel_dump_traceback_later()
+
+            _hd_ss_uv.Server.startup = _hd_ss_startup
+            _hd_bound.add("startup_stall_dump")
+    except Exception:
+        # Never leave a timer that nothing will cancel.
+        faulthandler.cancel_dump_traceback_later()
 
 # Protect user-turn text (CLAUDE.md system-reminders) from lossy Kompress:
 # flip the coding persona back to compress_user_messages=False. Guarded so
@@ -432,9 +515,6 @@ try:
         _hd_bound.add("user_turn_verbatim")
 except Exception:
     pass
-
-import os as _hd_os
-import sys as _hd_sys
 
 # OS trust store (desktop posture, no upstream equivalent). httpx verifies
 # upstream TLS against certifi's bundle, so a corporate proxy or antivirus
@@ -3214,6 +3294,7 @@ _HD_VENDORS = (
     "ccr_tool_eager",
     "held_read_breakpoint",
     "loop_stall_dump",
+    "startup_stall_dump",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -4895,6 +4976,18 @@ impl ToolManager {
                 };
                 let log_path = logs_dir.join(format!("headroom-{variant}.log"));
                 rotate_log_if_large(&log_path);
+                // The sitecustomize pre-bind stall dump (Windows). Cleared per
+                // spawn so a dump on disk always belongs to this attempt.
+                let stall_path = logs_dir.join("startup-stall.txt");
+                let _ = std::fs::remove_file(&stall_path);
+                // From create_app on, the wheel logs every startup step to its
+                // own file and nothing to stdout/stderr, so `log_path` ends at
+                // the banner however far the start got (RUST-P1).
+                let wheel_log = crate::client_adapters::home_dir()
+                    .join(".headroom")
+                    .join("logs")
+                    .join(format!("proxy-{}.log", headroom_proxy_port()));
+                let wheel_log_from = std::fs::metadata(&wheel_log).map_or(0, |m| m.len());
                 let log_file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -5340,6 +5433,7 @@ impl ToolManager {
                 if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
                     command.env("HEADROOM_DISABLE_KOMPRESS", "1");
                 }
+                command.envs(startup_stall_dump_env(&stall_path));
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -5424,7 +5518,12 @@ impl ToolManager {
                     program: executable.display().to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     log_path: log_path.display().to_string(),
-                    log_tail: crash_log_excerpt(&log_path),
+                    log_tail: startup_failure_excerpt(
+                        &log_path,
+                        &stall_path,
+                        &wheel_log,
+                        wheel_log_from,
+                    ),
                     reason,
                 });
             }
@@ -12006,6 +12105,44 @@ fn crash_log_excerpt(path: &Path) -> String {
     }
 }
 
+/// [`crash_log_excerpt`], led by what RUST-P1 (a Windows backend that printed
+/// its banner and then nothing for 300s) arrived without: the stacks the
+/// sitecustomize pre-bind stall dump wrote for this attempt, main thread
+/// first, and the lines this attempt added to the wheel's own log (from
+/// `wheel_log_from`, its length at spawn), which name the last startup step.
+fn startup_failure_excerpt(
+    log_path: &Path,
+    stall_path: &Path,
+    wheel_log: &Path,
+    wheel_log_from: u64,
+) -> String {
+    const WHEEL_LINES: usize = 30;
+    let mut lead = String::new();
+    if let Some(stacks) = std::fs::read_to_string(stall_path)
+        .ok()
+        .as_deref()
+        .and_then(crate::state::stall_dump_stacks)
+    {
+        lead.push_str(&format!("--- startup stall stacks ---\n{stacks}\n"));
+    }
+    let wheel = crate::log_text_since(wheel_log, wheel_log_from).unwrap_or_default();
+    let wheel: Vec<&str> = wheel.lines().collect();
+    if !wheel.is_empty() {
+        let tail = wheel[wheel.len().saturating_sub(WHEEL_LINES)..]
+            .iter()
+            .map(|line| redact_sensitive(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        lead.push_str(&format!("--- proxy log (this attempt) ---\n{tail}\n"));
+    }
+    let excerpt = crash_log_excerpt(log_path);
+    if lead.is_empty() {
+        excerpt
+    } else {
+        format!("{lead}--- log ---\n{excerpt}")
+    }
+}
+
 pub(crate) fn tail_log_file(path: &Path, max_lines: usize) -> String {
     let Ok(file) = std::fs::File::open(path) else {
         return String::new();
@@ -16943,6 +17080,121 @@ asyncio.run(main())
         assert!(main.contains("hd_probe_blocks_the_loop"), "{stacks}");
     }
 
+    /// RUST-P1: a backend that never binds leaves every thread's stack in
+    /// the desktop's file; one whose uvicorn startup returns (port bound)
+    /// leaves nothing, however long it runs after that.
+    #[test]
+    fn startup_stall_dump_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        // os._exit: the desktop kills a backend that never bound, and a normal
+        // interpreter exit waits on a dump that spun (see the vendor).
+        let wedged = dir.path().join("wedged.py");
+        std::fs::write(
+            &wedged,
+            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(4)\n\n\
+             hd_probe_never_binds()\nos._exit(0)\n",
+        )
+        .unwrap();
+        // The vendor's own timer is armed at interpreter start, before the
+        // vendors' imports (a few seconds), so the bound probe re-arms a short
+        // one on the same file: startup returning must cancel whichever is set.
+        let bound = dir.path().join("bound.py");
+        std::fs::write(
+            &bound,
+            r#"import asyncio, faulthandler, os, sys, time, uvicorn
+
+async def app(scope, receive, send):
+    while scope["type"] == "lifespan":
+        message = await receive()
+        if message["type"] == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+
+async def main():
+    # A child Python must not inherit the proxy's timer.
+    assert "HEADROOM_STARTUP_STALL_DUMP" not in os.environ
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND)
+    faulthandler.dump_traceback_later(3.0, file=fd)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    time.sleep(4.0)
+    server.should_exit = True
+    await serving
+
+asyncio.run(main())
+"#,
+        )
+        .unwrap();
+        let spawn = |name: &str, probe: &std::path::Path, secs: &str| {
+            let dump = dir.path().join(format!("{name}-stall.txt"));
+            let stderr = dir.path().join(format!("{name}-stderr.txt"));
+            let child = crate::proc::command(&python)
+                .arg(probe)
+                .arg(&dump)
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STARTUP_STALL_DUMP", &dump)
+                .env("HEADROOM_STARTUP_STALL_DUMP_SECS", secs)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .expect("run probe");
+            (child, dump, stderr)
+        };
+        let runs = [spawn("wedged", &wedged, "1"), spawn("bound", &bound, "600")];
+        let started = std::time::Instant::now();
+        for (mut child, _, stderr_path) in runs {
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("probe wait") {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(180) {
+                    let _ = child.kill();
+                    panic!(
+                        "probe hung: {}",
+                        std::fs::read_to_string(&stderr_path).unwrap()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+            assert!(status.success(), "{stderr}");
+            let bound_vendors = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("INFO:headroom.desktop:sitecustomize vendors bound="))
+                .and_then(|l| l.split_once(" skipped="))
+                .map(|(bound, _)| bound.split(',').any(|v| v == "startup_stall_dump"));
+            assert_eq!(bound_vendors, Some(true), "{stderr}");
+        }
+        let dump = std::fs::read_to_string(dir.path().join("wedged-stall.txt")).unwrap();
+        assert!(dump.starts_with("Timeout (0:00:01)!"), "{dump}");
+        // Armed before the vendors' imports, so on a loaded machine the dump
+        // can catch the main thread mid-import, where the frame walk may stop
+        // short (the spin the vendor guards against). It still names a frame.
+        let stacks = crate::state::stall_dump_stacks(&dump).expect("parsable dump");
+        let main = stacks.split("\n\n").next().unwrap();
+        assert!(
+            main.starts_with("Thread 0x") && main.contains("  File \""),
+            "{stacks}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bound-stall.txt")).unwrap(),
+            ""
+        );
+    }
+
     #[test]
     fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
         let python =
@@ -16977,6 +17229,8 @@ asyncio.run(main())
         assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
         // Opt-in only: its all-threads dump can crash or wedge a busy backend.
         assert!(skipped.contains("loop_stall_dump"), "{}", proxy[0]);
+        // Windows spawns only: unix takes its stacks with SIGABRT.
+        assert!(skipped.contains("startup_stall_dump"), "{}", proxy[0]);
         let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
         assert!(
             off.len() == 1
@@ -19046,6 +19300,77 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         // No dump: plain tail, no marker section.
         std::fs::write(&log, "just\na\nlog\n").unwrap();
         assert_eq!(super::crash_log_excerpt(&log), "just\na\nlog");
+    }
+
+    /// The GIL-free dump arms only on Windows, and fires inside the window
+    /// where the backend is about to be killed regardless.
+    #[test]
+    fn startup_stall_dump_arms_only_on_windows_and_only_before_the_kill() {
+        let env = super::startup_stall_dump_env(Path::new("startup-stall.txt"));
+        assert_eq!(env.is_empty(), !cfg!(windows), "{env:?}");
+        let ms = super::STARTUP_STALL_DUMP_SECS * 1000;
+        assert!(
+            (super::HEADROOM_STARTUP_TIMEOUT_MS * 9 / 10..super::HEADROOM_STARTUP_TIMEOUT_MS)
+                .contains(&ms),
+            "{ms}"
+        );
+    }
+
+    /// RUST-P1: a Windows backend that printed its banner and nothing else
+    /// for 300s. The pre-bind dump leads the report, main thread first, then
+    /// what this attempt wrote to the wheel's own log.
+    #[test]
+    fn startup_failure_excerpt_leads_with_the_pre_bind_stall_stacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("headroom-proxy.log");
+        let stall = dir.path().join("startup-stall.txt");
+        let wheel = dir.path().join("proxy-6768.log");
+        std::fs::write(&log, "banner\nproxy-6768.log owner-only warning\n").unwrap();
+        let earlier_run = "12:00:00 - headroom.proxy - INFO - an earlier run's line\n";
+        std::fs::write(&wheel, earlier_run).unwrap();
+        let from = earlier_run.len() as u64;
+        let excerpt = |from| super::startup_failure_excerpt(&log, &stall, &wheel, from);
+        // No dump file (port bound, or not Windows), nothing new in the
+        // wheel log: the plain excerpt.
+        assert_eq!(excerpt(from), super::crash_log_excerpt(&log));
+        // Truncated at arm, never fired.
+        std::fs::write(&stall, "").unwrap();
+        assert_eq!(excerpt(from), super::crash_log_excerpt(&log));
+        std::fs::write(
+            &wheel,
+            format!(
+                "{earlier_run}12:05:00 - headroom.proxy - INFO - Pre-loading compressors and \
+                 parsers...\n"
+            ),
+        )
+        .unwrap();
+        // faulthandler's layout: one block per thread, the main thread last.
+        std::fs::write(
+            &stall,
+            "Timeout (0:04:30)!\nThread 0x2 (most recent call first):\n  \
+             File \"threading.py\", line 3 in wait\n\n\
+             Thread 0x1 (most recent call first):\n  \
+             File \"server.py\", line 2151 in startup\n",
+        )
+        .unwrap();
+        let excerpt = excerpt(from);
+        assert!(
+            excerpt.starts_with("--- startup stall stacks ---\nThread 0x1"),
+            "{excerpt}"
+        );
+        assert!(excerpt.contains("in wait"), "{excerpt}");
+        assert!(
+            excerpt.contains(
+                "in wait\n--- proxy log (this attempt) ---\n12:05:00 - headroom.proxy - INFO - \
+                 Pre-loading compressors and parsers...\n--- log ---\n"
+            ),
+            "{excerpt}"
+        );
+        assert!(!excerpt.contains("earlier run"), "{excerpt}");
+        assert!(
+            excerpt.ends_with("--- log ---\nbanner\nproxy-6768.log owner-only warning"),
+            "{excerpt}"
+        );
     }
 
     /// Verbatim from RUST-BA (Windows, 0.9.16): the base stdlib's

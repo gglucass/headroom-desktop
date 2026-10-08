@@ -7068,7 +7068,7 @@ fn handle_crash_guard_flag() {
 /// The app log written since `from` (its length when the guard started), at
 /// most the last 256 KiB. A log shorter than `from` was rotated meanwhile, so
 /// all of it is new.
-fn log_text_since(log: &Path, from: u64) -> Option<String> {
+pub(crate) fn log_text_since(log: &Path, from: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(log).ok()?;
     let len = file.metadata().ok()?.len();
