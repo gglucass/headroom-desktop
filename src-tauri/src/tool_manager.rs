@@ -3345,6 +3345,81 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's relocation (the pre-vendor behaviour).
         pass
 
+# --- web_search_call history on a request without a web_search tool ----------
+# Codex compacts locally for a custom provider such as Headroom's: it resends
+# the whole history with `tools: []` and asks for a summary. When that history
+# holds a hosted `web_search_call` item, the ChatGPT backend answers 200 and
+# then the in-band error "response protection is unavailable". Codex ignores
+# in-band `error` events, sees the stream end ("stream closed before
+# response.completed"), retries the same body five times, and runs the same
+# compaction before every later prompt, so the session never answers again.
+# Measured 2026-10-08 straight against chatgpt.com, no Headroom in the path: a
+# captured compaction request failed as sent and completed with its 10
+# web_search_call items dropped; a normal turn on the same history (which
+# declares the tool) is unaffected. Codex on the built-in OpenAI provider uses
+# remote compaction instead, so only users of a custom provider hit it. The
+# vendor drops web_search_call items from a Responses `input` whose `tools`
+# declare no web_search tool, where every forwarder picks its outbound bytes,
+# and marks the body mutated so the edit is sent. Only the search action (query
+# or URL) leaves the history; its results were never in it. Exact-pin gated to
+# wheel 0.39.0; a no-op on any body without such items.
+# Kill switch: HEADROOM_WEB_SEARCH_HISTORY=0.
+_hd_wsh_flag = _hd_os.environ.get("HEADROOM_WEB_SEARCH_HISTORY", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_wsh_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_wsh_meta
+
+        if _hd_wsh_meta.version("headroom-ai") == "0.39.0":
+            import logging as _hd_wsh_logging
+
+            from headroom.proxy import body_forwarding as _hd_wsh_mod
+
+            _hd_wsh_orig = _hd_wsh_mod.select_outbound_body
+            _hd_wsh_log = _hd_wsh_logging.getLogger("headroom.proxy")
+
+            def _hd_wsh_strip(body):
+                items = body.get("input") if isinstance(body, dict) else None
+                if not isinstance(items, list):
+                    return 0
+                tools = body.get("tools")
+                if isinstance(tools, list) and any(
+                    isinstance(t, dict) and str(t.get("type") or "").startswith("web_search")
+                    for t in tools
+                ):
+                    return 0
+                kept = [
+                    i
+                    for i in items
+                    if not (isinstance(i, dict) and i.get("type") == "web_search_call")
+                ]
+                if len(kept) == len(items):
+                    return 0
+                body["input"] = kept
+                return len(items) - len(kept)
+
+            def _hd_wsh_select(*, body, original_body_bytes, body_mutated, **kwargs):
+                dropped = _hd_wsh_strip(body)
+                if dropped:
+                    body_mutated = True
+                    _hd_wsh_log.info(
+                        "event=web_search_history dropped=%d (no web_search tool declared)",
+                        dropped,
+                    )
+                return _hd_wsh_orig(
+                    body=body,
+                    original_body_bytes=original_body_bytes,
+                    body_mutated=body_mutated,
+                    **kwargs,
+                )
+
+            _hd_wsh_mod.select_outbound_body = _hd_wsh_select
+            _hd_bound.add("web_search_history")
+    except Exception:
+        # Fail-open to the wheel's forwarding (the pre-vendor behaviour).
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3466,6 +3541,7 @@ _HD_VENDORS = (
     "stream_uncached_input",
     "ccr_tool_eager",
     "held_read_breakpoint",
+    "web_search_history",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -18837,6 +18913,69 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
             off_stdout.contains("FAIL hrb bound")
                 && off_stdout.contains("FAIL every turn keeps the client's breakpoints"),
             "HEADROOM_HELD_READ_BREAKPOINT=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
+    }
+
+    #[test]
+    fn web_search_history_behaves_against_the_installed_wheel() {
+        // A Codex compaction request (`tools: []`) goes out without its
+        // web_search_call items, through both outbound pickers; a turn that
+        // declares web_search keeps them and its client bytes. The kill switch
+        // forwards the client's bytes throughout.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-web-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, sitecustomize\n\
+                     from headroom.proxy import body_forwarding as bf\n\
+                     WS = {'type': 'web_search_call', 'id': 'ws_1', 'status': 'completed',\n\
+                     \x20     'action': {'type': 'search', 'query': 'q'}}\n\
+                     MSG = {'type': 'message', 'role': 'user',\n\
+                     \x20      'content': [{'type': 'input_text', 'text': 'hi'}]}\n\
+                     def body(tools):\n\
+                     \x20   return {'model': 'gpt-6.1-sol', 'input': [MSG, WS, MSG], 'tools': tools}\n\
+                     def ws(raw):\n\
+                     \x20   return [i['type'] for i in json.loads(raw)['input']].count('web_search_call')\n\
+                     def pick(tools):\n\
+                     \x20   b = body(tools)\n\
+                     \x20   o = bf.select_outbound_body(body=b, original_body_bytes=json.dumps(b).encode(),\n\
+                     \x20       body_mutated=False)\n\
+                     \x20   return ws(o.content), o.source\n\
+                     b = body([])\n\
+                     raw, _ = bf.prepare_outbound_body_bytes(body=b,\n\
+                     \x20   original_body_bytes=json.dumps(b).encode(), body_mutated=False)\n\
+                     print(*pick([]), *pick([{'type': 'web_search'}]), ws(raw),\n\
+                     \x20     'web_search_history' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_WEB_SEARCH_HISTORY", kill)
+                .output()
+                .expect("run web search history probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: web search history vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "0 canonical 1 passthrough 0 True", "stderr:\n{on_err}");
+        assert_eq!(
+            off, "1 passthrough 1 passthrough 1 False",
+            "stderr:\n{off_err}"
         );
     }
 
