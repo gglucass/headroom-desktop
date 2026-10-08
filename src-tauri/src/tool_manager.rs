@@ -1813,12 +1813,12 @@ if _hd_os.environ.get(
 # "No such tool available: headroom_retrieve" and the model never gets the
 # content. On one machine 484 of 501 such leaks were mixed turns, 435 of them
 # in subagents. The client calls have not run yet, so drop them, serve the
-# retrieval in the continuation as for a lone call, and let the model re-issue
-# them there. They count as delivered only when a continuation re-issues every
-# one with the same name and arguments; otherwise (text answer, changed input,
-# failed continuation) the client gets the model's own turn back, the wheel's
-# behaviour, so no client call is lost. A headroom_retrieve without a valid
-# hash keeps the turn unchanged. Anthropic and OpenAI chat only (a Responses
+# retrieval in the continuation as for a lone call, and let the model decide
+# again there. The continuation is what the client gets, whatever it does:
+# re-issue the calls, change them, or withdraw them (handing back the original
+# turn instead delivered a call the model had cancelled). Only a failed
+# continuation request hands back the model's own turn, the wheel's behaviour.
+# A headroom_retrieve without a valid hash keeps the turn unchanged. Anthropic and OpenAI chat only (a Responses
 # function_call or a Gemini functionCall part can be load-bearing for
 # reasoning). Upstream PR #4034's hunks applied verbatim to the installed
 # method's source, its tool_calls helpers copied below. Fewer leaked pairs
@@ -1848,14 +1848,6 @@ if _hd_os.environ.get(
 
             _hd_cmt_hunks = (
                 (
-                    "    rounds = 0\n",
-                    "    rounds = 0\n"
-                    "    # A mixed turn whose client calls were dropped, and those calls, until\n"
-                    "    # a continuation re-issues them.\n"
-                    "    mixed_turn: dict[str, Any] | None = None\n"
-                    "    reissue: list[str] = []\n",
-                ),
-                (
                     "        # If the model called CCR alongside non-CCR tools, we cannot build\n"
                     "        # a valid continuation \u2014 every tool_use in the assistant message\n"
                     "        # requires a matching tool_result, but we only have CCR results.\n"
@@ -1873,12 +1865,14 @@ if _hd_os.environ.get(
                     '        # headroom_retrieve", so the model never gets the content), and a\n'
                     "        # continuation needs a tool_result for every tool_use. The client\n"
                     "        # calls have not run yet, so drop them and serve the retrieval now;\n"
-                    "        # the model re-issues them, content in hand, in the continuation.\n"
-                    "        # They count as delivered only if it re-issues every one unchanged;\n"
-                    "        # otherwise the client gets this turn back below. A CCR-named call\n"
-                    "        # without a valid hash, or a provider where dropping a sibling is\n"
-                    "        # not safe (see drop_tool_calls), keeps the turn as it is for the\n"
-                    "        # client to resolve.\n"
+                    "        # the model decides again, content in hand, in the continuation.\n"
+                    "        # That continuation replaces this turn whatever it does: re-issue\n"
+                    "        # the calls, change them or drop them. Only a failed continuation\n"
+                    "        # hands this turn back (below), since the model made no newer\n"
+                    "        # decision. A CCR-named call without a valid hash, or a provider\n"
+                    "        # where dropping a sibling is not safe (see drop_tool_calls), keeps\n"
+                    "        # the turn as it is for the client to resolve.\n"
+                    "        mixed_turn: dict[str, Any] | None = None\n"
                     "        if other_calls:\n"
                     "            trimmed = (\n"
                     "                current_response\n"
@@ -1900,24 +1894,19 @@ if _hd_os.environ.get(
                     "                len(other_calls),\n"
                     "            )\n"
                     "            mixed_turn = current_response\n"
-                    "            reissue = [tool_call_signature(c) for c in other_calls]\n"
                     "            current_response = trimmed\n",
                 ),
                 (
-                    "            break\n\n    if rounds >= self.config.max_retrieval_rounds:\n",
-                    "            break\n\n"
-                    "        if reissue:\n"
-                    "            _, reissued = self._parse_ccr_tool_calls(current_response, provider)\n"
-                    "            if not reissues_tool_calls(reissued, reissue):\n"
-                    "                break\n"
-                    "            reissue = []\n\n"
-                    "    if reissue and mixed_turn is not None:\n"
-                    "        logger.info(\n"
-                    '            "CCR: the client call(s) dropped for retrieval were not re-issued; "\n'
-                    '            "returning the model\'s own turn for the client to resolve"\n'
-                    "        )\n"
-                    "        return mixed_turn\n\n"
-                    "    if rounds >= self.config.max_retrieval_rounds:\n",
+                    "            # Return the response we had (with unhandled CCR calls)\n"
+                    "            # The client will see the tool_use and might handle it differently\n"
+                    "            break\n",
+                    "            # Return the response we had (with unhandled CCR calls)\n"
+                    "            # The client will see the tool_use and might handle it differently.\n"
+                    "            # For a mixed turn that is the model's own turn, client calls\n"
+                    "            # included (#839), never the trimmed one that lost them.\n"
+                    "            if mixed_turn is not None:\n"
+                    "                current_response = mixed_turn\n"
+                    "            break\n",
                 ),
             )
             _hd_cmt_src = _hd_cmt_textwrap.dedent(
@@ -1926,10 +1915,7 @@ if _hd_os.environ.get(
             if not hasattr(_hd_cmt_mod, "drop_tool_calls") and all(
                 _hd_cmt_src.count(old) == 1 for old, _ in _hd_cmt_hunks
             ):
-                import json as _hd_cmt_json
-                from collections import Counter as _hd_cmt_counter
-
-                # #4034's ccr.tool_calls helpers, verbatim.
+                # #4034's ccr.tool_calls helper, verbatim.
                 def _hd_cmt_drop(response, provider, calls):
                     drop = {id(call) for call in calls}
                     if provider == "anthropic":
@@ -1946,25 +1932,6 @@ if _hd_os.environ.get(
                                 return {**response, "choices": [first, *choices[1:]]}
                     return response
 
-                def _hd_cmt_signature(tool_call):
-                    function = tool_call.get("function")
-                    if isinstance(function, dict):
-                        name, arguments = function.get("name"), function.get("arguments")
-                        if isinstance(arguments, str):
-                            try:
-                                arguments = _hd_cmt_json.loads(arguments)
-                            except ValueError:
-                                pass
-                    else:
-                        name, arguments = tool_call.get("name"), tool_call.get("input")
-                    return _hd_cmt_json.dumps([name, arguments], sort_keys=True, default=str)
-
-                def _hd_cmt_reissues(calls, signatures):
-                    return not (
-                        _hd_cmt_counter(signatures)
-                        - _hd_cmt_counter(_hd_cmt_signature(c) for c in calls)
-                    )
-
                 for _hd_cmt_old, _hd_cmt_new in _hd_cmt_hunks:
                     _hd_cmt_src = _hd_cmt_src.replace(_hd_cmt_old, _hd_cmt_new)
                 _hd_cmt_ns = {}
@@ -1974,8 +1941,6 @@ if _hd_os.environ.get(
                     _hd_cmt_ns,
                 )
                 _hd_cmt_mod.drop_tool_calls = _hd_cmt_drop
-                _hd_cmt_mod.tool_call_signature = _hd_cmt_signature
-                _hd_cmt_mod.reissues_tool_calls = _hd_cmt_reissues
                 _hd_cmt_mod.is_ccr_tool_call = _hd_cmt_tc.is_ccr_tool_call
                 _hd_cmt_mod.CCRResponseHandler.handle_response = _hd_cmt_ns["handle_response"]
                 _hd_bound.add("ccr_mixed_turn")
@@ -19066,9 +19031,10 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         // available: headroom_retrieve"); the vendor serves the retrieval in a
         // continuation carrying only the retrieve pair and returns the
         // continuation, where the model re-issued the Read. A continuation
-        // that answers without re-issuing it hands back the model's own turn,
-        // so the Read still reaches the client. A Responses turn keeps the
-        // pass-through; the kill switch restores the wheel's.
+        // that withdraws the Read is the answer too: handing back the model's
+        // own turn would run a call it cancelled. Only a failed continuation
+        // hands that turn back. A Responses turn keeps the pass-through; the
+        // kill switch restores the wheel's.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -19096,9 +19062,13 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
                      async def done(m, t):\n\
                      \x20   return {'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}\n\
                      back = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, done, 'anthropic'))\n\
+                     async def fail(m, t):\n\
+                     \x20   raise RuntimeError('upstream down')\n\
+                     failed = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, fail, 'anthropic'))\n\
                      print(len(sent), [b['id'] for b in out['content']],\n\
                      [b['id'] for b in sent[0][0]['content']] if sent else '-',\n\
-                     '[1,2,3]' in json.dumps(sent[0][1:]) if sent else '-', kept is resp, back is mixed)";
+                     '[1,2,3]' in json.dumps(sent[0][1:]) if sent else '-', kept is resp,\n\
+                     [b.get('text', b.get('id')) for b in back['content']], failed is mixed)";
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
                 .args(["-c", probe])
@@ -19115,14 +19085,14 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         };
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
-        let served = "1 ['b2'] ['r'] True True True";
+        let served = "1 ['b2'] ['r'] True True ['Done'] True";
         if off == served {
             eprintln!("skipping: the wheel already serves a mixed retrieve; drop the vendor");
             return;
         }
         assert_eq!(on, served, "stderr:\n{on_err}");
         assert_eq!(
-            off, "0 ['r', 'b'] - - True True",
+            off, "0 ['r', 'b'] - - True ['r', 'b'] True",
             "kill switch did not unbind:\n{off_err}"
         );
     }
