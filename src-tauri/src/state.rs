@@ -4762,7 +4762,12 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
-    files.sort_by_key(|path| {
+    // Cached: each mtime is read once. sort_by_key re-reads the key on every
+    // comparison, and these are live transcripts, appended to (or briefly
+    // locked, on Windows) mid-sort, so one file could compare both older and
+    // newer than another and the sort panicked "does not correctly implement
+    // a total order" (RUST-P3).
+    files.sort_by_cached_key(|path| {
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
             .ok()
@@ -10849,6 +10854,30 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_jsonl_files_list_oldest_first() {
+        // RUST-P3 changed how the mtimes are read (once each); the order the
+        // learn scan relies on stays oldest-first, jsonl only.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now();
+        for (name, age_secs) in [("b.jsonl", 10), ("a.jsonl", 30), ("c.jsonl", 0)] {
+            let path = dir.path().join(name);
+            fs::write(&path, "{}\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age_secs))
+                .unwrap();
+        }
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        let names: Vec<_> = super::list_session_jsonl_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.jsonl", "b.jsonl", "c.jsonl"]);
+    }
 
     #[test]
     fn cache_integrity_report_is_allowlisted_and_throttled() {
