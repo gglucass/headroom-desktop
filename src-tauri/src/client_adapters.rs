@@ -801,9 +801,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             } else if claude_guard_registered_any_interpreter()? {
                 checks.push(CLAUDE_GUARD_STALE_COMMAND.into());
             } else {
-                failures.push(
-                    "Headroom routing guard was not found in ~/.claude/settings.json.".into(),
-                );
+                failures.push(CLAUDE_GUARD_NOT_FOUND.into());
             }
         }
         "vscode" => {
@@ -1062,6 +1060,35 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
     (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
 }
 
+/// A second lone guard loss inside this is a fight with another writer.
+const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether a repair that came back clean pages Sentry. Every cause does except
+/// the Claude guard entry alone gone with ANTHROPIC_BASE_URL intact (RUST-GS):
+/// apply and disable land settings.json in one write (`coalesce_writes`), so
+/// that shape is an outside edit (the hook deleted from /hooks, a tool or a
+/// stale Claude Code session rewriting the file), and the re-apply undid it.
+/// Only a repeat within a day pages: 13 of 16 hosts (2026-09-18..10-08) lost
+/// it once; the other three again after 1.5h, 11.8h and 21.7h. The last loss
+/// is a marker's mtime, so the repeat survives a restart (the 11.8h one spans
+/// a night).
+fn repair_pages(silent_failures: &[String]) -> bool {
+    if silent_failures != [CLAUDE_GUARD_NOT_FOUND] {
+        return true;
+    }
+    let marker = config_file(&app_data_dir(), "claude-guard-lost");
+    let repeat = std::fs::metadata(&marker)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| {
+            at.elapsed()
+                .map_or(true, |age| age < GUARD_LOSS_REPEAT_WINDOW)
+        });
+    if let Err(err) = atomic_write(&marker, b"") {
+        log::info!("recording a Claude guard loss failed: {err:#}");
+    }
+    repeat
+}
+
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
 /// true only when a silently broken config came back clean. A version restamp
 /// re-applies too but returns false: it is every client on every update, so
@@ -1075,7 +1102,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     // Only a failed check means a config broke silently. A version restamp
     // is every client on every update, and its text carries the version, so
     // reporting it opened four new issues per release (RUST-J5..J8).
-    let silently_broken = !broken.is_empty();
+    let silent_failures = broken.clone();
     // Managed files written by another app version verify fine (the routing
     // export is still there) but are a different generation from what this
     // build's scripts and hooks expect. Re-apply so an update carries them.
@@ -1112,8 +1139,11 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
             // of them meant nothing. One issue per client, from here.
             log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
-            if !silently_broken {
+            if silent_failures.is_empty() {
                 return false;
+            }
+            if !repair_pages(&silent_failures) {
+                return true;
             }
             // WHICH check failed, in the fingerprint and in full as an
             // extra. Grouping on the client alone said only "codex_cli
@@ -7531,6 +7561,8 @@ fn claude_guard_registered_any_interpreter() -> Result<bool> {
     )
 }
 
+const CLAUDE_GUARD_NOT_FOUND: &str =
+    "Headroom routing guard was not found in ~/.claude/settings.json.";
 const CLAUDE_GUARD_SCRIPT_MISSING: &str =
     "Headroom routing guard script was missing from ~/.claude/hooks.";
 const CLAUDE_GUARD_STALE_COMMAND: &str =
@@ -15176,6 +15208,43 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             missing.failures,
             vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()]
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_lone_claude_guard_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-GS: the guard entry gone with the env intact is an outside edit
+        // the repair undoes. One pages nothing; another within a day pages.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
+        let settings = home.path().join(".claude").join("settings.json");
+        let script = super::claude_guard_hook_path().display().to_string();
+        super::remove_guard_hook_entries(&settings, &script, false, None).unwrap();
+
+        let lost = super::verify_client_setup("claude_code")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+
+        let marker = super::config_file(&super::app_data_dir(), "claude-guard-lost");
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(25 * 3600))
+            .unwrap();
+        assert!(
+            !super::repair_pages(&lost),
+            "a day later it is a first loss"
+        );
+
+        let other = vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()];
+        assert!(super::repair_pages(&other), "any other cause pages");
+        assert!(super::repair_client_setup_now("claude_code"));
+        assert!(super::claude_guard_registered().unwrap(), "guard back");
     }
 
     #[test]
