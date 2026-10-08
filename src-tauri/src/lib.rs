@@ -8897,11 +8897,16 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 /// "There's an issue with the selected model (zen/claude-opus-5-5). It may not
 /// exist or you may not have access to it. Run /model to pick a different
 /// model."), with the model name in the line.
+///
+/// So is a model the user's Codex config selects that their ChatGPT plan
+/// does not include (RUST-NM: `ERROR: {"detail":"The 'gpt-5.6-sol' model is
+/// not supported when using Codex with a ChatGPT account."}`).
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     lowered.contains("unrecognized_model")
         || lowered.contains("does not support this model")
         || lowered.contains("issue with the selected model")
+        || lowered.contains("model is not supported when using codex")
 }
 
 /// True when a `headroom learn` failure was the agent CLI exhausting its own
@@ -15653,6 +15658,10 @@ Some unrelated content.
         // RUST-KE verbatim: a model name the backend does not know.
         assert!(learn_failure_is_agent_model_rejected(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages` failed (exit 1):\nThere's an issue with the selected model (zen/claude-opus-5-5). It may not exist or you may not have access to it. Run /model to pick a different model."
+        ));
+        // RUST-NM verbatim: a Codex model the user's ChatGPT plan lacks.
+        assert!(learn_failure_is_agent_model_rejected(
+            "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\nERROR: {\"detail\":\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\"}"
         ));
         // These must keep reporting: they are ours to fix (or transient).
         for stderr in [
