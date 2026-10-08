@@ -60,6 +60,8 @@ serial_test = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
+# Already in the tree via tauri; used to mark the login LaunchAgent Interactive.
+plist = "1"
 # system-proxy: honor the System Settings proxy, not only *_PROXY env; via the
 # shared hyper-util feature it also reaches the updater's reqwest 0.13. Not on
 # Windows: hyper-util parses HKCU ProxyServer raw, and the values real machines

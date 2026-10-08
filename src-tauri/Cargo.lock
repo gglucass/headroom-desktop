@@ -1814,6 +1814,7 @@ dependencies = [
  "mac-notification-sys",
  "os_info",
  "parking_lot",
+ "plist",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "rusqlite",
