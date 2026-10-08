@@ -9863,8 +9863,19 @@ fn windows_process_sweep_script(
     } else {
         String::new()
     };
+    // Skip WMI when nothing runs from the exe, the common case: stop_headroom
+    // has just killed the child it holds. Every CommandLine-only match is a
+    // child of a venv or console-script launcher whose image IS that path, and
+    // the launcher's job object keeps it alive exactly as long as the child,
+    // so an image-path miss means the CIM query would match nothing either.
+    // On some Windows hosts that query alone outran the 20s bound at quit and
+    // update (RUST-K3, ~60 hosts). A throwing Get-Process leaves `$hit` set
+    // and the CIM query runs as before.
     format!(
-        "$me = {self_pid}; try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
+        "$me = {self_pid}; $hit = $true; try {{ $hit = [bool](Get-Process \
+         | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }}) }} \
+         catch {{ }}; if (-not $hit) {{ exit 0 }}; \
+         try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
@@ -15103,8 +15114,13 @@ mod tests {
                 super::windows_process_sweep_script(exe, args, std::process::id(), parents);
             for (label, prefix) in [
                 ("wmi", ""),
-                // The fallback path, and both of its exits.
+                // Nothing runs from the exe: the prefilter exits before WMI.
                 ("no-wmi", "function Get-CimInstance { throw 'broken' }; "),
+                // A process does: the CIM query runs, then the fallback path.
+                (
+                    "no-wmi-candidate",
+                    r"function Get-CimInstance { throw 'broken' }; function Get-Process { [pscustomobject]@{ Id = 1; Path = 'C:\headroom-sweep-test\none\headroom.exe' } }; ",
+                ),
                 (
                     "no-wmi-no-get-process",
                     "function Get-CimInstance { throw 'broken' }; function Get-Process { throw 'broken' }; ",
@@ -15119,8 +15135,8 @@ mod tests {
                 assert!(!stderr.contains("ParserError"), "{label} {args:?}: {stderr}\n{script}");
                 let fallback = matches!(parents, super::SweepParents::Any) && args.is_empty();
                 let want = match label {
-                    "wmi" => 0,
-                    "no-wmi" if fallback => 0,
+                    "wmi" | "no-wmi" => 0,
+                    "no-wmi-candidate" if fallback => 0,
                     _ => super::PS_SWEEP_ENUMERATION_FAILED,
                 };
                 assert_eq!(output.status.code(), Some(want), "{label} {args:?}: {stderr}\n{script}");
@@ -15142,7 +15158,17 @@ mod tests {
             4242,
             super::SweepParents::Orphans { own_children: true },
         );
-        assert!(held.starts_with("$me = 4242; try {"), "{held}");
+        assert!(
+            held.starts_with("$me = 4242; $hit = $true; try {"),
+            "{held}"
+        );
+        // RUST-K3: nothing running from the exe skips the CIM query.
+        assert!(
+            held.contains(
+                r"-and $_.Path -like '*C:\Users\a\venv\Scripts\headroom.exe*' }) } catch { }; if (-not $hit) { exit 0 }; try { Get-CimInstance"
+            ),
+            "{held}"
+        );
         assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
         assert!(
             held.contains("($_.ParentProcessId -eq $me -and $true)"),
