@@ -185,7 +185,11 @@ static LOCAL_CONNECTION_FILTER_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 /// so a client that gave up on a slow backend never counts as a filter.
 const READYZ_FILTER_RESET_WINDOW: Duration = Duration::from_secs(1);
 const LOCAL_CONNECTION_FILTER_HINT_TTL_SECS: u64 = 15 * 60;
-const LOCAL_CONNECTION_FILTER_HINT: &str = "Something on this computer is cutting your coding tools' connections to Headroom on port 6767, so some of their requests fail. This is usually a traffic filter such as AdGuard (App management) or antivirus web protection: turn off filtering for Headroom in it, then restart Headroom. Contact support@extraheadroom.com if you need help.";
+/// Says only what was measured; the dashboard links docs/troubleshooting for
+/// the per-product fixes. Those live on the website because they change faster
+/// than releases: the first in-app fix ("exclude Headroom in AdGuard") turned
+/// out not to work two days later, the network driver did.
+const LOCAL_CONNECTION_FILTER_HINT: &str = "Something on this computer is cutting your coding tools' connections to Headroom, so some of their requests fail. A traffic filter, antivirus or VPN is the usual cause.";
 
 /// Local log lines per failure kind and process before going quiet; Sentry
 /// carries the totals.
@@ -4882,7 +4886,10 @@ mod tests {
             relay(Some("ConnectionReset (os error 10054)"), true, 12);
             relay(None, false, 3);
         }
-        assert!(super::local_connection_filter_hint().is_some_and(|h| h.contains("AdGuard")));
+        assert_eq!(
+            super::local_connection_filter_hint(),
+            Some(super::LOCAL_CONNECTION_FILTER_HINT)
+        );
 
         super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(
             super::now_epoch_secs() - super::LOCAL_CONNECTION_FILTER_HINT_TTL_SECS - 1,

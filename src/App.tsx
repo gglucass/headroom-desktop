@@ -589,6 +589,8 @@ const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
 const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
 
 const DOCS_URL = "https://extraheadroom.com/docs";
+const CONNECTION_TROUBLESHOOTING_URL =
+  "https://extraheadroom.com/docs/troubleshooting#connections-cut";
 
 const APPSUMO_ACCOUNT_URL = "https://appsumo.com/account/products/";
 
@@ -7023,7 +7025,24 @@ export default function App() {
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
                 {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded" || calloutBanner.tone === "auto-paused") ? (
-                  <p className="callout-banner__subtitle">{runtimeIssueDetail}</p>
+                  <p className="callout-banner__subtitle">
+                    {runtimeIssueDetail}
+                    {/* The causes and their fixes change faster than releases, so they live in the docs. */}
+                    {runtimeStatus?.localConnectionFilterHint &&
+                    runtimeIssues[0] === runtimeStatus.localConnectionFilterHint ? (
+                      <>
+                        {" "}
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => openLinkFromClick(CONNECTION_TROUBLESHOOTING_URL)}
+                        >
+                          See Troubleshooting
+                        </button>
+                        .
+                      </>
+                    ) : null}
+                  </p>
                 ) : null}
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">
