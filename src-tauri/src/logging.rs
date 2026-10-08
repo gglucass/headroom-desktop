@@ -1818,7 +1818,7 @@ mod tests {
         let path = dir.join("state.json");
         std::fs::write(&path, b"{}").unwrap();
         let chflags = |flag: &str| {
-            assert!(std::process::Command::new("chflags")
+            assert!(crate::proc::command("chflags")
                 .arg(flag)
                 .arg(&path)
                 .status()
