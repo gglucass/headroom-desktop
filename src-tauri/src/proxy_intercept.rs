@@ -2737,6 +2737,12 @@ async fn splice_with_codex_capture(
         // Report only: a 2xx outcome never reads the body (codex_prompt_failed).
         if status.is_some_and(|s| (200..300).contains(&s)) && streamed.failed() {
             error_body = streamed.failure_body();
+            // Local only (info never reaches Sentry): the one trace a provider
+            // failure the canary skips leaves.
+            log::info!(
+                "codex stream failed in-band on {req_path}: {}",
+                codex_error_summary(&error_body)
+            );
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -2762,7 +2768,9 @@ async fn splice_with_codex_capture(
 /// missing-bearer 401s. A response that never started because the client left
 /// first is a cancel. A 5xx the provider wrote itself is its outage, which
 /// Headroom neither caused nor can fix: RUST-KN escalated on 2026-10-04 for
-/// OpenAI's `cave_upstream_unreachable` 502s and a Cloudflare 502 page.
+/// OpenAI's `cave_upstream_unreachable` 502s and a Cloudflare 502 page. The
+/// same holds for a 200 stream the provider failed in-band with one of its own
+/// codes (`provider_failed_turn`, RUST-NY).
 fn codex_prompt_failed(
     status: Option<u16>,
     stream_failed: bool,
@@ -2770,7 +2778,13 @@ fn codex_prompt_failed(
     error_body: &[u8],
 ) -> Option<bool> {
     match status {
-        Some(200..=299) => Some(stream_failed),
+        Some(200..=299) if !stream_failed => Some(false),
+        Some(200..=299)
+            if provider_failed_turn(error_body) || backend_could_not_reach_provider(error_body) =>
+        {
+            None
+        }
+        Some(200..=299) => Some(true),
         Some(400..=499) => None,
         Some(_) if provider_wrote_error(error_body) => None,
         Some(_) if backend_could_not_reach_provider(error_body) => None,
@@ -2812,6 +2826,43 @@ fn provider_wrote_error(body: &[u8]) -> bool {
 
 /// The backend's streaming error frame, chunked by uvicorn so never JSON.
 const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
+
+/// Whether a 200 stream's failure (`CodexTerminalReader::failure_body`) is the
+/// provider's verdict on the turn: an OpenAI error code from
+/// `response.failed`'s `response.error`, or from its in-band `error` event
+/// (`{"type":"error","error":{"type":"server_error","code":"request_timeout"}}`,
+/// openai/codex#51886). RUST-NY: 46 hosts on every release from 0.9.27 to
+/// 0.9.36 hit ten failed streams in a row from the same minute (2026-10-07
+/// 21:06 UTC), OpenAI's Codex incident day. The backend's own frames
+/// (`api_error`, the residual-CCR one) carry no code, and `invalid_prompt`
+/// could be a body we built, so those keep counting.
+fn provider_failed_turn(body: &[u8]) -> bool {
+    /// The codes Codex itself classifies (codex-api `responses_error.rs`) as
+    /// overload, rate limit, quota, context window or content policy, plus
+    /// OpenAI's generic `server_error` and the backend's stream `request_timeout`.
+    const PROVIDER_CODES: &[&str] = &[
+        "server_error",
+        "server_is_overloaded",
+        "slow_down",
+        "rate_limit_exceeded",
+        "request_timeout",
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "usage_not_included",
+        "context_length_exceeded",
+        "cyber_policy",
+        "bio_policy",
+        "misalignment_policy_violation",
+    ];
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|json| {
+        json["error"]["code"]
+            .as_str()
+            .or(json["code"].as_str())
+            .is_some_and(|code| PROVIDER_CODES.contains(&code))
+    })
+}
 
 /// The backend could not reach the provider at all: wheel 0.39.0's
 /// `connection_error`, on its passthrough JSON 502 or its streaming
@@ -6553,6 +6604,57 @@ mod tests {
             codex_prompt_failed(Some(502), false, false, residual),
             Some(true)
         );
+    }
+
+    #[test]
+    fn codex_in_band_provider_failures_are_not_headroom_failures() {
+        // RUST-NY: a 200 stream OpenAI failed with its own code is its outage,
+        // read from the frame the terminal reader keeps.
+        let outcome = |frame: &[u8]| {
+            let mut reader = CodexTerminalReader::new(tokio::io::empty());
+            reader.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
+            reader.observe(frame);
+            assert!(reader.failed());
+            codex_prompt_failed(Some(200), true, false, &reader.failure_body())
+        };
+        let failed = |code: &str| {
+            format!("event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"instructions\":\"x\",\"error\":{{\"code\":\"{code}\",\"message\":\"m\"}}}}}}\n\n")
+        };
+        for code in [
+            "server_error",
+            "rate_limit_exceeded",
+            "context_length_exceeded",
+        ] {
+            assert_eq!(outcome(failed(code).as_bytes()), None, "{code}");
+        }
+        // The Codex backend's in-band error event (openai/codex#51886).
+        assert_eq!(
+            outcome(b"event: error\ndata: {\"type\":\"error\",\"sequence_number\":29810,\"error\":{\"type\":\"server_error\",\"code\":\"request_timeout\",\"message\":\"m\",\"param\":null}}\n\n"),
+            None
+        );
+        // The backend could not reach OpenAI mid-stream: the user's network.
+        assert_eq!(
+            outcome(b"event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect\"}}\n\n"),
+            None
+        );
+
+        // Still Headroom's, or anyone's: the backend's own stream error, a
+        // prompt OpenAI rejected (could be a body we built), an unknown code,
+        // a failure with no code, and a frame cut before its data line.
+        assert_eq!(
+            outcome(b"event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"api_error\", \"message\": \"peer closed\"}}\n\n"),
+            Some(true)
+        );
+        for code in ["invalid_prompt", "something_new"] {
+            assert_eq!(outcome(failed(code).as_bytes()), Some(true), "{code}");
+        }
+        assert_eq!(
+            outcome(
+                b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{}}\n\n"
+            ),
+            Some(true)
+        );
+        assert_eq!(outcome(b"event: response.failed\n"), Some(true));
     }
 
     #[test]
