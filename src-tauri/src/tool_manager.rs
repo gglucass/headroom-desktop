@@ -16001,7 +16001,22 @@ fn settle_plugin_hosts(
         let mut msg = if errors.is_empty() {
             String::new()
         } else {
-            format!("installing the {id} plugin failed: {}. ", errors.join("; "))
+            let detail = errors.join("; ");
+            // A failure on every host only reached the UI, so a user stuck on
+            // it left nothing in Sentry. Same per-category split as the
+            // partial path in `install_plugin`; a too-old CLI alone is not an
+            // error and stays out.
+            let category = plugin_install_failure_category(&detail);
+            sentry::with_scope(
+                |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
+                || {
+                    sentry::capture_message(
+                        &format!("{id} install failed on every host [{category}]: {detail}"),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            format!("installing the {id} plugin failed: {detail}. ")
         };
         if !outdated.is_empty() {
             let names = outdated.join(" and ");
