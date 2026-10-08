@@ -777,11 +777,16 @@ impl<R> CodexTerminalReader<R> {
             .extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 
-    fn failure_data_line(&self) -> Option<&[u8]> {
+    /// Whether the kept frame reached the blank line ending its event. The raw
+    /// bytes still carry chunk framing (see `unchunk`), which never holds
+    /// `\n\n`, so this can overshoot (bounded by the cap) but never stop
+    /// before the data line ends.
+    fn failure_frame_complete(&self) -> bool {
         let frame = &self.failure_frame;
-        let at = frame.windows(5).position(|w| w == b"data:")? + 5;
-        let len = frame[at..].iter().position(|&b| b == b'\n')?;
-        Some(frame[at..at + len].trim_ascii())
+        frame
+            .windows(5)
+            .position(|w| w == b"data:")
+            .is_some_and(|at| frame[at..].windows(2).any(|w| w == b"\n\n"))
     }
 
     fn observe(&mut self, bytes: &[u8]) {
@@ -791,7 +796,7 @@ impl<R> CodexTerminalReader<R> {
         if self.saw_terminal {
             if self.failed
                 && self.failure_frame.len() < FAILURE_FRAME_CAP
-                && self.failure_data_line().is_none()
+                && !self.failure_frame_complete()
             {
                 self.keep_failure_frame(bytes);
             }
@@ -863,7 +868,8 @@ impl<R> CodexTerminalReader<R> {
     /// `response.failed`, else the frame's data as sent (OpenAI's in-band
     /// `error` event, or the backend's `{"type":"error","error":{...}}`).
     fn failure_body(&self) -> Vec<u8> {
-        let Some(data) = self.failure_data_line() else {
+        let frame = unchunk(&self.failure_frame);
+        let Some(data) = sse_data_line(&frame) else {
             return self.failure_frame.clone();
         };
         match serde_json::from_slice::<serde_json::Value>(data) {
@@ -875,6 +881,38 @@ impl<R> CodexTerminalReader<R> {
             _ => data.to_vec(),
         }
     }
+}
+
+/// The first SSE `data:` line in `frame`, once its newline arrived.
+fn sse_data_line(frame: &[u8]) -> Option<&[u8]> {
+    let at = frame.windows(5).position(|w| w == b"data:")? + 5;
+    let len = frame[at..].iter().position(|&b| b == b'\n')?;
+    Some(frame[at..at + len].trim_ascii())
+}
+
+/// `bytes` without HTTP/1.1 chunk framing. The backend streams SSE chunked,
+/// one chunk per upstream read, so a `response.failed` data line tens of KB
+/// long arrives with `\r\n<size>\r\n` inside it and reading to the first
+/// newline cut its JSON there. SSE fields always carry a `:`, so a line of
+/// hex digits between CRLFs can only be a chunk size.
+fn unchunk(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\r\n") {
+            let digits = bytes[i + 2..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            if digits > 0 && bytes[i + 2 + digits..].starts_with(b"\r\n") {
+                i += digits + 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for CodexTerminalReader<R> {
@@ -6411,6 +6449,20 @@ mod tests {
         assert_eq!(
             codex_error_summary(&inband.failure_body()),
             "type=error code=rate_limit_exceeded param=-"
+        );
+
+        // The backend streams chunked, one HTTP chunk per upstream read, so a
+        // long data line carries `\r\n<size>\r\n`, and a read can end on the
+        // CRLF before the size line.
+        let mut chunked = CodexTerminalReader::new(tokio::io::empty());
+        chunked.observe(b"1f\r\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"instructions\":\"x\"");
+        chunked.observe(b"\r\n");
+        chunked
+            .observe(b"2a\r\n,\"error\":{\"code\":\"server_error\",\"message\":\"m\"}}}\n\n\r\n");
+        chunked.observe(b"0\r\n\r\n");
+        assert_eq!(
+            codex_error_summary(&chunked.failure_body()),
+            "type=- code=server_error param=-"
         );
     }
 
