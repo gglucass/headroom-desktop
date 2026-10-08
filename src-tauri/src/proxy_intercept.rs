@@ -751,7 +751,14 @@ struct CodexTerminalReader<R> {
     tail: Vec<u8>,
     saw_terminal: bool,
     failed: bool,
+    /// The failure frame from its `event:` line on, kept only once `failed`
+    /// is set, until its `data:` line ends (see `failure_body`).
+    failure_frame: Vec<u8>,
 }
+
+/// Bound on the failure frame kept: a `response.failed` echoes the whole
+/// response object (instructions, tools), tens of KB on a Codex turn.
+const FAILURE_FRAME_CAP: usize = 1 << 20;
 
 impl<R> CodexTerminalReader<R> {
     fn new(inner: R) -> Self {
@@ -760,11 +767,34 @@ impl<R> CodexTerminalReader<R> {
             tail: Vec::new(),
             saw_terminal: false,
             failed: false,
+            failure_frame: Vec::new(),
         }
     }
 
+    fn keep_failure_frame(&mut self, bytes: &[u8]) {
+        let room = FAILURE_FRAME_CAP.saturating_sub(self.failure_frame.len());
+        self.failure_frame
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    fn failure_data_line(&self) -> Option<&[u8]> {
+        let frame = &self.failure_frame;
+        let at = frame.windows(5).position(|w| w == b"data:")? + 5;
+        let len = frame[at..].iter().position(|&b| b == b'\n')?;
+        Some(frame[at..at + len].trim_ascii())
+    }
+
     fn observe(&mut self, bytes: &[u8]) {
-        if self.saw_terminal || bytes.is_empty() {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.saw_terminal {
+            if self.failed
+                && self.failure_frame.len() < FAILURE_FRAME_CAP
+                && self.failure_data_line().is_none()
+            {
+                self.keep_failure_frame(bytes);
+            }
             return;
         }
         const TERMINAL_EVENTS: &[&[u8]] = &[
@@ -797,6 +827,23 @@ impl<R> CodexTerminalReader<R> {
         };
         self.saw_terminal = hit(TERMINAL_EVENTS);
         self.failed = self.saw_terminal && hit(FAILURE_EVENTS);
+        if self.failed {
+            // From the start of the line naming the failure: its `event:` line.
+            let at = FAILURE_EVENTS
+                .iter()
+                .filter_map(|needle| {
+                    combined
+                        .windows(needle.len())
+                        .position(|window| window == *needle)
+                })
+                .min()
+                .unwrap_or(0);
+            let line = combined[..at]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            self.keep_failure_frame(&combined[line..]);
+        }
         let keep_from = combined.len().saturating_sub(TAIL_BYTES);
         self.tail.clear();
         self.tail.extend_from_slice(&combined[keep_from..]);
@@ -808,6 +855,25 @@ impl<R> CodexTerminalReader<R> {
 
     fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// The failure frame's error as JSON `codex_error_summary` reads, so a
+    /// stream_error run says who failed the turn (RUST-NY: 38 hosts on every
+    /// release at once, no code): `{"error": response.error}` for a
+    /// `response.failed`, else the frame's data as sent (OpenAI's in-band
+    /// `error` event, or the backend's `{"type":"error","error":{...}}`).
+    fn failure_body(&self) -> Vec<u8> {
+        let Some(data) = self.failure_data_line() else {
+            return self.failure_frame.clone();
+        };
+        match serde_json::from_slice::<serde_json::Value>(data) {
+            Ok(json) if json["type"] == "response.failed" => {
+                serde_json::json!({ "error": json["response"]["error"] })
+                    .to_string()
+                    .into_bytes()
+            }
+            _ => data.to_vec(),
+        }
     }
 }
 
@@ -2625,6 +2691,10 @@ async fn splice_with_codex_capture(
             && should_report_throttled(&CODEX_STREAM_NO_TERMINAL_LAST_REPORTED)
         {
             report_codex_stream_without_terminal(req_path, copy_result.unwrap_or(0));
+        }
+        // Report only: a 2xx outcome never reads the body (codex_prompt_failed).
+        if status.is_some_and(|s| (200..300).contains(&s)) && streamed.failed() {
+            error_body = streamed.failure_body();
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -6305,6 +6375,43 @@ mod tests {
         assert!(errored.saw_terminal());
         assert!(errored.failed());
         assert!(!reader.failed(), "response.completed is not a failure");
+    }
+
+    #[test]
+    fn codex_terminal_reader_keeps_the_failure_code_only() {
+        // RUST-NY: a split `response.failed` frame reduces to its error code;
+        // the echoed instructions and the message never reach the summary.
+        let mut failed = CodexTerminalReader::new(tokio::io::empty());
+        failed.observe(b"data: {\"type\":\"response.output_text.delta\"}\n\nevent: response.fa");
+        failed
+            .observe(b"iled\ndata: {\"type\":\"response.failed\",\"response\":{\"instructions\":");
+        failed.observe(
+            b"\"secret prompt\",\"error\":{\"code\":\"server_error\",\"message\":\"m\"}}}\n\n",
+        );
+        failed.observe(b"data: {\"type\":\"later\"}\n\n");
+        assert!(failed.failed());
+        let body = failed.failure_body();
+        assert_eq!(
+            codex_error_summary(&body),
+            "type=- code=server_error param=-"
+        );
+        assert_eq!(codex_error_shape_tag(&body), "object{error}");
+
+        // The backend's own frame keeps its type.
+        let mut errored = CodexTerminalReader::new(tokio::io::empty());
+        errored.observe(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"x\"}}\n\n");
+        assert_eq!(
+            codex_error_summary(&errored.failure_body()),
+            "type=api_error code=- param=-"
+        );
+
+        // OpenAI's in-band error event carries its code at the top level.
+        let mut inband = CodexTerminalReader::new(tokio::io::empty());
+        inband.observe(b"event: error\ndata: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"x\",\"param\":null}\n\n");
+        assert_eq!(
+            codex_error_summary(&inband.failure_body()),
+            "type=error code=rate_limit_exceeded param=-"
+        );
     }
 
     #[test]
