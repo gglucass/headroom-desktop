@@ -106,6 +106,7 @@ import {
   matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
+  trialSavingsLabel,
   recentDailySavingsUsd,
   unsavedWhileBlockedLabel,
   setServerPlanPrices,
@@ -1464,6 +1465,7 @@ function AddonCard({
   busy,
   busyLabel,
   resultMessage,
+  resultIsError,
   onDismissResult,
   sourceUrl,
   onOpenSource,
@@ -1493,6 +1495,7 @@ function AddonCard({
   busy: boolean;
   busyLabel: string | null;
   resultMessage: string | null;
+  resultIsError?: boolean;
   onDismissResult: () => void;
   sourceUrl: string;
   onOpenSource: () => void;
@@ -1563,7 +1566,10 @@ function AddonCard({
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
         ) : resultMessage ? (
-          <p className="addon-card__result">
+          <p
+            className={`addon-card__result${resultIsError ? " addon-card__result--error" : ""}`}
+            role={resultIsError ? "alert" : undefined}
+          >
             {resultMessage}
             <button
               type="button"
@@ -1686,8 +1692,13 @@ export default function App() {
   const [addonBusyId, setAddonBusyId] = useState<string | null>(null);
   const [addonBusyLabel, setAddonBusyLabel] = useState<string | null>(null);
   const [addonInfoId, setAddonInfoId] = useState<string | null>(null);
-  const [addonResult, setAddonResult] = useState<{ id: string; message: string } | null>(null);
-  const [addonError, setAddonError] = useState<string | null>(null);
+  // Shown on the card it belongs to: a failure rendered above the list was
+  // off-screen for a card further down, so a fast failure read as a flicker.
+  const [addonResult, setAddonResult] = useState<{
+    id: string;
+    message: string;
+    error?: boolean;
+  } | null>(null);
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootstrapProgress, setBootstrapProgress] =
     useState<BootstrapProgress>(idleBootstrapProgress);
@@ -3143,7 +3154,6 @@ export default function App() {
     setRtkBusy(true);
     setAddonBusyId("rtk");
     setAddonBusyLabel((nextEnabled ? copy?.enabling : copy?.disabling) ?? null);
-    setAddonError(null);
     setAddonResult(null);
     try {
       await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
@@ -3154,7 +3164,11 @@ export default function App() {
       }
     } catch (error) {
       console.error("Failed to update RTK", error);
-      setAddonError(describeInvokeError(error, "RTK could not be updated."));
+      setAddonResult({
+        id: "rtk",
+        message: describeInvokeError(error, "RTK could not be updated."),
+        error: true
+      });
     } finally {
       setRtkBusy(false);
       setAddonBusyId(null);
@@ -4452,7 +4466,6 @@ export default function App() {
             : copy?.disabling;
     setAddonBusyId(id);
     setAddonBusyLabel(busyLabel ?? null);
-    setAddonError(null);
     setAddonResult(null);
     try {
       const next = await invoke<DashboardState>(command, { id, enabled });
@@ -4472,9 +4485,11 @@ export default function App() {
         setAddonResult({ id, message });
       }
     } catch (error) {
-      setAddonError(
-        describeInvokeError(error, "The addon action could not be completed.")
-      );
+      setAddonResult({
+        id,
+        message: describeInvokeError(error, "The addon action could not be completed."),
+        error: true
+      });
     } finally {
       setAddonBusyId(null);
       setAddonBusyLabel(null);
@@ -6554,6 +6569,20 @@ export default function App() {
     inUpgradeMoment && paybackPlanId
       ? paybackLabel(recentDailySavings * 30, paybackPlanId, billingPeriod)
       : null;
+  // Item 3 - what the ended trial saved; still there once items 1-2 decay.
+  const trialSavedLabel =
+    pricingStatus?.account &&
+    !pricingStatus.account.trialActive &&
+    !pricingStatus.account.subscriptionActive &&
+    pricingStatus.account.trialStartedAt &&
+    pricingStatus.account.trialEndsAt
+      ? trialSavingsLabel(
+          dashboard.dailySavings,
+          pricingStatus.account.trialStartedAt,
+          pricingStatus.account.trialEndsAt,
+          paybackPlanId
+        )
+      : null;
   // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
   const weeklyGateForgoneLabel = (() => {
     if (!inUpgradeMoment || !pricingStatus) return null;
@@ -6579,7 +6608,7 @@ export default function App() {
     !!pricingStatus &&
     (!pricingStatus.optimizationAllowed || pricingStatus.codex?.optimizationAllowed === false);
   const upgradeSavingsLine = isHardGate
-    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel)
+    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel ?? (inUpgradeMoment ? trialSavedLabel : null))
     : (upgradePaybackLabel ?? weeklyGateForgoneLabel);
   // Only show it when the pricing gate/nudge banner actually wins: a startup,
   // paused, or disconnected banner takes precedence over the upsell, so the
@@ -6744,7 +6773,7 @@ export default function App() {
     const unsaved = unsavedWhileBlockedLabel(gatedBypassBytes, dashboard.dailySavings);
     return {
       tone: "expired" as const,
-      message: `Your trial has ended.${unsaved ? ` ${unsaved}` : ""} Upgrade to keep Headroom optimizing your prompts.`,
+      message: `Your trial has ended.${trialSavedLabel ? ` ${trialSavedLabel}` : ""}${unsaved ? ` ${unsaved}` : ""} Upgrade to keep Headroom optimizing your prompts.`,
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };
@@ -7715,7 +7744,6 @@ export default function App() {
               </p>
             </header>
           </article>
-          {addonError ? <p className="addons__error">{addonError}</p> : null}
           <ul className="addons__list">
               {dashboard.tools
                 .filter((tool) => !tool.required && tool.id !== "rtk")
@@ -7740,6 +7768,7 @@ export default function App() {
                       resultMessage={
                         addonResult?.id === tool.id ? addonResult.message : null
                       }
+                      resultIsError={addonResult?.error ?? false}
                       onDismissResult={() => setAddonResult(null)}
                       sourceUrl={tool.sourceUrl}
                       onOpenSource={() => openLinkFromClick(tool.sourceUrl)}
@@ -7790,6 +7819,7 @@ export default function App() {
                 busy={addonBusyId === "rtk"}
                 busyLabel={addonBusyLabel}
                 resultMessage={addonResult?.id === "rtk" ? addonResult.message : null}
+                resultIsError={addonResult?.error ?? false}
                 onDismissResult={() => setAddonResult(null)}
                 sourceUrl={
                   dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??

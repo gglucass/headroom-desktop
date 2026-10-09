@@ -1919,7 +1919,13 @@ fn show_notification_impl(
 #[tauri::command]
 async fn install_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
     // pip, npx and asset downloads run for minutes; see run_lifecycle_command.
-    run_lifecycle_command(app, move |app| install_addon_blocking(&app, &id)).await
+    run_lifecycle_command(app, move |app| {
+        // The reason reached only the UI, so a user who missed it left a log
+        // with nothing in it (no node, no CLI found: both fail before any run).
+        install_addon_blocking(&app, &id)
+            .inspect_err(|err| log::info!("addon {id}: install failed: {err}"))
+    })
+    .await
 }
 
 fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
@@ -6614,6 +6620,49 @@ fn autolaunch(
     app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
 }
 
+/// The login item tauri-plugin-autostart writes: auto-launch names the plist
+/// after the product name, `~/Library/LaunchAgents/Headroom.plist`.
+#[cfg(target_os = "macos")]
+fn autostart_launch_agent_path(app: &AppHandle) -> std::path::PathBuf {
+    client_adapters::home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", app.package_info().name))
+}
+
+/// Marks the login LaunchAgent `ProcessType = Interactive`; returns whether it
+/// rewrote the file. No file (autostart off) is a no-op, and a file that does
+/// not parse is left as it is.
+///
+/// auto-launch writes the plist with no ProcessType, and launchd runs such a
+/// job as Standard: utility QoS, base priority 20, inherited by every process
+/// it spawns and not escapable from inside. So a Headroom started at login ran
+/// itself and its Python backend below every app and CLI on the Mac (31-47),
+/// while a Finder or `open -n` launch runs as an app. Measured side by side on
+/// a loaded M2 (2026-10-08): a Standard job's 100ms sleeps woke 140ms late at
+/// p50 (Interactive: 5ms) and 2ms of CPU work took 29ms at p99 (7ms). On the
+/// same host the clamped backend sat runnable at 1.6% CPU for 30-97s at a time,
+/// `/readyz` and `/stats` unanswered: RUST-86, the 15s `/stats` timeouts.
+/// Interactive is the class launchd gives apps, which is what Headroom is.
+#[cfg(target_os = "macos")]
+fn ensure_launch_agent_interactive(path: &Path) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut agent = plist::Value::from_file(path)?;
+    let dict = agent
+        .as_dictionary_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a plist dictionary", path.display()))?;
+    if dict.get("ProcessType").and_then(plist::Value::as_string) == Some("Interactive") {
+        return Ok(false);
+    }
+    dict.insert("ProcessType".into(), "Interactive".into());
+    let mut xml = Vec::new();
+    agent.to_writer_xml(&mut xml)?;
+    client_adapters::atomic_write(path, &xml)?;
+    Ok(true)
+}
+
 #[cfg(target_os = "macos")]
 const AUTOSTART_UNAVAILABLE: &str =
     "Autostart is unavailable: Headroom could not resolve its own application path. \
@@ -6650,6 +6699,10 @@ async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, St
     }
     if enabled {
         manager.enable().map_err(|err| err.to_string())?;
+        #[cfg(target_os = "macos")]
+        if let Err(err) = ensure_launch_agent_interactive(&autostart_launch_agent_path(&app)) {
+            log::warn!("autostart: marking the LaunchAgent Interactive failed: {err:#}");
+        }
     } else {
         manager.disable().map_err(|err| err.to_string())?;
     }
@@ -7021,7 +7074,7 @@ fn handle_crash_guard_flag() {
 /// The app log written since `from` (its length when the guard started), at
 /// most the last 256 KiB. A log shorter than `from` was rotated meanwhile, so
 /// all of it is new.
-fn log_text_since(log: &Path, from: u64) -> Option<String> {
+pub(crate) fn log_text_since(log: &Path, from: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(log).ok()?;
     let len = file.metadata().ok()?.len();
@@ -7717,6 +7770,16 @@ pub fn run() {
             }
 
             let launched_from_autostart = launched_from_autostart();
+            // Login items written by older builds still lack ProcessType; this
+            // takes effect at the next login (see ensure_launch_agent_interactive).
+            #[cfg(target_os = "macos")]
+            match ensure_launch_agent_interactive(&autostart_launch_agent_path(app.handle())) {
+                Ok(true) => log::info!("autostart: LaunchAgent now runs Interactive"),
+                Ok(false) => {}
+                Err(err) => {
+                    log::warn!("autostart: marking the LaunchAgent Interactive failed: {err:#}")
+                }
+            }
             // Autostart is opt-in. Users enable it explicitly from Settings or
             // the onboarding's open-at-login step, which avoids triggering macOS's "Background item added" prompt
             // on first launch.
@@ -8931,6 +8994,14 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
     // RUST-F4: upstream's own idle watchdog (`produced no output for 180s.
     // Check network connectivity, ...`) -- the CLI never answered at all.
     if text.contains("produced no output for") {
+        return true;
+    }
+    // RUST-P2: codex's own give-up once `learn_codex_retries` bounds its
+    // connection retries; unbounded, the same run waited out the 900s cap.
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("ERROR: Connection failed:"))
+    {
         return true;
     }
     let mut statusless = false;
@@ -11816,6 +11887,8 @@ fn compute_tray_window_position(
 mod tests {
     #[cfg(unix)]
     use super::bundle_folder_accepts_writes;
+    #[cfg(target_os = "macos")]
+    use super::ensure_launch_agent_interactive;
     use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
@@ -11901,6 +11974,60 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &apps).expect("dir symlink");
         let via_dir = apps.join("Headroom.app/Contents/MacOS/headroom-desktop");
         assert_eq!(symlink_free_exe(&via_dir), Some(real));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_launch_agent_runs_interactive_not_as_a_clamped_standard_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Headroom.plist");
+        // auto-launch 0.5.0's LaunchAgent, byte for byte: no ProcessType, so
+        // launchd ran it as a utility-clamped Standard job (RUST-86).
+        let written = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+            <plist version=\"1.0\">\n  <dict>\n  <key>Label</key>\n  <string>Headroom</string>\n  \
+            <key>ProgramArguments</key>\n  <array><string>/Applications/Headroom.app/Contents/MacOS/headroom-desktop</string><string>--autostart</string></array>\n  \
+            <key>RunAtLoad</key>\n  <true/>\n  </dict>\n</plist>";
+        std::fs::write(&path, written).expect("write plist");
+
+        assert!(ensure_launch_agent_interactive(&path).expect("rewrite"));
+        let agent = plist::Value::from_file(&path).expect("still a plist");
+        let dict = agent.as_dictionary().expect("dict");
+        let string = |key: &str| dict.get(key).and_then(plist::Value::as_string);
+        assert_eq!(string("ProcessType"), Some("Interactive"));
+        // Everything launchd needs to start the app is kept.
+        assert_eq!(string("Label"), Some("Headroom"));
+        assert_eq!(
+            dict.get("RunAtLoad").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        let args: Vec<_> = dict
+            .get("ProgramArguments")
+            .and_then(plist::Value::as_array)
+            .expect("args")
+            .iter()
+            .filter_map(plist::Value::as_string)
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "/Applications/Headroom.app/Contents/MacOS/headroom-desktop",
+                "--autostart"
+            ]
+        );
+        // Every launch runs this; once marked, it is not rewritten again.
+        assert!(!ensure_launch_agent_interactive(&path).expect("idempotent"));
+
+        // Autostart off: nothing is created.
+        let missing = dir.path().join("missing.plist");
+        assert!(!ensure_launch_agent_interactive(&missing).expect("no-op"));
+        assert!(!missing.exists());
+
+        // A file that does not parse is left as it is.
+        let garbage = dir.path().join("garbage.plist");
+        std::fs::write(&garbage, b"not a plist").expect("write");
+        assert!(ensure_launch_agent_interactive(&garbage).is_err());
+        assert_eq!(std::fs::read(&garbage).expect("read"), b"not a plist");
     }
 
     #[test]
@@ -15588,6 +15715,20 @@ Some unrelated content.
         // RUST-F4 verbatim: upstream's own idle timeout, no CLI output at all.
         assert!(learn_failure_is_agent_api_unreachable(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose` produced no output for 180s. Check network connectivity, raise HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
+        ));
+    }
+
+    #[test]
+    fn learn_failure_is_agent_api_unreachable_matches_codex_giving_up() {
+        // RUST-P2: codex 0.160.0 against a dead route with its retries
+        // bounded, verbatim after the analyzer's marker and the prompt elision.
+        assert!(learn_failure_is_agent_api_unreachable(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nReading prompt from stdin...\n[prompt omitted]\nERROR: Reconnecting... 5/5\nERROR: Connection failed: error sending request\n"
+        ));
+        // The unbounded run is still reported: past the bound, a 900s
+        // timeout is a codex that was busy, not one that could not connect.
+        assert!(!learn_failure_is_agent_api_unreachable(
+            "LLM analysis failed: `codex exec --skip-git-repo-check` did not respond within 900s. Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
         ));
     }
 

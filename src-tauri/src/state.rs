@@ -4762,7 +4762,12 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
-    files.sort_by_key(|path| {
+    // Cached: each mtime is read once. sort_by_key re-reads the key on every
+    // comparison, and these are live transcripts, appended to (or briefly
+    // locked, on Windows) mid-sort, so one file could compare both older and
+    // newer than another and the sort panicked "does not correctly implement
+    // a total order" (RUST-P3).
+    files.sort_by_cached_key(|path| {
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
             .ok()
@@ -7421,7 +7426,6 @@ fn warn_stats_fetch_failed(reason: &str) {
 /// its stack unless another thread held the GIL, which is why the rest follow.
 pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Option<(u64, String)> {
     const FRESH: Duration = Duration::from_secs(120);
-    const MAX_CHARS: usize = 12_000;
     let age = now
         .duration_since(std::fs::metadata(path).ok()?.modified().ok()?)
         .unwrap_or_default();
@@ -7429,6 +7433,13 @@ pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Opti
         return None;
     }
     let dump = std::fs::read_to_string(path).ok()?;
+    Some((age.as_secs(), stall_dump_stacks(&dump)?))
+}
+
+/// The newest faulthandler `dump_traceback_later` dump in `dump`, main thread
+/// first and capped, or `None` when it holds none.
+pub(crate) fn stall_dump_stacks(dump: &str) -> Option<String> {
+    const MAX_CHARS: usize = 12_000;
     // Each dump opens with `Timeout (0:00:05)!`, then one block per thread.
     let newest = &dump[dump.rfind("Timeout (")?..];
     let mut threads: Vec<&str> = newest.split_once('\n')?.1.trim().split("\n\n").collect();
@@ -7437,7 +7448,7 @@ pub(crate) fn recent_loop_stall(path: &Path, now: std::time::SystemTime) -> Opti
         .chain(threads)
         .collect::<Vec<_>>()
         .join("\n\n");
-    Some((age.as_secs(), stacks.chars().take(MAX_CHARS).collect()))
+    Some(stacks.chars().take(MAX_CHARS).collect())
 }
 
 /// What is piled up on the backend when a `/stats` read just failed: requests
@@ -9308,12 +9319,19 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
         );
     }
     if raw.contains("never opened port") {
-        return Some(
-            "The Headroom runtime took too long to start. \
-             On first launch, macOS Gatekeeper can scan the bundled Python runtime for ~1-2 minutes. \
+        // RUST-P1: a Windows user was told about macOS Gatekeeper.
+        let scan = if cfg!(target_os = "macos") {
+            "On first launch, macOS Gatekeeper can scan the bundled Python runtime for ~1-2 minutes. "
+        } else if cfg!(windows) {
+            "On first launch, antivirus such as Microsoft Defender can scan the bundled Python \
+             runtime for several minutes. "
+        } else {
+            ""
+        };
+        return Some(format!(
+            "The Headroom runtime took too long to start. {scan}\
              Wait a moment and click Retry. If it keeps failing, open Headroom logs from Settings."
-                .into(),
-        );
+        ));
     }
     // Incomplete/corrupted runtime: a headroom.* module is missing from the
     // installed venv (interrupted upgrade or partial extraction left an import
@@ -9685,8 +9703,7 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
         log::info!("terminate_process_tree: {signal} to process group {target}");
         note_app_kill("terminate_process_tree", format!("{signal} group {target}"));
         let _ = crate::proc::command("/bin/kill")
-            .arg(signal)
-            .arg(target)
+            .args([signal, "--", &target])
             .status();
     }
 }
@@ -9699,6 +9716,11 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
 /// session, so a 0 here SIGTERMs xfce4-session, the window manager and the rest
 /// of the session out from under the user. Pid 1 is init. Neither is ever a
 /// backend we spawned, so neither is worth the blast radius.
+///
+/// Pass it after `--` (`kill -TERM -- -1234`). procps-ng 4.0.4 (Ubuntu 24.04)
+/// misparses `kill -TERM -1234`: two-digit groups read as a signal number and
+/// nothing is signalled, longer ones signal every process the user owns. On CI
+/// that SIGTERMed the GitHub runner mid-test; on a desktop it ends the session.
 fn group_kill_target(pid: i32) -> Option<String> {
     (pid > 1).then(|| format!("-{pid}"))
 }
@@ -9845,8 +9867,19 @@ fn windows_process_sweep_script(
     } else {
         String::new()
     };
+    // Skip WMI when nothing runs from the exe, the common case: stop_headroom
+    // has just killed the child it holds. Every CommandLine-only match is a
+    // child of a venv or console-script launcher whose image IS that path, and
+    // the launcher's job object keeps it alive exactly as long as the child,
+    // so an image-path miss means the CIM query would match nothing either.
+    // On some Windows hosts that query alone outran the 20s bound at quit and
+    // update (RUST-K3, ~60 hosts). A throwing Get-Process leaves `$hit` set
+    // and the CIM query runs as before.
     format!(
-        "$me = {self_pid}; try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
+        "$me = {self_pid}; $hit = $true; try {{ $hit = [bool](Get-Process \
+         | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }}) }} \
+         catch {{ }}; if (-not $hit) {{ exit 0 }}; \
+         try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
@@ -10086,7 +10119,7 @@ fn kill_processes_by_command_pattern(
             log::info!("process sweep: -TERM {target} (parent {ppid}) for '{pattern}'");
             note_app_kill("process_sweep", format!("-TERM {target} (parent {ppid})"));
             let _ = crate::proc::command("/bin/kill")
-                .args(["-TERM", &target])
+                .args(["-TERM", "--", &target])
                 .status();
         }
         Ok(())
@@ -10836,6 +10869,30 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_jsonl_files_list_oldest_first() {
+        // RUST-P3 changed how the mtimes are read (once each); the order the
+        // learn scan relies on stays oldest-first, jsonl only.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = std::time::SystemTime::now();
+        for (name, age_secs) in [("b.jsonl", 10), ("a.jsonl", 30), ("c.jsonl", 0)] {
+            let path = dir.path().join(name);
+            fs::write(&path, "{}\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age_secs))
+                .unwrap();
+        }
+        fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        let names: Vec<_> = super::list_session_jsonl_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.jsonl", "b.jsonl", "c.jsonl"]);
+    }
 
     #[test]
     fn cache_integrity_report_is_allowlisted_and_throttled() {
@@ -11809,7 +11866,13 @@ mod tests {
             /Users/x/venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms): \
             /Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 --no-http2 never opened port 6768 within 60000ms";
         let hint = classify_startup_error(raw).expect("timeout should classify");
-        assert!(hint.contains("Gatekeeper"), "got: {hint}");
+        // Each platform names its own scanner, never another's (RUST-P1).
+        assert_eq!(
+            hint.contains("Gatekeeper"),
+            cfg!(target_os = "macos"),
+            "got: {hint}"
+        );
+        assert_eq!(hint.contains("Defender"), cfg!(windows), "got: {hint}");
         assert!(hint.contains("Retry"));
     }
 
@@ -15055,8 +15118,13 @@ mod tests {
                 super::windows_process_sweep_script(exe, args, std::process::id(), parents);
             for (label, prefix) in [
                 ("wmi", ""),
-                // The fallback path, and both of its exits.
+                // Nothing runs from the exe: the prefilter exits before WMI.
                 ("no-wmi", "function Get-CimInstance { throw 'broken' }; "),
+                // A process does: the CIM query runs, then the fallback path.
+                (
+                    "no-wmi-candidate",
+                    r"function Get-CimInstance { throw 'broken' }; function Get-Process { [pscustomobject]@{ Id = 1; Path = 'C:\headroom-sweep-test\none\headroom.exe' } }; ",
+                ),
                 (
                     "no-wmi-no-get-process",
                     "function Get-CimInstance { throw 'broken' }; function Get-Process { throw 'broken' }; ",
@@ -15071,8 +15139,8 @@ mod tests {
                 assert!(!stderr.contains("ParserError"), "{label} {args:?}: {stderr}\n{script}");
                 let fallback = matches!(parents, super::SweepParents::Any) && args.is_empty();
                 let want = match label {
-                    "wmi" => 0,
-                    "no-wmi" if fallback => 0,
+                    "wmi" | "no-wmi" => 0,
+                    "no-wmi-candidate" if fallback => 0,
                     _ => super::PS_SWEEP_ENUMERATION_FAILED,
                 };
                 assert_eq!(output.status.code(), Some(want), "{label} {args:?}: {stderr}\n{script}");
@@ -15094,7 +15162,17 @@ mod tests {
             4242,
             super::SweepParents::Orphans { own_children: true },
         );
-        assert!(held.starts_with("$me = 4242; try {"), "{held}");
+        assert!(
+            held.starts_with("$me = 4242; $hit = $true; try {"),
+            "{held}"
+        );
+        // RUST-K3: nothing running from the exe skips the CIM query.
+        assert!(
+            held.contains(
+                r"-and $_.Path -like '*C:\Users\a\venv\Scripts\headroom.exe*' }) } catch { }; if (-not $hit) { exit 0 }; try { Get-CimInstance"
+            ),
+            "{held}"
+        );
         assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
         assert!(
             held.contains("($_.ParentProcessId -eq $me -and $true)"),

@@ -5861,15 +5861,6 @@ html.window-hiding {
 }
 
 /* Addons */
-.addons__error {
-  margin: 0;
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: var(--text-xs);
-  color: var(--danger);
-  background: var(--danger-tint);
-}
-
 .addons__list {
   list-style: none;
   margin: 0;
@@ -6008,6 +5999,15 @@ html.window-hiding {
 
 .addon-card__result-dismiss:hover {
   opacity: 1;
+}
+
+.addon-card__result--error,
+.addon-card__result--error .addon-card__result-dismiss {
+  color: var(--danger);
+}
+
+.addon-card__result--error {
+  background: var(--danger-tint);
 }
 
 .addon-card__badge {

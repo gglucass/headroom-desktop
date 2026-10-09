@@ -801,9 +801,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             } else if claude_guard_registered_any_interpreter()? {
                 checks.push(CLAUDE_GUARD_STALE_COMMAND.into());
             } else {
-                failures.push(
-                    "Headroom routing guard was not found in ~/.claude/settings.json.".into(),
-                );
+                failures.push(CLAUDE_GUARD_NOT_FOUND.into());
             }
         }
         "vscode" => {
@@ -1062,6 +1060,35 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
     (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
 }
 
+/// A second lone guard loss inside this is a fight with another writer.
+const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether a repair that came back clean pages Sentry. Every cause does except
+/// the Claude guard entry alone gone with ANTHROPIC_BASE_URL intact (RUST-GS):
+/// apply and disable land settings.json in one write (`coalesce_writes`), so
+/// that shape is an outside edit (the hook deleted from /hooks, a tool or a
+/// stale Claude Code session rewriting the file), and the re-apply undid it.
+/// Only a repeat within a day pages: 13 of 16 hosts (2026-09-18..10-08) lost
+/// it once; the other three again after 1.5h, 11.8h and 21.7h. The last loss
+/// is a marker's mtime, so the repeat survives a restart (the 11.8h one spans
+/// a night).
+fn repair_pages(silent_failures: &[String]) -> bool {
+    if silent_failures != [CLAUDE_GUARD_NOT_FOUND] {
+        return true;
+    }
+    let marker = config_file(&app_data_dir(), "claude-guard-lost");
+    let repeat = std::fs::metadata(&marker)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| {
+            at.elapsed()
+                .map_or(true, |age| age < GUARD_LOSS_REPEAT_WINDOW)
+        });
+    if let Err(err) = atomic_write(&marker, b"") {
+        log::info!("recording a Claude guard loss failed: {err:#}");
+    }
+    repeat
+}
+
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
 /// true only when a silently broken config came back clean. A version restamp
 /// re-applies too but returns false: it is every client on every update, so
@@ -1075,7 +1102,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     // Only a failed check means a config broke silently. A version restamp
     // is every client on every update, and its text carries the version, so
     // reporting it opened four new issues per release (RUST-J5..J8).
-    let silently_broken = !broken.is_empty();
+    let silent_failures = broken.clone();
     // Managed files written by another app version verify fine (the routing
     // export is still there) but are a different generation from what this
     // build's scripts and hooks expect. Re-apply so an update carries them.
@@ -1112,8 +1139,11 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
             // of them meant nothing. One issue per client, from here.
             log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
-            if !silently_broken {
+            if silent_failures.is_empty() {
                 return false;
+            }
+            if !repair_pages(&silent_failures) {
+                return true;
             }
             // WHICH check failed, in the fingerprint and in full as an
             // extra. Grouping on the client alone said only "codex_cli
@@ -3109,22 +3139,50 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
-    // direct-write: this is atomic_write
-    rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
-        |err| {
-            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-            anyhow!(
-                "renaming {} -> {}: {err}{}",
-                tmp_path.display(),
-                path.display(),
-                if is_locked_file(path) {
-                    LOCKED_FILE_NOTE
-                } else {
-                    ""
+    let renamed =
+        // direct-write: this is atomic_write
+        rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp);
+    copy_if_cross_device(renamed, &tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+        anyhow!(
+            "renaming {} -> {}: {err}{}",
+            tmp_path.display(),
+            path.display(),
+            if is_locked_file(path) {
+                LOCKED_FILE_NOTE
+            } else {
+                ""
+            }
+        )
+    })
+}
+
+/// Copies the tmp over `path` when the rename failed as a cross-device move.
+/// The tmp sits beside its target, so that only happens under a filter driver
+/// that virtualizes writes onto another volume (RUST-P4..P7: one Windows
+/// host's first four writes of a launch, ERROR_NOT_SAME_DEVICE, os error 17),
+/// where every persisted write was lost. Not atomic, but `move_aside` already
+/// copies on the same failure and a lost write is worse.
+fn copy_if_cross_device(
+    renamed: std::io::Result<()>,
+    tmp_path: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    match renamed {
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            match std::fs::copy(tmp_path, path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(tmp_path);
+                    Ok(())
                 }
-            )
-        },
-    )
+                Err(copy_err) => Err(std::io::Error::new(
+                    copy_err.kind(),
+                    format!("{err}; copy failed ({copy_err})"),
+                )),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Appended to a failed write whose destination the user locked. Matched by
@@ -5041,7 +5099,9 @@ fn rescue_foreign_toml_from_block(
 /// lines, a table is kept when `owns` accepts its header; `root_keys_only`
 /// also moves out any root key that is not one of [`CODEX_ROOT_KEYS`].
 /// Moved lines land after the block's end marker, or with `before_start` just
-/// before its start marker.
+/// before its start marker, with the keys TOML scopes to them (RUST-NP: a key
+/// below the end marker belongs to the block's last table, one right below
+/// the start marker to the table above the block).
 fn rescue_foreign_toml(
     content: &str,
     start: &str,
@@ -5072,12 +5132,23 @@ fn rescue_foreign_toml(
     let mut out: Vec<&str> = Vec::new();
     let mut rescued: Vec<&str> = Vec::new();
     let mut in_block = false;
+    let mut in_table = false;
     let mut in_foreign_table = false;
+    // After an end marker, until the next header: TOML gives these keys to
+    // the block's last table, so when that table moves they go with it.
+    let mut trailing = false;
     let mut start_at = 0;
     for line in content.lines() {
         let trimmed = line.trim();
+        let code = line.split('#').next().unwrap_or("").trim();
+        let is_header = code.starts_with('[') && code.ends_with(']');
+        if trailing && (is_header || trimmed == start) {
+            trailing = false;
+            place(&mut out, &mut rescued, Some(start_at));
+        }
         if trimmed == start {
             in_block = true;
+            in_table = false;
             in_foreign_table = false;
             start_at = out.len();
             out.push(line);
@@ -5086,13 +5157,28 @@ fn rescue_foreign_toml(
         if trimmed == end {
             in_block = false;
             out.push(line);
-            place(&mut out, &mut rescued, before_start.then_some(start_at));
+            if before_start && in_foreign_table {
+                trailing = true;
+            } else {
+                place(&mut out, &mut rescued, before_start.then_some(start_at));
+            }
+            continue;
+        }
+        if trailing && !code.is_empty() {
+            rescued.push(line);
             continue;
         }
         if in_block {
-            let code = line.split('#').next().unwrap_or("").trim();
-            if code.starts_with('[') && code.ends_with(']') {
+            if is_header {
+                in_table = true;
                 in_foreign_table = !owns(code);
+            } else if before_start && !in_table && !code.is_empty() {
+                // A key between the start marker and the block's first header
+                // belongs to the table above the block: keep it above the
+                // marker, so the tables moved there do not take it.
+                out.insert(start_at, line);
+                start_at += 1;
+                continue;
             }
             // Codex's TOML writer appends a new root key (/model's `model`,
             // `model_reasoning_effort`) after the last root key -- our
@@ -7503,6 +7589,8 @@ fn claude_guard_registered_any_interpreter() -> Result<bool> {
     )
 }
 
+const CLAUDE_GUARD_NOT_FOUND: &str =
+    "Headroom routing guard was not found in ~/.claude/settings.json.";
 const CLAUDE_GUARD_SCRIPT_MISSING: &str =
     "Headroom routing guard script was missing from ~/.claude/hooks.";
 const CLAUDE_GUARD_STALE_COMMAND: &str =
@@ -13142,6 +13230,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -13205,6 +13296,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("PATH", "/usr/bin:/bin") // ensure bare `rtk` is unresolvable
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -13301,6 +13395,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let output = run(
             crate::proc::command("bash")
                 .arg(&hook_path)
+                // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+                .env("HOME", &root)
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .current_dir(&fake_bin)
                 .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display())),
             r#"{"tool_input":{"command":"git status"}}"#,
@@ -13407,6 +13504,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("PATH", "/usr/bin:/bin") // bare `rtk` unresolvable without the prepend
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -15148,6 +15248,43 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             missing.failures,
             vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()]
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_lone_claude_guard_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-GS: the guard entry gone with the env intact is an outside edit
+        // the repair undoes. One pages nothing; another within a day pages.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
+        let settings = home.path().join(".claude").join("settings.json");
+        let script = super::claude_guard_hook_path().display().to_string();
+        super::remove_guard_hook_entries(&settings, &script, false, None).unwrap();
+
+        let lost = super::verify_client_setup("claude_code")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+
+        let marker = super::config_file(&super::app_data_dir(), "claude-guard-lost");
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(25 * 3600))
+            .unwrap();
+        assert!(
+            !super::repair_pages(&lost),
+            "a day later it is a first loss"
+        );
+
+        let other = vec![super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()];
+        assert!(super::repair_pages(&other), "any other cause pages");
+        assert!(super::repair_client_setup_now("claude_code"));
+        assert!(super::claude_guard_registered().unwrap(), "guard back");
     }
 
     #[test]
@@ -19767,6 +19904,25 @@ sys.exit(3)
     }
 
     #[test]
+    fn atomic_write_copies_when_the_rename_crosses_devices() {
+        // RUST-P4..P7: a Windows filter driver failed the same-directory rename
+        // with ERROR_NOT_SAME_DEVICE, losing every persisted write.
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, path) = (dir.path().join("s.json.tmp.1.0"), dir.path().join("s.json"));
+        std::fs::write(&tmp, b"new").unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        let cross = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
+        super::copy_if_cross_device(Err(cross), &tmp, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!tmp.exists());
+        // Any other rename failure is returned untouched, no copy.
+        std::fs::write(&tmp, b"newer").unwrap();
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(super::copy_if_cross_device(Err(denied), &tmp, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
     fn atomic_write_error_names_the_io_cause() {
         // RUST-77: callers log this with `{err}`, which drops the anyhow
         // source, so Sentry only ever saw "writing <path>.tmp.N". The cause
@@ -20553,6 +20709,45 @@ sys.exit(3)
         );
         // Idempotent once clean.
         assert!(!super::protect_foreign_mcp_tables_in(&config, false).unwrap());
+    }
+
+    /// RUST-NP: a key appended below the span (`echo ... >> config.toml`) is
+    /// TOML's to the span's last table, and one right below the start marker
+    /// to the table above it. Moving the trapped table alone changed that, so
+    /// the evacuation was refused and the table stayed in the wheel's reach.
+    /// Each key now moves with the table it belongs to.
+    #[test]
+    #[serial_test::serial]
+    fn keys_scoped_across_the_span_markers_keep_their_table() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        let pinned = "/Apps/Headroom/venv/bin/headroom";
+        let trapped = codex_config_with_trapped_node_repl(pinned);
+        let below_end = format!("{trapped}model_reasoning_effort = \"high\"\n");
+        let below_start = trapped.replace(
+            "# --- Headroom MCP server ---\n",
+            "# --- Headroom MCP server ---\nanimations = false\n",
+        );
+        for before in [below_end, below_start] {
+            std::fs::write(&config, &before).unwrap();
+            assert!(
+                super::protect_foreign_mcp_tables_in(&config, false).unwrap(),
+                "left in the span:\n{before}"
+            );
+            let after = std::fs::read_to_string(&config).unwrap();
+            assert_node_repl_intact(&after);
+            assert_eq!(
+                toml::from_str::<toml::Value>(&after).unwrap(),
+                toml::from_str::<toml::Value>(&before).unwrap()
+            );
+            let reinstalled = wheel_force_register(&after, WHEEL_BLOCK);
+            assert!(
+                reinstalled.contains("[mcp_servers.node_repl]"),
+                "{reinstalled}"
+            );
+        }
     }
 
     /// Heal for machines rc11 already damaged: a `.headroom-backup-*` still

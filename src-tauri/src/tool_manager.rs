@@ -109,6 +109,36 @@ impl McpInstallMethod {
 }
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
+/// `is_local_proxy_reachable`'s connect timeout. Windows retries the SYN on a
+/// refused loopback connect, so there every startup poll waits this out too.
+const LOCAL_PROXY_PROBE_TIMEOUT_MS: u64 = 180;
+/// When the Windows startup loop gives up: it counts polls, not time, and each
+/// one waits out the probe's timeout, so it runs ~516s, not 300s.
+const WINDOWS_STARTUP_LOOP_MS: u64 = HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS
+    * (HEADROOM_STARTUP_POLL_MS + LOCAL_PROXY_PROBE_TIMEOUT_MS);
+/// When a backend that has not bound its port dumps its stacks: 30s before
+/// the Windows startup loop kills it, room for the interpreter's own start
+/// before the sitecustomize arms the timer. Keyed to the nominal 300s, it
+/// fired at 270s in backends still on their way to a healthy bind up to ~516s.
+const STARTUP_STALL_DUMP_SECS: u64 = WINDOWS_STARTUP_LOOP_MS / 1000 - 30;
+
+/// The env that arms the sitecustomize `startup_stall_dump` (RUST-P1). Windows
+/// only: unix takes the same stacks with the SIGABRT sent at the startup
+/// timeout. The dump reads other threads' frames without the GIL (why
+/// `loop_stall_dump` is opt-in), so it fires only in a backend that has not
+/// bound for `STARTUP_STALL_DUMP_SECS` and is killed at the timeout anyway.
+fn startup_stall_dump_env(stall_path: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    vec![
+        ("HEADROOM_STARTUP_STALL_DUMP", stall_path.into()),
+        (
+            "HEADROOM_STARTUP_STALL_DUMP_SECS",
+            STARTUP_STALL_DUMP_SECS.to_string().into(),
+        ),
+    ]
+}
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
 const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
@@ -396,12 +426,22 @@ Also runs learn's `claude -p` analysis with no tools and no hooks, so a model
 that starts exploring cannot stream past the hard cap (RUST-KK) and a user's
 Stop hook cannot replace its answer. Kill switch: HEADROOM_LEARN_NO_TOOLS=0.
 
+Also bounds learn's `codex exec` connection retries, so a dead route fails
+in seconds with codex's own reason instead of waiting out the 900s cap
+(RUST-P2). Kill switch: HEADROOM_LEARN_CODEX_RETRIES=0.
+
 Can also write the serving loop's stack to logs/loop-stall.txt when the
 event loop stalls (desktop diagnostic, RUST-86). Off unless
 HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
+
+Can also write every thread's stack to HEADROOM_STARTUP_STALL_DUMP when the
+proxy has not bound its port HEADROOM_STARTUP_STALL_DUMP_SECS after start
+(desktop diagnostic, RUST-P1). The desktop sets both on Windows only.
 """
 import faulthandler
+import os as _hd_os
 import signal
+import sys as _hd_sys
 
 # No chain=True: SIGUSR1's default disposition is terminate, and chaining
 # falls through to it after the dump -- the process must survive the dump so
@@ -414,6 +454,61 @@ except Exception:
 # Names of the patches below that bound in this process; summarized once at
 # the end (see _HD_VENDORS).
 _hd_bound = set()
+
+# --- Pre-bind stall dump (desktop diagnostic, RUST-P1) ------------------------
+# A backend that never binds its port is killed at the desktop's startup
+# timeout. On unix that kill starts with SIGABRT, so faulthandler leaves every
+# thread's stack in the log; Windows has no such signal, and RUST-P1 arrived
+# with a banner and nothing after it (the wheel sends its own records after
+# create_app only to ~/.headroom/logs/proxy-<port>.log). faulthandler's C
+# timer writes the stacks to the desktop's file instead, unless uvicorn's
+# startup returns first (port bound), which cancels it. Armed here, before any
+# vendor below imports headroom, so a stall in those imports is covered too.
+# One-shot, and it fires only in a backend that has not bound for 270s, which
+# the desktop then kills (taskkill /F), so the crash risk that keeps
+# loop_stall_dump opt-in costs nothing here; the wedge risk is handled where
+# startup cancels it.
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        # Popped: this process's timer only, never a child Python's.
+        _hd_ss_path = _hd_os.environ.pop("HEADROOM_STARTUP_STALL_DUMP", "")
+        _hd_ss_secs = _hd_os.environ.pop("HEADROOM_STARTUP_STALL_DUMP_SECS", "")
+        if _hd_ss_path:
+            # O_BINARY: see loop_stall_dump.
+            _hd_ss_fd = _hd_os.open(
+                _hd_ss_path,
+                _hd_os.O_WRONLY | _hd_os.O_CREAT | _hd_os.O_TRUNC | getattr(_hd_os, "O_BINARY", 0),
+                0o600,
+            )
+            faulthandler.dump_traceback_later(float(_hd_ss_secs), file=_hd_ss_fd)
+            import uvicorn.server as _hd_ss_uv
+
+            _hd_ss_orig_startup = _hd_ss_uv.Server.startup
+
+            async def _hd_ss_startup(self, *args, **kwargs):
+                try:
+                    return await _hd_ss_orig_startup(self, *args, **kwargs)
+                finally:
+                    # Not once the dump has begun: its GIL-free frame walk can
+                    # spin forever on a main thread that is busy running Python
+                    # (seen mid-import), and cancel waits on it with the GIL
+                    # held, which would wedge a backend that bound late. A late
+                    # bind after a spun dump keeps the spinning thread instead.
+                    # ponytail: that thread burns a core until the process
+                    # exits; a GIL-holding sampler cannot see a GIL-holding
+                    # native stall (a DLL load), which is the case this is for.
+                    try:
+                        fired = _hd_os.fstat(_hd_ss_fd).st_size > 0
+                    except OSError:
+                        fired = False
+                    if not fired:
+                        faulthandler.cancel_dump_traceback_later()
+
+            _hd_ss_uv.Server.startup = _hd_ss_startup
+            _hd_bound.add("startup_stall_dump")
+    except Exception:
+        # Never leave a timer that nothing will cancel.
+        faulthandler.cancel_dump_traceback_later()
 
 # Protect user-turn text (CLAUDE.md system-reminders) from lossy Kompress:
 # flip the coding persona back to compress_user_messages=False. Guarded so
@@ -432,9 +527,6 @@ try:
         _hd_bound.add("user_turn_verbatim")
 except Exception:
     pass
-
-import os as _hd_os
-import sys as _hd_sys
 
 # OS trust store (desktop posture, no upstream equivalent). httpx verifies
 # upstream TLS against certifi's bundle, so a corporate proxy or antivirus
@@ -1721,6 +1813,149 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
 
+# --- headroom_retrieve alongside client tools: serve it (vendor) -------------
+# A model that calls headroom_retrieve in parallel with client tools (a Claude
+# Code subagent grepping and reading several files in one turn) got the whole
+# turn handed back by CCRResponseHandler.handle_response (#839) for the client
+# to resolve, and the client has no headroom_retrieve: Claude Code answers
+# "No such tool available: headroom_retrieve" and the model never gets the
+# content. On one machine 484 of 501 such leaks were mixed turns, 435 of them
+# in subagents. The client calls have not run yet, so drop them, serve the
+# retrieval in the continuation as for a lone call, and let the model decide
+# again there. The continuation is what the client gets, whatever it does:
+# re-issue the calls, change them, or withdraw them (handing back the original
+# turn instead delivered a call the model had cancelled). Only a failed
+# continuation request hands back the model's own turn, the wheel's behaviour.
+# A headroom_retrieve without a valid hash keeps the turn unchanged. Anthropic and OpenAI chat only (a Responses
+# function_call or a Gemini functionCall part can be load-bearing for
+# reasoning). Upstream PR #4034's hunks applied verbatim to the installed
+# method's source, its tool_calls helpers copied below. Fewer leaked pairs
+# also means fewer [text, tool_result] repairs for ccr_repair_order.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel ships
+# drop_tool_calls or a hunk's old text is gone. Kill switch:
+# HEADROOM_CCR_MIXED_TURN=0.
+_hd_cmt_flag = _hd_os.environ.get("HEADROOM_CCR_MIXED_TURN", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_cmt_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_cmt_meta
+
+        if _hd_cmt_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_cmt_inspect
+            import textwrap as _hd_cmt_textwrap
+
+            from headroom.ccr import response_handler as _hd_cmt_mod
+            from headroom.ccr import tool_calls as _hd_cmt_tc
+
+            _hd_cmt_hunks = (
+                (
+                    "        # If the model called CCR alongside non-CCR tools, we cannot build\n"
+                    "        # a valid continuation \u2014 every tool_use in the assistant message\n"
+                    "        # requires a matching tool_result, but we only have CCR results.\n"
+                    "        # Skip CCR handling and let the client resolve all tool calls.\n"
+                    "        if other_calls:\n"
+                    "            logger.warning(\n"
+                    '                "CCR: Skipping CCR handling \u2014 model called %d non-CCR tool(s) "\n'
+                    '                "alongside headroom_retrieve. Cannot create a valid continuation "\n'
+                    '                "without results for the other tools. Client must handle all tool calls.",\n'
+                    "                len(other_calls),\n"
+                    "            )\n"
+                    "            break\n",
+                    "        # The model called CCR alongside client tools. The client has no\n"
+                    '        # headroom_retrieve (Claude Code answers "No such tool available:\n'
+                    '        # headroom_retrieve", so the model never gets the content), and a\n'
+                    "        # continuation needs a tool_result for every tool_use. The client\n"
+                    "        # calls have not run yet, so drop them and serve the retrieval now;\n"
+                    "        # the model decides again, content in hand, in the continuation.\n"
+                    "        # That continuation replaces this turn whatever it does: re-issue\n"
+                    "        # the calls, change them or drop them. Only a failed continuation\n"
+                    "        # hands this turn back (below), since the model made no newer\n"
+                    "        # decision. A CCR-named call without a valid hash, or a provider\n"
+                    "        # where dropping a sibling is not safe (see drop_tool_calls), keeps\n"
+                    "        # the turn as it is for the client to resolve.\n"
+                    "        mixed_turn: dict[str, Any] | None = None\n"
+                    "        if other_calls:\n"
+                    "            trimmed = (\n"
+                    "                current_response\n"
+                    "                if any(is_ccr_tool_call(c) for c in other_calls)\n"
+                    "                else drop_tool_calls(current_response, provider, other_calls)\n"
+                    "            )\n"
+                    "            if trimmed is current_response:\n"
+                    "                logger.warning(\n"
+                    '                    "CCR: Skipping CCR handling \u2014 model called %d non-CCR tool(s) "\n'
+                    '                    "alongside headroom_retrieve. Cannot create a valid continuation "\n'
+                    '                    "without results for the other tools. Client must handle all tool calls.",\n'
+                    "                    len(other_calls),\n"
+                    "                )\n"
+                    "                break\n"
+                    "            logger.info(\n"
+                    '                "CCR: model called headroom_retrieve alongside %d client tool(s); "\n'
+                    '                "serving the retrieval and dropping the unrun client call(s) "\n'
+                    '                "for the model to re-issue",\n'
+                    "                len(other_calls),\n"
+                    "            )\n"
+                    "            mixed_turn = current_response\n"
+                    "            current_response = trimmed\n",
+                ),
+                (
+                    "            # Return the response we had (with unhandled CCR calls)\n"
+                    "            # The client will see the tool_use and might handle it differently\n"
+                    "            break\n",
+                    "            # Return the response we had (with unhandled CCR calls)\n"
+                    "            # The client will see the tool_use and might handle it differently.\n"
+                    "            # For a mixed turn that is the model's own turn, client calls\n"
+                    "            # included (#839), never the trimmed one that lost them.\n"
+                    "            if mixed_turn is not None:\n"
+                    "                current_response = mixed_turn\n"
+                    "            break\n",
+                ),
+            )
+            _hd_cmt_src = _hd_cmt_textwrap.dedent(
+                _hd_cmt_inspect.getsource(_hd_cmt_mod.CCRResponseHandler.handle_response)
+            )
+            if not hasattr(_hd_cmt_mod, "drop_tool_calls") and all(
+                _hd_cmt_src.count(old) == 1 for old, _ in _hd_cmt_hunks
+            ):
+                # #4034's ccr.tool_calls helper, verbatim.
+                def _hd_cmt_drop(response, provider, calls):
+                    drop = {id(call) for call in calls}
+                    if provider == "anthropic":
+                        content = response.get("content")
+                        if isinstance(content, list):
+                            return {**response, "content": [b for b in content if id(b) not in drop]}
+                    elif provider == "openai":
+                        choices = response.get("choices")
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            message = choices[0].get("message")
+                            if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
+                                tool_calls = [c for c in message["tool_calls"] if id(c) not in drop]
+                                first = {**choices[0], "message": {**message, "tool_calls": tool_calls}}
+                                return {**response, "choices": [first, *choices[1:]]}
+                    return response
+
+                for _hd_cmt_old, _hd_cmt_new in _hd_cmt_hunks:
+                    _hd_cmt_src = _hd_cmt_src.replace(_hd_cmt_old, _hd_cmt_new)
+                _hd_cmt_ns = {}
+                exec(
+                    compile(_hd_cmt_src, "<headroom-desktop ccr mixed turn>", "exec"),
+                    _hd_cmt_mod.__dict__,
+                    _hd_cmt_ns,
+                )
+                _hd_cmt_mod.drop_tool_calls = _hd_cmt_drop
+                _hd_cmt_mod.is_ccr_tool_call = _hd_cmt_tc.is_ccr_tool_call
+                _hd_cmt_mod.CCRResponseHandler.handle_response = _hd_cmt_ns["handle_response"]
+                _hd_bound.add("ccr_mixed_turn")
+    except Exception:
+        # Fail-open to the wheel's pass-through (the pre-vendor behaviour).
+        pass
+
 # --- Kompress fallback judged in tokens (vendor, upstream #3881) --------------
 # The code_aware branch of ContentRouter._apply_strategy_to_content records a
 # WORD count as compressed_tokens (content_router.py:3707), and the no-savings
@@ -2596,6 +2831,30 @@ if _hd_lnt_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: `codex exec` gives up on a dead route (posture) --------------------
+# Codex ships `unbounded_connection_retries` on (0.156.1 and the ChatGPT app's
+# 0.160.0 both do): when it cannot connect to its provider it prints
+# "Reconnecting... waiting for network" and never exits. The analyzer runs
+# `codex exec` under a wall clock only and drops its output on timeout, so the
+# scan sat out the full 900s and reported only "did not respond within 900s"
+# (RUST-P2). Bounded, the same dead route ends in ~25s with codex's own
+# "Connection failed" line. `-c`, not `--disable`: an older codex refuses an
+# unknown `--disable` name but ignores an unknown config key. Not
+# version-gated: a wheel that passes the override itself is left alone. Kill
+# switch: HEADROOM_LEARN_CODEX_RETRIES=0.
+_hd_lcr_flag = _hd_os.environ.get("HEADROOM_LEARN_CODEX_RETRIES", "1")
+if _hd_lcr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.learn import analyzer as _hd_lcr_mod
+
+        _hd_lcr_arg = "features.unbounded_connection_retries=false"
+        for _hd_lcr_name, _hd_lcr_model, _hd_lcr_cmd in _hd_lcr_mod._CLI_BACKENDS:
+            if _hd_lcr_model == "codex-cli" and _hd_lcr_arg not in _hd_lcr_cmd:
+                _hd_lcr_cmd.extend(["-c", _hd_lcr_arg])
+                _hd_bound.add("learn_codex_retries")
+    except Exception:
+        pass
+
 # --- Learn: drop the prompt a failed CLI echoed to stderr (diagnostics) --------
 # `codex exec` prints the whole prompt to stderr ahead of its own error, and the
 # analyzer keeps only the first 2000 chars of a failed CLI's stderr, so every
@@ -3094,6 +3353,81 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's relocation (the pre-vendor behaviour).
         pass
 
+# --- web_search_call history on a request without a web_search tool ----------
+# Codex compacts locally for a custom provider such as Headroom's: it resends
+# the whole history with `tools: []` and asks for a summary. When that history
+# holds a hosted `web_search_call` item, the ChatGPT backend answers 200 and
+# then the in-band error "response protection is unavailable". Codex ignores
+# in-band `error` events, sees the stream end ("stream closed before
+# response.completed"), retries the same body five times, and runs the same
+# compaction before every later prompt, so the session never answers again.
+# Measured 2026-10-08 straight against chatgpt.com, no Headroom in the path: a
+# captured compaction request failed as sent and completed with its 10
+# web_search_call items dropped; a normal turn on the same history (which
+# declares the tool) is unaffected. Codex on the built-in OpenAI provider uses
+# remote compaction instead, so only users of a custom provider hit it. The
+# vendor drops web_search_call items from a Responses `input` whose `tools`
+# declare no web_search tool, where every forwarder picks its outbound bytes,
+# and marks the body mutated so the edit is sent. Only the search action (query
+# or URL) leaves the history; its results were never in it. Exact-pin gated to
+# wheel 0.39.0; a no-op on any body without such items.
+# Kill switch: HEADROOM_WEB_SEARCH_HISTORY=0.
+_hd_wsh_flag = _hd_os.environ.get("HEADROOM_WEB_SEARCH_HISTORY", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_wsh_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_wsh_meta
+
+        if _hd_wsh_meta.version("headroom-ai") == "0.39.0":
+            import logging as _hd_wsh_logging
+
+            from headroom.proxy import body_forwarding as _hd_wsh_mod
+
+            _hd_wsh_orig = _hd_wsh_mod.select_outbound_body
+            _hd_wsh_log = _hd_wsh_logging.getLogger("headroom.proxy")
+
+            def _hd_wsh_strip(body):
+                items = body.get("input") if isinstance(body, dict) else None
+                if not isinstance(items, list):
+                    return 0
+                tools = body.get("tools")
+                if isinstance(tools, list) and any(
+                    isinstance(t, dict) and str(t.get("type") or "").startswith("web_search")
+                    for t in tools
+                ):
+                    return 0
+                kept = [
+                    i
+                    for i in items
+                    if not (isinstance(i, dict) and i.get("type") == "web_search_call")
+                ]
+                if len(kept) == len(items):
+                    return 0
+                body["input"] = kept
+                return len(items) - len(kept)
+
+            def _hd_wsh_select(*, body, original_body_bytes, body_mutated, **kwargs):
+                dropped = _hd_wsh_strip(body)
+                if dropped:
+                    body_mutated = True
+                    _hd_wsh_log.info(
+                        "event=web_search_history dropped=%d (no web_search tool declared)",
+                        dropped,
+                    )
+                return _hd_wsh_orig(
+                    body=body,
+                    original_body_bytes=original_body_bytes,
+                    body_mutated=body_mutated,
+                    **kwargs,
+                )
+
+            _hd_wsh_mod.select_outbound_body = _hd_wsh_select
+            _hd_bound.add("web_search_history")
+    except Exception:
+        # Fail-open to the wheel's forwarding (the pre-vendor behaviour).
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3195,6 +3529,7 @@ _HD_VENDORS = (
     "message_window",
     "quarantine_spare_capacity",
     "ccr_repair_order",
+    "ccr_mixed_turn",
     "kompress_fallback_units",
     "kompress_waste",
     "token_read_window",
@@ -3206,6 +3541,7 @@ _HD_VENDORS = (
     "learn_worktree_merge",
     "learn_drop_error_recovery",
     "learn_no_tools",
+    "learn_codex_retries",
     "learn_prompt_echo",
     "learn_stdin_early_exit",
     "image_memo",
@@ -3213,7 +3549,9 @@ _HD_VENDORS = (
     "stream_uncached_input",
     "ccr_tool_eager",
     "held_read_breakpoint",
+    "web_search_history",
     "loop_stall_dump",
+    "startup_stall_dump",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -4895,6 +5233,18 @@ impl ToolManager {
                 };
                 let log_path = logs_dir.join(format!("headroom-{variant}.log"));
                 rotate_log_if_large(&log_path);
+                // The sitecustomize pre-bind stall dump (Windows). Cleared per
+                // spawn so a dump on disk always belongs to this attempt.
+                let stall_path = logs_dir.join("startup-stall.txt");
+                let _ = std::fs::remove_file(&stall_path);
+                // From create_app on, the wheel logs every startup step to its
+                // own file and nothing to stdout/stderr, so `log_path` ends at
+                // the banner however far the start got (RUST-P1).
+                let wheel_log = crate::client_adapters::home_dir()
+                    .join(".headroom")
+                    .join("logs")
+                    .join(format!("proxy-{}.log", headroom_proxy_port()));
+                let wheel_log_from = std::fs::metadata(&wheel_log).map_or(0, |m| m.len());
                 let log_file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -5340,6 +5690,7 @@ impl ToolManager {
                 if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
                     command.env("HEADROOM_DISABLE_KOMPRESS", "1");
                 }
+                command.envs(startup_stall_dump_env(&stall_path));
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -5424,7 +5775,12 @@ impl ToolManager {
                     program: executable.display().to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     log_path: log_path.display().to_string(),
-                    log_tail: crash_log_excerpt(&log_path),
+                    log_tail: startup_failure_excerpt(
+                        &log_path,
+                        &stall_path,
+                        &wheel_log,
+                        wheel_log_from,
+                    ),
                     reason,
                 });
             }
@@ -10033,19 +10389,21 @@ impl ToolManager {
             // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
             // install path -- see `plugin_install_failure_category`.
             let category = plugin_install_failure_category(&detail);
-            sentry::with_scope(
-                |scope| {
-                    scope.set_fingerprint(Some(&["plugin-install-partial", category]));
-                },
-                || {
-                    sentry::capture_message(
-                        &format!(
-                            "{id} installed for some hosts but not all [{category}]: {detail}"
-                        ),
-                        sentry::Level::Warning,
-                    );
-                },
-            );
+            if plugin_install_failure_reported(category) {
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_fingerprint(Some(&["plugin-install-partial", category]));
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!(
+                                "{id} installed for some hosts but not all [{category}]: {detail}"
+                            ),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+            }
             log::warn!("{id} installed for some hosts but not all: {detail}");
         }
         let version =
@@ -10227,6 +10585,8 @@ impl ToolManager {
 }
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
+
+const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code needs it to download this addon: install it from https://git-scm.com, then try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -10989,7 +11349,11 @@ fn is_local_proxy_reachable() -> bool {
     // Check headroom's actual backend port, not the intercept port (6767),
     // because the intercept starts before headroom and would always be reachable.
     let address: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
-    TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
+    TcpStream::connect_timeout(
+        &address,
+        Duration::from_millis(LOCAL_PROXY_PROBE_TIMEOUT_MS),
+    )
+    .is_ok()
 }
 
 enum PortState {
@@ -12003,6 +12367,44 @@ fn crash_log_excerpt(path: &Path) -> String {
             "--- fatal markers ---\n{}\n--- tail ---\n{tail}",
             header.join("\n")
         )
+    }
+}
+
+/// [`crash_log_excerpt`], led by what RUST-P1 (a Windows backend that printed
+/// its banner and then nothing for 300s) arrived without: the stacks the
+/// sitecustomize pre-bind stall dump wrote for this attempt, main thread
+/// first, and the lines this attempt added to the wheel's own log (from
+/// `wheel_log_from`, its length at spawn), which name the last startup step.
+fn startup_failure_excerpt(
+    log_path: &Path,
+    stall_path: &Path,
+    wheel_log: &Path,
+    wheel_log_from: u64,
+) -> String {
+    const WHEEL_LINES: usize = 30;
+    let mut lead = String::new();
+    if let Some(stacks) = std::fs::read_to_string(stall_path)
+        .ok()
+        .as_deref()
+        .and_then(crate::state::stall_dump_stacks)
+    {
+        lead.push_str(&format!("--- startup stall stacks ---\n{stacks}\n"));
+    }
+    let wheel = crate::log_text_since(wheel_log, wheel_log_from).unwrap_or_default();
+    let wheel: Vec<&str> = wheel.lines().collect();
+    if !wheel.is_empty() {
+        let tail = wheel[wheel.len().saturating_sub(WHEEL_LINES)..]
+            .iter()
+            .map(|line| redact_sensitive(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        lead.push_str(&format!("--- proxy log (this attempt) ---\n{tail}\n"));
+    }
+    let excerpt = crash_log_excerpt(log_path);
+    if lead.is_empty() {
+        excerpt
+    } else {
+        format!("{lead}--- log ---\n{excerpt}")
     }
 }
 
@@ -15284,6 +15686,11 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
+/// The user's machine lacks git; the UI says so and nothing we ship fixes it.
+fn plugin_install_failure_reported(category: &str) -> bool {
+    category != "git-missing"
+}
+
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
 /// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
 /// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
@@ -15300,7 +15707,13 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("not found in marketplace") {
+    if lower.contains("'git' not found") {
+        // Claude Code clones a marketplace with git, and the host has none
+        // (RUST-P0: Windows, "Command 'git' not found or is in an unsafe
+        // location"). Checked first: the install that follows then fails
+        // "not found in marketplace", which names only the consequence.
+        "git-missing"
+    } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
         "marketplace-missing"
@@ -16007,16 +16420,22 @@ fn settle_plugin_hosts(
             // partial path in `install_plugin`; a too-old CLI alone is not an
             // error and stays out.
             let category = plugin_install_failure_category(&detail);
-            sentry::with_scope(
-                |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
-                || {
-                    sentry::capture_message(
-                        &format!("{id} install failed on every host [{category}]: {detail}"),
-                        sentry::Level::Warning,
-                    );
-                },
-            );
-            format!("installing the {id} plugin failed: {detail}. ")
+            if plugin_install_failure_reported(category) {
+                sentry::with_scope(
+                    |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
+                    || {
+                        sentry::capture_message(
+                            &format!("{id} install failed on every host [{category}]: {detail}"),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+            }
+            if category == "git-missing" {
+                format!("{NO_GIT_FOR_PLUGIN} ")
+            } else {
+                format!("installing the {id} plugin failed: {detail}. ")
+            }
         };
         if !outdated.is_empty() {
             let names = outdated.join(" and ");
@@ -16835,6 +17254,21 @@ mod tests {
         assert!(py.contains("_hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip"));
     }
 
+    #[test]
+    fn sitecustomize_vendors_ccr_mixed_turn() {
+        // headroom_retrieve called alongside client tools reached Claude Code
+        // as "No such tool available". Behaviour is proven by
+        // ccr_mixed_turn_behaves_against_the_installed_wheel; this pins the
+        // gate, the kill switch, the self-neutralization probe and the rebind.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CCR_MIXED_TURN"));
+        assert!(py.contains(r#"_hd_cmt_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#"not hasattr(_hd_cmt_mod, "drop_tool_calls")"#));
+        assert!(py.contains(
+            r#"_hd_cmt_mod.CCRResponseHandler.handle_response = _hd_cmt_ns["handle_response"]"#
+        ));
+    }
+
     /// Vendor names the summary line reports: every `_hd_bound.add("x")` and
     /// the `_HD_VENDORS` tuple must name the same set, or a vendor drops out
     /// of the line.
@@ -16943,6 +17377,123 @@ asyncio.run(main())
         assert!(main.contains("hd_probe_blocks_the_loop"), "{stacks}");
     }
 
+    /// RUST-P1: a backend that never binds leaves every thread's stack in
+    /// the desktop's file; one whose uvicorn startup returns (port bound)
+    /// leaves nothing, however long it runs after that.
+    #[test]
+    fn startup_stall_dump_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        // os._exit: the desktop kills a backend that never bound, and a normal
+        // interpreter exit waits on a dump that spun (see the vendor).
+        let wedged = dir.path().join("wedged.py");
+        std::fs::write(
+            &wedged,
+            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(4)\n\n\
+             hd_probe_never_binds()\nos._exit(0)\n",
+        )
+        .unwrap();
+        // The vendor's own timer is armed at interpreter start, before the
+        // vendors' imports (a few seconds), so the bound probe re-arms a short
+        // one on the same file: startup returning must cancel whichever is set.
+        let bound = dir.path().join("bound.py");
+        std::fs::write(
+            &bound,
+            r#"import asyncio, faulthandler, os, sys, time, uvicorn
+
+async def app(scope, receive, send):
+    while scope["type"] == "lifespan":
+        message = await receive()
+        if message["type"] == "lifespan.startup":
+            await send({"type": "lifespan.startup.complete"})
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+
+async def main():
+    # A child Python must not inherit the proxy's timer.
+    assert "HEADROOM_STARTUP_STALL_DUMP" not in os.environ
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND)
+    # Long enough that a loaded machine binds first (3s flaked in a full
+    # suite at load ~45); the sleep below outlasts it, so a missed cancel dumps.
+    faulthandler.dump_traceback_later(10.0, file=fd)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    time.sleep(11.0)
+    server.should_exit = True
+    await serving
+
+asyncio.run(main())
+"#,
+        )
+        .unwrap();
+        let spawn = |name: &str, probe: &std::path::Path, secs: &str| {
+            let dump = dir.path().join(format!("{name}-stall.txt"));
+            let stderr = dir.path().join(format!("{name}-stderr.txt"));
+            let child = crate::proc::command(&python)
+                .arg(probe)
+                .arg(&dump)
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STARTUP_STALL_DUMP", &dump)
+                .env("HEADROOM_STARTUP_STALL_DUMP_SECS", secs)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .expect("run probe");
+            (child, dump, stderr)
+        };
+        let runs = [spawn("wedged", &wedged, "1"), spawn("bound", &bound, "600")];
+        let started = std::time::Instant::now();
+        for (mut child, _, stderr_path) in runs {
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("probe wait") {
+                    break status;
+                }
+                if started.elapsed() > Duration::from_secs(180) {
+                    let _ = child.kill();
+                    panic!(
+                        "probe hung: {}",
+                        std::fs::read_to_string(&stderr_path).unwrap()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+            assert!(status.success(), "{stderr}");
+            let bound_vendors = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("INFO:headroom.desktop:sitecustomize vendors bound="))
+                .and_then(|l| l.split_once(" skipped="))
+                .map(|(bound, _)| bound.split(',').any(|v| v == "startup_stall_dump"));
+            assert_eq!(bound_vendors, Some(true), "{stderr}");
+        }
+        let dump = std::fs::read_to_string(dir.path().join("wedged-stall.txt")).unwrap();
+        assert!(dump.starts_with("Timeout (0:00:01)!"), "{dump}");
+        // Armed before the vendors' imports, so on a loaded machine the dump
+        // can catch the main thread mid-import, where the frame walk may stop
+        // short (the spin the vendor guards against). It still names a frame.
+        let stacks = crate::state::stall_dump_stacks(&dump).expect("parsable dump");
+        let main = stacks.split("\n\n").next().unwrap();
+        assert!(
+            main.starts_with("Thread 0x") && main.contains("  File \""),
+            "{stacks}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bound-stall.txt")).unwrap(),
+            ""
+        );
+    }
+
     #[test]
     fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
         let python =
@@ -16977,6 +17528,8 @@ asyncio.run(main())
         assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
         // Opt-in only: its all-threads dump can crash or wedge a busy backend.
         assert!(skipped.contains("loop_stall_dump"), "{}", proxy[0]);
+        // Windows spawns only: unix takes its stacks with SIGABRT.
+        assert!(skipped.contains("startup_stall_dump"), "{}", proxy[0]);
         let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
         assert!(
             off.len() == 1
@@ -17933,6 +18486,50 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     }
 
     #[test]
+    fn learn_codex_retries_behaves_against_the_installed_wheel() {
+        // RUST-P2: the codex-cli analysis command bounds codex's connection
+        // retries exactly once and leaves claude-cli alone; the kill switch
+        // restores the wheel's command.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-cr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn.analyzer import _CLI_BACKENDS as b\n\
+                     c = {m: c for _, m, c in b}\n\
+                     print(c['codex-cli'], c['claude-cli'].count('-c'))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_CODEX_RETRIES", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on,
+            "['codex', 'exec', '--skip-git-repo-check', '-c', 'features.unbounded_connection_retries=false'] 0",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off, "['codex', 'exec', '--skip-git-repo-check'] 0",
+            "stderr:\n{off_err}"
+        );
+    }
+
+    #[test]
     fn learn_prompt_echo_behaves_against_the_installed_wheel() {
         // RUST-KT: a CLI that echoes the prompt to stderr before failing (as
         // `codex exec` does) leaves its verdict, not the prompt, in the
@@ -18353,6 +18950,69 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     }
 
     #[test]
+    fn web_search_history_behaves_against_the_installed_wheel() {
+        // A Codex compaction request (`tools: []`) goes out without its
+        // web_search_call items, through both outbound pickers; a turn that
+        // declares web_search keeps them and its client bytes. The kill switch
+        // forwards the client's bytes throughout.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-web-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, sitecustomize\n\
+                     from headroom.proxy import body_forwarding as bf\n\
+                     WS = {'type': 'web_search_call', 'id': 'ws_1', 'status': 'completed',\n\
+                     \x20     'action': {'type': 'search', 'query': 'q'}}\n\
+                     MSG = {'type': 'message', 'role': 'user',\n\
+                     \x20      'content': [{'type': 'input_text', 'text': 'hi'}]}\n\
+                     def body(tools):\n\
+                     \x20   return {'model': 'gpt-6.1-sol', 'input': [MSG, WS, MSG], 'tools': tools}\n\
+                     def ws(raw):\n\
+                     \x20   return [i['type'] for i in json.loads(raw)['input']].count('web_search_call')\n\
+                     def pick(tools):\n\
+                     \x20   b = body(tools)\n\
+                     \x20   o = bf.select_outbound_body(body=b, original_body_bytes=json.dumps(b).encode(),\n\
+                     \x20       body_mutated=False)\n\
+                     \x20   return ws(o.content), o.source\n\
+                     b = body([])\n\
+                     raw, _ = bf.prepare_outbound_body_bytes(body=b,\n\
+                     \x20   original_body_bytes=json.dumps(b).encode(), body_mutated=False)\n\
+                     print(*pick([]), *pick([{'type': 'web_search'}]), ws(raw),\n\
+                     \x20     'web_search_history' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_WEB_SEARCH_HISTORY", kill)
+                .output()
+                .expect("run web search history probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: web search history vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "0 canonical 1 passthrough 0 True", "stderr:\n{on_err}");
+        assert_eq!(
+            off, "1 passthrough 1 passthrough 1 False",
+            "stderr:\n{off_err}"
+        );
+    }
+
+    #[test]
     fn learn_rule_coercion_behaves_against_the_installed_wheel() {
         // RUST-K5: list content becomes bullets, a non-string section drops
         // its rule, a null rules list reads as empty; the kill switch restores
@@ -18532,6 +19192,79 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(on, "2 True True 0 ['b', 'x', 'go']", "stderr:\n{on_err}");
         assert_eq!(
             off, "2 True True 0 ['x', 'b', 'go']",
+            "kill switch did not unbind:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn ccr_mixed_turn_behaves_against_the_installed_wheel() {
+        // A Claude Code subagent's turn: headroom_retrieve plus a Read in
+        // parallel. The wheel hands both back (Claude Code: "No such tool
+        // available: headroom_retrieve"); the vendor serves the retrieval in a
+        // continuation carrying only the retrieve pair and returns the
+        // continuation, where the model re-issued the Read. A continuation
+        // that withdraws the Read is the answer too: handing back the model's
+        // own turn would run a call it cancelled. Only a failed continuation
+        // hands that turn back. A Responses turn keeps the pass-through; the
+        // kill switch restores the wheel's.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = "import asyncio, json\n\
+                     from headroom.cache.backends import InMemoryBackend\n\
+                     from headroom.cache.compression_store import get_compression_store\n\
+                     from headroom.ccr.response_handler import CCRResponseHandler\n\
+                     h = get_compression_store(backend=InMemoryBackend()).store(original='[1,2,3]', compressed='[]')\n\
+                     def tu(i, n):\n\
+                     \x20   return {'type': 'tool_use', 'id': i, 'name': n, 'input': {'hash': h}}\n\
+                     mixed = {'content': [tu('r', 'headroom_retrieve'), tu('b', 'Read')], 'stop_reason': 'tool_use'}\n\
+                     sent = []\n\
+                     async def call(m, t):\n\
+                     \x20   sent.append(m)\n\
+                     \x20   return {'content': [tu('b2', 'Read')], 'stop_reason': 'tool_use'}\n\
+                     out = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, call, 'anthropic'))\n\
+                     fc = lambda i, n: {'type': 'function_call', 'call_id': i, 'name': n, 'arguments': json.dumps({'hash': h})}\n\
+                     resp = {'output': [fc('b', 'Read'), fc('r', 'headroom_retrieve')]}\n\
+                     kept = asyncio.run(CCRResponseHandler().handle_response(resp, [], None, call, 'openai_responses'))\n\
+                     async def done(m, t):\n\
+                     \x20   return {'content': [{'type': 'text', 'text': 'Done'}], 'stop_reason': 'end_turn'}\n\
+                     back = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, done, 'anthropic'))\n\
+                     async def fail(m, t):\n\
+                     \x20   raise RuntimeError('upstream down')\n\
+                     failed = asyncio.run(CCRResponseHandler().handle_response(mixed, [], None, fail, 'anthropic'))\n\
+                     print(len(sent), [b['id'] for b in out['content']],\n\
+                     [b['id'] for b in sent[0][0]['content']] if sent else '-',\n\
+                     '[1,2,3]' in json.dumps(sent[0][1:]) if sent else '-', kept is resp,\n\
+                     [b.get('text', b.get('id')) for b in back['content']], failed is mixed)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CCR_MIXED_TURN", kill)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run ccr mixed-turn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let served = "1 ['b2'] ['r'] True True ['Done'] True";
+        if off == served {
+            eprintln!("skipping: the wheel already serves a mixed retrieve; drop the vendor");
+            return;
+        }
+        assert_eq!(on, served, "stderr:\n{on_err}");
+        assert_eq!(
+            off, "0 ['r', 'b'] - - True ['r', 'b'] True",
             "kill switch did not unbind:\n{off_err}"
         );
     }
@@ -19046,6 +19779,79 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         // No dump: plain tail, no marker section.
         std::fs::write(&log, "just\na\nlog\n").unwrap();
         assert_eq!(super::crash_log_excerpt(&log), "just\na\nlog");
+    }
+
+    /// The GIL-free dump arms only on Windows, and fires inside the window
+    /// where the backend is about to be killed regardless.
+    #[test]
+    fn startup_stall_dump_arms_only_on_windows_and_only_before_the_kill() {
+        let env = super::startup_stall_dump_env(Path::new("startup-stall.txt"));
+        assert_eq!(env.is_empty(), !cfg!(windows), "{env:?}");
+        // Not before the Windows loop's real end: a backend that binds late
+        // but healthy must never take the GIL-free dump.
+        let ms = super::STARTUP_STALL_DUMP_SECS * 1000;
+        assert_eq!(super::WINDOWS_STARTUP_LOOP_MS, 516_000);
+        assert!(
+            (super::WINDOWS_STARTUP_LOOP_MS * 9 / 10..super::WINDOWS_STARTUP_LOOP_MS).contains(&ms),
+            "{ms}"
+        );
+    }
+
+    /// RUST-P1: a Windows backend that printed its banner and nothing else
+    /// for 300s. The pre-bind dump leads the report, main thread first, then
+    /// what this attempt wrote to the wheel's own log.
+    #[test]
+    fn startup_failure_excerpt_leads_with_the_pre_bind_stall_stacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("headroom-proxy.log");
+        let stall = dir.path().join("startup-stall.txt");
+        let wheel = dir.path().join("proxy-6768.log");
+        std::fs::write(&log, "banner\nproxy-6768.log owner-only warning\n").unwrap();
+        let earlier_run = "12:00:00 - headroom.proxy - INFO - an earlier run's line\n";
+        std::fs::write(&wheel, earlier_run).unwrap();
+        let from = earlier_run.len() as u64;
+        let excerpt = |from| super::startup_failure_excerpt(&log, &stall, &wheel, from);
+        // No dump file (port bound, or not Windows), nothing new in the
+        // wheel log: the plain excerpt.
+        assert_eq!(excerpt(from), super::crash_log_excerpt(&log));
+        // Truncated at arm, never fired.
+        std::fs::write(&stall, "").unwrap();
+        assert_eq!(excerpt(from), super::crash_log_excerpt(&log));
+        std::fs::write(
+            &wheel,
+            format!(
+                "{earlier_run}12:05:00 - headroom.proxy - INFO - Pre-loading compressors and \
+                 parsers...\n"
+            ),
+        )
+        .unwrap();
+        // faulthandler's layout: one block per thread, the main thread last.
+        std::fs::write(
+            &stall,
+            "Timeout (0:04:30)!\nThread 0x2 (most recent call first):\n  \
+             File \"threading.py\", line 3 in wait\n\n\
+             Thread 0x1 (most recent call first):\n  \
+             File \"server.py\", line 2151 in startup\n",
+        )
+        .unwrap();
+        let excerpt = excerpt(from);
+        assert!(
+            excerpt.starts_with("--- startup stall stacks ---\nThread 0x1"),
+            "{excerpt}"
+        );
+        assert!(excerpt.contains("in wait"), "{excerpt}");
+        assert!(
+            excerpt.contains(
+                "in wait\n--- proxy log (this attempt) ---\n12:05:00 - headroom.proxy - INFO - \
+                 Pre-loading compressors and parsers...\n--- log ---\n"
+            ),
+            "{excerpt}"
+        );
+        assert!(!excerpt.contains("earlier run"), "{excerpt}");
+        assert!(
+            excerpt.ends_with("--- log ---\nbanner\nproxy-6768.log owner-only warning"),
+            "{excerpt}"
+        );
     }
 
     /// Verbatim from RUST-BA (Windows, 0.9.16): the base stdlib's
@@ -26706,6 +27512,17 @@ exit 0
                  \"caveman@caveman\" at user scope\u{2026}\n\nstderr:\n\n[headroom] killed: no \
                  output for 180s (stalled installer)\n",
                 "host-cli-stalled",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JayPokale/Chisle\nstdout:\n\
+                 Adding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add marketplace: Failed \
+                 to clone marketplace repository: Command 'git' not found or is in an unsafe \
+                 location (current directory)\n: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin install chisle@chisle\nstdout:\n\nstderr:\n\
+                 \u{d7} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" not found \
+                 in marketplace \"chisle\".",
+                "git-missing",
             ),
             ("Codex: something we have not seen", "other"),
         ];
