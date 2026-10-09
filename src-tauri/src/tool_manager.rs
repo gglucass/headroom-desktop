@@ -3428,6 +3428,174 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's forwarding (the pre-vendor behaviour).
         pass
 
+# --- Buffered CCR turns stream from upstream ----------------------------------
+# A streaming Claude Code turn with headroom_retrieve resident is flipped to
+# stream:false so the proxy can serve a retrieval server-side. Anthropic then
+# sends nothing until the whole reply is generated, and a network middlebox that
+# drops HTTP connections idle for 60s (TLS-inspecting antivirus, VPN, corporate
+# proxy; TCP keepalive does not reset an L7 idle timer) closes it first: httpx
+# raises "Server disconnected without sending a response" at ~60s, the retry
+# loop tries three times and Claude Code gets a 502 after ~186s, then resends
+# the same body, forever (AppSumo customer 2026-10-08, 1.3-2.9MB opus turns and
+# 200KB subagent turns alike; without Headroom the client streams and works).
+# The vendor sends that one request as stream:true and folds the SSE reply back
+# into the Message JSON the buffered path expects, so bytes (deltas, pings)
+# flow the whole time and nothing downstream changes. It applies only to
+# api.anthropic.com /v1/messages bodies Headroom serializes itself: the
+# buffered flip, or a continuation built from scratch. A client's own
+# stream:false bytes stay byte-faithful. Request content is unchanged apart from
+# the stream flag, so no compression or cache effect. A stream that ends
+# without message_stop raises like a dropped connection (the wheel's 502); an
+# in-band error event returns its status (529 overloaded, 429, else 500).
+# Exact-pin gated to wheel 0.39.0; stands down when the wheel stops flipping.
+# Kill switch: HEADROOM_BUFFERED_UPSTREAM_STREAM=0.
+_hd_bus_flag = _hd_os.environ.get("HEADROOM_BUFFERED_UPSTREAM_STREAM", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_bus_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_bus_meta
+
+        if _hd_bus_meta.version("headroom-ai") == "0.39.0":
+            import json as _hd_bus_json
+            import logging as _hd_bus_logging
+            from urllib.parse import urlsplit as _hd_bus_urlsplit
+
+            import httpx as _hd_bus_httpx
+            from headroom.proxy import server as _hd_bus_server
+            from headroom.proxy.handlers import anthropic as _hd_bus_anth
+
+            _hd_bus_log = _hd_bus_logging.getLogger("headroom.proxy")
+            _hd_bus_orig = _hd_bus_server.HeadroomProxy._retry_request
+            _hd_bus_flip = "ccr_streaming_retrieve_buffered_non_stream"
+            _hd_bus_status = {"overloaded_error": 529, "rate_limit_error": 429}
+
+            def _hd_bus_applies(method, url, body, kwargs):
+                if method != "POST" or not isinstance(body, dict):
+                    return False
+                if body.get("stream") is not False:
+                    return False
+                parts = _hd_bus_urlsplit(url)
+                if parts.hostname != "api.anthropic.com" or not parts.path.endswith(
+                    "/v1/messages"
+                ):
+                    return False
+                if _hd_bus_flip in (kwargs.get("mutation_reasons") or []):
+                    return True
+                return kwargs.get("original_body_bytes") is None
+
+            def _hd_bus_events(text):
+                for chunk in text.replace("\r\n", "\n").split("\n\n"):
+                    data = [
+                        line[5:].lstrip() for line in chunk.split("\n") if line.startswith("data:")
+                    ]
+                    if data:
+                        yield _hd_bus_json.loads("\n".join(data))
+
+            def _hd_bus_fold(text):
+                msg, blocks, partial, done = None, {}, {}, False
+                for ev in _hd_bus_events(text):
+                    kind = ev.get("type")
+                    if kind == "error":
+                        return None, ev
+                    if kind == "message_start":
+                        msg = dict(ev["message"])
+                    elif kind == "content_block_start":
+                        blocks[ev["index"]] = dict(ev["content_block"])
+                    elif kind == "content_block_delta":
+                        block, delta = blocks[ev["index"]], ev["delta"]
+                        dtype = delta.get("type")
+                        if dtype == "input_json_delta":
+                            partial[ev["index"]] = (
+                                partial.get(ev["index"], "") + delta["partial_json"]
+                            )
+                        elif dtype == "signature_delta":
+                            block["signature"] = delta["signature"]
+                        elif dtype == "citations_delta":
+                            block["citations"] = (block.get("citations") or []) + [delta["citation"]]
+                        else:
+                            # text_delta / thinking_delta and any later string delta.
+                            for key, value in delta.items():
+                                if key == "type":
+                                    continue
+                                if isinstance(value, str) and isinstance(block.get(key), str):
+                                    block[key] += value
+                                else:
+                                    block[key] = value
+                    elif kind == "content_block_stop":
+                        raw = partial.pop(ev["index"], None)
+                        if raw is not None:
+                            blocks[ev["index"]]["input"] = (
+                                _hd_bus_json.loads(raw) if raw.strip() else {}
+                            )
+                    elif kind == "message_delta" and msg is not None:
+                        msg.update(ev.get("delta") or {})
+                        msg["usage"] = {**(msg.get("usage") or {}), **(ev.get("usage") or {})}
+                        for key, value in ev.items():
+                            if key not in ("type", "delta", "usage"):
+                                msg[key] = value
+                    elif kind == "message_stop":
+                        done = True
+                if msg is None or not done:
+                    return None, None
+                msg["content"] = [blocks[i] for i in sorted(blocks)]
+                return msg, None
+
+            def _hd_bus_reply(resp, status, payload):
+                headers = [
+                    (k, v)
+                    for k, v in resp.headers.items()
+                    if k.lower()
+                    not in ("content-type", "content-length", "content-encoding", "transfer-encoding")
+                ]
+                headers.append(("content-type", "application/json"))
+                return _hd_bus_httpx.Response(
+                    status,
+                    headers=headers,
+                    content=_hd_bus_json.dumps(payload, ensure_ascii=False).encode(),
+                    request=resp.request,
+                )
+
+            async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
+                if stream or not _hd_bus_applies(method, url, body, kwargs):
+                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                kwargs = {
+                    **kwargs,
+                    "body_mutated": True,
+                    "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
+                    + ["buffered_upstream_stream"],
+                }
+                sse_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+                sse_headers["accept"] = "text/event-stream"
+                resp = await _hd_bus_orig(
+                    self, method, url, sse_headers, {**body, "stream": True}, False, **kwargs
+                )
+                if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
+                    "content-type", ""
+                ):
+                    # An HTTP error, or the client's own bytes went out (signed
+                    # thinking): either way the reply is already what the caller reads.
+                    return resp
+                msg, err = _hd_bus_fold(resp.text)
+                if err is not None:
+                    etype = (err.get("error") or {}).get("type")
+                    _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
+                    return _hd_bus_reply(resp, _hd_bus_status.get(etype, 500), err)
+                if msg is None:
+                    raise _hd_bus_httpx.RemoteProtocolError(
+                        "upstream stream ended before message_stop", request=resp.request
+                    )
+                return _hd_bus_reply(resp, 200, msg)
+
+            with open(_hd_bus_anth.__file__, encoding="utf-8") as _hd_bus_src:
+                _hd_bus_needed = _hd_bus_flip in _hd_bus_src.read()
+            if _hd_bus_needed:
+                _hd_bus_server.HeadroomProxy._retry_request = _hd_bus_retry_request
+                _hd_bound.add("buffered_upstream_stream")
+    except Exception:
+        # Fail-open to the wheel's buffered stream:false request.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3550,6 +3718,7 @@ _HD_VENDORS = (
     "ccr_tool_eager",
     "held_read_breakpoint",
     "web_search_history",
+    "buffered_upstream_stream",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -19009,6 +19178,116 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(
             off, "1 passthrough 1 passthrough 1 False",
             "stderr:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn buffered_upstream_stream_behaves_against_the_installed_wheel() {
+        // The buffered CCR flip goes upstream as stream:true and its SSE reply
+        // folds back into the Message JSON; a client's own stream:false bytes,
+        // an in-band error and a truncated stream keep their wheel semantics.
+        // The kill switch sends the wheel's stream:false request.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-buffered-sse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"
+import asyncio, json, httpx, sitecustomize
+from headroom.proxy import server
+URL = 'https://api.anthropic.com/v1/messages'
+FLIP = 'ccr_streaming_retrieve_buffered_non_stream'
+def ev(d):
+    return 'event: %s\ndata: %s\n\n' % (d['type'], json.dumps(d))
+START = ev({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message',
+    'role': 'assistant', 'model': 'm', 'content': [], 'stop_reason': None,
+    'stop_sequence': None, 'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5,
+    'output_tokens': 1}}})
+BODY = ''.join([START, ev({'type': 'ping'}),
+    ev({'type': 'content_block_start', 'index': 0,
+        'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': 'hm'}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'sig'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}}),
+    ev({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': 'Hel'}}),
+    ev({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': 'lo'}}),
+    ev({'type': 'content_block_stop', 'index': 1}),
+    ev({'type': 'content_block_start', 'index': 2,
+        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
+    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
+    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
+    ev({'type': 'content_block_stop', 'index': 2}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None},
+        'usage': {'output_tokens': 42}}),
+    ev({'type': 'message_stop'})])
+EXPECT = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',
+    'content': [{'type': 'thinking', 'thinking': 'hm', 'signature': 'sig'},
+                {'type': 'text', 'text': 'Hello'},
+                {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}}],
+    'stop_reason': 'tool_use', 'stop_sequence': None,
+    'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 42}}
+ERR = START + ev({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}})
+class Cfg:
+    retry_max_attempts, retry_enabled, retry_base_delay_ms, retry_max_delay_ms = 1, False, 1, 1
+class Client:
+    def __init__(self, text):
+        self.text, self.sent = text, None
+    async def post(self, url, **kw):
+        self.sent = kw
+        return httpx.Response(200, headers={'content-type': 'text/event-stream',
+            'request-id': 'req_1'}, content=self.text.encode(), request=httpx.Request('POST', url))
+def run(text, **kw):
+    proxy = type('P', (), {})()
+    proxy.config, proxy.http_client = Cfg(), Client(text)
+    body = {'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}
+    try:
+        r = asyncio.run(server.HeadroomProxy._retry_request(proxy, 'POST', URL,
+            {'accept': 'application/json'}, body, original_body_bytes=json.dumps(body).encode(), **kw))
+    except httpx.RemoteProtocolError:
+        r = None
+    sent = proxy.http_client.sent
+    return r, json.loads(sent['content'])['stream'], sent['headers']['accept']
+r, s, a = run(BODY, body_mutated=True, mutation_reasons=[FLIP])
+fold = r.headers['content-type'] == 'application/json' and r.json() == EXPECT and r.headers['request-id'] == 'req_1'
+own, own_s, _ = run(BODY, body_mutated=False)
+err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
+cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
+print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
+      'buffered_upstream_stream' in sitecustomize._hd_bound)
+"#;
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_BUFFERED_UPSTREAM_STREAM", kill)
+                .output()
+                .expect("run buffered upstream stream probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: buffered upstream stream vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(
+            on, "True True text/event-stream False text/event-stream 529 None True",
+            "stderr:\n{on_err}"
+        );
+        assert!(
+            off.starts_with("False False application/json False"),
+            "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
         );
     }
 
