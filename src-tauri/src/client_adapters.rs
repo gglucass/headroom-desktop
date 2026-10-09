@@ -5384,6 +5384,46 @@ fn render_codex_config(existing: &str) -> String {
 /// A [`CODEX_ROOT_KEYS`] state entry and the user's own root value it holds.
 type CodexPreservedKey = (&'static str, String);
 
+/// A `config.toml` holding NUL bytes was zero-filled under us, the usual
+/// cause being a write some process had not flushed when the machine crashed
+/// or lost power (NTFS keeps the new length and zeros the lost data). Codex
+/// refuses the run ("key with no value, expected `=`"). Wrapping that run in the managed
+/// blocks kept Codex down for good: the next render matched and repair saw a
+/// healthy block, and every later write backed up the zeros until the
+/// three-backup prune had dropped each good copy. The zeros hold nothing of
+/// the user's, so recover from the newest Headroom backup that is NUL-free and
+/// parses (the render puts the blocks back around it), else drop the NULs and
+/// keep whatever text survived them.
+fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
+    if !existing.contains('\0') {
+        return existing.to_string();
+    }
+    let restored = headroom_backups_newest_first(path)
+        .into_iter()
+        .find_map(|backup| {
+            let text = std::fs::read_to_string(&backup).ok()?;
+            let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
+            clean.then_some((backup, text))
+        });
+    match restored {
+        Some((backup, text)) => {
+            log::warn!(
+                "{} held NUL bytes (zero-filled); restoring it from {}",
+                path.display(),
+                backup.display()
+            );
+            text
+        }
+        None => {
+            log::warn!(
+                "{} held NUL bytes (zero-filled) and no clean backup exists; dropping them",
+                path.display()
+            );
+            existing.replace('\0', "")
+        }
+    }
+}
+
 /// Returns `(changed_files, backup_files, preserved)`: the pre-existing
 /// *foreign* root values this write replaced -- callers must preserve them and
 /// restore them on disable instead of dropping the user onto api.openai.com
@@ -5399,20 +5439,23 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<Cod
     } else {
         String::new()
     };
+    // `existing` stays the on-disk text, so a recovered config always differs
+    // from it and is written even when the render alone would be a no-op.
+    let base = recover_zeroed_codex_config(&path, &existing);
 
     let preserved: Vec<CodexPreservedKey> = CODEX_ROOT_KEYS
         .iter()
         .filter_map(|&(key, ours, entry)| {
-            Some((entry, codex_foreign_root_value(&existing, key, ours)?))
+            Some((entry, codex_foreign_root_value(&base, key, ours)?))
         })
         .collect();
-    let updated = render_codex_config(&existing);
+    let updated = render_codex_config(&base);
     if updated == existing {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     // Never turn a config Codex loads into one it refuses (a duplicate root key
     // or table makes Codex reject the whole file): keep the user's file.
-    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+    if base.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
         return Err(anyhow!(
             "rendered {} is not valid TOML; refusing to overwrite",
             path.display()
@@ -6465,18 +6508,12 @@ fn mcp_span_start_offset(text: &str) -> Option<usize> {
     Some(lines[..at].iter().map(|l| l.len()).sum())
 }
 
-/// Heal configs an earlier build already damaged: re-add (before the span)
-/// each foreign table family a `<file>.headroom-backup-*` held inside a
-/// Headroom MCP span, newest backup first, when adding it to `live` still
-/// parses -- TOML refuses a table defined twice, so a table the live file has
-/// (the app re-added it, maybe with newer values) is never overwritten. A
-/// family without its root header is restored only under a root `live` has:
-/// a lone `[mcp_servers.x.env]` has no `command`, which Codex rejects.
-fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
-    let mut healed = live.to_string();
+/// `<file>.headroom-backup-*` siblings of `path`, newest first (the stamp
+/// sorts as text).
+fn headroom_backups_newest_first(path: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
-        return healed;
+        return Vec::new();
     };
     let prefix = format!("{file_name}.headroom-backup-");
     let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -6491,7 +6528,19 @@ fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
         })
         .collect();
     backups.sort_by(|a, b| b.cmp(a));
-    for backup in backups {
+    backups
+}
+
+/// Heal configs an earlier build already damaged: re-add (before the span)
+/// each foreign table family a `<file>.headroom-backup-*` held inside a
+/// Headroom MCP span, newest backup first, when adding it to `live` still
+/// parses -- TOML refuses a table defined twice, so a table the live file has
+/// (the app re-added it, maybe with newer values) is never overwritten. A
+/// family without its root header is restored only under a root `live` has:
+/// a lone `[mcp_servers.x.env]` has no `command`, which Codex rejects.
+fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
+    let mut healed = live.to_string();
+    for backup in headroom_backups_newest_first(path) {
         let Ok(text) = std::fs::read_to_string(&backup) else {
             continue;
         };
@@ -6634,6 +6683,11 @@ pub(crate) fn codex_provider_block_matches() -> Result<bool> {
     }
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    // Intact blocks around a zero-filled run still fail Codex's load, so a
+    // NUL fails verify and repair re-applies (`recover_zeroed_codex_config`).
+    if content.contains('\0') {
+        return Ok(false);
+    }
     let base_url = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let openai_base = format!("openai_base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let root_ok = marker_block_contains(
@@ -17054,6 +17108,65 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             super::codex_provider_block_matches().unwrap(),
             "upgraded block matches again"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_filled_codex_config_is_recovered_from_the_newest_clean_backup() {
+        // A Windows user's config.toml came back as a run of NULs; the render
+        // wrapped it in the managed blocks (Codex: "config.toml:6:6714 key with
+        // no value, expected `=`"), verify passed on the intact blocks, and
+        // every later backup held the zeros too.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        let wrapped = render_codex_config(&"\0".repeat(6713));
+        fs::write(&config, &wrapped).unwrap();
+        // Newest first: a zeroed backup, an unparsable one, then the good one.
+        let backup = |stamp: &str, text: &str| {
+            fs::write(
+                codex_dir.join(format!("config.toml.headroom-backup-{stamp}")),
+                text,
+            )
+            .unwrap()
+        };
+        backup("20261009030000", &wrapped);
+        backup("20261008030000", "model = \n");
+        backup(
+            "20261007030000",
+            "model = \"gpt-5\"\n\n[projects.'C:\\x']\ntrust_level = \"trusted\"\n",
+        );
+        assert!(
+            !super::codex_provider_block_matches().unwrap(),
+            "blocks around a NUL run must fail verify so repair runs"
+        );
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert!(!toml.contains('\0'), "NULs survived:\n{toml:?}");
+        let parsed: toml::Value = toml.parse().expect("recovered config parses");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+        assert_eq!(parsed["model_provider"].as_str(), Some("headroom"));
+        assert!(super::codex_provider_block_matches().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_filled_codex_config_without_a_clean_backup_drops_the_nuls() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        fs::write(&config, render_codex_config(&"\0".repeat(64))).unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert!(!toml.contains('\0'), "NULs survived:\n{toml:?}");
+        toml.parse::<toml::Value>().expect("config parses");
+        assert!(super::codex_provider_block_matches().unwrap());
     }
 
     #[test]
