@@ -28,11 +28,40 @@ fn bundled_codex_candidates() -> Vec<PathBuf> {
         let local = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join("AppData").join("Local"));
-        candidates.push(local.join("OpenAI").join("Codex").join("bin").join(exe));
+        candidates.extend(store_codex_candidates(
+            &local.join("OpenAI").join("Codex").join("bin"),
+            exe,
+        ));
     } else if let Some(app) = crate::client_adapters::chatgpt_app_path() {
         candidates.push(app.join("Contents/Resources/codex-cli/bin").join(exe));
     }
     candidates.extend(extension_codex_candidates(&home_dir(), exe));
+    candidates
+}
+
+/// The Codex Store app keeps each runtime in `bin\<hash>\codex.exe` and a new
+/// hash per update, leaving the old ones behind (openai/codex #50022), so the
+/// flat `bin\codex.exe` older builds used missed it and plugin addons said
+/// "not found on PATH" (a Windows user, 2026-10-08). Newest first, flat last;
+/// `.staging-*` dirs are half-written updates.
+fn store_codex_candidates(bin: &Path, exe: &str) -> Vec<PathBuf> {
+    let mut runtimes: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(bin)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified());
+            (
+                modified.unwrap_or(std::time::UNIX_EPOCH),
+                entry.path().join(exe),
+            )
+        })
+        .collect();
+    runtimes.sort_by_key(|runtime| std::cmp::Reverse(runtime.0));
+    let mut candidates: Vec<PathBuf> = runtimes.into_iter().map(|(_, path)| path).collect();
+    candidates.push(bin.join(exe));
     candidates
 }
 
@@ -768,6 +797,25 @@ mod tests {
             vec![
                 new.join("bin").join("macos-aarch64").join("codex"),
                 old.join("bin").join("macos-aarch64").join("codex"),
+            ],
+        );
+    }
+
+    #[test]
+    fn store_codex_candidates_find_hashed_runtimes_newest_first() {
+        let tmp = ScopedTempDir::new("store_codex");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(bin.join("faa963e871dd422c")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::create_dir_all(bin.join("c6fe824d725f02d7")).unwrap();
+        fs::create_dir_all(bin.join(".staging-c6fe824d725f02d7-lGUQC4")).unwrap();
+
+        assert_eq!(
+            store_codex_candidates(&bin, "codex.exe"),
+            vec![
+                bin.join("c6fe824d725f02d7").join("codex.exe"),
+                bin.join("faa963e871dd422c").join("codex.exe"),
+                bin.join("codex.exe"),
             ],
         );
     }
