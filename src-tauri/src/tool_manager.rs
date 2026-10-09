@@ -109,10 +109,18 @@ impl McpInstallMethod {
 }
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
-/// When a backend that has not bound its port dumps its stacks: inside the
-/// startup timeout, with room for the interpreter's own start before the
-/// sitecustomize arms the timer.
-const STARTUP_STALL_DUMP_SECS: u64 = HEADROOM_STARTUP_TIMEOUT_MS / 1000 - 30;
+/// `is_local_proxy_reachable`'s connect timeout. Windows retries the SYN on a
+/// refused loopback connect, so there every startup poll waits this out too.
+const LOCAL_PROXY_PROBE_TIMEOUT_MS: u64 = 180;
+/// When the Windows startup loop gives up: it counts polls, not time, and each
+/// one waits out the probe's timeout, so it runs ~516s, not 300s.
+const WINDOWS_STARTUP_LOOP_MS: u64 = HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS
+    * (HEADROOM_STARTUP_POLL_MS + LOCAL_PROXY_PROBE_TIMEOUT_MS);
+/// When a backend that has not bound its port dumps its stacks: 30s before
+/// the Windows startup loop kills it, room for the interpreter's own start
+/// before the sitecustomize arms the timer. Keyed to the nominal 300s, it
+/// fired at 270s in backends still on their way to a healthy bind up to ~516s.
+const STARTUP_STALL_DUMP_SECS: u64 = WINDOWS_STARTUP_LOOP_MS / 1000 - 30;
 
 /// The env that arms the sitecustomize `startup_stall_dump` (RUST-P1). Windows
 /// only: unix takes the same stacks with the SIGABRT sent at the startup
@@ -11341,7 +11349,11 @@ fn is_local_proxy_reachable() -> bool {
     // Check headroom's actual backend port, not the intercept port (6767),
     // because the intercept starts before headroom and would always be reachable.
     let address: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
-    TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
+    TcpStream::connect_timeout(
+        &address,
+        Duration::from_millis(LOCAL_PROXY_PROBE_TIMEOUT_MS),
+    )
+    .is_ok()
 }
 
 enum PortState {
@@ -19775,10 +19787,12 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     fn startup_stall_dump_arms_only_on_windows_and_only_before_the_kill() {
         let env = super::startup_stall_dump_env(Path::new("startup-stall.txt"));
         assert_eq!(env.is_empty(), !cfg!(windows), "{env:?}");
+        // Not before the Windows loop's real end: a backend that binds late
+        // but healthy must never take the GIL-free dump.
         let ms = super::STARTUP_STALL_DUMP_SECS * 1000;
+        assert_eq!(super::WINDOWS_STARTUP_LOOP_MS, 516_000);
         assert!(
-            (super::HEADROOM_STARTUP_TIMEOUT_MS * 9 / 10..super::HEADROOM_STARTUP_TIMEOUT_MS)
-                .contains(&ms),
+            (super::WINDOWS_STARTUP_LOOP_MS * 9 / 10..super::WINDOWS_STARTUP_LOOP_MS).contains(&ms),
             "{ms}"
         );
     }
