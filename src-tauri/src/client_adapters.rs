@@ -13230,6 +13230,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -13293,6 +13296,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("PATH", "/usr/bin:/bin") // ensure bare `rtk` is unresolvable
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -13389,6 +13395,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let output = run(
             crate::proc::command("bash")
                 .arg(&hook_path)
+                // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+                .env("HOME", &root)
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .current_dir(&fake_bin)
                 .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display())),
             r#"{"tool_input":{"command":"git status"}}"#,
@@ -13495,6 +13504,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let stdin = r#"{"tool_input":{"command":"git status"}}"#;
         let output = crate::proc::command("bash")
             .arg(&hook_path)
+            // Not the runner's ~/.claude: a remote-settings.json there silences the allow.
+            .env("HOME", &root)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("PATH", "/usr/bin:/bin") // bare `rtk` unresolvable without the prepend
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
