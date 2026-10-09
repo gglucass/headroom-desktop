@@ -3139,22 +3139,50 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
-    // direct-write: this is atomic_write
-    rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
-        |err| {
-            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-            anyhow!(
-                "renaming {} -> {}: {err}{}",
-                tmp_path.display(),
-                path.display(),
-                if is_locked_file(path) {
-                    LOCKED_FILE_NOTE
-                } else {
-                    ""
+    let renamed =
+        // direct-write: this is atomic_write
+        rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp);
+    copy_if_cross_device(renamed, &tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+        anyhow!(
+            "renaming {} -> {}: {err}{}",
+            tmp_path.display(),
+            path.display(),
+            if is_locked_file(path) {
+                LOCKED_FILE_NOTE
+            } else {
+                ""
+            }
+        )
+    })
+}
+
+/// Copies the tmp over `path` when the rename failed as a cross-device move.
+/// The tmp sits beside its target, so that only happens under a filter driver
+/// that virtualizes writes onto another volume (RUST-P4..P7: one Windows
+/// host's first four writes of a launch, ERROR_NOT_SAME_DEVICE, os error 17),
+/// where every persisted write was lost. Not atomic, but `move_aside` already
+/// copies on the same failure and a lost write is worse.
+fn copy_if_cross_device(
+    renamed: std::io::Result<()>,
+    tmp_path: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    match renamed {
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            match std::fs::copy(tmp_path, path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(tmp_path);
+                    Ok(())
                 }
-            )
-        },
-    )
+                Err(copy_err) => Err(std::io::Error::new(
+                    copy_err.kind(),
+                    format!("{err}; copy failed ({copy_err})"),
+                )),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Appended to a failed write whose destination the user locked. Matched by
@@ -19861,6 +19889,25 @@ sys.exit(3)
         );
         assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(writes, 0);
+    }
+
+    #[test]
+    fn atomic_write_copies_when_the_rename_crosses_devices() {
+        // RUST-P4..P7: a Windows filter driver failed the same-directory rename
+        // with ERROR_NOT_SAME_DEVICE, losing every persisted write.
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, path) = (dir.path().join("s.json.tmp.1.0"), dir.path().join("s.json"));
+        std::fs::write(&tmp, b"new").unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        let cross = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
+        super::copy_if_cross_device(Err(cross), &tmp, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!tmp.exists());
+        // Any other rename failure is returned untouched, no copy.
+        std::fs::write(&tmp, b"newer").unwrap();
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(super::copy_if_cross_device(Err(denied), &tmp, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]
