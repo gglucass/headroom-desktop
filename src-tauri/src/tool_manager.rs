@@ -17567,11 +17567,14 @@ asyncio.run(main())
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         // os._exit: the desktop kills a backend that never bound, and a normal
-        // interpreter exit waits on a dump that spun (see the vendor).
+        // interpreter exit waits on a dump that spun (see the vendor). The
+        // timer is armed before the vendors' imports, and a dump that lands
+        // mid-import can kill the probe outright (no stderr at all, CI on
+        // 2026-10-09 at 1s), so it fires well after them, in the sleep.
         let wedged = dir.path().join("wedged.py");
         std::fs::write(
             &wedged,
-            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(4)\n\n\
+            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(30)\n\n\
              hd_probe_never_binds()\nos._exit(0)\n",
         )
         .unwrap();
@@ -17628,7 +17631,10 @@ asyncio.run(main())
                 .expect("run probe");
             (child, dump, stderr)
         };
-        let runs = [spawn("wedged", &wedged, "1"), spawn("bound", &bound, "600")];
+        let runs = [
+            spawn("wedged", &wedged, "15"),
+            spawn("bound", &bound, "600"),
+        ];
         let started = std::time::Instant::now();
         for (mut child, _, stderr_path) in runs {
             let status = loop {
@@ -17654,10 +17660,10 @@ asyncio.run(main())
             assert_eq!(bound_vendors, Some(true), "{stderr}");
         }
         let dump = std::fs::read_to_string(dir.path().join("wedged-stall.txt")).unwrap();
-        assert!(dump.starts_with("Timeout (0:00:01)!"), "{dump}");
-        // Armed before the vendors' imports, so on a loaded machine the dump
-        // can catch the main thread mid-import, where the frame walk may stop
-        // short (the spin the vendor guards against). It still names a frame.
+        assert!(dump.starts_with("Timeout (0:00:15)!"), "{dump}");
+        // The main thread is in the probe's sleep by now; on a machine loaded
+        // enough to still be importing, the frame walk may stop short. It
+        // still names a frame.
         let stacks = crate::state::stall_dump_stacks(&dump).expect("parsable dump");
         let main = stacks.split("\n\n").next().unwrap();
         assert!(
