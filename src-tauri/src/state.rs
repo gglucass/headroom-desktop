@@ -9703,8 +9703,7 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
         log::info!("terminate_process_tree: {signal} to process group {target}");
         note_app_kill("terminate_process_tree", format!("{signal} group {target}"));
         let _ = crate::proc::command("/bin/kill")
-            .arg(signal)
-            .arg(target)
+            .args([signal, "--", &target])
             .status();
     }
 }
@@ -9717,6 +9716,11 @@ pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
 /// session, so a 0 here SIGTERMs xfce4-session, the window manager and the rest
 /// of the session out from under the user. Pid 1 is init. Neither is ever a
 /// backend we spawned, so neither is worth the blast radius.
+///
+/// Pass it after `--` (`kill -TERM -- -1234`). procps-ng 4.0.4 (Ubuntu 24.04)
+/// misparses `kill -TERM -1234`: two-digit groups read as a signal number and
+/// nothing is signalled, longer ones signal every process the user owns. On CI
+/// that SIGTERMed the GitHub runner mid-test; on a desktop it ends the session.
 fn group_kill_target(pid: i32) -> Option<String> {
     (pid > 1).then(|| format!("-{pid}"))
 }
@@ -10115,7 +10119,7 @@ fn kill_processes_by_command_pattern(
             log::info!("process sweep: -TERM {target} (parent {ppid}) for '{pattern}'");
             note_app_kill("process_sweep", format!("-TERM {target} (parent {ppid})"));
             let _ = crate::proc::command("/bin/kill")
-                .args(["-TERM", &target])
+                .args(["-TERM", "--", &target])
                 .status();
         }
         Ok(())
