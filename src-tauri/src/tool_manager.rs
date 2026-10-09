@@ -3538,6 +3538,13 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                         done = True
                 if msg is None or not done:
                     return None, None
+                # The stream adds placeholders the Message schema lacks (a thinking
+                # block's estimated_tokens: null); the client resends this content and
+                # Anthropic 400s "Extra inputs are not permitted" on any of them.
+                for block in blocks.values():
+                    if block.get("type") == "thinking":
+                        for key in [k for k in block if k not in ("type", "thinking", "signature")]:
+                            del block[key]
                 msg["content"] = [blocks[i] for i in sorted(blocks)]
                 return msg, None
 
@@ -19210,7 +19217,7 @@ START = ev({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message
     'output_tokens': 1}}})
 BODY = ''.join([START, ev({'type': 'ping'}),
     ev({'type': 'content_block_start', 'index': 0,
-        'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''}}),
+        'content_block': {'type': 'thinking', 'thinking': '', 'signature': '', 'estimated_tokens': None}}),
     ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': 'hm'}}),
     ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'sig'}}),
     ev({'type': 'content_block_stop', 'index': 0}),
