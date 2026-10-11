@@ -10629,10 +10629,12 @@ impl ToolManager {
         }
         // A host whose CLI was not detected can still hold the plugin (probe
         // timeout, IDE-only Claude Code). It was not toggled, so it counts as
-        // a failure rather than a silent skip.
+        // a failure rather than a silent skip. Except enabling Codex: it has no
+        // enable verb, so a Codex that holds the plugin already runs it.
         let mut errors: Vec<String> = PluginHost::ALL
             .into_iter()
             .filter(|host| !hosts.iter().any(|(h, _)| h == host) && host.plugin_present(plugin))
+            .filter(|host| !(enabled && *host == PluginHost::Codex))
             .map(|host| format!("{}: CLI not found on PATH", host.label()))
             .collect();
         let mut changed_any = false;
@@ -10644,13 +10646,6 @@ impl ToolManager {
             // back, so a registered plugin is enabled, not reinstalled.
             let result = if enabled && host.plugin_present(plugin) {
                 self.run_plugin_cmd(plugin, cli, host, &host.enable_args(plugin))
-                    .or_else(|err| {
-                        if format!("{err:#}").contains("is already enabled") {
-                            Ok(())
-                        } else {
-                            Err(err)
-                        }
-                    })
             } else if enabled {
                 self.install_plugin_into(plugin, host, cli)
             } else if host.plugin_present(plugin) {
@@ -10660,6 +10655,15 @@ impl ToolManager {
             };
             match result {
                 Ok(()) => changed_any = true,
+                // Claude Code refuses to flip a plugin already in the asked-for
+                // state, e.g. one the user toggled in its `/plugin` (RUST-MV).
+                Err(err)
+                    if ["is already enabled", "is already disabled"]
+                        .iter()
+                        .any(|state| format!("{err:#}").contains(state)) =>
+                {
+                    changed_any = true
+                }
                 Err(err) => errors.push(format!("{}: {err:#}", host.label())),
             }
         }
@@ -10667,10 +10671,14 @@ impl ToolManager {
             bail!("toggling {id} failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
-            log::warn!(
-                "{id} toggled on some hosts but not all: {}",
-                errors.join("; ")
-            );
+            let detail = errors.join("; ");
+            // Same split as the install path: a host holding the plugin whose
+            // CLI cannot be found is the user's machine (RUST-MV). Local log.
+            if plugin_install_failure_reported(plugin_install_failure_category(&detail)) {
+                log::warn!("{id} toggled on some hosts but not all: {detail}");
+            } else {
+                log::info!("{id} toggled on some hosts but not all: {detail}");
+            }
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
@@ -10773,7 +10781,7 @@ impl ToolManager {
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
-const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code needs it to download this addon: install it from https://git-scm.com, then try again.";
+const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -15875,9 +15883,10 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// The user's machine lacks git; the UI says so and nothing we ship fixes it.
+/// The user's machine lacks git (the UI says so), or a host holds the plugin
+/// but no CLI for it can be found (RUST-MV): nothing we ship fixes either.
 fn plugin_install_failure_reported(category: &str) -> bool {
-    category != "git-missing"
+    !matches!(category, "git-missing" | "cli-missing")
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -15896,10 +15905,13 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("'git' not found") {
-        // Claude Code clones a marketplace with git, and the host has none
-        // (RUST-P0: Windows, "Command 'git' not found or is in an unsafe
-        // location"). Checked first: the install that follows then fails
+    if lower.contains("'git' not found")
+        || (lower.contains("failed to run git") && lower.contains("program not found"))
+    {
+        // Claude Code and Codex clone a marketplace with git, and the host has
+        // none (RUST-P0: Windows, Claude Code's "Command 'git' not found or is
+        // in an unsafe location", Codex's "failed to run git clone ...: program
+        // not found"). Checked first: the install that follows then fails
         // "not found in marketplace", which names only the consequence.
         "git-missing"
     } else if lower.contains("not found in marketplace") {
@@ -26338,6 +26350,90 @@ Always run the linter first.
         assert_eq!(enabled, Some(true));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_disable_of_an_already_disabled_claude_plugin_succeeds() {
+        // RUST-MV: the user had disabled it in Claude Code's own `/plugin`.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-redisable-claude");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":true}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo \"Plugin \\\"$3\\\" is already disabled\" >&2; exit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", false, &[(PluginHost::ClaudeCode, cli)]);
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        result.expect("an already-disabled plugin is a successful disable");
+        assert_eq!(enabled, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_enable_does_not_fail_an_undetected_codex_that_holds_it() {
+        // Codex enables with `plugin add`, a no-op on a registered plugin, so
+        // a Codex holding it needs no CLI to be enabled (RUST-MV). Claude
+        // Code's enable fails here so the error lists every host it counted.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-enable-undetected-codex");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::create_dir_all(root.join(".codex")).expect("codex home");
+        fs::write(
+            root.join(".codex").join("config.toml"),
+            "[plugins.\"ponytail@ponytail\"]\nenabled = true\n",
+        )
+        .expect("codex config");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":false}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo boom >&2; exit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", true, &[(PluginHost::ClaudeCode, cli)]);
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("Claude Code's enable failed");
+        assert!(
+            !format!("{err:#}").contains("Codex: CLI not found"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn context7_helper_wraps_npx_in_cmd_on_windows() {
         // Native Windows agents spawn MCP servers without a shell, and there
@@ -27841,6 +27937,18 @@ exit 0
                  ~\\.local\\bin\\claude.exe plugin install chisle@chisle\nstdout:\n\nstderr:\n\
                  \u{d7} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" not found \
                  in marketplace \"chisle\".",
+                "git-missing",
+            ),
+            (
+                "Codex: marketplace add failed first: command failed (exit 1): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe plugin \
+                 marketplace add JuliusBrussee/caveman\nstdout:\n\nstderr:\nError: failed to run \
+                 git clone https://github.com/JuliusBrussee/caveman.git \
+                 ~\\.codex\\.tmp/marketplaces\\.staging\\marketplace-add-zQb0zR: program not \
+                 found\n: command failed (exit 1): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe plugin add \
+                 caveman@caveman\nstdout:\n\nstderr:\nError: plugin `caveman` was not found in \
+                 marketplace `caveman`",
                 "git-missing",
             ),
             ("Codex: something we have not seen", "other"),
