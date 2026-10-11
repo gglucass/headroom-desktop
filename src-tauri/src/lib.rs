@@ -9467,8 +9467,8 @@ fn execute_headroom_learn_run(
         // and "claude-sonnet-4-6" is not a valid Claude Code model alias,
         // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
-    if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
-        command.env("PATH", crate::proc::path_with_dir_prepended(dir));
+    if let Some(cli) = cli_path.as_ref() {
+        command.env("PATH", claude_cli::path_for_cli(cli));
     }
     // Seed a step before the first line arrives: session scanning is silent, and
     // an empty line that pops in later would shift the row.

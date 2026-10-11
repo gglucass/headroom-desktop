@@ -294,20 +294,13 @@ fn resolve_system_tool(program: &OsStr, system_root: Option<&OsStr>) -> OsString
     program.to_os_string()
 }
 
-/// Current PATH with `dir` prepended, joined with the platform separator
+/// `existing` with `dir` prepended, joined with the platform separator
 /// (':' on Unix, ';' on Windows). Hand-formatted `"{dir}:{existing}"` strings
 /// were a recurring Windows bug: the colon fuses the new dir and the first
 /// existing entry into one garbage path. On the (pathological) case where a
 /// PATH entry contains the separator, returns the existing PATH unchanged
-/// rather than corrupting it.
-pub fn path_with_dir_prepended(dir: &Path) -> OsString {
-    path_with_dir_prepended_to(dir, &std::env::var_os("PATH").unwrap_or_default())
-}
-
-/// As `path_with_dir_prepended`, but over a caller-supplied base instead of the
-/// process PATH -- so a caller that has already filtered the inherited PATH can
-/// still put the binary's own directory first (and keep it there, whatever the
-/// filter dropped).
+/// rather than corrupting it. Spawning a CLI goes through
+/// `claude_cli::path_for_cli`, which also finds an npm script its `node`.
 pub fn path_with_dir_prepended_to(dir: &Path, existing: &OsStr) -> OsString {
     std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(existing)))
         .unwrap_or_else(|_| existing.to_os_string())
@@ -392,11 +385,11 @@ mod tests {
     #[test]
     fn path_with_dir_prepended_puts_dir_first_with_platform_separator() {
         let dir = std::env::temp_dir();
-        let path = super::path_with_dir_prepended(&dir);
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path = super::path_with_dir_prepended_to(&dir, &inherited);
         let entries: Vec<_> = std::env::split_paths(&path).collect();
         assert_eq!(entries.first(), Some(&dir));
-        let existing: Vec<_> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        let existing: Vec<_> = std::env::split_paths(&inherited).collect();
         assert_eq!(entries.len(), existing.len() + 1);
     }
 

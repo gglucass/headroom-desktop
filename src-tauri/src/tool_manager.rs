@@ -9150,9 +9150,7 @@ impl ToolManager {
             }
             let mut cmd = build_command(&entrypoint, &args[..], &self.runtime.root_dir);
             if let Some(claude_path) = detected_claude.as_ref() {
-                if let Some(dir) = claude_path.parent() {
-                    cmd.env("PATH", crate::proc::path_with_dir_prepended(dir));
-                }
+                cmd.env("PATH", crate::claude_cli::path_for_cli(claude_path));
             }
             // Bounded: this runs on every launch until MCP is configured, and
             // `headroom mcp install` shells out to `claude mcp add`, which can
@@ -14816,12 +14814,7 @@ fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
     } else {
         inherited
     };
-    match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            crate::proc::path_with_dir_prepended_to(dir, &base)
-        }
-        _ => base,
-    }
+    crate::claude_cli::path_for_cli_over(binary, &base)
 }
 
 /// True when httpx can actually use `value` as a proxy URL. httpx parses the
@@ -15167,8 +15160,8 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env_remove("PYTHONHOME")
         // GUI apps inherit a minimal PATH lacking the nvm/homebrew bin dir, so a
         // CLI with a `#!/usr/bin/env node` shebang (e.g. codex) fails with exit
-        // 127 / "env: node: No such file or directory". node lives alongside the
-        // CLI in nvm's bin, so prepend the binary's own dir to PATH.
+        // 127 / "env: node: No such file or directory". Prepend the binary's
+        // own dir (nvm keeps node there) and, failing that, node's (`path_for_cli`).
         .env("PATH", path_with_binary_dir(binary))
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
