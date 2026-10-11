@@ -12489,9 +12489,16 @@ fn exe_identity_matches(listener_exe: &str, my_exe: &str) -> bool {
 /// the cmd/pid for the persistent-conflict marker.
 fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16)) -> String {
     let (start, end) = range;
+    // WSAEACCES: nothing listens, so there is no listener a reboot clears. A
+    // reserved range (Hyper-V, WSL2, Docker) or security software refused the
+    // bind, and the reserved-range check is the one that tells them apart.
+    let next = if occupant == DENIED_OCCUPANT {
+        "Check for a reserved port range with: netsh int ipv4 show excludedportrange protocol=tcp"
+    } else {
+        "Reboot to clear stuck listeners, then relaunch Headroom."
+    };
     format!(
-        "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. \
-         Reboot to clear stuck listeners, then relaunch Headroom."
+        "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. {next}"
     )
 }
 
@@ -22405,6 +22412,20 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         let (cmd, pid) = port_conflict::parse_occupant(&bail);
         assert!(cmd.is_none(), "got cmd: {cmd:?} from bail: {bail}");
         assert!(pid.is_none(), "got pid: {pid:?} from bail: {bail}");
+    }
+
+    /// RUST-PP: WSAEACCES on 6768 and every fallback. The occupant label
+    /// carries its own parens and came back cut at the first one, and the
+    /// bail sent the user to reboot away listeners that do not exist.
+    #[test]
+    fn all_foreign_bail_for_a_denied_port_round_trips_and_names_the_check() {
+        let bail = format_all_foreign_bail(6768, super::DENIED_OCCUPANT, (6769, 6790));
+        assert!(port_conflict::is_port_conflict(&bail), "{bail}");
+        let (cmd, pid) = port_conflict::parse_occupant(&bail);
+        assert_eq!(cmd.as_deref(), Some(super::DENIED_OCCUPANT), "{bail}");
+        assert!(pid.is_none(), "{bail}");
+        assert!(bail.contains("excludedportrange"), "{bail}");
+        assert!(!bail.contains("stuck listeners"), "{bail}");
     }
 
     /// The "stale headroom proxy holding the port" bail must NOT trigger

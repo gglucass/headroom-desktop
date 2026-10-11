@@ -4077,7 +4077,12 @@ pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
 /// Names both causes of WinError 10013 and how to tell them apart, without
 /// asserting either (same discipline as `state::intercept_bind_hint`).
 const LOOPBACK_SOCKET_DENIED_HINT: &str =
-    "Windows refused to let Headroom's runtime open a local network socket (WinError 10013),      so it exits before it can start listening. This is usually security software filtering      loopback connections, or a reserved port range (Hyper-V, WSL2, Docker) covering the ports      Windows hands out. Allow Headroom in your antivirus or firewall's network protection, and      run `netsh int ipv4 show excludedportrange protocol=tcp` in PowerShell to see reserved      ranges. Then click Retry.";
+    "Windows refused to let Headroom's runtime open a local network socket (WinError 10013), \
+     so it exits before it can start listening. This is usually security software filtering \
+     loopback connections, or a reserved port range (Hyper-V, WSL2, Docker) covering the ports \
+     Windows hands out. Allow Headroom in your antivirus or firewall's network protection, and \
+     run `netsh int ipv4 show excludedportrange protocol=tcp` in PowerShell to see reserved \
+     ranges. Then click Retry.";
 
 pub(crate) fn loopback_socket_denied_hint() -> String {
     LOOPBACK_SOCKET_DENIED_HINT.to_string()
