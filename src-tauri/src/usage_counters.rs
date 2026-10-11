@@ -1,7 +1,7 @@
-//! Per-day counters for provider rate limiting (HTTP 429s) and client mix,
-//! observed at the intercept proxy. Aggregate counts only — never content.
+//! Per-day counters for provider rate limiting (HTTP 429s), failed requests
+//! and client mix, observed at the intercept proxy. Aggregate counts only — never content.
 //! The counters ride the milestone/heartbeat savings payload to headroom-web
-//! (`SavingsDay.client_requests` / `SavingsDay.rate_limit_429s`).
+//! (`SavingsDay.client_requests` / `rate_limit_429s` / `failed_requests`).
 //!
 //! Day keys are LOCAL dates via `storage::user_day_key`, matching the local
 //! tracker buckets that make up the recent days of the merged savings series
@@ -37,6 +37,15 @@ pub struct DayCounters {
     pub client_requests: BTreeMap<String, u64>,
     /// Upstream HTTP 429 responses per client bucket.
     pub rate_limit_429s: BTreeMap<String, u64>,
+    /// Requests the user saw fail, per client bucket: any non-429 4xx or 5xx,
+    /// and for Codex a dropped response or a 200 stream failed in-band. No
+    /// class is excused as "the provider's" or "the network's": a single
+    /// request cannot tell, and both 2026-10 showstoppers (a 502 loop behind
+    /// an idle-killing middlebox, Codex's in-band web_search compaction
+    /// failure) were excused that way and never reached Sentry. headroom-web
+    /// tells them apart across the fleet: an outage hits every version at
+    /// once, a Headroom bug clusters on one.
+    pub failed_requests: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -149,14 +158,15 @@ fn with_store(f: impl FnOnce(&mut Store)) {
     }
 }
 
-fn bump(days: &mut BTreeMap<String, DayCounters>, day: String, client: &str, is_429: bool) {
-    let counters = days.entry(day).or_default();
-    let map = if is_429 {
-        &mut counters.rate_limit_429s
-    } else {
-        &mut counters.client_requests
-    };
-    *map.entry(client.to_string()).or_default() += 1;
+fn bump(
+    days: &mut BTreeMap<String, DayCounters>,
+    day: String,
+    client: &str,
+    field: fn(&mut DayCounters) -> &mut BTreeMap<String, u64>,
+) {
+    *field(days.entry(day).or_default())
+        .entry(client.to_string())
+        .or_default() += 1;
     // BTreeMap orders ISO date keys chronologically, so pruning the first
     // entry always drops the oldest day.
     while days.len() > MAX_DAYS {
@@ -171,7 +181,9 @@ fn bump(days: &mut BTreeMap<String, DayCounters>, day: String, client: &str, is_
 /// Count one provider-bound request for a client bucket (today, local day).
 pub fn record_request(client: &str) {
     with_store(|store| {
-        bump(&mut store.days, today_key(), client, false);
+        bump(&mut store.days, today_key(), client, |c| {
+            &mut c.client_requests
+        });
         store.dirty = true;
     });
 }
@@ -179,7 +191,19 @@ pub fn record_request(client: &str) {
 /// Count one upstream HTTP 429 for a client bucket (today, local day).
 pub fn record_429(client: &str) {
     with_store(|store| {
-        bump(&mut store.days, today_key(), client, true);
+        bump(&mut store.days, today_key(), client, |c| {
+            &mut c.rate_limit_429s
+        });
+        store.dirty = true;
+    });
+}
+
+/// Count one request the user saw fail for a client bucket (today, local day).
+pub fn record_failure(client: &str) {
+    with_store(|store| {
+        bump(&mut store.days, today_key(), client, |c| {
+            &mut c.failed_requests
+        });
         store.dirty = true;
     });
 }
@@ -220,18 +244,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bump_counts_requests_and_429s_separately() {
+    fn bump_counts_requests_429s_and_failures_separately() {
         let mut days = BTreeMap::new();
-        bump(&mut days, "2026-08-17".into(), "claude-code", false);
-        bump(&mut days, "2026-08-17".into(), "claude-code", false);
-        bump(&mut days, "2026-08-17".into(), "claude-code", true);
-        bump(&mut days, "2026-08-17".into(), "codex", false);
+        let day = || "2026-08-17".to_string();
+        bump(&mut days, day(), "claude-code", |c| &mut c.client_requests);
+        bump(&mut days, day(), "claude-code", |c| &mut c.client_requests);
+        bump(&mut days, day(), "claude-code", |c| &mut c.rate_limit_429s);
+        bump(&mut days, day(), "codex", |c| &mut c.client_requests);
+        bump(&mut days, day(), "codex", |c| &mut c.failed_requests);
 
         let day = &days["2026-08-17"];
         assert_eq!(day.client_requests["claude-code"], 2);
         assert_eq!(day.client_requests["codex"], 1);
         assert_eq!(day.rate_limit_429s["claude-code"], 1);
         assert!(!day.rate_limit_429s.contains_key("codex"));
+        assert_eq!(day.failed_requests["codex"], 1);
+        assert!(!day.failed_requests.contains_key("claude-code"));
     }
 
     #[test]
@@ -242,7 +270,7 @@ mod tests {
                 &mut days,
                 format!("2026-01-{:02}", i + 1),
                 "claude-code",
-                false,
+                |c| &mut c.client_requests,
             );
         }
         assert_eq!(days.len(), MAX_DAYS);
@@ -285,7 +313,9 @@ mod tests {
         let path = crate::storage::config_file(dir.path(), FILE_NAME);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
         let mut days = BTreeMap::new();
-        bump(&mut days, "2026-08-17".into(), "codex", false);
+        bump(&mut days, "2026-08-17".into(), "codex", |c| {
+            &mut c.client_requests
+        });
         let mut store = Store {
             path: path.clone(),
             days,
@@ -328,7 +358,9 @@ mod tests {
     #[test]
     fn round_trips_through_json() {
         let mut days = BTreeMap::new();
-        bump(&mut days, "2026-08-17".into(), "codex", true);
+        bump(&mut days, "2026-08-17".into(), "codex", |c| {
+            &mut c.rate_limit_429s
+        });
         let persisted = PersistedCounters {
             schema_version: SCHEMA_VERSION,
             days,

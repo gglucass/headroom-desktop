@@ -1929,6 +1929,7 @@ pub struct SavingsDay {
     /// observed by builds predating the counters.
     pub client_requests: Option<std::collections::BTreeMap<String, u64>>,
     pub rate_limit_429s: Option<std::collections::BTreeMap<String, u64>>,
+    pub failed_requests: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// Fire-and-forget: reports a milestone to the server so it can trigger
