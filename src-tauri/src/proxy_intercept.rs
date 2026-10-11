@@ -1089,6 +1089,14 @@ fn held_by_our_other_window(probe: PortProbe, is_twin: impl FnOnce() -> bool) ->
     probe == PortProbe::Http && is_twin()
 }
 
+/// Set while this window has stood past the relaunch grace beside another
+/// window of this same Headroom that serves 6767, cleared when this one binds.
+/// The clients are that window's, so this one's quit or restart must leave
+/// them wired: clearing them sent every client direct while the other window
+/// kept serving 6767 to nobody. If nothing answers 6767 once we are gone, the
+/// crash guard still unwires them.
+pub(crate) static SPECTATING_TWIN: AtomicBool = AtomicBool::new(false);
+
 /// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
 ///
 /// Only `Draining` does, and the distinction is a correctness boundary rather
@@ -1337,9 +1345,16 @@ fn serve(
                             // wait for it to go away. Anything else, HTTP or
                             // not, goes through the diagnosis below.
                             let probe = probe_port(INTERCEPT_PORT).await;
-                            if held_by_our_other_window(probe, || {
+                            let twin = held_by_our_other_window(probe, || {
                                 crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
-                            }) {
+                            });
+                            // Every iteration, so a twin that has since quit
+                            // hands the clients back to this window's exit.
+                            SPECTATING_TWIN.store(
+                                twin && launched_at.elapsed() >= RELAUNCH_GRACE,
+                                Ordering::Release,
+                            );
+                            if twin {
                                 // Name the real cause. `bind_error` is only
                                 // ever cleared by a successful bind and this
                                 // arm never binds, so whatever an earlier
@@ -1858,6 +1873,7 @@ async fn run(
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
+    SPECTATING_TWIN.store(false, Ordering::Release);
     // And wire back any clients the bind loop unwired from another holder of
     // this port. Off this single-threaded runtime, which must accept; tests
     // bind other ports and never reach it.

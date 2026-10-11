@@ -920,10 +920,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                         .into(),
                 );
             } else {
-                failures.push(
-                    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config."
-                        .into(),
-                );
+                failures.push(OPENCODE_BLOCK_NOT_FOUND.into());
             }
         }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
@@ -1060,7 +1057,8 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
     (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
 }
 
-/// A second lone guard loss inside this is a fight with another writer.
+/// A second lone loss (Claude guard, OpenCode block) inside this is a fight
+/// with another writer.
 const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether a repair that came back clean pages Sentry. Every cause does except
@@ -1072,11 +1070,18 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// it once; the other three again after 1.5h, 11.8h and 21.7h. The last loss
 /// is a marker's mtime, so the repeat survives a restart (the 11.8h one spans
 /// a night).
+///
+/// Same for OpenCode's block alone (RUST-K2): 12 repairs on 11 hosts
+/// (2026-09-27..10-10), each once but one 6 days apart. Six were Windows
+/// hosts leaving the pre-0.9.25 `%APPDATA%` config, the rest one edit to
+/// opencode.json(c) that a single re-apply fixed for good.
 fn repair_pages(silent_failures: &[String]) -> bool {
-    if silent_failures != [CLAUDE_GUARD_NOT_FOUND] {
-        return true;
-    }
-    let marker = config_file(&app_data_dir(), "claude-guard-lost");
+    let marker = match silent_failures {
+        [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
+        [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
+        _ => return true,
+    };
+    let marker = config_file(&app_data_dir(), marker);
     let repeat = std::fs::metadata(&marker)
         .and_then(|meta| meta.modified())
         .is_ok_and(|at| {
@@ -1084,7 +1089,7 @@ fn repair_pages(silent_failures: &[String]) -> bool {
                 .map_or(true, |age| age < GUARD_LOSS_REPEAT_WINDOW)
         });
     if let Err(err) = atomic_write(&marker, b"") {
-        log::info!("recording a Claude guard loss failed: {err:#}");
+        log::info!("recording a lone config loss failed: {err:#}");
     }
     repeat
 }
@@ -4894,7 +4899,12 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
 fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     reasons.iter().find_map(|reason| {
         let lower = reason.to_ascii_lowercase();
-        if lower.contains("malformed") || lower.contains("disk i/o error") {
+        // SQLITE_FULL is the user's full disk (RUST-PH), as environmental as
+        // a corrupted one.
+        if lower.contains("malformed")
+            || lower.contains("disk i/o error")
+            || lower.contains("database or disk is full")
+        {
             None
         } else if lower.contains("is locked") {
             Some("locked")
@@ -5844,6 +5854,8 @@ fn disable_grok_build() -> Result<()> {
 /// Verified against opencode 1.18.5.
 const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
+const OPENCODE_BLOCK_NOT_FOUND: &str =
+    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config.";
 
 /// OpenCode resolves its dirs with `xdg-basedir`, which has no Windows branch:
 /// `%USERPROFILE%\.config\opencode` there too, never `%APPDATA%`. An
@@ -11304,6 +11316,10 @@ mod tests {
             None
         );
         assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
+        assert_eq!(
+            codex_retag_skip_class(&["database or disk is full".into()]),
+            None
+        );
         // A lock outliving busy_timeout is: one class for the whole pass,
         // however many of Codex's own DBs it happened to hold (RUST-EK/EM/EN).
         assert_eq!(
@@ -15339,6 +15355,34 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(super::repair_pages(&other), "any other cause pages");
         assert!(super::repair_client_setup_now("claude_code"));
         assert!(super::claude_guard_registered().unwrap(), "guard back");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_lone_opencode_block_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-K2: an edit that drops the managed block, undone by one
+        // re-apply. One pages nothing; another within a day pages.
+        let _home = TestHome::new(); // env guard
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::write_opencode_config(&super::opencode_config_path(), &serde_json::json!({}))
+            .unwrap();
+
+        let lost = super::verify_client_setup("opencode")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::OPENCODE_BLOCK_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+        let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];
+        assert!(
+            !super::repair_pages(&claude),
+            "each cause keeps its own marker"
+        );
+        assert!(super::repair_client_setup_now("opencode"), "repaired");
+        assert!(
+            super::opencode_provider_block_matches().unwrap(),
+            "block back"
+        );
     }
 
     #[test]
