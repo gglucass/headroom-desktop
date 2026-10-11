@@ -4086,6 +4086,12 @@ impl AppState {
                     );
                     break;
                 }
+                // powershell.exe refused to start (RUST-PX/PY/PZ, os error 5):
+                // every pattern fails the same way. Not reported, see
+                // logging::skip_sentry.
+                if detail.contains("running powershell kill") {
+                    break;
+                }
             }
         }
         #[cfg(unix)]
@@ -9889,6 +9895,41 @@ fn windows_process_sweep_script(
     )
 }
 
+/// Whether any process could be a target of the Windows sweep: one whose
+/// image path contains `exe` (case-insensitive, as `-like` matches) and whose
+/// parent passes the sweep's parent rule. Run natively before PowerShell
+/// starts. The script's own image-path prefilter did not cut RUST-K3 (0.9.38
+/// fired at 0.9.37's rate): the `headroom mcp serve` that Claude Code and
+/// Codex keep running is `Scripts\headroom.exe` over the venv's
+/// `Scripts\python.exe` launcher, so with any client session open that check
+/// always hit and the CIM query ran anyway, and PowerShell's own start cost
+/// was never skipped. Those MCP servers have a live parent, so an orphans-only
+/// sweep never kills them; here they no longer count either. Same blind spot
+/// as the script's prefilter: a CommandLine-only match, which dies with its
+/// launcher. An unreadable image path (system processes) is no candidate:
+/// `Get-Process` cannot read it either.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_sweep_has_candidates(
+    processes: &[(u32, u32)],
+    exe: &str,
+    self_pid: u32,
+    parents: SweepParents,
+    image_path: impl Fn(u32) -> Option<String>,
+) -> bool {
+    let live: std::collections::HashSet<u32> = processes.iter().map(|&(pid, _)| pid).collect();
+    let exe = exe.to_lowercase();
+    processes.iter().any(|&(pid, ppid)| {
+        pid != self_pid
+            && match parents {
+                SweepParents::Any => true,
+                SweepParents::Orphans { own_children } => {
+                    (own_children && ppid == self_pid) || !live.contains(&ppid)
+                }
+            }
+            && image_path(pid).is_some_and(|path| path.to_lowercase().contains(&exe))
+    })
+}
+
 /// Whether the sweep may signal a matching process, given who its parent is.
 ///
 /// The sweep exists to reap proxies nobody holds a handle to: orphans of a
@@ -10127,6 +10168,18 @@ fn kill_processes_by_command_pattern(
 
     #[cfg(target_os = "windows")]
     {
+        // No snapshot runs the sweep as before.
+        if let Some(processes) = crate::winproc::process_parents() {
+            if !windows_sweep_has_candidates(
+                &processes,
+                &exe.display().to_string(),
+                std::process::id(),
+                parents,
+                crate::winproc::process_image_path,
+            ) {
+                return Ok(());
+            }
+        }
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
         let mut command = crate::proc::command("powershell");
         command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
@@ -15025,6 +15078,51 @@ mod tests {
         )
         .expect("parsed stats");
         assert!(parsed.output_reduction.is_none());
+    }
+
+    /// RUST-K3: Claude Code's live `headroom mcp serve` (headroom.exe over the
+    /// venv python launcher) must not start PowerShell for an orphans-only
+    /// sweep; an orphan, an own child on the way out, or any venv process for
+    /// the venv-lock sweep must.
+    #[test]
+    fn the_windows_sweep_starts_powershell_only_for_a_candidate() {
+        use super::{windows_sweep_has_candidates, SweepParents};
+        let venv = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\venv";
+        let headroom = format!(r"{venv}\Scripts\headroom.exe");
+        let python = format!(r"{venv}\Scripts\python.exe");
+        let me = 100;
+        // explorer 40 -> this app; explorer -> claude 50 -> headroom.exe 60
+        // -> venv python launcher 61.
+        let mut table = vec![(4, 0), (40, 4), (me, 40), (50, 40), (60, 50), (61, 60)];
+        let image = |pid: u32| match pid {
+            60 | 70 | 80 => Some(headroom.to_uppercase()),
+            61 => Some(python.clone()),
+            999 => None,
+            _ => Some(r"C:\Windows\explorer.exe".to_string()),
+        };
+        let orphans = |own_children| SweepParents::Orphans { own_children };
+        let hit = |table: &[(u32, u32)], exe: &str, parents| {
+            windows_sweep_has_candidates(table, exe, me, parents, image)
+        };
+
+        assert!(!hit(&table, &headroom, orphans(true)));
+        assert!(!hit(&table, &python, orphans(true)));
+        assert!(!hit(&table, venv, orphans(false)));
+        assert!(hit(&table, venv, SweepParents::Any));
+
+        // Parent 7 is gone: an orphan, matched case-insensitively.
+        table.push((70, 7));
+        assert!(hit(&table, &headroom, orphans(false)));
+        table.pop();
+
+        table.push((80, me));
+        assert!(hit(&table, &headroom, orphans(true)));
+        assert!(!hit(&table, &headroom, orphans(false)));
+        table.pop();
+
+        // An orphan whose image cannot be read never counts.
+        table.push((999, 7));
+        assert!(!hit(&table, &headroom, orphans(true)));
     }
 
     /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1

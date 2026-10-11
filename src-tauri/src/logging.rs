@@ -570,6 +570,24 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // A powershell.exe the host will not start (RUST-PX/PY/PZ: os error 5,
+    // AV/EDR or an execute-deny ACL; one stop filed three issues, one per
+    // pattern's args) or not finish within 20s (RUST-PB) is the host's, and
+    // nothing is left behind: the proxy tree dies with the app's kill-on-close
+    // job, the next launch's reclaim_orphan_proxy reaps a port holder without
+    // PowerShell, and the venv-lock sweep's pip step reports a holder that
+    // survives. stop_headroom's timeout stays captured as proxy_sweep_timed_out.
+    if target.starts_with("headroom_desktop_lib::state")
+        && [
+            "failed to clean detached headroom proxy processes: running powershell kill",
+            "killing venv lock holders before venv mutation failed: running powershell kill",
+            "killing venv lock holders before venv mutation failed: powershell sweep timed out",
+        ]
+        .iter()
+        .any(|prefix| msg.starts_with(prefix))
+    {
+        return true;
+    }
     // Stopping without the lifecycle lock is the DESIGNED path, not a failure:
     // `stop_headroom` deliberately caps its wait so a quit racing a launch can
     // never hang the app with the window stuck on "Restarting...". The pkill
@@ -1386,6 +1404,16 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "failed to clean detached headroom proxy processes: powershell sweep timed out after 20s for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+        // RUST-PX/PY/PZ: powershell.exe itself refused to start.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: running powershell kill for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe' args '-m headroom.cli proxy': Access is denied. (os error 5)"
+        ));
+        // RUST-PB: the venv-lock sweep's timeout.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "killing venv lock holders before venv mutation failed: powershell sweep timed out after 20s for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv' args ''"
         ));
     }
 
