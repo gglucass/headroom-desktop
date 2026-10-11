@@ -2982,13 +2982,16 @@ fn headroom_start_failure_category(reason: &str) -> String {
 /// Logs a failed proxy (re)start. The log bridge sends warn! to Sentry, so a
 /// start the app's own exit cut short goes to info instead, as
 /// `capture_headroom_start_failure` leaves it out (RUST-N0: a quit during the
-/// auto-learn toggle's restart).
+/// auto-learn toggle's restart). So does an endpoint-protection verdict: the
+/// boot path's capture files it once per session under a stable fingerprint,
+/// while this line embeds the full command line and grouped per host (RUST-PW,
+/// an App Control block on the gate exit's restart).
 pub(crate) fn log_headroom_start_failure(context: &str, err: &str) {
     log::log!(start_failure_log_level(err), "{context}: {err}");
 }
 
 fn start_failure_log_level(err: &str) -> log::Level {
-    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) || is_endpoint_protection_signal(err) {
         log::Level::Info
     } else {
         log::Level::Warn
@@ -9074,6 +9077,15 @@ fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
     })
 }
 
+/// Codex could not load the user's own config: a `model_catalog_json` file
+/// that does not parse (RUST-PA: Ollama's launcher wrote
+/// `~/.codex/ollama-launch-models.json` without a field Codex now requires).
+/// Every `codex exec` on the machine fails the same way until the user fixes
+/// that file, and the failure tail shown in the app already names it.
+fn learn_failure_is_agent_config_broken(text: &str) -> bool {
+    text.contains("failed to parse model_catalog_json")
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
 fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
     let (cli, update) = match agent {
@@ -9537,6 +9549,7 @@ fn execute_headroom_learn_run(
                         && !agent_api_unreachable
                         && !agent_unparseable
                         && !agent_cli_outdated
+                        && !learn_failure_is_agent_config_broken(diagnosis)
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -9760,6 +9773,7 @@ fn execute_headroom_learn_run(
                 let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                 let user_env_condition = path_unreadable
                     || agent_cli_outdated
+                    || learn_failure_is_agent_config_broken(diagnosis)
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -9995,6 +10009,21 @@ fn plan_usage_line(
 /// Sets the savings line and puts `usage` under it as disabled items,
 /// replacing the ones `items` holds. Reuses them while the count holds, so
 /// the open menu updates in place instead of jumping.
+/// A tray update that failed because the event loop is gone: the app is
+/// quitting, or the main thread died, which the panic hook already reported
+/// (RUST-PE then RUST-PF on one Windows host: softbuffer's GDI assert, then
+/// every tray update; RUST-PG). Nothing left for the tray loop to report.
+fn tray_update_failure_level(err: &tauri::Error) -> log::Level {
+    let event_loop_gone = matches!(err, tauri::Error::FailedToReceiveMessage)
+        || (matches!(err, tauri::Error::Runtime(_))
+            && err.to_string().contains("failed to send message"));
+    if event_loop_gone {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    }
+}
+
 fn update_tray_menu_info(
     app: &AppHandle,
     savings: &str,
@@ -10422,12 +10451,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     if let Err(err) =
                         update_tray_menu_info(&app, &menu_info.0, &menu_info.1, &mut usage_items)
                     {
-                        log::warn!("tray menu info update failed: {err}");
+                        log::log!(
+                            tray_update_failure_level(&err),
+                            "tray menu info update failed: {err}"
+                        );
                     }
                     last_menu_info = Some(menu_info);
                 }
                 if let Err(err) = sync_tray_invite_item(&app, &mut invite_item) {
-                    log::warn!("tray invite item update failed: {err}");
+                    log::log!(
+                        tray_update_failure_level(&err),
+                        "tray invite item update failed: {err}"
+                    );
                 }
 
                 let mut icon_changed = false;
@@ -11911,21 +11946,22 @@ mod tests {
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
-        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        missing_dependency_modules, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
+        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
+        learn_step_label, lifetime_token_milestone_kind, missing_dependency_modules,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
@@ -15089,6 +15125,18 @@ Some unrelated content.
     }
 
     #[test]
+    fn tray_updates_after_the_event_loop_died_log_below_sentry() {
+        assert_eq!(
+            crate::tray_update_failure_level(&tauri::Error::FailedToReceiveMessage),
+            log::Level::Info
+        );
+        assert_eq!(
+            crate::tray_update_failure_level(&tauri::Error::WebviewNotFound),
+            log::Level::Warn
+        );
+    }
+
+    #[test]
     fn start_failure_cut_short_by_exit_logs_below_sentry() {
         // RUST-N0: the auto-learn toggle restarted the proxy as the user quit.
         assert_eq!(
@@ -15102,6 +15150,14 @@ Some unrelated content.
                 "headroom exited with exit status: 1 before opening port 6768"
             ),
             log::Level::Warn
+        );
+        // RUST-PW: Portuguese Windows, App Control blocked the venv launcher.
+        assert_eq!(
+            crate::start_failure_log_level(
+                "starting headroom background process: headroom.exe proxy --port 6768: \
+                 Uma politica de Controle de Aplicativo bloqueou este arquivo. (os error 4551)"
+            ),
+            log::Level::Info
         );
     }
 
@@ -15758,6 +15814,17 @@ Some unrelated content.
                 "for: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_config_broken_matches_a_bad_model_catalog() {
+        // RUST-PA verbatim, minus the analyzer's log prefix.
+        assert!(learn_failure_is_agent_config_broken(
+            "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\nWARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)\nError: failed to parse model_catalog_json path `~/.codex/ollama-launch-models.json` as JSON: missing field `supports_reasoning_summaries` at line 422 column 5\n"
+        ));
+        assert!(!learn_failure_is_agent_config_broken(
+            "LLM analysis failed: `codex exec` failed (exit 1):\nError: stream disconnected\n"
+        ));
     }
 
     #[test]

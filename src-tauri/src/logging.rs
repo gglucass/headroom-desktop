@@ -136,8 +136,13 @@ fn is_windows_session_end_panic(msg: &str) -> bool {
 //
 // ENFILE only. EMFILE ("Too many open files", os error 24) is the PER-PROCESS
 // limit and would mean we are leaking descriptors -- that one stays reportable.
+//
+// Windows' version is ERROR_NO_SYSTEM_RESOURCES (os error 1450, prose
+// localized): the kernel pool is exhausted, so one profile scan filed four
+// issues, one per file it could not open (RUST-PR/PS/PT/PV).
 fn is_system_fd_exhaustion(msg: &str) -> bool {
     msg.contains("Too many open files in system") // unix ENFILE
+        || msg.contains("(os error 1450)") // Windows ERROR_NO_SYSTEM_RESOURCES
 }
 
 // Environmental or otherwise unfixable-by-release: keep the local log, never
@@ -1163,6 +1168,10 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "failed to persist usage-counters.json: writing /tmp/x: Too many open files (os error 24)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "skipping shell profile ~\\.zprofile: Insufficient system resources exist to complete the requested service. (os error 1450)"
         ));
     }
 

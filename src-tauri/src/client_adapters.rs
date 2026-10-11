@@ -4894,7 +4894,12 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
 fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     reasons.iter().find_map(|reason| {
         let lower = reason.to_ascii_lowercase();
-        if lower.contains("malformed") || lower.contains("disk i/o error") {
+        // SQLITE_FULL is the user's full disk (RUST-PH), as environmental as
+        // a corrupted one.
+        if lower.contains("malformed")
+            || lower.contains("disk i/o error")
+            || lower.contains("database or disk is full")
+        {
             None
         } else if lower.contains("is locked") {
             Some("locked")
@@ -11304,6 +11309,10 @@ mod tests {
             None
         );
         assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
+        assert_eq!(
+            codex_retag_skip_class(&["database or disk is full".into()]),
+            None
+        );
         // A lock outliving busy_timeout is: one class for the whole pass,
         // however many of Codex's own DBs it happened to hold (RUST-EK/EM/EN).
         assert_eq!(

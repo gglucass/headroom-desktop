@@ -7707,7 +7707,9 @@ impl ToolManager {
                 if !timed_out {
                     return Err(err);
                 }
-                log::warn!("smoke test timed out on a cold import; retrying once with 60s");
+                // Info: the retry is the recovery, and a repeat reports through
+                // the failed smoke test itself (RUST-P9 was this line bridged).
+                log::info!("smoke test timed out on a cold import; retrying once with 60s");
                 self.smoke_test_headroom_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
             });
         match first {
