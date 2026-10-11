@@ -5172,6 +5172,20 @@ fn run_activity_observation(app: &AppHandle) {
     // machine's feed is dead". See `FEED_FETCH_FAILURE_GRACE`.
     static FEED_FAILING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
+    // Windows' `Instant` keeps counting while the machine sleeps (see
+    // `proc::suspend_gap`), so a pull that failed going into a sleep and one
+    // that failed coming out of it read as a streak as long as the sleep.
+    // Ticks run 20s apart plus their own work; a gap past the forced-pull
+    // interval means this thread did not run, so the streak starts over.
+    static LAST_TICK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if LAST_TICK
+        .lock()
+        .replace(std::time::Instant::now())
+        .is_some_and(|at| at.elapsed() > ACTIVITY_OBSERVER_MAX_FEED_GAP)
+    {
+        *FEED_FAILING_SINCE.lock() = None;
+    }
+
     // The intercept answers every local path 503 while the backend is
     // unreachable, so a backend the app itself is holding down (paused, auto-
     // paused after a crash, or still starting -- update maintenance alone has
@@ -5238,6 +5252,7 @@ fn run_activity_observation(app: &AppHandle) {
                             scope.set_tag("flow", "transformations_feed_fetch");
                             scope.set_extra("error", err.clone().into());
                             scope.set_extra("limit", u64::from(limit).into());
+                            scope.set_extra("failing_for_secs", failing_for.as_secs().into());
                             scope.set_fingerprint(Some(&["transformations-feed-fetch", category]));
                         },
                         || {
@@ -6845,7 +6860,7 @@ fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
     // window on its event loop, and one that timed out on a large transcript
     // would time out again on every tick until the request aged out.
     let found =
-        fetch_request_bodies_from("http://127.0.0.1:6767", &missing).unwrap_or_else(|err| {
+        fetch_request_bodies_from(&backend_data_base_url(), &missing).unwrap_or_else(|err| {
             log::debug!("tile bodies pull failed: {err}");
             missing.into_iter().map(|id| (id, None)).collect()
         });
@@ -8622,8 +8637,18 @@ fn parse_memory_created_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+/// The backend's own port for the app's feed reads, like `/stats` (see
+/// `state::backend_data_port`), and the intercept until that port is vetted.
+/// Through the 6767 relay a traffic filter cutting the front door (AdGuard
+/// for Windows on RUST-NG) failed every pull while the backend answered
+/// each one, and the canary filed that as a dead feed (RUST-NH).
+fn backend_data_base_url() -> String {
+    let port = crate::state::backend_data_port().unwrap_or(crate::proxy_intercept::INTERCEPT_PORT);
+    format!("http://127.0.0.1:{port}")
+}
+
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
-    fetch_transformations_feed_from("http://127.0.0.1:6767", limit)
+    fetch_transformations_feed_from(&backend_data_base_url(), limit)
 }
 
 #[derive(serde::Deserialize)]

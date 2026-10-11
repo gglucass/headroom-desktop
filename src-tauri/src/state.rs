@@ -9508,7 +9508,7 @@ fn local_proxy_port() -> u16 {
 /// or reset and one intercept `/readyz` failed outright. The relay is the
 /// clients' front door on one runtime thread; the dashboard does not need it.
 /// None until tool_manager has vetted the port (see `backend_port::selected`).
-fn backend_data_port() -> Option<u16> {
+pub(crate) fn backend_data_port() -> Option<u16> {
     #[cfg(test)]
     if let Some(port) = TEST_BACKEND_PORT
         .with(std::cell::Cell::get)
