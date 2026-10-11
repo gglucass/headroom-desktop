@@ -768,7 +768,10 @@ mod tests {
             entries[..2],
             [bin.clone(), node.parent().unwrap().to_path_buf()]
         );
-        let status = Command::new(&codex).env("PATH", &path).status().unwrap();
+        let status = crate::proc::command(&codex)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
         assert!(status.success(), "the npm script must run on that PATH");
 
         // A node beside the script (nvm) or a non-node script: own dir only.
