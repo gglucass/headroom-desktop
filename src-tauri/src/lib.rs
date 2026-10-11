@@ -7245,7 +7245,9 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         // remembered_clients snapshot we just saved (configured_clients is now
         // empty, so the re-save is skipped while the disable loop still removes
         // remembered entries), leaving connectors disabled on next launch.
-        if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+        if !proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire)
+            && !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel)
+        {
             let _ = client_adapters::clear_client_setups();
         }
         runtime_paused
@@ -7280,6 +7282,12 @@ fn run_exit_teardown(state: &AppState) {
     // freezes the app mid-quit and emits nothing (Sentry only receives
     // warn!/error!). The last marker in the log names the step that hung.
     stop_headroom_for_exit(state);
+    // The window serving 6767 owns the clients and their Codex threads; see
+    // `proxy_intercept::SPECTATING_TWIN`.
+    if proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {
+        log::info!("exit: another Headroom window serves 6767; leaving the clients wired");
+        return;
+    }
     // Gracefully reverse every client's base-URL override (and shell blocks) on
     // quit so Claude Code / Codex fall back to talking directly to their native
     // providers while Headroom is not running, instead of pointing at a
