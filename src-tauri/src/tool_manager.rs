@@ -5649,6 +5649,17 @@ impl ToolManager {
                     // Costs first-turn savings per session; steady state recovers once
                     // the prefix is compressed once.
                     .env("HEADROOM_BACKGROUND_COMPRESSION", "1")
+                    // Forward the original when compression fails, as the
+                    // Anthropic path always does. The wheel's default refuses a
+                    // >256 KiB /v1/responses body (or WS frame) whose compression
+                    // timed out or raised with its own 413 "please compact
+                    // context", exempting only a Codex timeout, so a grok-build
+                    // turn that would have gone through without Headroom failed
+                    // (RUST-PD). Same bytes the client would have sent anyway.
+                    .env(
+                        "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE",
+                        user_env_or("HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE", "1"),
+                    )
                     // Pin per-request auth-mode policy enforcement ON. This is what
                     // keeps OAuth/subscription traffic (Claude Code, classified
                     // SUBSCRIPTION by User-Agent) on the conservative
