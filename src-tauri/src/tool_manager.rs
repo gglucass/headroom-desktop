@@ -3443,7 +3443,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # flow the whole time and nothing downstream changes. It applies only to
 # api.anthropic.com /v1/messages bodies Headroom serializes itself: the
 # buffered flip, or a continuation built from scratch. A client's own
-# stream:false bytes stay byte-faithful. Request content is unchanged apart from
+# stream:false bytes stay byte-faithful. The CCR continuation that serves the
+# retrieval is a third stream:false call (its own http_client.post, not
+# _retry_request) and dropped the same way: 5 a day on one VPN machine at
+# 61-66s, 3 of them handing Claude Code a bare headroom_retrieve (rc.8,
+# 2026-10-12). Its outbound log line marks it, and the next post in that task
+# streams and folds the same way. Request content is unchanged apart from
 # the stream flag, so no compression or cache effect. A stream that ends
 # without message_stop raises like a dropped connection (the wheel's 502); an
 # in-band error event returns its status (529 overloaded, 429, else 500).
@@ -3585,6 +3590,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     request=resp.request,
                 )
 
+            def _hd_bus_sse_headers(headers):
+                sse_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "accept"}
+                sse_headers["accept"] = "text/event-stream"
+                return sse_headers
+
             async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
                 if stream or not _hd_bus_applies(method, url, body, kwargs):
                     return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
@@ -3594,11 +3604,20 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
                     + ["buffered_upstream_stream"],
                 }
-                sse_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
-                sse_headers["accept"] = "text/event-stream"
                 resp = await _hd_bus_orig(
-                    self, method, url, sse_headers, {**body, "stream": True}, False, **sse_kwargs
+                    self,
+                    method,
+                    url,
+                    _hd_bus_sse_headers(headers),
+                    {**body, "stream": True},
+                    False,
+                    **sse_kwargs,
                 )
+                return await _hd_bus_settle(
+                    resp, lambda: _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                )
+
+            async def _hd_bus_settle(resp, fallback):
                 if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
                     "content-type", ""
                 ):
@@ -3614,7 +3633,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     _hd_bus_log.warning(
                         "event=buffered_upstream_stream fold_failed=%s", type(exc).__name__
                     )
-                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                    return await fallback()
                 if err is not None:
                     etype = (err.get("error") or {}).get("type")
                     _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
@@ -3625,13 +3644,94 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     )
                 return _hd_bus_reply(resp, 200, msg)
 
+            # The CCR continuation: its api_call_fn imports log_outbound_request
+            # at call time and posts right after it, in the same task, so the
+            # mark is read by exactly that post and cleared there.
+            import contextvars as _hd_bus_cv
+
+            from headroom.proxy import body_forwarding as _hd_bus_bf
+            from headroom.proxy import helpers as _hd_bus_helpers
+
+            _hd_bus_cont = _hd_bus_cv.ContextVar("_hd_bus_cont", default=False)
+            _hd_bus_log_orig = _hd_bus_helpers.log_outbound_request
+            _hd_bus_post_orig = _hd_bus_httpx.AsyncClient.post
+
+            def _hd_bus_log_outbound(**kwargs):
+                if kwargs.get("forwarder") == "anthropic_ccr_continuation":
+                    _hd_bus_cont.set(True)
+                return _hd_bus_log_orig(**kwargs)
+
+            async def _hd_bus_post(self, url, **kwargs):
+                if not _hd_bus_cont.get():
+                    return await _hd_bus_post_orig(self, url, **kwargs)
+                _hd_bus_cont.set(False)
+                try:
+                    body = _hd_bus_json.loads(kwargs.get("content") or b"")
+                except ValueError:
+                    body = None
+                if not _hd_bus_applies("POST", str(url), body, {}):
+                    return await _hd_bus_post_orig(self, url, **kwargs)
+                content, _ = _hd_bus_bf.prepare_outbound_body_bytes(
+                    body={**body, "stream": True}, original_body_bytes=None, body_mutated=True
+                )
+                _hd_bus_log.info("event=buffered_upstream_stream forwarder=anthropic_ccr_continuation")
+                resp = await _hd_bus_post_orig(
+                    self,
+                    url,
+                    **{**kwargs, "content": content, "headers": _hd_bus_sse_headers(kwargs.get("headers"))},
+                )
+                return await _hd_bus_settle(resp, lambda: _hd_bus_post_orig(self, url, **kwargs))
+
             with open(_hd_bus_anth.__file__, encoding="utf-8") as _hd_bus_src:
-                _hd_bus_needed = _hd_bus_flip in _hd_bus_src.read()
-            if _hd_bus_needed:
+                _hd_bus_text = _hd_bus_src.read()
+            if _hd_bus_flip in _hd_bus_text:
                 _hd_bus_server.HeadroomProxy._retry_request = _hd_bus_retry_request
+                if 'forwarder="anthropic_ccr_continuation"' in _hd_bus_text:
+                    _hd_bus_helpers.log_outbound_request = _hd_bus_log_outbound
+                    _hd_bus_httpx.AsyncClient.post = _hd_bus_post
                 _hd_bound.add("buffered_upstream_stream")
     except Exception:
         # Fail-open to the wheel's buffered stream:false request.
+        pass
+
+# --- Output shaper: no system prompt where the client sent none ---------------
+# shape_request appends the verbosity block to the tail of the system prompt
+# and, on a body with no system field, creates one holding only that block.
+# Claude Code's startup probe (one 8-token user message, no system, no tools,
+# stream:false) is such a body, and on a Claude subscription it came back 429
+# rate_limit_error "Error" every time, once per session start, retried twice by
+# the proxy (3-5s), while every real turn of the same sessions went through
+# (AppSumo customer, rc.8, 2026-10-12: 6 of 6). A body without a system prompt
+# now goes out unshaped; a turn that carries one is shaped as before, so no
+# compression, cache or output-savings effect on sessions.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel stops
+# creating the field. Kill switch: HEADROOM_SHAPER_KEEP_SYSTEMLESS=0.
+_hd_sks_flag = _hd_os.environ.get("HEADROOM_SHAPER_KEEP_SYSTEMLESS", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_sks_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_sks_meta
+
+        if _hd_sks_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_sks_inspect
+
+            from headroom.proxy import output_shaper as _hd_sks_mod
+
+            _hd_sks_orig = _hd_sks_mod.apply_verbosity_steering
+
+            def _hd_sks_apply(body, level):
+                if isinstance(body, dict) and body.get("system") is None:
+                    return False
+                return _hd_sks_orig(body, level)
+
+            if 'body["system"] = [{"type": "text", "text": text}]' in _hd_sks_inspect.getsource(
+                _hd_sks_orig
+            ):
+                _hd_sks_mod.apply_verbosity_steering = _hd_sks_apply
+                _hd_bound.add("shaper_keep_systemless")
+    except Exception:
+        # Fail-open to the wheel's shaping.
         pass
 
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
@@ -3757,6 +3857,7 @@ _HD_VENDORS = (
     "held_read_breakpoint",
     "web_search_history",
     "buffered_upstream_stream",
+    "shaper_keep_systemless",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -5729,8 +5830,13 @@ impl ToolManager {
                     // and mechanical-effort use upstream defaults (on, "low"). The
                     // shaper only ever lowers an effort the client already sent and
                     // never toggles thinking.type, so it cannot 400 a model that
-                    // lacks effort support.
-                    .env("HEADROOM_OUTPUT_SHAPER", "1")
+                    // lacks effort support. A user-exported HEADROOM_OUTPUT_SHAPER=0
+                    // turns it off without a rebuild (verified on 0.39.0: decision
+                    // disabled); a customer asked for an off switch, 2026-10-12.
+                    .env(
+                        "HEADROOM_OUTPUT_SHAPER",
+                        user_env_or("HEADROOM_OUTPUT_SHAPER", "1"),
+                    )
                     // The 0.37.0 wheel added a rollout registry that gates
                     // proxy_output_shaper to the beta channel and defaults the
                     // channel to stable, which silently disabled the shaper on
@@ -19357,8 +19463,30 @@ err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
 cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
 bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
 odd, odd_s, _ = run(ODD, body_mutated=True, mutation_reasons=[FLIP])
+# The CCR continuation posts on its own right after its outbound log line: that
+# post streams and folds, the next one in the task goes out as sent.
+from headroom.proxy import helpers
+seen = []
+def upstream(request):
+    b = json.loads(request.content)
+    seen.append((b['stream'], request.headers['accept']))
+    if b['stream']:
+        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=BODY.encode())
+    return httpx.Response(200, json=EXPECT)
+async def continuation():
+    body = json.dumps({'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+    hdrs = {'accept': 'application/json', 'content-type': 'application/json'}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as c:
+        helpers.log_outbound_request(forwarder='anthropic_ccr_continuation', method='POST', path=URL,
+            body_bytes_count=len(body), body_mutated=True, mutation_reasons=['ccr_continuation'],
+            request_id='r', source='canonical')
+        first = await c.post(URL, content=body, headers=hdrs, timeout=5)
+        second = await c.post(URL, content=body, headers=hdrs, timeout=5)
+    return first.json() == EXPECT and second.json() == EXPECT
+cont = asyncio.run(continuation())
 print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
       bad is not None, bad_s, bad_a, odd is not None, odd_s,
+      cont, seen[0][0], seen[0][1], seen[1][0],
       'buffered_upstream_stream' in sitecustomize._hd_bound)
 "#;
         let run = |kill: &str| {
@@ -19383,13 +19511,61 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(
             on,
-            "True True text/event-stream False text/event-stream 529 None True False application/json True False True",
+            "True True text/event-stream False text/event-stream 529 None True False application/json True False \
+             True True text/event-stream False True",
             "stderr:\n{on_err}"
         );
         assert!(
-            off.starts_with("False False application/json False"),
+            off.starts_with("False False application/json False")
+                && off.ends_with("True False application/json False False"),
             "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn shaper_keep_systemless_behaves_against_the_installed_wheel() {
+        // A body without a system prompt goes out unshaped; one with a system
+        // prompt still gets the steering block. The kill switch restores the
+        // wheel's created system field.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-shaper-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sitecustomize\n\
+                     from headroom.proxy.output_shaper import shape_request, OutputShaperSettings\n\
+                     s = OutputShaperSettings(enabled=True, verbosity_level=2)\n\
+                     bare = {'messages': [{'role': 'user', 'content': 'quota'}]}\n\
+                     cc = {'system': [{'type': 'text', 'text': 'You are Claude Code'}], 'messages': []}\n\
+                     shape_request(bare, s, 2); shape_request(cc, s, 2)\n\
+                     print('system' in bare, len(cc['system']), 'shaper_keep_systemless' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_SHAPER_KEEP_SYSTEMLESS", kill)
+                .output()
+                .expect("run shaper probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: shaper keep-systemless vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "False 2 True", "stderr:\n{on_err}");
+        assert_eq!(off, "True 2 False", "stderr:\n{off_err}");
     }
 
     #[test]
