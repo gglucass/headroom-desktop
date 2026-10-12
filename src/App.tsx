@@ -5045,7 +5045,7 @@ export default function App() {
   }
 
 
-  function handleLauncherSurfaceMouseDown(event: MouseEvent<HTMLElement>) {
+  function handleWindowDragMouseDown(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
       return;
     }
@@ -5059,7 +5059,12 @@ export default function App() {
       return;
     }
 
-    void getCurrentWindow().startDragging();
+    const current = getCurrentWindow();
+    // The dashboard's drag goes through Rust, which tells a real move from a
+    // click so only a move stops it opening at the tray icon.
+    void (current.label === "main"
+      ? invoke("start_main_window_drag")
+      : current.startDragging());
   }
 
   const hidingRef = useRef(false);
@@ -5155,7 +5160,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={magicLinkState === "verifying"}
       >
@@ -5397,7 +5402,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={showUpgradeModal}
       >
@@ -5550,7 +5555,7 @@ export default function App() {
         shellClassName="intro-shell"
         spinnerClassName="intro-shell__spinner"
         copyClassName="intro-shell__copy intro-shell__copy--first-run"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={bootstrapping}
       >
@@ -5734,7 +5739,7 @@ export default function App() {
           shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
           spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
           copyClassName="intro-shell__copy intro-shell__copy--post-install"
-          onMouseDown={handleLauncherSurfaceMouseDown}
+          onMouseDown={handleWindowDragMouseDown}
           version={appSemver}
         >
           <div className="post-install__lead">
@@ -5851,7 +5856,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6051,7 +6056,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--paywall"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="paywall">
@@ -6178,7 +6183,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6293,7 +6298,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6900,7 +6905,14 @@ export default function App() {
   return (
     <main className="tray-shell">
       {upgradeOverlay}
-      <aside className="tray-sidebar">
+      {/* The sidebar's empty space moves the dashboard on Windows and Linux,
+          like a title bar. macOS keeps the menu-bar popover in place. */}
+      <aside
+        className="tray-sidebar"
+        onMouseDown={
+          navigator.userAgent.includes("Mac") ? undefined : handleWindowDragMouseDown
+        }
+      >
         <div className="tray-sidebar__logo">
           <img src={headroomLogo} alt="Headroom" />
         </div>
