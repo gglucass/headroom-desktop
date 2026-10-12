@@ -3469,11 +3469,6 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
             _hd_bus_orig = _hd_bus_server.HeadroomProxy._retry_request
             _hd_bus_flip = "ccr_streaming_retrieve_buffered_non_stream"
             _hd_bus_status = {"overloaded_error": 529, "rate_limit_error": 429}
-            _hd_bus_delta_member = {
-                "text_delta": "text",
-                "thinking_delta": "thinking",
-                "compaction_delta": "content",
-            }
             _hd_bus_block_members = {
                 "thinking": ("type", "thinking", "signature"),
                 "redacted_thinking": ("type", "data"),
@@ -3501,6 +3496,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     if data:
                         yield _hd_bus_json.loads("\n".join(data))
 
+            # The fold mirrors the Anthropic SDK's stream accumulator, the one
+            # Claude Code builds a streamed reply with (MessageStream in its
+            # bundled @anthropic-ai/sdk): each delta type it knows, and
+            # message_delta usage only where non-null. A delta type it does not
+            # know raises, so the caller sends the wheel's stream:false request
+            # instead of guessing at what that delta means.
             def _hd_bus_fold(text):
                 msg, blocks, partial, done = None, {}, {}, False
                 for ev in _hd_bus_events(text):
@@ -3509,30 +3510,33 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                         return None, ev
                     if kind == "message_start":
                         msg = dict(ev["message"])
+                        msg["usage"] = dict(msg.get("usage") or {})
                     elif kind == "content_block_start":
-                        blocks[ev["index"]] = dict(ev["content_block"])
+                        block = dict(ev["content_block"])
+                        blocks[ev["index"]] = block
+                        if block.get("type") == "fallback" and msg is not None:
+                            msg["model"] = block["to"]["model"]
                     elif kind == "content_block_delta":
-                        block, delta = blocks[ev["index"]], ev["delta"]
-                        dtype = delta.get("type")
-                        if dtype == "input_json_delta":
-                            partial[ev["index"]] = (
-                                partial.get(ev["index"], "") + delta["partial_json"]
-                            )
-                        elif dtype == "signature_delta":
-                            block["signature"] = delta["signature"]
+                        index, delta = ev["index"], ev["delta"]
+                        block, dtype = blocks[index], delta["type"]
+                        if dtype == "text_delta":
+                            block["text"] = (block.get("text") or "") + delta["text"]
                         elif dtype == "citations_delta":
                             block["citations"] = (block.get("citations") or []) + [delta["citation"]]
+                        elif dtype == "input_json_delta":
+                            partial[index] = partial.get(index, "") + delta["partial_json"]
+                        elif dtype == "thinking_delta":
+                            # Not its estimated_tokens: a progress count the
+                            # Message schema lacks (rc.1 resent it: 400).
+                            block["thinking"] = (block.get("thinking") or "") + delta["thinking"]
+                        elif dtype == "signature_delta":
+                            block["signature"] = delta["signature"]
+                        elif dtype == "compaction_delta":
+                            block["content"] = delta.get("content")
+                            if "encrypted_content" in delta:
+                                block["encrypted_content"] = delta["encrypted_content"]
                         else:
-                            # A known delta appends its one member, an unknown one
-                            # its string members. Anything else rides the stream
-                            # only (thinking_delta's estimated_tokens count) and
-                            # must not become a block member the client resends.
-                            known = _hd_bus_delta_member.get(dtype)
-                            for key, value in delta.items():
-                                if key == "type" or not isinstance(value, str):
-                                    continue
-                                if known is None or key == known:
-                                    block[key] = (block.get(key) or "") + value
+                            raise ValueError("unknown delta type %r" % (dtype,))
                     elif kind == "content_block_stop":
                         raw = partial.pop(ev["index"], None)
                         if raw is not None:
@@ -3541,20 +3545,21 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                             )
                     elif kind == "message_delta" and msg is not None:
                         msg.update(ev.get("delta") or {})
-                        msg["usage"] = {**(msg.get("usage") or {}), **(ev.get("usage") or {})}
+                        msg["usage"].update(
+                            (k, v) for k, v in (ev.get("usage") or {}).items() if v is not None
+                        )
                         for key, value in ev.items():
-                            if key not in ("type", "delta", "usage"):
+                            if key not in ("type", "delta", "usage") and value is not None:
                                 msg[key] = value
                     elif kind == "message_stop":
                         done = True
                 if msg is None or not done:
                     return None, None
                 # The stream adds placeholders the Message schema lacks (a thinking
-                # block's estimated_tokens: null); the client and the CCR
-                # continuation resend this content and Anthropic 400s "Extra inputs
-                # are not permitted" on any of them, every turn after. A null
-                # member carries no content, so it leaves every block type;
-                # thinking blocks keep only their schema.
+                # block's estimated_tokens: null); the CCR continuation resends this
+                # content as is and Anthropic 400s "Extra inputs are not permitted"
+                # on any of them. A null member carries no content, so it leaves
+                # every block type; thinking blocks keep only their schema.
                 content = []
                 for i in sorted(blocks):
                     block = {k: v for k, v in blocks[i].items() if v is not None}
@@ -19293,14 +19298,19 @@ BODY = ''.join([START, ev({'type': 'ping'}),
     ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
     ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
     ev({'type': 'content_block_stop', 'index': 3}),
+    ev({'type': 'content_block_start', 'index': 4, 'content_block': {'type': 'compaction', 'content': None}}),
+    ev({'type': 'content_block_delta', 'index': 4,
+        'delta': {'type': 'compaction_delta', 'content': 'summary', 'encrypted_content': 'sealed'}}),
+    ev({'type': 'content_block_stop', 'index': 4}),
     ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None},
-        'usage': {'output_tokens': 42}}),
+        'usage': {'output_tokens': 42, 'cache_read_input_tokens': None}}),
     ev({'type': 'message_stop'})])
 EXPECT = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',
     'content': [{'type': 'thinking', 'thinking': 'hm', 'signature': 'sig'},
                 {'type': 'redacted_thinking', 'data': 'enc'},
                 {'type': 'text', 'text': 'Hello'},
-                {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}}],
+                {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}},
+                {'type': 'compaction', 'content': 'summary', 'encrypted_content': 'sealed'}],
     'stop_reason': 'tool_use', 'stop_sequence': None,
     'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 42}}
 ERR = START + ev({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}})
@@ -19312,6 +19322,13 @@ BAD = ''.join([START,
     ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
     ev({'type': 'content_block_stop', 'index': 0}),
     ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}, 'usage': {'output_tokens': 1}}),
+    ev({'type': 'message_stop'})])
+# A delta type the fold does not know is not guessed at: same fallback.
+ODD = ''.join([START,
+    ev({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'mystery_delta', 'text': 'x'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 1}}),
     ev({'type': 'message_stop'})])
 class Cfg:
     retry_max_attempts, retry_enabled, retry_base_delay_ms, retry_max_delay_ms = 1, False, 1, 1
@@ -19339,8 +19356,10 @@ own, own_s, _ = run(BODY, body_mutated=False)
 err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
 cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
 bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
+odd, odd_s, _ = run(ODD, body_mutated=True, mutation_reasons=[FLIP])
 print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
-      bad is not None, bad_s, bad_a, 'buffered_upstream_stream' in sitecustomize._hd_bound)
+      bad is not None, bad_s, bad_a, odd is not None, odd_s,
+      'buffered_upstream_stream' in sitecustomize._hd_bound)
 "#;
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
@@ -19364,7 +19383,7 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(
             on,
-            "True True text/event-stream False text/event-stream 529 None True False application/json True",
+            "True True text/event-stream False text/event-stream 529 None True False application/json True False True",
             "stderr:\n{on_err}"
         );
         assert!(
