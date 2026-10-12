@@ -1234,7 +1234,7 @@ fn spawn_idle_update_applier(app: AppHandle) {
             last_tick_wall = now;
             let requests: u64 = proxy_intercept::intercept_request_counts().values().sum();
             let traffic =
-                last_requests != Some(requests) || proxy_intercept::backend_traffic_within(TICK);
+                last_requests != Some(requests) || proxy_intercept::client_traffic_within(TICK);
             last_requests = Some(requests);
             idle_minutes = idle_minutes_after(idle_minutes, traffic, slept);
             if idle_minutes < IDLE_UPDATE_MINUTES {
