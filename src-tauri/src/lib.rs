@@ -1099,11 +1099,8 @@ async fn check_for_app_update(
         .map_err(|err| err.to_string())?
         .on_before_exit(move || {
             log::info!("update: running the exit teardown before the installer exits the app");
-            // The installer kills every running copy of our exe, the window
-            // serving 6767 included, so a spectator must unwire like any window.
-            proxy_intercept::SPECTATING_TWIN.store(false, Ordering::Release);
             let state: tauri::State<'_, AppState> = teardown.state();
-            run_exit_teardown(&state);
+            run_exit_teardown(&state, true);
         })
         .build()
         .map_err(|err| err.to_string())?;
@@ -7309,8 +7306,12 @@ fn stop_headroom_for_exit(state: &AppState) {
 
 /// The teardown every exit runs: the RunEvent exit arm, and the Windows
 /// updater's `on_before_exit`, which exits through `std::process::exit` and so
-/// never reaches that arm.
-fn run_exit_teardown(state: &AppState) {
+/// never reaches that arm. `installer_follows` is that hook: the installer
+/// kills every running copy of our exe, the window serving 6767 included, so
+/// a spectator must unwire like any window. A parameter, not a cleared
+/// `SPECTATING_TWIN`: the bind loop re-sets that flag every 15s, and one pass
+/// landing while `stop_headroom` runs left the clients on a dead 6767.
+fn run_exit_teardown(state: &AppState, installer_follows: bool) {
     SHUTTING_DOWN.store(true, Ordering::Release);
     // Step markers: this teardown runs on the UI thread, so a step that blocks
     // freezes the app mid-quit and emits nothing (Sentry only receives
@@ -7318,7 +7319,7 @@ fn run_exit_teardown(state: &AppState) {
     stop_headroom_for_exit(state);
     // The window serving 6767 owns the clients and their Codex threads; see
     // `proxy_intercept::SPECTATING_TWIN`.
-    if proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {
+    if !installer_follows && proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {
         log::info!("exit: another Headroom window serves 6767; leaving the clients wired");
         return;
     }
@@ -8227,7 +8228,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state: tauri::State<'_, AppState> = app.state();
-            run_exit_teardown(&state);
+            run_exit_teardown(&state, false);
         }
     });
 }
@@ -14798,6 +14799,28 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    /// The installer kills the window serving 6767 too, so the updater's
+    /// teardown must unwire a spectator. Clearing `SPECTATING_TWIN` did not
+    /// hold: the bind loop re-sets it every 15s, and a pass landing during
+    /// `stop_headroom` skipped the unwire. Needs a twin and an installer, so
+    /// pinned in source.
+    #[test]
+    fn updater_teardown_unwires_a_spectator_without_the_shared_flag() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, hook) = source
+            .split_once(".on_before_exit(move || {")
+            .expect("updater hook present");
+        let hook = &hook[..hook.find("})").expect("hook end")];
+        assert!(hook.contains("run_exit_teardown(&state, true);"), "{hook}");
+        assert!(!hook.contains("SPECTATING_TWIN"), "{hook}");
+        let (_, teardown) = source
+            .split_once("fn run_exit_teardown(state: &AppState, installer_follows: bool) {")
+            .expect("teardown present");
+        assert!(teardown.contains(
+            "if !installer_follows && proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {"
+        ));
     }
 
     /// A second launch on Windows/Linux (a shortcut clicked during a slow first
