@@ -374,7 +374,7 @@ fn is_runnable(path: &Path) -> bool {
 
 /// PATH for running `cli`: its own dir first, as `is_runnable` explains. An
 /// npm `#!/usr/bin/env node` script whose dir holds no `node` also gets the
-/// detected node's dir: npm's own EACCES fix (prefix `~/.npm-global`) beside a
+/// detected node's dir, last: npm's own EACCES fix (prefix `~/.npm-global`) beside a
 /// Homebrew or nodejs.org node exits 127 under a GUI launch's bare PATH, so an
 /// npm-installed codex read as "Install the Codex CLI" in Optimize (a
 /// customer, 2026-10-10).
@@ -388,7 +388,13 @@ pub(crate) fn path_for_cli_over(cli: &Path, base: &OsStr) -> OsString {
         return base.to_os_string();
     };
     let base = match needs_node_dir(cli, dir).then(detect_node).flatten() {
-        Some(node) => crate::proc::path_with_dir_prepended_to(node.parent().unwrap_or(dir), base),
+        // Last, so it only answers `env node` when the inherited PATH has no
+        // node: ahead of it, a distro node's /usr/bin would shadow the user's
+        // own node (nvm, fnm) and tools for this CLI and all it spawns.
+        Some(node) => std::env::join_paths(
+            std::env::split_paths(base).chain(std::iter::once(node.parent().unwrap_or(dir).into())),
+        )
+        .unwrap_or_else(|_| base.to_os_string()),
         None => base.to_os_string(),
     };
     crate::proc::path_with_dir_prepended_to(dir, &base)
@@ -770,8 +776,13 @@ mod tests {
         let path = path_for_cli_over(&codex, bare);
         let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(
-            entries[..2],
-            [bin.clone(), node.parent().unwrap().to_path_buf()]
+            entries,
+            [
+                bin.clone(),
+                "/usr/bin".into(),
+                "/bin".into(),
+                node.parent().unwrap().to_path_buf()
+            ]
         );
         let status = crate::proc::command(&codex)
             .env("PATH", &path)
