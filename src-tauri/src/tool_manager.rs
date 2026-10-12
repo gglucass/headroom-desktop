@@ -3469,6 +3469,15 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
             _hd_bus_orig = _hd_bus_server.HeadroomProxy._retry_request
             _hd_bus_flip = "ccr_streaming_retrieve_buffered_non_stream"
             _hd_bus_status = {"overloaded_error": 529, "rate_limit_error": 429}
+            _hd_bus_delta_member = {
+                "text_delta": "text",
+                "thinking_delta": "thinking",
+                "compaction_delta": "content",
+            }
+            _hd_bus_block_members = {
+                "thinking": ("type", "thinking", "signature"),
+                "redacted_thinking": ("type", "data"),
+            }
 
             def _hd_bus_applies(method, url, body, kwargs):
                 if method != "POST" or not isinstance(body, dict):
@@ -3514,14 +3523,16 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                         elif dtype == "citations_delta":
                             block["citations"] = (block.get("citations") or []) + [delta["citation"]]
                         else:
-                            # text_delta / thinking_delta and any later string delta.
+                            # A known delta appends its one member, an unknown one
+                            # its string members. Anything else rides the stream
+                            # only (thinking_delta's estimated_tokens count) and
+                            # must not become a block member the client resends.
+                            known = _hd_bus_delta_member.get(dtype)
                             for key, value in delta.items():
-                                if key == "type":
+                                if key == "type" or not isinstance(value, str):
                                     continue
-                                if isinstance(value, str) and isinstance(block.get(key), str):
-                                    block[key] += value
-                                else:
-                                    block[key] = value
+                                if known is None or key == known:
+                                    block[key] = (block.get(key) or "") + value
                     elif kind == "content_block_stop":
                         raw = partial.pop(ev["index"], None)
                         if raw is not None:
@@ -3539,13 +3550,19 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                 if msg is None or not done:
                     return None, None
                 # The stream adds placeholders the Message schema lacks (a thinking
-                # block's estimated_tokens: null); the client resends this content and
-                # Anthropic 400s "Extra inputs are not permitted" on any of them.
-                for block in blocks.values():
-                    if block.get("type") == "thinking":
-                        for key in [k for k in block if k not in ("type", "thinking", "signature")]:
-                            del block[key]
-                msg["content"] = [blocks[i] for i in sorted(blocks)]
+                # block's estimated_tokens: null); the client and the CCR
+                # continuation resend this content and Anthropic 400s "Extra inputs
+                # are not permitted" on any of them, every turn after. A null
+                # member carries no content, so it leaves every block type;
+                # thinking blocks keep only their schema.
+                content = []
+                for i in sorted(blocks):
+                    block = {k: v for k, v in blocks[i].items() if v is not None}
+                    keep = _hd_bus_block_members.get(block.get("type"))
+                    if keep:
+                        block = {k: v for k, v in block.items() if k in keep}
+                    content.append(block)
+                msg["content"] = content
                 return msg, None
 
             def _hd_bus_reply(resp, status, payload):
@@ -3566,7 +3583,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
             async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
                 if stream or not _hd_bus_applies(method, url, body, kwargs):
                     return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
-                kwargs = {
+                sse_kwargs = {
                     **kwargs,
                     "body_mutated": True,
                     "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
@@ -3575,7 +3592,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                 sse_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
                 sse_headers["accept"] = "text/event-stream"
                 resp = await _hd_bus_orig(
-                    self, method, url, sse_headers, {**body, "stream": True}, False, **kwargs
+                    self, method, url, sse_headers, {**body, "stream": True}, False, **sse_kwargs
                 )
                 if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
                     "content-type", ""
@@ -3583,7 +3600,16 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     # An HTTP error, or the client's own bytes went out (signed
                     # thinking): either way the reply is already what the caller reads.
                     return resp
-                msg, err = _hd_bus_fold(resp.text)
+                try:
+                    msg, err = _hd_bus_fold(resp.text)
+                except Exception as exc:
+                    # A reply this fold cannot read would 502 the same way on every
+                    # resend; the wheel's own stream:false request answers it (one
+                    # more generation, the pre-vendor path).
+                    _hd_bus_log.warning(
+                        "event=buffered_upstream_stream fold_failed=%s", type(exc).__name__
+                    )
+                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
                 if err is not None:
                     etype = (err.get("error") or {}).get("type")
                     _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
@@ -19249,28 +19275,44 @@ START = ev({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message
 BODY = ''.join([START, ev({'type': 'ping'}),
     ev({'type': 'content_block_start', 'index': 0,
         'content_block': {'type': 'thinking', 'thinking': '', 'signature': '', 'estimated_tokens': None}}),
-    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': 'hm'}}),
+    ev({'type': 'content_block_delta', 'index': 0,
+        'delta': {'type': 'thinking_delta', 'thinking': 'hm', 'estimated_tokens': 7}}),
     ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'sig'}}),
     ev({'type': 'content_block_stop', 'index': 0}),
-    ev({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}}),
-    ev({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': 'Hel'}}),
-    ev({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': 'lo'}}),
+    ev({'type': 'content_block_start', 'index': 1,
+        'content_block': {'type': 'redacted_thinking', 'data': 'enc', 'estimated_tokens': None}}),
     ev({'type': 'content_block_stop', 'index': 1}),
     ev({'type': 'content_block_start', 'index': 2,
-        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
-    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
-    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
+        'content_block': {'type': 'text', 'text': '', 'citations': None, 'estimated_tokens': None}}),
+    ev({'type': 'content_block_delta', 'index': 2,
+        'delta': {'type': 'text_delta', 'text': 'Hel', 'estimated_tokens': 3, 'phase': 'live'}}),
+    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'text_delta', 'text': 'lo'}}),
     ev({'type': 'content_block_stop', 'index': 2}),
+    ev({'type': 'content_block_start', 'index': 3,
+        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
+    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
+    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
+    ev({'type': 'content_block_stop', 'index': 3}),
     ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None},
         'usage': {'output_tokens': 42}}),
     ev({'type': 'message_stop'})])
 EXPECT = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',
     'content': [{'type': 'thinking', 'thinking': 'hm', 'signature': 'sig'},
+                {'type': 'redacted_thinking', 'data': 'enc'},
                 {'type': 'text', 'text': 'Hello'},
                 {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}}],
     'stop_reason': 'tool_use', 'stop_sequence': None,
     'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 42}}
 ERR = START + ev({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}})
+# A reply the fold cannot read (truncated tool input JSON) falls back to the
+# wheel's own stream:false request instead of a 502 the client resends forever.
+BAD = ''.join([START,
+    ev({'type': 'content_block_start', 'index': 0,
+        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}, 'usage': {'output_tokens': 1}}),
+    ev({'type': 'message_stop'})])
 class Cfg:
     retry_max_attempts, retry_enabled, retry_base_delay_ms, retry_max_delay_ms = 1, False, 1, 1
 class Client:
@@ -19296,8 +19338,9 @@ fold = r.headers['content-type'] == 'application/json' and r.json() == EXPECT an
 own, own_s, _ = run(BODY, body_mutated=False)
 err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
 cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
+bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
 print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
-      'buffered_upstream_stream' in sitecustomize._hd_bound)
+      bad is not None, bad_s, bad_a, 'buffered_upstream_stream' in sitecustomize._hd_bound)
 "#;
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
@@ -19320,7 +19363,8 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
             return;
         }
         assert_eq!(
-            on, "True True text/event-stream False text/event-stream 529 None True",
+            on,
+            "True True text/event-stream False text/event-stream 529 None True False application/json True",
             "stderr:\n{on_err}"
         );
         assert!(
