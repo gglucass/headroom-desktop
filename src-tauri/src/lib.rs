@@ -1099,6 +1099,9 @@ async fn check_for_app_update(
         .map_err(|err| err.to_string())?
         .on_before_exit(move || {
             log::info!("update: running the exit teardown before the installer exits the app");
+            // The installer kills every running copy of our exe, the window
+            // serving 6767 included, so a spectator must unwire like any window.
+            proxy_intercept::SPECTATING_TWIN.store(false, Ordering::Release);
             let state: tauri::State<'_, AppState> = teardown.state();
             run_exit_teardown(&state);
         })
