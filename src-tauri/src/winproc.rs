@@ -149,7 +149,7 @@ pub(crate) fn process_image_path(pid: u32) -> Option<String> {
 
 /// Every running process as `(pid, parent pid)`, from one toolhelp snapshot:
 /// the same table `Get-Process` reads, without starting PowerShell. `None`
-/// when the snapshot fails.
+/// when the snapshot fails or lists nothing (never true of a live system).
 pub(crate) fn process_parents() -> Option<Vec<(u32, u32)>> {
     // SAFETY: documented flags; the handle is checked and closed below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -170,5 +170,5 @@ pub(crate) fn process_parents() -> Option<Vec<(u32, u32)>> {
     }
     // SAFETY: `snapshot` came from CreateToolhelp32Snapshot and is closed once.
     unsafe { CloseHandle(snapshot) };
-    Some(processes)
+    (!processes.is_empty()).then_some(processes)
 }

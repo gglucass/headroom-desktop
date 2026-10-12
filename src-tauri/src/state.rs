@@ -9896,28 +9896,29 @@ fn windows_process_sweep_script(
 }
 
 /// Whether any process could be a target of the Windows sweep: one whose
-/// image path contains `exe` (case-insensitive, as `-like` matches) and whose
-/// parent passes the sweep's parent rule. Run natively before PowerShell
-/// starts. The script's own image-path prefilter did not cut RUST-K3 (0.9.38
-/// fired at 0.9.37's rate): the `headroom mcp serve` that Claude Code and
-/// Codex keep running is `Scripts\headroom.exe` over the venv's
-/// `Scripts\python.exe` launcher, so with any client session open that check
-/// always hit and the CIM query ran anyway, and PowerShell's own start cost
-/// was never skipped. Those MCP servers have a live parent, so an orphans-only
-/// sweep never kills them; here they no longer count either. Same blind spot
-/// as the script's prefilter: a CommandLine-only match, which dies with its
-/// launcher. An unreadable image path (system processes) is no candidate:
-/// `Get-Process` cannot read it either.
+/// image path contains one of `image_dirs` (case-insensitive, as `-like`
+/// matches) and whose parent passes the sweep's parent rule. Run natively
+/// before PowerShell starts. The script's own image-path prefilter did not cut
+/// RUST-K3 (0.9.38 fired at 0.9.37's rate): the `headroom mcp serve` that
+/// Claude Code and Codex keep running is `Scripts\headroom.exe` over the
+/// venv's `Scripts\python.exe` launcher, so with any client session open that
+/// check always hit and the CIM query ran anyway, and PowerShell's own start
+/// cost was never skipped. Those MCP servers have a live parent, so an
+/// orphans-only sweep never kills them; here they no longer count either.
+/// This must never be narrower than the script, or an orphan it would kill
+/// keeps holding the port or the venv lock: hence directories, not the
+/// pattern's exe (see `windows_sweep_image_dirs`). An unreadable image path
+/// (system processes) is no candidate: `Get-Process` cannot read it either.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn windows_sweep_has_candidates(
     processes: &[(u32, u32)],
-    exe: &str,
+    image_dirs: &[String],
     self_pid: u32,
     parents: SweepParents,
     image_path: impl Fn(u32) -> Option<String>,
 ) -> bool {
     let live: std::collections::HashSet<u32> = processes.iter().map(|&(pid, _)| pid).collect();
-    let exe = exe.to_lowercase();
+    let dirs: Vec<String> = image_dirs.iter().map(|dir| dir.to_lowercase()).collect();
     processes.iter().any(|&(pid, ppid)| {
         pid != self_pid
             && match parents {
@@ -9926,8 +9927,26 @@ fn windows_sweep_has_candidates(
                     (own_children && ppid == self_pid) || !live.contains(&ppid)
                 }
             }
-            && image_path(pid).is_some_and(|path| path.to_lowercase().contains(&exe))
+            && image_path(pid).is_some_and(|path| {
+                let path = path.to_lowercase();
+                dirs.iter().any(|dir| path.contains(dir.as_str()))
+            })
     })
+}
+
+/// Where a Windows sweep target's image can sit: the pattern's exe, the managed
+/// runtime (an orphaned launcher's child runs the base `runtime\python`
+/// interpreter, which only the script's CommandLine match names), and the
+/// runtime's real path, since the kernel reports an image through a junction
+/// by its target (a data dir moved to D:\ with `mklink /J`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_sweep_image_dirs(exe: &std::path::Path) -> Vec<String> {
+    let runtime = ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).runtime_dir;
+    let mut dirs = vec![exe.display().to_string(), runtime.display().to_string()];
+    if let Ok(real) = std::fs::canonicalize(&runtime) {
+        dirs.push(strip_extended_length_prefix(real.display().to_string()));
+    }
+    dirs
 }
 
 /// Whether the sweep may signal a matching process, given who its parent is.
@@ -10172,7 +10191,7 @@ fn kill_processes_by_command_pattern(
         if let Some(processes) = crate::winproc::process_parents() {
             if !windows_sweep_has_candidates(
                 &processes,
-                &exe.display().to_string(),
+                &windows_sweep_image_dirs(exe),
                 std::process::id(),
                 parents,
                 crate::winproc::process_image_path,
@@ -15087,28 +15106,41 @@ mod tests {
     #[test]
     fn the_windows_sweep_starts_powershell_only_for_a_candidate() {
         use super::{windows_sweep_has_candidates, SweepParents};
-        let venv = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\venv";
+        let runtime = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime";
+        let venv = format!(r"{runtime}\venv");
         let headroom = format!(r"{venv}\Scripts\headroom.exe");
         let python = format!(r"{venv}\Scripts\python.exe");
+        let base = format!(r"{runtime}\python\python.exe");
         let me = 100;
         // explorer 40 -> this app; explorer -> claude 50 -> headroom.exe 60
-        // -> venv python launcher 61.
-        let mut table = vec![(4, 0), (40, 4), (me, 40), (50, 40), (60, 50), (61, 60)];
+        // -> venv python launcher 61 -> base python 62.
+        let mut table = vec![
+            (4, 0),
+            (40, 4),
+            (me, 40),
+            (50, 40),
+            (60, 50),
+            (61, 60),
+            (62, 61),
+        ];
         let image = |pid: u32| match pid {
             60 | 70 | 80 => Some(headroom.to_uppercase()),
             61 => Some(python.clone()),
+            62 | 90 => Some(base.clone()),
+            91 => Some(r"D:\Headroom\headroom\runtime\python\python.exe".to_string()),
             999 => None,
             _ => Some(r"C:\Windows\explorer.exe".to_string()),
         };
         let orphans = |own_children| SweepParents::Orphans { own_children };
+        let dirs = |exe: &str| vec![exe.to_string(), runtime.to_string()];
         let hit = |table: &[(u32, u32)], exe: &str, parents| {
-            windows_sweep_has_candidates(table, exe, me, parents, image)
+            windows_sweep_has_candidates(table, &dirs(exe), me, parents, image)
         };
 
         assert!(!hit(&table, &headroom, orphans(true)));
         assert!(!hit(&table, &python, orphans(true)));
-        assert!(!hit(&table, venv, orphans(false)));
-        assert!(hit(&table, venv, SweepParents::Any));
+        assert!(!hit(&table, &venv, orphans(false)));
+        assert!(hit(&table, &venv, SweepParents::Any));
 
         // Parent 7 is gone: an orphan, matched case-insensitively.
         table.push((70, 7));
@@ -15118,6 +15150,29 @@ mod tests {
         table.push((80, me));
         assert!(hit(&table, &headroom, orphans(true)));
         assert!(!hit(&table, &headroom, orphans(false)));
+        table.pop();
+
+        // The launcher died and left its base-python child: the script names
+        // it by CommandLine only, so the pattern's exe alone must not decide.
+        table.push((90, 7));
+        assert!(hit(&table, &headroom, orphans(false)));
+        table.pop();
+
+        // A runtime behind a junction reads back by its real path.
+        table.push((91, 7));
+        assert!(!hit(&table, &headroom, orphans(false)));
+        let real = vec![
+            headroom.clone(),
+            runtime.to_string(),
+            r"D:\Headroom\headroom\runtime".to_string(),
+        ];
+        assert!(windows_sweep_has_candidates(
+            &table,
+            &real,
+            me,
+            orphans(false),
+            image
+        ));
         table.pop();
 
         // An orphan whose image cannot be read never counts.
