@@ -409,7 +409,12 @@ fn needs_node_dir(cli: &Path, dir: &Path) -> bool {
         .split(|byte| *byte == b'\n')
         .next()
         .unwrap_or(&[]);
-    first_line.starts_with(b"#!") && first_line.windows(4).any(|word| word == b"node")
+    // The interpreter (or `env`'s program) by name: a path that merely holds
+    // "node" (`/home/anode/...venv/bin/python3`) is not one.
+    first_line.strip_prefix(b"#!").is_some_and(|rest| {
+        rest.split(u8::is_ascii_whitespace)
+            .any(|word| word.rsplit(|byte| *byte == b'/').next() == Some(b"node".as_slice()))
+    })
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
@@ -789,6 +794,29 @@ mod tests {
             std::env::split_paths(&path_for_cli_over(&codex, bare)).collect::<Vec<_>>(),
             own_dir_only
         );
+    }
+
+    #[test]
+    fn needs_node_dir_reads_the_interpreter_not_a_substring() {
+        // A Linux venv console script under /home/anode names python, not
+        // node: matching "node" anywhere ran `detect_node` (up to a 2s login
+        // shell) on every spawn of the headroom entrypoint.
+        let tmp = ScopedTempDir::new("needs_node_dir");
+        let script = tmp.path().join("cli");
+        let needs = |shebang: &str| {
+            fs::write(&script, format!("{shebang}\nrest\n")).unwrap();
+            needs_node_dir(&script, tmp.path())
+        };
+        assert!(needs("#!/usr/bin/env node"));
+        assert!(needs("#!/usr/bin/env node\r"));
+        assert!(needs("#!/usr/bin/env -S node --no-warnings"));
+        assert!(needs("#!/opt/homebrew/opt/node/bin/node"));
+        assert!(!needs(
+            "#!/home/anode/.local/share/Headroom/venv/bin/python3"
+        ));
+        assert!(!needs("#!/usr/bin/env nodemon"));
+        assert!(!needs("#!/bin/sh"));
+        assert!(!needs("node"));
     }
 
     #[test]
