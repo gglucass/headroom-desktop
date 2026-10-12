@@ -643,12 +643,25 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     if !(claude || codex) || !state.try_mark_unrouted_usage_notified() {
         return;
     }
-    let (title, body) = unrouted_usage_copy(claude, codex);
+    // A restart cannot route a Claude desktop app session; say what can. With
+    // Codex also leaking, its restart advice still holds and the hourly
+    // detector names the desktop half.
+    let claude_desktop = claude
+        && routed("claude_code")
+            .is_some_and(|at| client_adapters::claude_ran_only_in_desktop_app_since(at.into()));
+    let (title, body) = if claude_desktop && !codex {
+        (
+            "Claude Code in the Claude app isn't optimized",
+            client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS,
+        )
+    } else {
+        unrouted_usage_copy(claude && !claude_desktop, codex)
+    };
     let _ = show_notification_impl(app, title, body, None);
     analytics::track_event(
         app,
         "unrouted_usage_nudge_shown",
-        Some(json!({ "claude": claude, "codex": codex })),
+        Some(json!({ "claude": claude, "codex": codex, "claude_desktop": claude_desktop })),
     );
 }
 
@@ -6219,12 +6232,27 @@ async fn detect_unrouted_clients(
             } else {
                 Vec::new()
             };
-            let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
+            // Every session in the window ran in the Claude desktop app, which
+            // routes nothing through us by design. The guard calls those
+            // healthy (our settings are right, the app just ignores them), so
+            // without this RUST-DN said `diagnosed=false` and told a desktop
+            // user to restart a terminal they never used (user 895 cancelled
+            // over five weeks of it).
+            let desktop_only = client_id == "claude_code"
+                && client_adapters::claude_ran_only_in_desktop_app_since(
+                    routed_since.max(now - client_adapters::UNROUTED_ACTIVITY_WINDOW),
+                );
+            let reapplied =
+                enabled && !desktop_only && client_adapters::apply_client_setup(client_id).is_ok();
             // Re-applying our own config is only a fix when our own config was
             // the problem. Ask the guard what the agent actually saw.
-            let diagnosis = client_adapters::read_guard_verdict(client_id)
-                .filter(|issues| !issues.is_empty())
-                .map(|issues| issues.join("; "));
+            let diagnosis = if desktop_only {
+                Some(client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS.to_string())
+            } else {
+                client_adapters::read_guard_verdict(client_id)
+                    .filter(|issues| !issues.is_empty())
+                    .map(|issues| issues.join("; "))
+            };
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
@@ -6248,6 +6276,9 @@ async fn detect_unrouted_clients(
                     // this every event says only "ran unrouted", which is the
                     // symptom we already knew.
                     scope.set_tag("diagnosed", diagnosis.is_some());
+                    if client_id == "claude_code" {
+                        scope.set_tag("claude_desktop_only", desktop_only);
+                    }
                     if let Some(diagnosis) = diagnosis.as_deref() {
                         scope.set_extra("guard_diagnosis", diagnosis.into());
                     }

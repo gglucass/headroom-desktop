@@ -1211,28 +1211,70 @@ const LOCAL_ACTIVITY_WALK_CAP: usize = 20_000;
 /// it through the proxy for two days fired the unrouted alert hourly
 /// (RUST-2K: five hosts in the first day of 0.9.10).
 pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<SystemTime> {
-    let mut newest: Option<SystemTime> = None;
-    let mut visited = 0usize;
-    for project in std::fs::read_dir(projects_root).ok()?.flatten() {
-        let Ok(entries) = std::fs::read_dir(project.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > LOCAL_ACTIVITY_WALK_CAP {
-                return newest;
-            }
-            if entry.path().extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
-                if Some(modified) > newest {
-                    newest = Some(modified);
-                }
-            }
-        }
-    }
-    newest
+    claude_transcripts(projects_root).map(|(_, at)| at).max()
+}
+
+/// `<projects_root>/<project>/*.jsonl` with mtimes, visiting at most
+/// `LOCAL_ACTIVITY_WALK_CAP` entries.
+fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, SystemTime)> {
+    std::fs::read_dir(projects_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|project| std::fs::read_dir(project.path()).ok())
+        .flatten()
+        .flatten()
+        .take(LOCAL_ACTIVITY_WALK_CAP)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.modified().ok()?)))
+}
+
+/// What the unrouted alert says when every recent Claude Code session ran in
+/// the Claude desktop app. Those sessions are host-managed: the app pins its
+/// own API host and Claude Code drops provider env from every settings scope,
+/// so no config Headroom owns can route them.
+/// "Restart your terminal" is advice that cannot work there.
+pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desktop app go \
+     straight to Anthropic, so Headroom can't optimize them. Run Claude Code in your \
+     terminal or IDE to keep saving.";
+
+/// True when the transcript was written by Claude Code inside the Claude
+/// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
+/// `claude-desktop-3p`) on its lines; the CLI says `cli`, the IDE extension
+/// `claude-vscode`. The first stamped line sits within the first few.
+// ponytail: reads the session's FIRST surface; a CLI session later resumed in
+// the desktop app still reads as CLI and keeps the generic advice.
+fn claude_transcript_is_desktop(path: &Path) -> bool {
+    use std::io::{BufRead, Read};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // Lines can carry whole tool results or pasted images; cap the read.
+    std::io::BufReader::new(file.take(4 << 20))
+        .lines()
+        .take(32)
+        .map_while(Result::ok)
+        .find_map(|line| {
+            serde_json::from_str::<Value>(&line)
+                .ok()?
+                .get("entrypoint")?
+                .as_str()
+                .map(|entrypoint| entrypoint.starts_with("claude-desktop"))
+        })
+        .unwrap_or(false)
+}
+
+/// True when Claude Code ran after `since` and every such session was inside
+/// the Claude desktop app: activity Headroom can see but never route.
+pub(crate) fn claude_ran_only_in_desktop_app(projects_root: &Path, since: SystemTime) -> bool {
+    let mut recent = claude_transcripts(projects_root)
+        .filter(|(_, at)| *at > since)
+        .peekable();
+    recent.peek().is_some() && recent.all(|(path, _)| claude_transcript_is_desktop(&path))
+}
+
+pub fn claude_ran_only_in_desktop_app_since(since: SystemTime) -> bool {
+    claude_ran_only_in_desktop_app(&home_dir().join(".claude").join("projects"), since)
 }
 
 /// When the agent last wrote its own session artifacts on this machine:
@@ -17383,6 +17425,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(project.join("session.jsonl"), b"x").unwrap();
         assert!(super::newest_claude_transcript_mtime(tmp.path()).is_some());
         assert!(super::newest_claude_transcript_mtime(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn claude_ran_only_in_desktop_app_reads_each_recent_sessions_entrypoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("-Users-x-repo");
+        fs::create_dir_all(&project).unwrap();
+        let before = SystemTime::now() - std::time::Duration::from_secs(60);
+        // Real head shape: unstamped queue lines, then the stamped turn.
+        let desktop = "{\"type\":\"queue-operation\"}\n\
+                       {\"type\":\"user\",\"entrypoint\":\"claude-desktop\"}\n";
+        let cli = "{\"type\":\"mode\"}\n{\"type\":\"attachment\",\"entrypoint\":\"cli\"}\n";
+
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("a.jsonl"), desktop).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        // Nothing written after `since` is no evidence either way.
+        assert!(!super::claude_ran_only_in_desktop_app(
+            tmp.path(),
+            SystemTime::now() + std::time::Duration::from_secs(60)
+        ));
+        // One terminal session alongside is a routable agent gone missing.
+        fs::write(project.join("b.jsonl"), cli).unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("b.jsonl"), "not json\n").unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
     }
 
     #[test]
