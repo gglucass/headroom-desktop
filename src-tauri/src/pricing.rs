@@ -1617,11 +1617,14 @@ pub(crate) fn verify_auth_code_with_base_url(
 
     write_session_token(&body.session_token)?;
 
-    let local_state = reconcile_local_state_with_server(state)?;
+    let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
+    // Remembered now, not on the first background sync: if that sync fails,
+    // Settings still shows which account is signed in.
+    remember_account_email(&mut local_state, Some(&account));
     // Merged profile (live bearer + auth.json), same source the identity
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
@@ -1807,11 +1810,14 @@ pub(crate) fn activate_account_with_retry_backoff(
         );
         msg
     })?;
-    let local_state = reconcile_local_state_with_server(state)?;
+    let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
+    // Remembered now, not on the first background sync: if that sync fails,
+    // Settings still shows which account is signed in.
+    remember_account_email(&mut local_state, Some(&account));
     // Merged profile (live bearer + auth.json), same source the identity
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
@@ -1923,6 +1929,7 @@ pub struct SavingsDay {
     /// observed by builds predating the counters.
     pub client_requests: Option<std::collections::BTreeMap<String, u64>>,
     pub rate_limit_429s: Option<std::collections::BTreeMap<String, u64>>,
+    pub failed_requests: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// Fire-and-forget: reports a milestone to the server so it can trigger

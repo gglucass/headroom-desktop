@@ -3428,6 +3428,212 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's forwarding (the pre-vendor behaviour).
         pass
 
+# --- Buffered CCR turns stream from upstream ----------------------------------
+# A streaming Claude Code turn with headroom_retrieve resident is flipped to
+# stream:false so the proxy can serve a retrieval server-side. Anthropic then
+# sends nothing until the whole reply is generated, and a network middlebox that
+# drops HTTP connections idle for 60s (TLS-inspecting antivirus, VPN, corporate
+# proxy; TCP keepalive does not reset an L7 idle timer) closes it first: httpx
+# raises "Server disconnected without sending a response" at ~60s, the retry
+# loop tries three times and Claude Code gets a 502 after ~186s, then resends
+# the same body, forever (AppSumo customer 2026-10-08, 1.3-2.9MB opus turns and
+# 200KB subagent turns alike; without Headroom the client streams and works).
+# The vendor sends that one request as stream:true and folds the SSE reply back
+# into the Message JSON the buffered path expects, so bytes (deltas, pings)
+# flow the whole time and nothing downstream changes. It applies only to
+# api.anthropic.com /v1/messages bodies Headroom serializes itself: the
+# buffered flip, or a continuation built from scratch. A client's own
+# stream:false bytes stay byte-faithful. Request content is unchanged apart from
+# the stream flag, so no compression or cache effect. A stream that ends
+# without message_stop raises like a dropped connection (the wheel's 502); an
+# in-band error event returns its status (529 overloaded, 429, else 500).
+# Exact-pin gated to wheel 0.39.0; stands down when the wheel stops flipping.
+# Kill switch: HEADROOM_BUFFERED_UPSTREAM_STREAM=0.
+_hd_bus_flag = _hd_os.environ.get("HEADROOM_BUFFERED_UPSTREAM_STREAM", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_bus_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_bus_meta
+
+        if _hd_bus_meta.version("headroom-ai") == "0.39.0":
+            import json as _hd_bus_json
+            import logging as _hd_bus_logging
+            from urllib.parse import urlsplit as _hd_bus_urlsplit
+
+            import httpx as _hd_bus_httpx
+            from headroom.proxy import server as _hd_bus_server
+            from headroom.proxy.handlers import anthropic as _hd_bus_anth
+
+            _hd_bus_log = _hd_bus_logging.getLogger("headroom.proxy")
+            _hd_bus_orig = _hd_bus_server.HeadroomProxy._retry_request
+            _hd_bus_flip = "ccr_streaming_retrieve_buffered_non_stream"
+            _hd_bus_status = {"overloaded_error": 529, "rate_limit_error": 429}
+            _hd_bus_block_members = {
+                "thinking": ("type", "thinking", "signature"),
+                "redacted_thinking": ("type", "data"),
+            }
+
+            def _hd_bus_applies(method, url, body, kwargs):
+                if method != "POST" or not isinstance(body, dict):
+                    return False
+                if body.get("stream") is not False:
+                    return False
+                parts = _hd_bus_urlsplit(url)
+                if parts.hostname != "api.anthropic.com" or not parts.path.endswith(
+                    "/v1/messages"
+                ):
+                    return False
+                if _hd_bus_flip in (kwargs.get("mutation_reasons") or []):
+                    return True
+                return kwargs.get("original_body_bytes") is None
+
+            def _hd_bus_events(text):
+                for chunk in text.replace("\r\n", "\n").split("\n\n"):
+                    data = [
+                        line[5:].lstrip() for line in chunk.split("\n") if line.startswith("data:")
+                    ]
+                    if data:
+                        yield _hd_bus_json.loads("\n".join(data))
+
+            # The fold mirrors the Anthropic SDK's stream accumulator, the one
+            # Claude Code builds a streamed reply with (MessageStream in its
+            # bundled @anthropic-ai/sdk): each delta type it knows, and
+            # message_delta usage only where non-null. A delta type it does not
+            # know raises, so the caller sends the wheel's stream:false request
+            # instead of guessing at what that delta means.
+            def _hd_bus_fold(text):
+                msg, blocks, partial, done = None, {}, {}, False
+                for ev in _hd_bus_events(text):
+                    kind = ev.get("type")
+                    if kind == "error":
+                        return None, ev
+                    if kind == "message_start":
+                        msg = dict(ev["message"])
+                        msg["usage"] = dict(msg.get("usage") or {})
+                    elif kind == "content_block_start":
+                        block = dict(ev["content_block"])
+                        blocks[ev["index"]] = block
+                        if block.get("type") == "fallback" and msg is not None:
+                            msg["model"] = block["to"]["model"]
+                    elif kind == "content_block_delta":
+                        index, delta = ev["index"], ev["delta"]
+                        block, dtype = blocks[index], delta["type"]
+                        if dtype == "text_delta":
+                            block["text"] = (block.get("text") or "") + delta["text"]
+                        elif dtype == "citations_delta":
+                            block["citations"] = (block.get("citations") or []) + [delta["citation"]]
+                        elif dtype == "input_json_delta":
+                            partial[index] = partial.get(index, "") + delta["partial_json"]
+                        elif dtype == "thinking_delta":
+                            # Not its estimated_tokens: a progress count the
+                            # Message schema lacks (rc.1 resent it: 400).
+                            block["thinking"] = (block.get("thinking") or "") + delta["thinking"]
+                        elif dtype == "signature_delta":
+                            block["signature"] = delta["signature"]
+                        elif dtype == "compaction_delta":
+                            block["content"] = delta.get("content")
+                            if "encrypted_content" in delta:
+                                block["encrypted_content"] = delta["encrypted_content"]
+                        else:
+                            raise ValueError("unknown delta type %r" % (dtype,))
+                    elif kind == "content_block_stop":
+                        raw = partial.pop(ev["index"], None)
+                        if raw is not None:
+                            blocks[ev["index"]]["input"] = (
+                                _hd_bus_json.loads(raw) if raw.strip() else {}
+                            )
+                    elif kind == "message_delta" and msg is not None:
+                        msg.update(ev.get("delta") or {})
+                        msg["usage"].update(
+                            (k, v) for k, v in (ev.get("usage") or {}).items() if v is not None
+                        )
+                        for key, value in ev.items():
+                            if key not in ("type", "delta", "usage") and value is not None:
+                                msg[key] = value
+                    elif kind == "message_stop":
+                        done = True
+                if msg is None or not done:
+                    return None, None
+                # The stream adds placeholders the Message schema lacks (a thinking
+                # block's estimated_tokens: null); the CCR continuation resends this
+                # content as is and Anthropic 400s "Extra inputs are not permitted"
+                # on any of them. A null member carries no content, so it leaves
+                # every block type; thinking blocks keep only their schema.
+                content = []
+                for i in sorted(blocks):
+                    block = {k: v for k, v in blocks[i].items() if v is not None}
+                    keep = _hd_bus_block_members.get(block.get("type"))
+                    if keep:
+                        block = {k: v for k, v in block.items() if k in keep}
+                    content.append(block)
+                msg["content"] = content
+                return msg, None
+
+            def _hd_bus_reply(resp, status, payload):
+                headers = [
+                    (k, v)
+                    for k, v in resp.headers.items()
+                    if k.lower()
+                    not in ("content-type", "content-length", "content-encoding", "transfer-encoding")
+                ]
+                headers.append(("content-type", "application/json"))
+                return _hd_bus_httpx.Response(
+                    status,
+                    headers=headers,
+                    content=_hd_bus_json.dumps(payload, ensure_ascii=False).encode(),
+                    request=resp.request,
+                )
+
+            async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
+                if stream or not _hd_bus_applies(method, url, body, kwargs):
+                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                sse_kwargs = {
+                    **kwargs,
+                    "body_mutated": True,
+                    "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
+                    + ["buffered_upstream_stream"],
+                }
+                sse_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+                sse_headers["accept"] = "text/event-stream"
+                resp = await _hd_bus_orig(
+                    self, method, url, sse_headers, {**body, "stream": True}, False, **sse_kwargs
+                )
+                if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
+                    "content-type", ""
+                ):
+                    # An HTTP error, or the client's own bytes went out (signed
+                    # thinking): either way the reply is already what the caller reads.
+                    return resp
+                try:
+                    msg, err = _hd_bus_fold(resp.text)
+                except Exception as exc:
+                    # A reply this fold cannot read would 502 the same way on every
+                    # resend; the wheel's own stream:false request answers it (one
+                    # more generation, the pre-vendor path).
+                    _hd_bus_log.warning(
+                        "event=buffered_upstream_stream fold_failed=%s", type(exc).__name__
+                    )
+                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                if err is not None:
+                    etype = (err.get("error") or {}).get("type")
+                    _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
+                    return _hd_bus_reply(resp, _hd_bus_status.get(etype, 500), err)
+                if msg is None:
+                    raise _hd_bus_httpx.RemoteProtocolError(
+                        "upstream stream ended before message_stop", request=resp.request
+                    )
+                return _hd_bus_reply(resp, 200, msg)
+
+            with open(_hd_bus_anth.__file__, encoding="utf-8") as _hd_bus_src:
+                _hd_bus_needed = _hd_bus_flip in _hd_bus_src.read()
+            if _hd_bus_needed:
+                _hd_bus_server.HeadroomProxy._retry_request = _hd_bus_retry_request
+                _hd_bound.add("buffered_upstream_stream")
+    except Exception:
+        # Fail-open to the wheel's buffered stream:false request.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3550,6 +3756,7 @@ _HD_VENDORS = (
     "ccr_tool_eager",
     "held_read_breakpoint",
     "web_search_history",
+    "buffered_upstream_stream",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -5473,6 +5680,17 @@ impl ToolManager {
                     // Costs first-turn savings per session; steady state recovers once
                     // the prefix is compressed once.
                     .env("HEADROOM_BACKGROUND_COMPRESSION", "1")
+                    // Forward the original when compression fails, as the
+                    // Anthropic path always does. The wheel's default refuses a
+                    // >256 KiB /v1/responses body (or WS frame) whose compression
+                    // timed out or raised with its own 413 "please compact
+                    // context", exempting only a Codex timeout, so a grok-build
+                    // turn that would have gone through without Headroom failed
+                    // (RUST-PD). Same bytes the client would have sent anyway.
+                    .env(
+                        "HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE",
+                        user_env_or("HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE", "1"),
+                    )
                     // Pin per-request auth-mode policy enforcement ON. This is what
                     // keeps OAuth/subscription traffic (Claude Code, classified
                     // SUBSCRIPTION by User-Agent) on the conservative
@@ -7531,7 +7749,9 @@ impl ToolManager {
                 if !timed_out {
                     return Err(err);
                 }
-                log::warn!("smoke test timed out on a cold import; retrying once with 60s");
+                // Info: the retry is the recovery, and a repeat reports through
+                // the failed smoke test itself (RUST-P9 was this line bridged).
+                log::info!("smoke test timed out on a cold import; retrying once with 60s");
                 self.smoke_test_headroom_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
             });
         match first {
@@ -8974,9 +9194,7 @@ impl ToolManager {
             }
             let mut cmd = build_command(&entrypoint, &args[..], &self.runtime.root_dir);
             if let Some(claude_path) = detected_claude.as_ref() {
-                if let Some(dir) = claude_path.parent() {
-                    cmd.env("PATH", crate::proc::path_with_dir_prepended(dir));
-                }
+                cmd.env("PATH", crate::claude_cli::path_for_cli(claude_path));
             }
             // Bounded: this runs on every launch until MCP is configured, and
             // `headroom mcp install` shells out to `claude mcp add`, which can
@@ -10442,10 +10660,12 @@ impl ToolManager {
         }
         // A host whose CLI was not detected can still hold the plugin (probe
         // timeout, IDE-only Claude Code). It was not toggled, so it counts as
-        // a failure rather than a silent skip.
+        // a failure rather than a silent skip. Except enabling Codex: it has no
+        // enable verb, so a Codex that holds the plugin already runs it.
         let mut errors: Vec<String> = PluginHost::ALL
             .into_iter()
             .filter(|host| !hosts.iter().any(|(h, _)| h == host) && host.plugin_present(plugin))
+            .filter(|host| !(enabled && *host == PluginHost::Codex))
             .map(|host| format!("{}: CLI not found on PATH", host.label()))
             .collect();
         let mut changed_any = false;
@@ -10457,13 +10677,6 @@ impl ToolManager {
             // back, so a registered plugin is enabled, not reinstalled.
             let result = if enabled && host.plugin_present(plugin) {
                 self.run_plugin_cmd(plugin, cli, host, &host.enable_args(plugin))
-                    .or_else(|err| {
-                        if format!("{err:#}").contains("is already enabled") {
-                            Ok(())
-                        } else {
-                            Err(err)
-                        }
-                    })
             } else if enabled {
                 self.install_plugin_into(plugin, host, cli)
             } else if host.plugin_present(plugin) {
@@ -10473,6 +10686,15 @@ impl ToolManager {
             };
             match result {
                 Ok(()) => changed_any = true,
+                // Claude Code refuses to flip a plugin already in the asked-for
+                // state, e.g. one the user toggled in its `/plugin` (RUST-MV).
+                Err(err)
+                    if ["is already enabled", "is already disabled"]
+                        .iter()
+                        .any(|state| format!("{err:#}").contains(state)) =>
+                {
+                    changed_any = true
+                }
                 Err(err) => errors.push(format!("{}: {err:#}", host.label())),
             }
         }
@@ -10480,10 +10702,14 @@ impl ToolManager {
             bail!("toggling {id} failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
-            log::warn!(
-                "{id} toggled on some hosts but not all: {}",
-                errors.join("; ")
-            );
+            let detail = errors.join("; ");
+            // Same split as the install path: a host holding the plugin whose
+            // CLI cannot be found is the user's machine (RUST-MV). Local log.
+            if plugin_install_failure_reported(plugin_install_failure_category(&detail)) {
+                log::warn!("{id} toggled on some hosts but not all: {detail}");
+            } else {
+                log::info!("{id} toggled on some hosts but not all: {detail}");
+            }
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
@@ -10586,7 +10812,7 @@ impl ToolManager {
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
-const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code needs it to download this addon: install it from https://git-scm.com, then try again.";
+const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again.";
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -12302,9 +12528,16 @@ fn exe_identity_matches(listener_exe: &str, my_exe: &str) -> bool {
 /// the cmd/pid for the persistent-conflict marker.
 fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16)) -> String {
     let (start, end) = range;
+    // WSAEACCES: nothing listens, so there is no listener a reboot clears. A
+    // reserved range (Hyper-V, WSL2, Docker) or security software refused the
+    // bind, and the reserved-range check is the one that tells them apart.
+    let next = if occupant == DENIED_OCCUPANT {
+        "Check for a reserved port range with: netsh int ipv4 show excludedportrange protocol=tcp"
+    } else {
+        "Reboot to clear stuck listeners, then relaunch Headroom."
+    };
     format!(
-        "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. \
-         Reboot to clear stuck listeners, then relaunch Headroom."
+        "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. {next}"
     )
 }
 
@@ -14640,12 +14873,7 @@ fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
     } else {
         inherited
     };
-    match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            crate::proc::path_with_dir_prepended_to(dir, &base)
-        }
-        _ => base,
-    }
+    crate::claude_cli::path_for_cli_over(binary, &base)
 }
 
 /// True when httpx can actually use `value` as a proxy URL. httpx parses the
@@ -14991,8 +15219,8 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env_remove("PYTHONHOME")
         // GUI apps inherit a minimal PATH lacking the nvm/homebrew bin dir, so a
         // CLI with a `#!/usr/bin/env node` shebang (e.g. codex) fails with exit
-        // 127 / "env: node: No such file or directory". node lives alongside the
-        // CLI in nvm's bin, so prepend the binary's own dir to PATH.
+        // 127 / "env: node: No such file or directory". Prepend the binary's
+        // own dir (nvm keeps node there) and, failing that, node's (`path_for_cli`).
         .env("PATH", path_with_binary_dir(binary))
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
@@ -15686,9 +15914,10 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// The user's machine lacks git; the UI says so and nothing we ship fixes it.
+/// The user's machine lacks git (the UI says so), or a host holds the plugin
+/// but no CLI for it can be found (RUST-MV): nothing we ship fixes either.
 fn plugin_install_failure_reported(category: &str) -> bool {
-    category != "git-missing"
+    !matches!(category, "git-missing" | "cli-missing")
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -15707,10 +15936,13 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("'git' not found") {
-        // Claude Code clones a marketplace with git, and the host has none
-        // (RUST-P0: Windows, "Command 'git' not found or is in an unsafe
-        // location"). Checked first: the install that follows then fails
+    if lower.contains("'git' not found")
+        || (lower.contains("failed to run git") && lower.contains("program not found"))
+    {
+        // Claude Code and Codex clone a marketplace with git, and the host has
+        // none (RUST-P0: Windows, Claude Code's "Command 'git' not found or is
+        // in an unsafe location", Codex's "failed to run git clone ...: program
+        // not found"). Checked first: the install that follows then fails
         // "not found in marketplace", which names only the consequence.
         "git-missing"
     } else if lower.contains("not found in marketplace") {
@@ -17391,11 +17623,14 @@ asyncio.run(main())
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         // os._exit: the desktop kills a backend that never bound, and a normal
-        // interpreter exit waits on a dump that spun (see the vendor).
+        // interpreter exit waits on a dump that spun (see the vendor). The
+        // timer is armed before the vendors' imports, and a dump that lands
+        // mid-import can kill the probe outright (no stderr at all, CI on
+        // 2026-10-09 at 1s), so it fires well after them, in the sleep.
         let wedged = dir.path().join("wedged.py");
         std::fs::write(
             &wedged,
-            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(4)\n\n\
+            "import os, time\n\ndef hd_probe_never_binds():\n    time.sleep(30)\n\n\
              hd_probe_never_binds()\nos._exit(0)\n",
         )
         .unwrap();
@@ -17452,7 +17687,10 @@ asyncio.run(main())
                 .expect("run probe");
             (child, dump, stderr)
         };
-        let runs = [spawn("wedged", &wedged, "1"), spawn("bound", &bound, "600")];
+        let runs = [
+            spawn("wedged", &wedged, "15"),
+            spawn("bound", &bound, "600"),
+        ];
         let started = std::time::Instant::now();
         for (mut child, _, stderr_path) in runs {
             let status = loop {
@@ -17478,10 +17716,10 @@ asyncio.run(main())
             assert_eq!(bound_vendors, Some(true), "{stderr}");
         }
         let dump = std::fs::read_to_string(dir.path().join("wedged-stall.txt")).unwrap();
-        assert!(dump.starts_with("Timeout (0:00:01)!"), "{dump}");
-        // Armed before the vendors' imports, so on a loaded machine the dump
-        // can catch the main thread mid-import, where the frame walk may stop
-        // short (the spin the vendor guards against). It still names a frame.
+        assert!(dump.starts_with("Timeout (0:00:15)!"), "{dump}");
+        // The main thread is in the probe's sleep by now; on a machine loaded
+        // enough to still be importing, the frame walk may stop short. It
+        // still names a frame.
         let stacks = crate::state::stall_dump_stacks(&dump).expect("parsable dump");
         let main = stacks.split("\n\n").next().unwrap();
         assert!(
@@ -19009,6 +19247,148 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(
             off, "1 passthrough 1 passthrough 1 False",
             "stderr:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn buffered_upstream_stream_behaves_against_the_installed_wheel() {
+        // The buffered CCR flip goes upstream as stream:true and its SSE reply
+        // folds back into the Message JSON; a client's own stream:false bytes,
+        // an in-band error and a truncated stream keep their wheel semantics.
+        // The kill switch sends the wheel's stream:false request.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-buffered-sse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"
+import asyncio, json, httpx, sitecustomize
+from headroom.proxy import server
+URL = 'https://api.anthropic.com/v1/messages'
+FLIP = 'ccr_streaming_retrieve_buffered_non_stream'
+def ev(d):
+    return 'event: %s\ndata: %s\n\n' % (d['type'], json.dumps(d))
+START = ev({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message',
+    'role': 'assistant', 'model': 'm', 'content': [], 'stop_reason': None,
+    'stop_sequence': None, 'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5,
+    'output_tokens': 1}}})
+BODY = ''.join([START, ev({'type': 'ping'}),
+    ev({'type': 'content_block_start', 'index': 0,
+        'content_block': {'type': 'thinking', 'thinking': '', 'signature': '', 'estimated_tokens': None}}),
+    ev({'type': 'content_block_delta', 'index': 0,
+        'delta': {'type': 'thinking_delta', 'thinking': 'hm', 'estimated_tokens': 7}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'sig'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'content_block_start', 'index': 1,
+        'content_block': {'type': 'redacted_thinking', 'data': 'enc', 'estimated_tokens': None}}),
+    ev({'type': 'content_block_stop', 'index': 1}),
+    ev({'type': 'content_block_start', 'index': 2,
+        'content_block': {'type': 'text', 'text': '', 'citations': None, 'estimated_tokens': None}}),
+    ev({'type': 'content_block_delta', 'index': 2,
+        'delta': {'type': 'text_delta', 'text': 'Hel', 'estimated_tokens': 3, 'phase': 'live'}}),
+    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'text_delta', 'text': 'lo'}}),
+    ev({'type': 'content_block_stop', 'index': 2}),
+    ev({'type': 'content_block_start', 'index': 3,
+        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
+    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
+    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
+    ev({'type': 'content_block_stop', 'index': 3}),
+    ev({'type': 'content_block_start', 'index': 4, 'content_block': {'type': 'compaction', 'content': None}}),
+    ev({'type': 'content_block_delta', 'index': 4,
+        'delta': {'type': 'compaction_delta', 'content': 'summary', 'encrypted_content': 'sealed'}}),
+    ev({'type': 'content_block_stop', 'index': 4}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None},
+        'usage': {'output_tokens': 42, 'cache_read_input_tokens': None}}),
+    ev({'type': 'message_stop'})])
+EXPECT = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',
+    'content': [{'type': 'thinking', 'thinking': 'hm', 'signature': 'sig'},
+                {'type': 'redacted_thinking', 'data': 'enc'},
+                {'type': 'text', 'text': 'Hello'},
+                {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}},
+                {'type': 'compaction', 'content': 'summary', 'encrypted_content': 'sealed'}],
+    'stop_reason': 'tool_use', 'stop_sequence': None,
+    'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 42}}
+ERR = START + ev({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}})
+# A reply the fold cannot read (truncated tool input JSON) falls back to the
+# wheel's own stream:false request instead of a 502 the client resends forever.
+BAD = ''.join([START,
+    ev({'type': 'content_block_start', 'index': 0,
+        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}, 'usage': {'output_tokens': 1}}),
+    ev({'type': 'message_stop'})])
+# A delta type the fold does not know is not guessed at: same fallback.
+ODD = ''.join([START,
+    ev({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}),
+    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'mystery_delta', 'text': 'x'}}),
+    ev({'type': 'content_block_stop', 'index': 0}),
+    ev({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 1}}),
+    ev({'type': 'message_stop'})])
+class Cfg:
+    retry_max_attempts, retry_enabled, retry_base_delay_ms, retry_max_delay_ms = 1, False, 1, 1
+class Client:
+    def __init__(self, text):
+        self.text, self.sent = text, None
+    async def post(self, url, **kw):
+        self.sent = kw
+        return httpx.Response(200, headers={'content-type': 'text/event-stream',
+            'request-id': 'req_1'}, content=self.text.encode(), request=httpx.Request('POST', url))
+def run(text, **kw):
+    proxy = type('P', (), {})()
+    proxy.config, proxy.http_client = Cfg(), Client(text)
+    body = {'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}
+    try:
+        r = asyncio.run(server.HeadroomProxy._retry_request(proxy, 'POST', URL,
+            {'accept': 'application/json'}, body, original_body_bytes=json.dumps(body).encode(), **kw))
+    except httpx.RemoteProtocolError:
+        r = None
+    sent = proxy.http_client.sent
+    return r, json.loads(sent['content'])['stream'], sent['headers']['accept']
+r, s, a = run(BODY, body_mutated=True, mutation_reasons=[FLIP])
+fold = r.headers['content-type'] == 'application/json' and r.json() == EXPECT and r.headers['request-id'] == 'req_1'
+own, own_s, _ = run(BODY, body_mutated=False)
+err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
+cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
+bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
+odd, odd_s, _ = run(ODD, body_mutated=True, mutation_reasons=[FLIP])
+print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
+      bad is not None, bad_s, bad_a, odd is not None, odd_s,
+      'buffered_upstream_stream' in sitecustomize._hd_bound)
+"#;
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_BUFFERED_UPSTREAM_STREAM", kill)
+                .output()
+                .expect("run buffered upstream stream probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: buffered upstream stream vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(
+            on,
+            "True True text/event-stream False text/event-stream 529 None True False application/json True False True",
+            "stderr:\n{on_err}"
+        );
+        assert!(
+            off.starts_with("False False application/json False"),
+            "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
         );
     }
 
@@ -22107,6 +22487,20 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let (cmd, pid) = port_conflict::parse_occupant(&bail);
         assert!(cmd.is_none(), "got cmd: {cmd:?} from bail: {bail}");
         assert!(pid.is_none(), "got pid: {pid:?} from bail: {bail}");
+    }
+
+    /// RUST-PP: WSAEACCES on 6768 and every fallback. The occupant label
+    /// carries its own parens and came back cut at the first one, and the
+    /// bail sent the user to reboot away listeners that do not exist.
+    #[test]
+    fn all_foreign_bail_for_a_denied_port_round_trips_and_names_the_check() {
+        let bail = format_all_foreign_bail(6768, super::DENIED_OCCUPANT, (6769, 6790));
+        assert!(port_conflict::is_port_conflict(&bail), "{bail}");
+        let (cmd, pid) = port_conflict::parse_occupant(&bail);
+        assert_eq!(cmd.as_deref(), Some(super::DENIED_OCCUPANT), "{bail}");
+        assert!(pid.is_none(), "{bail}");
+        assert!(bail.contains("excludedportrange"), "{bail}");
+        assert!(!bail.contains("stuck listeners"), "{bail}");
     }
 
     /// The "stale headroom proxy holding the port" bail must NOT trigger
@@ -26019,6 +26413,90 @@ Always run the linter first.
         assert_eq!(enabled, Some(true));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_disable_of_an_already_disabled_claude_plugin_succeeds() {
+        // RUST-MV: the user had disabled it in Claude Code's own `/plugin`.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-redisable-claude");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":true}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo \"Plugin \\\"$3\\\" is already disabled\" >&2; exit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", false, &[(PluginHost::ClaudeCode, cli)]);
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        result.expect("an already-disabled plugin is a successful disable");
+        assert_eq!(enabled, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_enable_does_not_fail_an_undetected_codex_that_holds_it() {
+        // Codex enables with `plugin add`, a no-op on a registered plugin, so
+        // a Codex holding it needs no CLI to be enabled (RUST-MV). Claude
+        // Code's enable fails here so the error lists every host it counted.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-enable-undetected-codex");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::create_dir_all(root.join(".codex")).expect("codex home");
+        fs::write(
+            root.join(".codex").join("config.toml"),
+            "[plugins.\"ponytail@ponytail\"]\nenabled = true\n",
+        )
+        .expect("codex config");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":false}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo boom >&2; exit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", true, &[(PluginHost::ClaudeCode, cli)]);
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("Claude Code's enable failed");
+        assert!(
+            !format!("{err:#}").contains("Codex: CLI not found"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn context7_helper_wraps_npx_in_cmd_on_windows() {
         // Native Windows agents spawn MCP servers without a shell, and there
@@ -27522,6 +28000,18 @@ exit 0
                  ~\\.local\\bin\\claude.exe plugin install chisle@chisle\nstdout:\n\nstderr:\n\
                  \u{d7} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" not found \
                  in marketplace \"chisle\".",
+                "git-missing",
+            ),
+            (
+                "Codex: marketplace add failed first: command failed (exit 1): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe plugin \
+                 marketplace add JuliusBrussee/caveman\nstdout:\n\nstderr:\nError: failed to run \
+                 git clone https://github.com/JuliusBrussee/caveman.git \
+                 ~\\.codex\\.tmp/marketplaces\\.staging\\marketplace-add-zQb0zR: program not \
+                 found\n: command failed (exit 1): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe plugin add \
+                 caveman@caveman\nstdout:\n\nstderr:\nError: plugin `caveman` was not found in \
+                 marketplace `caveman`",
                 "git-missing",
             ),
             ("Codex: something we have not seen", "other"),

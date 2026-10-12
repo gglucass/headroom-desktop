@@ -80,7 +80,22 @@ pub fn parse_occupant(err_chain: &str) -> (Option<String>, Option<u32>) {
         return (None, None);
     };
     let after = &err_chain[start + PREFIX.len()..];
-    let Some(end) = after.find(')') else {
+    // The paren that closes ours, not the first one: an occupant can carry its
+    // own, and `DENIED_OCCUPANT` does, which cut RUST-PP's label to
+    // "Windows itself (WinError 10013".
+    let mut depth = 0usize;
+    let Some(end) = after.char_indices().find_map(|(i, c)| match c {
+        '(' => {
+            depth += 1;
+            None
+        }
+        ')' if depth == 0 => Some(i),
+        ')' => {
+            depth -= 1;
+            None
+        }
+        _ => None,
+    }) else {
         return (None, None);
     };
     let detail = after[..end].trim();

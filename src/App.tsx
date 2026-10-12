@@ -6680,7 +6680,10 @@ export default function App() {
     const enteredEmail = authEmail.trim();
     return (
       pricingStatus?.account?.email ??
-      (enteredEmail || pricingStatus?.claude.email || "unknown email")
+      (enteredEmail ||
+        pricingStatus?.lastAccountEmail ||
+        pricingStatus?.claude.email ||
+        "unknown email")
     );
   })();
   const accountPlanName = (() => {
@@ -6691,7 +6694,11 @@ export default function App() {
       return pricingStatus.accountSyncError ? "Plan unavailable" : "Syncing plan...";
     }
     if (pricingStatus.account.subscriptionActive) {
-      return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
+      const tierLabel = subscriptionTierLabel(pricingStatus.account.subscriptionTier);
+      // "lifetime" is headroom-web's AppSumo entitlement marker.
+      return pricingStatus.account.subscriptionBillingPeriod === "lifetime"
+        ? `${tierLabel}, AppSumo lifetime`
+        : tierLabel;
     }
     if (pricingStatus.account.trialActive) {
       const usageDaysLeft = pricingStatus.account.trialUsageDaysLeft;

@@ -920,10 +920,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                         .into(),
                 );
             } else {
-                failures.push(
-                    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config."
-                        .into(),
-                );
+                failures.push(OPENCODE_BLOCK_NOT_FOUND.into());
             }
         }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
@@ -1060,7 +1057,8 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
     (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
 }
 
-/// A second lone guard loss inside this is a fight with another writer.
+/// A second lone loss (Claude guard, OpenCode block) inside this is a fight
+/// with another writer.
 const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether a repair that came back clean pages Sentry. Every cause does except
@@ -1072,11 +1070,18 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// it once; the other three again after 1.5h, 11.8h and 21.7h. The last loss
 /// is a marker's mtime, so the repeat survives a restart (the 11.8h one spans
 /// a night).
+///
+/// Same for OpenCode's block alone (RUST-K2): 12 repairs on 11 hosts
+/// (2026-09-27..10-10), each once but one 6 days apart. Six were Windows
+/// hosts leaving the pre-0.9.25 `%APPDATA%` config, the rest one edit to
+/// opencode.json(c) that a single re-apply fixed for good.
 fn repair_pages(silent_failures: &[String]) -> bool {
-    if silent_failures != [CLAUDE_GUARD_NOT_FOUND] {
-        return true;
-    }
-    let marker = config_file(&app_data_dir(), "claude-guard-lost");
+    let marker = match silent_failures {
+        [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
+        [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
+        _ => return true,
+    };
+    let marker = config_file(&app_data_dir(), marker);
     let repeat = std::fs::metadata(&marker)
         .and_then(|meta| meta.modified())
         .is_ok_and(|at| {
@@ -1084,7 +1089,7 @@ fn repair_pages(silent_failures: &[String]) -> bool {
                 .map_or(true, |age| age < GUARD_LOSS_REPEAT_WINDOW)
         });
     if let Err(err) = atomic_write(&marker, b"") {
-        log::info!("recording a Claude guard loss failed: {err:#}");
+        log::info!("recording a lone config loss failed: {err:#}");
     }
     repeat
 }
@@ -1206,28 +1211,86 @@ const LOCAL_ACTIVITY_WALK_CAP: usize = 20_000;
 /// it through the proxy for two days fired the unrouted alert hourly
 /// (RUST-2K: five hosts in the first day of 0.9.10).
 pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<SystemTime> {
-    let mut newest: Option<SystemTime> = None;
-    let mut visited = 0usize;
-    for project in std::fs::read_dir(projects_root).ok()?.flatten() {
-        let Ok(entries) = std::fs::read_dir(project.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > LOCAL_ACTIVITY_WALK_CAP {
-                return newest;
-            }
-            if entry.path().extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
-                if Some(modified) > newest {
-                    newest = Some(modified);
-                }
-            }
+    claude_transcripts(projects_root).map(|(_, at)| at).max()
+}
+
+/// `<projects_root>/<project>/*.jsonl` with mtimes, visiting at most
+/// `LOCAL_ACTIVITY_WALK_CAP` entries.
+fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, SystemTime)> {
+    std::fs::read_dir(projects_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|project| std::fs::read_dir(project.path()).ok())
+        .flatten()
+        .flatten()
+        .take(LOCAL_ACTIVITY_WALK_CAP)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.modified().ok()?)))
+}
+
+/// What the unrouted alert says when every recent Claude Code session ran in
+/// the Claude desktop app. Those sessions are host-managed: the app pins its
+/// own API host and Claude Code drops provider env from every settings scope,
+/// so no config Headroom owns can route them.
+/// "Restart your terminal" is advice that cannot work there.
+pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desktop app go \
+     straight to Anthropic, so Headroom can't optimize them. Run Claude Code in your \
+     terminal or IDE to keep saving.";
+
+/// True when the transcript was written by Claude Code inside the Claude
+/// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
+/// `claude-desktop-3p`) on its lines; the CLI says `cli`, the IDE extension
+/// `claude-vscode`. The newest stamp decides: a resumed session appends to the
+/// same file even from another surface (an app session continued with
+/// `claude -c` in a terminal is a CLI session now).
+fn claude_transcript_is_desktop(path: &Path) -> bool {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    const TAIL: u64 = 1 << 20;
+    let stamp = |line: &str| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("entrypoint")?
+            .as_str()
+            .map(|entrypoint| entrypoint.starts_with("claude-desktop"))
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_ok()
+        && file.by_ref().take(TAIL).read_to_end(&mut tail).is_ok()
+    {
+        // The first tail line may be cut mid-way; it just fails to parse.
+        if let Some(desktop) = String::from_utf8_lossy(&tail).lines().rev().find_map(stamp) {
+            return desktop;
         }
     }
-    newest
+    // Lines can carry whole tool results or pasted images, so the tail may
+    // hold no whole stamped line; the first one sits within the first few.
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    std::io::BufReader::new(file.take(4 << 20))
+        .lines()
+        .take(32)
+        .map_while(Result::ok)
+        .find_map(|line| stamp(&line))
+        .unwrap_or(false)
+}
+
+/// True when Claude Code ran after `since` and every such session was inside
+/// the Claude desktop app: activity Headroom can see but never route.
+pub(crate) fn claude_ran_only_in_desktop_app(projects_root: &Path, since: SystemTime) -> bool {
+    let mut recent = claude_transcripts(projects_root)
+        .filter(|(_, at)| *at > since)
+        .peekable();
+    recent.peek().is_some() && recent.all(|(path, _)| claude_transcript_is_desktop(&path))
+}
+
+pub fn claude_ran_only_in_desktop_app_since(since: SystemTime) -> bool {
+    claude_ran_only_in_desktop_app(&home_dir().join(".claude").join("projects"), since)
 }
 
 /// When the agent last wrote its own session artifacts on this machine:
@@ -4894,7 +4957,12 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
 fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     reasons.iter().find_map(|reason| {
         let lower = reason.to_ascii_lowercase();
-        if lower.contains("malformed") || lower.contains("disk i/o error") {
+        // SQLITE_FULL is the user's full disk (RUST-PH), as environmental as
+        // a corrupted one.
+        if lower.contains("malformed")
+            || lower.contains("disk i/o error")
+            || lower.contains("database or disk is full")
+        {
             None
         } else if lower.contains("is locked") {
             Some("locked")
@@ -5384,6 +5452,46 @@ fn render_codex_config(existing: &str) -> String {
 /// A [`CODEX_ROOT_KEYS`] state entry and the user's own root value it holds.
 type CodexPreservedKey = (&'static str, String);
 
+/// A `config.toml` holding NUL bytes was zero-filled under us, the usual
+/// cause being a write some process had not flushed when the machine crashed
+/// or lost power (NTFS keeps the new length and zeros the lost data). Codex
+/// refuses the run ("key with no value, expected `=`"). Wrapping that run in the managed
+/// blocks kept Codex down for good: the next render matched and repair saw a
+/// healthy block, and every later write backed up the zeros until the
+/// three-backup prune had dropped each good copy. The zeros hold nothing of
+/// the user's, so recover from the newest Headroom backup that is NUL-free and
+/// parses (the render puts the blocks back around it), else drop the NULs and
+/// keep whatever text survived them.
+fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
+    if !existing.contains('\0') {
+        return existing.to_string();
+    }
+    let restored = headroom_backups_newest_first(path)
+        .into_iter()
+        .find_map(|backup| {
+            let text = std::fs::read_to_string(&backup).ok()?;
+            let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
+            clean.then_some((backup, text))
+        });
+    match restored {
+        Some((backup, text)) => {
+            log::warn!(
+                "{} held NUL bytes (zero-filled); restoring it from {}",
+                path.display(),
+                backup.display()
+            );
+            text
+        }
+        None => {
+            log::warn!(
+                "{} held NUL bytes (zero-filled) and no clean backup exists; dropping them",
+                path.display()
+            );
+            existing.replace('\0', "")
+        }
+    }
+}
+
 /// Returns `(changed_files, backup_files, preserved)`: the pre-existing
 /// *foreign* root values this write replaced -- callers must preserve them and
 /// restore them on disable instead of dropping the user onto api.openai.com
@@ -5399,20 +5507,23 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<Cod
     } else {
         String::new()
     };
+    // `existing` stays the on-disk text, so a recovered config always differs
+    // from it and is written even when the render alone would be a no-op.
+    let base = recover_zeroed_codex_config(&path, &existing);
 
     let preserved: Vec<CodexPreservedKey> = CODEX_ROOT_KEYS
         .iter()
         .filter_map(|&(key, ours, entry)| {
-            Some((entry, codex_foreign_root_value(&existing, key, ours)?))
+            Some((entry, codex_foreign_root_value(&base, key, ours)?))
         })
         .collect();
-    let updated = render_codex_config(&existing);
+    let updated = render_codex_config(&base);
     if updated == existing {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     // Never turn a config Codex loads into one it refuses (a duplicate root key
     // or table makes Codex reject the whole file): keep the user's file.
-    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+    if base.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
         return Err(anyhow!(
             "rendered {} is not valid TOML; refusing to overwrite",
             path.display()
@@ -5801,6 +5912,8 @@ fn disable_grok_build() -> Result<()> {
 /// Verified against opencode 1.18.5.
 const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
+const OPENCODE_BLOCK_NOT_FOUND: &str =
+    "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config.";
 
 /// OpenCode resolves its dirs with `xdg-basedir`, which has no Windows branch:
 /// `%USERPROFILE%\.config\opencode` there too, never `%APPDATA%`. An
@@ -6465,18 +6578,12 @@ fn mcp_span_start_offset(text: &str) -> Option<usize> {
     Some(lines[..at].iter().map(|l| l.len()).sum())
 }
 
-/// Heal configs an earlier build already damaged: re-add (before the span)
-/// each foreign table family a `<file>.headroom-backup-*` held inside a
-/// Headroom MCP span, newest backup first, when adding it to `live` still
-/// parses -- TOML refuses a table defined twice, so a table the live file has
-/// (the app re-added it, maybe with newer values) is never overwritten. A
-/// family without its root header is restored only under a root `live` has:
-/// a lone `[mcp_servers.x.env]` has no `command`, which Codex rejects.
-fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
-    let mut healed = live.to_string();
+/// `<file>.headroom-backup-*` siblings of `path`, newest first (the stamp
+/// sorts as text).
+fn headroom_backups_newest_first(path: &Path) -> Vec<PathBuf> {
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
-        return healed;
+        return Vec::new();
     };
     let prefix = format!("{file_name}.headroom-backup-");
     let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -6491,7 +6598,19 @@ fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
         })
         .collect();
     backups.sort_by(|a, b| b.cmp(a));
-    for backup in backups {
+    backups
+}
+
+/// Heal configs an earlier build already damaged: re-add (before the span)
+/// each foreign table family a `<file>.headroom-backup-*` held inside a
+/// Headroom MCP span, newest backup first, when adding it to `live` still
+/// parses -- TOML refuses a table defined twice, so a table the live file has
+/// (the app re-added it, maybe with newer values) is never overwritten. A
+/// family without its root header is restored only under a root `live` has:
+/// a lone `[mcp_servers.x.env]` has no `command`, which Codex rejects.
+fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
+    let mut healed = live.to_string();
+    for backup in headroom_backups_newest_first(path) {
         let Ok(text) = std::fs::read_to_string(&backup) else {
             continue;
         };
@@ -6634,6 +6753,11 @@ pub(crate) fn codex_provider_block_matches() -> Result<bool> {
     }
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    // Intact blocks around a zero-filled run still fail Codex's load, so a
+    // NUL fails verify and repair re-applies (`recover_zeroed_codex_config`).
+    if content.contains('\0') {
+        return Ok(false);
+    }
     let base_url = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let openai_base = format!("openai_base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let root_ok = marker_block_contains(
@@ -11250,6 +11374,10 @@ mod tests {
             None
         );
         assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
+        assert_eq!(
+            codex_retag_skip_class(&["database or disk is full".into()]),
+            None
+        );
         // A lock outliving busy_timeout is: one class for the whole pass,
         // however many of Codex's own DBs it happened to hold (RUST-EK/EM/EN).
         assert_eq!(
@@ -15289,6 +15417,34 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn a_lone_opencode_block_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-K2: an edit that drops the managed block, undone by one
+        // re-apply. One pages nothing; another within a day pages.
+        let _home = TestHome::new(); // env guard
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::write_opencode_config(&super::opencode_config_path(), &serde_json::json!({}))
+            .unwrap();
+
+        let lost = super::verify_client_setup("opencode")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::OPENCODE_BLOCK_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+        let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];
+        assert!(
+            !super::repair_pages(&claude),
+            "each cause keeps its own marker"
+        );
+        assert!(super::repair_client_setup_now("opencode"), "repaired");
+        assert!(
+            super::opencode_provider_block_matches().unwrap(),
+            "block back"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn codex_guard_under_another_python_is_stale_not_missing() {
         // RUST-KA: the Codex twin of RUST-GS. An update from 0.9.25 found the
         // guard registered under the old interpreter and reported a repair.
@@ -17057,6 +17213,65 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[serial_test::serial]
+    fn zero_filled_codex_config_is_recovered_from_the_newest_clean_backup() {
+        // A Windows user's config.toml came back as a run of NULs; the render
+        // wrapped it in the managed blocks (Codex: "config.toml:6:6714 key with
+        // no value, expected `=`"), verify passed on the intact blocks, and
+        // every later backup held the zeros too.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        let wrapped = render_codex_config(&"\0".repeat(6713));
+        fs::write(&config, &wrapped).unwrap();
+        // Newest first: a zeroed backup, an unparsable one, then the good one.
+        let backup = |stamp: &str, text: &str| {
+            fs::write(
+                codex_dir.join(format!("config.toml.headroom-backup-{stamp}")),
+                text,
+            )
+            .unwrap()
+        };
+        backup("20261009030000", &wrapped);
+        backup("20261008030000", "model = \n");
+        backup(
+            "20261007030000",
+            "model = \"gpt-5\"\n\n[projects.'C:\\x']\ntrust_level = \"trusted\"\n",
+        );
+        assert!(
+            !super::codex_provider_block_matches().unwrap(),
+            "blocks around a NUL run must fail verify so repair runs"
+        );
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert!(!toml.contains('\0'), "NULs survived:\n{toml:?}");
+        let parsed: toml::Value = toml.parse().expect("recovered config parses");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
+        assert_eq!(parsed["model_provider"].as_str(), Some("headroom"));
+        assert!(super::codex_provider_block_matches().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_filled_codex_config_without_a_clean_backup_drops_the_nuls() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        fs::write(&config, render_codex_config(&"\0".repeat(64))).unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert!(!toml.contains('\0'), "NULs survived:\n{toml:?}");
+        toml.parse::<toml::Value>().expect("config parses");
+        assert!(super::codex_provider_block_matches().unwrap());
+    }
+
+    #[test]
     fn render_codex_config_drops_an_unmarked_headroom_provider_table() {
         // Regression for Sentry RUST-6K: an OSS `pip install headroom` (or a
         // hand-added table from before marker blocks) leaves an UNMARKED
@@ -17226,6 +17441,43 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(project.join("session.jsonl"), b"x").unwrap();
         assert!(super::newest_claude_transcript_mtime(tmp.path()).is_some());
         assert!(super::newest_claude_transcript_mtime(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn claude_ran_only_in_desktop_app_reads_each_recent_sessions_entrypoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("-Users-x-repo");
+        fs::create_dir_all(&project).unwrap();
+        let before = SystemTime::now() - std::time::Duration::from_secs(60);
+        // Real head shape: unstamped queue lines, then the stamped turn.
+        let desktop = "{\"type\":\"queue-operation\"}\n\
+                       {\"type\":\"user\",\"entrypoint\":\"claude-desktop\"}\n";
+        let cli = "{\"type\":\"mode\"}\n{\"type\":\"attachment\",\"entrypoint\":\"cli\"}\n";
+
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("a.jsonl"), desktop).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        // Nothing written after `since` is no evidence either way.
+        assert!(!super::claude_ran_only_in_desktop_app(
+            tmp.path(),
+            SystemTime::now() + std::time::Duration::from_secs(60)
+        ));
+        // One terminal session alongside is a routable agent gone missing.
+        fs::write(project.join("b.jsonl"), cli).unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("b.jsonl"), "not json\n").unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::remove_file(project.join("b.jsonl")).unwrap();
+        // A resumed session appends to its file: the newest surface decides.
+        let resumed_in_cli = format!("{desktop}{cli}{{\"type\":\"last-prompt\"}}\n");
+        fs::write(project.join("a.jsonl"), resumed_in_cli).unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("a.jsonl"), format!("{cli}{desktop}")).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        // A tail of one huge unstamped line falls back to the head stamp.
+        let big = format!("{desktop}{{\"t\":\"{}\"}}\n", "x".repeat(1 << 21));
+        fs::write(project.join("a.jsonl"), big).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -362,15 +363,64 @@ fn is_runnable(path: &Path) -> bool {
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(dir) = path.parent() {
-        command.env("PATH", crate::proc::path_with_dir_prepended(dir));
-    }
+        .stderr(Stdio::null())
+        .env("PATH", path_for_cli(path));
     let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
     matches!(wait_with_timeout(child, SMOKE_TEST_TIMEOUT), Some(status) if status.success())
+}
+
+/// PATH for running `cli`: its own dir first, as `is_runnable` explains. An
+/// npm `#!/usr/bin/env node` script whose dir holds no `node` also gets the
+/// detected node's dir, last: npm's own EACCES fix (prefix `~/.npm-global`) beside a
+/// Homebrew or nodejs.org node exits 127 under a GUI launch's bare PATH, so an
+/// npm-installed codex read as "Install the Codex CLI" in Optimize (a
+/// customer, 2026-10-10).
+pub(crate) fn path_for_cli(cli: &Path) -> OsString {
+    path_for_cli_over(cli, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// As `path_for_cli`, over a caller-supplied base PATH.
+pub(crate) fn path_for_cli_over(cli: &Path, base: &OsStr) -> OsString {
+    let Some(dir) = cli.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return base.to_os_string();
+    };
+    let base = match needs_node_dir(cli, dir).then(detect_node).flatten() {
+        // Last, so it only answers `env node` when the inherited PATH has no
+        // node: ahead of it, a distro node's /usr/bin would shadow the user's
+        // own node (nvm, fnm) and tools for this CLI and all it spawns.
+        Some(node) => std::env::join_paths(
+            std::env::split_paths(base).chain(std::iter::once(node.parent().unwrap_or(dir).into())),
+        )
+        .unwrap_or_else(|_| base.to_os_string()),
+        None => base.to_os_string(),
+    };
+    crate::proc::path_with_dir_prepended_to(dir, &base)
+}
+
+/// Only a `node` shebang with no `node` beside it. The `node` check also ends
+/// the recursion: `detect_node` smoke-tests node through `is_runnable`.
+fn needs_node_dir(cli: &Path, dir: &Path) -> bool {
+    use std::io::Read;
+    if dir.join("node").exists() {
+        return false;
+    }
+    let mut head = [0u8; 128];
+    let len = std::fs::File::open(cli)
+        .and_then(|mut file| file.read(&mut head))
+        .unwrap_or(0);
+    let first_line = head[..len]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or(&[]);
+    // The interpreter (or `env`'s program) by name: a path that merely holds
+    // "node" (`/home/anode/...venv/bin/python3`) is not one.
+    first_line.strip_prefix(b"#!").is_some_and(|rest| {
+        rest.split(u8::is_ascii_whitespace)
+            .any(|word| word.rsplit(|byte| *byte == b'/').next() == Some(b"node".as_slice()))
+    })
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
@@ -705,6 +755,79 @@ mod tests {
             None => std::env::remove_var("PATH"),
         }
         assert!(result, "is_runnable must augment PATH with the candidate's bin dir so colocated interpreters resolve");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_for_cli_finds_node_for_an_npm_script_under_its_own_prefix() {
+        // `~/.npm-global/bin/codex` beside a Homebrew node: a GUI launch's
+        // PATH has neither dir, and the script's own dir holds no node.
+        let Some(node) = detect_node() else {
+            panic!("this test needs a node install the app can detect");
+        };
+        let tmp = ScopedTempDir::new("npm_prefix_script");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(&codex, "#!/usr/bin/env node\nprocess.exit(0)\n").unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bare = OsStr::new("/usr/bin:/bin");
+        let path = path_for_cli_over(&codex, bare);
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            entries,
+            [
+                bin.clone(),
+                "/usr/bin".into(),
+                "/bin".into(),
+                node.parent().unwrap().to_path_buf()
+            ]
+        );
+        let status = crate::proc::command(&codex)
+            .env("PATH", &path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the npm script must run on that PATH");
+
+        // A node beside the script (nvm) or a non-node script: own dir only.
+        let own_dir_only: Vec<PathBuf> = std::iter::once(bin.clone())
+            .chain(std::env::split_paths(bare))
+            .collect();
+        let shell = bin.join("claude");
+        make_executable(&shell);
+        assert_eq!(
+            std::env::split_paths(&path_for_cli_over(&shell, bare)).collect::<Vec<_>>(),
+            own_dir_only
+        );
+        fs::write(bin.join("node"), "").unwrap();
+        assert_eq!(
+            std::env::split_paths(&path_for_cli_over(&codex, bare)).collect::<Vec<_>>(),
+            own_dir_only
+        );
+    }
+
+    #[test]
+    fn needs_node_dir_reads_the_interpreter_not_a_substring() {
+        // A Linux venv console script under /home/anode names python, not
+        // node: matching "node" anywhere ran `detect_node` (up to a 2s login
+        // shell) on every spawn of the headroom entrypoint.
+        let tmp = ScopedTempDir::new("needs_node_dir");
+        let script = tmp.path().join("cli");
+        let needs = |shebang: &str| {
+            fs::write(&script, format!("{shebang}\nrest\n")).unwrap();
+            needs_node_dir(&script, tmp.path())
+        };
+        assert!(needs("#!/usr/bin/env node"));
+        assert!(needs("#!/usr/bin/env node\r"));
+        assert!(needs("#!/usr/bin/env -S node --no-warnings"));
+        assert!(needs("#!/opt/homebrew/opt/node/bin/node"));
+        assert!(!needs(
+            "#!/home/anode/.local/share/Headroom/venv/bin/python3"
+        ));
+        assert!(!needs("#!/usr/bin/env nodemon"));
+        assert!(!needs("#!/bin/sh"));
+        assert!(!needs("node"));
     }
 
     #[test]

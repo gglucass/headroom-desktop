@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -174,8 +175,29 @@ fn persist() {
         })
         .unwrap_or_default()
     };
-    if let Err(err) = crate::client_adapters::atomic_write(&state_path(), &bytes) {
-        log::warn!("failed to persist {FILE_NAME}: {err}");
+    match crate::client_adapters::atomic_write(&state_path(), &bytes) {
+        Ok(()) => FAILED_WRITES.store(0, Ordering::Relaxed),
+        Err(err) => {
+            let failed = FAILED_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+            log::log!(
+                write_failure_level(failed),
+                "failed to persist {FILE_NAME}: {err}"
+            );
+        }
+    }
+}
+
+/// Consecutive failed writes. The next request rewrites the whole file, so a
+/// lone failure heals by itself: on Windows, Defender held the file past
+/// atomic_write's ~1.5s rename retry once and filed a Warning (RUST-PC). A
+/// write that keeps failing leaves the statusline stale, and that reports.
+static FAILED_WRITES: AtomicU32 = AtomicU32::new(0);
+
+fn write_failure_level(consecutive: u32) -> log::Level {
+    if consecutive >= 3 {
+        log::Level::Warn
+    } else {
+        log::Level::Info
     }
 }
 
@@ -305,6 +327,13 @@ pub(crate) fn recorded(session_id: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_repeated_write_failure_reaches_sentry() {
+        assert_eq!(write_failure_level(1), log::Level::Info);
+        assert_eq!(write_failure_level(2), log::Level::Info);
+        assert_eq!(write_failure_level(3), log::Level::Warn);
+    }
 
     #[test]
     fn savings_accumulate_per_conversation_and_stay_silent_until_one_lands() {

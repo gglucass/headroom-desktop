@@ -661,6 +661,10 @@ impl<R> ResponseSniffer<R> {
             self.status = parse_response_status(&self.buf);
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
+            } else if self.capture_path.is_some()
+                && self.status.is_some_and(is_failed_request_status)
+            {
+                crate::usage_counters::record_failure(self.client_key);
             }
             self.capturing = self.capture_path.is_some()
                 && self
@@ -1085,6 +1089,14 @@ fn held_by_our_other_window(probe: PortProbe, is_twin: impl FnOnce() -> bool) ->
     probe == PortProbe::Http && is_twin()
 }
 
+/// Set while this window has stood past the relaunch grace beside another
+/// window of this same Headroom that serves 6767, cleared when this one binds.
+/// The clients are that window's, so this one's quit or restart must leave
+/// them wired: clearing them sent every client direct while the other window
+/// kept serving 6767 to nobody. If nothing answers 6767 once we are gone, the
+/// crash guard still unwires them.
+pub(crate) static SPECTATING_TWIN: AtomicBool = AtomicBool::new(false);
+
 /// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
 ///
 /// Only `Draining` does, and the distinction is a correctness boundary rather
@@ -1333,9 +1345,16 @@ fn serve(
                             // wait for it to go away. Anything else, HTTP or
                             // not, goes through the diagnosis below.
                             let probe = probe_port(INTERCEPT_PORT).await;
-                            if held_by_our_other_window(probe, || {
+                            let twin = held_by_our_other_window(probe, || {
                                 crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
-                            }) {
+                            });
+                            // Every iteration, so a twin that has since quit
+                            // hands the clients back to this window's exit.
+                            SPECTATING_TWIN.store(
+                                twin && launched_at.elapsed() >= RELAUNCH_GRACE,
+                                Ordering::Release,
+                            );
+                            if twin {
                                 // Name the real cause. `bind_error` is only
                                 // ever cleared by a successful bind and this
                                 // arm never binds, so whatever an earlier
@@ -1854,6 +1873,7 @@ async fn run(
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
+    SPECTATING_TWIN.store(false, Ordering::Release);
     // And wire back any clients the bind loop unwired from another holder of
     // this port. Off this single-threaded runtime, which must accept; tests
     // bind other ports and never reach it.
@@ -2744,6 +2764,16 @@ async fn splice_with_codex_capture(
                 codex_error_summary(&error_body)
             );
         }
+        let failed = match status {
+            Some(status) => {
+                is_failed_request_status(status)
+                    || ((200..300).contains(&status) && streamed.failed())
+            }
+            None => !client_gone.load(Ordering::Relaxed),
+        };
+        if failed && is_provider_api_path(req_path) {
+            crate::usage_counters::record_failure("codex");
+        }
         if prompt {
             note_codex_prompt_outcome(
                 status,
@@ -2937,6 +2967,12 @@ fn note_codex_prompt_outcome(
         Some(200..=299) => "stream_error",
         Some(_) => "status",
     };
+    let [err_type, err_code] = codex_error_class(error_body);
+    let class = if err_type == "-" && err_code == "-" {
+        kind.to_string()
+    } else {
+        format!("{kind}, {err_type}/{err_code}")
+    };
     sentry::with_scope(
         |scope| {
             scope.set_tag("codex_failure_kind", kind);
@@ -2948,21 +2984,35 @@ fn note_codex_prompt_outcome(
                 scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
                 scope.set_extra("error_body", codex_error_summary(error_body).into());
             }
+            if let Some(message) = (kind == "stream_error")
+                .then(|| codex_inband_message(error_body))
+                .flatten()
+            {
+                scope.set_extra("error_message", message.into());
+            }
             if let Some((err_kind, waited)) = head_failure {
                 scope.set_extra("head_error", format!("{err_kind:?}").into());
                 scope.set_extra("head_wait_ms", (waited.as_millis() as u64).into());
             }
-            scope.set_fingerprint(Some(&["codex-prompts-failing", kind]));
+            scope.set_fingerprint(Some(&["codex-prompts-failing", kind, &err_type, &err_code]));
         },
         || {
             sentry::capture_message(
                 &format!(
-                    "Codex prompts failing: {CODEX_FAILURE_STREAK_REPORT_AT} in a row ({kind})"
+                    "Codex prompts failing: {CODEX_FAILURE_STREAK_REPORT_AT} in a row ({class})"
                 ),
                 sentry::Level::Warning,
             );
         },
     );
+}
+
+/// A status the user saw as a failed request, for the per-day
+/// `failed_requests` counter: any 4xx or 5xx but a 429, which has its own.
+/// Nothing is excused here (unlike `codex_prompt_failed`); headroom-web
+/// separates provider outages from Headroom bugs by comparing versions.
+fn is_failed_request_status(status: u16) -> bool {
+    status >= 400 && status != 429
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -3336,17 +3386,60 @@ fn codex_error_summary(body: &[u8]) -> String {
 fn safe_detail_text(json: &serde_json::Value) -> Option<String> {
     const MAX_LEN: usize = 120;
     let detail = json.get("detail")?.as_str()?.trim();
-    let plain = !detail.is_empty()
-        && detail.len() <= MAX_LEN
-        && detail.chars().all(|c| {
+    (detail.len() <= MAX_LEN && plain_server_text(detail)).then(|| detail.to_string())
+}
+
+/// The opening words of an in-band stream failure's `message`, for the
+/// `codex-prompts-failing` report. RUST-NY held the web_search compaction
+/// failure ("response protection is unavailable") as a bare
+/// `type=internal_error`, indistinguishable from an outage. Only a failure
+/// the provider raised while serving an accepted turn is read: a 4xx
+/// `message` describes the request and can quote it (`codex_error_summary`
+/// never reads one). 80 chars name the failure and stop short of where
+/// providers quote; `plain_server_text` drops anything that could be an echo.
+fn codex_inband_message(body: &[u8]) -> Option<String> {
+    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let err = json.get("error").filter(|e| e.is_object()).unwrap_or(&json);
+    let message: String = err
+        .get("message")?
+        .as_str()?
+        .trim()
+        .chars()
+        .take(80)
+        .collect();
+    plain_server_text(&message).then_some(message)
+}
+
+/// Whether `text` is plainly a server-generated sentence: non-empty printable
+/// ASCII without the quote, bracket or `@` characters an echoed request
+/// fragment or account name would carry (see `safe_detail_text`).
+fn plain_server_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| {
             c.is_ascii_graphic()
                 && !matches!(
                     c,
                     '"' | '\'' | '{' | '}' | '[' | ']' | '<' | '>' | '\\' | '@'
                 )
                 || c == ' '
-        });
-    plain.then(|| detail.to_string())
+        })
+}
+
+/// `error.type` and `error.code` of an error body (or the body's own when it
+/// has no `error` object), `-` when absent or not identifier-shaped. They key
+/// the `codex-prompts-failing` issue, so a Headroom-caused `internal_error`
+/// run is not resolved together with a provider's `server_error` outage, as
+/// both were inside RUST-NY.
+fn codex_error_class(body: &[u8]) -> [String; 2] {
+    let json = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let err = json.get("error").filter(|e| e.is_object()).unwrap_or(&json);
+    ["type", "code"].map(|key| {
+        err.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| is_safe_shape_key(v))
+            .unwrap_or("-")
+            .to_string()
+    })
 }
 
 /// Content-free descriptor of an error body's JSON shape.
@@ -4951,12 +5044,13 @@ mod tests {
     }
 
     use super::{
-        bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
-        codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
-        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
-        is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
-        is_codex_sse_response, is_compression_refused_error, is_geo_blocked_codex_error,
+        bearer_value_changed, bind_intercept, classify_held_port, codex_error_class,
+        codex_error_shape_tag, codex_error_summary, codex_inband_message, codex_prompt_failed,
+        codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
+        extract_bearer, extract_header_value, find_header_end, grok_upstream_header,
+        held_by_our_other_window, intercept_request_counts, is_ccr_retrieve_path,
+        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
+        is_compression_refused_error, is_failed_request_status, is_geo_blocked_codex_error,
         is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
         is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
         is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
@@ -8583,6 +8677,49 @@ mod tests {
             !summary.contains("SECRET"),
             "free-text message must never reach Sentry: {summary}"
         );
+    }
+
+    #[test]
+    fn codex_streak_report_keys_on_error_class_and_keeps_an_inband_message() {
+        // OpenAI's in-band error event, the shape RUST-NY's 0.9.37 events had.
+        let inband = br#"{"type":"error","error":{"type":"internal_error","message":"response protection is unavailable"}}"#;
+        assert_eq!(codex_error_class(inband), ["internal_error", "-"]);
+        assert_eq!(
+            codex_inband_message(inband).as_deref(),
+            Some("response protection is unavailable")
+        );
+        let outage = br#"{"error":{"type":"server_error","code":"server_is_overloaded"}}"#;
+        assert_eq!(
+            codex_error_class(outage),
+            ["server_error", "server_is_overloaded"]
+        );
+        assert_eq!(codex_error_class(b""), ["-", "-"]);
+        assert_eq!(codex_error_class(b"event: error\ndata: {"), ["-", "-"]);
+        // A value shaped like content never becomes a fingerprint key.
+        assert_eq!(
+            codex_error_class(br#"{"error":{"type":"my secret prompt"}}"#),
+            ["-", "-"]
+        );
+        // Cut at 80 chars, and dropped whole when its opening words quote.
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "ab ".repeat(40));
+        assert_eq!(
+            codex_inband_message(long.as_bytes()).map(|m| m.len()),
+            Some(80)
+        );
+        assert_eq!(
+            codex_inband_message(br#"{"error":{"message":"Invalid value: 'my secret prompt'"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_request_status_counts_every_error_but_429() {
+        assert!([400, 401, 413, 500, 502, 529]
+            .into_iter()
+            .all(is_failed_request_status));
+        assert!(![200, 204, 304, 429]
+            .into_iter()
+            .any(is_failed_request_status));
     }
 
     #[test]

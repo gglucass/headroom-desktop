@@ -357,6 +357,16 @@ fn cli_stderr(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// The editor's own executable failed to load on Windows (`ExitStatus` prints
+/// the NTSTATUS): a DLL missing (RUST-PM), built for the wrong architecture, or
+/// refusing to initialize. The same executable runs the editor, so the install
+/// is broken for the user too; nothing on our side to fix.
+fn editor_failed_to_load(err: &str) -> bool {
+    ["0xc0000135", "0xc000007b", "0xc0000142"]
+        .iter()
+        .any(|status| err.contains(status))
+}
+
 fn install(editor: &Editor, profile: &Profile, vsix_bytes: &[u8]) -> Result<()> {
     let vsix = std::env::temp_dir().join(format!("headroom-status-{}.vsix", std::process::id()));
     // direct-write: a throwaway CLI input, deleted right after; not persisted state.
@@ -431,6 +441,12 @@ fn install_where_needed(editors: &[Editor]) {
                 Err(err) if format!("{err:#}").contains("not compatible with") => {
                     log::info!(
                         "{} is too old for the Headroom status bar: {err:#}",
+                        profile.key
+                    )
+                }
+                Err(err) if editor_failed_to_load(&format!("{err:#}")) => {
+                    log::info!(
+                        "{} cannot start, a broken editor install: {err:#}",
                         profile.key
                     )
                 }
@@ -524,6 +540,18 @@ mod tests {
             cli_stderr(stderr),
             "Unable to install extension 'headroom.headroom-status' as it is not compatible with VS Code '1.74.3'."
         );
+    }
+
+    #[test]
+    fn an_editor_that_cannot_load_is_a_broken_install_not_our_failure() {
+        assert!(editor_failed_to_load(
+            "vscode exited exit code: 0xc0000135: "
+        ));
+        assert!(editor_failed_to_load(
+            "cursor exited exit code: 0xc000007b: "
+        ));
+        assert!(!editor_failed_to_load("vscode exited exit code: 1: boom"));
+        assert!(!editor_failed_to_load("vscode timed out after 60s"));
     }
 
     #[test]

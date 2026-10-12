@@ -10,6 +10,8 @@
 //!   the idle `headroom.exe` launcher anyway, not the python doing the work.
 //! - A process's image path from the kernel, for identity checks that must
 //!   keep working where AppLocker/SRP blocks powershell.exe.
+//! - The process table (pid, parent pid) from one kernel snapshot, so the
+//!   process sweep can tell it has nothing to do without starting PowerShell.
 //!
 //! Only proxy spawns join the job. The updater's installer, the relaunch
 //! helper and anything else that has to outlive the app never do.
@@ -17,7 +19,10 @@
 use std::os::windows::io::AsRawHandle;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
@@ -140,4 +145,30 @@ pub(crate) fn process_image_path(pid: u32) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// Every running process as `(pid, parent pid)`, from one toolhelp snapshot:
+/// the same table `Get-Process` reads, without starting PowerShell. `None`
+/// when the snapshot fails or lists nothing (never true of a live system).
+pub(crate) fn process_parents() -> Option<Vec<(u32, u32)>> {
+    // SAFETY: documented flags; the handle is checked and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut processes = Vec::new();
+    // SAFETY: `entry.dwSize` is set as the API requires and `snapshot` is live.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while more != 0 {
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    // SAFETY: `snapshot` came from CreateToolhelp32Snapshot and is closed once.
+    unsafe { CloseHandle(snapshot) };
+    (!processes.is_empty()).then_some(processes)
 }

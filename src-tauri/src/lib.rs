@@ -643,12 +643,25 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     if !(claude || codex) || !state.try_mark_unrouted_usage_notified() {
         return;
     }
-    let (title, body) = unrouted_usage_copy(claude, codex);
+    // A restart cannot route a Claude desktop app session; say what can. With
+    // Codex also leaking, its restart advice still holds and the hourly
+    // detector names the desktop half.
+    let claude_desktop = claude
+        && routed("claude_code")
+            .is_some_and(|at| client_adapters::claude_ran_only_in_desktop_app_since(at.into()));
+    let (title, body) = if claude_desktop && !codex {
+        (
+            "Claude Code in the Claude app isn't optimized",
+            client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS,
+        )
+    } else {
+        unrouted_usage_copy(claude && !claude_desktop, codex)
+    };
     let _ = show_notification_impl(app, title, body, None);
     analytics::track_event(
         app,
         "unrouted_usage_nudge_shown",
-        Some(json!({ "claude": claude, "codex": codex })),
+        Some(json!({ "claude": claude, "codex": codex, "claude_desktop": claude_desktop })),
     );
 }
 
@@ -1087,7 +1100,7 @@ async fn check_for_app_update(
         .on_before_exit(move || {
             log::info!("update: running the exit teardown before the installer exits the app");
             let state: tauri::State<'_, AppState> = teardown.state();
-            run_exit_teardown(&state);
+            run_exit_teardown(&state, true);
         })
         .build()
         .map_err(|err| err.to_string())?;
@@ -2982,13 +2995,16 @@ fn headroom_start_failure_category(reason: &str) -> String {
 /// Logs a failed proxy (re)start. The log bridge sends warn! to Sentry, so a
 /// start the app's own exit cut short goes to info instead, as
 /// `capture_headroom_start_failure` leaves it out (RUST-N0: a quit during the
-/// auto-learn toggle's restart).
+/// auto-learn toggle's restart). So does an endpoint-protection verdict: the
+/// boot path's capture files it once per session under a stable fingerprint,
+/// while this line embeds the full command line and grouped per host (RUST-PW,
+/// an App Control block on the gate exit's restart).
 pub(crate) fn log_headroom_start_failure(context: &str, err: &str) {
     log::log!(start_failure_log_level(err), "{context}: {err}");
 }
 
 fn start_failure_log_level(err: &str) -> log::Level {
-    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) {
+    if err.contains(tool_manager::START_CUT_SHORT_BY_EXIT) || is_endpoint_protection_signal(err) {
         log::Level::Info
     } else {
         log::Level::Warn
@@ -4074,7 +4090,12 @@ pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
 /// Names both causes of WinError 10013 and how to tell them apart, without
 /// asserting either (same discipline as `state::intercept_bind_hint`).
 const LOOPBACK_SOCKET_DENIED_HINT: &str =
-    "Windows refused to let Headroom's runtime open a local network socket (WinError 10013),      so it exits before it can start listening. This is usually security software filtering      loopback connections, or a reserved port range (Hyper-V, WSL2, Docker) covering the ports      Windows hands out. Allow Headroom in your antivirus or firewall's network protection, and      run `netsh int ipv4 show excludedportrange protocol=tcp` in PowerShell to see reserved      ranges. Then click Retry.";
+    "Windows refused to let Headroom's runtime open a local network socket (WinError 10013), \
+     so it exits before it can start listening. This is usually security software filtering \
+     loopback connections, or a reserved port range (Hyper-V, WSL2, Docker) covering the ports \
+     Windows hands out. Allow Headroom in your antivirus or firewall's network protection, and \
+     run `netsh int ipv4 show excludedportrange protocol=tcp` in PowerShell to see reserved \
+     ranges. Then click Retry.";
 
 pub(crate) fn loopback_socket_denied_hint() -> String {
     LOOPBACK_SOCKET_DENIED_HINT.to_string()
@@ -5164,6 +5185,20 @@ fn run_activity_observation(app: &AppHandle) {
     // machine's feed is dead". See `FEED_FETCH_FAILURE_GRACE`.
     static FEED_FAILING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
+    // Windows' `Instant` keeps counting while the machine sleeps (see
+    // `proc::suspend_gap`), so a pull that failed going into a sleep and one
+    // that failed coming out of it read as a streak as long as the sleep.
+    // Ticks run 20s apart plus their own work; a gap past the forced-pull
+    // interval means this thread did not run, so the streak starts over.
+    static LAST_TICK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if LAST_TICK
+        .lock()
+        .replace(std::time::Instant::now())
+        .is_some_and(|at| at.elapsed() > ACTIVITY_OBSERVER_MAX_FEED_GAP)
+    {
+        *FEED_FAILING_SINCE.lock() = None;
+    }
+
     // The intercept answers every local path 503 while the backend is
     // unreachable, so a backend the app itself is holding down (paused, auto-
     // paused after a crash, or still starting -- update maintenance alone has
@@ -5230,6 +5265,7 @@ fn run_activity_observation(app: &AppHandle) {
                             scope.set_tag("flow", "transformations_feed_fetch");
                             scope.set_extra("error", err.clone().into());
                             scope.set_extra("limit", u64::from(limit).into());
+                            scope.set_extra("failing_for_secs", failing_for.as_secs().into());
                             scope.set_fingerprint(Some(&["transformations-feed-fetch", category]));
                         },
                         || {
@@ -6196,12 +6232,27 @@ async fn detect_unrouted_clients(
             } else {
                 Vec::new()
             };
-            let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
+            // Every session in the window ran in the Claude desktop app, which
+            // routes nothing through us by design. The guard calls those
+            // healthy (our settings are right, the app just ignores them), so
+            // without this RUST-DN said `diagnosed=false` and told a desktop
+            // user to restart a terminal they never used (user 895 cancelled
+            // over five weeks of it).
+            let desktop_only = client_id == "claude_code"
+                && client_adapters::claude_ran_only_in_desktop_app_since(
+                    routed_since.max(now - client_adapters::UNROUTED_ACTIVITY_WINDOW),
+                );
+            let reapplied =
+                enabled && !desktop_only && client_adapters::apply_client_setup(client_id).is_ok();
             // Re-applying our own config is only a fix when our own config was
             // the problem. Ask the guard what the agent actually saw.
-            let diagnosis = client_adapters::read_guard_verdict(client_id)
-                .filter(|issues| !issues.is_empty())
-                .map(|issues| issues.join("; "));
+            let diagnosis = if desktop_only {
+                Some(client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS.to_string())
+            } else {
+                client_adapters::read_guard_verdict(client_id)
+                    .filter(|issues| !issues.is_empty())
+                    .map(|issues| issues.join("; "))
+            };
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
@@ -6225,6 +6276,9 @@ async fn detect_unrouted_clients(
                     // this every event says only "ran unrouted", which is the
                     // symptom we already knew.
                     scope.set_tag("diagnosed", diagnosis.is_some());
+                    if client_id == "claude_code" {
+                        scope.set_tag("claude_desktop_only", desktop_only);
+                    }
                     if let Some(diagnosis) = diagnosis.as_deref() {
                         scope.set_extra("guard_diagnosis", diagnosis.into());
                     }
@@ -6837,7 +6891,7 @@ fn capture_tile_bodies(state: &AppState, log_full_messages: bool) {
     // window on its event loop, and one that timed out on a large transcript
     // would time out again on every tick until the request aged out.
     let found =
-        fetch_request_bodies_from("http://127.0.0.1:6767", &missing).unwrap_or_else(|err| {
+        fetch_request_bodies_from(&backend_data_base_url(), &missing).unwrap_or_else(|err| {
             log::debug!("tile bodies pull failed: {err}");
             missing.into_iter().map(|id| (id, None)).collect()
         });
@@ -7222,7 +7276,9 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         // remembered_clients snapshot we just saved (configured_clients is now
         // empty, so the re-save is skipped while the disable loop still removes
         // remembered entries), leaving connectors disabled on next launch.
-        if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+        if !proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire)
+            && !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel)
+        {
             let _ = client_adapters::clear_client_setups();
         }
         runtime_paused
@@ -7250,13 +7306,23 @@ fn stop_headroom_for_exit(state: &AppState) {
 
 /// The teardown every exit runs: the RunEvent exit arm, and the Windows
 /// updater's `on_before_exit`, which exits through `std::process::exit` and so
-/// never reaches that arm.
-fn run_exit_teardown(state: &AppState) {
+/// never reaches that arm. `installer_follows` is that hook: the installer
+/// kills every running copy of our exe, the window serving 6767 included, so
+/// a spectator must unwire like any window. A parameter, not a cleared
+/// `SPECTATING_TWIN`: the bind loop re-sets that flag every 15s, and one pass
+/// landing while `stop_headroom` runs left the clients on a dead 6767.
+fn run_exit_teardown(state: &AppState, installer_follows: bool) {
     SHUTTING_DOWN.store(true, Ordering::Release);
     // Step markers: this teardown runs on the UI thread, so a step that blocks
     // freezes the app mid-quit and emits nothing (Sentry only receives
     // warn!/error!). The last marker in the log names the step that hung.
     stop_headroom_for_exit(state);
+    // The window serving 6767 owns the clients and their Codex threads; see
+    // `proxy_intercept::SPECTATING_TWIN`.
+    if !installer_follows && proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {
+        log::info!("exit: another Headroom window serves 6767; leaving the clients wired");
+        return;
+    }
     // Gracefully reverse every client's base-URL override (and shell blocks) on
     // quit so Claude Code / Codex fall back to talking directly to their native
     // providers while Headroom is not running, instead of pointing at a
@@ -8162,7 +8228,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state: tauri::State<'_, AppState> = app.state();
-            run_exit_teardown(&state);
+            run_exit_teardown(&state, false);
         }
     });
 }
@@ -8323,6 +8389,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 output_baseline_tokens: point.output_baseline_tokens,
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
                 rate_limit_429s: day_counters.map(|c| c.rate_limit_429s.clone()),
+                failed_requests: day_counters.map(|c| c.failed_requests.clone()),
             }
         })
         .collect();
@@ -8613,8 +8680,18 @@ fn parse_memory_created_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+/// The backend's own port for the app's feed reads, like `/stats` (see
+/// `state::backend_data_port`), and the intercept until that port is vetted.
+/// Through the 6767 relay a traffic filter cutting the front door (AdGuard
+/// for Windows on RUST-NG) failed every pull while the backend answered
+/// each one, and the canary filed that as a dead feed (RUST-NH).
+fn backend_data_base_url() -> String {
+    let port = crate::state::backend_data_port().unwrap_or(crate::proxy_intercept::INTERCEPT_PORT);
+    format!("http://127.0.0.1:{port}")
+}
+
 fn fetch_transformations_feed(limit: u32) -> Result<TransformationFeedResponse, String> {
-    fetch_transformations_feed_from("http://127.0.0.1:6767", limit)
+    fetch_transformations_feed_from(&backend_data_base_url(), limit)
 }
 
 #[derive(serde::Deserialize)]
@@ -9073,6 +9150,15 @@ fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
     })
 }
 
+/// Codex could not load the user's own config: a `model_catalog_json` file
+/// that does not parse (RUST-PA: Ollama's launcher wrote
+/// `~/.codex/ollama-launch-models.json` without a field Codex now requires).
+/// Every `codex exec` on the machine fails the same way until the user fixes
+/// that file, and the failure tail shown in the app already names it.
+fn learn_failure_is_agent_config_broken(text: &str) -> bool {
+    text.contains("failed to parse model_catalog_json")
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
 fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
     let (cli, update) = match agent {
@@ -9467,8 +9553,8 @@ fn execute_headroom_learn_run(
         // and "claude-sonnet-4-6" is not a valid Claude Code model alias,
         // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
-    if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
-        command.env("PATH", crate::proc::path_with_dir_prepended(dir));
+    if let Some(cli) = cli_path.as_ref() {
+        command.env("PATH", claude_cli::path_for_cli(cli));
     }
     // Seed a step before the first line arrives: session scanning is silent, and
     // an empty line that pops in later would shift the row.
@@ -9536,6 +9622,7 @@ fn execute_headroom_learn_run(
                         && !agent_api_unreachable
                         && !agent_unparseable
                         && !agent_cli_outdated
+                        && !learn_failure_is_agent_config_broken(diagnosis)
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -9759,6 +9846,7 @@ fn execute_headroom_learn_run(
                 let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                 let user_env_condition = path_unreadable
                     || agent_cli_outdated
+                    || learn_failure_is_agent_config_broken(diagnosis)
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -9994,6 +10082,21 @@ fn plan_usage_line(
 /// Sets the savings line and puts `usage` under it as disabled items,
 /// replacing the ones `items` holds. Reuses them while the count holds, so
 /// the open menu updates in place instead of jumping.
+/// A tray update that failed because the event loop is gone: the app is
+/// quitting, or the main thread died, which the panic hook already reported
+/// (RUST-PE then RUST-PF on one Windows host: softbuffer's GDI assert, then
+/// every tray update; RUST-PG). Nothing left for the tray loop to report.
+fn tray_update_failure_level(err: &tauri::Error) -> log::Level {
+    let event_loop_gone = matches!(err, tauri::Error::FailedToReceiveMessage)
+        || (matches!(err, tauri::Error::Runtime(_))
+            && err.to_string().contains("failed to send message"));
+    if event_loop_gone {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    }
+}
+
 fn update_tray_menu_info(
     app: &AppHandle,
     savings: &str,
@@ -10421,12 +10524,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     if let Err(err) =
                         update_tray_menu_info(&app, &menu_info.0, &menu_info.1, &mut usage_items)
                     {
-                        log::warn!("tray menu info update failed: {err}");
+                        log::log!(
+                            tray_update_failure_level(&err),
+                            "tray menu info update failed: {err}"
+                        );
                     }
                     last_menu_info = Some(menu_info);
                 }
                 if let Err(err) = sync_tray_invite_item(&app, &mut invite_item) {
-                    log::warn!("tray invite item update failed: {err}");
+                    log::log!(
+                        tray_update_failure_level(&err),
+                        "tray invite item update failed: {err}"
+                    );
                 }
 
                 let mut icon_changed = false;
@@ -11910,21 +12019,22 @@ mod tests {
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
-        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        missing_dependency_modules, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
+        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
+        learn_step_label, lifetime_token_milestone_kind, missing_dependency_modules,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
@@ -14691,6 +14801,28 @@ Some unrelated content.
         assert!(!watchdog_should_be_up(true, false, false, false, true));
     }
 
+    /// The installer kills the window serving 6767 too, so the updater's
+    /// teardown must unwire a spectator. Clearing `SPECTATING_TWIN` did not
+    /// hold: the bind loop re-sets it every 15s, and a pass landing during
+    /// `stop_headroom` skipped the unwire. Needs a twin and an installer, so
+    /// pinned in source.
+    #[test]
+    fn updater_teardown_unwires_a_spectator_without_the_shared_flag() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, hook) = source
+            .split_once(".on_before_exit(move || {")
+            .expect("updater hook present");
+        let hook = &hook[..hook.find("})").expect("hook end")];
+        assert!(hook.contains("run_exit_teardown(&state, true);"), "{hook}");
+        assert!(!hook.contains("SPECTATING_TWIN"), "{hook}");
+        let (_, teardown) = source
+            .split_once("fn run_exit_teardown(state: &AppState, installer_follows: bool) {")
+            .expect("teardown present");
+        assert!(teardown.contains(
+            "if !installer_follows && proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire) {"
+        ));
+    }
+
     /// A second launch on Windows/Linux (a shortcut clicked during a slow first
     /// install, or any headroom:// link) runs until single-instance exits it
     /// from its plugin setup, which Tauri runs before the app's own `.setup`.
@@ -15088,6 +15220,18 @@ Some unrelated content.
     }
 
     #[test]
+    fn tray_updates_after_the_event_loop_died_log_below_sentry() {
+        assert_eq!(
+            crate::tray_update_failure_level(&tauri::Error::FailedToReceiveMessage),
+            log::Level::Info
+        );
+        assert_eq!(
+            crate::tray_update_failure_level(&tauri::Error::WebviewNotFound),
+            log::Level::Warn
+        );
+    }
+
+    #[test]
     fn start_failure_cut_short_by_exit_logs_below_sentry() {
         // RUST-N0: the auto-learn toggle restarted the proxy as the user quit.
         assert_eq!(
@@ -15101,6 +15245,14 @@ Some unrelated content.
                 "headroom exited with exit status: 1 before opening port 6768"
             ),
             log::Level::Warn
+        );
+        // RUST-PW: Portuguese Windows, App Control blocked the venv launcher.
+        assert_eq!(
+            crate::start_failure_log_level(
+                "starting headroom background process: headroom.exe proxy --port 6768: \
+                 Uma politica de Controle de Aplicativo bloqueou este arquivo. (os error 4551)"
+            ),
+            log::Level::Info
         );
     }
 
@@ -15757,6 +15909,17 @@ Some unrelated content.
                 "for: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_config_broken_matches_a_bad_model_catalog() {
+        // RUST-PA verbatim, minus the analyzer's log prefix.
+        assert!(learn_failure_is_agent_config_broken(
+            "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\nWARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)\nError: failed to parse model_catalog_json path `~/.codex/ollama-launch-models.json` as JSON: missing field `supports_reasoning_summaries` at line 422 column 5\n"
+        ));
+        assert!(!learn_failure_is_agent_config_broken(
+            "LLM analysis failed: `codex exec` failed (exit 1):\nError: stream disconnected\n"
+        ));
     }
 
     #[test]
