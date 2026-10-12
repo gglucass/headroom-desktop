@@ -2699,19 +2699,13 @@ impl AppState {
         let ledger_estimate = ledger_read.scored();
         // An addon shaping replies too (Chisle, Caveman, Ponytail) leaves only
         // the holdout honest: the estimate and the backend's figure both book
-        // the addon's savings as Headroom's. The holdout takes a heavy user
-        // a couple of months, so until it is ready the tile shows the
-        // estimate with `alongside_addon` set and says it includes the addon;
-        // the server report drops that combined figure (lib.rs). The lifetime
-        // dollar row below keeps `ledger_estimate`; it is floored by the
-        // backend's own daily output buckets, which this cannot reach anyway
-        // (audit #50).
+        // the addon's savings as Headroom's. Until the holdout is ready the
+        // tile shows the estimate with `alongside_addon` set and says it
+        // includes the addon; the server report drops that combined figure
+        // (lib.rs). The lifetime dollar row below stays on the estimate either
+        // way (audit #50).
         let reply_addon = self.tool_manager.active_reply_addon();
-        let tile_estimate = match reply_addon {
-            Some(_) => crate::output_savings::measured().or_else(|| ledger_estimate.clone()),
-            None => ledger_estimate.clone(),
-        };
-        let output_reduction = tile_estimate
+        let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
                 method: e.method.to_string(),
@@ -2916,9 +2910,10 @@ impl AppState {
         // off the last persisted estimator reading instead of the bucket sum,
         // so the headline doesn't dip by hundreds of dollars for the first
         // minutes and then jump back up.
-        // Same ledger recomputation as the tile above: the dollar row and the
-        // percentage have to describe one estimate, or the drill-down stops
-        // explaining the headline.
+        // Priced off the synthetic-control estimate even when the tile shows
+        // the holdout: Garm kept output dollars as they were on 2026-10-12,
+        // when the holdout first promoted (-8.7% on one machine), pending
+        // audit #50.
         // Kept as in rc7 on purpose: audit finding #50 (price the ledger
         // total, $0 when it scores nothing, never floored by the credited
         // buckets) visibly drops the lifetime headline on update, so it is
@@ -2926,8 +2921,8 @@ impl AppState {
         // /Users/garmlucassen/Code/headroom-audit-2026-09-29/findings.json.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            ledger_estimate
-                .as_ref()
+            crate::output_savings::estimated()
+                .scored()
                 .map(|e| e.tokens_saved)
                 .or_else(|| {
                     // Same gate as the tile above: the backend's token total
@@ -5382,7 +5377,7 @@ struct OutputSampleBucket {
 }
 
 /// Semantics version of the sampled output series. The samples are deltas of
-/// `crate::output_savings::estimate()`, so a sample is only comparable to
+/// `crate::output_savings::estimated()`, so a sample is only comparable to
 /// others taken under the same estimator rules. Bump this when those rules
 /// change: the persisted *watermark pair* is then dropped once on load, so the
 /// next poll reseeds against the new cumulative instead of parking above it
@@ -5394,8 +5389,9 @@ struct OutputSampleBucket {
 /// day is worth more than a gap: v1 dropped them and simply erased two weeks
 /// of a user's output history. Only the seed pair is unit-sensitive.
 /// Version history: 0 = pre-field (prefix-fallback lookup), 1 = exact-stratum
-/// lookup with MIN_BASELINE_N (2026-08-22).
-const OUTPUT_SAMPLE_SERIES_VERSION: u8 = 1;
+/// lookup with MIN_BASELINE_N (2026-08-22), 2 = synthetic control only, never
+/// the holdout, which used to be sampled once it promoted (2026-10-12).
+const OUTPUT_SAMPLE_SERIES_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -6065,16 +6061,17 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
-        // Sampled from the locally recomputed estimate ONLY, never the
-        // backend's `/stats` figure: its global-mean credit is what the
-        // recompute exists to remove, and sampling it as a fallback booked an
+        // Sampled from the locally recomputed synthetic control ONLY, never
+        // the holdout (an all-time figure: see `output_savings::estimated`)
+        // and never the backend's `/stats` figure: its global-mean credit is
+        // what the recompute exists to remove, and sampling it as a fallback booked an
         // Opus-mean "reduction" into the daily buckets of exactly the machines
         // the recompute refuses to score (read as "Output -100%" on an
         // all-codex Windows machine, 0.9.7-rc.7). A ledger with no evidence
         // just skips this poll's sample; a readable ledger that scores nothing
         // also convicts every sample the retired fallback recorded -- see
         // `drop_unscoreable_output_samples`.
-        match crate::output_savings::estimate() {
+        match crate::output_savings::estimated() {
             crate::output_savings::LedgerEstimate::Scored(e) => {
                 self.sample_output_reduction(Some((e.tokens_saved, e.baseline_tokens)));
             }

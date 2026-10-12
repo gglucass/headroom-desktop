@@ -27,9 +27,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// The measured (A/B holdout) estimate replaces the synthetic-control one only
-/// once strata with data in both arms account for this share of treatment
-/// volume. Below it the holdout describes a corner of the traffic, not the
-/// traffic.
+/// once strata with data in both arms account for this share of shaped OUTPUT
+/// TOKENS. Below it the holdout describes a corner of the traffic, not the
+/// traffic. Tokens, not requests: Claude Code's helper calls (titles and the
+/// like, 10-50-token replies) were 37% of one machine's qualified requests and
+/// 3.6% of its output (2026-10-12), so a holdout speaking for 54% of that
+/// machine's output counted as 40% and never promoted.
 const MEASURED_MIN_COVERAGE_PCT: f64 = 50.0;
 
 /// ...and only once its 95% band is this tight. At a 3% holdout this takes a
@@ -189,11 +192,11 @@ impl Ledger {
         self.treatment.values().map(|acc| acc.n).sum()
     }
 
-    /// The shaped requests that carry a conversation (`qn`): the measured
-    /// estimate's coverage denominator, since those are the only rows it can
-    /// ever score.
-    fn qualified(&self) -> u64 {
-        self.treatment.values().map(|acc| acc.qn).sum()
+    /// Output tokens of the shaped requests that carry a conversation (`qn`):
+    /// the measured estimate's coverage denominator, since those are the only
+    /// rows it can ever score.
+    fn qualified_output(&self) -> f64 {
+        self.treatment.values().map(|acc| acc.qsum).sum()
     }
 }
 
@@ -208,10 +211,14 @@ pub struct OutputEstimate {
     /// Treatment requests the estimate actually covers -- not every shaped
     /// request, since strata without baseline evidence are excluded.
     pub requests: u64,
-    /// `requests` as a share of every shaped request, so a reader can tell a
-    /// number about all of this machine's traffic from one about a corner of
-    /// it. Travels to the server with the percentage for the same reason.
+    /// How much of this machine's shaped traffic the figure covers, so a
+    /// reader can tell a number about all of it from one about a corner of
+    /// it: by requests for "estimated", by output tokens for "measured" (see
+    /// [`MEASURED_MIN_COVERAGE_PCT`]). Travels to the server with the
+    /// percentage for the same reason.
     pub coverage_percent: f64,
+    /// Floored at 0 for both methods, even when a measured
+    /// `reduction_percent` is negative.
     pub tokens_saved: u64,
     pub baseline_tokens: u64,
 }
@@ -288,32 +295,42 @@ pub fn estimate() -> LedgerEstimate {
     }
 }
 
-/// The A/B holdout figure alone, never the synthetic control, for when an
-/// addon (Chisle, Caveman, Ponytail) shapes replies too. Its effect lands in
-/// both holdout arms, so the A/B difference is the shaper's share alone; the
-/// synthetic control scores against replies from before the addon and would
-/// book its savings as Headroom's. The "never trade a usable estimate for a
-/// measurement of less traffic" rule in [`measured_if_ready`] is skipped:
-/// that estimate is the one being ruled out. `None` until the holdout is
-/// ready, which shows nothing rather than the inflated number.
-pub fn measured() -> Option<OutputEstimate> {
-    measured_from_bytes(&std::fs::read(ledger_path()?).ok()?)
-}
-
-fn measured_from_bytes(bytes: &[u8]) -> Option<OutputEstimate> {
-    let ledger = serde_json::from_slice::<Ledger>(bytes).ok()?;
-    measured_if_ready(&ledger, &None)
+/// The synthetic-control figure alone, never the holdout: what the sampled
+/// day/hour series and the lifetime output dollars are built on. The holdout
+/// is an all-time figure (a new control reply re-prices every past request in
+/// its stratum), so its deltas mean nothing per day, and output dollars stay
+/// on the estimate until audit #50 is decided.
+pub fn estimated() -> LedgerEstimate {
+    let Some(path) = ledger_path() else {
+        return LedgerEstimate::NoEvidence;
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => estimated_from_bytes(&bytes),
+        Err(_) => LedgerEstimate::NoEvidence,
+    }
 }
 
 fn estimate_from_bytes(bytes: &[u8]) -> LedgerEstimate {
     let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
         return LedgerEstimate::NoEvidence;
     };
-    let estimated = estimate_from_baseline(&ledger);
-    let best = match measured_if_ready(&ledger, &estimated) {
-        Some(measured) => Some(measured),
-        None => estimated,
+    let best = measured_if_ready(&ledger).or_else(|| estimate_from_baseline(&ledger));
+    classify(&ledger, best)
+}
+
+fn estimated_from_bytes(bytes: &[u8]) -> LedgerEstimate {
+    let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
+        return LedgerEstimate::NoEvidence;
     };
+    match estimate_from_baseline(&ledger) {
+        // Scoreable by the holdout alone (control n of 5-9 everywhere): not
+        // Unscored, which would make the tracker discard its sampled buckets.
+        None if measured_if_ready(&ledger).is_some() => LedgerEstimate::NoEvidence,
+        estimated => classify(&ledger, estimated),
+    }
+}
+
+fn classify(ledger: &Ledger, best: Option<OutputEstimate>) -> LedgerEstimate {
     if let Some(best) = best {
         return LedgerEstimate::Scored(best);
     }
@@ -355,7 +372,7 @@ fn estimate_from_baseline(ledger: &Ledger) -> Option<OutputEstimate> {
         baseline_tokens,
         var,
         requests,
-        ledger.shaped(),
+        requests as f64 / ledger.shaped() as f64,
     )
 }
 
@@ -366,6 +383,7 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
     let mut baseline_tokens = 0.0;
     let mut var = 0.0;
     let mut requests = 0u64;
+    let mut covered_output = 0.0;
 
     for (key, t) in &ledger.treatment {
         let Some(c) = ledger.control.get(key) else {
@@ -379,6 +397,7 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         }
         let n = t.qn as f64;
         requests += t.qn;
+        covered_output += t.qsum;
         saved += n * (c.qmean() - t.qmean());
         baseline_tokens += n * c.qmean();
         var += (n * n) * (c.qvar() / c.qn as f64 + t.qvar() / t.qn as f64);
@@ -390,12 +409,12 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         baseline_tokens,
         var,
         requests,
-        ledger.qualified(),
+        covered_output / ledger.qualified_output(),
     )
 }
 
 /// The measured estimate, but only once it is worth showing: it must cover
-/// [`MEASURED_MIN_COVERAGE_PCT`] of the conversation-qualified shaped traffic
+/// [`MEASURED_MIN_COVERAGE_PCT`] of the conversation-qualified shaped output
 /// and carry a band no wider than [`MEASURED_MAX_CI_HALF_WIDTH_PCT`].
 ///
 /// Coverage counts qualified rows only. Rows without a conversation (from
@@ -403,32 +422,21 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
 /// can never enter the measured estimate, so counting them in its
 /// denominator held promotion back by however much history a machine had:
 /// 54k such rows on one machine against a few thousand a day of new ones.
-/// The check below still refuses a measurement of less traffic than the
-/// estimate it would replace, so a holdout only displaces an estimate it
-/// genuinely outgrew.
-fn measured_if_ready(
-    ledger: &Ledger,
-    estimated: &Option<OutputEstimate>,
-) -> Option<OutputEstimate> {
+///
+/// A ready holdout wins even where the synthetic control covers more traffic.
+/// That control scores against a baseline frozen before install, which ran
+/// 20-65% above the concurrent control arm in the same stratum (model and
+/// workload drift); a rule refusing "a measurement of less traffic" kept that
+/// biased figure up on every machine, since it covers ~90% of qualified
+/// traffic and a holdout at 3% never will. It also made a reply addon's users
+/// (Chisle, Caveman, Ponytail) the only ones who could see the holdout.
+fn measured_if_ready(ledger: &Ledger) -> Option<OutputEstimate> {
     let measured = estimate_from_holdout(ledger)?;
     if measured.coverage_percent < MEASURED_MIN_COVERAGE_PCT {
         return None;
     }
     let half_width = (measured.ci_high_percent - measured.ci_low_percent) / 2.0;
     if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT {
-        return None;
-    }
-    // Never trade a usable estimate for a measurement of less traffic. Both
-    // sides on the qn basis: `measured.requests` counts only conversation-
-    // qualified rows, so comparing it to the estimate's `n` let one legacy
-    // row block promotion for good.
-    let estimated_qn: u64 = ledger
-        .treatment
-        .iter()
-        .filter(|(key, _)| ledger.baseline_for(key).is_some())
-        .map(|(_, acc)| acc.qn)
-        .sum();
-    if estimated.is_some() && estimated_qn > measured.requests {
         return None;
     }
     Some(measured)
@@ -439,11 +447,16 @@ fn measured_if_ready(
 /// a >100% blowup from a near-zero one — the dashboard once rendered such a
 /// blowup as "Output --6,130.7%").
 ///
-/// A NEGATIVE result floors to 0% instead of returning `None`. "No reduction"
-/// is an answer, not an error: discarding it meant a holdout measuring ~0
-/// could never replace the estimate, and a `None` here demotes a scoreable
+/// A NEGATIVE estimated result floors to 0% instead of returning `None`. "No
+/// reduction" is an answer, not an error: a `None` here demotes a scoreable
 /// ledger to [`LedgerEstimate::Unscored`], hiding a tile whose honest value is
-/// zero. The CI is left unclamped so the gate in [`measured_if_ready`] still
+/// zero. Below zero it is not an answer: the frozen baseline reads a morning
+/// of long replies as the shaper lengthening them.
+///
+/// A negative MEASURED result is kept: both arms ran over the same weeks and
+/// workload, so replies longer than the control group's are the finding, and
+/// the tile shows it (2026-10-12: -8.5% on 24k requests, which a floor showed
+/// as "0%"). The CI is never clamped, so the gate in [`measured_if_ready`]
 /// sees the real band.
 fn finalize(
     method: &'static str,
@@ -451,9 +464,13 @@ fn finalize(
     baseline_tokens: f64,
     var: f64,
     requests: u64,
-    shaped: u64,
+    coverage: f64,
 ) -> Option<OutputEstimate> {
-    if requests == 0 || shaped == 0 || baseline_tokens <= 0.0 || !baseline_tokens.is_finite() {
+    if requests == 0
+        || !coverage.is_finite()
+        || baseline_tokens <= 0.0
+        || !baseline_tokens.is_finite()
+    {
         return None;
     }
     let pct = saved / baseline_tokens * 100.0;
@@ -463,11 +480,15 @@ fn finalize(
     let se = var.max(0.0).sqrt();
     Some(OutputEstimate {
         method,
-        reduction_percent: pct.max(0.0),
+        reduction_percent: if method == "measured" {
+            pct
+        } else {
+            pct.max(0.0)
+        },
         ci_low_percent: (saved - 1.96 * se) / baseline_tokens * 100.0,
         ci_high_percent: (saved + 1.96 * se) / baseline_tokens * 100.0,
         requests,
-        coverage_percent: requests as f64 / shaped as f64 * 100.0,
+        coverage_percent: coverage * 100.0,
         tokens_saved: saved.max(0.0).round() as u64,
         baseline_tokens: baseline_tokens.round() as u64,
     })
@@ -598,9 +619,9 @@ mod tests {
         // A ledger upgraded from before wheel 0.38.0, or requalified for the
         // holdout key, keeps treatment rows with no conversation: they count
         // in n, never in qn. Here they are 10x the qualified rows. The
-        // measured side is on the qn basis, so both its coverage gate and the
-        // "never trade for less traffic" check have to be too, or it cannot
-        // promote until new traffic outweighs all of that history.
+        // measured side is on the qn basis, so its coverage gate has to be
+        // too, or it cannot promote until new traffic outweighs all of that
+        // history.
         let e = estimate(&HOLDOUT.replace(
             r#"{"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
             r#"{"n": 11000, "sum": 8800000, "sumsq": 7049990000,"#,
@@ -742,26 +763,44 @@ mod tests {
     }
 
     #[test]
-    fn a_solid_holdout_measuring_no_reduction_still_takes_over() {
-        // Control replies come out SHORTER than treatment: the true effect is
-        // ~zero-or-negative. Once the holdout is solid (full coverage, tight
-        // band) that honest zero must replace the synthetic estimate -- the
-        // old [0,100] validity check discarded it, so a shaper that saved
-        // nothing kept its estimated percentage forever.
+    fn a_solid_holdout_measuring_longer_replies_reports_the_negative() {
+        // Control replies come out SHORTER than treatment (700 vs 800). Once
+        // the holdout is solid that finding replaces the synthetic estimate,
+        // sign and all: floored, it read "Output 0%" for a shaper that made
+        // replies 14% longer.
         let e = estimate(&with_control(
             r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 70000, "sumsq": 49010000,
                                                "qn": 100, "qsum": 70000, "qsumsq": 49010000,
                                                "clusters": ["c1", "c2", "c3", "c4", "c5"]}}"#,
         ));
         assert_eq!(e.method, "measured");
-        assert_eq!(e.reduction_percent, 0.0);
+        assert!((e.reduction_percent + 14.285_714).abs() < 1e-5);
+        assert_eq!(e.tokens_saved, 0);
         assert!(e.ci_high_percent < 0.0, "band stays unclamped for the gate");
     }
 
     #[test]
-    fn measured_only_ignores_the_estimate_a_reply_addon_inflates() {
+    fn holdout_coverage_counts_output_tokens_not_requests() {
+        // 2,000 helper calls of 20 tokens with no control: two thirds of the
+        // requests, 5% of the output. By requests the solid holdout covers
+        // 33% and never promotes; by output it covers 95%.
+        let json = HOLDOUT.replace(
+            r#""treatment": {"#,
+            r#""treatment": {"sonnet|ask|xs|notools": {"n": 2000, "sum": 40000, "sumsq": 800000,
+                                                      "qn": 2000, "qsum": 40000, "qsumsq": 800000,
+                                                      "clusters": ["s1", "s2", "s3", "s4", "s5"]},"#,
+        );
+        let e = estimate(&json);
+        assert_eq!(e.method, "measured");
+        assert_eq!(e.requests, 1000);
+        assert!((e.coverage_percent - 95.238_095).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_solid_holdout_wins_over_an_estimate_covering_more_traffic() {
         // A solid holdout on `l`, plus an `xl` stratum the baseline scores but
-        // the holdout cannot: the estimate covers more traffic, so it wins.
+        // the holdout cannot. The estimate covers more traffic, against a
+        // baseline frozen before install; the holdout is the honest one.
         let json = HOLDOUT
             .replace(
                 r#""treatment": {"#,
@@ -773,14 +812,18 @@ mod tests {
                 r#""strata": {"#,
                 r#""strata": {"opus|ask|xl|tools": {"n": 100, "sum": 120000, "sumsq": 144990000},"#,
             );
-        assert_eq!(estimate(&json).method, "estimated");
-
-        let m = measured_from_bytes(json.as_bytes()).expect("holdout is solid");
+        let m = estimate(&json);
         assert_eq!(m.method, "measured");
         assert_eq!(m.requests, 1000);
         assert!((m.reduction_percent - 20.0).abs() < 1e-9);
+        // 800k of 1.3M qualified output tokens.
+        assert!((m.coverage_percent - 61.538_461).abs() < 1e-5);
 
-        // No holdout at all: nothing, never the estimate.
-        assert_eq!(measured_from_bytes(MIXED.as_bytes()), None);
+        // The sampled series and the dollars stay on the synthetic control.
+        let e = estimated_from_bytes(json.as_bytes())
+            .scored()
+            .expect("estimate");
+        assert_eq!(e.method, "estimated");
+        assert_eq!(e.requests, 1500);
     }
 }

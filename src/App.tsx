@@ -860,9 +860,17 @@ function WindowRateChip({
 
 // How much of this machine's shaped traffic an output figure speaks for --
 // the chip's confidence row, shown however thin, so a low number reads as low.
+// The holdout's coverage is by output tokens (output_savings.rs).
 function outputCoverageRows(reduction: OutputReduction | null) {
   return reduction?.coveragePercent != null
-    ? [{ dt: "Covers", dd: `${Math.round(reduction.coveragePercent)}% of replies` }]
+    ? [
+        {
+          dt: "Covers",
+          dd: `${Math.round(reduction.coveragePercent)}% of ${
+            reduction.method === "measured" ? "reply tokens" : "replies"
+          }`
+        }
+      ]
     : [];
 }
 
@@ -881,6 +889,9 @@ function OutputReductionChip({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
+  // Only a measured figure can be negative: shaped replies came out longer
+  // than the control group's.
+  const longer = reduction.reductionPercent < 0;
 
   useEffect(() => {
     if (!open) return;
@@ -912,7 +923,8 @@ function OutputReductionChip({
         onKeyDown={(e) => e.stopPropagation()}
       >
         <span className="output-chip__dot" aria-hidden="true" />
-        Output −{percent1(reduction.reductionPercent)}%
+        Output {longer ? "+" : "−"}
+        {percent1(Math.abs(reduction.reductionPercent))}%
       </button>
       {open ? (
         <div
@@ -923,7 +935,7 @@ function OutputReductionChip({
         >
           <div className="output-chip__pop-head">
             <span className="output-chip__pop-title">
-              Output token reduction{allTimeFallback ? " · all-time" : ""}
+              Output token reduction · all-time
             </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
@@ -932,7 +944,7 @@ function OutputReductionChip({
             <div>
               <dt>95% CI</dt>
               <dd>
-                {percent1(reduction.ciLowPercent)}–{percent1(reduction.ciHighPercent)}%
+                {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
               </dd>
             </div>
             <div>
@@ -948,7 +960,11 @@ function OutputReductionChip({
           </dl>
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
-            {isMeasured && reduction.alongsideAddon
+            {longer
+              ? `Shaped replies came out longer than those of a control group of unshaped conversations, so Headroom saved no output tokens.${
+                  reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : ""
+                }`
+              : isMeasured && reduction.alongsideAddon
               ? `Output tokens the model skipped because Headroom asked for shorter replies or less effort, on top of what ${reduction.alongsideAddon} saves. Measured against a control group of conversations Headroom leaves unshaped; ${reduction.alongsideAddon} runs in both.`
               : isMeasured
               ? "Output tokens the model skipped because Headroom asked for shorter replies or less effort, measured against a control group of unshaped conversations."
@@ -1224,7 +1240,10 @@ function DailySavingsChart({
                     note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
-                {windowOutput !== null ? (
+                {/* A measured figure is all-time only and outranks the per-window
+                    estimate: the estimate is scored against the baseline the
+                    control group just contradicted. */}
+                {windowOutput !== null && outputReduction?.method !== "measured" ? (
                   <WindowRateChip
                     dot="output"
                     popSide="left"
@@ -1247,7 +1266,11 @@ function DailySavingsChart({
                     }`}
                   />
                 ) : outputReduction ? (
-                  <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
+                  <OutputReductionChip
+                    allTimeFallback={windowOutput === null}
+                    flip
+                    reduction={outputReduction}
+                  />
                 ) : roughOutputTokens > 0 ? (
                   <WindowRateChip
                     dot="output"
@@ -8676,10 +8699,13 @@ export default function App() {
                             the baseline never observed are excluded rather
                             than scored against a global mean. */}
                         <p className="savings-breakdown__note">
+                          {/* The dollars stay on the estimate when the
+                              holdout promotes (state.rs, audit #50), so
+                              this note must not call them measured. */}
                           {dashboard.outputReduction?.method === "measured"
-                            ? `Measured: a small share of conversations run unshaped as a control group, compared with your other replies over ${compactNumber(dashboard.outputReduction.requests)} requests.${
+                            ? `Estimated against a baseline learned from your past replies. Measured against a control group of unshaped conversations over ${compactNumber(dashboard.outputReduction.requests)} requests, the reduction is ${percent1(dashboard.outputReduction.reductionPercent)}%.${
                                 dashboard.outputReduction.alongsideAddon
-                                  ? ` ${dashboard.outputReduction.alongsideAddon} runs in both groups, so this is Headroom's shaping on top of it.`
+                                  ? ` ${dashboard.outputReduction.alongsideAddon} runs in both groups.`
                                   : ""
                               }`
                             : `Estimated: each reply is compared with a baseline learned from your past replies${
