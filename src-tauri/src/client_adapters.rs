@@ -1241,26 +1241,42 @@ pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desk
 /// True when the transcript was written by Claude Code inside the Claude
 /// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
 /// `claude-desktop-3p`) on its lines; the CLI says `cli`, the IDE extension
-/// `claude-vscode`. The first stamped line sits within the first few.
-// ponytail: reads the session's FIRST surface; a CLI session later resumed in
-// the desktop app still reads as CLI and keeps the generic advice.
+/// `claude-vscode`. The newest stamp decides: a resumed session appends to the
+/// same file even from another surface (an app session continued with
+/// `claude -c` in a terminal is a CLI session now).
 fn claude_transcript_is_desktop(path: &Path) -> bool {
-    use std::io::{BufRead, Read};
-    let Ok(file) = std::fs::File::open(path) else {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    const TAIL: u64 = 1 << 20;
+    let stamp = |line: &str| {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .get("entrypoint")?
+            .as_str()
+            .map(|entrypoint| entrypoint.starts_with("claude-desktop"))
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    // Lines can carry whole tool results or pasted images; cap the read.
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_ok()
+        && file.by_ref().take(TAIL).read_to_end(&mut tail).is_ok()
+    {
+        // The first tail line may be cut mid-way; it just fails to parse.
+        if let Some(desktop) = String::from_utf8_lossy(&tail).lines().rev().find_map(stamp) {
+            return desktop;
+        }
+    }
+    // Lines can carry whole tool results or pasted images, so the tail may
+    // hold no whole stamped line; the first one sits within the first few.
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
     std::io::BufReader::new(file.take(4 << 20))
         .lines()
         .take(32)
         .map_while(Result::ok)
-        .find_map(|line| {
-            serde_json::from_str::<Value>(&line)
-                .ok()?
-                .get("entrypoint")?
-                .as_str()
-                .map(|entrypoint| entrypoint.starts_with("claude-desktop"))
-        })
+        .find_map(|line| stamp(&line))
         .unwrap_or(false)
 }
 
@@ -17451,6 +17467,17 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
         fs::write(project.join("b.jsonl"), "not json\n").unwrap();
         assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::remove_file(project.join("b.jsonl")).unwrap();
+        // A resumed session appends to its file: the newest surface decides.
+        let resumed_in_cli = format!("{desktop}{cli}{{\"type\":\"last-prompt\"}}\n");
+        fs::write(project.join("a.jsonl"), resumed_in_cli).unwrap();
+        assert!(!super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        fs::write(project.join("a.jsonl"), format!("{cli}{desktop}")).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
+        // A tail of one huge unstamped line falls back to the head stamp.
+        let big = format!("{desktop}{{\"t\":\"{}\"}}\n", "x".repeat(1 << 21));
+        fs::write(project.join("a.jsonl"), big).unwrap();
+        assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
     }
 
     #[test]
