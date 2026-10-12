@@ -111,6 +111,12 @@ const MAIN_WINDOW_HEIGHT: u32 = 560;
 /// off 100vh, so the same wider-font/narrower-viewport reflow overflows them.
 #[cfg(not(target_os = "macos"))]
 const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
+/// The dashboard's logical size there, also its minimum once resizable.
+#[cfg(not(target_os = "macos"))]
+const MAIN_WINDOW_DEFAULT_SIZE: (f64, f64) = (
+    MAIN_WINDOW_WIDTH as f64,
+    (MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT) as f64,
+);
 /// Mirrors the `launcher` entry in tauri.conf.json.
 #[cfg(not(target_os = "macos"))]
 const LAUNCHER_WINDOW_WIDTH: u32 = 760;
@@ -7816,14 +7822,21 @@ pub fn run() {
             // The launcher needs the same treatment: it is fixed-size too, and
             // the wider system font wrapping its headline to three lines pushed
             // the install screen into `.intro-shell`'s scroll fallback.
+            // The dashboard is also resizable there (issue #153), never below
+            // this frame, and reopens at the size the user left it.
             #[cfg(not(target_os = "macos"))]
             {
                 use tauri::LogicalSize;
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_size(LogicalSize::new(
-                        MAIN_WINDOW_WIDTH,
-                        MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
-                    ));
+                    let placement = load_main_window_placement();
+                    let (width, height) = placement.size.unwrap_or(MAIN_WINDOW_DEFAULT_SIZE);
+                    let _ = window.set_min_size(Some(LogicalSize::new(
+                        MAIN_WINDOW_DEFAULT_SIZE.0,
+                        MAIN_WINDOW_DEFAULT_SIZE.1,
+                    )));
+                    let _ = window.set_resizable(true);
+                    let _ = window.set_size(LogicalSize::new(width, height));
+                    *MAIN_WINDOW_PLACEMENT.lock() = placement;
                 }
                 if let Some(window) = app.get_webview_window("launcher") {
                     let _ = window.set_size(LogicalSize::new(
@@ -8184,6 +8197,7 @@ pub fn run() {
             open_external_link,
             submit_contact_request,
             hide_launcher_animated,
+            start_main_window_drag,
             complete_setup_wizard,
             accept_terms,
             get_autostart_enabled,
@@ -11481,6 +11495,10 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
+            #[cfg(not(target_os = "macos"))]
+            if window.label() == "main" {
+                record_main_window_placement(window);
+            }
             // An update install steals focus with a privilege prompt; hiding
             // underneath it strands the user mid-flow.
             if INSTALLING_UPDATE.load(Ordering::Acquire) {
@@ -11743,7 +11761,9 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         return Err(tauri::Error::WebviewNotFound);
     };
 
-    if let Some(rect) = anchor_rect {
+    if let Some(position) = user_placed_main_window_position(&window) {
+        window.set_position(Position::Physical(position))?;
+    } else if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
     } else {
         #[cfg(target_os = "linux")]
@@ -11804,6 +11824,119 @@ fn hide_launcher_window(app: &AppHandle) -> tauri::Result<()> {
         window.hide()?;
     }
     Ok(())
+}
+
+/// Where the user put the dashboard on Windows and Linux, which had no way to
+/// move or resize it (issue #153). macOS keeps the menu-bar popover: anchored
+/// under the status item on every open, fixed size, never recorded here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct MainWindowPlacement {
+    /// Physical outer position, set by the first sidebar drag. While None
+    /// every open anchors to the tray icon.
+    position: Option<(i32, i32)>,
+    /// Logical inner size, None at the default size.
+    size: Option<(f64, f64)>,
+}
+
+static MAIN_WINDOW_PLACEMENT: Mutex<MainWindowPlacement> = Mutex::new(MainWindowPlacement {
+    position: None,
+    size: None,
+});
+/// Outer position when the user grabbed the sidebar, so a click that never
+/// moved the window does not pin it away from the tray.
+static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
+
+#[tauri::command]
+async fn start_main_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    *MAIN_WINDOW_DRAG_ORIGIN.lock() = window.outer_position().ok();
+    window.start_dragging().map_err(|err| err.to_string())
+}
+
+/// The saved position, while its top-left corner (the logo the user drags it
+/// by) is on a connected monitor. An unplugged display falls back to the tray.
+fn user_placed_main_window_position(
+    window: &tauri::WebviewWindow,
+) -> Option<PhysicalPosition<i32>> {
+    let (x, y) = MAIN_WINDOW_PLACEMENT.lock().position?;
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .map(monitor_bounds_from_monitor)
+        .any(|bounds| point_within_monitor(bounds, x.saturating_add(40), y.saturating_add(40)))
+        .then(|| PhysicalPosition::new(x, y))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main_window_placement_path() -> std::path::PathBuf {
+    storage::config_file(&storage::app_data_dir(), "window-placement.json")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_main_window_placement() -> MainWindowPlacement {
+    let path = main_window_placement_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return MainWindowPlacement::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        log::warn!("window placement: unreadable, using the default: {err}");
+        let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
+        MainWindowPlacement::default()
+    })
+}
+
+/// Runs as the dashboard loses focus, which precedes every hide.
+#[cfg(not(target_os = "macos"))]
+fn record_main_window_placement(window: &Window) {
+    if window.is_minimized().unwrap_or(false) {
+        return;
+    }
+    let (Ok(position), Ok(size), Ok(scale)) = (
+        window.outer_position(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
+        return;
+    };
+    let size = size.to_logical::<f64>(scale);
+    let drag_origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
+    let mut placement = MAIN_WINDOW_PLACEMENT.lock();
+    let next = next_main_window_placement(
+        *placement,
+        drag_origin,
+        position,
+        (size.width, size.height),
+        MAIN_WINDOW_DEFAULT_SIZE,
+    );
+    if next == *placement {
+        return;
+    }
+    *placement = next;
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        if let Err(err) = client_adapters::atomic_write(&main_window_placement_path(), &bytes) {
+            log::warn!("window placement: saving failed: {err}");
+        }
+    }
+}
+
+/// Once placed, the window's position is wherever it is now (a later drag,
+/// or a resize from its left or top edge); before that only a drag that
+/// actually moved it places it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn next_main_window_placement(
+    previous: MainWindowPlacement,
+    drag_origin: Option<PhysicalPosition<i32>>,
+    position: PhysicalPosition<i32>,
+    size: (f64, f64),
+    default_size: (f64, f64),
+) -> MainWindowPlacement {
+    let moved = drag_origin.is_some_and(|origin| origin != position);
+    let size = (size.0.round(), size.1.round());
+    MainWindowPlacement {
+        position: (previous.position.is_some() || moved).then_some((position.x, position.y)),
+        size: (size != default_size).then_some(size),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13415,6 +13548,38 @@ mod tests {
 
         assert_eq!(target.x, 0);
         assert_eq!(target.y, 10);
+    }
+
+    #[test]
+    fn only_a_drag_that_moved_the_dashboard_unpins_it_from_the_tray() {
+        use super::{next_main_window_placement, MainWindowPlacement, PhysicalPosition};
+        let at = |x, y| PhysicalPosition::new(x, y);
+        let default_size = (760.0, 632.0);
+        let place = |previous, origin, position, size| {
+            next_main_window_placement(previous, origin, position, size, default_size)
+        };
+        let anchored = MainWindowPlacement::default();
+
+        // A click on the sidebar that never moved it, or plain focus loss.
+        assert_eq!(
+            place(anchored, Some(at(5, 5)), at(5, 5), default_size),
+            anchored
+        );
+        assert_eq!(place(anchored, None, at(9, 9), default_size), anchored);
+
+        // A real drag, then a resize from the left edge without one.
+        let dragged = place(anchored, Some(at(5, 5)), at(300, 200), default_size);
+        assert_eq!(dragged.position, Some((300, 200)));
+        assert_eq!(dragged.size, None);
+        let resized = place(dragged, None, at(250, 200), (810.2, 700.0));
+        assert_eq!(resized.position, Some((250, 200)));
+        assert_eq!(resized.size, Some((810.0, 700.0)));
+
+        // Every field is optional, so an older or newer file still loads.
+        let parsed: MainWindowPlacement =
+            serde_json::from_str(r#"{"size":[900.0,700.0],"later":1}"#).unwrap();
+        assert_eq!(parsed.position, None);
+        assert_eq!(parsed.size, Some((900.0, 700.0)));
     }
 
     #[test]
