@@ -114,7 +114,7 @@ impl McpInstallMethod {
 }
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
-/// `is_local_proxy_reachable`'s connect timeout. Windows retries the SYN on a
+/// `connect_local_proxy`'s connect timeout. Windows retries the SYN on a
 /// refused loopback connect, so there every startup poll waits this out too.
 const LOCAL_PROXY_PROBE_TIMEOUT_MS: u64 = 180;
 /// When the Windows startup loop gives up: it counts polls, not time, and each
@@ -6056,14 +6056,18 @@ impl ToolManager {
 
                 let mut startup_ok = false;
                 let mut reason: Option<String> = None;
+                let mut last_connect_err: Option<std::io::Error> = None;
 
                 let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
                 for _ in 0..startup_polls {
                     thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
                     stop_if_shutting_down(&mut child, &crate::SHUTTING_DOWN)?;
-                    if is_local_proxy_reachable() {
-                        startup_ok = true;
-                        break;
+                    match connect_local_proxy() {
+                        Ok(()) => {
+                            startup_ok = true;
+                            break;
+                        }
+                        Err(err) => last_connect_err = Some(err),
                     }
 
                     match child.try_wait() {
@@ -6109,11 +6113,16 @@ impl ToolManager {
                 let _ = child.kill();
                 let _ = child.wait();
 
+                // The last connect error tells a backend that never bound
+                // ("refused") from a host whose own connects fail: RUST-Q0's
+                // backend was serving while the Mac ran out of ephemeral ports
+                // ("Can't assign requested address", os error 49).
                 let reason = reason.unwrap_or_else(|| {
                     format!(
-                        "never opened port {} within {}ms",
+                        "never opened port {} within {}ms (last connect: {})",
                         headroom_proxy_port(),
-                        HEADROOM_STARTUP_TIMEOUT_MS
+                        HEADROOM_STARTUP_TIMEOUT_MS,
+                        last_connect_err.map_or_else(|| "none".to_string(), |err| err.to_string())
                     )
                 });
                 failures.push(HeadroomStartupFailure {
@@ -11752,7 +11761,7 @@ fn update_claude_json_at(
     unreachable!("loop always returns")
 }
 
-fn is_local_proxy_reachable() -> bool {
+fn connect_local_proxy() -> std::io::Result<()> {
     // Check headroom's actual backend port, not the intercept port (6767),
     // because the intercept starts before headroom and would always be reachable.
     let address: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
@@ -11760,7 +11769,7 @@ fn is_local_proxy_reachable() -> bool {
         &address,
         Duration::from_millis(LOCAL_PROXY_PROBE_TIMEOUT_MS),
     )
-    .is_ok()
+    .map(drop)
 }
 
 enum PortState {
