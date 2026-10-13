@@ -57,9 +57,11 @@ const PACKAGE_INSTALL_COPY =
 // code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
 // RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
 // "error decoding response body" = the body stopped arriving mid-transfer),
-// and github.com answering that download with a 5xx (RUST-MQ: a 503).
+// and github.com answering that download with a 5xx (RUST-MQ: a 503). A status
+// past 599 is no HTTP status at all, so a proxy or filter on the user's network
+// answered instead of github.com (RUST-Q1: "618 <unknown status code>").
 const TRANSPORT_FAILURE =
-  /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON|failed with status: 5\d\d/i;
+  /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON|failed with status: [5-9]\d\d/i;
 
 // Releases are quiet by default: no dialog, no notification, and (on macOS
 // and a Linux AppImage) a silent background install that only asks for a
