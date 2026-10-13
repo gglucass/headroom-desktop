@@ -890,7 +890,9 @@ function OutputReductionChip({
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
   // Only a measured figure can be negative: shaped replies came out longer
-  // than the control group's.
+  // than the control group's. Shown as 0% with no CI: a 3% holdout is not
+  // yet a measurement to put a "+10%" in front of a user on. The true figure
+  // still reaches the server (`reported_output_reduction`).
   const longer = reduction.reductionPercent < 0;
 
   useEffect(() => {
@@ -923,8 +925,7 @@ function OutputReductionChip({
         onKeyDown={(e) => e.stopPropagation()}
       >
         <span className="output-chip__dot" aria-hidden="true" />
-        Output {longer ? "+" : "−"}
-        {percent1(Math.abs(reduction.reductionPercent))}%
+        Output {longer ? "0" : `−${percent1(reduction.reductionPercent)}`}%
       </button>
       {open ? (
         <div
@@ -939,14 +940,18 @@ function OutputReductionChip({
             </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
-          <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
+          <div className="output-chip__pop-value">
+            {longer ? "0" : percent1(reduction.reductionPercent)}%
+          </div>
           <dl className="output-chip__pop-stats">
-            <div>
-              <dt>95% CI</dt>
-              <dd>
-                {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
-              </dd>
-            </div>
+            {longer ? null : (
+              <div>
+                <dt>95% CI</dt>
+                <dd>
+                  {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
+                </dd>
+              </div>
+            )}
             <div>
               <dt>Requests</dt>
               <dd>{compactNumber(reduction.requests)}</dd>
@@ -961,7 +966,7 @@ function OutputReductionChip({
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
             {longer
-              ? `Shaped replies came out longer than those of a control group of unshaped conversations, so Headroom saved no output tokens.${
+              ? `No measured reduction yet: shaped replies were no shorter than those of a control group of unshaped conversations, so Headroom claims no output savings.${
                   reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : ""
                 }`
               : isMeasured && reduction.alongsideAddon

@@ -455,9 +455,9 @@ fn measured_if_ready(ledger: &Ledger) -> Option<OutputEstimate> {
 ///
 /// A negative MEASURED result is kept: both arms ran over the same weeks and
 /// workload, so replies longer than the control group's are the finding, and
-/// the tile shows it (2026-10-12: -8.5% on 24k requests, which a floor showed
-/// as "0%"). The CI is never clamped, so the gate in [`measured_if_ready`]
-/// sees the real band.
+/// the server gets it (2026-10-12: -8.5% on 24k requests). The dashboard chip
+/// shows it as 0% with no CI (`OutputReductionChip`). The CI is never
+/// clamped, so the gate in [`measured_if_ready`] sees the real band.
 fn finalize(
     method: &'static str,
     saved: f64,
