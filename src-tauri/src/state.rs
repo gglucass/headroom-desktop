@@ -10184,17 +10184,34 @@ fn kill_processes_by_command_pattern(
 
     #[cfg(target_os = "windows")]
     {
-        // No snapshot runs the sweep as before.
-        if let Some(processes) = crate::winproc::process_parents() {
-            if !windows_sweep_has_candidates(
-                &processes,
-                &windows_sweep_image_dirs(exe),
-                std::process::id(),
-                parents,
-                crate::winproc::process_image_path,
-            ) {
-                return Ok(());
+        // No snapshot runs the sweep as before. A candidate gets ~1s to go:
+        // stop_headroom's tree kill returns once the launcher exits, while the
+        // venv and base python under it are still running down, so they sat in
+        // the snapshot with a dead parent and every quit paid PowerShell's
+        // start, and on a slow AV host its 20s timeout (RUST-K3, still ~2 a day
+        // on 0.9.39 after the native prefilter).
+        let image_dirs = windows_sweep_image_dirs(exe);
+        let has_candidates = || {
+            crate::winproc::process_parents().map(|processes| {
+                windows_sweep_has_candidates(
+                    &processes,
+                    &image_dirs,
+                    std::process::id(),
+                    parents,
+                    crate::winproc::process_image_path,
+                )
+            })
+        };
+        let mut pending = has_candidates();
+        for _ in 0..4 {
+            if pending != Some(true) {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(250));
+            pending = has_candidates();
+        }
+        if pending == Some(false) {
+            return Ok(());
         }
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
         let mut command = crate::proc::command("powershell");
