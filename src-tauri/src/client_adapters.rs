@@ -846,8 +846,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             } else if codex_guard_registered_any_interpreter()? {
                 checks.push(CODEX_GUARD_STALE_COMMAND.into());
             } else {
-                failures
-                    .push("Headroom routing guard was not found in ~/.codex/hooks.json.".into());
+                failures.push(CODEX_GUARD_NOT_FOUND.into());
             }
 
             // Independent confirmation from Codex itself, run off-thread: the
@@ -1075,9 +1074,14 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// (2026-09-27..10-10), each once but one 6 days apart. Six were Windows
 /// hosts leaving the pre-0.9.25 `%APPDATA%` config, the rest one edit to
 /// opencode.json(c) that a single re-apply fixed for good.
+///
+/// And Codex's guard alone (RUST-KA): hooks.json is a file the user and
+/// Codex's own /hooks edit, separate from the config.toml block. 5 repairs on
+/// 4 hosts (2026-09-29..10-12); only one host lost it again, 1.7h later.
 fn repair_pages(silent_failures: &[String]) -> bool {
     let marker = match silent_failures {
         [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
+        [only] if only == CODEX_GUARD_NOT_FOUND => "codex-guard-lost",
         [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
         _ => return true,
     };
@@ -7368,6 +7372,7 @@ fn codex_guard_registered_any_interpreter() -> Result<bool> {
     )
 }
 
+const CODEX_GUARD_NOT_FOUND: &str = "Headroom routing guard was not found in ~/.codex/hooks.json.";
 const CODEX_GUARD_SCRIPT_MISSING: &str =
     "Headroom routing guard script was missing from ~/.codex/hooks.";
 const CODEX_GUARD_STALE_COMMAND: &str =
@@ -15441,6 +15446,33 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             super::opencode_provider_block_matches().unwrap(),
             "block back"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_lone_codex_guard_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-KA: the guard entry gone from hooks.json with config.toml
+        // intact is an outside edit the repair undoes.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let script = super::codex_guard_hook_path().display().to_string();
+        super::remove_guard_hook_entries(&super::codex_hooks_json_path(), &script, true, None)
+            .unwrap();
+
+        let lost = super::verify_client_setup("codex")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::CODEX_GUARD_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+        let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];
+        assert!(
+            !super::repair_pages(&claude),
+            "each cause keeps its own marker"
+        );
+        assert!(super::repair_client_setup_now("codex_cli"), "repaired");
+        assert!(super::codex_guard_registered().unwrap(), "guard back");
     }
 
     #[test]
