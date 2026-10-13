@@ -1250,33 +1250,12 @@ function DailySavingsChart({
                     note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
-                {/* Once the holdout is solid it outranks the per-window
-                    estimate, which is scored against the baseline the control
-                    group just contradicted: the period's own A/B figure where
-                    it was sampled, else the all-time one. */}
-                {windowOutputAb !== null && outputReduction?.method === "measured" ? (
-                  <WindowRateChip
-                    dot="output"
-                    popSide="left"
-                    label={`Output ${Math.round(windowOutputAb.pct) > 0 ? "−" : ""}${Math.round(windowOutputAb.pct)}%`}
-                    title="Output token reduction"
-                    badge="measured"
-                    value={`${Math.round(windowOutputAb.pct)}%`}
-                    rows={[
-                      { dt: "Avoided", dd: compactNumber(windowOutputAb.savedTokens) },
-                      { dt: "Control baseline", dd: compactNumber(windowOutputAb.baselineTokens) },
-                      {
-                        dt: "All-time",
-                        dd: `${percent1(Math.max(0, outputReduction.reductionPercent))}%`
-                      }
-                    ]}
-                    note={`This period's shaped replies against the average reply of the same kind in a control group of conversations Headroom leaves unshaped; 0% when they were no shorter.${
-                      outputReduction.alongsideAddon
-                        ? ` ${outputReduction.alongsideAddon} runs in both groups.`
-                        : ""
-                    }`}
-                  />
-                ) : windowOutput !== null && outputReduction?.method !== "measured" ? (
+                {/* The per-period estimate is the chip wherever the period has
+                    samples, measured holdout or not: it is the only output
+                    series with history, and the control group (all-time, or
+                    this period's since 0.9.40) rides along in its popover,
+                    floored at 0. */}
+                {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
                     popSide="left"
@@ -1287,12 +1266,24 @@ function DailySavingsChart({
                     rows={[
                       { dt: "Avoided", dd: compactNumber(windowOutput.savedTokens) },
                       { dt: "Baseline", dd: compactNumber(windowOutput.baselineTokens) },
-                      ...(outputReduction
-                        ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
+                      ...(windowOutputAb !== null && outputReduction?.method === "measured"
+                        ? [{ dt: "Control, period", dd: `${Math.round(windowOutputAb.pct)}%` }]
                         : []),
-                      ...outputCoverageRows(outputReduction)
+                      ...(outputReduction
+                        ? [
+                            {
+                              dt: outputReduction.method === "measured" ? "Control, all-time" : "All-time",
+                              dd: `${percent1(Math.max(0, outputReduction.reductionPercent))}%`
+                            }
+                          ]
+                        : []),
+                      ...(outputReduction?.method === "measured" ? [] : outputCoverageRows(outputReduction))
                     ]}
                     note={`Estimate vs the shaper's learned baseline, sampled while the app runs.${
+                      outputReduction?.method === "measured"
+                        ? " The control-group rows compare with conversations Headroom leaves unshaped, 0% where shaped replies were no shorter."
+                        : ""
+                    }${
                       outputReduction?.alongsideAddon
                         ? ` Includes what ${outputReduction.alongsideAddon} saves.`
                         : ""
