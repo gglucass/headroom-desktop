@@ -877,6 +877,7 @@ impl AppState {
                 log::warn!("markitdown hook refresh failed during warm_runtime_on_launch: {err:#}");
             }
         }
+        self.tool_manager.ensure_codex_skill_nudges();
 
         // Heals installs already in the field: older installs and pre-fix venv
         // swaps never vendored the MSVC runtime DLLs, so on a redist-less

@@ -4281,6 +4281,11 @@ static PLUGIN_ADDONS: [PluginAddon; 3] = [
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
+/// Plugin addons whose Codex build needs `client_adapters::set_codex_skill_nudge`
+/// to run every session, with the skill name Codex knows them by. Ponytail's
+/// Codex build ships its own session hooks.
+const CODEX_SKILL_NUDGES: [(&str, &str); 2] =
+    [("chisle", "chisle:chisle"), ("caveman", "caveman:caveman")];
 
 fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
@@ -10801,6 +10806,7 @@ impl ToolManager {
                 log::warn!("chisle: scoping its tool-output compression failed: {err:#}");
             }
         }
+        self.ensure_codex_skill_nudges();
         // At most one: with two hosts, the other one installed.
         Ok(outdated.pop())
     }
@@ -10883,6 +10889,7 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
+        self.ensure_codex_skill_nudges();
         Ok(())
     }
 
@@ -10908,7 +10915,24 @@ impl ToolManager {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
+        self.ensure_codex_skill_nudges();
         Ok(())
+    }
+
+    /// Writes or removes each `CODEX_SKILL_NUDGES` block to match what
+    /// Headroom installed into Codex and left enabled. Runs after every
+    /// install, toggle and uninstall, and at launch for earlier installs.
+    pub fn ensure_codex_skill_nudges(&self) {
+        for (id, skill) in CODEX_SKILL_NUDGES {
+            let on = plugin_addon(id).is_some_and(|plugin| {
+                self.plugin_receipt_exists(plugin)
+                    && self.tool_enabled(id)
+                    && PluginHost::Codex.plugin_present(plugin)
+            });
+            if let Err(err) = crate::client_adapters::set_codex_skill_nudge(id, skill, on) {
+                log::warn!("{id}: Codex skill nudge failed: {err:#}");
+            }
+        }
     }
 
     /// Name of an enabled addon that shapes the agent's replies itself (every
@@ -26763,6 +26787,38 @@ Always run the linter first.
             !format!("{err:#}").contains("Codex: CLI not found"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn codex_skill_nudge_follows_the_receipt_and_the_codex_registry() {
+        // Chisle's Codex build has no session hook, so without this block
+        // Codex runs its skill only when the model happens to pick it.
+        let (root, runtime, manager) = seed_test_runtime("codex-skill-nudge");
+        let _home = HomeGuard::new(&root);
+        let codex = root.join(".codex");
+        fs::create_dir_all(&codex).expect("codex home");
+        fs::write(
+            codex.join("config.toml"),
+            "[plugins.\"chisle@chisle\"]\nenabled = true\n",
+        )
+        .expect("codex config");
+        fs::write(codex.join("AGENTS.md"), "My own rules.\n").expect("agents");
+        let receipt = runtime.tools_dir.join("chisle.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let agents = || fs::read_to_string(codex.join("AGENTS.md")).expect("read agents");
+
+        manager.ensure_codex_skill_nudges();
+        let on = agents();
+        fs::write(&receipt, br#"{"version":"latest","enabled":false}"#).expect("receipt");
+        manager.ensure_codex_skill_nudges();
+        let off = agents();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(on.contains("load the `chisle:chisle` skill"), "{on}");
+        assert!(on.contains("My own rules."), "{on}");
+        // Caveman has neither a receipt nor a Codex registration.
+        assert!(!on.contains("caveman:caveman"), "{on}");
+        assert_eq!(off.trim(), "My own rules.");
     }
 
     #[test]

@@ -158,6 +158,28 @@ fn rtk_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
+/// The Codex builds of some plugin addons carry the skill but no session hook,
+/// so Codex runs it only when the model happens to pick it: Chisle's
+/// `.codex-plugin` points an `instructions` key at its rules, a key Codex does
+/// not read, and caveman's has no hooks (caveman#1242). This managed
+/// `~/.codex/AGENTS.md` block switches the skill on for every session, the way
+/// the plugin's hooks do in Claude Code.
+pub fn set_codex_skill_nudge(id: &str, skill: &str, on: bool) -> Result<()> {
+    let agents = rtk_codex_agents_path();
+    let block_id = format!("{id}_codex");
+    if on {
+        let body = format!(
+            "## {id} (Headroom addon)\n\
+             At the start of every session, load the `{skill}` skill and apply it\n\
+             for the rest of the session, until the user turns it off."
+        );
+        upsert_nudge_block(&agents, &block_id, &body)?;
+    } else {
+        remove_managed_block(&agents, &block_id)?;
+    }
+    Ok(())
+}
+
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
