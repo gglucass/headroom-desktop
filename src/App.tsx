@@ -890,7 +890,9 @@ function OutputReductionChip({
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
   // Only a measured figure can be negative: shaped replies came out longer
-  // than the control group's.
+  // than the control group's. Shown as 0% with no CI: a 3% holdout is not
+  // yet a measurement to put a "+10%" in front of a user on. The true figure
+  // still reaches the server (`reported_output_reduction`).
   const longer = reduction.reductionPercent < 0;
 
   useEffect(() => {
@@ -923,8 +925,7 @@ function OutputReductionChip({
         onKeyDown={(e) => e.stopPropagation()}
       >
         <span className="output-chip__dot" aria-hidden="true" />
-        Output {longer ? "+" : "−"}
-        {percent1(Math.abs(reduction.reductionPercent))}%
+        Output {longer ? "0" : `−${percent1(reduction.reductionPercent)}`}%
       </button>
       {open ? (
         <div
@@ -939,14 +940,18 @@ function OutputReductionChip({
             </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
-          <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
+          <div className="output-chip__pop-value">
+            {longer ? "0" : percent1(reduction.reductionPercent)}%
+          </div>
           <dl className="output-chip__pop-stats">
-            <div>
-              <dt>95% CI</dt>
-              <dd>
-                {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
-              </dd>
-            </div>
+            {longer ? null : (
+              <div>
+                <dt>95% CI</dt>
+                <dd>
+                  {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
+                </dd>
+              </div>
+            )}
             <div>
               <dt>Requests</dt>
               <dd>{compactNumber(reduction.requests)}</dd>
@@ -961,7 +966,7 @@ function OutputReductionChip({
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
             {longer
-              ? `Shaped replies came out longer than those of a control group of unshaped conversations, so Headroom saved no output tokens.${
+              ? `No measured reduction yet: shaped replies were no shorter than those of a control group of unshaped conversations, so Headroom claims no output savings.${
                   reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : ""
                 }`
               : isMeasured && reduction.alongsideAddon
@@ -1049,6 +1054,10 @@ function DailySavingsChart({
   // as "the shaper did nothing" rather than "this window can't be measured".
   const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
+  );
+  const windowOutputAb = outputReductionForWindow(
+    view === "month" ? monthlyWindow : hourlyWindow,
+    "ab"
   );
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
@@ -1240,10 +1249,33 @@ function DailySavingsChart({
                     note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
-                {/* A measured figure is all-time only and outranks the per-window
-                    estimate: the estimate is scored against the baseline the
-                    control group just contradicted. */}
-                {windowOutput !== null && outputReduction?.method !== "measured" ? (
+                {/* Once the holdout is solid it outranks the per-window
+                    estimate, which is scored against the baseline the control
+                    group just contradicted: the period's own A/B figure where
+                    it was sampled, else the all-time one. */}
+                {windowOutputAb !== null && outputReduction?.method === "measured" ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label={`Output ${Math.round(windowOutputAb.pct) > 0 ? "−" : ""}${Math.round(windowOutputAb.pct)}%`}
+                    title="Output token reduction"
+                    badge="measured"
+                    value={`${Math.round(windowOutputAb.pct)}%`}
+                    rows={[
+                      { dt: "Avoided", dd: compactNumber(windowOutputAb.savedTokens) },
+                      { dt: "Control baseline", dd: compactNumber(windowOutputAb.baselineTokens) },
+                      {
+                        dt: "All-time",
+                        dd: `${percent1(Math.max(0, outputReduction.reductionPercent))}%`
+                      }
+                    ]}
+                    note={`This period's shaped replies against the average reply of the same kind in a control group of conversations Headroom leaves unshaped; 0% when they were no shorter.${
+                      outputReduction.alongsideAddon
+                        ? ` ${outputReduction.alongsideAddon} runs in both groups.`
+                        : ""
+                    }`}
+                  />
+                ) : windowOutput !== null && outputReduction?.method !== "measured" ? (
                   <WindowRateChip
                     dot="output"
                     popSide="left"
@@ -1267,7 +1299,7 @@ function DailySavingsChart({
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip
-                    allTimeFallback={windowOutput === null}
+                    allTimeFallback
                     flip
                     reduction={outputReduction}
                   />
