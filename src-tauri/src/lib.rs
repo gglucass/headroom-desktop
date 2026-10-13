@@ -11854,8 +11854,17 @@ static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::ne
 
 #[tauri::command]
 async fn start_main_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
-    *MAIN_WINDOW_DRAG_ORIGIN.lock() = window.outer_position().ok();
+    note_main_window_drag_start(window.outer_position().ok());
     window.start_dragging().map_err(|err| err.to_string())
+}
+
+/// Keeps the FIRST grab since the last focus loss: a later click that never
+/// moved the window (or either half of a title-bar double-click) re-read the
+/// origin at the dragged-to spot, and the drag was forgotten.
+fn note_main_window_drag_start(at: Option<PhysicalPosition<i32>>) {
+    if let Some(at) = at {
+        MAIN_WINDOW_DRAG_ORIGIN.lock().get_or_insert(at);
+    }
 }
 
 /// The saved position, while its top-left corner (the logo the user drags it
@@ -11894,6 +11903,8 @@ fn load_main_window_placement() -> MainWindowPlacement {
 /// Runs as the dashboard loses focus, which precedes every hide.
 #[cfg(not(target_os = "macos"))]
 fn record_main_window_placement(window: &Window) {
+    // Taken first so an origin never outlives the focus it was grabbed in.
+    let drag_origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
     if window.is_minimized().unwrap_or(false) {
         return;
     }
@@ -11905,7 +11916,6 @@ fn record_main_window_placement(window: &Window) {
         return;
     };
     let size = size.to_logical::<f64>(scale);
-    let drag_origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
     let mut placement = MAIN_WINDOW_PLACEMENT.lock();
     let next = next_main_window_placement(
         *placement,
@@ -13585,6 +13595,29 @@ mod tests {
             serde_json::from_str(r#"{"size":[900.0,700.0],"later":1}"#).unwrap();
         assert_eq!(parsed.position, None);
         assert_eq!(parsed.size, Some((900.0, 700.0)));
+    }
+
+    #[test]
+    fn a_click_after_a_drag_keeps_the_drag() {
+        use super::{
+            next_main_window_placement, note_main_window_drag_start, MainWindowPlacement,
+            PhysicalPosition, MAIN_WINDOW_DRAG_ORIGIN,
+        };
+        let at = |x, y| PhysicalPosition::new(x, y);
+        *MAIN_WINDOW_DRAG_ORIGIN.lock() = None;
+        // Dragged from (5,5) to (300,200), then the sidebar clicked in place
+        // before the dashboard lost focus.
+        note_main_window_drag_start(Some(at(5, 5)));
+        note_main_window_drag_start(Some(at(300, 200)));
+        let origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
+        let placed = next_main_window_placement(
+            MainWindowPlacement::default(),
+            origin,
+            at(300, 200),
+            (760.0, 632.0),
+            (760.0, 632.0),
+        );
+        assert_eq!(placed.position, Some((300, 200)));
     }
 
     #[test]
