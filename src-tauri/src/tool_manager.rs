@@ -90,12 +90,16 @@ const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
 const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
 const MCP_METHOD_DIRECT_CLAUDE_JSON: &str = "direct_claude_json";
+/// Installed for the other agents only: the Claude Code connector was off, so
+/// its entry was taken back out (see `install_headroom_mcp`).
+const MCP_METHOD_CLAUDE_CONNECTOR_OFF: &str = "claude_connector_off";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum McpInstallMethod {
     ClaudeCli,
     FallbackJson,
     DirectClaudeJson,
+    ClaudeConnectorOff,
 }
 
 impl McpInstallMethod {
@@ -104,6 +108,7 @@ impl McpInstallMethod {
             McpInstallMethod::ClaudeCli => MCP_METHOD_CLAUDE_CLI,
             McpInstallMethod::FallbackJson => MCP_METHOD_FALLBACK_JSON,
             McpInstallMethod::DirectClaudeJson => MCP_METHOD_DIRECT_CLAUDE_JSON,
+            McpInstallMethod::ClaudeConnectorOff => MCP_METHOD_CLAUDE_CONNECTOR_OFF,
         }
     }
 }
@@ -9200,11 +9205,20 @@ impl ToolManager {
         if self.headroom_mcp_configured() == Some(true)
             && matches!(
                 self.headroom_mcp_install_method().as_deref(),
-                Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                Some(MCP_METHOD_CLAUDE_CLI)
+                    | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                    | Some(MCP_METHOD_CLAUDE_CONNECTOR_OFF)
             )
         {
-            // Heals entries registered before the install path set it.
-            turn_off_claude_mcp_beacon();
+            if crate::client_adapters::claude_code_connector_wanted() {
+                // Heals entries registered before the install path set it.
+                turn_off_claude_mcp_beacon();
+            } else if let Err(err) = remove_headroom_from_claude_json() {
+                // Also heals a connector turned off before toggle-off removed
+                // the entry. Info, as for the beacon: an unparsable
+                // ~/.claude.json would re-report on every launch.
+                log::info!("[tool_manager] could not remove the headroom MCP entry from ~/.claude.json: {err:#}");
+            }
             return Ok(());
         }
         let method = match self.install_headroom_mcp() {
@@ -9240,6 +9254,18 @@ impl ToolManager {
             }
         }
         Ok(())
+    }
+
+    /// Puts Claude Code's `headroom` MCP entry back for a connector turned on
+    /// again; it was taken out while the connector was off. No-op when it is
+    /// there, or before bootstrap has a runtime to point it at (bootstrap's
+    /// own install registers it then).
+    pub fn restore_claude_headroom_mcp(&self) -> Result<()> {
+        let entrypoint = self.headroom_entrypoint();
+        if claude_code_has_headroom_mcp_server() || !entrypoint.exists() {
+            return Ok(());
+        }
+        write_headroom_to_claude_json(&entrypoint, HEADROOM_PROXY_URL)
     }
 
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
@@ -9372,8 +9398,20 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
-        turn_off_claude_mcp_beacon();
         crate::client_adapters::protect_foreign_mcp_tables();
+
+        // Claude Code connector off: take back what the CLI just registered
+        // there (Codex, Grok and OpenCode keep theirs). Every repair, upgrade
+        // and bootstrap runs this, so skipping it here put the entry straight
+        // back after a toggle-off. Turning the connector on writes it back
+        // (`restore_claude_headroom_mcp`).
+        if !crate::client_adapters::claude_code_connector_wanted() {
+            if let Err(err) = remove_headroom_from_claude_json() {
+                log::info!("Headroom MCP install: Claude Code connector is off but its entry stayed: {err:#}");
+            }
+            return Ok(McpInstallMethod::ClaudeConnectorOff);
+        }
+        turn_off_claude_mcp_beacon();
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -11498,6 +11536,27 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
             .context("~/.claude.json mcpServers is not a JSON object")?
             .insert("headroom".into(), desired.clone());
         Ok(true)
+    })
+}
+
+/// Removes Claude Code's `headroom` MCP entry, for a Claude Code connector
+/// that is off: without the proxy route nothing is compressed, so its
+/// `headroom_retrieve` has nothing to fetch, yet every session still spawned
+/// the server. Only that entry: serena, context7 and codebase-memory are
+/// addons with toggles of their own.
+pub fn remove_headroom_from_claude_json() -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    remove_headroom_from_claude_json_at(&home.join(".claude.json"))
+}
+
+fn remove_headroom_from_claude_json_at(path: &Path) -> Result<()> {
+    update_claude_json_at(path, |config| {
+        Ok(config
+            .get_mut("mcpServers")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|servers| servers.remove("headroom").is_some()))
     })
 }
 
@@ -27377,6 +27436,33 @@ exit 0
         assert!(!dir.path().join("missing.json").exists());
         let entries = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(entries, 1, "no backup or tmp file for a no-op");
+    }
+
+    #[test]
+    fn connector_off_removes_only_the_headroom_mcp_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"mcpServers":{"headroom":{"command":"/bin/headroom","args":["mcp","serve"]},"serena":{"command":"/rt/serena"},"context7":{"command":"npx"},"codebase-memory":{"command":"/rt/cbm"}}}"#,
+        )
+        .unwrap();
+
+        super::remove_headroom_from_claude_json_at(&path).unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let servers = after["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key("headroom"));
+        for addon in ["serena", "context7", "codebase-memory"] {
+            assert!(servers.contains_key(addon), "{addon} kept: {after}");
+        }
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+
+        // Already gone: no rewrite, so no second backup or tmp file.
+        let before = fs::read_dir(dir.path()).unwrap().count();
+        super::remove_headroom_from_claude_json_at(&path).unwrap();
+        super::remove_headroom_from_claude_json_at(&dir.path().join("missing.json")).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     #[test]

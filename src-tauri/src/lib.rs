@@ -6002,10 +6002,21 @@ async fn apply_client_setup(
     let state: tauri::State<'_, AppState> = app.state();
     // On the blocking pool: verification probes the proxy over blocking HTTP.
     let id = client_id.clone();
-    let applied =
-        tauri::async_runtime::spawn_blocking(move || client_adapters::apply_client_setup(&id))
-            .await
-            .map_err(|err| err.to_string())?;
+    let blocking_app = app.clone();
+    let applied = tauri::async_runtime::spawn_blocking(move || {
+        let applied = client_adapters::apply_client_setup(&id);
+        // Turning it off took the headroom MCP server out of Claude Code's
+        // config (`disable_client_setup`); put it back. Best-effort.
+        if applied.is_ok() && matches!(id.as_str(), "claude_code" | "vscode") {
+            let state: tauri::State<'_, AppState> = blocking_app.state();
+            if let Err(err) = state.tool_manager.restore_claude_headroom_mcp() {
+                log::warn!("restoring the headroom MCP server in Claude Code failed: {err:#}");
+            }
+        }
+        applied
+    })
+    .await
+    .map_err(|err| err.to_string())?;
     match applied {
         Ok(mut result) => {
             if resume_after_write && needs_resume(&state) {
@@ -6341,6 +6352,14 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
     // first and announce the user's own change as a disconnect.
     *LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
     client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
+    // The headroom MCP server goes too (see `claude_code_connector_wanted`).
+    // Here, not in the client_adapters arm: pause and quit run that arm as
+    // well, and they keep the entry. Best-effort; the connector is off.
+    if matches!(client_id.as_str(), "claude_code" | "vscode") {
+        if let Err(err) = tool_manager::remove_headroom_from_claude_json() {
+            log::warn!("removing the headroom MCP server from Claude Code failed: {err:#}");
+        }
+    }
     analytics::track_event(
         &app,
         "client_setup_disabled",

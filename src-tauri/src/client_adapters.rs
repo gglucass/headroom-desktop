@@ -1508,6 +1508,16 @@ pub fn any_gate_exempt_client_enabled() -> bool {
 
 const GATE_EXEMPT_CLIENTS: [&str; 3] = ["codex_cli", "opencode", "grok_build"];
 
+/// Whether the user has the Claude Code connector on, which keeps Headroom's
+/// `headroom` MCP server in Claude Code's config. The remembered snapshot
+/// counts, as above: a pause or quit comes back. The VS Code connector shares
+/// this state (`normalized_setup_id`), and its extension reads the same
+/// `~/.claude.json`, so either one keeps the entry.
+pub fn claude_code_connector_wanted() -> bool {
+    let state = load_setup_state();
+    is_configured(&state, "claude_code") || state.remembered_clients.contains_key("claude_code")
+}
+
 /// Whether `client_id` is one of the connectors the Claude pricing gate keeps
 /// the backend up for (see `any_gate_exempt_client_enabled`).
 pub fn is_gate_exempt_client(client_id: &str) -> bool {
@@ -15791,6 +15801,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
             state.remembered_clients
         );
+    }
+
+    /// The headroom MCP entry follows this: a pause or quit keeps it, only a
+    /// toggle-off drops it, and VS Code counts as Claude Code.
+    #[test]
+    #[serial_test::serial]
+    fn claude_code_connector_wanted_survives_pause_not_toggle_off() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        assert!(!super::claude_code_connector_wanted());
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert!(super::claude_code_connector_wanted());
+        super::clear_client_setups().expect("pause");
+        assert!(super::claude_code_connector_wanted(), "pause comes back");
+        super::disable_client_setup("claude_code").expect("toggle off");
+        assert!(!super::claude_code_connector_wanted());
+
+        super::apply_client_setup("vscode").expect("apply vscode");
+        assert!(super::claude_code_connector_wanted(), "vscode keeps it");
+        super::disable_client_setup("vscode").expect("toggle vscode off");
+        assert!(!super::claude_code_connector_wanted());
     }
 
     /// Finding 38: a 6767 holder Headroom cannot identify (another signed-in
