@@ -4,6 +4,7 @@ import type {
   DailySavingsPoint,
   HeadroomPricingStatus,
   HourlySavingsPoint,
+  OutputReduction,
   ProviderSavingsPoint,
   RuntimeStatus
 } from "./types";
@@ -229,6 +230,20 @@ export function outputReductionForWindow(
   if (baseline <= 0) return null;
   saved = Math.max(0, saved);
   return { pct: Math.min(100, (saved / baseline) * 100), savedTokens: saved, baselineTokens: baseline };
+}
+
+/** The savings breakdown's output-shaping note. A measured reduction below
+ * zero reads 0%, as on the output chip (`OutputReductionChip`). */
+export function outputSavingsNote(reduction: OutputReduction | null | undefined) {
+  if (reduction?.method === "measured") {
+    const addon = reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : "";
+    return `Estimated against a baseline learned from your past replies. Measured against a control group of unshaped conversations over ${compactNumber(reduction.requests)} requests, the reduction is ${percent1(Math.max(0, reduction.reductionPercent))}%.${addon}`;
+  }
+  const covered = reduction
+    ? `, over the ${compactNumber(reduction.requests)} requests that baseline covers`
+    : "";
+  const addon = reduction?.alongsideAddon ? ` It includes what ${reduction.alongsideAddon} saves.` : "";
+  return `Estimated: each reply is compared with a baseline learned from your past replies${covered}.${addon}`;
 }
 
 export function formatDayLabel(dayKey: string) {

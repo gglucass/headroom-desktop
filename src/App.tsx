@@ -138,6 +138,7 @@ import {
   newInputSavingsRate,
   calloutBannerFor,
   outputReductionForWindow,
+  outputSavingsNote,
   compactNumber,
   connectorDashboardStatus,
   connectorGateBlocksEnable,
@@ -8746,21 +8747,7 @@ export default function App() {
                           {/* The dollars stay on the estimate when the
                               holdout promotes (state.rs, audit #50), so
                               this note must not call them measured. */}
-                          {dashboard.outputReduction?.method === "measured"
-                            ? `Estimated against a baseline learned from your past replies. Measured against a control group of unshaped conversations over ${compactNumber(dashboard.outputReduction.requests)} requests, the reduction is ${percent1(dashboard.outputReduction.reductionPercent)}%.${
-                                dashboard.outputReduction.alongsideAddon
-                                  ? ` ${dashboard.outputReduction.alongsideAddon} runs in both groups.`
-                                  : ""
-                              }`
-                            : `Estimated: each reply is compared with a baseline learned from your past replies${
-                                dashboard.outputReduction
-                                  ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
-                                  : ""
-                              }.${
-                                dashboard.outputReduction?.alongsideAddon
-                                  ? ` It includes what ${dashboard.outputReduction.alongsideAddon} saves.`
-                                  : ""
-                              }`}
+                          {outputSavingsNote(dashboard.outputReduction)}
                         </p>
                       </>
                     ) : null}

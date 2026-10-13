@@ -13,6 +13,7 @@ import {
   newInputTokensForBar,
   calloutBannerFor,
   outputReductionForWindow,
+  outputSavingsNote,
   compactNumber,
   connectorDashboardStatus,
   connectorGateBlocksEnable,
@@ -752,6 +753,34 @@ describe("newInputSavingsRate", () => {
     const legacy = { estimatedTokensSaved: 5 };
     expect(newInputSavingsRate([uncovered, legacy])).toBeNull();
     expect(newInputSavingsRate([covered, uncovered, legacy])!.pct).toBeCloseTo(20);
+  });
+});
+
+describe("outputSavingsNote", () => {
+  const measured = {
+    method: "measured",
+    reductionPercent: -10.4,
+    ciLowPercent: -14,
+    ciHighPercent: -7,
+    requests: 24_000
+  };
+
+  it("shows a negative measured reduction as 0%, like the output chip", () => {
+    const note = outputSavingsNote(measured);
+    expect(note).toContain("the reduction is 0.0%.");
+    expect(note).not.toContain("-10.4");
+    expect(outputSavingsNote({ ...measured, reductionPercent: 8.7 })).toContain(
+      "the reduction is 8.7%."
+    );
+  });
+
+  it("keeps the estimate wording", () => {
+    expect(outputSavingsNote(null)).toBe(
+      "Estimated: each reply is compared with a baseline learned from your past replies."
+    );
+    expect(
+      outputSavingsNote({ ...measured, method: "estimated", alongsideAddon: "Caveman" })
+    ).toContain("over the 24K requests that baseline covers. It includes what Caveman saves.");
   });
 });
 
