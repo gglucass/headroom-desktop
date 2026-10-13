@@ -11257,12 +11257,10 @@ fn codex_user_state_exists() -> bool {
 pub(crate) fn chatgpt_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        [
-            PathBuf::from("/Applications/ChatGPT.app"),
-            home_dir().join("Applications").join("ChatGPT.app"),
-        ]
-        .into_iter()
-        .find(|path| path.exists())
+        chatgpt_app_in(&[
+            PathBuf::from("/Applications"),
+            home_dir().join("Applications"),
+        ])
     }
     #[cfg(target_os = "windows")]
     {
@@ -11276,6 +11274,23 @@ pub(crate) fn chatgpt_app_path() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// An install from before the merge can still be named Codex.app, with the
+/// same bundled `codex-cli`, so Optimize said "Install the Codex CLI" beside a
+/// working Codex (a customer, 2026-10-13). It can sit beside a ChatGPT.app
+/// without Codex in it, so the copy that carries Codex wins.
+#[cfg(any(target_os = "macos", test))]
+fn chatgpt_app_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let apps: Vec<PathBuf> = ["ChatGPT.app", "Codex.app"]
+        .into_iter()
+        .flat_map(|name| dirs.iter().map(move |dir| dir.join(name)))
+        .filter(|app| app.exists())
+        .collect();
+    apps.iter()
+        .find(|app| app.join("Contents/Resources/codex-cli").exists())
+        .or(apps.first())
+        .cloned()
 }
 
 /// Locate a Codex CLI that actually runs, for the Headroom Learn analysis
@@ -11380,6 +11395,33 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chatgpt_app_in_finds_a_codex_app_and_prefers_the_copy_with_codex() {
+        let system = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
+        assert_eq!(super::chatgpt_app_in(&dirs), None);
+
+        let chat = system.path().join("ChatGPT.app");
+        std::fs::create_dir(&chat).unwrap();
+        assert_eq!(super::chatgpt_app_in(&dirs), Some(chat.clone()));
+
+        let codex = user.path().join("Codex.app");
+        std::fs::create_dir_all(codex.join("Contents/Resources/codex-cli")).unwrap();
+        assert_eq!(
+            super::chatgpt_app_in(&dirs),
+            Some(codex),
+            "the copy with Codex wins"
+        );
+
+        std::fs::create_dir_all(chat.join("Contents/Resources/codex-cli")).unwrap();
+        assert_eq!(
+            super::chatgpt_app_in(&dirs),
+            Some(chat),
+            "ChatGPT.app first when both have it"
+        );
+    }
+
     #[test]
     fn codex_retag_skip_class_reports_only_what_a_release_can_fix() {
         use super::codex_retag_skip_class;
