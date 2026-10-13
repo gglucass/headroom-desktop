@@ -11766,7 +11766,9 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         return Err(tauri::Error::WebviewNotFound);
     };
 
-    if let Some(position) = user_placed_main_window_position(&window) {
+    let saved = user_placed_main_window_position(&window);
+    MAIN_WINDOW_AT_SAVED_SPOT.store(saved.is_some(), Ordering::Release);
+    if let Some(position) = saved {
         window.set_position(Position::Physical(position))?;
     } else if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
@@ -11848,6 +11850,9 @@ static MAIN_WINDOW_PLACEMENT: Mutex<MainWindowPlacement> = Mutex::new(MainWindow
     position: None,
     size: None,
 });
+/// Whether the dashboard stands at its saved position: this open restored it,
+/// or a drag put it there. False while it is anchored to the tray.
+static MAIN_WINDOW_AT_SAVED_SPOT: AtomicBool = AtomicBool::new(false);
 /// Outer position when the user grabbed the sidebar, so a click that never
 /// moved the window does not pin it away from the tray.
 static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
@@ -11919,10 +11924,15 @@ fn record_main_window_placement(window: &Window) {
     let mut placement = MAIN_WINDOW_PLACEMENT.lock();
     let next = next_main_window_placement(
         *placement,
+        MAIN_WINDOW_AT_SAVED_SPOT.load(Ordering::Acquire),
         drag_origin,
         position,
         (size.width, size.height),
         MAIN_WINDOW_DEFAULT_SIZE,
+    );
+    MAIN_WINDOW_AT_SAVED_SPOT.store(
+        next.position == Some((position.x, position.y)),
+        Ordering::Release,
     );
     if next == *placement {
         return;
@@ -11935,12 +11945,15 @@ fn record_main_window_placement(window: &Window) {
     }
 }
 
-/// Once placed, the window's position is wherever it is now (a later drag,
-/// or a resize from its left or top edge); before that only a drag that
-/// actually moved it places it.
+/// While the window stands at its saved spot (`at_saved`), its position is
+/// wherever it is now (a later drag, or a resize from its left or top edge).
+/// Otherwise only a drag that actually moved it places it, and the saved
+/// spot is kept: an open that fell back to the tray because that spot's
+/// monitor was unplugged must not overwrite it with the tray's.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn next_main_window_placement(
     previous: MainWindowPlacement,
+    at_saved: bool,
     drag_origin: Option<PhysicalPosition<i32>>,
     position: PhysicalPosition<i32>,
     size: (f64, f64),
@@ -11949,7 +11962,11 @@ fn next_main_window_placement(
     let moved = drag_origin.is_some_and(|origin| origin != position);
     let size = (size.0.round(), size.1.round());
     MainWindowPlacement {
-        position: (previous.position.is_some() || moved).then_some((position.x, position.y)),
+        position: if at_saved || moved {
+            Some((position.x, position.y))
+        } else {
+            previous.position
+        },
         size: (size != default_size).then_some(size),
     }
 }
@@ -13570,8 +13587,10 @@ mod tests {
         use super::{next_main_window_placement, MainWindowPlacement, PhysicalPosition};
         let at = |x, y| PhysicalPosition::new(x, y);
         let default_size = (760.0, 632.0);
-        let place = |previous, origin, position, size| {
-            next_main_window_placement(previous, origin, position, size, default_size)
+        // Within one open: at the saved spot exactly when one is saved.
+        let place = |previous: MainWindowPlacement, origin, position, size| {
+            let at_saved = previous.position.is_some();
+            next_main_window_placement(previous, at_saved, origin, position, size, default_size)
         };
         let anchored = MainWindowPlacement::default();
 
@@ -13589,6 +13608,29 @@ mod tests {
         let resized = place(dragged, None, at(250, 200), (810.2, 700.0));
         assert_eq!(resized.position, Some((250, 200)));
         assert_eq!(resized.size, Some((810.0, 700.0)));
+
+        // The saved spot's monitor was unplugged, so this open anchored to
+        // the tray: losing focus there keeps the saved spot for the next open
+        // rather than saving the tray's.
+        let fell_back = next_main_window_placement(
+            resized,
+            false,
+            None,
+            at(10, 10),
+            (810.0, 700.0),
+            default_size,
+        );
+        assert_eq!(fell_back.position, Some((250, 200)));
+        // Dragged from there, the new spot is saved.
+        let moved_on = next_main_window_placement(
+            resized,
+            false,
+            Some(at(10, 10)),
+            at(40, 60),
+            (810.0, 700.0),
+            default_size,
+        );
+        assert_eq!(moved_on.position, Some((40, 60)));
 
         // Every field is optional, so an older or newer file still loads.
         let parsed: MainWindowPlacement =
@@ -13612,6 +13654,7 @@ mod tests {
         let origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
         let placed = next_main_window_placement(
             MainWindowPlacement::default(),
+            false,
             origin,
             at(300, 200),
             (760.0, 632.0),
