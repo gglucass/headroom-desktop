@@ -386,15 +386,9 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
     let mut covered_output = 0.0;
 
     for (key, t) in &ledger.treatment {
-        let Some(c) = ledger.control.get(key) else {
+        let Some(c) = ledger.control.get(key).filter(|c| holdout_scores(t, c)) else {
             continue;
         };
-        if t.qn == 0 || c.qn == 0 {
-            continue;
-        }
-        if t.clusters.len() < MEASURED_MIN_CLUSTERS || c.clusters.len() < MEASURED_MIN_CLUSTERS {
-            continue;
-        }
         let n = t.qn as f64;
         requests += t.qn;
         covered_output += t.qsum;
@@ -410,6 +404,52 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         var,
         requests,
         covered_output / ledger.qualified_output(),
+    )
+}
+
+/// Whether the holdout can score a stratum: conversation-qualified rows in both
+/// arms, from at least [`MEASURED_MIN_CLUSTERS`] conversations each.
+fn holdout_scores(t: &Accum, c: &Accum) -> bool {
+    t.qn > 0
+        && c.qn > 0
+        && t.clusters.len() >= MEASURED_MIN_CLUSTERS
+        && c.clusters.len() >= MEASURED_MIN_CLUSTERS
+}
+
+/// A stratum the daily A/B series can price: the shaped arm's
+/// conversation-qualified totals and the control arm's mean reply.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoldoutStratum {
+    pub shaped_replies: u64,
+    pub shaped_tokens: f64,
+    pub control_mean: f64,
+}
+
+/// The strata the holdout can score, for the daily A/B series. The tracker
+/// prices each poll's NEW shaped replies against the control mean of that
+/// moment, so a later control reply never re-prices a past day: the reason the
+/// all-time holdout figure itself cannot be sampled (see [`estimated`]).
+/// `None` when the ledger is absent or torn.
+pub fn holdout_strata() -> Option<HashMap<String, HoldoutStratum>> {
+    holdout_strata_from_bytes(&std::fs::read(ledger_path()?).ok()?)
+}
+
+fn holdout_strata_from_bytes(bytes: &[u8]) -> Option<HashMap<String, HoldoutStratum>> {
+    let ledger = serde_json::from_slice::<Ledger>(bytes).ok()?;
+    Some(
+        ledger
+            .treatment
+            .iter()
+            .filter_map(|(key, t)| {
+                let c = ledger.control.get(key).filter(|c| holdout_scores(t, c))?;
+                let stratum = HoldoutStratum {
+                    shaped_replies: t.qn,
+                    shaped_tokens: t.qsum,
+                    control_mean: c.qmean(),
+                };
+                Some((key.clone(), stratum))
+            })
+            .collect(),
     )
 }
 
@@ -777,6 +817,29 @@ mod tests {
         assert!((e.reduction_percent + 14.285_714).abs() < 1e-5);
         assert_eq!(e.tokens_saved, 0);
         assert!(e.ci_high_percent < 0.0, "band stays unclamped for the gate");
+    }
+
+    #[test]
+    fn the_daily_series_prices_only_strata_the_holdout_scores() {
+        let strata = holdout_strata_from_bytes(HOLDOUT.as_bytes()).expect("readable");
+        assert_eq!(
+            strata.get("opus|ask|l|tools"),
+            Some(&HoldoutStratum {
+                shaped_replies: 1000,
+                shaped_tokens: 800_000.0,
+                control_mean: 1000.0,
+            })
+        );
+        assert_eq!(strata.len(), 1);
+        let few = with_control(
+            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 100000, "sumsq": 100990000,
+                                               "qn": 100, "qsum": 100000, "qsumsq": 100990000,
+                                               "clusters": ["c1", "c2", "c3", "c4"]}}"#,
+        );
+        assert!(holdout_strata_from_bytes(few.as_bytes())
+            .expect("readable")
+            .is_empty());
+        assert!(holdout_strata_from_bytes(b"{torn").is_none());
     }
 
     #[test]

@@ -1055,6 +1055,10 @@ function DailySavingsChart({
   const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
   );
+  const windowOutputAb = outputReductionForWindow(
+    view === "month" ? monthlyWindow : hourlyWindow,
+    "ab"
+  );
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
@@ -1245,10 +1249,33 @@ function DailySavingsChart({
                     note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
-                {/* A measured figure is all-time only and outranks the per-window
-                    estimate: the estimate is scored against the baseline the
-                    control group just contradicted. */}
-                {windowOutput !== null && outputReduction?.method !== "measured" ? (
+                {/* Once the holdout is solid it outranks the per-window
+                    estimate, which is scored against the baseline the control
+                    group just contradicted: the period's own A/B figure where
+                    it was sampled, else the all-time one. */}
+                {windowOutputAb !== null && outputReduction?.method === "measured" ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label={`Output ${Math.round(windowOutputAb.pct) > 0 ? "−" : ""}${Math.round(windowOutputAb.pct)}%`}
+                    title="Output token reduction"
+                    badge="measured"
+                    value={`${Math.round(windowOutputAb.pct)}%`}
+                    rows={[
+                      { dt: "Avoided", dd: compactNumber(windowOutputAb.savedTokens) },
+                      { dt: "Control baseline", dd: compactNumber(windowOutputAb.baselineTokens) },
+                      {
+                        dt: "All-time",
+                        dd: `${percent1(Math.max(0, outputReduction.reductionPercent))}%`
+                      }
+                    ]}
+                    note={`This period's shaped replies against the average reply of the same kind in a control group of conversations Headroom leaves unshaped; 0% when they were no shorter.${
+                      outputReduction.alongsideAddon
+                        ? ` ${outputReduction.alongsideAddon} runs in both groups.`
+                        : ""
+                    }`}
+                  />
+                ) : windowOutput !== null && outputReduction?.method !== "measured" ? (
                   <WindowRateChip
                     dot="output"
                     popSide="left"
@@ -1272,7 +1299,7 @@ function DailySavingsChart({
                   />
                 ) : outputReduction ? (
                   <OutputReductionChip
-                    allTimeFallback={windowOutput === null}
+                    allTimeFallback
                     flip
                     reduction={outputReduction}
                   />

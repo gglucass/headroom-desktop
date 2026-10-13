@@ -778,6 +778,23 @@ describe("outputReductionForWindow", () => {
     expect(negative!.savedTokens).toBe(0);
   });
 
+  it("reads the A/B series on request and floors a longer day at 0%", () => {
+    const points = [
+      {
+        outputSampledTokensSaved: 400,
+        outputBaselineTokens: 1000,
+        outputAbTokensSaved: -150,
+        outputAbBaselineTokens: 1000
+      },
+      { outputSampledTokensSaved: 200, outputBaselineTokens: 1000 }
+    ];
+    expect(outputReductionForWindow(points)!.pct).toBeCloseTo(30);
+    const ab = outputReductionForWindow(points, "ab");
+    expect(ab!.pct).toBe(0);
+    expect(ab!.baselineTokens).toBe(1000);
+    expect(outputReductionForWindow([points[1]], "ab")).toBeNull();
+  });
+
   it("returns null without coverage or baseline", () => {
     expect(outputReductionForWindow([{}])).toBeNull();
     expect(

@@ -963,6 +963,8 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         })
         .collect();
@@ -12380,6 +12382,8 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         }
     }

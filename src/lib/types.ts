@@ -95,6 +95,10 @@ export interface DailySavingsPoint {
   // running. Window reduction = saved / baseline over covered buckets.
   outputSampledTokensSaved?: number | null;
   outputBaselineTokens?: number | null;
+  // The same, scored against the A/B holdout's control group. Null where the
+  // holdout scored nothing.
+  outputAbTokensSaved?: number | null;
+  outputAbBaselineTokens?: number | null;
 }
 
 // Counterfactual output-token reduction from the proxy's output shaper.
@@ -174,6 +178,8 @@ export interface HourlySavingsPoint {
   cacheReadCostUsd?: number | null;
   outputSampledTokensSaved?: number | null;
   outputBaselineTokens?: number | null;
+  outputAbTokensSaved?: number | null;
+  outputAbBaselineTokens?: number | null;
   byProvider: ProviderSavingsPoint[];
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::AtomicBool;
@@ -2820,6 +2820,10 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                if let Some(sample) = tracker.output_ab_daily_samples.get(&point.date) {
+                    point.output_ab_tokens_saved = Some(sample.saved_tokens);
+                    point.output_ab_baseline_tokens = Some(sample.baseline_tokens);
+                }
                 if let Some(bucket) = tracker.daily_savings.get(&point.date) {
                     (
                         point.cache_read_tokens,
@@ -2852,6 +2856,10 @@ impl AppState {
                 if let Some(sample) = tracker.output_hourly_samples.get(&point.hour) {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
+                }
+                if let Some(sample) = tracker.output_ab_hourly_samples.get(&point.hour) {
+                    point.output_ab_tokens_saved = Some(sample.saved_tokens);
+                    point.output_ab_baseline_tokens = Some(sample.baseline_tokens);
                 }
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     (
@@ -5376,6 +5384,25 @@ struct OutputSampleBucket {
     baseline_tokens: u64,
 }
 
+/// Adds one poll's output sample to the bucket of this moment. Daily keys are
+/// UTC to join the backend's UTC-bucketed daily rollups; hourly keys are local
+/// to join the local-keyed hourly points.
+fn record_output_sample(
+    daily: &mut BTreeMap<String, OutputSampleBucket>,
+    hourly: &mut BTreeMap<String, OutputSampleBucket>,
+    saved_tokens: i64,
+    baseline_tokens: u64,
+) {
+    let now_utc = Utc::now();
+    let day_key = now_utc.format("%Y-%m-%d").to_string();
+    let hour_key = local_hour_key(now_utc.with_timezone(&Local));
+    for (map, key) in [(daily, day_key), (hourly, hour_key)] {
+        let entry = map.entry(key).or_default();
+        entry.saved_tokens += saved_tokens;
+        entry.baseline_tokens += baseline_tokens;
+    }
+}
+
 /// Semantics version of the sampled output series. The samples are deltas of
 /// `crate::output_savings::estimated()`, so a sample is only comparable to
 /// others taken under the same estimator rules. Bump this when those rules
@@ -5431,6 +5458,10 @@ struct PersistedSavingsState {
     /// local (`local_hour_key`, joining the local-keyed hourly points).
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// The same buckets scored by the A/B holdout instead of the synthetic
+    /// control (`SavingsTracker::sample_output_holdout`), same keys.
+    output_ab_daily_samples: BTreeMap<String, OutputSampleBucket>,
+    output_ab_hourly_samples: BTreeMap<String, OutputSampleBucket>,
     /// Locally-sampled tool-schema deferral deltas, keyed exactly like the
     /// output samples above. The backend exposes tool-schema savings ONLY as a
     /// lifetime cumulative counter: it is absent from the `history`
@@ -5493,6 +5524,13 @@ struct SavingsTracker {
     /// See `PersistedSavingsState::output_daily_samples`.
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// See `PersistedSavingsState::output_ab_daily_samples`.
+    output_ab_daily_samples: BTreeMap<String, OutputSampleBucket>,
+    output_ab_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// Shaped `(replies, tokens)` per holdout-scored stratum at the last poll.
+    /// Not persisted: the first reading of a launch only seeds, like
+    /// `output_sample_watermark`.
+    output_ab_watermark: Option<HashMap<String, (u64, f64)>>,
     /// See `PersistedSavingsState::tool_schema_daily_samples`.
     tool_schema_daily_samples: BTreeMap<String, u64>,
     tool_schema_hourly_samples: BTreeMap<String, u64>,
@@ -5662,6 +5700,15 @@ impl SavingsTracker {
                     }
                     samples
                 }),
+            output_ab_daily_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| state.output_ab_daily_samples.clone()),
+            output_ab_hourly_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| {
+                    state.output_ab_hourly_samples.clone()
+                }),
+            output_ab_watermark: None,
             tool_schema_daily_samples: persisted_state
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| {
@@ -5758,6 +5805,8 @@ impl SavingsTracker {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                output_ab_tokens_saved: None,
+                output_ab_baseline_tokens: None,
                 utc_keyed: bucket.utc_keyed,
             })
             .collect()
@@ -5805,6 +5854,8 @@ impl SavingsTracker {
                 cache_read_cost_usd: bucket.cache_read_cost_usd,
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                output_ab_tokens_saved: None,
+                output_ab_baseline_tokens: None,
                 // The local pre-cutoff tracker has no provider dimension.
                 by_provider: Vec::new(),
             })
@@ -6080,6 +6131,7 @@ impl SavingsTracker {
             }
             crate::output_savings::LedgerEstimate::NoEvidence => {}
         }
+        self.sample_output_holdout(crate::output_savings::holdout_strata());
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -6625,20 +6677,55 @@ impl SavingsTracker {
         if delta_saved == 0 && delta_baseline == 0 {
             return;
         }
-        let now_utc = Utc::now();
-        let now_local = now_utc.with_timezone(&Local);
-        // Daily keys are UTC to join the backend's UTC-bucketed daily rollups;
-        // hourly keys are local to join the local-keyed hourly points.
-        let day_key = now_utc.format("%Y-%m-%d").to_string();
-        let hour_key = local_hour_key(now_local);
-        for (map, key) in [
-            (&mut self.output_daily_samples, day_key),
-            (&mut self.output_hourly_samples, hour_key),
-        ] {
-            let entry = map.entry(key).or_default();
-            entry.saved_tokens += delta_saved;
-            entry.baseline_tokens += delta_baseline;
+        record_output_sample(
+            &mut self.output_daily_samples,
+            &mut self.output_hourly_samples,
+            delta_saved,
+            delta_baseline,
+        );
+    }
+
+    /// The A/B series behind the measured day chip: each poll's new shaped
+    /// replies, per stratum the holdout scores, priced against that stratum's
+    /// control mean of the moment, so a later control reply never re-prices a
+    /// past day. The first reading of a launch, and a stratum's first
+    /// scoreable reading, only seed; a stratum whose count fell (a wiped
+    /// ledger) reseeds the same way.
+    fn sample_output_holdout(
+        &mut self,
+        current: Option<HashMap<String, crate::output_savings::HoldoutStratum>>,
+    ) {
+        let Some(current) = current else {
+            return;
+        };
+        let marks = current
+            .iter()
+            .map(|(key, s)| (key.clone(), (s.shaped_replies, s.shaped_tokens)))
+            .collect();
+        let Some(previous) = self.output_ab_watermark.replace(marks) else {
+            return;
+        };
+        let (mut saved, mut baseline) = (0.0, 0.0);
+        for (key, stratum) in &current {
+            let Some(&(replies, tokens)) = previous.get(key) else {
+                continue;
+            };
+            if stratum.shaped_replies <= replies {
+                continue;
+            }
+            let new_replies = (stratum.shaped_replies - replies) as f64;
+            saved += new_replies * stratum.control_mean - (stratum.shaped_tokens - tokens);
+            baseline += new_replies * stratum.control_mean;
         }
+        if baseline < 1.0 {
+            return;
+        }
+        record_output_sample(
+            &mut self.output_ab_daily_samples,
+            &mut self.output_ab_hourly_samples,
+            saved.round() as i64,
+            baseline.round() as u64,
+        );
     }
 
     /// A readable ledger that scores no strata convicts this machine's entire
@@ -6694,6 +6781,8 @@ impl SavingsTracker {
             hourly_savings: self.hourly_savings.clone(),
             output_daily_samples: self.output_daily_samples.clone(),
             output_hourly_samples: self.output_hourly_samples.clone(),
+            output_ab_daily_samples: self.output_ab_daily_samples.clone(),
+            output_ab_hourly_samples: self.output_ab_hourly_samples.clone(),
             tool_schema_daily_samples: self.tool_schema_daily_samples.clone(),
             tool_schema_hourly_samples: self.tool_schema_hourly_samples.clone(),
             last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
@@ -6741,6 +6830,8 @@ impl SavingsTracker {
         self.session_hourly_buckets
             .retain(|key, _| key.as_str() >= cutoff.as_str());
         self.output_hourly_samples
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+        self.output_ab_hourly_samples
             .retain(|key, _| key.as_str() >= cutoff.as_str());
         self.tool_schema_hourly_samples
             .retain(|key, _| key.as_str() >= cutoff.as_str());
@@ -7130,6 +7221,8 @@ impl HeadroomSavingsHistoryResponse {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                output_ab_tokens_saved: None,
+                output_ab_baseline_tokens: None,
                 utc_keyed: true,
             })
             .collect()
@@ -7164,6 +7257,8 @@ impl HeadroomSavingsHistoryResponse {
             cache_read_cost_usd: point.cache_read_cost_usd_delta,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             by_provider: point
                 .by_provider
                 .iter()
@@ -12783,6 +12878,61 @@ mod tests {
     }
 
     #[test]
+    fn holdout_samples_price_new_replies_at_the_control_mean_of_the_moment() {
+        use crate::output_savings::HoldoutStratum;
+        let reading = |strata: &[(&str, u64, f64, f64)]| {
+            Some(
+                strata
+                    .iter()
+                    .map(|&(key, replies, tokens, mean)| {
+                        let stratum = HoldoutStratum {
+                            shaped_replies: replies,
+                            shaped_tokens: tokens,
+                            control_mean: mean,
+                        };
+                        (key.to_string(), stratum)
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        };
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = |t: &SavingsTracker| t.output_ab_daily_samples[&day_key];
+
+        // First reading of a launch seeds only.
+        tracker.sample_output_holdout(reading(&[("a", 100, 70_000.0, 800.0)]));
+        assert!(tracker.output_ab_daily_samples.is_empty());
+
+        // 10 new replies of 700 against a control mean of 800 save 1,000. A
+        // stratum just turned scoreable ("b") only seeds.
+        tracker.sample_output_holdout(reading(&[
+            ("a", 110, 77_000.0, 800.0),
+            ("b", 50, 5_000.0, 90.0),
+        ]));
+        assert_eq!(day(&tracker).saved_tokens, 1_000);
+        assert_eq!(day(&tracker).baseline_tokens, 8_000);
+
+        // The control mean moved to 600: only the new replies are priced at
+        // it, nothing already booked is re-priced. These came out longer.
+        tracker.sample_output_holdout(reading(&[
+            ("a", 120, 84_000.0, 600.0),
+            ("b", 50, 5_000.0, 90.0),
+        ]));
+        assert_eq!(day(&tracker).saved_tokens, 0);
+        assert_eq!(day(&tracker).baseline_tokens, 14_000);
+
+        // A wiped ledger reseeds instead of booking a negative count.
+        tracker.sample_output_holdout(reading(&[("a", 5, 3_000.0, 600.0)]));
+        assert_eq!(day(&tracker).baseline_tokens, 14_000);
+        tracker.sample_output_holdout(reading(&[("a", 6, 3_500.0, 600.0)]));
+        assert_eq!(day(&tracker).saved_tokens, 100);
+        assert_eq!(
+            tracker.persisted_state().output_ab_daily_samples[&day_key],
+            day(&tracker)
+        );
+    }
+
+    #[test]
     fn net_negative_stretch_is_booked_as_it_happens_not_dumped_on_recovery() {
         // 2026-09-30: an evening of replies longer than their baseline pulled
         // tokens_saved down while baseline grew. Holding the mark on that dip
@@ -13043,6 +13193,9 @@ mod tests {
             hourly_savings: std::collections::BTreeMap::new(),
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
+            output_ab_daily_samples: std::collections::BTreeMap::new(),
+            output_ab_hourly_samples: std::collections::BTreeMap::new(),
+            output_ab_watermark: None,
             tool_schema_daily_samples: std::collections::BTreeMap::new(),
             tool_schema_hourly_samples: std::collections::BTreeMap::new(),
             output_sample_watermark: None,
@@ -17585,6 +17738,8 @@ mod tests {
             hourly_savings: std::collections::BTreeMap::new(),
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
+            output_ab_daily_samples: std::collections::BTreeMap::new(),
+            output_ab_hourly_samples: std::collections::BTreeMap::new(),
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
             output_sample_series_version: OUTPUT_SAMPLE_SERIES_VERSION,
@@ -17743,6 +17898,8 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         }
     }
@@ -17765,6 +17922,8 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
         }
     }
 
@@ -18098,6 +18257,8 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         }];
         let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
