@@ -11912,7 +11912,10 @@ fn load_main_window_placement() -> MainWindowPlacement {
 fn record_main_window_placement(window: &Window) {
     // Taken first so an origin never outlives the focus it was grabbed in.
     let drag_origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
-    if window.is_minimized().unwrap_or(false) {
+    // Maximized (Aero Snap: dragged to the top edge) it stands at about
+    // (-8,-8) at the work area's size; saved, the next launch opened a normal
+    // window that size with three resize edges off-screen.
+    if window.is_minimized().unwrap_or(false) || window.is_maximized().unwrap_or(false) {
         return;
     }
     let (Ok(position), Ok(size), Ok(scale)) = (
@@ -13687,6 +13690,21 @@ mod tests {
             .expect("records placement");
         assert!(delay < recheck && recheck < record, "{handler}");
         assert_eq!(handler.matches("record_main_window_placement(").count(), 1);
+    }
+
+    /// Dragged to the top edge on Windows, the resizable dashboard snaps to
+    /// maximized at (-8,-8) and the work area's size (win-test, 0.9.40-rc.3);
+    /// recording that frame reopened it as a normal window filling the screen.
+    #[test]
+    fn placement_skips_a_maximized_dashboard() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, record) = source
+            .split_once("fn record_main_window_placement(")
+            .expect("record present");
+        let record = &record[..record.find("\n}\n").expect("record end")];
+        let guard = record.find("is_maximized()").expect("maximized guard");
+        let read = record.find("window.outer_position()").expect("reads frame");
+        assert!(guard < read, "{record}");
     }
 
     #[test]
