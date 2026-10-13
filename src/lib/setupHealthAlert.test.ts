@@ -598,14 +598,16 @@ describe("unroutedBody", () => {
     });
     expect(body).toContain("/repo/.claude/settings.json");
     // The restart advice is wrong here: the file is still there after a restart.
-    expect(body).not.toContain("Quit and reopen");
+    expect(body).not.toContain("quit and reopen");
   });
 
   it("falls back to the restart ask when the guard saw nothing", () => {
-    expect(unroutedBody({ ...base, enabled: true, reapplied: true })).toContain("Quit and reopen");
-    expect(unroutedBody({ ...base, enabled: true, reapplied: true, diagnosis: null })).toContain(
-      "Quit and reopen"
-    );
+    const body = unroutedBody({ ...base, enabled: true, reapplied: true });
+    expect(body).toContain("quit and reopen Claude Code");
+    // Says why, and that settings hold no fix (a customer searched them for weeks).
+    expect(body).toContain("without going through Headroom");
+    expect(body).toContain("Nothing to change in settings");
+    expect(unroutedBody({ ...base, enabled: true, reapplied: true, diagnosis: null })).toBe(body);
   });
 
   it("asks a switched-off connector to be turned back on", () => {

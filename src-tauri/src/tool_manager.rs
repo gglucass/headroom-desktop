@@ -90,12 +90,16 @@ const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const MCP_METHOD_CLAUDE_CLI: &str = "claude_cli";
 const MCP_METHOD_FALLBACK_JSON: &str = "fallback_json";
 const MCP_METHOD_DIRECT_CLAUDE_JSON: &str = "direct_claude_json";
+/// Installed for the other agents only: the Claude Code connector was off, so
+/// its entry was taken back out (see `install_headroom_mcp`).
+const MCP_METHOD_CLAUDE_CONNECTOR_OFF: &str = "claude_connector_off";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum McpInstallMethod {
     ClaudeCli,
     FallbackJson,
     DirectClaudeJson,
+    ClaudeConnectorOff,
 }
 
 impl McpInstallMethod {
@@ -104,12 +108,13 @@ impl McpInstallMethod {
             McpInstallMethod::ClaudeCli => MCP_METHOD_CLAUDE_CLI,
             McpInstallMethod::FallbackJson => MCP_METHOD_FALLBACK_JSON,
             McpInstallMethod::DirectClaudeJson => MCP_METHOD_DIRECT_CLAUDE_JSON,
+            McpInstallMethod::ClaudeConnectorOff => MCP_METHOD_CLAUDE_CONNECTOR_OFF,
         }
     }
 }
 const HEADROOM_STARTUP_POLL_MS: u64 = 250;
 const HEADROOM_STARTUP_TIMEOUT_MS: u64 = 300_000;
-/// `is_local_proxy_reachable`'s connect timeout. Windows retries the SYN on a
+/// `connect_local_proxy`'s connect timeout. Windows retries the SYN on a
 /// refused loopback connect, so there every startup poll waits this out too.
 const LOCAL_PROXY_PROBE_TIMEOUT_MS: u64 = 180;
 /// When the Windows startup loop gives up: it counts polls, not time, and each
@@ -3443,7 +3448,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # flow the whole time and nothing downstream changes. It applies only to
 # api.anthropic.com /v1/messages bodies Headroom serializes itself: the
 # buffered flip, or a continuation built from scratch. A client's own
-# stream:false bytes stay byte-faithful. Request content is unchanged apart from
+# stream:false bytes stay byte-faithful. The CCR continuation that serves the
+# retrieval is a third stream:false call (its own http_client.post, not
+# _retry_request) and dropped the same way: 5 a day on one VPN machine at
+# 61-66s, 3 of them handing Claude Code a bare headroom_retrieve (rc.8,
+# 2026-10-12). Its outbound log line marks it, and the next post in that task
+# streams and folds the same way. Request content is unchanged apart from
 # the stream flag, so no compression or cache effect. A stream that ends
 # without message_stop raises like a dropped connection (the wheel's 502); an
 # in-band error event returns its status (529 overloaded, 429, else 500).
@@ -3585,6 +3595,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     request=resp.request,
                 )
 
+            def _hd_bus_sse_headers(headers):
+                sse_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "accept"}
+                sse_headers["accept"] = "text/event-stream"
+                return sse_headers
+
             async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
                 if stream or not _hd_bus_applies(method, url, body, kwargs):
                     return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
@@ -3594,11 +3609,20 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
                     + ["buffered_upstream_stream"],
                 }
-                sse_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
-                sse_headers["accept"] = "text/event-stream"
                 resp = await _hd_bus_orig(
-                    self, method, url, sse_headers, {**body, "stream": True}, False, **sse_kwargs
+                    self,
+                    method,
+                    url,
+                    _hd_bus_sse_headers(headers),
+                    {**body, "stream": True},
+                    False,
+                    **sse_kwargs,
                 )
+                return await _hd_bus_settle(
+                    resp, lambda: _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                )
+
+            async def _hd_bus_settle(resp, fallback):
                 if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
                     "content-type", ""
                 ):
@@ -3614,7 +3638,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     _hd_bus_log.warning(
                         "event=buffered_upstream_stream fold_failed=%s", type(exc).__name__
                     )
-                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
+                    return await fallback()
                 if err is not None:
                     etype = (err.get("error") or {}).get("type")
                     _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
@@ -3625,13 +3649,110 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                     )
                 return _hd_bus_reply(resp, 200, msg)
 
+            # The CCR continuation: its api_call_fn imports log_outbound_request
+            # at call time and posts right after it, in the same task, so the
+            # mark is read by exactly that post and cleared there.
+            import contextvars as _hd_bus_cv
+
+            from headroom.proxy import body_forwarding as _hd_bus_bf
+            from headroom.proxy import helpers as _hd_bus_helpers
+
+            _hd_bus_cont = _hd_bus_cv.ContextVar("_hd_bus_cont", default=False)
+            _hd_bus_log_orig = _hd_bus_helpers.log_outbound_request
+            _hd_bus_post_orig = _hd_bus_httpx.AsyncClient.post
+
+            def _hd_bus_log_outbound(**kwargs):
+                if kwargs.get("forwarder") == "anthropic_ccr_continuation":
+                    _hd_bus_cont.set(True)
+                return _hd_bus_log_orig(**kwargs)
+
+            async def _hd_bus_post(self, url, **kwargs):
+                if not _hd_bus_cont.get():
+                    return await _hd_bus_post_orig(self, url, **kwargs)
+                _hd_bus_cont.set(False)
+                try:
+                    body = _hd_bus_json.loads(kwargs.get("content") or b"")
+                except ValueError:
+                    body = None
+                if not _hd_bus_applies("POST", str(url), body, {}):
+                    return await _hd_bus_post_orig(self, url, **kwargs)
+                content, _ = _hd_bus_bf.prepare_outbound_body_bytes(
+                    body={**body, "stream": True}, original_body_bytes=None, body_mutated=True
+                )
+                _hd_bus_log.info("event=buffered_upstream_stream forwarder=anthropic_ccr_continuation")
+                resp = await _hd_bus_post_orig(
+                    self,
+                    url,
+                    **{**kwargs, "content": content, "headers": _hd_bus_sse_headers(kwargs.get("headers"))},
+                )
+                return await _hd_bus_settle(resp, lambda: _hd_bus_post_orig(self, url, **kwargs))
+
             with open(_hd_bus_anth.__file__, encoding="utf-8") as _hd_bus_src:
-                _hd_bus_needed = _hd_bus_flip in _hd_bus_src.read()
-            if _hd_bus_needed:
+                _hd_bus_text = _hd_bus_src.read()
+            if _hd_bus_flip in _hd_bus_text:
                 _hd_bus_server.HeadroomProxy._retry_request = _hd_bus_retry_request
+                if 'forwarder="anthropic_ccr_continuation"' in _hd_bus_text:
+                    _hd_bus_helpers.log_outbound_request = _hd_bus_log_outbound
+                    _hd_bus_httpx.AsyncClient.post = _hd_bus_post
                 _hd_bound.add("buffered_upstream_stream")
     except Exception:
         # Fail-open to the wheel's buffered stream:false request.
+        pass
+
+# --- Prefix tracker: a deferred tool load is not a new conversation -----------
+# The tracker lineage is keyed on a fingerprint of the cache-key segments
+# before the messages, the whole `tools` array included. Claude Code appends
+# every tool ToolSearch loads to `tools`, still marked defer_loading, and
+# Anthropic leaves deferred tools out of the cached prompt (a direct session
+# keeps reading its cache across the load). The proxy saw a new conversation:
+# a fresh tracker, frozen=0, and the whole history re-run through the
+# pipeline, whose output differs from the bytes already cached (reads that
+# were recent then and are older now, a background Kompress result), so the
+# message tier was re-written. On one machine over 5 days, the turn after a
+# deferred load missed big 21.9% of the time against 0.4% for every other
+# turn: 53 misses, 9.2M tokens, 12% of all cache writes (2026-10-13). The
+# fingerprint now leaves deferred tools out, as Anthropic's key does; a change
+# to any tool the prompt renders still starts a new lineage. RAISES cache reads,
+# tokens saved unchanged in aggregate, so check cache_read per request with
+# savings:did after the stable ships.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel's
+# fingerprint already ignores a deferred tool. Kill switch:
+# HEADROOM_DEFERRED_TOOL_AFFINITY=0.
+_hd_dta_flag = _hd_os.environ.get("HEADROOM_DEFERRED_TOOL_AFFINITY", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_dta_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_dta_meta
+
+        if _hd_dta_meta.version("headroom-ai") == "0.39.0":
+            from headroom.cache import prefix_tracker as _hd_dta_pt
+
+            _hd_dta_orig = _hd_dta_pt.segment_fingerprint
+
+            def _hd_dta_fingerprint(value):
+                if isinstance(value, dict) and isinstance(value.get("tools"), list):
+                    value = {
+                        **value,
+                        "tools": [
+                            t
+                            for t in value["tools"]
+                            if not (isinstance(t, dict) and t.get("defer_loading"))
+                        ],
+                    }
+                return _hd_dta_orig(value)
+
+            _hd_dta_tool = {"name": "Read", "input_schema": {"type": "object"}}
+            _hd_dta_deferred = {"name": "x", "defer_loading": True, "input_schema": {}}
+            if _hd_dta_orig({"tools": [_hd_dta_tool]}) != _hd_dta_orig(
+                {"tools": [_hd_dta_tool, _hd_dta_deferred]}
+            ):
+                # The handler imports the name at call time, so the module
+                # attribute is the one it reads.
+                _hd_dta_pt.segment_fingerprint = _hd_dta_fingerprint
+                _hd_bound.add("deferred_tool_affinity")
+    except Exception:
+        # Fail-open to the wheel's fingerprint.
         pass
 
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
@@ -3757,6 +3878,7 @@ _HD_VENDORS = (
     "held_read_breakpoint",
     "web_search_history",
     "buffered_upstream_stream",
+    "deferred_tool_affinity",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -5729,8 +5851,13 @@ impl ToolManager {
                     // and mechanical-effort use upstream defaults (on, "low"). The
                     // shaper only ever lowers an effort the client already sent and
                     // never toggles thinking.type, so it cannot 400 a model that
-                    // lacks effort support.
-                    .env("HEADROOM_OUTPUT_SHAPER", "1")
+                    // lacks effort support. A user-exported HEADROOM_OUTPUT_SHAPER=0
+                    // turns it off without a rebuild (verified on 0.39.0: decision
+                    // disabled); a customer asked for an off switch, 2026-10-12.
+                    .env(
+                        "HEADROOM_OUTPUT_SHAPER",
+                        user_env_or("HEADROOM_OUTPUT_SHAPER", "1"),
+                    )
                     // The 0.37.0 wheel added a rollout registry that gates
                     // proxy_output_shaper to the beta channel and defaults the
                     // channel to stable, which silently disabled the shaper on
@@ -5929,14 +6056,18 @@ impl ToolManager {
 
                 let mut startup_ok = false;
                 let mut reason: Option<String> = None;
+                let mut last_connect_err: Option<std::io::Error> = None;
 
                 let startup_polls = (HEADROOM_STARTUP_TIMEOUT_MS / HEADROOM_STARTUP_POLL_MS).max(1);
                 for _ in 0..startup_polls {
                     thread::sleep(Duration::from_millis(HEADROOM_STARTUP_POLL_MS));
                     stop_if_shutting_down(&mut child, &crate::SHUTTING_DOWN)?;
-                    if is_local_proxy_reachable() {
-                        startup_ok = true;
-                        break;
+                    match connect_local_proxy() {
+                        Ok(()) => {
+                            startup_ok = true;
+                            break;
+                        }
+                        Err(err) => last_connect_err = Some(err),
                     }
 
                     match child.try_wait() {
@@ -5982,11 +6113,16 @@ impl ToolManager {
                 let _ = child.kill();
                 let _ = child.wait();
 
+                // The last connect error tells a backend that never bound
+                // ("refused") from a host whose own connects fail: RUST-Q0's
+                // backend was serving while the Mac ran out of ephemeral ports
+                // ("Can't assign requested address", os error 49).
                 let reason = reason.unwrap_or_else(|| {
                     format!(
-                        "never opened port {} within {}ms",
+                        "never opened port {} within {}ms (last connect: {})",
                         headroom_proxy_port(),
-                        HEADROOM_STARTUP_TIMEOUT_MS
+                        HEADROOM_STARTUP_TIMEOUT_MS,
+                        last_connect_err.map_or_else(|| "none".to_string(), |err| err.to_string())
                     )
                 });
                 failures.push(HeadroomStartupFailure {
@@ -9135,11 +9271,20 @@ impl ToolManager {
         if self.headroom_mcp_configured() == Some(true)
             && matches!(
                 self.headroom_mcp_install_method().as_deref(),
-                Some(MCP_METHOD_CLAUDE_CLI) | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                Some(MCP_METHOD_CLAUDE_CLI)
+                    | Some(MCP_METHOD_DIRECT_CLAUDE_JSON)
+                    | Some(MCP_METHOD_CLAUDE_CONNECTOR_OFF)
             )
         {
-            // Heals entries registered before the install path set it.
-            turn_off_claude_mcp_beacon();
+            if crate::client_adapters::claude_code_connector_wanted() {
+                // Heals entries registered before the install path set it.
+                turn_off_claude_mcp_beacon();
+            } else if let Err(err) = remove_headroom_from_claude_json() {
+                // Also heals a connector turned off before toggle-off removed
+                // the entry. Info, as for the beacon: an unparsable
+                // ~/.claude.json would re-report on every launch.
+                log::info!("[tool_manager] could not remove the headroom MCP entry from ~/.claude.json: {err:#}");
+            }
             return Ok(());
         }
         let method = match self.install_headroom_mcp() {
@@ -9175,6 +9320,18 @@ impl ToolManager {
             }
         }
         Ok(())
+    }
+
+    /// Puts Claude Code's `headroom` MCP entry back for a connector turned on
+    /// again; it was taken out while the connector was off. No-op when it is
+    /// there, or before bootstrap has a runtime to point it at (bootstrap's
+    /// own install registers it then).
+    pub fn restore_claude_headroom_mcp(&self) -> Result<()> {
+        let entrypoint = self.headroom_entrypoint();
+        if claude_code_has_headroom_mcp_server() || !entrypoint.exists() {
+            return Ok(());
+        }
+        write_headroom_to_claude_json(&entrypoint, HEADROOM_PROXY_URL)
     }
 
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
@@ -9307,8 +9464,20 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
-        turn_off_claude_mcp_beacon();
         crate::client_adapters::protect_foreign_mcp_tables();
+
+        // Claude Code connector off: take back what the CLI just registered
+        // there (Codex, Grok and OpenCode keep theirs). Every repair, upgrade
+        // and bootstrap runs this, so skipping it here put the entry straight
+        // back after a toggle-off. Turning the connector on writes it back
+        // (`restore_claude_headroom_mcp`).
+        if !crate::client_adapters::claude_code_connector_wanted() {
+            if let Err(err) = remove_headroom_from_claude_json() {
+                log::info!("Headroom MCP install: Claude Code connector is off but its entry stayed: {err:#}");
+            }
+            return Ok(McpInstallMethod::ClaudeConnectorOff);
+        }
+        turn_off_claude_mcp_beacon();
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -11436,6 +11605,27 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
     })
 }
 
+/// Removes Claude Code's `headroom` MCP entry, for a Claude Code connector
+/// that is off: without the proxy route nothing is compressed, so its
+/// `headroom_retrieve` has nothing to fetch, yet every session still spawned
+/// the server. Only that entry: serena, context7 and codebase-memory are
+/// addons with toggles of their own.
+pub fn remove_headroom_from_claude_json() -> Result<()> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    remove_headroom_from_claude_json_at(&home.join(".claude.json"))
+}
+
+fn remove_headroom_from_claude_json_at(path: &Path) -> Result<()> {
+    update_claude_json_at(path, |config| {
+        Ok(config
+            .get_mut("mcpServers")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|servers| servers.remove("headroom").is_some()))
+    })
+}
+
 /// Best-effort [`turn_off_claude_mcp_beacon_at`] on the real `~/.claude.json`.
 fn turn_off_claude_mcp_beacon() {
     let Some(home) = dirs::home_dir() else {
@@ -11571,7 +11761,7 @@ fn update_claude_json_at(
     unreachable!("loop always returns")
 }
 
-fn is_local_proxy_reachable() -> bool {
+fn connect_local_proxy() -> std::io::Result<()> {
     // Check headroom's actual backend port, not the intercept port (6767),
     // because the intercept starts before headroom and would always be reachable.
     let address: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
@@ -11579,7 +11769,7 @@ fn is_local_proxy_reachable() -> bool {
         &address,
         Duration::from_millis(LOCAL_PROXY_PROBE_TIMEOUT_MS),
     )
-    .is_ok()
+    .map(drop)
 }
 
 enum PortState {
@@ -19357,8 +19547,30 @@ err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
 cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
 bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
 odd, odd_s, _ = run(ODD, body_mutated=True, mutation_reasons=[FLIP])
+# The CCR continuation posts on its own right after its outbound log line: that
+# post streams and folds, the next one in the task goes out as sent.
+from headroom.proxy import helpers
+seen = []
+def upstream(request):
+    b = json.loads(request.content)
+    seen.append((b['stream'], request.headers['accept']))
+    if b['stream']:
+        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=BODY.encode())
+    return httpx.Response(200, json=EXPECT)
+async def continuation():
+    body = json.dumps({'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+    hdrs = {'accept': 'application/json', 'content-type': 'application/json'}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as c:
+        helpers.log_outbound_request(forwarder='anthropic_ccr_continuation', method='POST', path=URL,
+            body_bytes_count=len(body), body_mutated=True, mutation_reasons=['ccr_continuation'],
+            request_id='r', source='canonical')
+        first = await c.post(URL, content=body, headers=hdrs, timeout=5)
+        second = await c.post(URL, content=body, headers=hdrs, timeout=5)
+    return first.json() == EXPECT and second.json() == EXPECT
+cont = asyncio.run(continuation())
 print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
       bad is not None, bad_s, bad_a, odd is not None, odd_s,
+      cont, seen[0][0], seen[0][1], seen[1][0],
       'buffered_upstream_stream' in sitecustomize._hd_bound)
 "#;
         let run = |kill: &str| {
@@ -19383,13 +19595,69 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(
             on,
-            "True True text/event-stream False text/event-stream 529 None True False application/json True False True",
+            "True True text/event-stream False text/event-stream 529 None True False application/json True False \
+             True True text/event-stream False True",
             "stderr:\n{on_err}"
         );
         assert!(
-            off.starts_with("False False application/json False"),
+            off.starts_with("False False application/json False")
+                && off.ends_with("True False application/json False False"),
             "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn deferred_tool_affinity_behaves_against_the_installed_wheel() {
+        // A tool ToolSearch loads joins `tools` with defer_loading and keeps
+        // the conversation on its tracker; a rendered tool still splits it.
+        // The kill switch restores the wheel's split on both.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-deferred-aff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sitecustomize\n\
+                     from headroom.cache import prefix_tracker as pt\n\
+                     R = {'name': 'Read', 'input_schema': {'type': 'object'}}\n\
+                     D = {'name': 'mcp__x__search', 'defer_loading': True, 'input_schema': {}}\n\
+                     W = {'name': 'Write', 'input_schema': {'type': 'object'}}\n\
+                     def aff(tools):\n    \
+                         return pt.segment_fingerprint({'model': 'm', 'tools': tools, 'tool_choice': None, 'thinking': None, 'output_config': None})\n\
+                     s = pt.SessionTrackerStore()\n\
+                     m = [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'ok'}]\n\
+                     t1 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R]))\n\
+                     m = m + [{'role': 'user', 'content': 'go'}]\n\
+                     t2 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D]))\n\
+                     m = m + [{'role': 'assistant', 'content': 'k'}]\n\
+                     t3 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D, W]))\n\
+                     print(t1 is t2, t2 is t3, 'deferred_tool_affinity' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_DEFERRED_TOOL_AFFINITY", kill)
+                .output()
+                .expect("run deferred tool affinity probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: deferred tool affinity vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True False True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False False", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -27288,6 +27556,33 @@ exit 0
         assert!(!dir.path().join("missing.json").exists());
         let entries = fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(entries, 1, "no backup or tmp file for a no-op");
+    }
+
+    #[test]
+    fn connector_off_removes_only_the_headroom_mcp_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"mcpServers":{"headroom":{"command":"/bin/headroom","args":["mcp","serve"]},"serena":{"command":"/rt/serena"},"context7":{"command":"npx"},"codebase-memory":{"command":"/rt/cbm"}}}"#,
+        )
+        .unwrap();
+
+        super::remove_headroom_from_claude_json_at(&path).unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let servers = after["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key("headroom"));
+        for addon in ["serena", "context7", "codebase-memory"] {
+            assert!(servers.contains_key(addon), "{addon} kept: {after}");
+        }
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+
+        // Already gone: no rewrite, so no second backup or tmp file.
+        let before = fs::read_dir(dir.path()).unwrap().count();
+        super::remove_headroom_from_claude_json_at(&path).unwrap();
+        super::remove_headroom_from_claude_json_at(&dir.path().join("missing.json")).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     #[test]

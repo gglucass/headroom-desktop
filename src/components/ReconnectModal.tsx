@@ -35,20 +35,23 @@ export function ReconnectModal({
           <p key={client.clientId}>{unroutedBody(client)}</p>
         ))}
         <div className="modal-actions">
-          <button className="secondary-button" onClick={onOpenSettings} type="button">
-            Open settings
-          </button>
           {switchedOff.length > 0 ? (
-            switchedOff.map((client) => (
-              <button
-                key={client.clientId}
-                className="primary-button"
-                onClick={() => onReconnect(client)}
-                type="button"
-              >
-                Reconnect {client.name}
+            <>
+              {/* Only a switched-off connector has anything in settings. */}
+              <button className="secondary-button" onClick={onOpenSettings} type="button">
+                Open settings
               </button>
-            ))
+              {switchedOff.map((client) => (
+                <button
+                  key={client.clientId}
+                  className="primary-button"
+                  onClick={() => onReconnect(client)}
+                  type="button"
+                >
+                  Reconnect {client.name}
+                </button>
+              ))}
+            </>
           ) : (
             <button className="primary-button" onClick={onClose} type="button">
               Got it

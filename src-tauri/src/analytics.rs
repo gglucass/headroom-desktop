@@ -332,8 +332,12 @@ pub fn set_headroom_ai_version(app: &AppHandle, version: Option<String>) {
     }
 }
 
+// Debug builds only: a user who starts Headroom from a terminal (Linux, or the
+// macOS binary run directly) must never see analytics plumbing.
 fn log_stderr(args: std::fmt::Arguments<'_>) {
-    let _ = writeln!(std::io::stderr(), "{args}");
+    if cfg!(debug_assertions) {
+        let _ = writeln!(std::io::stderr(), "{args}");
+    }
 }
 
 pub fn shutdown(app: &AppHandle) {

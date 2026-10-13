@@ -846,8 +846,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             } else if codex_guard_registered_any_interpreter()? {
                 checks.push(CODEX_GUARD_STALE_COMMAND.into());
             } else {
-                failures
-                    .push("Headroom routing guard was not found in ~/.codex/hooks.json.".into());
+                failures.push(CODEX_GUARD_NOT_FOUND.into());
             }
 
             // Independent confirmation from Codex itself, run off-thread: the
@@ -1075,9 +1074,14 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// (2026-09-27..10-10), each once but one 6 days apart. Six were Windows
 /// hosts leaving the pre-0.9.25 `%APPDATA%` config, the rest one edit to
 /// opencode.json(c) that a single re-apply fixed for good.
+///
+/// And Codex's guard alone (RUST-KA): hooks.json is a file the user and
+/// Codex's own /hooks edit, separate from the config.toml block. 5 repairs on
+/// 4 hosts (2026-09-29..10-12); only one host lost it again, 1.7h later.
 fn repair_pages(silent_failures: &[String]) -> bool {
     let marker = match silent_failures {
         [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
+        [only] if only == CODEX_GUARD_NOT_FOUND => "codex-guard-lost",
         [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
         _ => return true,
     };
@@ -1503,6 +1507,16 @@ pub fn any_gate_exempt_client_enabled() -> bool {
 }
 
 const GATE_EXEMPT_CLIENTS: [&str; 3] = ["codex_cli", "opencode", "grok_build"];
+
+/// Whether the user has the Claude Code connector on, which keeps Headroom's
+/// `headroom` MCP server in Claude Code's config. The remembered snapshot
+/// counts, as above: a pause or quit comes back. The VS Code connector shares
+/// this state (`normalized_setup_id`), and its extension reads the same
+/// `~/.claude.json`, so either one keeps the entry.
+pub fn claude_code_connector_wanted() -> bool {
+    let state = load_setup_state();
+    is_configured(&state, "claude_code") || state.remembered_clients.contains_key("claude_code")
+}
 
 /// Whether `client_id` is one of the connectors the Claude pricing gate keeps
 /// the backend up for (see `any_gate_exempt_client_enabled`).
@@ -7368,6 +7382,7 @@ fn codex_guard_registered_any_interpreter() -> Result<bool> {
     )
 }
 
+const CODEX_GUARD_NOT_FOUND: &str = "Headroom routing guard was not found in ~/.codex/hooks.json.";
 const CODEX_GUARD_SCRIPT_MISSING: &str =
     "Headroom routing guard script was missing from ~/.codex/hooks.";
 const CODEX_GUARD_STALE_COMMAND: &str =
@@ -11242,12 +11257,10 @@ fn codex_user_state_exists() -> bool {
 pub(crate) fn chatgpt_app_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        [
-            PathBuf::from("/Applications/ChatGPT.app"),
-            home_dir().join("Applications").join("ChatGPT.app"),
-        ]
-        .into_iter()
-        .find(|path| path.exists())
+        chatgpt_app_in(&[
+            PathBuf::from("/Applications"),
+            home_dir().join("Applications"),
+        ])
     }
     #[cfg(target_os = "windows")]
     {
@@ -11261,6 +11274,23 @@ pub(crate) fn chatgpt_app_path() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// An install from before the merge can still be named Codex.app, with the
+/// same bundled `codex-cli`, so Optimize said "Install the Codex CLI" beside a
+/// working Codex (a customer, 2026-10-13). It can sit beside a ChatGPT.app
+/// without Codex in it, so the copy that carries Codex wins.
+#[cfg(any(target_os = "macos", test))]
+fn chatgpt_app_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let apps: Vec<PathBuf> = ["ChatGPT.app", "Codex.app"]
+        .into_iter()
+        .flat_map(|name| dirs.iter().map(move |dir| dir.join(name)))
+        .filter(|app| app.exists())
+        .collect();
+    apps.iter()
+        .find(|app| app.join("Contents/Resources/codex-cli").exists())
+        .or(apps.first())
+        .cloned()
 }
 
 /// Locate a Codex CLI that actually runs, for the Headroom Learn analysis
@@ -11365,6 +11395,33 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chatgpt_app_in_finds_a_codex_app_and_prefers_the_copy_with_codex() {
+        let system = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let dirs = [system.path().to_path_buf(), user.path().to_path_buf()];
+        assert_eq!(super::chatgpt_app_in(&dirs), None);
+
+        let chat = system.path().join("ChatGPT.app");
+        std::fs::create_dir(&chat).unwrap();
+        assert_eq!(super::chatgpt_app_in(&dirs), Some(chat.clone()));
+
+        let codex = user.path().join("Codex.app");
+        std::fs::create_dir_all(codex.join("Contents/Resources/codex-cli")).unwrap();
+        assert_eq!(
+            super::chatgpt_app_in(&dirs),
+            Some(codex),
+            "the copy with Codex wins"
+        );
+
+        std::fs::create_dir_all(chat.join("Contents/Resources/codex-cli")).unwrap();
+        assert_eq!(
+            super::chatgpt_app_in(&dirs),
+            Some(chat),
+            "ChatGPT.app first when both have it"
+        );
+    }
+
     #[test]
     fn codex_retag_skip_class_reports_only_what_a_release_can_fix() {
         use super::codex_retag_skip_class;
@@ -15445,6 +15502,33 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn a_lone_codex_guard_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-KA: the guard entry gone from hooks.json with config.toml
+        // intact is an outside edit the repair undoes.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let script = super::codex_guard_hook_path().display().to_string();
+        super::remove_guard_hook_entries(&super::codex_hooks_json_path(), &script, true, None)
+            .unwrap();
+
+        let lost = super::verify_client_setup("codex")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::CODEX_GUARD_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        assert!(super::repair_pages(&lost), "a repeat within a day pages");
+        let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];
+        assert!(
+            !super::repair_pages(&claude),
+            "each cause keeps its own marker"
+        );
+        assert!(super::repair_client_setup_now("codex_cli"), "repaired");
+        assert!(super::codex_guard_registered().unwrap(), "guard back");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn codex_guard_under_another_python_is_stale_not_missing() {
         // RUST-KA: the Codex twin of RUST-GS. An update from 0.9.25 found the
         // guard registered under the old interpreter and reported a repair.
@@ -15759,6 +15843,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
             state.remembered_clients
         );
+    }
+
+    /// The headroom MCP entry follows this: a pause or quit keeps it, only a
+    /// toggle-off drops it, and VS Code counts as Claude Code.
+    #[test]
+    #[serial_test::serial]
+    fn claude_code_connector_wanted_survives_pause_not_toggle_off() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        assert!(!super::claude_code_connector_wanted());
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert!(super::claude_code_connector_wanted());
+        super::clear_client_setups().expect("pause");
+        assert!(super::claude_code_connector_wanted(), "pause comes back");
+        super::disable_client_setup("claude_code").expect("toggle off");
+        assert!(!super::claude_code_connector_wanted());
+
+        super::apply_client_setup("vscode").expect("apply vscode");
+        assert!(super::claude_code_connector_wanted(), "vscode keeps it");
+        super::disable_client_setup("vscode").expect("toggle vscode off");
+        assert!(!super::claude_code_connector_wanted());
     }
 
     /// Finding 38: a 6767 holder Headroom cannot identify (another signed-in

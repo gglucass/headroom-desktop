@@ -13,6 +13,7 @@ import {
   newInputTokensForBar,
   calloutBannerFor,
   outputReductionForWindow,
+  outputSavingsNote,
   compactNumber,
   connectorDashboardStatus,
   connectorGateBlocksEnable,
@@ -755,6 +756,34 @@ describe("newInputSavingsRate", () => {
   });
 });
 
+describe("outputSavingsNote", () => {
+  const measured = {
+    method: "measured",
+    reductionPercent: -10.4,
+    ciLowPercent: -14,
+    ciHighPercent: -7,
+    requests: 24_000
+  };
+
+  it("shows a negative measured reduction as 0%, like the output chip", () => {
+    const note = outputSavingsNote(measured);
+    expect(note).toContain("the reduction is 0.0%.");
+    expect(note).not.toContain("-10.4");
+    expect(outputSavingsNote({ ...measured, reductionPercent: 8.7 })).toContain(
+      "the reduction is 8.7%."
+    );
+  });
+
+  it("keeps the estimate wording", () => {
+    expect(outputSavingsNote(null)).toBe(
+      "Estimated: each reply is compared with a baseline learned from your past replies."
+    );
+    expect(
+      outputSavingsNote({ ...measured, method: "estimated", alongsideAddon: "Caveman" })
+    ).toContain("over the 24K requests that baseline covers. It includes what Caveman saves.");
+  });
+});
+
 describe("outputReductionForWindow", () => {
   it("computes reduction over sampled buckets only", () => {
     const pct = outputReductionForWindow([
@@ -776,6 +805,23 @@ describe("outputReductionForWindow", () => {
     ]);
     expect(negative!.pct).toBe(0);
     expect(negative!.savedTokens).toBe(0);
+  });
+
+  it("reads the A/B series on request and floors a longer day at 0%", () => {
+    const points = [
+      {
+        outputSampledTokensSaved: 400,
+        outputBaselineTokens: 1000,
+        outputAbTokensSaved: -150,
+        outputAbBaselineTokens: 1000
+      },
+      { outputSampledTokensSaved: 200, outputBaselineTokens: 1000 }
+    ];
+    expect(outputReductionForWindow(points)!.pct).toBeCloseTo(30);
+    const ab = outputReductionForWindow(points, "ab");
+    expect(ab!.pct).toBe(0);
+    expect(ab!.baselineTokens).toBe(1000);
+    expect(outputReductionForWindow([points[1]], "ab")).toBeNull();
   });
 
   it("returns null without coverage or baseline", () => {

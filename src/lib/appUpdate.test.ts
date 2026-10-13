@@ -403,6 +403,7 @@ describe("app update helpers", () => {
   it.each([
     "error decoding response body", // RUST-HS
     "Download request failed with status: 503 Service Unavailable", // RUST-MQ
+    "Download request failed with status: 618 <unknown status code>", // RUST-Q1
   ])("re-downloads once after a failed download instead of reporting it: %s", async (failure) => {
     vi.mocked(Sentry.captureException).mockClear();
     const invokeFn = vi

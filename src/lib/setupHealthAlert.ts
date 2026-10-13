@@ -403,8 +403,10 @@ export function unroutedBody(client: UnroutedClient): string {
   if (client.diagnosis) {
     return `${client.name}: ${client.diagnosis}`;
   }
+  // Says why and that settings hold no fix: "reconnected, quit and reopen"
+  // alone sent a customer searching settings for weeks (2026-10-12).
   return client.enabled
-    ? `Headroom has reconnected ${client.name}. Quit and reopen it to pick that up.`
+    ? `${client.name} ran in the last day without going through Headroom, usually because it was open before Headroom connected it. Headroom has fixed the connection: quit and reopen ${client.name} (or reload your editor) to save tokens again. Nothing to change in settings.`
     : `${client.name}'s connector is off, so nothing was optimized. Reconnect it to resume saving.`;
 }
 

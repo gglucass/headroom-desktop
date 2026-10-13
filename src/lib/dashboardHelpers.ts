@@ -4,6 +4,7 @@ import type {
   DailySavingsPoint,
   HeadroomPricingStatus,
   HourlySavingsPoint,
+  OutputReduction,
   ProviderSavingsPoint,
   RuntimeStatus
 } from "./types";
@@ -206,22 +207,43 @@ export function newInputSavingsRate(
  * has no coverage or the sampled baseline is zero. A bucket's saved delta is
  * signed (a stretch of replies longer than baseline), so it nets against the
  * rest of the window and only the window total is floored at zero. */
+/** "estimate" scores the window against the shaper's learned baseline, "ab"
+ * against the control group's mean reply of the same kind. */
 export function outputReductionForWindow(
   points: Array<{
     outputSampledTokensSaved?: number | null;
     outputBaselineTokens?: number | null;
-  }>
+    outputAbTokensSaved?: number | null;
+    outputAbBaselineTokens?: number | null;
+  }>,
+  source: "estimate" | "ab" = "estimate"
 ) {
   let saved = 0;
   let baseline = 0;
   for (const point of points) {
-    if (point.outputSampledTokensSaved == null || point.outputBaselineTokens == null) continue;
-    saved += point.outputSampledTokensSaved;
-    baseline += Math.max(0, point.outputBaselineTokens);
+    const pointSaved = source === "ab" ? point.outputAbTokensSaved : point.outputSampledTokensSaved;
+    const pointBaseline = source === "ab" ? point.outputAbBaselineTokens : point.outputBaselineTokens;
+    if (pointSaved == null || pointBaseline == null) continue;
+    saved += pointSaved;
+    baseline += Math.max(0, pointBaseline);
   }
   if (baseline <= 0) return null;
   saved = Math.max(0, saved);
   return { pct: Math.min(100, (saved / baseline) * 100), savedTokens: saved, baselineTokens: baseline };
+}
+
+/** The savings breakdown's output-shaping note. A measured reduction below
+ * zero reads 0%, as on the output chip (`OutputReductionChip`). */
+export function outputSavingsNote(reduction: OutputReduction | null | undefined) {
+  if (reduction?.method === "measured") {
+    const addon = reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : "";
+    return `Estimated against a baseline learned from your past replies. Measured against a control group of unshaped conversations over ${compactNumber(reduction.requests)} requests, the reduction is ${percent1(Math.max(0, reduction.reductionPercent))}%.${addon}`;
+  }
+  const covered = reduction
+    ? `, over the ${compactNumber(reduction.requests)} requests that baseline covers`
+    : "";
+  const addon = reduction?.alongsideAddon ? ` It includes what ${reduction.alongsideAddon} saves.` : "";
+  return `Estimated: each reply is compared with a baseline learned from your past replies${covered}.${addon}`;
 }
 
 export function formatDayLabel(dayKey: string) {

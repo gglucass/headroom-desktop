@@ -269,6 +269,14 @@ pub struct DailySavingsPoint {
     pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
+    /// The same, scored by the A/B holdout: the bucket's shaped replies against
+    /// the control group's mean reply of their stratum
+    /// (`SavingsTracker::sample_output_holdout`). None where the holdout
+    /// scored nothing.
+    #[serde(default)]
+    pub output_ab_tokens_saved: Option<i64>,
+    #[serde(default)]
+    pub output_ab_baseline_tokens: Option<u64>,
     /// `date` is a UTC day: the bucket is a backend rollup (fresh, or archived
     /// at ingest). False for buckets the local tracker keyed by LOCAL day.
     /// Decides whether the reported day ends at UTC or local midnight.
@@ -331,6 +339,11 @@ pub struct HourlySavingsPoint {
     pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
+    /// See `DailySavingsPoint::output_ab_tokens_saved`.
+    #[serde(default)]
+    pub output_ab_tokens_saved: Option<i64>,
+    #[serde(default)]
+    pub output_ab_baseline_tokens: Option<u64>,
     #[serde(default)]
     pub by_provider: Vec<ProviderSavingsPoint>,
 }

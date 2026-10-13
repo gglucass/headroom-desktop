@@ -138,6 +138,7 @@ import {
   newInputSavingsRate,
   calloutBannerFor,
   outputReductionForWindow,
+  outputSavingsNote,
   compactNumber,
   connectorDashboardStatus,
   connectorGateBlocksEnable,
@@ -860,9 +861,17 @@ function WindowRateChip({
 
 // How much of this machine's shaped traffic an output figure speaks for --
 // the chip's confidence row, shown however thin, so a low number reads as low.
+// The holdout's coverage is by output tokens (output_savings.rs).
 function outputCoverageRows(reduction: OutputReduction | null) {
   return reduction?.coveragePercent != null
-    ? [{ dt: "Covers", dd: `${Math.round(reduction.coveragePercent)}% of replies` }]
+    ? [
+        {
+          dt: "Covers",
+          dd: `${Math.round(reduction.coveragePercent)}% of ${
+            reduction.method === "measured" ? "reply tokens" : "replies"
+          }`
+        }
+      ]
     : [];
 }
 
@@ -881,6 +890,11 @@ function OutputReductionChip({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const isMeasured = reduction.method === "measured";
+  // Only a measured figure can be negative: shaped replies came out longer
+  // than the control group's. Shown as 0% with no CI: a 3% holdout is not
+  // yet a measurement to put a "+10%" in front of a user on. The true figure
+  // still reaches the server (`reported_output_reduction`).
+  const longer = reduction.reductionPercent < 0;
 
   useEffect(() => {
     if (!open) return;
@@ -912,7 +926,7 @@ function OutputReductionChip({
         onKeyDown={(e) => e.stopPropagation()}
       >
         <span className="output-chip__dot" aria-hidden="true" />
-        Output −{percent1(reduction.reductionPercent)}%
+        Output {longer ? "0" : `−${percent1(reduction.reductionPercent)}`}%
       </button>
       {open ? (
         <div
@@ -923,18 +937,22 @@ function OutputReductionChip({
         >
           <div className="output-chip__pop-head">
             <span className="output-chip__pop-title">
-              Output token reduction{allTimeFallback ? " · all-time" : ""}
+              Output token reduction · all-time
             </span>
             <span className="output-chip__pop-badge">{isMeasured ? "measured" : "estimated"}</span>
           </div>
-          <div className="output-chip__pop-value">{percent1(reduction.reductionPercent)}%</div>
+          <div className="output-chip__pop-value">
+            {longer ? "0" : percent1(reduction.reductionPercent)}%
+          </div>
           <dl className="output-chip__pop-stats">
-            <div>
-              <dt>95% CI</dt>
-              <dd>
-                {percent1(reduction.ciLowPercent)}–{percent1(reduction.ciHighPercent)}%
-              </dd>
-            </div>
+            {longer ? null : (
+              <div>
+                <dt>95% CI</dt>
+                <dd>
+                  {percent1(reduction.ciLowPercent)} to {percent1(reduction.ciHighPercent)}%
+                </dd>
+              </div>
+            )}
             <div>
               <dt>Requests</dt>
               <dd>{compactNumber(reduction.requests)}</dd>
@@ -948,7 +966,11 @@ function OutputReductionChip({
           </dl>
           <p className="output-chip__pop-note">
             {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
-            {isMeasured && reduction.alongsideAddon
+            {longer
+              ? `No measured reduction yet: shaped replies were no shorter than those of a control group of unshaped conversations, so Headroom claims no output savings.${
+                  reduction.alongsideAddon ? ` ${reduction.alongsideAddon} runs in both groups.` : ""
+                }`
+              : isMeasured && reduction.alongsideAddon
               ? `Output tokens the model skipped because Headroom asked for shorter replies or less effort, on top of what ${reduction.alongsideAddon} saves. Measured against a control group of conversations Headroom leaves unshaped; ${reduction.alongsideAddon} runs in both.`
               : isMeasured
               ? "Output tokens the model skipped because Headroom asked for shorter replies or less effort, measured against a control group of unshaped conversations."
@@ -1033,6 +1055,10 @@ function DailySavingsChart({
   // as "the shaper did nothing" rather than "this window can't be measured".
   const windowOutput = outputReductionForWindow(
     view === "month" ? monthlyWindow : hourlyWindow
+  );
+  const windowOutputAb = outputReductionForWindow(
+    view === "month" ? monthlyWindow : hourlyWindow,
+    "ab"
   );
   const canViewPreviousMonth = firstSavingsMonth ? visibleMonth > firstSavingsMonth : false;
   const canViewNextMonth = visibleMonth < currentMonth;
@@ -1224,6 +1250,11 @@ function DailySavingsChart({
                     note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
+                {/* The per-period estimate is the chip wherever the period has
+                    samples, measured holdout or not: it is the only output
+                    series with history, and the control group (all-time, or
+                    this period's since 0.9.40) rides along in its popover,
+                    floored at 0. */}
                 {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
@@ -1235,19 +1266,35 @@ function DailySavingsChart({
                     rows={[
                       { dt: "Avoided", dd: compactNumber(windowOutput.savedTokens) },
                       { dt: "Baseline", dd: compactNumber(windowOutput.baselineTokens) },
-                      ...(outputReduction
-                        ? [{ dt: "All-time", dd: `${percent1(outputReduction.reductionPercent)}%` }]
+                      ...(windowOutputAb !== null && outputReduction?.method === "measured"
+                        ? [{ dt: "Control, period", dd: `${Math.round(windowOutputAb.pct)}%` }]
                         : []),
-                      ...outputCoverageRows(outputReduction)
+                      ...(outputReduction
+                        ? [
+                            {
+                              dt: outputReduction.method === "measured" ? "Control, all-time" : "All-time",
+                              dd: `${percent1(Math.max(0, outputReduction.reductionPercent))}%`
+                            }
+                          ]
+                        : []),
+                      ...(outputReduction?.method === "measured" ? [] : outputCoverageRows(outputReduction))
                     ]}
                     note={`Estimate vs the shaper's learned baseline, sampled while the app runs.${
+                      outputReduction?.method === "measured"
+                        ? " The control-group rows compare with conversations Headroom leaves unshaped, 0% where shaped replies were no shorter."
+                        : ""
+                    }${
                       outputReduction?.alongsideAddon
                         ? ` Includes what ${outputReduction.alongsideAddon} saves.`
                         : ""
                     }`}
                   />
                 ) : outputReduction ? (
-                  <OutputReductionChip allTimeFallback flip reduction={outputReduction} />
+                  <OutputReductionChip
+                    allTimeFallback
+                    flip
+                    reduction={outputReduction}
+                  />
                 ) : roughOutputTokens > 0 ? (
                   <WindowRateChip
                     dot="output"
@@ -5045,7 +5092,7 @@ export default function App() {
   }
 
 
-  function handleLauncherSurfaceMouseDown(event: MouseEvent<HTMLElement>) {
+  function handleWindowDragMouseDown(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
       return;
     }
@@ -5059,7 +5106,12 @@ export default function App() {
       return;
     }
 
-    void getCurrentWindow().startDragging();
+    const current = getCurrentWindow();
+    // The dashboard's drag goes through Rust, which tells a real move from a
+    // click so only a move stops it opening at the tray icon.
+    void (current.label === "main"
+      ? invoke("start_main_window_drag")
+      : current.startDragging());
   }
 
   const hidingRef = useRef(false);
@@ -5155,7 +5207,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={magicLinkState === "verifying"}
       >
@@ -5397,7 +5449,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={showUpgradeModal}
       >
@@ -5550,7 +5602,7 @@ export default function App() {
         shellClassName="intro-shell"
         spinnerClassName="intro-shell__spinner"
         copyClassName="intro-shell__copy intro-shell__copy--first-run"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
         showSpinner={bootstrapping}
       >
@@ -5734,7 +5786,7 @@ export default function App() {
           shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
           spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
           copyClassName="intro-shell__copy intro-shell__copy--post-install"
-          onMouseDown={handleLauncherSurfaceMouseDown}
+          onMouseDown={handleWindowDragMouseDown}
           version={appSemver}
         >
           <div className="post-install__lead">
@@ -5851,7 +5903,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6051,7 +6103,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--paywall"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="paywall">
@@ -6178,7 +6230,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6293,7 +6345,7 @@ export default function App() {
         shellClassName="intro-shell intro-shell--post-install"
         spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
         copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
+        onMouseDown={handleWindowDragMouseDown}
         version={appSemver}
       >
         <div className="post-install__lead">
@@ -6900,7 +6952,14 @@ export default function App() {
   return (
     <main className="tray-shell">
       {upgradeOverlay}
-      <aside className="tray-sidebar">
+      {/* The sidebar's empty space moves the dashboard on Windows and Linux,
+          like a title bar. macOS keeps the menu-bar popover in place. */}
+      <aside
+        className="tray-sidebar"
+        onMouseDown={
+          navigator.userAgent.includes("Mac") ? undefined : handleWindowDragMouseDown
+        }
+      >
         <div className="tray-sidebar__logo">
           <img src={headroomLogo} alt="Headroom" />
         </div>
@@ -8676,21 +8735,10 @@ export default function App() {
                             the baseline never observed are excluded rather
                             than scored against a global mean. */}
                         <p className="savings-breakdown__note">
-                          {dashboard.outputReduction?.method === "measured"
-                            ? `Measured: a small share of conversations run unshaped as a control group, compared with your other replies over ${compactNumber(dashboard.outputReduction.requests)} requests.${
-                                dashboard.outputReduction.alongsideAddon
-                                  ? ` ${dashboard.outputReduction.alongsideAddon} runs in both groups, so this is Headroom's shaping on top of it.`
-                                  : ""
-                              }`
-                            : `Estimated: each reply is compared with a baseline learned from your past replies${
-                                dashboard.outputReduction
-                                  ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
-                                  : ""
-                              }.${
-                                dashboard.outputReduction?.alongsideAddon
-                                  ? ` It includes what ${dashboard.outputReduction.alongsideAddon} saves.`
-                                  : ""
-                              }`}
+                          {/* The dollars stay on the estimate when the
+                              holdout promotes (state.rs, audit #50), so
+                              this note must not call them measured. */}
+                          {outputSavingsNote(dashboard.outputReduction)}
                         </p>
                       </>
                     ) : null}

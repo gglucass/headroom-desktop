@@ -87,14 +87,34 @@ static CODEX_USAGE_LAST_POLL: AtomicU64 = AtomicU64::new(0);
 /// mask a dead backend.
 static BACKEND_LAST_TRAFFIC_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// The same stamp minus the app's own local paths (/readyz, /stats, ...) and
+/// clients' reachability probes, for the idle update applier. The tray polls
+/// /readyz through this intercept every 5s, so the backend stamp never went a
+/// minute without traffic and no staged update ever applied itself.
+static CLIENT_LAST_TRAFFIC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// True when the backend delivered response bytes within `window`.
 pub fn backend_traffic_within(window: Duration) -> bool {
-    let last = BACKEND_LAST_TRAFFIC_EPOCH.load(Ordering::Acquire);
+    stamped_within(&BACKEND_LAST_TRAFFIC_EPOCH, window)
+}
+
+/// True when the backend delivered response bytes for a client's request
+/// within `window`.
+pub fn client_traffic_within(window: Duration) -> bool {
+    stamped_within(&CLIENT_LAST_TRAFFIC_EPOCH, window)
+}
+
+fn stamped_within(stamp: &AtomicU64, window: Duration) -> bool {
+    let last = stamp.load(Ordering::Acquire);
     last != 0 && now_epoch_secs().saturating_sub(last) <= window.as_secs()
 }
 
-fn stamp_backend_traffic() {
-    BACKEND_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
+fn stamp_backend_traffic(client: bool) {
+    let now = now_epoch_secs();
+    BACKEND_LAST_TRAFFIC_EPOCH.store(now, Ordering::Release);
+    if client {
+        CLIENT_LAST_TRAFFIC_EPOCH.store(now, Ordering::Release);
+    }
 }
 
 /// Provider-bound requests seen by this intercept, per agent, regardless of
@@ -566,9 +586,10 @@ pub fn first_prompt_request_seen() -> bool {
 }
 
 /// AsyncRead wrapper that stamps `BACKEND_LAST_TRAFFIC_EPOCH` whenever the
-/// inner reader yields bytes. Wrapped around the backend->client half of the
-/// splices below.
-struct StampReader<R>(R);
+/// inner reader yields bytes (and `CLIENT_LAST_TRAFFIC_EPOCH` when the bool
+/// says the request was a client's). Wrapped around the backend->client half of
+/// the splices below.
+struct StampReader<R>(R, bool);
 
 impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
     fn poll_read(
@@ -579,7 +600,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            stamp_backend_traffic();
+            stamp_backend_traffic(self.1);
         }
         poll
     }
@@ -932,7 +953,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for CodexTerminalReader<R> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            stamp_backend_traffic();
+            stamp_backend_traffic(true);
             let bytes = &buf.filled()[before..];
             self.observe(bytes);
         }
@@ -2377,8 +2398,16 @@ async fn handle(
             if let Some(id) = savings_session.as_deref() {
                 crate::claude_statusline::record_request(id);
             }
-            let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path)
-                .with_savings_session(savings_session);
+            // The same two kinds of noise must not hold off the idle update.
+            let client_traffic = !parsed_head.as_ref().is_some_and(|head| {
+                is_local_proxy_path(&head.path) || is_client_probe_path(&head.path)
+            });
+            let mut stamped = ResponseSniffer::new(
+                StampReader(backend_rd, client_traffic),
+                client_key,
+                error_path,
+            )
+            .with_savings_session(savings_session);
             let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
             copied
@@ -2688,7 +2717,7 @@ async fn splice_with_codex_capture(
             .map(|err| (err.kind(), head_started.elapsed()));
 
         if read_head.is_ok() {
-            stamp_backend_traffic();
+            stamp_backend_traffic(true);
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
             }
@@ -5325,7 +5354,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
         assert!(!super::backend_traffic_within(Duration::from_secs(10)));
-        super::stamp_backend_traffic();
+        super::stamp_backend_traffic(true);
         assert!(super::backend_traffic_within(Duration::from_secs(10)));
         super::BACKEND_LAST_TRAFFIC_EPOCH.store(
             super::now_epoch_secs().saturating_sub(11),
@@ -5338,14 +5367,21 @@ mod tests {
     #[serial]
     async fn stamp_reader_stamps_on_backend_bytes() {
         use std::sync::atomic::Ordering;
-        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
-        let (mut writer, backend_side) = duplex(64);
-        writer.write_all(b"data: chunk\n\n").await.unwrap();
-        let mut reader = super::StampReader(backend_side);
-        let mut buf = [0u8; 32];
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n, 13);
-        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+        for client in [false, true] {
+            super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+            super::CLIENT_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+            let (mut writer, backend_side) = duplex(64);
+            writer.write_all(b"data: chunk\n\n").await.unwrap();
+            let mut reader = super::StampReader(backend_side, client);
+            let mut buf = [0u8; 32];
+            let n = reader.read(&mut buf).await.unwrap();
+            assert_eq!(n, 13);
+            assert!(super::backend_traffic_within(Duration::from_secs(10)));
+            assert_eq!(
+                super::client_traffic_within(Duration::from_secs(10)),
+                client
+            );
+        }
     }
 
     #[test]
@@ -5863,10 +5899,16 @@ mod tests {
 
         let relays = super::READYZ_RELAYS.load(Ordering::Acquire);
         let failures = super::READYZ_RELAY_FAILURES.load(Ordering::Acquire);
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+        super::CLIENT_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
 
         let answer = probe().await;
         assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
         settled(relays + 1).await;
+        // The watchdog still sees the answer; the idle update applier, fed the
+        // tray's 5s /readyz poll, never went idle before this distinction.
+        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+        assert!(!super::client_traffic_within(Duration::from_secs(10)));
         assert_eq!(
             super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
             failures

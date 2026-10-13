@@ -111,6 +111,12 @@ const MAIN_WINDOW_HEIGHT: u32 = 560;
 /// off 100vh, so the same wider-font/narrower-viewport reflow overflows them.
 #[cfg(not(target_os = "macos"))]
 const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
+/// The dashboard's logical size there, also its minimum once resizable.
+#[cfg(not(target_os = "macos"))]
+const MAIN_WINDOW_DEFAULT_SIZE: (f64, f64) = (
+    MAIN_WINDOW_WIDTH as f64,
+    (MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT) as f64,
+);
 /// Mirrors the `launcher` entry in tauri.conf.json.
 #[cfg(not(target_os = "macos"))]
 const LAUNCHER_WINDOW_WIDTH: u32 = 760;
@@ -957,6 +963,8 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         })
         .collect();
@@ -1234,7 +1242,7 @@ fn spawn_idle_update_applier(app: AppHandle) {
             last_tick_wall = now;
             let requests: u64 = proxy_intercept::intercept_request_counts().values().sum();
             let traffic =
-                last_requests != Some(requests) || proxy_intercept::backend_traffic_within(TICK);
+                last_requests != Some(requests) || proxy_intercept::client_traffic_within(TICK);
             last_requests = Some(requests);
             idle_minutes = idle_minutes_after(idle_minutes, traffic, slept);
             if idle_minutes < IDLE_UPDATE_MINUTES {
@@ -5996,10 +6004,21 @@ async fn apply_client_setup(
     let state: tauri::State<'_, AppState> = app.state();
     // On the blocking pool: verification probes the proxy over blocking HTTP.
     let id = client_id.clone();
-    let applied =
-        tauri::async_runtime::spawn_blocking(move || client_adapters::apply_client_setup(&id))
-            .await
-            .map_err(|err| err.to_string())?;
+    let blocking_app = app.clone();
+    let applied = tauri::async_runtime::spawn_blocking(move || {
+        let applied = client_adapters::apply_client_setup(&id);
+        // Turning it off took the headroom MCP server out of Claude Code's
+        // config (`disable_client_setup`); put it back. Best-effort.
+        if applied.is_ok() && matches!(id.as_str(), "claude_code" | "vscode") {
+            let state: tauri::State<'_, AppState> = blocking_app.state();
+            if let Err(err) = state.tool_manager.restore_claude_headroom_mcp() {
+                log::warn!("restoring the headroom MCP server in Claude Code failed: {err:#}");
+            }
+        }
+        applied
+    })
+    .await
+    .map_err(|err| err.to_string())?;
     match applied {
         Ok(mut result) => {
             if resume_after_write && needs_resume(&state) {
@@ -6335,6 +6354,14 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
     // first and announce the user's own change as a disconnect.
     *LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
     client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
+    // The headroom MCP server goes too (see `claude_code_connector_wanted`).
+    // Here, not in the client_adapters arm: pause and quit run that arm as
+    // well, and they keep the entry. Best-effort; the connector is off.
+    if matches!(client_id.as_str(), "claude_code" | "vscode") {
+        if let Err(err) = tool_manager::remove_headroom_from_claude_json() {
+            log::warn!("removing the headroom MCP server from Claude Code failed: {err:#}");
+        }
+    }
     analytics::track_event(
         &app,
         "client_setup_disabled",
@@ -7817,14 +7844,21 @@ pub fn run() {
             // The launcher needs the same treatment: it is fixed-size too, and
             // the wider system font wrapping its headline to three lines pushed
             // the install screen into `.intro-shell`'s scroll fallback.
+            // The dashboard is also resizable there (issue #153), never below
+            // this frame, and reopens at the size the user left it.
             #[cfg(not(target_os = "macos"))]
             {
                 use tauri::LogicalSize;
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_size(LogicalSize::new(
-                        MAIN_WINDOW_WIDTH,
-                        MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
-                    ));
+                    let placement = load_main_window_placement();
+                    let (width, height) = placement.size.unwrap_or(MAIN_WINDOW_DEFAULT_SIZE);
+                    let _ = window.set_min_size(Some(LogicalSize::new(
+                        MAIN_WINDOW_DEFAULT_SIZE.0,
+                        MAIN_WINDOW_DEFAULT_SIZE.1,
+                    )));
+                    let _ = window.set_resizable(true);
+                    let _ = window.set_size(LogicalSize::new(width, height));
+                    *MAIN_WINDOW_PLACEMENT.lock() = placement;
                 }
                 if let Some(window) = app.get_webview_window("launcher") {
                     let _ = window.set_size(LogicalSize::new(
@@ -8185,6 +8219,7 @@ pub fn run() {
             open_external_link,
             submit_contact_request,
             hide_launcher_animated,
+            start_main_window_drag,
             complete_setup_wizard,
             accept_terms,
             get_autostart_enabled,
@@ -8988,6 +9023,10 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // View details or appeal: https://claude.ai/restricted` -- an
             // account restriction, and the line carries its own appeal link.
             || lower.contains("account is on hold")
+            // RUST-Q2/Q4: Codex relaying OpenAI's `ERROR: Selected model is
+            // at capacity. Please try a different model.` -- the provider out
+            // of capacity for the model the user's Codex config selects.
+            || lower.contains("model is at capacity")
     })
 }
 
@@ -11482,30 +11521,34 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
+            if window.label() != "main" {
+                return;
+            }
             // An update install steals focus with a privilege prompt; hiding
             // underneath it strands the user mid-flow.
-            if INSTALLING_UPDATE.load(Ordering::Acquire) {
-                return;
-            }
             // WSLg has no system tray, so a window hidden on blur had no way
             // back short of relaunching from a terminal.
-            if proxy_intercept::is_wsl() {
-                return;
-            }
-            if window.label() == "main" {
-                let window = window.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
-                    ));
+            let may_hide = !INSTALLING_UPDATE.load(Ordering::Acquire) && !proxy_intercept::is_wsl();
+            let window = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
+                ));
 
-                    let still_unfocused = matches!(window.is_focused(), Ok(false));
-                    let still_visible = matches!(window.is_visible(), Ok(true));
-                    if still_unfocused && still_visible {
-                        let _ = window.hide();
-                    }
-                });
-            }
+                // Windows derives this event from WebView2 focus, which the
+                // start of every sidebar drag also takes while the window
+                // stays focused. Recording there consumed the drag's origin
+                // before the window moved, so no drag was ever saved
+                // (0.9.40-rc.3 on win-test); only a real blur records.
+                if !matches!(window.is_focused(), Ok(false)) {
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                record_main_window_placement(&window);
+                if may_hide && matches!(window.is_visible(), Ok(true)) {
+                    let _ = window.hide();
+                }
+            });
         }
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -11744,7 +11787,13 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         return Err(tauri::Error::WebviewNotFound);
     };
 
-    if let Some(rect) = anchor_rect {
+    // A hide without a blur (Esc, close) leaves its open's drag origin behind.
+    MAIN_WINDOW_DRAG_ORIGIN.lock().take();
+    let saved = user_placed_main_window_position(&window);
+    MAIN_WINDOW_AT_SAVED_SPOT.store(saved.is_some(), Ordering::Release);
+    if let Some(position) = saved {
+        window.set_position(Position::Physical(position))?;
+    } else if let Some(rect) = anchor_rect {
         position_tray_window(&window, rect)?;
     } else {
         #[cfg(target_os = "linux")]
@@ -11805,6 +11854,147 @@ fn hide_launcher_window(app: &AppHandle) -> tauri::Result<()> {
         window.hide()?;
     }
     Ok(())
+}
+
+/// Where the user put the dashboard on Windows and Linux, which had no way to
+/// move or resize it (issue #153). macOS keeps the menu-bar popover: anchored
+/// under the status item on every open, fixed size, never recorded here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct MainWindowPlacement {
+    /// Physical outer position, set by the first sidebar drag. While None
+    /// every open anchors to the tray icon.
+    position: Option<(i32, i32)>,
+    /// Logical inner size, None at the default size.
+    size: Option<(f64, f64)>,
+}
+
+static MAIN_WINDOW_PLACEMENT: Mutex<MainWindowPlacement> = Mutex::new(MainWindowPlacement {
+    position: None,
+    size: None,
+});
+/// Whether the dashboard stands at its saved position: this open restored it,
+/// or a drag put it there. False while it is anchored to the tray.
+static MAIN_WINDOW_AT_SAVED_SPOT: AtomicBool = AtomicBool::new(false);
+/// Outer position when the user grabbed the sidebar, so a click that never
+/// moved the window does not pin it away from the tray.
+static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
+
+#[tauri::command]
+async fn start_main_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    note_main_window_drag_start(window.outer_position().ok());
+    window.start_dragging().map_err(|err| err.to_string())
+}
+
+/// Keeps the FIRST grab since the last focus loss: a later click that never
+/// moved the window (or either half of a title-bar double-click) re-read the
+/// origin at the dragged-to spot, and the drag was forgotten.
+fn note_main_window_drag_start(at: Option<PhysicalPosition<i32>>) {
+    if let Some(at) = at {
+        MAIN_WINDOW_DRAG_ORIGIN.lock().get_or_insert(at);
+    }
+}
+
+/// The saved position, while its top-left corner (the logo the user drags it
+/// by) is on a connected monitor. An unplugged display falls back to the tray.
+fn user_placed_main_window_position(
+    window: &tauri::WebviewWindow,
+) -> Option<PhysicalPosition<i32>> {
+    let (x, y) = MAIN_WINDOW_PLACEMENT.lock().position?;
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .map(monitor_bounds_from_monitor)
+        .any(|bounds| point_within_monitor(bounds, x.saturating_add(40), y.saturating_add(40)))
+        .then(|| PhysicalPosition::new(x, y))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main_window_placement_path() -> std::path::PathBuf {
+    storage::config_file(&storage::app_data_dir(), "window-placement.json")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_main_window_placement() -> MainWindowPlacement {
+    let path = main_window_placement_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return MainWindowPlacement::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        log::warn!("window placement: unreadable, using the default: {err}");
+        let _ = std::fs::copy(&path, path.with_extension("json.corrupt"));
+        MainWindowPlacement::default()
+    })
+}
+
+/// Runs once the dashboard has really lost focus, just before the blur hides it.
+#[cfg(not(target_os = "macos"))]
+fn record_main_window_placement(window: &Window) {
+    // Taken first so an origin never outlives the focus it was grabbed in.
+    let drag_origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
+    // Maximized (Aero Snap: dragged to the top edge) it stands at about
+    // (-8,-8) at the work area's size; saved, the next launch opened a normal
+    // window that size with three resize edges off-screen.
+    if window.is_minimized().unwrap_or(false) || window.is_maximized().unwrap_or(false) {
+        return;
+    }
+    let (Ok(position), Ok(size), Ok(scale)) = (
+        window.outer_position(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
+        return;
+    };
+    let size = size.to_logical::<f64>(scale);
+    let mut placement = MAIN_WINDOW_PLACEMENT.lock();
+    let next = next_main_window_placement(
+        *placement,
+        MAIN_WINDOW_AT_SAVED_SPOT.load(Ordering::Acquire),
+        drag_origin,
+        position,
+        (size.width, size.height),
+        MAIN_WINDOW_DEFAULT_SIZE,
+    );
+    MAIN_WINDOW_AT_SAVED_SPOT.store(
+        next.position == Some((position.x, position.y)),
+        Ordering::Release,
+    );
+    if next == *placement {
+        return;
+    }
+    *placement = next;
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        if let Err(err) = client_adapters::atomic_write(&main_window_placement_path(), &bytes) {
+            log::warn!("window placement: saving failed: {err}");
+        }
+    }
+}
+
+/// While the window stands at its saved spot (`at_saved`), its position is
+/// wherever it is now (a later drag, or a resize from its left or top edge).
+/// Otherwise only a drag that actually moved it places it, and the saved
+/// spot is kept: an open that fell back to the tray because that spot's
+/// monitor was unplugged must not overwrite it with the tray's.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn next_main_window_placement(
+    previous: MainWindowPlacement,
+    at_saved: bool,
+    drag_origin: Option<PhysicalPosition<i32>>,
+    position: PhysicalPosition<i32>,
+    size: (f64, f64),
+    default_size: (f64, f64),
+) -> MainWindowPlacement {
+    let moved = drag_origin.is_some_and(|origin| origin != position);
+    let size = (size.0.round(), size.1.round());
+    MainWindowPlacement {
+        position: if at_saved || moved {
+            Some((position.x, position.y))
+        } else {
+            previous.position
+        },
+        size: (size != default_size).then_some(size),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12192,6 +12382,8 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            output_ab_tokens_saved: None,
+            output_ab_baseline_tokens: None,
             utc_keyed: false,
         }
     }
@@ -13416,6 +13608,126 @@ mod tests {
 
         assert_eq!(target.x, 0);
         assert_eq!(target.y, 10);
+    }
+
+    #[test]
+    fn only_a_drag_that_moved_the_dashboard_unpins_it_from_the_tray() {
+        use super::{next_main_window_placement, MainWindowPlacement, PhysicalPosition};
+        let at = |x, y| PhysicalPosition::new(x, y);
+        let default_size = (760.0, 632.0);
+        // Within one open: at the saved spot exactly when one is saved.
+        let place = |previous: MainWindowPlacement, origin, position, size| {
+            let at_saved = previous.position.is_some();
+            next_main_window_placement(previous, at_saved, origin, position, size, default_size)
+        };
+        let anchored = MainWindowPlacement::default();
+
+        // A click on the sidebar that never moved it, or plain focus loss.
+        assert_eq!(
+            place(anchored, Some(at(5, 5)), at(5, 5), default_size),
+            anchored
+        );
+        assert_eq!(place(anchored, None, at(9, 9), default_size), anchored);
+
+        // A real drag, then a resize from the left edge without one.
+        let dragged = place(anchored, Some(at(5, 5)), at(300, 200), default_size);
+        assert_eq!(dragged.position, Some((300, 200)));
+        assert_eq!(dragged.size, None);
+        let resized = place(dragged, None, at(250, 200), (810.2, 700.0));
+        assert_eq!(resized.position, Some((250, 200)));
+        assert_eq!(resized.size, Some((810.0, 700.0)));
+
+        // The saved spot's monitor was unplugged, so this open anchored to
+        // the tray: losing focus there keeps the saved spot for the next open
+        // rather than saving the tray's.
+        let fell_back = next_main_window_placement(
+            resized,
+            false,
+            None,
+            at(10, 10),
+            (810.0, 700.0),
+            default_size,
+        );
+        assert_eq!(fell_back.position, Some((250, 200)));
+        // Dragged from there, the new spot is saved.
+        let moved_on = next_main_window_placement(
+            resized,
+            false,
+            Some(at(10, 10)),
+            at(40, 60),
+            (810.0, 700.0),
+            default_size,
+        );
+        assert_eq!(moved_on.position, Some((40, 60)));
+
+        // Every field is optional, so an older or newer file still loads.
+        let parsed: MainWindowPlacement =
+            serde_json::from_str(r#"{"size":[900.0,700.0],"later":1}"#).unwrap();
+        assert_eq!(parsed.position, None);
+        assert_eq!(parsed.size, Some((900.0, 700.0)));
+    }
+
+    #[test]
+    fn a_click_after_a_drag_keeps_the_drag() {
+        use super::{
+            next_main_window_placement, note_main_window_drag_start, MainWindowPlacement,
+            PhysicalPosition, MAIN_WINDOW_DRAG_ORIGIN,
+        };
+        let at = |x, y| PhysicalPosition::new(x, y);
+        *MAIN_WINDOW_DRAG_ORIGIN.lock() = None;
+        // Dragged from (5,5) to (300,200), then the sidebar clicked in place
+        // before the dashboard lost focus.
+        note_main_window_drag_start(Some(at(5, 5)));
+        note_main_window_drag_start(Some(at(300, 200)));
+        let origin = MAIN_WINDOW_DRAG_ORIGIN.lock().take();
+        let placed = next_main_window_placement(
+            MainWindowPlacement::default(),
+            false,
+            origin,
+            at(300, 200),
+            (760.0, 632.0),
+            (760.0, 632.0),
+        );
+        assert_eq!(placed.position, Some((300, 200)));
+    }
+
+    /// Windows reports the dashboard's focus from WebView2, and the start of
+    /// every sidebar drag takes it while the window stays focused: recording
+    /// on that event consumed the drag's origin before the window moved, so
+    /// no drag was ever saved (0.9.40-rc.3 on win-test). Needs a real window,
+    /// so this pins the order in source: placement is recorded only after the
+    /// delayed still-unfocused check the blur-hide already relies on.
+    #[test]
+    fn placement_records_only_on_a_blur_that_outlasts_the_hide_delay() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, handler) = source
+            .split_once("fn handle_window_event(")
+            .expect("handler present");
+        let handler = &handler[..handler.find("\n}\n").expect("handler end")];
+        let delay = handler
+            .find("MAIN_WINDOW_BLUR_HIDE_DELAY_MS")
+            .expect("blur delay");
+        let recheck = handler.find("window.is_focused()").expect("recheck");
+        let record = handler
+            .find("record_main_window_placement(")
+            .expect("records placement");
+        assert!(delay < recheck && recheck < record, "{handler}");
+        assert_eq!(handler.matches("record_main_window_placement(").count(), 1);
+    }
+
+    /// Dragged to the top edge on Windows, the resizable dashboard snaps to
+    /// maximized at (-8,-8) and the work area's size (win-test, 0.9.40-rc.3);
+    /// recording that frame reopened it as a normal window filling the screen.
+    #[test]
+    fn placement_skips_a_maximized_dashboard() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, record) = source
+            .split_once("fn record_main_window_placement(")
+            .expect("record present");
+        let record = &record[..record.find("\n}\n").expect("record end")];
+        let guard = record.find("is_maximized()").expect("maximized guard");
+        let read = record.find("window.outer_position()").expect("reads frame");
+        assert!(guard < read, "{record}");
     }
 
     #[test]
@@ -15834,6 +16146,8 @@ Some unrelated content.
             "Usage credits are required for long context requests.",
             // RUST-M8 verbatim: an account restriction with its own appeal link.
             "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
+            // RUST-Q2/Q4 verbatim, from `codex exec`.
+            "ERROR: Selected model is at capacity. Please try a different model.",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
