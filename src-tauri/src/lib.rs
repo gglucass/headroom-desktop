@@ -11500,34 +11500,34 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
 fn handle_window_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Focused(false) => {
-            #[cfg(not(target_os = "macos"))]
-            if window.label() == "main" {
-                record_main_window_placement(window);
+            if window.label() != "main" {
+                return;
             }
             // An update install steals focus with a privilege prompt; hiding
             // underneath it strands the user mid-flow.
-            if INSTALLING_UPDATE.load(Ordering::Acquire) {
-                return;
-            }
             // WSLg has no system tray, so a window hidden on blur had no way
             // back short of relaunching from a terminal.
-            if proxy_intercept::is_wsl() {
-                return;
-            }
-            if window.label() == "main" {
-                let window = window.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
-                    ));
+            let may_hide = !INSTALLING_UPDATE.load(Ordering::Acquire) && !proxy_intercept::is_wsl();
+            let window = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    MAIN_WINDOW_BLUR_HIDE_DELAY_MS,
+                ));
 
-                    let still_unfocused = matches!(window.is_focused(), Ok(false));
-                    let still_visible = matches!(window.is_visible(), Ok(true));
-                    if still_unfocused && still_visible {
-                        let _ = window.hide();
-                    }
-                });
-            }
+                // Windows derives this event from WebView2 focus, which the
+                // start of every sidebar drag also takes while the window
+                // stays focused. Recording there consumed the drag's origin
+                // before the window moved, so no drag was ever saved
+                // (0.9.40-rc.3 on win-test); only a real blur records.
+                if !matches!(window.is_focused(), Ok(false)) {
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                record_main_window_placement(&window);
+                if may_hide && matches!(window.is_visible(), Ok(true)) {
+                    let _ = window.hide();
+                }
+            });
         }
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -11766,6 +11766,8 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         return Err(tauri::Error::WebviewNotFound);
     };
 
+    // A hide without a blur (Esc, close) leaves its open's drag origin behind.
+    MAIN_WINDOW_DRAG_ORIGIN.lock().take();
     let saved = user_placed_main_window_position(&window);
     MAIN_WINDOW_AT_SAVED_SPOT.store(saved.is_some(), Ordering::Release);
     if let Some(position) = saved {
@@ -11905,7 +11907,7 @@ fn load_main_window_placement() -> MainWindowPlacement {
     })
 }
 
-/// Runs as the dashboard loses focus, which precedes every hide.
+/// Runs once the dashboard has really lost focus, just before the blur hides it.
 #[cfg(not(target_os = "macos"))]
 fn record_main_window_placement(window: &Window) {
     // Taken first so an origin never outlives the focus it was grabbed in.
@@ -13661,6 +13663,30 @@ mod tests {
             (760.0, 632.0),
         );
         assert_eq!(placed.position, Some((300, 200)));
+    }
+
+    /// Windows reports the dashboard's focus from WebView2, and the start of
+    /// every sidebar drag takes it while the window stays focused: recording
+    /// on that event consumed the drag's origin before the window moved, so
+    /// no drag was ever saved (0.9.40-rc.3 on win-test). Needs a real window,
+    /// so this pins the order in source: placement is recorded only after the
+    /// delayed still-unfocused check the blur-hide already relies on.
+    #[test]
+    fn placement_records_only_on_a_blur_that_outlasts_the_hide_delay() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, handler) = source
+            .split_once("fn handle_window_event(")
+            .expect("handler present");
+        let handler = &handler[..handler.find("\n}\n").expect("handler end")];
+        let delay = handler
+            .find("MAIN_WINDOW_BLUR_HIDE_DELAY_MS")
+            .expect("blur delay");
+        let recheck = handler.find("window.is_focused()").expect("recheck");
+        let record = handler
+            .find("record_main_window_placement(")
+            .expect("records placement");
+        assert!(delay < recheck && recheck < record, "{handler}");
+        assert_eq!(handler.matches("record_main_window_placement(").count(), 1);
     }
 
     #[test]
