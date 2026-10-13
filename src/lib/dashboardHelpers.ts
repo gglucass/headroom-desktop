@@ -206,18 +206,25 @@ export function newInputSavingsRate(
  * has no coverage or the sampled baseline is zero. A bucket's saved delta is
  * signed (a stretch of replies longer than baseline), so it nets against the
  * rest of the window and only the window total is floored at zero. */
+/** "estimate" scores the window against the shaper's learned baseline, "ab"
+ * against the control group's mean reply of the same kind. */
 export function outputReductionForWindow(
   points: Array<{
     outputSampledTokensSaved?: number | null;
     outputBaselineTokens?: number | null;
-  }>
+    outputAbTokensSaved?: number | null;
+    outputAbBaselineTokens?: number | null;
+  }>,
+  source: "estimate" | "ab" = "estimate"
 ) {
   let saved = 0;
   let baseline = 0;
   for (const point of points) {
-    if (point.outputSampledTokensSaved == null || point.outputBaselineTokens == null) continue;
-    saved += point.outputSampledTokensSaved;
-    baseline += Math.max(0, point.outputBaselineTokens);
+    const pointSaved = source === "ab" ? point.outputAbTokensSaved : point.outputSampledTokensSaved;
+    const pointBaseline = source === "ab" ? point.outputAbBaselineTokens : point.outputBaselineTokens;
+    if (pointSaved == null || pointBaseline == null) continue;
+    saved += pointSaved;
+    baseline += Math.max(0, pointBaseline);
   }
   if (baseline <= 0) return null;
   saved = Math.max(0, saved);
