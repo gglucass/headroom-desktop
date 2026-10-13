@@ -3699,6 +3699,62 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's buffered stream:false request.
         pass
 
+# --- Prefix tracker: a deferred tool load is not a new conversation -----------
+# The tracker lineage is keyed on a fingerprint of the cache-key segments
+# before the messages, the whole `tools` array included. Claude Code appends
+# every tool ToolSearch loads to `tools`, still marked defer_loading, and
+# Anthropic leaves deferred tools out of the cached prompt (a direct session
+# keeps reading its cache across the load). The proxy saw a new conversation:
+# a fresh tracker, frozen=0, and the whole history re-run through the
+# pipeline, whose output differs from the bytes already cached (reads that
+# were recent then and are older now, a background Kompress result), so the
+# message tier was re-written. On one machine over 5 days, the turn after a
+# deferred load missed big 21.9% of the time against 0.4% for every other
+# turn: 53 misses, 9.2M tokens, 12% of all cache writes (2026-10-13). The
+# fingerprint now leaves deferred tools out, as Anthropic's key does; a change
+# to any tool the prompt renders still starts a new lineage. RAISES cache reads,
+# tokens saved unchanged in aggregate, so check cache_read per request with
+# savings:did after the stable ships.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel's
+# fingerprint already ignores a deferred tool. Kill switch:
+# HEADROOM_DEFERRED_TOOL_AFFINITY=0.
+_hd_dta_flag = _hd_os.environ.get("HEADROOM_DEFERRED_TOOL_AFFINITY", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_dta_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_dta_meta
+
+        if _hd_dta_meta.version("headroom-ai") == "0.39.0":
+            from headroom.cache import prefix_tracker as _hd_dta_pt
+
+            _hd_dta_orig = _hd_dta_pt.segment_fingerprint
+
+            def _hd_dta_fingerprint(value):
+                if isinstance(value, dict) and isinstance(value.get("tools"), list):
+                    value = {
+                        **value,
+                        "tools": [
+                            t
+                            for t in value["tools"]
+                            if not (isinstance(t, dict) and t.get("defer_loading"))
+                        ],
+                    }
+                return _hd_dta_orig(value)
+
+            _hd_dta_tool = {"name": "Read", "input_schema": {"type": "object"}}
+            _hd_dta_deferred = {"name": "x", "defer_loading": True, "input_schema": {}}
+            if _hd_dta_orig({"tools": [_hd_dta_tool]}) != _hd_dta_orig(
+                {"tools": [_hd_dta_tool, _hd_dta_deferred]}
+            ):
+                # The handler imports the name at call time, so the module
+                # attribute is the one it reads.
+                _hd_dta_pt.segment_fingerprint = _hd_dta_fingerprint
+                _hd_bound.add("deferred_tool_affinity")
+    except Exception:
+        # Fail-open to the wheel's fingerprint.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3822,6 +3878,7 @@ _HD_VENDORS = (
     "held_read_breakpoint",
     "web_search_history",
     "buffered_upstream_stream",
+    "deferred_tool_affinity",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -19538,6 +19595,60 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
                 && off.ends_with("True False application/json False False"),
             "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn deferred_tool_affinity_behaves_against_the_installed_wheel() {
+        // A tool ToolSearch loads joins `tools` with defer_loading and keeps
+        // the conversation on its tracker; a rendered tool still splits it.
+        // The kill switch restores the wheel's split on both.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-deferred-aff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sitecustomize\n\
+                     from headroom.cache import prefix_tracker as pt\n\
+                     R = {'name': 'Read', 'input_schema': {'type': 'object'}}\n\
+                     D = {'name': 'mcp__x__search', 'defer_loading': True, 'input_schema': {}}\n\
+                     W = {'name': 'Write', 'input_schema': {'type': 'object'}}\n\
+                     def aff(tools):\n    \
+                         return pt.segment_fingerprint({'model': 'm', 'tools': tools, 'tool_choice': None, 'thinking': None, 'output_config': None})\n\
+                     s = pt.SessionTrackerStore()\n\
+                     m = [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'ok'}]\n\
+                     t1 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R]))\n\
+                     m = m + [{'role': 'user', 'content': 'go'}]\n\
+                     t2 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D]))\n\
+                     m = m + [{'role': 'assistant', 'content': 'k'}]\n\
+                     t3 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D, W]))\n\
+                     print(t1 is t2, t2 is t3, 'deferred_tool_affinity' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_DEFERRED_TOOL_AFFINITY", kill)
+                .output()
+                .expect("run deferred tool affinity probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: deferred tool affinity vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True False True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False False", "stderr:\n{off_err}");
     }
 
     #[test]
