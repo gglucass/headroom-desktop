@@ -9002,6 +9002,10 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // View details or appeal: https://claude.ai/restricted` -- an
             // account restriction, and the line carries its own appeal link.
             || lower.contains("account is on hold")
+            // RUST-Q2/Q4: Codex relaying OpenAI's `ERROR: Selected model is
+            // at capacity. Please try a different model.` -- the provider out
+            // of capacity for the model the user's Codex config selects.
+            || lower.contains("model is at capacity")
     })
 }
 
@@ -15999,6 +16003,8 @@ Some unrelated content.
             "Usage credits are required for long context requests.",
             // RUST-M8 verbatim: an account restriction with its own appeal link.
             "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
+            // RUST-Q2/Q4 verbatim, from `codex exec`.
+            "ERROR: Selected model is at capacity. Please try a different model.",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
