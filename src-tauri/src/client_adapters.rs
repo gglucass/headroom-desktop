@@ -2428,7 +2428,10 @@ fn command_under_dir_for(command: &str, dir: &str, windows: bool) -> bool {
 /// `command` is a string with `args` beside it in Claude's config and one
 /// array in OpenCode's.
 fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
-    if name == "headroom" {
+    if name == "headroom"
+        || entry.get("url").and_then(Value::as_str)
+            == Some(crate::tool_manager::CONTEXT7_HOSTED_URL)
+    {
         return true;
     }
     let launch: Vec<&str> = match entry.get("command") {
@@ -2594,7 +2597,12 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
             };
             value?.as_str().map(str::to_owned)
         });
+        let hosted = toml::from_str::<toml::Table>(line)
+            .ok()
+            .and_then(|line| line.get("url")?.as_str().map(str::to_owned))
+            .is_some_and(|url| url == crate::tool_manager::CONTEXT7_HOSTED_URL);
         if name == "headroom"
+            || hosted
             || launch
                 .as_deref()
                 .is_some_and(mcp_command_in_headroom_footprint)
@@ -11640,6 +11648,34 @@ mod tests {
         assert!(!super::remove_headroom_mcp_json_entries(
             untouched.as_object_mut().unwrap()
         ));
+    }
+
+    #[test]
+    fn mcp_cleanup_removes_our_hosted_context7_and_keeps_a_users_own() {
+        let url = crate::tool_manager::CONTEXT7_HOSTED_URL;
+        let mut servers = json!({
+            "context7": { "type": "http", "url": url },
+            "docs": { "type": "http", "url": "https://mcp.context7.com/mcp" },
+        });
+        let map = servers.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(
+            map.get("docs").is_some(),
+            "the user's own hosted entry stays"
+        );
+
+        let content = format!(
+            "# --- Headroom MCP server: context7 ---\n\
+             [mcp_servers.context7]\n\
+             url = \"{url}\"\n\
+             # --- end Headroom MCP server: context7 ---\n\
+             [mcp_servers.docs]\n\
+             url = \"https://mcp.context7.com/mcp\"\n"
+        );
+        let stripped = super::strip_headroom_mcp_toml(&content);
+        assert!(!stripped.contains("via=headroom"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.docs]"));
     }
 
     #[test]

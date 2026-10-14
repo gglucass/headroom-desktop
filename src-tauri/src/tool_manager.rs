@@ -4035,6 +4035,10 @@ const SERENA_PINNED_VERSION: &str = "1.7.0";
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
 const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
+/// Context7's own hosted MCP server. The server ignores `via=headroom`; it is
+/// how uninstall tells this entry from one a user added by hand, which
+/// Context7's own docs tell them to do.
+pub(crate) const CONTEXT7_HOSTED_URL: &str = "https://mcp.context7.com/mcp?via=headroom";
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -4126,10 +4130,15 @@ if failures:
     sys.exit("; ".join(failures))
 "#;
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
-/// the Context7 MCP entry: a bare `node` (resolved from the agent session's
-/// own PATH, so nvm version switches don't strand an absolute path) running
-/// the managed package's script. argv: `register <script>` | `unregister`.
+/// the Context7 MCP entry: Context7's hosted server (`CONTEXT7_HOSTED_URL`)
+/// for Claude Code, Codex and OpenCode, and for Grok, which has no URL
+/// servers, a bare `node` (resolved from the agent session's own PATH, so nvm
+/// version switches don't strand an absolute path) running the managed
+/// package's script. The wheel's registrars only write command servers, so
+/// this process teaches them the URL form each agent's config uses.
+/// argv: `register <url> [<script>]` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
+import dataclasses
 import sys
 
 from headroom.mcp_registry import (
@@ -4139,13 +4148,105 @@ from headroom.mcp_registry import (
     OpencodeRegistrar,
     ServerSpec,
 )
-from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry import claude as claude_mod
+from headroom.mcp_registry import codex as codex_mod
+from headroom.mcp_registry import ledger as ledger_mod
+from headroom.mcp_registry import opencode as opencode_mod
+from headroom.mcp_registry.base import RegisterResult, RegisterStatus
 from headroom.mcp_registry.ledger import (
     clear_install,
     headroom_installed_matching,
     record_install,
 )
 
+
+@dataclasses.dataclass
+class UrlSpec(ServerSpec):
+    url: str = ""
+
+
+def url_of(spec):
+    return getattr(spec, "url", "")
+
+
+def parse_url_entries(parse, is_url):
+    def wrapped(name, entry):
+        if isinstance(entry, dict) and isinstance(entry.get("url"), str) and is_url(entry):
+            return UrlSpec(name=name, command="", url=entry["url"])
+        return parse(name, entry)
+    return wrapped
+
+
+def compare_urls(equivalent):
+    return lambda a, b: equivalent(a, b) and url_of(a) == url_of(b)
+
+
+def diff_urls(diff):
+    def wrapped(existing, requested):
+        if url_of(existing) != url_of(requested):
+            return f"url {url_of(existing)!r} -> {url_of(requested)!r}"
+        return diff(existing, requested)
+    return wrapped
+
+
+for module in (claude_mod, codex_mod, opencode_mod):
+    module._specs_equivalent = compare_urls(module._specs_equivalent)
+    module._diff_specs = diff_urls(module._diff_specs)
+claude_mod._entry_to_spec = parse_url_entries(claude_mod._entry_to_spec, lambda e: True)
+codex_mod._entry_to_spec = parse_url_entries(codex_mod._entry_to_spec, lambda e: True)
+opencode_mod._entry_to_spec = parse_url_entries(
+    opencode_mod._entry_to_spec, lambda e: e.get("type") == "remote"
+)
+
+render_codex = codex_mod._render_block
+
+
+def codex_block(spec):
+    if not url_of(spec):
+        return render_codex(spec)
+    return "\n".join((
+        codex_mod._marker_start(spec.name),
+        f"[mcp_servers.{spec.name}]",
+        f"url = {codex_mod._toml_str(spec.url)}",
+        codex_mod._marker_end(spec.name),
+    ))
+
+
+codex_mod._render_block = codex_block
+
+claude_entry = claude_mod._spec_to_entry
+claude_mod._spec_to_entry = lambda spec: (
+    {"type": "http", "url": spec.url} if url_of(spec) else claude_entry(spec)
+)
+opencode_entry = opencode_mod._spec_to_entry
+opencode_mod._spec_to_entry = lambda spec: (
+    {"type": "remote", "url": spec.url, "enabled": True} if url_of(spec) else opencode_entry(spec)
+)
+
+claude_via_cli = ClaudeRegistrar._register_via_cli
+
+
+def claude_url_via_cli(self, spec):
+    if not url_of(spec):
+        return claude_via_cli(self, spec)
+    done = claude_mod.run(
+        [str(self._claude_cli), "mcp", "add", "--transport", "http", "-s", "user",
+         spec.name, spec.url],
+        capture_output=True, text=True, env=self._claude_cli_env(),
+    )
+    if done.returncode == 0:
+        return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add --transport http`")
+    return self._register_via_file(spec)
+
+
+ClaudeRegistrar._register_via_cli = claude_url_via_cli
+
+fingerprint = ledger_mod.spec_fingerprint
+ledger_mod.spec_fingerprint = lambda spec: fingerprint(
+    ServerSpec(name=spec.name, command="url:" + url_of(spec)) if url_of(spec) else spec
+)
+
+URL_AGENTS = {"claude", "codex", "opencode"}
 action = sys.argv[1]
 failures = []
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
@@ -4153,9 +4254,13 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         print(f"{registrar.name}: not detected, skipping")
         continue
     if action == "register":
-        # node.exe is a real executable, so no agent needs the `cmd /c`
-        # wrapper on Windows that the npx.cmd shim did.
-        spec = ServerSpec(name="context7", command="node", args=(sys.argv[2],))
+        if registrar.name in URL_AGENTS:
+            spec = UrlSpec(name="context7", command="", url=sys.argv[2])
+        elif len(sys.argv) > 3:
+            spec = ServerSpec(name="context7", command="node", args=(sys.argv[3],))
+        else:
+            print(f"{registrar.name}: no local Context7 package, skipping")
+            continue
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("context7")
@@ -4929,7 +5034,7 @@ impl ToolManager {
                 id: "context7".into(),
                 name: "Context7".into(),
                 description:
-                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js 20.18.1 or newer on PATH."
+                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Uses Context7's hosted server; only Grok runs it locally, which needs Node.js 20.18.1 or newer."
                         .into(),
                 runtime: "node".into(),
                 source_url: "https://github.com/upstash/context7".into(),
@@ -10336,42 +10441,61 @@ impl ToolManager {
         self.runtime.tools_dir.join("context7.json").exists()
     }
 
-    /// npm installs the pinned package into the tools dir and the agents run
-    /// it as `node <script>`: one process per agent session. Through `npx` it
-    /// was four on Windows (cmd, npm's node, cmd, node: ~150 MB and ~1.8 CPU-s
-    /// each), and every agent session starts its own copy of every MCP server.
-    /// The ChatGPT app runs one per open thread and subagent, so about eleven
-    /// at once pinned a customer's CPU with 80 processes (2026-10-13). A broken
-    /// entry would make every new session spawn a failing server, hence the
-    /// smoke test before registering.
+    /// Claude Code, Codex and OpenCode reach Context7's hosted server
+    /// (`CONTEXT7_HOSTED_URL`): no process per agent session and no Node.js.
+    /// Every agent session starts its own copy of every local MCP server, and
+    /// through `cmd /c npx` Context7 was four processes per session on Windows
+    /// (~150 MB, ~1.8 CPU-s): about eleven ChatGPT-app sessions at once pinned
+    /// a customer's CPU with 80 processes (2026-10-13). Only Grok, which has
+    /// no URL servers, runs the pinned package, as one `node <script>`.
     pub fn install_context7(&self) -> Result<()> {
-        let script = self.install_context7_package()?;
-        self.register_context7_mcp(&script)?;
-        self.write_context7_receipt(true)
+        let package = self.register_context7(grok_home_present())?;
+        self.write_context7_receipt(true, package)
     }
 
     pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
         if !self.context7_installed() {
             bail!("context7 is not installed");
         }
-        if enabled {
-            let script = match context7_script_in(&self.context7_package_dir()) {
-                Some(script) => script,
-                None => self.install_context7_package()?,
-            };
-            self.register_context7_mcp(&script)?;
+        let package = if enabled {
+            self.register_context7(grok_home_present())?
         } else {
             self.unregister_context7_mcp()?;
-        }
-        self.write_context7_receipt(enabled)
+            false
+        };
+        self.write_context7_receipt(enabled, package)
     }
 
-    /// `package` marks a receipt written after this code registered the
-    /// managed script, so a launch knows the agents no longer run npx.
-    fn write_context7_receipt(&self, enabled: bool) -> Result<()> {
+    /// Registers the hosted entry and, when Grok is there, the local package,
+    /// installing it if missing. Returns whether Grok got it; a Grok without
+    /// Node.js only misses Context7, the other agents are unaffected. A broken
+    /// local entry would make every Grok session spawn a failing server, hence
+    /// the package's smoke test before registering it.
+    fn register_context7(&self, grok: bool) -> Result<bool> {
+        let script = match grok.then(|| context7_script_in(&self.context7_package_dir())) {
+            None => None,
+            Some(Some(script)) => Some(script),
+            Some(None) => self
+                .install_context7_package()
+                .map_err(|err| log::warn!("context7 for Grok: {err:#}"))
+                .ok(),
+        };
+        self.register_context7_mcp(script.as_deref())?;
+        Ok(script.is_some())
+    }
+
+    /// `hosted` marks a receipt written after this code registered the hosted
+    /// entry, `package` one where Grok got the local package too, so a launch
+    /// knows what the agents run.
+    fn write_context7_receipt(&self, enabled: bool, package: bool) -> Result<()> {
         self.write_tool_receipt(
             "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled, "package": true }),
+            json!({
+                "version": CONTEXT7_PINNED_VERSION,
+                "enabled": enabled,
+                "hosted": true,
+                "package": package,
+            }),
         )
     }
 
@@ -10439,40 +10563,42 @@ impl ToolManager {
         Ok(script)
     }
 
-    /// Installs from before the managed package (0.9.41) registered
-    /// `cmd /c npx -y ...`; an enabled one moves over at launch, as does one
-    /// left on an older pinned version. A failure (offline, npm missing) keeps
-    /// the old entry working as it did, and the next launch tries again.
-    pub fn ensure_context7_package(&self) {
-        if !self.context7_needs_package_move() {
+    /// Installs from before the hosted entry run `cmd /c npx -y ...` or
+    /// `node <script>`; an enabled one moves over at launch, and a Grok still
+    /// without its package retries. A failure keeps the old entry working, and
+    /// the next launch tries again.
+    pub fn ensure_context7_registration(&self) {
+        let grok = grok_home_present();
+        if !self.context7_needs_move(grok) {
             return;
         }
         match self
-            .install_context7_package()
-            .and_then(|script| self.register_context7_mcp(&script))
-            .and_then(|()| self.write_context7_receipt(true))
+            .register_context7(grok)
+            .and_then(|package| self.write_context7_receipt(true, package))
         {
-            Ok(()) => log::info!("context7 moved to the managed package"),
-            Err(err) => log::warn!("moving context7 to the managed package failed: {err:#}"),
+            Ok(()) => log::info!("context7 moved to the hosted server"),
+            Err(err) => log::warn!("moving context7 to the hosted server failed: {err:#}"),
         }
     }
 
-    /// Keyed on the receipt, not on the package being there: npm can finish
-    /// while the registration fails (a registrar error, the 60s helper
-    /// timeout, a quit), and the agents then still run the old npx entry.
-    fn context7_needs_package_move(&self) -> bool {
-        let moved = self
-            .read_tool_receipt("context7")
-            .and_then(|receipt| receipt.get("package")?.as_bool())
-            == Some(true);
+    /// Keyed on the receipt, not on what is on disk: a registration can fail
+    /// after npm finished (a registrar error, the 60s helper timeout, a quit),
+    /// and the agents then still run the old entry.
+    fn context7_needs_move(&self, grok: bool) -> bool {
+        let receipt = self.read_tool_receipt("context7");
+        let flag = |key: &str| receipt.as_ref().and_then(|r| r.get(key)?.as_bool()) == Some(true);
+        let grok_served = !grok
+            || (flag("package") && context7_script_in(&self.context7_package_dir()).is_some());
         self.context7_installed()
             && self.tool_enabled("context7")
-            && !(moved && context7_script_in(&self.context7_package_dir()).is_some())
+            && !(flag("hosted") && grok_served)
     }
 
-    fn register_context7_mcp(&self, script: &Path) -> Result<()> {
-        let script = script.to_string_lossy();
-        self.run_mcp_helper(&["-c", CONTEXT7_MCP_HELPER, "register", &script])
+    fn register_context7_mcp(&self, script: Option<&Path>) -> Result<()> {
+        let script = script.map(|script| script.to_string_lossy().into_owned());
+        let mut args = vec!["-c", CONTEXT7_MCP_HELPER, "register", CONTEXT7_HOSTED_URL];
+        args.extend(script.as_deref());
+        self.run_mcp_helper(&args)
             .context("registering context7 MCP server")
     }
 
@@ -15193,6 +15319,15 @@ fn addon_summary_in(tools: &Path) -> Option<String> {
     } else {
         addons.join(",")
     })
+}
+
+/// Grok has no URL servers, so it is the one agent that still runs Context7's
+/// package locally. Same test as the wheel's `GrokRegistrar.detect`.
+fn grok_home_present() -> bool {
+    std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::client_adapters::home_dir().join(".grok"))
+        .is_dir()
 }
 
 fn context7_package_spec() -> String {
@@ -27040,16 +27175,21 @@ Always run the linter first.
     }
 
     #[test]
-    fn context7_package_move_retries_until_a_registration_lands() {
+    fn context7_move_retries_until_its_registration_lands() {
         let (_root, runtime, manager) = seed_test_runtime("context7-move");
-        assert!(!manager.context7_needs_package_move(), "not installed");
+        assert!(!manager.context7_needs_move(false), "not installed");
         let receipt =
             |body: &str| fs::write(runtime.tools_dir.join("context7.json"), body).unwrap();
-        // An npx-era receipt moves over.
+        // npx- and node-era receipts move over.
         receipt(r#"{"version":"4.0.6","enabled":true}"#);
-        assert!(manager.context7_needs_package_move());
-        // npm finished but the registration failed: the agents still run npx,
-        // so the package being there must not end the retries.
+        assert!(manager.context7_needs_move(false));
+        receipt(r#"{"version":"4.0.6","enabled":true,"package":true}"#);
+        assert!(manager.context7_needs_move(false));
+        manager.write_context7_receipt(true, false).unwrap();
+        assert!(!manager.context7_needs_move(false));
+        // With Grok there it moves until the package is registered and present:
+        // npm can finish while the registration after it fails.
+        assert!(manager.context7_needs_move(true));
         let package = runtime
             .tools_dir
             .join("context7-mcp/node_modules/@upstash/context7-mcp");
@@ -27061,14 +27201,14 @@ Always run the linter first.
                 .to_string(),
         )
         .unwrap();
-        assert!(manager.context7_needs_package_move());
-        manager.write_context7_receipt(true).unwrap();
-        assert!(!manager.context7_needs_package_move());
-        // A package that went missing moves again; a disabled one never does.
+        assert!(manager.context7_needs_move(true));
+        manager.write_context7_receipt(true, true).unwrap();
+        assert!(!manager.context7_needs_move(true));
         fs::remove_file(package.join("dist/index.js")).unwrap();
-        assert!(manager.context7_needs_package_move());
-        manager.write_context7_receipt(false).unwrap();
-        assert!(!manager.context7_needs_package_move());
+        assert!(manager.context7_needs_move(true));
+        // A disabled one never moves.
+        manager.write_context7_receipt(false, false).unwrap();
+        assert!(!manager.context7_needs_move(true));
     }
 
     #[test]
@@ -27129,66 +27269,94 @@ Always run the linter first.
         assert_eq!(super::context7_script_in(prefix.path()), None);
     }
 
+    /// The real helper against the installed wheel's registrars, in a scratch
+    /// home: hosted entries for Claude Code, Codex and OpenCode, the local
+    /// script for Grok, an npx-era entry replaced, a rerun a no-op, and
+    /// unregister removing all of it. No `claude` on PATH, so nothing reaches
+    /// the real CLI or the real configs.
     #[test]
-    fn context7_helper_registers_node_with_the_managed_script() {
-        // One `node` process per agent session on every platform: no npx, and
-        // on Windows no `cmd /c` (an npx.cmd shim needed one, and made four
-        // processes per session out of one server).
-        // Stub registrars print the spec the real helper registers.
-        let probe = r#"import os, sys, types, enum
-S = enum.Enum("S", {"REGISTERED": "registered", "MISMATCH": "mismatch", "FAILED": "failed"})
-class R:
-    name = "claude"
-    def detect(self): return True
-    def register_server(self, spec, force=False):
-        print("SPEC", spec.command, *spec.args)
-        return types.SimpleNamespace(status=S.REGISTERED, detail=None)
-class Off(R):
-    def detect(self): return False
-reg = types.ModuleType("headroom.mcp_registry")
-reg.ClaudeRegistrar, reg.CodexRegistrar, reg.GrokRegistrar, reg.OpencodeRegistrar = R, Off, Off, Off
-reg.ServerSpec = types.SimpleNamespace
-base = types.ModuleType("base"); base.RegisterStatus = S
-led = types.ModuleType("ledger")
-led.clear_install = led.record_install = lambda *a: None
-led.headroom_installed_matching = lambda *a: False
-sys.modules.update({"headroom": types.ModuleType("headroom"), "headroom.mcp_registry": reg,
-    "headroom.mcp_registry.base": base, "headroom.mcp_registry.ledger": led})
-sys.platform = sys.argv.pop(1)
-exec(os.environ["HELPER"])
-"#;
-        let spec = |platform: &str| {
-            let out = crate::proc::command("python3")
-                .args([
-                    "-c",
-                    probe,
-                    platform,
-                    "register",
-                    "/tools/context7/index.js",
-                ])
-                .env("HELPER", super::CONTEXT7_MCP_HELPER)
+    fn context7_helper_registers_hosted_entries_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [
+            ".codex",
+            ".claude",
+            ".grok",
+            ".config/opencode",
+            ".headroom",
+        ] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
                 .output()
-                .ok()?;
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            assert!(
-                out.status.success(),
-                "{stdout}{}",
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            stdout
-                .lines()
-                .find(|l| l.starts_with("SPEC "))
-                .map(str::to_owned)
+            assert!(out.status.success(), "{text}");
+            text
         };
-        let Some(windows) = spec("win32") else {
-            eprintln!("skipping: no python3 on PATH");
-            return;
-        };
-        assert_eq!(windows, "SPEC node /tools/context7/index.js");
+        // An npx-era install, recorded in the ledger like the old helper did.
+        run(&[
+            "-c",
+            r#"from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, OpencodeRegistrar, ServerSpec
+from headroom.mcp_registry.ledger import record_install
+old = ServerSpec(name="context7", command="npx", args=("-y", "@upstash/context7-mcp@4.0.6"))
+for r in (ClaudeRegistrar(claude_cli=None), CodexRegistrar(), OpencodeRegistrar()):
+    assert r.register_server(old).ok
+    record_install(r.name, old)"#,
+        ]);
+        let script = "/tools/context7-mcp/dist/index.js";
+        let helper = super::CONTEXT7_MCP_HELPER;
+        let url = super::CONTEXT7_HOSTED_URL;
+        let first = run(&["-c", helper, "register", url, script]);
+        for agent in [
+            "claude: registered",
+            "codex: registered",
+            "grok: registered",
+            "opencode: registered",
+        ] {
+            assert!(first.contains(agent), "{first}");
+        }
+        let read = |path: &str| std::fs::read_to_string(home.path().join(path)).unwrap();
+        let claude: serde_json::Value = serde_json::from_str(&read(".claude.json")).unwrap();
         assert_eq!(
-            spec("darwin").as_deref(),
-            Some("SPEC node /tools/context7/index.js")
+            claude["mcpServers"]["context7"],
+            serde_json::json!({ "type": "http", "url": url })
         );
+        let codex = read(".codex/config.toml");
+        assert!(codex.contains(&format!("url = \"{url}\"")), "{codex}");
+        assert!(!codex.contains("npx"), "{codex}");
+        let opencode: serde_json::Value =
+            serde_json::from_str(&read(".config/opencode/opencode.json")).unwrap();
+        assert_eq!(opencode["mcp"]["context7"]["type"], "remote");
+        assert_eq!(opencode["mcp"]["context7"]["url"], url);
+        let grok = read(".grok/config.toml");
+        assert!(
+            grok.contains("command = \"node\"") && grok.contains(script),
+            "{grok}"
+        );
+
+        let again = run(&["-c", helper, "register", url, script]);
+        assert!(!again.contains(": registered"), "a rerun rewrote: {again}");
+        let gone = run(&["-c", helper, "unregister"]);
+        assert_eq!(gone.matches(": removed").count(), 4, "{gone}");
+        assert!(!read(".codex/config.toml").contains("context7"));
+        assert!(!read(".claude.json").contains("context7"));
     }
 
     #[test]
