@@ -1087,13 +1087,6 @@ impl AppState {
         *self.runtime_upgrade_in_progress.lock() = true;
         self.invalidate_runtime_status_cache();
 
-        // We're about to stop the old backend and spawn a fresh one. Suppress
-        // Codex reconnect warnings across the whole reinstall+boot so the
-        // self-inflicted down->up transition isn't paged as `backend_unreachable`.
-        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
-            std::time::Duration::from_secs(600),
-        );
-
         // Clear the flag on EVERY exit, including a panic anywhere in the
         // ~500-line body below. This runs on a bare spawned thread with no
         // catch_unwind and parking_lot mutexes don't poison, so without this
@@ -3961,18 +3954,6 @@ impl AppState {
         let lock_held = _lifecycle_guard.is_some();
         let reap_own_children =
             lock_held || crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire);
-        // Every app-initiated stop is a down window we caused: a watchdog
-        // restart, a pricing-gate pause, a port rebind, quit. The down->up
-        // transition that follows is not an outage worth paging, and when the
-        // stop came from the watchdog auto-pause it duplicates
-        // `proxy_unreachable_post_boot` with none of its diagnostics
-        // (RUST-5J/5D). A backend that dies on its own never routes through
-        // here, so genuine crashes still report. The window has to outlast a
-        // cold boot (tiktoken prefetch alone gets 120s); the upgrade path
-        // above uses 600s for a reinstall+boot.
-        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
-            std::time::Duration::from_secs(300),
-        );
         // `starting` belongs to the transition holding the lifecycle lock. An
         // unguarded stop clearing it mid-spawn told the watchdog the runtime
         // should be up, so 15s later it hung-killed the spawn it should have
