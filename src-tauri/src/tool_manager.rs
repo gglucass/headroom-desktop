@@ -4284,7 +4284,7 @@ const PLUGIN_DISPLAY_VERSION: &str = "latest";
 /// Plugin addons whose Codex build needs `client_adapters::set_codex_skill_nudge`
 /// to run every session, with the skill name Codex knows them by. Ponytail's
 /// Codex build ships its own session hooks.
-const CODEX_SKILL_NUDGES: [(&str, &str); 2] =
+pub(crate) const CODEX_SKILL_NUDGES: [(&str, &str); 2] =
     [("chisle", "chisle:chisle"), ("caveman", "caveman:caveman")];
 
 fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
