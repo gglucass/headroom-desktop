@@ -6083,6 +6083,7 @@ async fn apply_client_setup(
             // 28) writes are unwritable-file environment issues, not app bugs --
             // surface to the user but keep them out of Sentry.
             if !msg.starts_with("Automatic setup is not supported yet")
+                && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
                 && !client_adapters::is_permission_denied(&err)
                 && !client_adapters::is_no_space(&err)
             {

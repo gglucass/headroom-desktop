@@ -392,6 +392,12 @@ pub fn is_no_space(err: &anyhow::Error) -> bool {
         .any(|code| NO_SPACE_OS_ERRORS.contains(code))
 }
 
+/// Every settings-file parse refusal says this. The file is the user's and
+/// already invalid for the client that owns it, so leaving it alone is the
+/// correct branch, never a defect to report (RUST-6X, RUST-Q7/Q8).
+pub(crate) const UNPARSEABLE_SETTINGS: &str =
+    "refusing to overwrite potentially valid user settings";
+
 /// True when the error chain contains an io InvalidData -- in practice a
 /// `read_to_string` on a file that isn't valid UTF-8 (RUST-5X: a latin-1
 /// ~/.bashrc). Rewriting such a file would mangle the user's own bytes, so the
@@ -11346,10 +11352,13 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
     }
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
-        Err(_) => {
+        Err(strict) => {
+            // serde_json's line and column go in the message the user sees:
+            // json5 points one element early on a missing comma ("expected
+            // boolean or null" at the string before it, RUST-Q7/Q8).
             let value = json5::from_str(raw).with_context(|| {
                 format!(
-                    "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+                    "parsing {} failed ({strict}); {UNPARSEABLE_SETTINGS}",
                     path.display()
                 )
             })?;
@@ -11887,6 +11896,13 @@ mod tests {
         let raw = "{\n    \"chat.viewSessions.orientation\": \"stacked\"\n    \"a\": 1\n}\n";
         let err = parse_json_object(raw, Path::new("settings.json")).expect_err("missing comma");
         assert_eq!(vscode_settings_failure_level(&err), log::Level::Info);
+        // RUST-Q7/Q8: the message the user sees names the line to fix.
+        let shown = err.to_string();
+        assert!(
+            shown.contains("expected `,` or `}` at line 3 column 5"),
+            "{shown}"
+        );
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
 
         let io = anyhow::Error::from(std::io::Error::other("denied")).context("writing settings");
         assert_eq!(vscode_settings_failure_level(&io), log::Level::Warn);
