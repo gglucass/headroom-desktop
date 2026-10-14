@@ -1595,6 +1595,13 @@ pub fn list_client_connectors(
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
+    disable_client_setup_with(client_id, true)
+}
+
+/// `forget: false` unwires the client but keeps it in the restore snapshot
+/// (`remembered_*`, `setup_versions`): the pause/quit/crash path, which must
+/// bring it back on the next launch however far it got.
+fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
     let _setup = setup_write_lock();
     let mut state = load_setup_state();
 
@@ -1683,6 +1690,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         }
     }
 
+    let kept = (!forget).then(|| {
+        (
+            state.remembered_clients.clone(),
+            state.remembered_shell_files.clone(),
+            state.setup_versions.clone(),
+        )
+    });
     match client_id {
         "codex" | "codex_cli" => {
             state.configured_clients.remove("codex");
@@ -1726,6 +1740,11 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove(state_id);
         }
+    }
+    if let Some((clients, shell_files, versions)) = kept {
+        state.remembered_clients = clients;
+        state.remembered_shell_files = shell_files;
+        state.setup_versions = versions;
     }
     write_setup_state(&state)?;
     Ok(())
@@ -1815,40 +1834,57 @@ pub fn unwire_clients_after_crash(intercept_answers: impl FnOnce() -> bool) -> V
     state.configured_clients.into_keys().collect()
 }
 
-fn clear_and_remember_client_setups() -> Result<()> {
-    // Capture snapshot before disabling. We re-apply it afterwards because
-    // disable_client_setup also clears remembered_clients as a side effect,
-    // which would otherwise erase the snapshot we need for restore_client_setups.
+/// What a clear must bring back on the next launch: everything configured
+/// plus whatever an earlier clear already remembered, so a second clear is
+/// idempotent (after a pause only `remembered_clients` holds the set, and
+/// pause then Cmd-Q used to lose every connector). `setup_versions` lets the
+/// restore tell an update from a relaunch (configured_at in
+/// apply_client_setup).
+struct RestoreSnapshot {
+    clients: BTreeMap<String, String>,
+    shell_files: BTreeMap<String, Vec<String>>,
+    versions: BTreeMap<String, String>,
+}
+
+fn restore_snapshot() -> RestoreSnapshot {
     let pre = load_setup_state();
-    // Merge with any prior snapshot so a second clear is idempotent: after a
-    // pause, configured_clients is already empty and only remembered_clients
-    // holds the restore set — a quit-time clear must not wipe it (pause then
-    // Cmd-Q used to permanently lose all connectors).
-    let mut snapshot_clients = pre.remembered_clients.clone();
-    snapshot_clients.extend(pre.configured_clients.clone());
-    let mut snapshot_shell_files = pre.remembered_shell_files.clone();
-    snapshot_shell_files.extend(pre.managed_shell_files.clone());
-    // Kept so the next launch's restore can tell an update from a relaunch
-    // (see configured_at in apply_client_setup).
-    let snapshot_versions = pre.setup_versions.clone();
+    let mut clients = pre.remembered_clients;
+    clients.extend(pre.configured_clients);
+    let mut shell_files = pre.remembered_shell_files;
+    shell_files.extend(pre.managed_shell_files);
+    RestoreSnapshot {
+        clients,
+        shell_files,
+        versions: pre.setup_versions,
+    }
+}
 
+fn save_restore_snapshot(snapshot: &RestoreSnapshot) -> Result<()> {
+    if snapshot.clients.is_empty() {
+        return Ok(());
+    }
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    state.remembered_clients = snapshot.clients.clone();
+    state.remembered_shell_files = snapshot.shell_files.clone();
+    state.setup_versions = snapshot.versions.clone();
+    write_setup_state(&state)
+}
+
+fn clear_and_remember_client_setups() -> Result<()> {
+    // Saved before the disables, which keep it: the Windows installer kills
+    // every headroom-desktop.exe, the crash guard included, so this can stop
+    // between any two disables, and a client already unwired must still come
+    // back on the next launch. Saved only afterwards, the guard killed after
+    // its Claude Code disable left Claude Code direct for good (win-test,
+    // 2026-10-14).
+    let snapshot = restore_snapshot();
+    save_restore_snapshot(&snapshot)?;
     for spec in MANAGED_CLIENT_SPECS {
-        let _ = disable_client_setup(spec.id);
+        let _ = disable_client_setup_with(spec.id, false);
     }
-    let _ = disable_client_setup("codex_gui");
-
-    // Re-save the remembered snapshot so restore_client_setups works on next launch.
-    if !snapshot_clients.is_empty() {
-        // Only here: disable_client_setup above takes the lock itself.
-        let _setup = setup_write_lock();
-        let mut state = load_setup_state();
-        state.remembered_clients = snapshot_clients;
-        state.remembered_shell_files = snapshot_shell_files;
-        state.setup_versions = snapshot_versions;
-        write_setup_state(&state)?;
-    }
-
-    Ok(())
+    let _ = disable_client_setup_with("codex_gui", false);
+    save_restore_snapshot(&snapshot)
 }
 
 /// Fully uninstalls Headroom's on-disk footprint on a best-effort basis:
@@ -15973,6 +16009,35 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "claude_code dropped from configured_clients, got: {:?}",
             post.configured_clients
         );
+    }
+
+    /// What the crash guard leaves when the Windows installer kills it after
+    /// its first disable: the snapshot saved, Claude Code unwired, nothing
+    /// after. The next launch must still re-wire Claude Code.
+    #[test]
+    #[serial_test::serial]
+    fn a_clear_killed_after_its_first_disable_still_restores_that_client() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        super::save_restore_snapshot(&super::restore_snapshot()).unwrap();
+        super::disable_client_setup_with("claude_code", false).unwrap();
+        let state = super::load_setup_state();
+        assert!(!state.configured_clients.contains_key("claude_code"));
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "unwired but forgotten, got: {:?}",
+            state.remembered_clients
+        );
+
+        // A toggle-off still forgets it.
+        super::disable_client_setup("claude_code").unwrap();
+        assert!(!super::load_setup_state()
+            .remembered_clients
+            .contains_key("claude_code"));
     }
 
     #[test]
