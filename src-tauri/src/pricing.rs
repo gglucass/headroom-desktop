@@ -3062,9 +3062,12 @@ const CLAUDE_JSON_PLAN_SOURCE: &str = "claude_json.oauthAccount";
 /// The plan Claude Code cached for its signed-in account in `~/.claude.json`
 /// (`oauthAccount`, the same org fields the live profile carries). Readable
 /// before any request has gone through the proxy. Only with the Claude Code
-/// connector on: a Codex-only user can carry an old login there.
+/// connector on: a Codex-only user can carry an old login there. The
+/// remembered snapshot counts: quit empties the configured set until
+/// `restore_client_setups`, and the launch-time Unknown stood for the profile
+/// cache's 5 minutes.
 fn claude_json_plan_tier() -> Option<(ClaudePlanTier, Option<String>)> {
-    if !crate::client_adapters::is_claude_code_enabled() {
+    if !crate::client_adapters::claude_code_connector_wanted() {
         return None;
     }
     let raw =
@@ -8030,6 +8033,37 @@ mod tests {
                 .is_none()
         );
         assert_eq!(persisted(), (None, None));
+    }
+
+    /// Right after a relaunch only the remembered snapshot holds Claude Code
+    /// (quit empties the configured set), and the plan must still be read.
+    #[test]
+    #[serial_test::serial]
+    fn claude_json_plan_is_read_before_setups_are_restored() {
+        let env = AuthedTestEnv::new("session-xyz");
+        std::fs::write(
+            env._scratch.path().join(".claude.json"),
+            r#"{"oauthAccount":{"organizationRateLimitTier":"default_claude_max_20x",
+                "organizationType":"claude_max"}}"#,
+        )
+        .unwrap();
+        let setup =
+            crate::storage::config_file(&crate::storage::app_data_dir(), "client-setup.json");
+        let write_setup = |remembered: &str| {
+            std::fs::write(
+                &setup,
+                format!(r#"{{"configuredClients":{{}},"rememberedClients":{{{remembered}}}}}"#),
+            )
+            .unwrap()
+        };
+
+        write_setup("");
+        assert!(super::claude_json_plan_tier().is_none(), "connector off");
+        write_setup(r#""claude_code":"2026-10-14T00:00:00Z""#);
+        assert!(matches!(
+            super::claude_json_plan_tier(),
+            Some((ClaudePlanTier::Max20x, _))
+        ));
     }
 
     /// The ~/.claude.json plan (no live bearer) is display-only: a Pro there
