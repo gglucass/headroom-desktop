@@ -623,7 +623,12 @@ fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
         RELAY_IDLE_LIMIT.as_secs(),
         open.as_secs()
     );
-    if !should_report_throttled(&IDLE_RELAY_CLOSED_LAST_REPORTED) {
+    // Open clearly less than the idle limit (a minute of slack for the two
+    // clocks' granularity) yet idle past it: the idle time is mostly a system
+    // sleep, which kills every connection. Closing it is right; reporting it
+    // would bury the leaks this report exists to find.
+    let slept = open + Duration::from_secs(60) < RELAY_IDLE_LIMIT;
+    if slept || !should_report_throttled(&IDLE_RELAY_CLOSED_LAST_REPORTED) {
         return;
     }
     sentry::with_scope(
