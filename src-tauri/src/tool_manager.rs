@@ -11073,7 +11073,13 @@ impl ToolManager {
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
-const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again.";
+// macOS ships a /usr/bin/git stub that only works through Apple's developer
+// tools, so a Mac fixes it there, not at git-scm.com (RUST-P0).
+const NO_GIT_FOR_PLUGIN: &str = if cfg!(target_os = "macos") {
+    "Git is not working on this Mac. Claude Code and Codex need it to download this addon: run `xcode-select --install` in Terminal (or update Xcode), then restart Headroom and try again."
+} else {
+    "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again."
+};
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
@@ -16220,12 +16226,18 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("'git' not found")
         || (lower.contains("failed to run git") && lower.contains("program not found"))
+        || lower.contains("failed to locate 'git'")
+        || lower.contains("xcrun: error: invalid active developer path")
     {
         // Claude Code and Codex clone a marketplace with git, and the host has
         // none (RUST-P0: Windows, Claude Code's "Command 'git' not found or is
         // in an unsafe location", Codex's "failed to run git clone ...: program
-        // not found"). Checked first: the install that follows then fails
-        // "not found in marketplace", which names only the consequence.
+        // not found"), or macOS's /usr/bin/git stub has no working developer
+        // tools behind it (RUST-P0 on 0.9.40: an Xcode out of step with macOS,
+        // "xcode-select: Failed to locate 'git'"; after a macOS upgrade, xcrun's
+        // "invalid active developer path"). Checked first: the install that
+        // follows then fails "not found in marketplace", which names only the
+        // consequence.
         "git-missing"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
@@ -28437,6 +28449,26 @@ exit 0
                  ~\\AppData\\Local\\OpenAI\\Codex\\bin\\2e5e00daee91c61d\\codex.exe plugin add \
                  caveman@caveman\nstdout:\n\nstderr:\nError: plugin `caveman` was not found in \
                  marketplace `caveman`",
+                "git-missing",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\nAdding \
+                 marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: Failed to \
+                 clone marketplace repository: Error loading required libraries.\nxcode-select: \
+                 Failed to locate 'git', requesting installation of command line developer \
+                 tools.\n: command failed (exit 1): ~/.local/bin/claude plugin install \
+                 chisle@chisle\nstdout:\n\nstderr:\n\u{2718} Failed to install plugin \
+                 \"chisle@chisle\": Plugin \"chisle\" not found in marketplace \"chisle\"",
+                "git-missing",
+            ),
+            (
+                "Codex: marketplace add failed first: command failed (exit 1): codex plugin \
+                 marketplace add JayPokale/Chisle\nstdout:\n\nstderr:\nError: git clone \
+                 https://github.com/JayPokale/Chisle.git failed with status exit status: 1\n\
+                 stderr:\nxcrun: error: invalid active developer path \
+                 (/Library/Developer/CommandLineTools), missing xcrun at: \
+                 /Library/Developer/CommandLineTools/usr/bin/xcrun",
                 "git-missing",
             ),
             ("Codex: something we have not seen", "other"),
