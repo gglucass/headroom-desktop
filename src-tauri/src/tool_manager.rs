@@ -4305,17 +4305,47 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
 fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Option<String> {
     let installed = installed?;
     match id {
-        // Plugins track a moving marketplace, not a pin, so there is no local
-        // signal for "newer exists" — the Update action is the check. It always
-        // shows for an installed plugin, and the button says just "Update".
-        _ if plugin_addon(id).is_some() => Some(String::new()),
-        "markitdown" | "serena" | "context7" | "codebase-memory" => {
-            let on_disk = parse_major_minor_patch(installed)?;
-            let target = parse_major_minor_patch(pinned)?;
-            (on_disk < target).then(|| pinned.to_string())
-        }
-        _ => None,
+        "markitdown" | "serena" | "context7" | "codebase-memory" => {}
+        // Plugins track a moving marketplace, so their pin is the newest
+        // plugin.json on GitHub (`plugin_latest_version`), empty until the
+        // first fetch lands.
+        _ if plugin_addon(id).is_some() => {}
+        _ => return None,
     }
+    let on_disk = parse_major_minor_patch(installed)?;
+    let target = parse_major_minor_patch(pinned)?;
+    (on_disk < target).then(|| pinned.to_string())
+}
+
+/// How long a fetched plugin version stands before the next background fetch.
+const PLUGIN_LATEST_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Newest plugin.json version per plugin addon id. The Instant is when the
+/// last fetch started, so a slow or failed one is not retried on every poll.
+type PluginLatestCache =
+    Arc<Mutex<Option<(Instant, std::collections::HashMap<&'static str, String>)>>>;
+
+/// `version` from the plugin.json at the default branch of `repo`
+/// (`owner/repo`), the commit `plugin marketplace update` moves to. Every
+/// plugin addon keeps its plugin at the marketplace root.
+fn fetch_plugin_version(repo: &str) -> Option<String> {
+    // proxy-ok: public GitHub, not loopback
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("headroom-desktop/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let manifest: Value = client
+        .get(format!(
+            "https://raw.githubusercontent.com/{repo}/HEAD/.claude-plugin/plugin.json"
+        ))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    manifest.get("version")?.as_str().map(str::to_string)
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
     "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
@@ -4586,6 +4616,7 @@ pub struct ToolManager {
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
     serena_live_stats_cache: SerenaLiveStatsCache,
+    plugin_latest_cache: PluginLatestCache,
     /// False once this app process has tried to start the backend at least
     /// once. See its use in `start_headroom_background`.
     first_backend_start: Arc<std::sync::atomic::AtomicBool>,
@@ -4956,6 +4987,7 @@ impl ToolManager {
             log_marker_cache: Arc::new(Mutex::new(None)),
             serena_calls_cache: Arc::new(Mutex::new(None)),
             serena_live_stats_cache: Arc::new(Mutex::new(None)),
+            plugin_latest_cache: Arc::new(Mutex::new(None)),
             first_backend_start: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
@@ -4971,11 +5003,18 @@ impl ToolManager {
                 // it back on. Enable first, then update.
                 let pending = enabled
                     .then(|| {
-                        pending_addon_update(&manifest.id, installed.as_deref(), &manifest.version)
-                            .or_else(|| {
+                        let pin = match plugin_addon(&manifest.id) {
+                            Some(plugin) if installed.is_some() => {
+                                self.plugin_latest_version(plugin).unwrap_or_default()
+                            }
+                            _ => manifest.version.clone(),
+                        };
+                        pending_addon_update(&manifest.id, installed.as_deref(), &pin).or_else(
+                            || {
                                 (manifest.id == "serena" && self.serena_lacks_uvx())
                                     .then(String::new)
-                            })
+                            },
+                        )
                     })
                     .flatten();
                 let update_available = pending.is_some();
@@ -4998,6 +5037,35 @@ impl ToolManager {
                 }
             })
             .collect()
+    }
+
+    /// The newest version of `plugin` on GitHub. Called from every dashboard
+    /// poll, so it only reads the cache and refreshes it on a background
+    /// thread once stale. None until a fetch lands: no Update button beats a
+    /// wrong one.
+    fn plugin_latest_version(&self, plugin: &PluginAddon) -> Option<String> {
+        let mut cache = self.plugin_latest_cache.lock();
+        if cache
+            .as_ref()
+            .is_none_or(|(started, _)| started.elapsed() >= PLUGIN_LATEST_TTL)
+        {
+            let known = cache
+                .take()
+                .map(|(_, versions)| versions)
+                .unwrap_or_default();
+            *cache = Some((Instant::now(), known));
+            let shared = Arc::clone(&self.plugin_latest_cache);
+            thread::spawn(move || {
+                for plugin in &PLUGIN_ADDONS {
+                    if let Some(version) = fetch_plugin_version(plugin.marketplace) {
+                        if let Some((_, versions)) = shared.lock().as_mut() {
+                            versions.insert(plugin.id, version);
+                        }
+                    }
+                }
+            });
+        }
+        cache.as_ref()?.1.get(plugin.id).cloned()
     }
 
     /// The version actually on disk, from whichever record the addon's own
@@ -25043,16 +25111,22 @@ Always run the linter first.
             None
         );
 
-        // Plugins track a marketplace, so the action is the check: offered
-        // whenever installed, with no version to advertise.
+        // Plugins are pinned to the newest plugin.json on GitHub: offered only
+        // when that is ahead of the install, never before the first fetch.
         assert_eq!(
-            pending_addon_update("ponytail", Some("4.7.0"), PLUGIN_DISPLAY_VERSION).as_deref(),
-            Some("")
+            pending_addon_update("ponytail", Some("4.9.0"), "5.2.0").as_deref(),
+            Some("5.2.0")
         );
         assert_eq!(
-            pending_addon_update("caveman", None, PLUGIN_DISPLAY_VERSION),
+            pending_addon_update("ponytail", Some("5.2.0"), "5.2.0"),
             None
         );
+        assert_eq!(pending_addon_update("ponytail", Some("4.9.0"), ""), None);
+        assert_eq!(
+            pending_addon_update("chisle", Some("4.9.0"), PLUGIN_DISPLAY_VERSION),
+            None
+        );
+        assert_eq!(pending_addon_update("caveman", None, "4.0.1"), None);
 
         // Self-maintaining: rtk is refreshed at launch, headroom rides the
         // runtime upgrade. Neither gets an Update button, stale or not.
