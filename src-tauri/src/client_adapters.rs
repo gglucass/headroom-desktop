@@ -2141,6 +2141,13 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
+    // The plugin addons' Codex skill nudges: uninstall_and_quit removes them
+    // through ToolManager::uninstall_plugin, which `--uninstall` does not have.
+    for (id, skill) in crate::tool_manager::CODEX_SKILL_NUDGES {
+        if let Err(err) = set_codex_skill_nudge(id, skill, false) {
+            log::warn!("cleanup: removing {id} AGENTS.md block failed: {err}");
+        }
+    }
     // MarkItDown's nudges, Bash rule and conversion cache: uninstall_and_quit
     // removes them through the ToolManager, which `--uninstall` does not have.
     // The unix shim path (ToolManager::markitdown_shim_path); Windows has no
@@ -14749,6 +14756,25 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .unwrap()
             .contains("headroom:markitdown"));
         assert!(!cache.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revert_external_mutations_strips_codex_skill_nudges() {
+        // `--uninstall` (NSIS, the Homebrew cask) never runs uninstall_plugin,
+        // so the addon's AGENTS.md block outlived Headroom.
+        let home = TestHome::new();
+        let agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        fs::write(&agents, "My own rules.\n").unwrap();
+        super::set_codex_skill_nudge("chisle", "chisle:chisle", true).unwrap();
+        assert!(fs::read_to_string(&agents)
+            .unwrap()
+            .contains("chisle:chisle"));
+
+        super::revert_external_mutations();
+
+        assert_eq!(fs::read_to_string(&agents).unwrap().trim(), "My own rules.");
     }
 
     #[test]
