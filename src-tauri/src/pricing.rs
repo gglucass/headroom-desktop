@@ -2562,6 +2562,19 @@ fn resolve_tier_mismatch(
     codex_plan: Option<CodexPlanTier>,
     active_day_keys: &[String],
 ) -> Option<TierMismatch> {
+    // A plan read from ~/.claude.json while no bearer is live may be another
+    // account's (CLAUDE_CONFIG_DIR) or stale, so it neither starts nor clears
+    // the clock: an idle hour stays "no verdict" (#36).
+    let file_plan;
+    let claude = if claude.plan_detection_source.as_deref() == Some(CLAUDE_JSON_PLAN_SOURCE) {
+        file_plan = ClaudeAccountProfile {
+            plan_tier: ClaudePlanTier::Unknown,
+            ..claude.clone()
+        };
+        &file_plan
+    } else {
+        claude
+    };
     let (paid_tier, recommended_tier, recommended_source) =
         match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
             Some(triple) => triple,
@@ -3042,6 +3055,10 @@ pub struct ProfileDetection {
     pub error_is_transient: bool,
 }
 
+/// `plan_detection_source` of a plan read from `~/.claude.json` rather than a
+/// live bearer. Display only: `resolve_tier_mismatch` judges it as Unknown.
+const CLAUDE_JSON_PLAN_SOURCE: &str = "claude_json.oauthAccount";
+
 /// The plan Claude Code cached for its signed-in account in `~/.claude.json`
 /// (`oauthAccount`, the same org fields the live profile carries). Readable
 /// before any request has gone through the proxy. Only with the Claude Code
@@ -3091,7 +3108,7 @@ fn plan_tier_from_claude_json(raw: &str) -> Option<(ClaudePlanTier, Option<Strin
     };
     match detect_plan_tier_from_profile(&profile).0 {
         ClaudePlanTier::Unknown => None,
-        tier => Some((tier, Some("claude_json.oauthAccount".into()))),
+        tier => Some((tier, Some(CLAUDE_JSON_PLAN_SOURCE.into()))),
     }
 }
 
@@ -8013,6 +8030,51 @@ mod tests {
                 .is_none()
         );
         assert_eq!(persisted(), (None, None));
+    }
+
+    /// The ~/.claude.json plan (no live bearer) is display-only: a Pro there
+    /// must not wipe a running clock, and a Max x20 there must not start one.
+    #[test]
+    #[serial_test::serial]
+    fn tier_mismatch_clock_ignores_the_claude_json_plan() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let persisted = || {
+            let local = super::load_or_initialize_local_state().unwrap();
+            (local.mismatch_since, local.mismatch_clamped_at)
+        };
+        let from_file = |tier| ClaudeAccountProfile {
+            plan_detection_source: Some(super::CLAUDE_JSON_PLAN_SOURCE.into()),
+            ..empty_claude_profile(tier)
+        };
+
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &from_file(ClaudePlanTier::Max20x),
+            None,
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(persisted(), (None, None), "file plan started the clock");
+
+        let since = Utc::now() - Duration::days(3);
+        let mut local = super::load_or_initialize_local_state().unwrap();
+        local.mismatch_since = Some(since);
+        super::write_local_state(&local).unwrap();
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &from_file(ClaudePlanTier::Pro),
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(
+            persisted(),
+            (Some(since), None),
+            "file plan cleared the clock"
+        );
     }
 
     #[test]
