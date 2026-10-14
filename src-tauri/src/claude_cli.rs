@@ -94,6 +94,19 @@ fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Both plugin CLIs clone an addon's marketplace with git. Also tries Git for
+/// Windows' default dir, so one installed after launch is not reported
+/// missing; the install's own git-missing error then asks for the restart the
+/// CLI needs to see it.
+pub fn detect_git() -> Option<PathBuf> {
+    detect_cli("git").or_else(|| {
+        let dir = PathBuf::from(std::env::var_os("ProgramFiles")?)
+            .join("Git")
+            .join("cmd");
+        first_runnable(std::iter::once(dir.join("git.exe")))
+    })
+}
+
 /// Plugin addons' hooks run `node`. Also tries the Windows installer's default
 /// dir: Headroom's own PATH predates a Node installed after launch, so "install
 /// Node.js, then try again" would otherwise keep failing until a restart.

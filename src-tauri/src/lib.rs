@@ -1982,10 +1982,18 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
         "ponytail" | "caveman" | "chisle" => {
-            let outdated = state
-                .tool_manager
-                .install_plugin(id)
-                .map_err(|err| err.to_string())?;
+            let outdated = state.tool_manager.install_plugin(id).map_err(|err| {
+                // Counts how often a missing Node.js or Git blocks an addon,
+                // to decide whether Headroom should supply them.
+                if let Some(missing) = err.downcast_ref::<tool_manager::MissingPluginPrereqs>() {
+                    analytics::track_event(
+                        app,
+                        "addon_install_blocked",
+                        Some(json!({ "addon": id, "missing": missing.0.join(",") })),
+                    );
+                }
+                err.to_string()
+            })?;
             if let Some(host) = outdated {
                 let name = match id {
                     "caveman" => "Caveman",

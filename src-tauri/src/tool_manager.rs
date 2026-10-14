@@ -11034,13 +11034,20 @@ impl ToolManager {
     pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let hosts = PluginHost::detected();
+        let mut missing = Vec::new();
         if hosts.is_empty() {
-            bail!(NO_PLUGIN_HOST_CLI);
+            missing.push("cli");
         }
         // The install itself never runs node, so without this it "succeeded"
         // and the plugin's hooks then failed in every agent session.
         if crate::claude_cli::detect_node().is_none() {
-            bail!(NO_NODE_FOR_PLUGIN);
+            missing.push("node");
+        }
+        if crate::claude_cli::detect_git().is_none() {
+            missing.push("git");
+        }
+        if !missing.is_empty() {
+            return Err(MissingPluginPrereqs(missing).into());
         }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
@@ -11287,6 +11294,43 @@ const NO_GIT_FOR_PLUGIN: &str = if cfg!(target_os = "macos") {
 };
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
+
+/// Plugin-addon prerequisites this machine lacks ("cli", "node", "git"), all
+/// named at once: one at a time, a Windows user without a codex on PATH,
+/// Node.js and Git took three email round trips to clear them (2026-10).
+#[derive(Debug)]
+pub(crate) struct MissingPluginPrereqs(pub(crate) Vec<&'static str>);
+
+impl std::fmt::Display for MissingPluginPrereqs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let [only] = self.0.as_slice() {
+            return f.write_str(match *only {
+                "cli" => NO_PLUGIN_HOST_CLI,
+                "node" => NO_NODE_FOR_PLUGIN,
+                _ => NO_GIT_FOR_PLUGIN,
+            });
+        }
+        let names: Vec<&str> = self
+            .0
+            .iter()
+            .map(|key| match *key {
+                "cli" => "the Claude Code or Codex CLI",
+                "node" => "Node.js (https://nodejs.org)",
+                _ if cfg!(target_os = "macos") => "Git (run `xcode-select --install` in Terminal)",
+                _ => "Git (https://git-scm.com)",
+            })
+            .collect();
+        let (last, rest) = names.split_last().unwrap_or((&"", &[]));
+        write!(
+            f,
+            "This addon needs {} and {}, which were not found on this computer. Install them, then restart Headroom and try again.",
+            rest.join(", "),
+            last
+        )
+    }
+}
+
+impl std::error::Error for MissingPluginPrereqs {}
 
 /// Plugin addons ship marketplace plugins that both Claude Code and Codex can
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
@@ -17536,6 +17580,7 @@ mod tests {
         SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
+    use super::{MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use crate::backend_port;
     use crate::models::ManagedTool;
     use crate::port_conflict;
@@ -28768,6 +28813,22 @@ exit 0
             "PLUGIN STATUS VERSION SOURCE",
             r
         ));
+    }
+
+    #[test]
+    fn missing_plugin_prereqs_names_every_missing_one_at_once() {
+        assert_eq!(
+            MissingPluginPrereqs(vec!["node"]).to_string(),
+            NO_NODE_FOR_PLUGIN
+        );
+        let all = MissingPluginPrereqs(vec!["cli", "node", "git"]).to_string();
+        assert!(
+            all.starts_with(
+                "This addon needs the Claude Code or Codex CLI, Node.js (https://nodejs.org) and Git ("
+            ),
+            "{all}"
+        );
+        assert!(all.ends_with("restart Headroom and try again."), "{all}");
     }
 
     #[test]
