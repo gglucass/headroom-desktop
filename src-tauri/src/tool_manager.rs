@@ -4039,6 +4039,11 @@ const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
 /// how uninstall tells this entry from one a user added by hand, which
 /// Context7's own docs tell them to do.
 pub(crate) const CONTEXT7_HOSTED_URL: &str = "https://mcp.context7.com/mcp?via=headroom";
+/// Serializes Context7's install, toggle, uninstall and launch move: the move
+/// runs on its own thread at launch, and a toggle or uninstall in the same
+/// minute could otherwise interleave with it and leave the receipt and the
+/// agents' entries disagreeing.
+static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -10449,11 +10454,13 @@ impl ToolManager {
     /// a customer's CPU with 80 processes (2026-10-13). Only Grok, which has
     /// no URL servers, runs the pinned package, as one `node <script>`.
     pub fn install_context7(&self) -> Result<()> {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         let package = self.register_context7(grok_home_present())?;
         self.write_context7_receipt(true, package)
     }
 
     pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         if !self.context7_installed() {
             bail!("context7 is not installed");
         }
@@ -10500,6 +10507,7 @@ impl ToolManager {
     }
 
     pub fn uninstall_context7(&self) -> Result<()> {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         self.unregister_context7_mcp()?;
         // Best effort: a server an open session still runs can hold a file.
         let package = self.context7_package_dir();
@@ -10568,6 +10576,7 @@ impl ToolManager {
     /// without its package retries. A failure keeps the old entry working, and
     /// the next launch tries again.
     pub fn ensure_context7_registration(&self) {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         let grok = grok_home_present();
         if !self.context7_needs_move(grok) {
             return;
