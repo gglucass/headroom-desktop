@@ -10347,11 +10347,7 @@ impl ToolManager {
     pub fn install_context7(&self) -> Result<()> {
         let script = self.install_context7_package()?;
         self.register_context7_mcp(&script)?;
-        self.write_tool_receipt(
-            "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": true }),
-        )?;
-        Ok(())
+        self.write_context7_receipt(true)
     }
 
     pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
@@ -10367,11 +10363,16 @@ impl ToolManager {
         } else {
             self.unregister_context7_mcp()?;
         }
+        self.write_context7_receipt(enabled)
+    }
+
+    /// `package` marks a receipt written after this code registered the
+    /// managed script, so a launch knows the agents no longer run npx.
+    fn write_context7_receipt(&self, enabled: bool) -> Result<()> {
         self.write_tool_receipt(
             "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled }),
-        )?;
-        Ok(())
+            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled, "package": true }),
+        )
     }
 
     pub fn uninstall_context7(&self) -> Result<()> {
@@ -10441,21 +10442,32 @@ impl ToolManager {
     /// Installs from before the managed package (0.9.41) registered
     /// `cmd /c npx -y ...`; an enabled one moves over at launch, as does one
     /// left on an older pinned version. A failure (offline, npm missing) keeps
-    /// the old entry working as it did.
+    /// the old entry working as it did, and the next launch tries again.
     pub fn ensure_context7_package(&self) {
-        if !self.context7_installed()
-            || !self.tool_enabled("context7")
-            || context7_script_in(&self.context7_package_dir()).is_some()
-        {
+        if !self.context7_needs_package_move() {
             return;
         }
         match self
             .install_context7_package()
             .and_then(|script| self.register_context7_mcp(&script))
+            .and_then(|()| self.write_context7_receipt(true))
         {
             Ok(()) => log::info!("context7 moved to the managed package"),
             Err(err) => log::warn!("moving context7 to the managed package failed: {err:#}"),
         }
+    }
+
+    /// Keyed on the receipt, not on the package being there: npm can finish
+    /// while the registration fails (a registrar error, the 60s helper
+    /// timeout, a quit), and the agents then still run the old npx entry.
+    fn context7_needs_package_move(&self) -> bool {
+        let moved = self
+            .read_tool_receipt("context7")
+            .and_then(|receipt| receipt.get("package")?.as_bool())
+            == Some(true);
+        self.context7_installed()
+            && self.tool_enabled("context7")
+            && !(moved && context7_script_in(&self.context7_package_dir()).is_some())
     }
 
     fn register_context7_mcp(&self, script: &Path) -> Result<()> {
@@ -26986,6 +26998,38 @@ Always run the linter first.
         // Caveman has neither a receipt nor a Codex registration.
         assert!(!on.contains("caveman:caveman"), "{on}");
         assert_eq!(off.trim(), "My own rules.");
+    }
+
+    #[test]
+    fn context7_package_move_retries_until_a_registration_lands() {
+        let (_root, runtime, manager) = seed_test_runtime("context7-move");
+        assert!(!manager.context7_needs_package_move(), "not installed");
+        let receipt =
+            |body: &str| fs::write(runtime.tools_dir.join("context7.json"), body).unwrap();
+        // An npx-era receipt moves over.
+        receipt(r#"{"version":"4.0.6","enabled":true}"#);
+        assert!(manager.context7_needs_package_move());
+        // npm finished but the registration failed: the agents still run npx,
+        // so the package being there must not end the retries.
+        let package = runtime
+            .tools_dir
+            .join("context7-mcp/node_modules/@upstash/context7-mcp");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::write(package.join("dist/index.js"), "").unwrap();
+        fs::write(
+            package.join("package.json"),
+            serde_json::json!({ "version": super::CONTEXT7_PINNED_VERSION, "bin": "dist/index.js" })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(manager.context7_needs_package_move());
+        manager.write_context7_receipt(true).unwrap();
+        assert!(!manager.context7_needs_package_move());
+        // A package that went missing moves again; a disabled one never does.
+        fs::remove_file(package.join("dist/index.js")).unwrap();
+        assert!(manager.context7_needs_package_move());
+        manager.write_context7_receipt(false).unwrap();
+        assert!(!manager.context7_needs_package_move());
     }
 
     #[test]
