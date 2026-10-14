@@ -7428,12 +7428,13 @@ fn fatal_build_error(err: tauri::Error) -> ! {
     let message = err.to_string();
     #[cfg(target_os = "windows")]
     if is_missing_webview_runtime(&message) {
-        show_webview2_dialog(concat!(
+        let _ = show_webview2_dialog(concat!(
             "Headroom needs the Microsoft Edge WebView2 runtime, ",
             "which is not installed on this PC.\n\n",
             "Open the download page? Install the Evergreen Runtime, ",
             "then start Headroom again."
-        ));
+        ))
+        .join();
     }
     panic!("error while building tauri application: {message}");
 }
@@ -7464,13 +7465,21 @@ fn fatal_app_state_error(err: anyhow::Error) -> ! {
     panic!("failed to create app state: {err:?}");
 }
 
+/// On its own thread: a modal dialog pumps its thread's messages, and on the
+/// event-loop thread that dispatches tao's windows, whose handler is either
+/// already running (setup) or not registered yet, so tao panics "either event
+/// handler is re-entrant" and the app dies once the dialog closes (Sentry
+/// RUST-Q6).
 #[cfg(target_os = "windows")]
-fn show_webview2_dialog(text: &str) {
+fn show_webview2_dialog(text: &'static str) -> std::thread::JoinHandle<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_YESNO};
 
-    if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
-        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
-    }
+    std::thread::spawn(move || {
+        if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
+            let _ =
+                open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
+        }
+    })
 }
 
 /// MessageBoxW rather than a Tauri dialog: there is no webview left to render
@@ -7726,6 +7735,26 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init());
+
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    // Without the runtime, Tauri answers each config window it cannot create
+    // with a modal dialog of its own, inside the event handler (RUST-Q6, see
+    // show_webview2_dialog), and the app then ran windowless anyway. Say it
+    // once ourselves and keep running without them, so configured clients
+    // keep their proxy.
+    #[cfg(target_os = "windows")]
+    if tauri::webview_version().is_err() {
+        for window in &mut context.config_mut().app.windows {
+            window.create = false;
+        }
+        show_webview2_dialog(concat!(
+            "Headroom needs the Microsoft Edge WebView2 runtime, ",
+            "which is not installed on this PC.\n\n",
+            "Open the download page? Install the Evergreen Runtime, ",
+            "then quit Headroom from its tray icon and start it again."
+        ));
+    }
 
     let app = builder
         .setup(move |app| {
@@ -8237,7 +8266,7 @@ pub fn run() {
             #[cfg(debug_assertions)]
             debug_force_proxy_bypass
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
