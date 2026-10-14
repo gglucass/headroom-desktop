@@ -104,14 +104,14 @@ pub fn detect_node() -> Option<PathBuf> {
     })
 }
 
-/// npm installs npx beside node, so wherever `detect_node` found node (its
-/// Windows installer-dir fallback included), npx is there too: without this a
-/// Node installed after launch let every plugin addon install while Context7
-/// kept reporting "npx was not found" (a Windows customer, 2026-10-12).
-pub fn detect_npx() -> Option<PathBuf> {
-    detect_cli("npx").or_else(|| {
+/// npm sits beside node, so wherever `detect_node` found node (its Windows
+/// installer-dir fallback included), npm is there too: without this a Node
+/// installed after launch let every plugin addon install while Context7 kept
+/// reporting that it was not found (a Windows customer, 2026-10-12).
+pub fn detect_npm() -> Option<PathBuf> {
+    detect_cli("npm").or_else(|| {
         let dir = detect_node()?.parent()?.to_path_buf();
-        first_runnable(["npx.cmd", "npx"].into_iter().map(|name| dir.join(name)))
+        first_runnable(["npm.cmd", "npm"].into_iter().map(|name| dir.join(name)))
     })
 }
 

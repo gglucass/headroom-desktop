@@ -352,7 +352,7 @@ const addonCopy: Record<string, AddonCopy> = {
   context7: {
     whatItDoes:
       "Up-to-date code documentation for LLMs, so your agent stops guessing APIs from stale training data.",
-    installing: "Verifying Context7 with npx and registering its MCP server...",
+    installing: "Installing Context7 with npm and registering its MCP server...",
     installed: "Context7 installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing the Context7 MCP registrations...",
     uninstalled: "Context7 removed. Your agent relies on its training data for library docs again.",

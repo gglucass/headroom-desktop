@@ -878,6 +878,9 @@ impl AppState {
             }
         }
         self.tool_manager.ensure_codex_skill_nudges();
+        // npm can take a minute, and this runs before the proxy starts.
+        let tools = self.tool_manager.clone();
+        std::thread::spawn(move || tools.ensure_context7_package());
 
         // Heals installs already in the field: older installs and pre-fix venv
         // swaps never vendored the MSVC runtime DLLs, so on a redist-less

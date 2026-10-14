@@ -4035,8 +4035,8 @@ const SERENA_PINNED_VERSION: &str = "1.7.0";
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
 const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
-/// First run downloads the package into the npx cache; slow networks need
-/// headroom over the usual smoke-test budget.
+/// npm downloads the package into the tools dir; slow networks need headroom
+/// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
@@ -4126,10 +4126,9 @@ if failures:
     sys.exit("; ".join(failures))
 "#;
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
-/// the Context7 MCP entry. The registered command is a bare `npx` (resolved
-/// from the agent session's own PATH, so nvm version switches don't strand an
-/// absolute path) running the pinned package, wrapped in `cmd /c` on Windows.
-/// argv: `register <package-spec>` | `unregister`.
+/// the Context7 MCP entry: a bare `node` (resolved from the agent session's
+/// own PATH, so nvm version switches don't strand an absolute path) running
+/// the managed package's script. argv: `register <script>` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
 import sys
 
@@ -4148,20 +4147,15 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
-# On Windows npx is an npx.cmd shim, which agents that spawn MCP servers
-# without a shell cannot start ("Windows requires 'cmd /c' wrapper").
-npx = ("cmd", "/c", "npx") if sys.platform == "win32" else ("npx",)
 failures = []
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
     if action == "register":
-        spec = ServerSpec(
-            name="context7",
-            command=npx[0],
-            args=(*npx[1:], "-y", sys.argv[2]),
-        )
+        # node.exe is a real executable, so no agent needs the `cmd /c`
+        # wrapper on Windows that the npx.cmd shim did.
+        spec = ServerSpec(name="context7", command="node", args=(sys.argv[2],))
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("context7")
@@ -10342,27 +10336,17 @@ impl ToolManager {
         self.runtime.tools_dir.join("context7.json").exists()
     }
 
-    /// No managed venv or binary: the agent runs the pinned package through
-    /// its own `npx`. Install just proves that works once (warming the npx
-    /// cache), then registers the MCP entry — a broken entry would make every
-    /// new agent session spawn a failing server.
+    /// npm installs the pinned package into the tools dir and the agents run
+    /// it as `node <script>`: one process per agent session. Through `npx` it
+    /// was four on Windows (cmd, npm's node, cmd, node: ~150 MB and ~1.8 CPU-s
+    /// each), and every agent session starts its own copy of every MCP server.
+    /// The ChatGPT app runs one per open thread and subagent, so about eleven
+    /// at once pinned a customer's CPU with 80 processes (2026-10-13). A broken
+    /// entry would make every new session spawn a failing server, hence the
+    /// smoke test before registering.
     pub fn install_context7(&self) -> Result<()> {
-        let npx = crate::claude_cli::detect_npx().context(
-            "npx was not found. Context7 runs through Node.js -- install Node.js, then try again.",
-        )?;
-        run_command_with_timeout(
-            &npx,
-            &["-y", &context7_package_spec(), "--help"],
-            &self.runtime.root_dir,
-            CONTEXT7_INSTALL_TIMEOUT,
-        )
-        // ponytail: no separate Node version probe. Context7 4.x declares
-        // node >=20.18.1 but npm only warns on an engines mismatch, so the
-        // --help run above is what actually proves this Node can run it.
-        .context(
-            "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
-        )?;
-        self.register_context7_mcp()?;
+        let script = self.install_context7_package()?;
+        self.register_context7_mcp(&script)?;
         self.write_tool_receipt(
             "context7",
             json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": true }),
@@ -10375,7 +10359,11 @@ impl ToolManager {
             bail!("context7 is not installed");
         }
         if enabled {
-            self.register_context7_mcp()?;
+            let script = match context7_script_in(&self.context7_package_dir()) {
+                Some(script) => script,
+                None => self.install_context7_package()?,
+            };
+            self.register_context7_mcp(&script)?;
         } else {
             self.unregister_context7_mcp()?;
         }
@@ -10388,6 +10376,13 @@ impl ToolManager {
 
     pub fn uninstall_context7(&self) -> Result<()> {
         self.unregister_context7_mcp()?;
+        // Best effort: a server an open session still runs can hold a file.
+        let package = self.context7_package_dir();
+        if package.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&package) {
+                log::warn!("removing {} failed: {err}", package.display());
+            }
+        }
         let receipt = self.runtime.tools_dir.join("context7.json");
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -10396,14 +10391,77 @@ impl ToolManager {
         Ok(())
     }
 
-    fn register_context7_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&[
-            "-c",
-            CONTEXT7_MCP_HELPER,
-            "register",
-            &context7_package_spec(),
-        ])
-        .context("registering context7 MCP server")
+    fn context7_package_dir(&self) -> PathBuf {
+        self.runtime.tools_dir.join("context7-mcp")
+    }
+
+    /// npm-installs the pinned package and proves this Node runs it; returns
+    /// its server script.
+    fn install_context7_package(&self) -> Result<PathBuf> {
+        let npm = crate::claude_cli::detect_npm().context(
+            "npm was not found. Context7 runs through Node.js -- install Node.js, then try again.",
+        )?;
+        let dir = self.context7_package_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dir_arg = dir.to_string_lossy();
+        run_command_with_timeout(
+            &npm,
+            &[
+                "install",
+                "--prefix",
+                &dir_arg,
+                "--no-audit",
+                "--no-fund",
+                "--omit=dev",
+                &context7_package_spec(),
+            ],
+            &self.runtime.root_dir,
+            CONTEXT7_INSTALL_TIMEOUT,
+        )
+        .context("downloading context7 with npm")?;
+        let script =
+            context7_script_in(&dir).context("npm installed context7 without its server script")?;
+        let node = crate::claude_cli::detect_node().context(
+            "node was not found. Context7 runs through Node.js -- install Node.js, then try again.",
+        )?;
+        let script_arg = script.to_string_lossy();
+        run_command_with_timeout(
+            &node,
+            &[&script_arg, "--help"],
+            &self.runtime.root_dir,
+            Duration::from_secs(60),
+        )
+        // ponytail: no separate Node version probe. Context7 4.x declares
+        // node >=20.18.1 but npm only warns on an engines mismatch, so the
+        // --help run above is what actually proves this Node can run it.
+        .context("context7 failed its smoke test. Context7 needs Node.js 20.18.1 or newer")?;
+        Ok(script)
+    }
+
+    /// Installs from before the managed package (0.9.41) registered
+    /// `cmd /c npx -y ...`; an enabled one moves over at launch, as does one
+    /// left on an older pinned version. A failure (offline, npm missing) keeps
+    /// the old entry working as it did.
+    pub fn ensure_context7_package(&self) {
+        if !self.context7_installed()
+            || !self.tool_enabled("context7")
+            || context7_script_in(&self.context7_package_dir()).is_some()
+        {
+            return;
+        }
+        match self
+            .install_context7_package()
+            .and_then(|script| self.register_context7_mcp(&script))
+        {
+            Ok(()) => log::info!("context7 moved to the managed package"),
+            Err(err) => log::warn!("moving context7 to the managed package failed: {err:#}"),
+        }
+    }
+
+    fn register_context7_mcp(&self, script: &Path) -> Result<()> {
+        let script = script.to_string_lossy();
+        self.run_mcp_helper(&["-c", CONTEXT7_MCP_HELPER, "register", &script])
+            .context("registering context7 MCP server")
     }
 
     fn unregister_context7_mcp(&self) -> Result<()> {
@@ -15088,6 +15146,27 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
 /// it. Falls back to the existing PATH when the binary has no parent.
 fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
+}
+
+/// The server script of the pinned Context7 under an npm `--prefix` dir, from
+/// the package's own `bin` entry. None when it is missing or another version.
+fn context7_script_in(prefix: &Path) -> Option<PathBuf> {
+    let package = prefix
+        .join("node_modules")
+        .join("@upstash")
+        .join("context7-mcp");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(package.join("package.json")).ok()?).ok()?;
+    if manifest.get("version")?.as_str()? != CONTEXT7_PINNED_VERSION {
+        return None;
+    }
+    let bin = match manifest.get("bin")? {
+        Value::String(path) => path.as_str(),
+        Value::Object(bins) => bins.values().next()?.as_str()?,
+        _ => return None,
+    };
+    let script = package.join(bin);
+    script.is_file().then_some(script)
 }
 
 /// PATH directories that would load a foreign OpenSSL into a bundled
@@ -26910,9 +26989,46 @@ Always run the linter first.
     }
 
     #[test]
-    fn context7_helper_wraps_npx_in_cmd_on_windows() {
-        // Native Windows agents spawn MCP servers without a shell, and there
-        // npx is an npx.cmd shim ("Windows requires 'cmd /c' wrapper").
+    fn context7_script_comes_from_the_pinned_package_bin() {
+        let prefix = tempfile::tempdir().unwrap();
+        let package = prefix.path().join("node_modules/@upstash/context7-mcp");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        std::fs::write(package.join("dist/index.js"), "").unwrap();
+        let manifest = |version: &str, bin: serde_json::Value| {
+            std::fs::write(
+                package.join("package.json"),
+                serde_json::json!({ "version": version, "bin": bin }).to_string(),
+            )
+            .unwrap()
+        };
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!({ "context7-mcp": "dist/index.js" }),
+        );
+        assert_eq!(
+            super::context7_script_in(prefix.path()),
+            Some(package.join("dist/index.js"))
+        );
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!("dist/index.js"),
+        );
+        assert!(super::context7_script_in(prefix.path()).is_some());
+        // Another version, or a bin that is not there, is no install.
+        manifest("1.0.0", serde_json::json!("dist/index.js"));
+        assert_eq!(super::context7_script_in(prefix.path()), None);
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!("dist/gone.js"),
+        );
+        assert_eq!(super::context7_script_in(prefix.path()), None);
+    }
+
+    #[test]
+    fn context7_helper_registers_node_with_the_managed_script() {
+        // One `node` process per agent session on every platform: no npx, and
+        // on Windows no `cmd /c` (an npx.cmd shim needed one, and made four
+        // processes per session out of one server).
         // Stub registrars print the spec the real helper registers.
         let probe = r#"import os, sys, types, enum
 S = enum.Enum("S", {"REGISTERED": "registered", "MISMATCH": "mismatch", "FAILED": "failed"})
@@ -26938,7 +27054,13 @@ exec(os.environ["HELPER"])
 "#;
         let spec = |platform: &str| {
             let out = crate::proc::command("python3")
-                .args(["-c", probe, platform, "register", "@upstash/context7-mcp@9"])
+                .args([
+                    "-c",
+                    probe,
+                    platform,
+                    "register",
+                    "/tools/context7/index.js",
+                ])
                 .env("HELPER", super::CONTEXT7_MCP_HELPER)
                 .output()
                 .ok()?;
@@ -26957,10 +27079,10 @@ exec(os.environ["HELPER"])
             eprintln!("skipping: no python3 on PATH");
             return;
         };
-        assert_eq!(windows, "SPEC cmd /c npx -y @upstash/context7-mcp@9");
+        assert_eq!(windows, "SPEC node /tools/context7/index.js");
         assert_eq!(
             spec("darwin").as_deref(),
-            Some("SPEC npx -y @upstash/context7-mcp@9")
+            Some("SPEC node /tools/context7/index.js")
         );
     }
 
