@@ -4423,6 +4423,8 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
 
 /// How long a fetched plugin version stands before the next background fetch.
 const PLUGIN_LATEST_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// A fetch round with a failure (offline at a login launch) retries this soon.
+const PLUGIN_LATEST_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Newest plugin.json version per plugin addon id. The Instant is when the
 /// last fetch started, so a slow or failed one is not retried on every poll.
@@ -5160,10 +5162,23 @@ impl ToolManager {
             *cache = Some((Instant::now(), known));
             let shared = Arc::clone(&self.plugin_latest_cache);
             thread::spawn(move || {
+                let mut failed = false;
                 for plugin in &PLUGIN_ADDONS {
-                    if let Some(version) = fetch_plugin_version(plugin.marketplace) {
-                        if let Some((_, versions)) = shared.lock().as_mut() {
-                            versions.insert(plugin.id, version);
+                    match fetch_plugin_version(plugin.marketplace) {
+                        Some(version) => {
+                            if let Some((_, versions)) = shared.lock().as_mut() {
+                                versions.insert(plugin.id, version);
+                            }
+                        }
+                        None => failed = true,
+                    }
+                }
+                if failed {
+                    if let Some((started, _)) = shared.lock().as_mut() {
+                        if let Some(sooner) =
+                            Instant::now().checked_sub(PLUGIN_LATEST_TTL - PLUGIN_LATEST_RETRY)
+                        {
+                            *started = sooner;
                         }
                     }
                 }
@@ -10484,7 +10499,9 @@ impl ToolManager {
             Some(Some(script)) => Some(script),
             Some(None) => self
                 .install_context7_package()
-                .map_err(|err| log::warn!("context7 for Grok: {err:#}"))
+                // Info: no npm or too old a Node, which every launch retries,
+                // is this machine's setup, not a bug for Sentry.
+                .map_err(|err| log::info!("context7 for Grok: {err:#}"))
                 .ok(),
         };
         self.register_context7_mcp(script.as_deref())?;
@@ -11882,14 +11899,46 @@ fn set_serena_browser_dashboard() {
     }
 }
 
+/// The older of the Claude Code and Codex copies, so Update stays offered until
+/// both hosts have the new build: Claude's copy alone hid it from a dual-host
+/// user whose Codex step failed or who updated Claude's copy via `/plugin`.
 fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
-    let plugins = claude_installed_plugins()?;
-    let installs = plugins.get("plugins")?.get(plugin.plugin_ref)?.as_array()?;
-    installs
-        .first()?
-        .get("version")?
-        .as_str()
-        .map(str::to_string)
+    let claude = claude_installed_plugins().and_then(|plugins| {
+        plugins
+            .get("plugins")?
+            .get(plugin.plugin_ref)?
+            .as_array()?
+            .first()?
+            .get("version")?
+            .as_str()
+            .map(str::to_string)
+    });
+    let codex = codex_cached_plugin_version(
+        &crate::client_adapters::codex_home()
+            .join("plugins")
+            .join("cache"),
+        plugin,
+    );
+    match (claude, codex) {
+        (Some(claude), Some(codex))
+            if parse_major_minor_patch(&codex) < parse_major_minor_patch(&claude) =>
+        {
+            Some(codex)
+        }
+        (claude, codex) => claude.or(codex),
+    }
+}
+
+/// Codex keeps an installed plugin at `<cache>/<marketplace>/<plugin>/<version>`
+/// (plus a `latest` link for some). Only parseable version dirs count.
+fn codex_cached_plugin_version(cache: &Path, plugin: &PluginAddon) -> Option<String> {
+    let name = plugin.plugin_ref.split('@').next().unwrap_or(plugin.id);
+    std::fs::read_dir(cache.join(plugin.marketplace_name).join(name))
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|dir| Some((parse_major_minor_patch(&dir)?, dir)))
+        .max()
+        .map(|(_, dir)| dir)
 }
 
 /// Claude Code ≥2.x stores user-scope MCP servers in `~/.claude.json` under
@@ -17579,8 +17628,8 @@ mod tests {
         PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
         SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
+    use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
-    use super::{MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use crate::backend_port;
     use crate::models::ManagedTool;
     use crate::port_conflict;
@@ -28813,6 +28862,21 @@ exit 0
             "PLUGIN STATUS VERSION SOURCE",
             r
         ));
+    }
+
+    #[test]
+    fn codex_cached_plugin_version_takes_the_newest_version_dir() {
+        let cache = tempfile::tempdir().unwrap();
+        let plugin = super::plugin_addon("ponytail").unwrap();
+        assert_eq!(codex_cached_plugin_version(cache.path(), plugin), None);
+        let dir = cache.path().join("ponytail").join("ponytail");
+        for name in ["4.9.0", "5.10.0", "latest"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        assert_eq!(
+            codex_cached_plugin_version(cache.path(), plugin).as_deref(),
+            Some("5.10.0")
+        );
     }
 
     #[test]
