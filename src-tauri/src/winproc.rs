@@ -10,8 +10,9 @@
 //!   the idle `headroom.exe` launcher anyway, not the python doing the work.
 //! - A process's image path from the kernel, for identity checks that must
 //!   keep working where AppLocker/SRP blocks powershell.exe.
-//! - The process table (pid, parent pid) from one kernel snapshot, so the
-//!   process sweep can tell it has nothing to do without starting PowerShell.
+//! - The process table (pid, parent pid) from one kernel snapshot, plus each
+//!   process's command line and a TerminateProcess, so the process sweep runs
+//!   without starting PowerShell.
 //!
 //! Only proxy spawns join the job. The updater's installer, the relaunch
 //! helper and anything else that has to outlive the app never do.
@@ -19,7 +20,10 @@
 use std::os::windows::io::AsRawHandle;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessCommandLineInformation,
+};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -30,7 +34,8 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 /// The app's proxy job, created once. Stored as usize: a raw HANDLE is not
@@ -171,4 +176,60 @@ pub(crate) fn process_parents() -> Option<Vec<(u32, u32)>> {
     // SAFETY: `snapshot` came from CreateToolhelp32Snapshot and is closed once.
     unsafe { CloseHandle(snapshot) };
     (!processes.is_empty()).then_some(processes)
+}
+
+/// Command line `pid` was started with, the string WMI's
+/// `Win32_Process.CommandLine` reads, or `None` when the process is gone or
+/// not ours to query.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    // SAFETY: OpenProcess with a limited query right; the handle is checked
+    // and closed on every path below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    // A UNICODE_STRING header, then the string it points at; a command line
+    // is at most 32,767 UTF-16 units. u64s keep the header pointer-aligned.
+    let mut buf = vec![0u64; (std::mem::size_of::<UNICODE_STRING>() + 65_536) / 8];
+    let mut written = 0u32;
+    // SAFETY: `buf` is `buf.len() * 8` writable bytes, as passed.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            ProcessCommandLineInformation,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut written,
+        )
+    };
+    // SAFETY: `handle` came from OpenProcess above and is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    if status < 0 {
+        return None;
+    }
+    // SAFETY: on success the buffer starts with a UNICODE_STRING whose Buffer
+    // points into `buf` and holds `Length` bytes.
+    let text = unsafe {
+        let header = &*(buf.as_ptr() as *const UNICODE_STRING);
+        if header.Buffer.is_null() {
+            return Some(String::new());
+        }
+        std::slice::from_raw_parts(header.Buffer, header.Length as usize / 2)
+    };
+    Some(String::from_utf16_lossy(text))
+}
+
+/// `TerminateProcess(pid, -1)`, what `Stop-Process -Force` does, so the victim
+/// exits 0xffffffff either way. False when it is gone or not ours to kill.
+pub(crate) fn terminate_process(pid: u32) -> bool {
+    // SAFETY: as in `process_image_path`.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: `handle` is live and opened with PROCESS_TERMINATE.
+    let ok = unsafe { TerminateProcess(handle, u32::MAX) };
+    // SAFETY: closed exactly once.
+    unsafe { CloseHandle(handle) };
+    ok != 0
 }

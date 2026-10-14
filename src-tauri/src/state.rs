@@ -9988,10 +9988,10 @@ fn windows_process_sweep_script(
     )
 }
 
-/// Whether any process could be a target of the Windows sweep: one whose
-/// image path contains one of `image_dirs` (case-insensitive, as `-like`
-/// matches) and whose parent passes the sweep's parent rule. Run natively
-/// before PowerShell starts. The script's own image-path prefilter did not cut
+/// Every process that could be a target of the Windows sweep, as `(pid,
+/// parent pid, image path)`: one whose image path contains one of
+/// `image_dirs` (case-insensitive, as `-like` matches) and whose parent passes
+/// the sweep's parent rule. Run natively before PowerShell starts. The script's own image-path prefilter did not cut
 /// RUST-K3 (0.9.38 fired at 0.9.37's rate): the `headroom mcp serve` that
 /// Claude Code and Codex keep running is `Scripts\headroom.exe` over the
 /// venv's `Scripts\python.exe` launcher, so with any client session open that
@@ -10003,28 +10003,57 @@ fn windows_process_sweep_script(
 /// pattern's exe (see `windows_sweep_image_dirs`). An unreadable image path
 /// (system processes) is no candidate: `Get-Process` cannot read it either.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_sweep_has_candidates(
+fn windows_sweep_candidates(
     processes: &[(u32, u32)],
     image_dirs: &[String],
     self_pid: u32,
     parents: SweepParents,
     image_path: impl Fn(u32) -> Option<String>,
-) -> bool {
+) -> Vec<(u32, u32, String)> {
     let live: std::collections::HashSet<u32> = processes.iter().map(|&(pid, _)| pid).collect();
     let dirs: Vec<String> = image_dirs.iter().map(|dir| dir.to_lowercase()).collect();
-    processes.iter().any(|&(pid, ppid)| {
-        pid != self_pid
-            && match parents {
-                SweepParents::Any => true,
-                SweepParents::Orphans { own_children } => {
-                    (own_children && ppid == self_pid) || !live.contains(&ppid)
+    processes
+        .iter()
+        .filter(|&&(pid, ppid)| {
+            pid != self_pid
+                && match parents {
+                    SweepParents::Any => true,
+                    SweepParents::Orphans { own_children } => {
+                        (own_children && ppid == self_pid) || !live.contains(&ppid)
+                    }
                 }
-            }
-            && image_path(pid).is_some_and(|path| {
-                let path = path.to_lowercase();
-                dirs.iter().any(|dir| path.contains(dir.as_str()))
-            })
-    })
+        })
+        .filter_map(|&(pid, ppid)| {
+            let path = image_path(pid)?;
+            let lower = path.to_lowercase();
+            dirs.iter()
+                .any(|dir| lower.contains(dir.as_str()))
+                .then_some((pid, ppid, path))
+        })
+        .collect()
+}
+
+/// The sweep script's match for one candidate, decided natively: its command
+/// line or image names `exe`, and its command line holds `args_pattern`
+/// (case-insensitive, as `-like` is). `None` when that needs the command line
+/// and it cannot be read; the caller then runs the script. `command_line` is
+/// only called when the image alone cannot decide.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_sweep_matches(
+    image: &str,
+    command_line: impl FnOnce() -> Option<String>,
+    exe: &str,
+    args_pattern: &str,
+) -> Option<bool> {
+    let exe = exe.to_lowercase();
+    if args_pattern.is_empty() && image.to_lowercase().contains(&exe) {
+        return Some(true);
+    }
+    let command_line = command_line()?.to_lowercase();
+    Some(
+        (command_line.contains(&exe) || image.to_lowercase().contains(&exe))
+            && command_line.contains(&args_pattern.to_lowercase()),
+    )
 }
 
 /// Where a Windows sweep target's image can sit: the pattern's exe, the managed
@@ -10287,9 +10316,9 @@ fn kill_processes_by_command_pattern(
         // start, and on a slow AV host its 20s timeout (RUST-K3, still ~2 a day
         // on 0.9.39 after the native prefilter).
         let image_dirs = windows_sweep_image_dirs(exe);
-        let has_candidates = || {
+        let candidates = || {
             crate::winproc::process_parents().map(|processes| {
-                windows_sweep_has_candidates(
+                windows_sweep_candidates(
                     &processes,
                     &image_dirs,
                     std::process::id(),
@@ -10298,16 +10327,48 @@ fn kill_processes_by_command_pattern(
                 )
             })
         };
-        let mut pending = has_candidates();
+        let mut pending = candidates();
         for _ in 0..4 {
-            if pending != Some(true) {
+            if pending.as_ref().is_none_or(Vec::is_empty) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
-            pending = has_candidates();
+            pending = candidates();
         }
-        if pending == Some(false) {
-            return Ok(());
+        // A candidate that outlived the settle used to start PowerShell, and
+        // on a slow AV host it still ran out its 20s at quit (RUST-K3, 2 hosts
+        // on 0.9.40). Decide and kill natively; only a command line we cannot
+        // read falls back to the script.
+        if let Some(candidates) = pending {
+            let exe_text = exe.display().to_string();
+            let targets: Option<Vec<(u32, u32)>> = candidates
+                .into_iter()
+                .filter_map(|(pid, ppid, image)| {
+                    match windows_sweep_matches(
+                        &image,
+                        || crate::winproc::process_command_line(pid),
+                        &exe_text,
+                        args_pattern,
+                    ) {
+                        Some(true) => Some(Some((pid, ppid))),
+                        Some(false) => None,
+                        None => Some(None),
+                    }
+                })
+                .collect();
+            if let Some(targets) = targets {
+                for (pid, ppid) in targets {
+                    log::info!(
+                        "process sweep: TerminateProcess {pid} (parent {ppid}) for '{args_pattern}'"
+                    );
+                    note_app_kill(
+                        "process_sweep",
+                        format!("TerminateProcess {pid} (parent {ppid})"),
+                    );
+                    crate::winproc::terminate_process(pid);
+                }
+                return Ok(());
+            }
         }
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
         let mut command = crate::proc::command("powershell");
@@ -15273,7 +15334,7 @@ mod tests {
     /// the venv-lock sweep must.
     #[test]
     fn the_windows_sweep_starts_powershell_only_for_a_candidate() {
-        use super::{windows_sweep_has_candidates, SweepParents};
+        use super::{windows_sweep_candidates, SweepParents};
         let runtime = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime";
         let venv = format!(r"{runtime}\venv");
         let headroom = format!(r"{venv}\Scripts\headroom.exe");
@@ -15302,7 +15363,7 @@ mod tests {
         let orphans = |own_children| SweepParents::Orphans { own_children };
         let dirs = |exe: &str| vec![exe.to_string(), runtime.to_string()];
         let hit = |table: &[(u32, u32)], exe: &str, parents| {
-            windows_sweep_has_candidates(table, &dirs(exe), me, parents, image)
+            !windows_sweep_candidates(table, &dirs(exe), me, parents, image).is_empty()
         };
 
         assert!(!hit(&table, &headroom, orphans(true)));
@@ -15334,18 +15395,61 @@ mod tests {
             runtime.to_string(),
             r"D:\Headroom\headroom\runtime".to_string(),
         ];
-        assert!(windows_sweep_has_candidates(
-            &table,
-            &real,
-            me,
-            orphans(false),
-            image
-        ));
+        assert!(!windows_sweep_candidates(&table, &real, me, orphans(false), image).is_empty());
         table.pop();
 
         // An orphan whose image cannot be read never counts.
         table.push((999, 7));
         assert!(!hit(&table, &headroom, orphans(true)));
+    }
+
+    /// RUST-K3 on 0.9.40: a candidate is decided natively with the script's
+    /// own match, so PowerShell starts only for an unreadable command line.
+    #[test]
+    fn the_windows_sweep_matches_a_candidate_like_its_script() {
+        use super::windows_sweep_matches;
+        let venv = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\venv";
+        let headroom = format!(r"{venv}\Scripts\headroom.exe");
+        let python = format!(r"{venv}\Scripts\python.exe");
+        let base = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\python\python.exe";
+        let line = |text: &str| {
+            let text = text.to_string();
+            move || Some(text)
+        };
+        let proxy = format!("\"{python}\" -m headroom.proxy.server --port 6768");
+        // The backend and its base-python child, named by command line.
+        assert_eq!(
+            windows_sweep_matches(&python, line(&proxy), &python, "-m headroom.proxy.server"),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line(&proxy), &python, "-M HEADROOM.PROXY.SERVER"),
+            Some(true)
+        );
+        // An MCP server is no proxy.
+        let mcp = format!("\"{headroom}\" mcp serve");
+        assert_eq!(
+            windows_sweep_matches(&headroom, line(&mcp), &headroom, "proxy --port"),
+            Some(false)
+        );
+        // The venv sweep: the image decides without reading the command line.
+        assert_eq!(
+            windows_sweep_matches(&headroom.to_uppercase(), || panic!(), venv, ""),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line(&proxy), venv, ""),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line("python.exe -c pass"), venv, ""),
+            Some(false)
+        );
+        // Unreadable command line: leave it to the script.
+        assert_eq!(
+            windows_sweep_matches(base, || None, &python, "-m headroom.proxy.server"),
+            None
+        );
     }
 
     /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1
