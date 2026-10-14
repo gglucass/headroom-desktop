@@ -16228,6 +16228,7 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || (lower.contains("failed to run git") && lower.contains("program not found"))
         || lower.contains("failed to locate 'git'")
         || lower.contains("xcrun: error: invalid active developer path")
+        || lower.contains("xcode-select: note: no developer tools were found")
     {
         // Claude Code and Codex clone a marketplace with git, and the host has
         // none (RUST-P0: Windows, Claude Code's "Command 'git' not found or is
@@ -16235,7 +16236,8 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // not found"), or macOS's /usr/bin/git stub has no working developer
         // tools behind it (RUST-P0 on 0.9.40: an Xcode out of step with macOS,
         // "xcode-select: Failed to locate 'git'"; after a macOS upgrade, xcrun's
-        // "invalid active developer path"). Checked first: the install that
+        // "invalid active developer path"; with no developer tools at all,
+        // "No developer tools were found"). Checked first: the install that
         // follows then fails "not found in marketplace", which names only the
         // consequence.
         "git-missing"
@@ -28469,6 +28471,19 @@ exit 0
                  stderr:\nxcrun: error: invalid active developer path \
                  (/Library/Developer/CommandLineTools), missing xcrun at: \
                  /Library/Developer/CommandLineTools/usr/bin/xcrun",
+                "git-missing",
+            ),
+            (
+                // No developer tools at all (the release-train guest with
+                // /Library/Developer/CommandLineTools moved aside).
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 /Users/admin/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\n\
+                 Adding marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: \
+                 Failed to clone marketplace repository: xcode-select: note: No developer tools \
+                 were found, requesting install. If developer tools are located at a \
+                 non-default location on disk, use `sudo xcode-select --switch \
+                 path/to/Xcode.app` to specify the Xcode that you wish to use for command line \
+                 developer tools, and cancel the installation dialog.",
                 "git-missing",
             ),
             ("Codex: something we have not seen", "other"),
