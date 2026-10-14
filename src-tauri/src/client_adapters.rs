@@ -165,6 +165,8 @@ fn rtk_codex_agents_path() -> PathBuf {
 /// `~/.codex/AGENTS.md` block switches the skill on for every session, the way
 /// the plugin's hooks do in Claude Code.
 pub fn set_codex_skill_nudge(id: &str, skill: &str, on: bool) -> Result<()> {
+    // AGENTS.md also carries the rtk and markitdown blocks, written under it.
+    let _setup = setup_write_lock();
     let agents = rtk_codex_agents_path();
     let block_id = format!("{id}_codex");
     if on {
@@ -1878,8 +1880,12 @@ fn clear_and_remember_client_setups() -> Result<()> {
     // back on the next launch. Saved only afterwards, the guard killed after
     // its Claude Code disable left Claude Code direct for good (win-test,
     // 2026-10-14).
+    // Best-effort: an unwritable setup state must not leave every client
+    // pointed at a dead intercept. The save after the disables still reports.
     let snapshot = restore_snapshot();
-    save_restore_snapshot(&snapshot)?;
+    if let Err(err) = save_restore_snapshot(&snapshot) {
+        log::warn!("saving the restore snapshot before the disables failed: {err:#}");
+    }
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup_with(spec.id, false);
     }
