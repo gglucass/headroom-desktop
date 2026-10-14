@@ -160,6 +160,10 @@ struct IdentityPayload {
     /// enough that it never reported" (which stays null).
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_desktop: Option<&'static str>,
+    /// Installed addons (`tool_manager::addon_summary`), so "who runs
+    /// Context7 on Windows" has an answer: on 2026-10-14 it had none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addons: Option<String>,
 }
 
 /// Reqwest errors caused by the user's environment (offline, captive portal,
@@ -407,6 +411,7 @@ impl IdentityPayload {
             claude_usage_windows: None,
             claude_desktop: None,
             wsl_agents: None,
+            addons: None,
             ..self
         }
     }
@@ -438,6 +443,7 @@ impl IdentityPayload {
             accepted_terms_version: None,
             wsl_agents: crate::wsl_probe::result(),
             claude_desktop: Some(crate::client_adapters::claude_desktop_verdict()),
+            addons: crate::tool_manager::addon_summary(),
         }
     }
 
@@ -4685,6 +4691,7 @@ mod tests {
             codex_usage_windows: Some("primary=99@43200".into()),
             wsl_agents: Some("none".into()),
             claude_desktop: Some("absent"),
+            addons: Some("context7".into()),
             ..Default::default()
         }
         .without_analytics();
@@ -4702,6 +4709,7 @@ mod tests {
             "codexUsageWindows",
             "wslAgents",
             "claudeDesktop",
+            "addons",
         ] {
             assert!(json.get(dropped).is_none(), "{dropped} sent: {json}");
         }

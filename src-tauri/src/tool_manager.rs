@@ -15156,6 +15156,45 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
 /// Prepend a binary's own directory to PATH so an `#!/usr/bin/env node`
 /// shebang (or similar) resolves the interpreter that nvm installs alongside
 /// it. Falls back to the existing PATH when the binary has no parent.
+/// Every addon this install has, sorted, `:off` on a disabled one
+/// (`caveman,context7,serena:off`), read from the tool receipts; `none`
+/// without any, so the server can tell that from an app too old to report.
+/// The core runtime's own receipt is not an addon.
+pub fn addon_summary() -> Option<String> {
+    let tools = ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).tools_dir;
+    addon_summary_in(&tools)
+}
+
+fn addon_summary_in(tools: &Path) -> Option<String> {
+    let mut addons: Vec<String> = std::fs::read_dir(tools)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_string();
+            if id == "headroom" || !path.is_file() {
+                return None;
+            }
+            let enabled = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|receipt| receipt.get("enabled")?.as_bool())
+                .unwrap_or(true);
+            Some(if enabled { id } else { format!("{id}:off") })
+        })
+        .collect();
+    addons.sort();
+    Some(if addons.is_empty() {
+        "none".to_string()
+    } else {
+        addons.join(",")
+    })
+}
+
 fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
 }
@@ -27030,6 +27069,28 @@ Always run the linter first.
         assert!(manager.context7_needs_package_move());
         manager.write_context7_receipt(false).unwrap();
         assert!(!manager.context7_needs_package_move());
+    }
+
+    #[test]
+    fn addon_summary_lists_receipts_with_their_enabled_flag() {
+        let tools = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::addon_summary_in(tools.path()).as_deref(),
+            Some("none")
+        );
+        for (name, body) in [
+            ("headroom.json", r#"{"artifact":{}}"#),
+            ("serena.json", r#"{"enabled":false,"version":"1"}"#),
+            ("context7.json", r#"{"enabled":true}"#),
+            ("rtk.json", r#"{"artifact":{}}"#),
+        ] {
+            std::fs::write(tools.path().join(name), body).unwrap();
+        }
+        std::fs::create_dir(tools.path().join("context7-mcp")).unwrap();
+        assert_eq!(
+            super::addon_summary_in(tools.path()).as_deref(),
+            Some("context7,rtk,serena:off")
+        );
     }
 
     #[test]
