@@ -1033,7 +1033,7 @@ describe("replyAddonOverlapNotice", () => {
 describe("underTierWarning", () => {
   it("warns only on cards below the detected plan", () => {
     expect(underTierWarning("pro", "max20x", null)).toBe(
-      "Your Claude plan needs Headroom Max x20. On Pro, weekly limits apply after 14 days."
+      "Your Claude plan needs Headroom Max x20. On Pro, weekly limits apply once the grace period ends."
     );
     expect(underTierWarning("max5x", "max20x", null)).toContain("On Max x5");
     expect(underTierWarning("max20x", "max20x", null)).toBeNull();
@@ -1042,7 +1042,7 @@ describe("underTierWarning", () => {
 
   it("names ChatGPT when the Codex plan is the bigger one", () => {
     expect(underTierWarning("pro", "pro", "prolite")).toBe(
-      "Your ChatGPT plan needs Headroom Max x5. On Pro, weekly limits apply after 14 days."
+      "Your ChatGPT plan needs Headroom Max x5. On Pro, weekly limits apply once the grace period ends."
     );
   });
 

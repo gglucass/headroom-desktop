@@ -423,8 +423,9 @@ export function scheduledPlanChange(
 
 // Shown on a plan card below the tier the user's own Claude or ChatGPT plan
 // calls for: a subscriber that far under is metered once the tier-mismatch
-// grace runs out (TIER_MISMATCH_GRACE_DAYS in pricing.rs). Null when no plan is
-// detected or the card covers it.
+// grace runs out (TIER_MISMATCH_GRACE_DAYS in pricing.rs). No day count: a
+// clock already running or clamped is not reset by a change that stays under.
+// Null when no plan is detected or the card covers it.
 export function underTierWarning(
   cardTier: UpgradePlanId,
   claudePlanTier: ClaudePlanTier | null | undefined,
@@ -436,7 +437,7 @@ export function underTierWarning(
   if (!needed || TIER_RANK[cardTier] >= TIER_RANK[needed]) return null;
   return (
     `Your ${needed === fromClaude ? "Claude" : "ChatGPT"} plan needs Headroom ${upgradePlanIntentLabel(needed)}. ` +
-    `On ${upgradePlanIntentLabel(cardTier)}, weekly limits apply after 14 days.`
+    `On ${upgradePlanIntentLabel(cardTier)}, weekly limits apply once the grace period ends.`
   );
 }
 

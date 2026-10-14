@@ -423,7 +423,16 @@ impl IdentityPayload {
             chopratejas_instance_id: device.chopratejas_instance_id,
             claude_account_uuid: claude.and_then(|p| p.account_uuid.clone()),
             claude_email: claude.and_then(|p| p.email.clone()),
-            claude_plan_tier: claude.map(|p| p.plan_tier.clone()),
+            // A ~/.claude.json plan is display only, like in
+            // resolve_tier_mismatch: the server stores any known tier it is
+            // sent for billing, and the file can be another account's.
+            claude_plan_tier: claude.map(|p| {
+                if plan_is_from_claude_json(p) {
+                    ClaudePlanTier::Unknown
+                } else {
+                    p.plan_tier.clone()
+                }
+            }),
             claude_organization_type: claude.and_then(|p| p.organization_type.clone()),
             claude_rate_limit_tier: claude.and_then(|p| p.rate_limit_tier.clone()),
             claude_user_rate_limit_tier: claude.and_then(|p| p.user_rate_limit_tier.clone()),
@@ -2572,7 +2581,7 @@ fn resolve_tier_mismatch(
     // account's (CLAUDE_CONFIG_DIR) or stale, so it neither starts nor clears
     // the clock: an idle hour stays "no verdict" (#36).
     let file_plan;
-    let claude = if claude.plan_detection_source.as_deref() == Some(CLAUDE_JSON_PLAN_SOURCE) {
+    let claude = if plan_is_from_claude_json(claude) {
         file_plan = ClaudeAccountProfile {
             plan_tier: ClaudePlanTier::Unknown,
             ..claude.clone()
@@ -3064,6 +3073,10 @@ pub struct ProfileDetection {
 /// `plan_detection_source` of a plan read from `~/.claude.json` rather than a
 /// live bearer. Display only: `resolve_tier_mismatch` judges it as Unknown.
 const CLAUDE_JSON_PLAN_SOURCE: &str = "claude_json.oauthAccount";
+
+fn plan_is_from_claude_json(profile: &ClaudeAccountProfile) -> bool {
+    profile.plan_detection_source.as_deref() == Some(CLAUDE_JSON_PLAN_SOURCE)
+}
 
 /// The plan Claude Code cached for its signed-in account in `~/.claude.json`
 /// (`oauthAccount`, the same org fields the live profile carries). Readable
@@ -8072,6 +8085,22 @@ mod tests {
             super::claude_json_plan_tier(),
             Some((ClaudePlanTier::Max20x, _))
         ));
+    }
+
+    /// The server stores any known tier it is sent, so a ~/.claude.json plan
+    /// goes out as unknown while a live one goes out as is.
+    #[test]
+    fn identity_reports_the_claude_json_plan_as_unknown() {
+        let live = empty_claude_profile(ClaudePlanTier::Max20x);
+        let from_file = ClaudeAccountProfile {
+            plan_detection_source: Some(super::CLAUDE_JSON_PLAN_SOURCE.into()),
+            ..live.clone()
+        };
+        let tier = |p: &ClaudeAccountProfile| {
+            super::IdentityPayload::build(Some(p), None).claude_plan_tier
+        };
+        assert_eq!(tier(&live), Some(ClaudePlanTier::Max20x));
+        assert_eq!(tier(&from_file), Some(ClaudePlanTier::Unknown));
     }
 
     /// The ~/.claude.json plan (no live bearer) is display-only: a Pro there
