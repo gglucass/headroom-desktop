@@ -93,12 +93,13 @@ export function isValidEmailAddress(email: string) {
 
 // Mirrors headroom_tier_for_claude_plan / headroom_tier_for_codex_plan in
 // models.rs, with one paywall-specific difference: undetected/free maps to
-// "pro" (the paywall always recommends something) instead of None.
+// `fallback` ("pro" by default: the paywall always recommends something)
+// instead of None. Pass null to get None back.
 export function recommendedHeadroomTier(
   claudeTier: ClaudePlanTier | null | undefined,
   codexTier: CodexPlanTier | null | undefined,
-  fallback: HeadroomSubscriptionTier = "pro"
-): HeadroomSubscriptionTier {
+  fallback: HeadroomSubscriptionTier | null = "pro"
+): HeadroomSubscriptionTier | null {
   const TIER_RANK: Record<HeadroomSubscriptionTier, number> = {
     pro: 1,
     max5x: 2,

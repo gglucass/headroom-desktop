@@ -111,6 +111,7 @@ import {
   unsavedWhileBlockedLabel,
   setServerPlanPrices,
   tierRecommendationSourceLabel,
+  underTierWarning,
   scheduledPlanChange,
   upgradePlanIntentLabel,
   pendingAuthStorageKey,
@@ -8030,6 +8031,10 @@ export default function App() {
                 plan.id === pendingPlanChangeInfo.tier &&
                 billingPeriod === pendingPlanChangeInfo.billingPeriod &&
                 !isActivePlan;
+              // The active plan's mismatch already has the metering banner.
+              const tierWarning = isActivePlan
+                ? null
+                : underTierWarning(plan.id, pricingStatus?.claude.planTier, pricingStatus?.codexPlanTier);
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
@@ -8101,6 +8106,7 @@ export default function App() {
                           ) : null}
                       </p>
                     ) : null}
+                    {tierWarning ? <p className="upgrade-plan-card__tier-warning">{tierWarning}</p> : null}
                   </div>
                   <div className="upgrade-plan-card__action">
                     {plan.id === "enterprise" ? (

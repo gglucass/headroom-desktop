@@ -3042,10 +3042,68 @@ pub struct ProfileDetection {
     pub error_is_transient: bool,
 }
 
+/// The plan Claude Code cached for its signed-in account in `~/.claude.json`
+/// (`oauthAccount`, the same org fields the live profile carries). Readable
+/// before any request has gone through the proxy. Only with the Claude Code
+/// connector on: a Codex-only user can carry an old login there.
+fn claude_json_plan_tier() -> Option<(ClaudePlanTier, Option<String>)> {
+    if !crate::client_adapters::is_claude_code_enabled() {
+        return None;
+    }
+    let raw =
+        std::fs::read_to_string(crate::client_adapters::home_dir().join(".claude.json")).ok()?;
+    plan_tier_from_claude_json(&raw)
+}
+
+fn plan_tier_from_claude_json(raw: &str) -> Option<(ClaudePlanTier, Option<String>)> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let account = json.get("oauthAccount")?;
+    let field = |key: &str| {
+        account
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let organization_type = field("organizationType");
+    let rate_limit_tier = field("organizationRateLimitTier");
+    // Without either org field the classifier would read a missing
+    // subscription date as Free; that is "no data", not a plan.
+    if organization_type.is_none() && rate_limit_tier.is_none() {
+        return None;
+    }
+    let profile = ClaudeOauthProfile {
+        account: ClaudeOauthProfileAccount {
+            uuid: None,
+            email: None,
+            display_name: None,
+            created_at: None,
+        },
+        organization: Some(ClaudeOauthProfileOrganization {
+            uuid: None,
+            billing_type: field("billingType"),
+            subscription_created_at: field("subscriptionCreatedAt").and_then(|t| t.parse().ok()),
+            has_extra_usage_enabled: false,
+            organization_type,
+            rate_limit_tier,
+            user_rate_limit_tier: field("userRateLimitTier"),
+            seat_tier: field("seatTier"),
+        }),
+    };
+    match detect_plan_tier_from_profile(&profile).0 {
+        ClaudePlanTier::Unknown => None,
+        tier => Some((tier, Some("claude_json.oauthAccount".into()))),
+    }
+}
+
 pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
     let Some(token) = state.current_bearer_token() else {
         // No token yet — proxy hasn't seen a request through. Return a minimal
-        // profile so the app can show "send a message first" messaging.
+        // profile so the app can show "send a message first" messaging. The
+        // plan still comes from Claude Code's own cache when it has one, so the
+        // upgrade view never pitches a Max user Pro just because no request
+        // went through in the last hour (the bearer TTL).
+        let (plan_tier, plan_detection_source) =
+            claude_json_plan_tier().unwrap_or((ClaudePlanTier::Unknown, None));
         return ProfileDetection {
             profile: ClaudeAccountProfile {
                 auth_method: ClaudeAuthMethod::Unknown,
@@ -3057,8 +3115,8 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 account_created_at: None,
                 subscription_created_at: None,
                 has_extra_usage_enabled: false,
-                plan_tier: ClaudePlanTier::Unknown,
-                plan_detection_source: None,
+                plan_tier,
+                plan_detection_source,
                 organization_type: None,
                 rate_limit_tier: None,
                 user_rate_limit_tier: None,
@@ -4303,12 +4361,13 @@ mod tests {
         codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
         latch_clamp_start, merge_background_account_sync, parse_oauth_profile_value,
-        plan_tier_header_value, remote_account_to_profile, resolve_account_api_base_url,
-        resolve_tier_mismatch, tier_mismatch_grace_ends_at, ClaudeOauthProfile,
-        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
-        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
-        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
-        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
+        plan_tier_from_claude_json, plan_tier_header_value, remote_account_to_profile,
+        resolve_account_api_base_url, resolve_tier_mismatch, tier_mismatch_grace_ends_at,
+        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
+        HeadroomSubscriptionTier, IdentityFingerprint, IdentityPayload, LocalPricingState,
+        PricingPromo, RemoteAccountResponse, RemoteAccountSyncError,
+        CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -5702,6 +5761,29 @@ mod tests {
         let org = profile.organization.expect("organization present");
         assert!(org.user_rate_limit_tier.is_none());
         assert!(org.seat_tier.is_none());
+    }
+
+    #[test]
+    fn claude_json_oauth_account_classifies_the_plan() {
+        // Shape Claude Code writes to ~/.claude.json (keys as of 2026-10).
+        let max20 = r#"{"oauthAccount":{"accountUuid":"a","billingType":"stripe_subscription",
+            "organizationRateLimitTier":"default_claude_max_20x","organizationType":"claude_max",
+            "seatTier":null,"subscriptionCreatedAt":"2025-09-02T11:17:30.062615Z"}}"#;
+        assert!(matches!(
+            plan_tier_from_claude_json(max20),
+            Some((ClaudePlanTier::Max20x, Some(_)))
+        ));
+        let pro = r#"{"oauthAccount":{"organizationRateLimitTier":"default_claude_ai",
+            "organizationType":"claude_pro","subscriptionCreatedAt":"2025-09-02T11:17:30Z"}}"#;
+        assert!(matches!(
+            plan_tier_from_claude_json(pro),
+            Some((ClaudePlanTier::Pro, _))
+        ));
+        // No login, an API-key setup, or an account without org fields is no
+        // data, never Free.
+        assert!(plan_tier_from_claude_json(r#"{"projects":{}}"#).is_none());
+        assert!(plan_tier_from_claude_json(r#"{"oauthAccount":{"accountUuid":"a"}}"#).is_none());
+        assert!(plan_tier_from_claude_json("not json").is_none());
     }
 
     #[test]
