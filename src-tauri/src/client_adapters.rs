@@ -2423,18 +2423,28 @@ fn command_under_dir_for(command: &str, dir: &str, windows: bool) -> bool {
 
 /// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
 /// name — install always writes it with --force), or any entry whose command
-/// resolves into Headroom's install footprint (serena, codebase-memory).
-/// `command` is a string in Claude's config and an array in OpenCode's.
+/// or first argument resolves into Headroom's install footprint (serena and
+/// codebase-memory by command; context7 is `node <script in our tools dir>`).
+/// `command` is a string with `args` beside it in Claude's config and one
+/// array in OpenCode's.
 fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
     if name == "headroom" {
         return true;
     }
-    let command = match entry.get("command") {
-        Some(Value::String(command)) => Some(command.as_str()),
-        Some(Value::Array(items)) => items.first().and_then(Value::as_str),
-        _ => None,
+    let launch: Vec<&str> = match entry.get("command") {
+        Some(Value::String(command)) => std::iter::once(command.as_str())
+            .chain(
+                entry
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .and_then(|args| args.first())
+                    .and_then(Value::as_str),
+            )
+            .collect(),
+        Some(Value::Array(items)) => items.iter().take(2).filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     };
-    command.is_some_and(mcp_command_in_headroom_footprint)
+    launch.into_iter().any(mcp_command_in_headroom_footprint)
 }
 
 /// Drop Headroom-owned entries from a `mcpServers`/`mcp` JSON map in place.
@@ -2560,8 +2570,9 @@ fn mcp_table_name(line: &str) -> Option<String> {
 /// subtables) and the Python registrar's
 /// `# --- [end ]Headroom MCP server[: name] ---` marker comments from a
 /// Codex-style TOML config. A table is ours when its name is `headroom` or
-/// its `command` launches from Headroom's install footprint; user-managed
-/// servers stay untouched.
+/// its `command` or first `args` entry launches from Headroom's install
+/// footprint (see `mcp_json_entry_is_headroom`); user-managed servers stay
+/// untouched.
 fn strip_headroom_mcp_toml(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -2575,13 +2586,18 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
         let Some(name) = current.as_deref() else {
             continue;
         };
+        // The registrars write `command = "..."` and `args = [...]` inline.
+        let launch = toml::from_str::<toml::Table>(line).ok().and_then(|line| {
+            let value = match line.get("args") {
+                Some(toml::Value::Array(args)) => args.first(),
+                _ => line.get("command"),
+            };
+            value?.as_str().map(str::to_owned)
+        });
         if name == "headroom"
-            || (line
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-                && toml_line_value(line)
-                    .as_deref()
-                    .is_some_and(mcp_command_in_headroom_footprint))
+            || launch
+                .as_deref()
+                .is_some_and(mcp_command_in_headroom_footprint)
         {
             owned.insert(name.to_string());
         }
@@ -11624,6 +11640,52 @@ mod tests {
         assert!(!super::remove_headroom_mcp_json_entries(
             untouched.as_object_mut().unwrap()
         ));
+    }
+
+    #[test]
+    fn mcp_cleanup_removes_a_node_entry_running_a_script_from_our_tools_dir() {
+        // Context7 registers `node <tools>/context7-mcp/.../dist/index.js`.
+        // The Windows uninstaller's `--uninstall` has no ToolManager to run
+        // the unregister helper, and deletes the tools dir, so an entry kept
+        // here spawns a failing server in every later agent session.
+        let _env_lock = crate::test_env_lock::lock_home();
+        let app_dir = crate::storage::app_data_dir().display().to_string();
+        let script = format!(
+            "{app_dir}/headroom/tools/context7-mcp/node_modules/@upstash/context7-mcp/dist/index.js"
+        );
+        let mut servers = json!({
+            "context7": { "command": "node", "args": [script] },
+            "mine": { "command": "node", "args": ["/Users/x/server.js"] },
+        });
+        let map = servers.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(map.get("mine").is_some());
+
+        let mut opencode = json!({
+            "context7": { "type": "local", "command": ["node", script] },
+            "mine": { "type": "local", "command": ["node", "/Users/x/server.js"] },
+        });
+        let map = opencode.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(map.get("mine").is_some());
+
+        let content = format!(
+            "# --- Headroom MCP server: context7 ---\n\
+             [mcp_servers.context7]\n\
+             command = \"node\"\n\
+             args = [{}]\n\
+             # --- end Headroom MCP server: context7 ---\n\
+             [mcp_servers.mine]\n\
+             command = \"node\"\n\
+             args = [\"/Users/x/server.js\"]\n",
+            super::toml_basic_string(&script)
+        );
+        let stripped = super::strip_headroom_mcp_toml(&content);
+        assert!(!stripped.contains("context7"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.mine]"));
+        assert!(stripped.contains("/Users/x/server.js"));
     }
 
     #[test]
