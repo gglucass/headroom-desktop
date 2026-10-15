@@ -75,6 +75,16 @@ const RELAY_IDLE_CHECK: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+/// How long a relay's client half may outlive the backend's response. Every
+/// forward is one request per connection (`force_connection_close`), so once
+/// the backend has finished nothing the client sends can be used, yet the
+/// relay waited for the client to close too: a close that never reached us
+/// (RUST-GY's leak) held the permit for the whole idle limit.
+const RESPONSE_DONE_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(5)
+};
 static IDLE_RELAYS_CLOSED: AtomicU64 = AtomicU64::new(0);
 static IDLE_RELAY_CLOSED_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 
@@ -2491,7 +2501,7 @@ async fn handle(
                 let _ = client_wr.shutdown().await;
                 copied
             };
-            let relay = async { tokio::join!(upstream, downstream).1 };
+            let relay = relay_until_response_done(upstream, downstream);
             let is_readyz = parsed_head
                 .as_ref()
                 .is_some_and(|head| head.path == "/readyz" || head.path.starts_with("/readyz?"));
@@ -2938,7 +2948,23 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
         let _ = client_wr.shutdown().await;
     };
 
-    tokio::join!(upstream, downstream);
+    relay_until_response_done(upstream, downstream).await;
+}
+
+/// Both halves of a relay, ending the client->backend one `RESPONSE_DONE_GRACE`
+/// after the backend->client one finishes. Returns the latter's output.
+async fn relay_until_response_done<T>(
+    upstream: impl std::future::Future<Output = ()>,
+    downstream: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(upstream, downstream);
+    tokio::select! {
+        () = &mut upstream => downstream.await,
+        out = &mut downstream => {
+            let _ = tokio::time::timeout(RESPONSE_DONE_GRACE, upstream).await;
+            out
+        }
+    }
 }
 
 /// Whether a Codex prompt failed in a way the user saw: `Some(true)` failed,
@@ -6119,6 +6145,58 @@ mod tests {
             .expect("the backend side is closed too");
         assert!(matches!(backend_eof, Ok(0) | Err(_)));
         assert_eq!(super::backend_inflight().available_permits(), permits);
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A client that never closes after a complete response (its close lost
+    /// on the host, RUST-GY) gets the response and its permit back within
+    /// `RESPONSE_DONE_GRACE`, not the idle limit.
+    #[tokio::test]
+    #[serial]
+    async fn a_finished_response_frees_its_permit_though_the_client_stays_open() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        backend
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("respond");
+        drop(backend);
+
+        // The client keeps its socket open and never sends EOF.
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("the response ends")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"ok"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            super::backend_inflight().available_permits(),
+            permits,
+            "the permit returns well before the idle limit"
+        );
 
         task.abort();
         backend_port::reset_for_tests();
