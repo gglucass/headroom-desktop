@@ -132,24 +132,36 @@ pub(crate) fn proxy_job_cpu_time_secs() -> Option<u64> {
 /// checks keep working on hosts whose policy blocks powershell.exe, and it
 /// is a single syscall instead of a PowerShell cold start.
 pub(crate) fn process_image_path(pid: u32) -> Option<String> {
-    // SAFETY: OpenProcess with a limited query right; the handle is checked
-    // and closed on every path below.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
+    ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.image_path()
+}
+
+/// An open process handle, closed on drop. While it is open the pid cannot be
+/// reused, so what was checked through it is the process it terminates.
+pub(crate) struct ProcessHandle(HANDLE);
+
+impl ProcessHandle {
+    fn open(pid: u32, access: u32) -> Option<Self> {
+        // SAFETY: plain OpenProcess; a non-null handle is owned by the result
+        // and closed once, in Drop.
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        (!handle.is_null()).then_some(Self(handle))
     }
-    let mut buf = vec![0u16; 32_768];
-    let mut len = buf.len() as u32;
-    // SAFETY: `buf` holds `len` u16s and the call writes at most that many.
-    let ok = unsafe {
-        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
-    };
-    // SAFETY: `handle` came from OpenProcess above and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    if ok == 0 {
-        return None;
+
+    /// For the process sweep: query and terminate rights. `None` when the
+    /// process is gone or not ours to kill (an elevated one).
+    pub(crate) fn open_to_terminate(pid: u32) -> Option<Self> {
+        Self::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE)
     }
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
+
+    pub(crate) fn image_path(&self) -> Option<String> {
+        let mut buf = vec![0u16; 32_768];
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf` holds `len` u16s and the call writes at most that many.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+        };
+        (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    }
 }
 
 /// Every running process as `(pid, parent pid)`, from one toolhelp snapshot:
@@ -178,58 +190,51 @@ pub(crate) fn process_parents() -> Option<Vec<(u32, u32)>> {
     (!processes.is_empty()).then_some(processes)
 }
 
-/// Command line `pid` was started with, the string WMI's
-/// `Win32_Process.CommandLine` reads, or `None` when the process is gone or
-/// not ours to query.
-pub(crate) fn process_command_line(pid: u32) -> Option<String> {
-    // SAFETY: OpenProcess with a limited query right; the handle is checked
-    // and closed on every path below.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
-    }
-    // A UNICODE_STRING header, then the string it points at; a command line
-    // is at most 32,767 UTF-16 units. u64s keep the header pointer-aligned.
-    let mut buf = vec![0u64; (std::mem::size_of::<UNICODE_STRING>() + 65_536) / 8];
-    let mut written = 0u32;
-    // SAFETY: `buf` is `buf.len() * 8` writable bytes, as passed.
-    let status = unsafe {
-        NtQueryInformationProcess(
-            handle,
-            ProcessCommandLineInformation,
-            buf.as_mut_ptr().cast(),
-            (buf.len() * 8) as u32,
-            &mut written,
-        )
-    };
-    // SAFETY: `handle` came from OpenProcess above and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    if status < 0 {
-        return None;
-    }
-    // SAFETY: on success the buffer starts with a UNICODE_STRING whose Buffer
-    // points into `buf` and holds `Length` bytes.
-    let text = unsafe {
-        let header = &*(buf.as_ptr() as *const UNICODE_STRING);
-        if header.Buffer.is_null() {
-            return Some(String::new());
+impl ProcessHandle {
+    /// Command line the process was started with, the string WMI's
+    /// `Win32_Process.CommandLine` reads, or `None` when it cannot be read.
+    pub(crate) fn command_line(&self) -> Option<String> {
+        // A UNICODE_STRING header, then the string it points at; a command line
+        // is at most 32,767 UTF-16 units. u64s keep the header pointer-aligned.
+        let mut buf = vec![0u64; (std::mem::size_of::<UNICODE_STRING>() + 65_536) / 8];
+        let mut written = 0u32;
+        // SAFETY: `buf` is `buf.len() * 8` writable bytes, as passed.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.0,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut written,
+            )
+        };
+        if status < 0 {
+            return None;
         }
-        std::slice::from_raw_parts(header.Buffer, header.Length as usize / 2)
-    };
-    Some(String::from_utf16_lossy(text))
+        // SAFETY: on success the buffer starts with a UNICODE_STRING whose Buffer
+        // points into `buf` and holds `Length` bytes.
+        let text = unsafe {
+            let header = &*(buf.as_ptr() as *const UNICODE_STRING);
+            if header.Buffer.is_null() {
+                return Some(String::new());
+            }
+            std::slice::from_raw_parts(header.Buffer, header.Length as usize / 2)
+        };
+        Some(String::from_utf16_lossy(text))
+    }
+
+    /// `TerminateProcess(-1)`, what `Stop-Process -Force` does, so the victim
+    /// exits 0xffffffff either way. False when refused.
+    pub(crate) fn terminate(&self) -> bool {
+        // SAFETY: the handle is live; TerminateProcess fails cleanly without
+        // the terminate right.
+        unsafe { TerminateProcess(self.0, u32::MAX) != 0 }
+    }
 }
 
-/// `TerminateProcess(pid, -1)`, what `Stop-Process -Force` does, so the victim
-/// exits 0xffffffff either way. False when it is gone or not ours to kill.
-pub(crate) fn terminate_process(pid: u32) -> bool {
-    // SAFETY: as in `process_image_path`.
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return false;
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from OpenProcess and is closed only here.
+        unsafe { CloseHandle(self.0) };
     }
-    // SAFETY: `handle` is live and opened with PROCESS_TERMINATE.
-    let ok = unsafe { TerminateProcess(handle, u32::MAX) };
-    // SAFETY: closed exactly once.
-    unsafe { CloseHandle(handle) };
-    ok != 0
 }

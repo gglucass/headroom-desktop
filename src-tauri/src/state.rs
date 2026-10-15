@@ -10325,23 +10325,36 @@ fn kill_processes_by_command_pattern(
         // read falls back to the script.
         if let Some(candidates) = pending {
             let exe_text = exe.display().to_string();
-            let targets: Option<Vec<(u32, u32)>> = candidates
+            // Each target is checked and killed through one handle, which keeps
+            // its pid from being reused in between. One gone by now, not ours
+            // to kill, or showing another image (a reused pid) is skipped.
+            let targets: Option<Vec<(u32, u32, crate::winproc::ProcessHandle)>> = candidates
                 .into_iter()
                 .filter_map(|(pid, ppid, image)| {
+                    let process = crate::winproc::ProcessHandle::open_to_terminate(pid)?;
+                    if !process.image_path()?.eq_ignore_ascii_case(&image) {
+                        return None;
+                    }
                     match windows_sweep_matches(
                         &image,
-                        || crate::winproc::process_command_line(pid),
+                        || process.command_line(),
                         &exe_text,
                         args_pattern,
                     ) {
-                        Some(true) => Some(Some((pid, ppid))),
+                        Some(true) => Some(Some((pid, ppid, process))),
                         Some(false) => None,
                         None => Some(None),
                     }
                 })
                 .collect();
             if let Some(targets) = targets {
-                for (pid, ppid) in targets {
+                for (pid, ppid, process) in targets {
+                    if !process.terminate() {
+                        log::info!(
+                            "process sweep: TerminateProcess {pid} refused for '{args_pattern}'"
+                        );
+                        continue;
+                    }
                     log::info!(
                         "process sweep: TerminateProcess {pid} (parent {ppid}) for '{args_pattern}'"
                     );
@@ -10349,7 +10362,6 @@ fn kill_processes_by_command_pattern(
                         "process_sweep",
                         format!("TerminateProcess {pid} (parent {ppid})"),
                     );
-                    crate::winproc::terminate_process(pid);
                 }
                 return Ok(());
             }
