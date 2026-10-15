@@ -2375,6 +2375,14 @@ enum BootstrapFailureKind {
     /// it, and the retry got further only for _ssl's DLLs to be blocked the
     /// same way). The user action is a security setting, not Try again.
     AppControlBlocked,
+    /// Antivirus removed or blocked a file we had just written: pip's own
+    /// download vanished from its `pip-unpack-*` temp dir between download and
+    /// install (RUST-8K, 2026-10-14, same wheel on every attempt), or `_ssl`
+    /// would not load so urllib has no `HTTPSHandler` (RUST-8K, 2026-10-07;
+    /// that host's retry five hours later went through). Both told the user to
+    /// check their internet. Unlike App Control a retry can work once a scan
+    /// settles, so the message offers Try again before the quarantine.
+    SecuritySoftware,
     /// pip fell back to building a package from source and the build failed.
     /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
     /// this should be unreachable, so reaching it means *we* shipped a lock or
@@ -2396,6 +2404,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::Permission => "permission",
             BootstrapFailureKind::SslLibraryConflict => "ssl_library_conflict",
             BootstrapFailureKind::AppControlBlocked => "app_control_blocked",
+            BootstrapFailureKind::SecuritySoftware => "security_software",
             BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
@@ -2471,6 +2480,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslLibraryConflict
     } else if is_windows_app_control_block(&haystack) {
         BootstrapFailureKind::AppControlBlocked
+    } else if is_security_software_removal_signal(&haystack) {
+        BootstrapFailureKind::SecuritySoftware
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -2535,6 +2546,28 @@ pub(crate) fn is_windows_app_control_block(text: &str) -> bool {
     is_app_control_signal(text)
         || is_blocked_runtime_dll_signal(text)
         || is_venv_base_spawn_refused_signal(text)
+}
+
+/// True when security software removed or blocked a file we had just written:
+/// pip's own download ([`is_pip_download_removed_signal`]), or `_ssl`, which
+/// fails to load without saying why because urllib swallows the ImportError and
+/// only the missing `HTTPSHandler` shows. Shares its strings with
+/// `pip_failure_category`'s `download-removed` and `ssl-missing`.
+pub(crate) fn is_security_software_removal_signal(text: &str) -> bool {
+    is_pip_download_removed_signal(text)
+        || text
+            .to_ascii_lowercase()
+            .contains("cannot import name 'httpshandler'")
+}
+
+/// True when a wheel pip had just downloaded was gone when pip opened it again.
+/// pip writes every download into a `pip-unpack-*` temp dir and reads it back
+/// moments later, so ENOENT on that path means something took the file from
+/// under it. Errno 2 is the C runtime's text and WinError 2 the code, so both
+/// survive a localized Windows.
+pub(crate) fn is_pip_download_removed_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("pip-unpack-") && (lower.contains("[errno 2]") || lower.contains("[winerror 2]"))
 }
 
 /// True when Windows refused to load one of the bundled interpreter's own
@@ -2779,6 +2812,25 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              turn it off. On a work PC, ask your IT team to allow Headroom's install folder \
              (%LOCALAPPDATA%\\Headroom). Use Contact support below and we'll read \
              the details it sends."
+        }
+        BootstrapFailureKind::SecuritySoftware if cfg!(windows) => {
+            "Installation failed: security software on this PC removed or blocked a \
+             file Headroom had just downloaded. This is not a network problem. A \
+             scan that hasn't finished often causes it, so wait a minute and click \
+             Try again. If it fails again, open your antivirus's quarantine or \
+             protection history (for Microsoft Defender: Windows Security > Virus & \
+             threat protection > Protection history), restore and allow the Headroom \
+             or Python file it lists, then click Try again. Use Contact support below \
+             and we'll read the details it sends."
+        }
+        BootstrapFailureKind::SecuritySoftware => {
+            "Installation failed: security software on this computer removed or \
+             blocked a file Headroom had just downloaded. This is not a network \
+             problem. A scan that hasn't finished often causes it, so wait a minute \
+             and click Try again. If it fails again, check your antivirus's \
+             quarantine for a Headroom or Python file, restore and allow it, then \
+             click Try again. Use Contact support below and we'll read the details \
+             it sends."
         }
         BootstrapFailureKind::SourceBuild => {
             "Installation failed: Headroom couldn't assemble its runtime on this \
@@ -4006,6 +4058,9 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // The same verdict seen from inside Python, where the OS prose is
     // localized and carries no code (RUST-BB/BA/5C).
     if is_blocked_runtime_dll_signal(&lower) {
+        return true;
+    }
+    if is_security_software_removal_signal(&lower) {
         return true;
     }
     // The RUST-9F probe (tool_manager::probe_onnx_import) importing
@@ -14696,6 +14751,52 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_a_removed_download_or_ssl_as_security_software() {
+        // RUST-8K, 2026-10-14, verbatim tail: the wheel pip downloaded was gone
+        // when its conflict check opened it, on every attempt. Filed `other`,
+        // which told the user to check their internet; they left.
+        let removed: anyhow::Error = make_command_failure(
+            "ERROR: Error while checking for conflicts. Please file an issue on pip's issue tracker\n\
+             FileNotFoundError: [Errno 2] No such file or directory: \
+             '~\\AppData\\Local\\Temp\\pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'\n\
+             ERROR: Could not install packages due to an OSError: [Errno 2] No such file or directory: \
+             '~\\AppData\\Local\\Temp\\pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&removed).as_str(),
+            "security_software"
+        );
+        assert!(is_endpoint_protection_signal(&format!("{removed:#}")));
+        // RUST-8K, 2026-10-07: `_ssl` would not load. That host's retry hours
+        // later went through, so this is not App Control's permanent wall.
+        let ssl: anyhow::Error = make_command_failure(
+            "ImportError: cannot import name 'HTTPSHandler' from 'urllib.request' \
+             (~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\urllib\\request.py). \
+             Did you mean: 'HTTPHandler'?",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&ssl).as_str(),
+            "security_software"
+        );
+        // A missing file anywhere else is not a removed download.
+        let other: anyhow::Error = make_command_failure(
+            "ERROR: Could not install packages due to an OSError: [Errno 2] No such file or \
+             directory: '/opt/x/site-packages/foo/RECORD'",
+        )
+        .into();
+        assert_eq!(classify_bootstrap_failure(&other).as_str(), "other");
+    }
+
+    #[test]
+    fn security_software_message_offers_a_retry_and_the_quarantine() {
+        let message = user_message_for(BootstrapFailureKind::SecuritySoftware);
+        assert!(message.contains("Try again"), "{message}");
+        assert!(message.contains("quarantine"), "{message}");
+    }
+
+    #[test]
     fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
         // Unreachable while every install passes `--only-binary=:all:`; if it
         // fires, a wheel we promised is missing for this machine.
@@ -14744,6 +14845,7 @@ mod tests {
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
             BootstrapFailureKind::AppControlBlocked,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
             BootstrapFailureKind::Other,
         ] {
@@ -14767,6 +14869,7 @@ mod tests {
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
             BootstrapFailureKind::AppControlBlocked,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
         ] {
             let msg = user_message_for(kind).to_ascii_lowercase();
@@ -14790,6 +14893,7 @@ mod tests {
             BootstrapFailureKind::NetworkDownload,
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
             BootstrapFailureKind::Other,
         ] {

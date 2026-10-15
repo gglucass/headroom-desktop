@@ -16326,6 +16326,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // cause: the App Control machine on retry -- python.exe was allowed
         // through, but _ssl's DLLs were still blocked).
         "ssl-missing"
+    } else if crate::is_pip_download_removed_signal(&evidence_lower) {
+        // A wheel pip had just downloaded was gone when pip opened it again,
+        // usually antivirus quarantining it. Read from the evidence: the
+        // compact tail stops at pip's "Error while checking for conflicts"
+        // banner, long before the path (RUST-6S, 2026-10-14, filed `other`).
+        "download-removed"
     } else if lower.contains("no pyvenv.cfg") {
         // The venv launcher stub found no pyvenv.cfg next to it (exit 106):
         // the venv was damaged in place (AV quarantine, disk cleanup) while
@@ -28687,6 +28693,28 @@ exit 0
         assert_eq!(
             super::pip_failure_category_with_evidence(elsewhere, elsewhere),
             "other"
+        );
+    }
+
+    #[test]
+    fn pip_download_removed_from_its_unpack_dir_is_its_own_bucket() {
+        // RUST-6S on 0.9.40 (Windows): the tail stops at the conflict-check
+        // banner, so only pip's full output names the vanished wheel.
+        let stderr = concat!(
+            "ERROR: Error while checking for conflicts. Please file an issue on pip's issue ",
+            "tracker: https://github.com/pypa/pip/issues/new\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages\\pip\\",
+            "_internal\\commands\\install.py\", line 585, in _determine_conflicts\n",
+            "FileNotFoundError: [Errno 2] No such file or directory: '~\\AppData\\Local\\Temp\\",
+            "pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "download-removed"
         );
     }
 
