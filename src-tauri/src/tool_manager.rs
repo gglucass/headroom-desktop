@@ -4427,9 +4427,19 @@ const PLUGIN_LATEST_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const PLUGIN_LATEST_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Newest plugin.json version per plugin addon id. The Instant is when the
-/// last fetch started, so a slow or failed one is not retried on every poll.
+/// next fetch is due, set as a round starts so a slow or failed one is not
+/// retried on every poll.
 type PluginLatestCache =
     Arc<Mutex<Option<(Instant, std::collections::HashMap<&'static str, String>)>>>;
+
+/// A round with a failure is due again in `PLUGIN_LATEST_RETRY`. A due time,
+/// not a backdated start: Windows cannot hold an Instant from before boot, so
+/// backdating a login launch's round by most of the TTL did nothing there.
+fn plugin_latest_round_failed(cache: &PluginLatestCache) {
+    if let Some((due, _)) = cache.lock().as_mut() {
+        *due = Instant::now() + PLUGIN_LATEST_RETRY;
+    }
+}
 
 /// `version` from the plugin.json at the default branch of `repo`
 /// (`owner/repo`), the commit `plugin marketplace update` moves to. Every
@@ -5151,15 +5161,12 @@ impl ToolManager {
     /// wrong one.
     fn plugin_latest_version(&self, plugin: &PluginAddon) -> Option<String> {
         let mut cache = self.plugin_latest_cache.lock();
-        if cache
-            .as_ref()
-            .is_none_or(|(started, _)| started.elapsed() >= PLUGIN_LATEST_TTL)
-        {
+        if cache.as_ref().is_none_or(|(due, _)| Instant::now() >= *due) {
             let known = cache
                 .take()
                 .map(|(_, versions)| versions)
                 .unwrap_or_default();
-            *cache = Some((Instant::now(), known));
+            *cache = Some((Instant::now() + PLUGIN_LATEST_TTL, known));
             let shared = Arc::clone(&self.plugin_latest_cache);
             thread::spawn(move || {
                 let mut failed = false;
@@ -5174,13 +5181,7 @@ impl ToolManager {
                     }
                 }
                 if failed {
-                    if let Some((started, _)) = shared.lock().as_mut() {
-                        if let Some(sooner) =
-                            Instant::now().checked_sub(PLUGIN_LATEST_TTL - PLUGIN_LATEST_RETRY)
-                        {
-                            *started = sooner;
-                        }
-                    }
+                    plugin_latest_round_failed(&shared);
                 }
             });
         }
@@ -28892,6 +28893,21 @@ exit 0
             "PLUGIN STATUS VERSION SOURCE",
             r
         ));
+    }
+
+    /// Offline at a login launch, the version fetch must come back within the
+    /// retry on every platform. Backdating the round's start could not reach
+    /// before boot on Windows, so there it waited out the full 6-hour TTL.
+    #[test]
+    fn a_failed_plugin_version_round_is_due_again_within_the_retry() {
+        use std::time::Instant;
+        let cache: super::PluginLatestCache = std::sync::Arc::new(parking_lot::Mutex::new(Some((
+            Instant::now() + super::PLUGIN_LATEST_TTL,
+            Default::default(),
+        ))));
+        super::plugin_latest_round_failed(&cache);
+        let due = cache.lock().as_ref().unwrap().0;
+        assert!(due <= Instant::now() + super::PLUGIN_LATEST_RETRY);
     }
 
     #[test]
