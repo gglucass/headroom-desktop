@@ -12492,9 +12492,11 @@ pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
     for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
         // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
         // selector (lsof ORs `-i` options) and match every listening socket on
-        // the machine, so the first row would be an unrelated daemon.
+        // the machine, so the first row would be an unrelated daemon. `+c 0`:
+        // the default cuts COMMAND at 9 characters, which named a holder
+        // `python3.1` (RUST-EC) and `Paseo\x20` (RUST-KD) to the user.
         let Ok(output) = crate::proc::command(lsof)
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .args(["-nP", "+c", "0", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
             .output()
         else {
             continue; // not installed at this path
@@ -12642,10 +12644,30 @@ fn parse_tasklist_image(text: &str) -> Option<String> {
 
 /// `(command, pid)` from the first data row of `lsof -nP -iTCP -sTCP:LISTEN`,
 /// whose columns start `COMMAND PID`. Row 0 is the header.
+/// lsof writes a space or non-ASCII byte in COMMAND as `\xNN` so the columns
+/// still split on whitespace; decoded here, since the name reaches the UI.
 fn parse_lsof_listener(text: &str) -> Option<(String, u32)> {
     let mut fields = text.lines().nth(1)?.split_whitespace();
-    let command = fields.next()?.to_string();
+    let raw = fields.next()?.as_bytes();
     let pid = fields.next()?.parse().ok()?;
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw
+            .get(i + 2..i + 4)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(byte) if raw[i..].starts_with(b"\\x") => {
+                bytes.push(byte);
+                i += 4;
+            }
+            _ => {
+                bytes.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    let command = String::from_utf8_lossy(&bytes).trim().to_string();
     Some((command, pid))
 }
 
@@ -23163,6 +23185,14 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
                    python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
         assert_eq!(parse_lsof_listener(out), Some(("python".into(), 12345)));
+        // RUST-KD: lsof escapes spaces and non-ASCII bytes in COMMAND.
+        let out = "COMMAND PID USER\nPaseo\\x20Helper 49331 garm\n";
+        assert_eq!(
+            parse_lsof_listener(out),
+            Some(("Paseo Helper".into(), 49331))
+        );
+        let out = "COMMAND PID USER\nCaf\\xc3\\xa9\\x20 7 garm\n";
+        assert_eq!(parse_lsof_listener(out), Some(("Caf\u{e9}".into(), 7)));
         // Header only: lsof found nothing, which is not a listener.
         assert_eq!(
             parse_lsof_listener("COMMAND   PID USER   FD   TYPE DEVICE\n"),
