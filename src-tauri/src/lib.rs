@@ -11920,8 +11920,106 @@ static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::ne
 
 #[tauri::command]
 async fn start_main_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
-    note_main_window_drag_start(window.outer_position().ok());
-    window.start_dragging().map_err(|err| err.to_string())
+    let origin = window.outer_position().ok();
+    note_main_window_drag_start(origin);
+    window.start_dragging().map_err(|err| err.to_string())?;
+    // Windows only posts the drag here, so this returns while it runs.
+    #[cfg(target_os = "windows")]
+    if let (Some(origin), Ok(size)) = (origin, window.outer_size()) {
+        std::thread::spawn(move || snap_main_window_after_drag(&window, origin, size));
+    }
+    Ok(())
+}
+
+/// How close, in logical pixels, a dropped dashboard must be to a work-area
+/// edge before it snaps to it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const MAIN_WINDOW_SNAP_REACH: f64 = 40.0;
+
+/// Waits for the button that started the drag to come up, then snaps the
+/// dashboard to the work-area edges it was dropped near, so a drop by the
+/// tray lands neatly in the bottom-right corner (user request). Linux is not
+/// covered: GTK hands the move to the window manager and reports no release.
+#[cfg(target_os = "windows")]
+fn snap_main_window_after_drag(
+    window: &tauri::WebviewWindow,
+    origin: PhysicalPosition<i32>,
+    origin_size: PhysicalSize<u32>,
+) {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+
+    // GetAsyncKeyState reads the physical button; the drag is on the primary.
+    let primary = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
+        VK_RBUTTON
+    } else {
+        VK_LBUTTON
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while unsafe { GetAsyncKeyState(i32::from(primary)) } < 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (Ok(position), Ok(size), Ok(scale), Ok(Some(monitor))) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.scale_factor(),
+        window.current_monitor(),
+    ) else {
+        return;
+    };
+    // A click that never moved it, or a drop Windows itself tiled (maximized
+    // at the top edge, Snap Layouts in a corner), which changes the size.
+    if position == origin || size != origin_size {
+        return;
+    }
+    let area = monitor.work_area();
+    let target = snap_to_work_area_edges(
+        MonitorBounds {
+            x: area.position.x,
+            y: area.position.y,
+            width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+            height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+        },
+        position,
+        size,
+        (MAIN_WINDOW_SNAP_REACH * scale).round() as i32,
+    );
+    if target != position {
+        let _ = window.set_position(Position::Physical(target));
+    }
+}
+
+/// Moves each axis to the nearer work-area edge, inset by the tray gap, when
+/// the window lies within `reach` of it; otherwise leaves it where it is.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn snap_to_work_area_edges(
+    work_area: MonitorBounds,
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    reach: i32,
+) -> PhysicalPosition<i32> {
+    let snap = |at: i32, len: u32, start: i32, span: i32| {
+        let len = i32::try_from(len).unwrap_or(i32::MAX);
+        let near = start.saturating_add(TRAY_WINDOW_VERTICAL_GAP);
+        let far = start
+            .saturating_add(span)
+            .saturating_sub(len)
+            .saturating_sub(TRAY_WINDOW_VERTICAL_GAP);
+        if at.abs_diff(far) <= reach.unsigned_abs() {
+            far
+        } else if at.abs_diff(near) <= reach.unsigned_abs() {
+            near
+        } else {
+            at
+        }
+    };
+    PhysicalPosition::new(
+        snap(position.x, size.width, work_area.x, work_area.width),
+        snap(position.y, size.height, work_area.y, work_area.height),
+    )
 }
 
 /// Keeps the FIRST grab since the last focus loss: a later click that never
@@ -12256,13 +12354,13 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
-        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
-        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
-        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
-        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        savings_report, select_updater_endpoints, snap_to_work_area_edges,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
@@ -13766,6 +13864,25 @@ mod tests {
         let guard = record.find("is_maximized()").expect("maximized guard");
         let read = record.find("window.outer_position()").expect("reads frame");
         assert!(guard < read, "{record}");
+    }
+
+    /// A 1920x1040 work area (taskbar below it): a drop near the bottom-right
+    /// corner lands 10px inside it, one near no edge stays put.
+    #[test]
+    fn dropped_dashboard_snaps_to_nearby_work_area_edges() {
+        let area = MonitorBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let size = PhysicalSize::new(760, 632);
+        let snap =
+            |x, y| snap_to_work_area_edges(area, tauri::PhysicalPosition::new(x, y), size, 40);
+        assert_eq!(snap(1130, 380), tauri::PhysicalPosition::new(1150, 398));
+        assert_eq!(snap(600, 200), tauri::PhysicalPosition::new(600, 200));
+        assert_eq!(snap(-20, 30), tauri::PhysicalPosition::new(10, 10));
+        assert_eq!(snap(1090, 398), tauri::PhysicalPosition::new(1090, 398));
     }
 
     #[test]
