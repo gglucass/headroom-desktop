@@ -9482,6 +9482,16 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 /// dashboard prefixes the first sentence with "Headroom is not hooked up right
 /// now:" as the headline and shows the rest underneath, so the first sentence
 /// states only the fact and stays short.
+/// Where this platform's users end a program by hand: the 6767 hint named Task
+/// Manager to Mac users too.
+const PROCESS_MONITOR: &str = if cfg!(target_os = "macos") {
+    "Activity Monitor"
+} else if cfg!(windows) {
+    "Task Manager"
+} else {
+    "your system monitor"
+};
+
 pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
     if let Some((_, holder)) = raw.split_once(" is held by ") {
@@ -9495,7 +9505,7 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
         };
         return format!(
             "Port {port} is in use by {holder}. {direct}\
-             Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
+             Quit that program, or end it in {PROCESS_MONITOR}, and Headroom reconnects on its own."
         );
     }
     // Two app instances (`restart_app`'s `open -n` relauncher bypasses
@@ -12204,7 +12214,7 @@ mod tests {
         // Must not inherit the mid-diagnosis or foreign-holder remedies: no
         // program is squatting the port and nothing is being identified.
         assert!(!hint.contains("checking what holds it"), "{hint}");
-        assert!(!hint.contains("Task Manager"), "{hint}");
+        assert!(!hint.contains(super::PROCESS_MONITOR), "{hint}");
     }
 
     #[test]
@@ -12227,7 +12237,7 @@ mod tests {
     fn intercept_bind_hint_reads_the_bind_loops_verdicts() {
         let foreign = intercept_bind_hint("port 6767 is held by python.exe (pid 11236)");
         assert!(foreign.contains("python.exe (PID 11236)"), "{foreign}");
-        assert!(foreign.contains("Task Manager"), "{foreign}");
+        assert!(foreign.contains(super::PROCESS_MONITOR), "{foreign}");
         let draining =
             intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
         assert!(draining.contains("Nothing to do"), "{draining}");
@@ -12266,7 +12276,7 @@ mod tests {
         ] {
             let hint = intercept_bind_hint(raw);
             assert!(hint.contains("connect directly until the port is free"), "{hint}");
-            assert!(hint.contains("Task Manager"), "{hint}");
+            assert!(hint.contains(super::PROCESS_MONITOR), "{hint}");
         }
         let own = intercept_bind_hint(&format!(
             "port 6767 is held by {} (pid 7)",
