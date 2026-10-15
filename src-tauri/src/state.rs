@@ -15695,7 +15695,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
@@ -15745,7 +15745,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn a_lone_success_between_failures_does_not_reset_the_backoff() {
         // RUST-86: a starved backend flaps -- /stats times out only while the
         // proxy is busy -- so timeout/success/timeout was the common shape.
@@ -15887,7 +15887,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn a_lone_stats_stall_stays_local_and_its_repeat_reports() {
         assert!(lone_stats_stall("timeout", None));
         assert!(lone_stats_stall(
