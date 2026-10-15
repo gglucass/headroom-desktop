@@ -16639,10 +16639,15 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// The user's machine lacks git (the UI says so), or a host holds the plugin
-/// but no CLI for it can be found (RUST-MV): nothing we ship fixes either.
+/// The user's machine lacks git (the UI says so), a host holds the plugin but
+/// no CLI for it can be found (RUST-MV), or the user's own settings.json does
+/// not parse (RUST-DQ; our own writers already keep that refusal out of
+/// Sentry): nothing we ship fixes any of them.
 fn plugin_install_failure_reported(category: &str) -> bool {
-    !matches!(category, "git-missing" | "cli-missing")
+    !matches!(
+        category,
+        "git-missing" | "cli-missing" | "settings-unparseable"
+    )
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -16695,6 +16700,11 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     {
         // The host CLI cannot read its own config, so nothing we do lands.
         "host-config-invalid"
+    } else if lower.contains("invalid json syntax in settings file") {
+        // Claude Code refusing a ~/.claude/settings.json the user broke by
+        // hand (RUST-DQ on 0.9.40: a missing comma, the same file that filed
+        // RUST-Q7/Q8/QD/QE/QF from our own writers).
+        "settings-unparseable"
     } else if crate::is_disk_full_signal(&lower) {
         "disk-full"
     } else if lower.contains("permission denied")
@@ -29168,6 +29178,17 @@ exit 0
                  path/to/Xcode.app` to specify the Xcode that you wish to use for command line \
                  developer tools, and cancel the installation dialog.",
                 "git-missing",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add DietrichGebert/ponytail\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Invalid JSON syntax in settings file at ~\\.claude\\settings.json\n\
+                 : command failed (exit 1): ~\\.local\\bin\\claude.exe plugin install \
+                 ponytail@ponytail\nstdout:\nInstalling plugin \"ponytail@ponytail\"...\n\n\
+                 stderr:\n\u{d7} Failed to install plugin \"ponytail@ponytail\": Failed to update \
+                 settings: Invalid JSON syntax in settings file at ~\\.claude\\settings.json",
+                "settings-unparseable",
             ),
             ("Codex: something we have not seen", "other"),
         ];
