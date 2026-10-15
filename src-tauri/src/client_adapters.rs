@@ -2439,6 +2439,22 @@ fn mcp_command_in_headroom_footprint(command: &str) -> bool {
         || command_under_dir(command, &home_dir().join(".headroom"))
 }
 
+/// `[cmd /c] npx -y @upstash/context7-mcp@<version>`, the Context7 entry
+/// Headroom wrote through 0.9.40. Context7's own docs pin no version (or
+/// `@latest`), so a pinned one is ours; a bare `npx` stays the user's. Without
+/// this, an uninstall that purged the ledger left it spawning npx in every
+/// agent session.
+fn is_npx_era_context7(name: &str, launch: &[&str]) -> bool {
+    let launch = match launch {
+        ["cmd", "/c", rest @ ..] => rest,
+        _ => launch,
+    };
+    name == "context7"
+        && matches!(launch, ["npx", "-y", spec] if spec
+            .strip_prefix("@upstash/context7-mcp@")
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit())))
+}
+
 /// Is `command` a path inside `dir`? A literal `format!("{dir}/")` prefix never
 /// matched on Windows, where the configs hold `C:\Users\...\serena.exe` with
 /// backslashes and any drive-letter/user casing, so uninstall left entries
@@ -2482,14 +2498,19 @@ fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
                 entry
                     .get("args")
                     .and_then(Value::as_array)
-                    .and_then(|args| args.first())
-                    .and_then(Value::as_str),
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
             )
             .collect(),
-        Some(Value::Array(items)) => items.iter().take(2).filter_map(Value::as_str).collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    launch.into_iter().any(mcp_command_in_headroom_footprint)
+    is_npx_era_context7(name, &launch)
+        || launch
+            .into_iter()
+            .take(2)
+            .any(mcp_command_in_headroom_footprint)
 }
 
 /// Drop Headroom-owned entries from a `mcpServers`/`mcp` JSON map in place.
@@ -2623,6 +2644,7 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
 
     // Pass 1: which server names are Headroom-owned.
     let mut owned: BTreeSet<String> = BTreeSet::new();
+    let mut launches: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
     let mut current: Option<String> = None;
     for line in &lines {
         if line.trim().starts_with('[') {
@@ -2631,6 +2653,18 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
         let Some(name) = current.as_deref() else {
             continue;
         };
+        if let Ok(table) = toml::from_str::<toml::Table>(line) {
+            let launch = launches.entry(name.to_string()).or_default();
+            if let Some(command) = table.get("command").and_then(toml::Value::as_str) {
+                launch.0 = Some(command.to_string());
+            }
+            if let Some(args) = table.get("args").and_then(toml::Value::as_array) {
+                launch.1 = args
+                    .iter()
+                    .filter_map(|arg| arg.as_str().map(str::to_string))
+                    .collect();
+            }
+        }
         // The registrars write `command = "..."` and `args = [...]` inline.
         let launch = toml::from_str::<toml::Table>(line).ok().and_then(|line| {
             let value = match line.get("args") {
@@ -2650,6 +2684,12 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
                 .is_some_and(mcp_command_in_headroom_footprint)
         {
             owned.insert(name.to_string());
+        }
+    }
+    for (name, (command, args)) in &launches {
+        let launch: Vec<&str> = command.iter().chain(args).map(String::as_str).collect();
+        if is_npx_era_context7(name, &launch) {
+            owned.insert(name.clone());
         }
     }
 
@@ -11690,6 +11730,44 @@ mod tests {
         assert!(!super::remove_headroom_mcp_json_entries(
             untouched.as_object_mut().unwrap()
         ));
+    }
+
+    /// The npx-era Context7 entry is Headroom's in every shape it was written
+    /// (Claude's command + args, Windows' `cmd /c`, OpenCode's one array); an
+    /// unpinned or `@latest` one, or another server's name, is the user's.
+    #[test]
+    fn mcp_cleanup_removes_the_npx_era_context7_and_keeps_a_users_own() {
+        let pin = "@upstash/context7-mcp@4.0.6";
+        for owned in [
+            json!({ "command": "npx", "args": ["-y", pin] }),
+            json!({ "command": "cmd", "args": ["/c", "npx", "-y", pin] }),
+            json!({ "type": "local", "command": ["npx", "-y", pin] }),
+        ] {
+            let mut servers = json!({ "context7": owned });
+            assert!(
+                super::remove_headroom_mcp_json_entries(servers.as_object_mut().unwrap()),
+                "{owned}"
+            );
+        }
+        for kept in [
+            json!({ "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"] } }),
+            json!({ "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp@latest"] } }),
+            json!({ "docs": { "command": "npx", "args": ["-y", pin] } }),
+        ] {
+            let mut servers = kept.clone();
+            assert!(
+                !super::remove_headroom_mcp_json_entries(servers.as_object_mut().unwrap()),
+                "{kept}"
+            );
+        }
+
+        let toml = format!(
+            "[mcp_servers.context7]\ncommand = \"cmd\"\nargs = [\"/c\", \"npx\", \"-y\", \"{pin}\"]\n\n\
+             [mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"-y\", \"{pin}\"]\n"
+        );
+        let stripped = super::strip_headroom_mcp_toml(&toml);
+        assert!(!stripped.contains("mcp_servers.context7"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.docs]"), "{stripped}");
     }
 
     #[test]

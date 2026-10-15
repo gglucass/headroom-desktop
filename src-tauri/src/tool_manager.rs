@@ -4144,6 +4144,7 @@ if failures:
 /// argv: `register <url> [<script>]` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
 import dataclasses
+import re
 import sys
 
 from headroom.mcp_registry import (
@@ -4251,6 +4252,23 @@ ledger_mod.spec_fingerprint = lambda spec: fingerprint(
     ServerSpec(name=spec.name, command="url:" + url_of(spec)) if url_of(spec) else spec
 )
 
+
+
+def npx_era(spec):
+    # [cmd /c] npx -y @upstash/context7-mcp@<version>, written through 0.9.40:
+    # ours even when an uninstall purged the ledger that recorded it.
+    if spec is None:
+        return False
+    launch = (spec.command, *(spec.args or ()))
+    if launch[:2] == ("cmd", "/c"):
+        launch = launch[2:]
+    return (
+        len(launch) == 3
+        and launch[:2] == ("npx", "-y")
+        and re.fullmatch(r"@upstash/context7-mcp@\d\S*", launch[2]) is not None
+    )
+
+
 URL_AGENTS = {"claude", "codex", "opencode"}
 action = sys.argv[1]
 failures = []
@@ -4267,10 +4285,10 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             print(f"{registrar.name}: no local Context7 package, skipping")
             continue
         result = registrar.register_server(spec)
-        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-            registrar.name, registrar.get_server("context7")
-        ):
-            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.MISMATCH:
+            current = registrar.get_server("context7")
+            if headroom_installed_matching(registrar.name, current) or npx_era(current):
+                result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.FAILED:
@@ -27491,6 +27509,29 @@ for r in (ClaudeRegistrar(claude_cli=None), CodexRegistrar(), OpencodeRegistrar(
         assert_eq!(gone.matches(": removed").count(), 4, "{gone}");
         assert!(!read(".codex/config.toml").contains("context7"));
         assert!(!read(".claude.json").contains("context7"));
+
+        // The same npx-era entries with no ledger record (an uninstall purged
+        // ~/.headroom) are still replaced; a user's unpinned one is not.
+        run(&[
+            "-c",
+            r#"from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, OpencodeRegistrar, ServerSpec
+old = ServerSpec(name="context7", command="cmd", args=("/c", "npx", "-y", "@upstash/context7-mcp@4.0.6"))
+for r in (ClaudeRegistrar(claude_cli=None), CodexRegistrar()):
+    assert r.register_server(old).ok
+own = ServerSpec(name="context7", command="npx", args=("-y", "@upstash/context7-mcp"))
+assert OpencodeRegistrar().register_server(own).ok"#,
+        ]);
+        let unrecorded = run(&["-c", helper, "register", url, script]);
+        for agent in [
+            "claude: registered",
+            "codex: registered",
+            "opencode: mismatch",
+        ] {
+            assert!(unrecorded.contains(agent), "{unrecorded}");
+        }
+        assert!(!read(".claude.json").contains("npx"));
+        assert!(!read(".codex/config.toml").contains("npx"));
+        assert!(read(".config/opencode/opencode.json").contains("npx"));
     }
 
     #[test]
