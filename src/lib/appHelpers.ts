@@ -1,6 +1,8 @@
 import type {
   BillingPeriod,
+  ClaudePlanTier,
   ClientConnectorStatus,
+  CodexPlanTier,
   RuntimeStatus,
   DailySavingsPoint,
   HeadroomAccountProfile,
@@ -20,6 +22,7 @@ import {
   parseDayKey,
   startOfDay
 } from "./dashboardHelpers";
+import { recommendedHeadroomTier } from "./launcherHelpers";
 // Type-only, so this stays free of setupHealthAlert's Tauri imports at runtime.
 import type { SetupStallKind } from "./setupHealthAlert";
 
@@ -416,6 +419,26 @@ export function scheduledPlanChange(
     ? `Switches to ${billingPeriod} billing on ${on}`
     : `Switches to ${upgradePlanIntentLabel(tier)} (${billingPeriod}) on ${on}`;
   return { tier, billingPeriod, note };
+}
+
+// Shown on a plan card below the tier the user's own Claude or ChatGPT plan
+// calls for: a subscriber that far under is metered once the tier-mismatch
+// grace runs out (TIER_MISMATCH_GRACE_DAYS in pricing.rs). No day count: a
+// clock already running or clamped is not reset by a change that stays under.
+// Null when no plan is detected or the card covers it.
+export function underTierWarning(
+  cardTier: UpgradePlanId,
+  claudePlanTier: ClaudePlanTier | null | undefined,
+  codexPlanTier: CodexPlanTier | null | undefined
+): string | null {
+  if (cardTier !== "pro" && cardTier !== "max5x" && cardTier !== "max20x") return null;
+  const fromClaude = recommendedHeadroomTier(claudePlanTier, null, null);
+  const needed = higherSubscriptionTier(fromClaude, recommendedHeadroomTier(null, codexPlanTier, null));
+  if (!needed || TIER_RANK[cardTier] >= TIER_RANK[needed]) return null;
+  return (
+    `Your ${needed === fromClaude ? "Claude" : "ChatGPT"} plan needs Headroom ${upgradePlanIntentLabel(needed)}. ` +
+    `On ${upgradePlanIntentLabel(cardTier)}, weekly limits apply once the grace period ends.`
+  );
 }
 
 // Connector(s) whose detected plan drives a tier-mismatch recommendation, for

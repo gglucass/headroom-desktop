@@ -4035,8 +4035,17 @@ const SERENA_PINNED_VERSION: &str = "1.7.0";
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
 const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
-/// First run downloads the package into the npx cache; slow networks need
-/// headroom over the usual smoke-test budget.
+/// Context7's own hosted MCP server. The server ignores `via=headroom`; it is
+/// how uninstall tells this entry from one a user added by hand, which
+/// Context7's own docs tell them to do.
+pub(crate) const CONTEXT7_HOSTED_URL: &str = "https://mcp.context7.com/mcp?via=headroom";
+/// Serializes Context7's install, toggle, uninstall and launch move: the move
+/// runs on its own thread at launch, and a toggle or uninstall in the same
+/// minute could otherwise interleave with it and leave the receipt and the
+/// agents' entries disagreeing.
+static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// npm downloads the package into the tools dir; slow networks need headroom
+/// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
@@ -4126,11 +4135,16 @@ if failures:
     sys.exit("; ".join(failures))
 "#;
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
-/// the Context7 MCP entry. The registered command is a bare `npx` (resolved
-/// from the agent session's own PATH, so nvm version switches don't strand an
-/// absolute path) running the pinned package, wrapped in `cmd /c` on Windows.
-/// argv: `register <package-spec>` | `unregister`.
+/// the Context7 MCP entry: Context7's hosted server (`CONTEXT7_HOSTED_URL`)
+/// for Claude Code, Codex and OpenCode, and for Grok, which has no URL
+/// servers, a bare `node` (resolved from the agent session's own PATH, so nvm
+/// version switches don't strand an absolute path) running the managed
+/// package's script. The wheel's registrars only write command servers, so
+/// this process teaches them the URL form each agent's config uses.
+/// argv: `register <url> [<script>]` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
+import dataclasses
+import re
 import sys
 
 from headroom.mcp_registry import (
@@ -4140,33 +4154,141 @@ from headroom.mcp_registry import (
     OpencodeRegistrar,
     ServerSpec,
 )
-from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry import claude as claude_mod
+from headroom.mcp_registry import codex as codex_mod
+from headroom.mcp_registry import ledger as ledger_mod
+from headroom.mcp_registry import opencode as opencode_mod
+from headroom.mcp_registry.base import RegisterResult, RegisterStatus
 from headroom.mcp_registry.ledger import (
     clear_install,
     headroom_installed_matching,
     record_install,
 )
 
+
+@dataclasses.dataclass
+class UrlSpec(ServerSpec):
+    url: str = ""
+
+
+def url_of(spec):
+    return getattr(spec, "url", "")
+
+
+def parse_url_entries(parse, is_url):
+    def wrapped(name, entry):
+        if isinstance(entry, dict) and isinstance(entry.get("url"), str) and is_url(entry):
+            return UrlSpec(name=name, command="", url=entry["url"])
+        return parse(name, entry)
+    return wrapped
+
+
+def compare_urls(equivalent):
+    return lambda a, b: equivalent(a, b) and url_of(a) == url_of(b)
+
+
+def diff_urls(diff):
+    def wrapped(existing, requested):
+        if url_of(existing) != url_of(requested):
+            return f"url {url_of(existing)!r} -> {url_of(requested)!r}"
+        return diff(existing, requested)
+    return wrapped
+
+
+for module in (claude_mod, codex_mod, opencode_mod):
+    module._specs_equivalent = compare_urls(module._specs_equivalent)
+    module._diff_specs = diff_urls(module._diff_specs)
+claude_mod._entry_to_spec = parse_url_entries(claude_mod._entry_to_spec, lambda e: True)
+codex_mod._entry_to_spec = parse_url_entries(codex_mod._entry_to_spec, lambda e: True)
+opencode_mod._entry_to_spec = parse_url_entries(
+    opencode_mod._entry_to_spec, lambda e: e.get("type") == "remote"
+)
+
+render_codex = codex_mod._render_block
+
+
+def codex_block(spec):
+    if not url_of(spec):
+        return render_codex(spec)
+    return "\n".join((
+        codex_mod._marker_start(spec.name),
+        f"[mcp_servers.{spec.name}]",
+        f"url = {codex_mod._toml_str(spec.url)}",
+        codex_mod._marker_end(spec.name),
+    ))
+
+
+codex_mod._render_block = codex_block
+
+claude_entry = claude_mod._spec_to_entry
+claude_mod._spec_to_entry = lambda spec: (
+    {"type": "http", "url": spec.url} if url_of(spec) else claude_entry(spec)
+)
+opencode_entry = opencode_mod._spec_to_entry
+opencode_mod._spec_to_entry = lambda spec: (
+    {"type": "remote", "url": spec.url, "enabled": True} if url_of(spec) else opencode_entry(spec)
+)
+
+claude_via_cli = ClaudeRegistrar._register_via_cli
+
+
+def claude_url_via_cli(self, spec):
+    if not url_of(spec):
+        return claude_via_cli(self, spec)
+    done = claude_mod.run(
+        [str(self._claude_cli), "mcp", "add", "--transport", "http", "-s", "user",
+         spec.name, spec.url],
+        capture_output=True, text=True, env=self._claude_cli_env(),
+    )
+    if done.returncode == 0:
+        return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add --transport http`")
+    return self._register_via_file(spec)
+
+
+ClaudeRegistrar._register_via_cli = claude_url_via_cli
+
+fingerprint = ledger_mod.spec_fingerprint
+ledger_mod.spec_fingerprint = lambda spec: fingerprint(
+    ServerSpec(name=spec.name, command="url:" + url_of(spec)) if url_of(spec) else spec
+)
+
+
+
+def npx_era(spec):
+    # [cmd /c] npx -y @upstash/context7-mcp@<version>, written through 0.9.40:
+    # ours even when an uninstall purged the ledger that recorded it.
+    if spec is None:
+        return False
+    launch = (spec.command, *(spec.args or ()))
+    if launch[:2] == ("cmd", "/c"):
+        launch = launch[2:]
+    return (
+        len(launch) == 3
+        and launch[:2] == ("npx", "-y")
+        and re.fullmatch(r"@upstash/context7-mcp@\d\S*", launch[2]) is not None
+    )
+
+
+URL_AGENTS = {"claude", "codex", "opencode"}
 action = sys.argv[1]
-# On Windows npx is an npx.cmd shim, which agents that spawn MCP servers
-# without a shell cannot start ("Windows requires 'cmd /c' wrapper").
-npx = ("cmd", "/c", "npx") if sys.platform == "win32" else ("npx",)
 failures = []
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
     if action == "register":
-        spec = ServerSpec(
-            name="context7",
-            command=npx[0],
-            args=(*npx[1:], "-y", sys.argv[2]),
-        )
+        if registrar.name in URL_AGENTS:
+            spec = UrlSpec(name="context7", command="", url=sys.argv[2])
+        elif len(sys.argv) > 3:
+            spec = ServerSpec(name="context7", command="node", args=(sys.argv[3],))
+        else:
+            print(f"{registrar.name}: no local Context7 package, skipping")
+            continue
         result = registrar.register_server(spec)
-        if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
-            registrar.name, registrar.get_server("context7")
-        ):
-            result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.MISMATCH:
+            current = registrar.get_server("context7")
+            if headroom_installed_matching(registrar.name, current) or npx_era(current):
+                result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.FAILED:
@@ -4281,6 +4403,11 @@ static PLUGIN_ADDONS: [PluginAddon; 3] = [
     },
 ];
 const PLUGIN_DISPLAY_VERSION: &str = "latest";
+/// Plugin addons whose Codex build needs `client_adapters::set_codex_skill_nudge`
+/// to run every session, with the skill name Codex knows them by. Ponytail's
+/// Codex build ships its own session hooks.
+pub(crate) const CODEX_SKILL_NUDGES: [(&str, &str); 2] =
+    [("chisle", "chisle:chisle"), ("caveman", "caveman:caveman")];
 
 fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
     PLUGIN_ADDONS.iter().find(|plugin| plugin.id == id)
@@ -4300,17 +4427,59 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
 fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Option<String> {
     let installed = installed?;
     match id {
-        // Plugins track a moving marketplace, not a pin, so there is no local
-        // signal for "newer exists" — the Update action is the check. It always
-        // shows for an installed plugin, and the button says just "Update".
-        _ if plugin_addon(id).is_some() => Some(String::new()),
-        "markitdown" | "serena" | "context7" | "codebase-memory" => {
-            let on_disk = parse_major_minor_patch(installed)?;
-            let target = parse_major_minor_patch(pinned)?;
-            (on_disk < target).then(|| pinned.to_string())
-        }
-        _ => None,
+        "markitdown" | "serena" | "context7" | "codebase-memory" => {}
+        // Plugins track a moving marketplace, so their pin is the newest
+        // plugin.json on GitHub (`plugin_latest_version`), empty until the
+        // first fetch lands.
+        _ if plugin_addon(id).is_some() => {}
+        _ => return None,
     }
+    let on_disk = parse_major_minor_patch(installed)?;
+    let target = parse_major_minor_patch(pinned)?;
+    (on_disk < target).then(|| pinned.to_string())
+}
+
+/// How long a fetched plugin version stands before the next background fetch.
+const PLUGIN_LATEST_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// A fetch round with a failure (offline at a login launch) retries this soon.
+const PLUGIN_LATEST_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// Newest plugin.json version per plugin addon id. The Instant is when the
+/// next fetch is due, set as a round starts so a slow or failed one is not
+/// retried on every poll.
+type PluginLatestCache =
+    Arc<Mutex<Option<(Instant, std::collections::HashMap<&'static str, String>)>>>;
+
+/// A round with a failure is due again in `PLUGIN_LATEST_RETRY`. A due time,
+/// not a backdated start: Windows cannot hold an Instant from before boot, so
+/// backdating a login launch's round by most of the TTL did nothing there.
+fn plugin_latest_round_failed(cache: &PluginLatestCache) {
+    if let Some((due, _)) = cache.lock().as_mut() {
+        *due = Instant::now() + PLUGIN_LATEST_RETRY;
+    }
+}
+
+/// `version` from the plugin.json at the default branch of `repo`
+/// (`owner/repo`), the commit `plugin marketplace update` moves to. Every
+/// plugin addon keeps its plugin at the marketplace root.
+fn fetch_plugin_version(repo: &str) -> Option<String> {
+    // proxy-ok: public GitHub, not loopback
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("headroom-desktop/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let manifest: Value = client
+        .get(format!(
+            "https://raw.githubusercontent.com/{repo}/HEAD/.claude-plugin/plugin.json"
+        ))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    manifest.get("version")?.as_str().map(str::to_string)
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
     "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
@@ -4581,6 +4750,7 @@ pub struct ToolManager {
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
     serena_live_stats_cache: SerenaLiveStatsCache,
+    plugin_latest_cache: PluginLatestCache,
     /// False once this app process has tried to start the backend at least
     /// once. See its use in `start_headroom_background`.
     first_backend_start: Arc<std::sync::atomic::AtomicBool>,
@@ -4899,7 +5069,7 @@ impl ToolManager {
                 id: "context7".into(),
                 name: "Context7".into(),
                 description:
-                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Requires Node.js 20.18.1 or newer on PATH."
+                    "MCP server that fetches current, version-specific documentation for the libraries you use, so your agent stops burning tokens on guessed or outdated APIs. Uses Context7's hosted server; only Grok runs it locally, which needs Node.js 20.18.1 or newer."
                         .into(),
                 runtime: "node".into(),
                 source_url: "https://github.com/upstash/context7".into(),
@@ -4951,6 +5121,7 @@ impl ToolManager {
             log_marker_cache: Arc::new(Mutex::new(None)),
             serena_calls_cache: Arc::new(Mutex::new(None)),
             serena_live_stats_cache: Arc::new(Mutex::new(None)),
+            plugin_latest_cache: Arc::new(Mutex::new(None)),
             first_backend_start: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
@@ -4966,11 +5137,18 @@ impl ToolManager {
                 // it back on. Enable first, then update.
                 let pending = enabled
                     .then(|| {
-                        pending_addon_update(&manifest.id, installed.as_deref(), &manifest.version)
-                            .or_else(|| {
+                        let pin = match plugin_addon(&manifest.id) {
+                            Some(plugin) if installed.is_some() => {
+                                self.plugin_latest_version(plugin).unwrap_or_default()
+                            }
+                            _ => manifest.version.clone(),
+                        };
+                        pending_addon_update(&manifest.id, installed.as_deref(), &pin).or_else(
+                            || {
                                 (manifest.id == "serena" && self.serena_lacks_uvx())
                                     .then(String::new)
-                            })
+                            },
+                        )
                     })
                     .flatten();
                 let update_available = pending.is_some();
@@ -4993,6 +5171,39 @@ impl ToolManager {
                 }
             })
             .collect()
+    }
+
+    /// The newest version of `plugin` on GitHub. Called from every dashboard
+    /// poll, so it only reads the cache and refreshes it on a background
+    /// thread once stale. None until a fetch lands: no Update button beats a
+    /// wrong one.
+    fn plugin_latest_version(&self, plugin: &PluginAddon) -> Option<String> {
+        let mut cache = self.plugin_latest_cache.lock();
+        if cache.as_ref().is_none_or(|(due, _)| Instant::now() >= *due) {
+            let known = cache
+                .take()
+                .map(|(_, versions)| versions)
+                .unwrap_or_default();
+            *cache = Some((Instant::now() + PLUGIN_LATEST_TTL, known));
+            let shared = Arc::clone(&self.plugin_latest_cache);
+            thread::spawn(move || {
+                let mut failed = false;
+                for plugin in &PLUGIN_ADDONS {
+                    match fetch_plugin_version(plugin.marketplace) {
+                        Some(version) => {
+                            if let Some((_, versions)) = shared.lock().as_mut() {
+                                versions.insert(plugin.id, version);
+                            }
+                        }
+                        None => failed = true,
+                    }
+                }
+                if failed {
+                    plugin_latest_round_failed(&shared);
+                }
+            });
+        }
+        cache.as_ref()?.1.get(plugin.id).cloned()
     }
 
     /// The version actually on disk, from whichever record the addon's own
@@ -10269,52 +10480,78 @@ impl ToolManager {
         self.runtime.tools_dir.join("context7.json").exists()
     }
 
-    /// No managed venv or binary: the agent runs the pinned package through
-    /// its own `npx`. Install just proves that works once (warming the npx
-    /// cache), then registers the MCP entry — a broken entry would make every
-    /// new agent session spawn a failing server.
+    /// Claude Code, Codex and OpenCode reach Context7's hosted server
+    /// (`CONTEXT7_HOSTED_URL`): no process per agent session and no Node.js.
+    /// Every agent session starts its own copy of every local MCP server, and
+    /// through `cmd /c npx` Context7 was four processes per session on Windows
+    /// (~150 MB, ~1.8 CPU-s): about eleven ChatGPT-app sessions at once pinned
+    /// a customer's CPU with 80 processes (2026-10-13). Only Grok, which has
+    /// no URL servers, runs the pinned package, as one `node <script>`.
     pub fn install_context7(&self) -> Result<()> {
-        let npx = crate::claude_cli::detect_npx().context(
-            "npx was not found. Context7 runs through Node.js -- install Node.js, then try again.",
-        )?;
-        run_command_with_timeout(
-            &npx,
-            &["-y", &context7_package_spec(), "--help"],
-            &self.runtime.root_dir,
-            CONTEXT7_INSTALL_TIMEOUT,
-        )
-        // ponytail: no separate Node version probe. Context7 4.x declares
-        // node >=20.18.1 but npm only warns on an engines mismatch, so the
-        // --help run above is what actually proves this Node can run it.
-        .context(
-            "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
-        )?;
-        self.register_context7_mcp()?;
-        self.write_tool_receipt(
-            "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": true }),
-        )?;
-        Ok(())
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
+        let package = self.register_context7(grok_home_present())?;
+        self.write_context7_receipt(true, package)
     }
 
     pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         if !self.context7_installed() {
             bail!("context7 is not installed");
         }
-        if enabled {
-            self.register_context7_mcp()?;
+        let package = if enabled {
+            self.register_context7(grok_home_present())?
         } else {
             self.unregister_context7_mcp()?;
-        }
+            false
+        };
+        self.write_context7_receipt(enabled, package)
+    }
+
+    /// Registers the hosted entry and, when Grok is there, the local package,
+    /// installing it if missing. Returns whether Grok got it; a Grok without
+    /// Node.js only misses Context7, the other agents are unaffected. A broken
+    /// local entry would make every Grok session spawn a failing server, hence
+    /// the package's smoke test before registering it.
+    fn register_context7(&self, grok: bool) -> Result<bool> {
+        let script = match grok.then(|| context7_script_in(&self.context7_package_dir())) {
+            None => None,
+            Some(Some(script)) => Some(script),
+            Some(None) => self
+                .install_context7_package()
+                // Info: no npm or too old a Node, which every launch retries,
+                // is this machine's setup, not a bug for Sentry.
+                .map_err(|err| log::info!("context7 for Grok: {err:#}"))
+                .ok(),
+        };
+        self.register_context7_mcp(script.as_deref())?;
+        Ok(script.is_some())
+    }
+
+    /// `hosted` marks a receipt written after this code registered the hosted
+    /// entry, `package` one where Grok got the local package too, so a launch
+    /// knows what the agents run.
+    fn write_context7_receipt(&self, enabled: bool, package: bool) -> Result<()> {
         self.write_tool_receipt(
             "context7",
-            json!({ "version": CONTEXT7_PINNED_VERSION, "enabled": enabled }),
-        )?;
-        Ok(())
+            json!({
+                "version": CONTEXT7_PINNED_VERSION,
+                "enabled": enabled,
+                "hosted": true,
+                "package": package,
+            }),
+        )
     }
 
     pub fn uninstall_context7(&self) -> Result<()> {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
         self.unregister_context7_mcp()?;
+        // Best effort: a server an open session still runs can hold a file.
+        let package = self.context7_package_dir();
+        if package.exists() {
+            if let Err(err) = std::fs::remove_dir_all(&package) {
+                log::warn!("removing {} failed: {err}", package.display());
+            }
+        }
         let receipt = self.runtime.tools_dir.join("context7.json");
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -10323,14 +10560,91 @@ impl ToolManager {
         Ok(())
     }
 
-    fn register_context7_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&[
-            "-c",
-            CONTEXT7_MCP_HELPER,
-            "register",
-            &context7_package_spec(),
-        ])
-        .context("registering context7 MCP server")
+    fn context7_package_dir(&self) -> PathBuf {
+        self.runtime.tools_dir.join("context7-mcp")
+    }
+
+    /// npm-installs the pinned package and proves this Node runs it; returns
+    /// its server script.
+    fn install_context7_package(&self) -> Result<PathBuf> {
+        let npm = crate::claude_cli::detect_npm().context(
+            "npm was not found. Context7 runs through Node.js -- install Node.js, then try again.",
+        )?;
+        let dir = self.context7_package_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dir_arg = dir.to_string_lossy();
+        run_command_with_timeout(
+            &npm,
+            &[
+                "install",
+                "--prefix",
+                &dir_arg,
+                "--no-audit",
+                "--no-fund",
+                "--omit=dev",
+                &context7_package_spec(),
+            ],
+            &self.runtime.root_dir,
+            CONTEXT7_INSTALL_TIMEOUT,
+        )
+        .context("downloading context7 with npm")?;
+        let script =
+            context7_script_in(&dir).context("npm installed context7 without its server script")?;
+        let node = crate::claude_cli::detect_node().context(
+            "node was not found. Context7 runs through Node.js -- install Node.js, then try again.",
+        )?;
+        let script_arg = script.to_string_lossy();
+        run_command_with_timeout(
+            &node,
+            &[&script_arg, "--help"],
+            &self.runtime.root_dir,
+            Duration::from_secs(60),
+        )
+        // ponytail: no separate Node version probe. Context7 4.x declares
+        // node >=20.18.1 but npm only warns on an engines mismatch, so the
+        // --help run above is what actually proves this Node can run it.
+        .context("context7 failed its smoke test. Context7 needs Node.js 20.18.1 or newer")?;
+        Ok(script)
+    }
+
+    /// Installs from before the hosted entry run `cmd /c npx -y ...` or
+    /// `node <script>`; an enabled one moves over at launch, and a Grok still
+    /// without its package retries. A failure keeps the old entry working, and
+    /// the next launch tries again.
+    pub fn ensure_context7_registration(&self) {
+        let _lifecycle = CONTEXT7_LIFECYCLE.lock();
+        let grok = grok_home_present();
+        if !self.context7_needs_move(grok) {
+            return;
+        }
+        match self
+            .register_context7(grok)
+            .and_then(|package| self.write_context7_receipt(true, package))
+        {
+            Ok(()) => log::info!("context7 moved to the hosted server"),
+            Err(err) => log::warn!("moving context7 to the hosted server failed: {err:#}"),
+        }
+    }
+
+    /// Keyed on the receipt, not on what is on disk: a registration can fail
+    /// after npm finished (a registrar error, the 60s helper timeout, a quit),
+    /// and the agents then still run the old entry.
+    fn context7_needs_move(&self, grok: bool) -> bool {
+        let receipt = self.read_tool_receipt("context7");
+        let flag = |key: &str| receipt.as_ref().and_then(|r| r.get(key)?.as_bool()) == Some(true);
+        let grok_served = !grok
+            || (flag("package") && context7_script_in(&self.context7_package_dir()).is_some());
+        self.context7_installed()
+            && self.tool_enabled("context7")
+            && !(flag("hosted") && grok_served)
+    }
+
+    fn register_context7_mcp(&self, script: Option<&Path>) -> Result<()> {
+        let script = script.map(|script| script.to_string_lossy().into_owned());
+        let mut args = vec!["-c", CONTEXT7_MCP_HELPER, "register", CONTEXT7_HOSTED_URL];
+        args.extend(script.as_deref());
+        self.run_mcp_helper(&args)
+            .context("registering context7 MCP server")
     }
 
     fn unregister_context7_mcp(&self) -> Result<()> {
@@ -10756,13 +11070,20 @@ impl ToolManager {
     pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let hosts = PluginHost::detected();
+        let mut missing = Vec::new();
         if hosts.is_empty() {
-            bail!(NO_PLUGIN_HOST_CLI);
+            missing.push("cli");
         }
         // The install itself never runs node, so without this it "succeeded"
         // and the plugin's hooks then failed in every agent session.
         if crate::claude_cli::detect_node().is_none() {
-            bail!(NO_NODE_FOR_PLUGIN);
+            missing.push("node");
+        }
+        if crate::claude_cli::detect_git().is_none() {
+            missing.push("git");
+        }
+        if !missing.is_empty() {
+            return Err(MissingPluginPrereqs(missing).into());
         }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
@@ -10801,6 +11122,7 @@ impl ToolManager {
                 log::warn!("chisle: scoping its tool-output compression failed: {err:#}");
             }
         }
+        self.ensure_codex_skill_nudges();
         // At most one: with two hosts, the other one installed.
         Ok(outdated.pop())
     }
@@ -10883,6 +11205,7 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
+        self.ensure_codex_skill_nudges();
         Ok(())
     }
 
@@ -10908,7 +11231,25 @@ impl ToolManager {
             std::fs::remove_file(&receipt)
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
+        self.ensure_codex_skill_nudges();
         Ok(())
+    }
+
+    /// Writes or removes each `CODEX_SKILL_NUDGES` block to match what
+    /// Headroom installed into Codex and left enabled. Runs after every
+    /// install, toggle and uninstall, and at launch for earlier installs.
+    pub fn ensure_codex_skill_nudges(&self) {
+        for (id, skill) in CODEX_SKILL_NUDGES {
+            let on = plugin_addon(id).is_some_and(|plugin| {
+                self.plugin_receipt_exists(plugin)
+                    && self.tool_enabled(id)
+                    && PluginHost::Codex.plugin_present(plugin)
+                    && !codex_plugin_disabled(plugin)
+            });
+            if let Err(err) = crate::client_adapters::set_codex_skill_nudge(id, skill, on) {
+                log::warn!("{id}: Codex skill nudge failed: {err:#}");
+            }
+        }
     }
 
     /// Name of an enabled addon that shapes the agent's replies itself (every
@@ -10981,9 +11322,52 @@ impl ToolManager {
 
 const NO_NODE_FOR_PLUGIN: &str = "Node.js was not found. This addon runs through Node.js: install it from https://nodejs.org, then try again.";
 
-const NO_GIT_FOR_PLUGIN: &str = "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again.";
+// macOS ships a /usr/bin/git stub that only works through Apple's developer
+// tools, so a Mac fixes it there, not at git-scm.com (RUST-P0).
+const NO_GIT_FOR_PLUGIN: &str = if cfg!(target_os = "macos") {
+    "Git is not working on this Mac. Claude Code and Codex need it to download this addon: run `xcode-select --install` in Terminal (or update Xcode), then restart Headroom and try again."
+} else {
+    "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again."
+};
 
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
+
+/// Plugin-addon prerequisites this machine lacks ("cli", "node", "git"), all
+/// named at once: one at a time, a Windows user without a codex on PATH,
+/// Node.js and Git took three email round trips to clear them (2026-10).
+#[derive(Debug)]
+pub(crate) struct MissingPluginPrereqs(pub(crate) Vec<&'static str>);
+
+impl std::fmt::Display for MissingPluginPrereqs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let [only] = self.0.as_slice() {
+            return f.write_str(match *only {
+                "cli" => NO_PLUGIN_HOST_CLI,
+                "node" => NO_NODE_FOR_PLUGIN,
+                _ => NO_GIT_FOR_PLUGIN,
+            });
+        }
+        let names: Vec<&str> = self
+            .0
+            .iter()
+            .map(|key| match *key {
+                "cli" => "the Claude Code or Codex CLI",
+                "node" => "Node.js (https://nodejs.org)",
+                _ if cfg!(target_os = "macos") => "Git (run `xcode-select --install` in Terminal)",
+                _ => "Git (https://git-scm.com)",
+            })
+            .collect();
+        let (last, rest) = names.split_last().unwrap_or((&"", &[]));
+        write!(
+            f,
+            "This addon needs {} and {}, which were not found on this computer. Install them, then restart Headroom and try again.",
+            rest.join(", "),
+            last
+        )
+    }
+}
+
+impl std::error::Error for MissingPluginPrereqs {}
 
 /// Plugin addons ship marketplace plugins that both Claude Code and Codex can
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
@@ -11153,6 +11537,28 @@ fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
         std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
     Some(text.lines().any(|line| line.trim_start() == header))
+}
+
+/// The plugin's Codex table says `enabled = false`: the user switched it off
+/// in Codex, so its skill nudge must not tell every session to load it. An
+/// unreadable config keeps the nudge as it is.
+fn codex_plugin_disabled(plugin: &PluginAddon) -> bool {
+    codex_plugin_disabled_in(
+        &std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml"))
+            .unwrap_or_default(),
+        plugin,
+    )
+}
+
+fn codex_plugin_disabled_in(config: &str, plugin: &PluginAddon) -> bool {
+    config.parse::<toml::Table>().ok().is_some_and(|config| {
+        config
+            .get("plugins")
+            .and_then(|plugins| plugins.get(plugin.plugin_ref))
+            .and_then(|table| table.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+    })
 }
 
 /// One row of `codex plugin list`: `<ref>  installed, enabled  4.10.0  <src>`,
@@ -11535,14 +11941,46 @@ fn set_serena_browser_dashboard() {
     }
 }
 
+/// The older of the Claude Code and Codex copies, so Update stays offered until
+/// both hosts have the new build: Claude's copy alone hid it from a dual-host
+/// user whose Codex step failed or who updated Claude's copy via `/plugin`.
 fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
-    let plugins = claude_installed_plugins()?;
-    let installs = plugins.get("plugins")?.get(plugin.plugin_ref)?.as_array()?;
-    installs
-        .first()?
-        .get("version")?
-        .as_str()
-        .map(str::to_string)
+    let claude = claude_installed_plugins().and_then(|plugins| {
+        plugins
+            .get("plugins")?
+            .get(plugin.plugin_ref)?
+            .as_array()?
+            .first()?
+            .get("version")?
+            .as_str()
+            .map(str::to_string)
+    });
+    let codex = codex_cached_plugin_version(
+        &crate::client_adapters::codex_home()
+            .join("plugins")
+            .join("cache"),
+        plugin,
+    );
+    match (claude, codex) {
+        (Some(claude), Some(codex))
+            if parse_major_minor_patch(&codex) < parse_major_minor_patch(&claude) =>
+        {
+            Some(codex)
+        }
+        (claude, codex) => claude.or(codex),
+    }
+}
+
+/// Codex keeps an installed plugin at `<cache>/<marketplace>/<plugin>/<version>`
+/// (plus a `latest` link for some). Only parseable version dirs count.
+fn codex_cached_plugin_version(cache: &Path, plugin: &PluginAddon) -> Option<String> {
+    let name = plugin.plugin_ref.split('@').next().unwrap_or(plugin.id);
+    std::fs::read_dir(cache.join(plugin.marketplace_name).join(name))
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|dir| Some((parse_major_minor_patch(&dir)?, dir)))
+        .max()
+        .map(|(_, dir)| dir)
 }
 
 /// Claude Code ≥2.x stores user-scope MCP servers in `~/.claude.json` under
@@ -12096,9 +12534,11 @@ pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
     for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
         // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
         // selector (lsof ORs `-i` options) and match every listening socket on
-        // the machine, so the first row would be an unrelated daemon.
+        // the machine, so the first row would be an unrelated daemon. `+c 0`:
+        // the default cuts COMMAND at 9 characters, which named a holder
+        // `python3.1` (RUST-EC) and `Paseo\x20` (RUST-KD) to the user.
         let Ok(output) = crate::proc::command(lsof)
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .args(["-nP", "+c", "0", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
             .output()
         else {
             continue; // not installed at this path
@@ -12246,10 +12686,30 @@ fn parse_tasklist_image(text: &str) -> Option<String> {
 
 /// `(command, pid)` from the first data row of `lsof -nP -iTCP -sTCP:LISTEN`,
 /// whose columns start `COMMAND PID`. Row 0 is the header.
+/// lsof writes a space or non-ASCII byte in COMMAND as `\xNN` so the columns
+/// still split on whitespace; decoded here, since the name reaches the UI.
 fn parse_lsof_listener(text: &str) -> Option<(String, u32)> {
     let mut fields = text.lines().nth(1)?.split_whitespace();
-    let command = fields.next()?.to_string();
+    let raw = fields.next()?.as_bytes();
     let pid = fields.next()?.parse().ok()?;
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw
+            .get(i + 2..i + 4)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(byte) if raw[i..].starts_with(b"\\x") => {
+                bytes.push(byte);
+                i += 4;
+            }
+            _ => {
+                bytes.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    let command = String::from_utf8_lossy(&bytes).trim().to_string();
     Some((command, pid))
 }
 
@@ -14988,8 +15448,77 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
 /// Prepend a binary's own directory to PATH so an `#!/usr/bin/env node`
 /// shebang (or similar) resolves the interpreter that nvm installs alongside
 /// it. Falls back to the existing PATH when the binary has no parent.
+/// Every addon this install has, sorted, `:off` on a disabled one
+/// (`caveman,context7,serena:off`), read from the tool receipts; `none`
+/// without any, so the server can tell that from an app too old to report.
+/// The core runtime's own receipt is not an addon.
+pub fn addon_summary() -> Option<String> {
+    let tools = ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).tools_dir;
+    addon_summary_in(&tools)
+}
+
+fn addon_summary_in(tools: &Path) -> Option<String> {
+    let mut addons: Vec<String> = std::fs::read_dir(tools)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_string();
+            if id == "headroom" || !path.is_file() {
+                return None;
+            }
+            let enabled = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|receipt| receipt.get("enabled")?.as_bool())
+                .unwrap_or(true);
+            Some(if enabled { id } else { format!("{id}:off") })
+        })
+        .collect();
+    addons.sort();
+    Some(if addons.is_empty() {
+        "none".to_string()
+    } else {
+        addons.join(",")
+    })
+}
+
+/// Grok has no URL servers, so it is the one agent that still runs Context7's
+/// package locally. Same test as the wheel's `GrokRegistrar.detect`.
+fn grok_home_present() -> bool {
+    std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::client_adapters::home_dir().join(".grok"))
+        .is_dir()
+}
+
 fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
+}
+
+/// The server script of the pinned Context7 under an npm `--prefix` dir, from
+/// the package's own `bin` entry. None when it is missing or another version.
+fn context7_script_in(prefix: &Path) -> Option<PathBuf> {
+    let package = prefix
+        .join("node_modules")
+        .join("@upstash")
+        .join("context7-mcp");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(package.join("package.json")).ok()?).ok()?;
+    if manifest.get("version")?.as_str()? != CONTEXT7_PINNED_VERSION {
+        return None;
+    }
+    let bin = match manifest.get("bin")? {
+        Value::String(path) => path.as_str(),
+        Value::Object(bins) => bins.values().next()?.as_str()?,
+        _ => return None,
+    };
+    let script = package.join(bin);
+    script.is_file().then_some(script)
 }
 
 /// PATH directories that would load a foreign OpenSSL into a bundled
@@ -15797,6 +16326,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // cause: the App Control machine on retry -- python.exe was allowed
         // through, but _ssl's DLLs were still blocked).
         "ssl-missing"
+    } else if crate::is_pip_download_removed_signal(&evidence_lower) {
+        // A wheel pip had just downloaded was gone when pip opened it again,
+        // usually antivirus quarantining it. Read from the evidence: the
+        // compact tail stops at pip's "Error while checking for conflicts"
+        // banner, long before the path (RUST-6S, 2026-10-14, filed `other`).
+        "download-removed"
     } else if lower.contains("no pyvenv.cfg") {
         // The venv launcher stub found no pyvenv.cfg next to it (exit 106):
         // the venv was damaged in place (AV quarantine, disk cleanup) while
@@ -16104,10 +16639,15 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
     log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
-/// The user's machine lacks git (the UI says so), or a host holds the plugin
-/// but no CLI for it can be found (RUST-MV): nothing we ship fixes either.
+/// The user's machine lacks git (the UI says so), a host holds the plugin but
+/// no CLI for it can be found (RUST-MV), or the user's own settings.json does
+/// not parse (RUST-DQ; our own writers already keep that refusal out of
+/// Sentry): nothing we ship fixes any of them.
 fn plugin_install_failure_reported(category: &str) -> bool {
-    !matches!(category, "git-missing" | "cli-missing")
+    !matches!(
+        category,
+        "git-missing" | "cli-missing" | "settings-unparseable"
+    )
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -16128,12 +16668,20 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("'git' not found")
         || (lower.contains("failed to run git") && lower.contains("program not found"))
+        || lower.contains("failed to locate 'git'")
+        || lower.contains("xcrun: error: invalid active developer path")
+        || lower.contains("xcode-select: note: no developer tools were found")
     {
         // Claude Code and Codex clone a marketplace with git, and the host has
         // none (RUST-P0: Windows, Claude Code's "Command 'git' not found or is
         // in an unsafe location", Codex's "failed to run git clone ...: program
-        // not found"). Checked first: the install that follows then fails
-        // "not found in marketplace", which names only the consequence.
+        // not found"), or macOS's /usr/bin/git stub has no working developer
+        // tools behind it (RUST-P0 on 0.9.40: an Xcode out of step with macOS,
+        // "xcode-select: Failed to locate 'git'"; after a macOS upgrade, xcrun's
+        // "invalid active developer path"; with no developer tools at all,
+        // "No developer tools were found"). Checked first: the install that
+        // follows then fails "not found in marketplace", which names only the
+        // consequence.
         "git-missing"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
@@ -16152,6 +16700,11 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     {
         // The host CLI cannot read its own config, so nothing we do lands.
         "host-config-invalid"
+    } else if lower.contains("invalid json syntax in settings file") {
+        // Claude Code refusing a ~/.claude/settings.json the user broke by
+        // hand (RUST-DQ on 0.9.40: a missing comma, the same file that filed
+        // RUST-Q7/Q8/QD/QE/QF from our own writers).
+        "settings-unparseable"
     } else if crate::is_disk_full_signal(&lower) {
         "disk-full"
     } else if lower.contains("permission denied")
@@ -17155,6 +17708,7 @@ mod tests {
         PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
         SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
+    use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -22689,6 +23243,14 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         let out = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
                    python  12345 garm    7u  IPv4 0x1234      0t0  TCP 127.0.0.1:6768 (LISTEN)\n";
         assert_eq!(parse_lsof_listener(out), Some(("python".into(), 12345)));
+        // RUST-KD: lsof escapes spaces and non-ASCII bytes in COMMAND.
+        let out = "COMMAND PID USER\nPaseo\\x20Helper 49331 garm\n";
+        assert_eq!(
+            parse_lsof_listener(out),
+            Some(("Paseo Helper".into(), 49331))
+        );
+        let out = "COMMAND PID USER\nCaf\\xc3\\xa9\\x20 7 garm\n";
+        assert_eq!(parse_lsof_listener(out), Some(("Caf\u{e9}".into(), 7)));
         // Header only: lsof found nothing, which is not a listener.
         assert_eq!(
             parse_lsof_listener("COMMAND   PID USER   FD   TYPE DEVICE\n"),
@@ -25019,16 +25581,22 @@ Always run the linter first.
             None
         );
 
-        // Plugins track a marketplace, so the action is the check: offered
-        // whenever installed, with no version to advertise.
+        // Plugins are pinned to the newest plugin.json on GitHub: offered only
+        // when that is ahead of the install, never before the first fetch.
         assert_eq!(
-            pending_addon_update("ponytail", Some("4.7.0"), PLUGIN_DISPLAY_VERSION).as_deref(),
-            Some("")
+            pending_addon_update("ponytail", Some("4.9.0"), "5.2.0").as_deref(),
+            Some("5.2.0")
         );
         assert_eq!(
-            pending_addon_update("caveman", None, PLUGIN_DISPLAY_VERSION),
+            pending_addon_update("ponytail", Some("5.2.0"), "5.2.0"),
             None
         );
+        assert_eq!(pending_addon_update("ponytail", Some("4.9.0"), ""), None);
+        assert_eq!(
+            pending_addon_update("chisle", Some("4.9.0"), PLUGIN_DISPLAY_VERSION),
+            None
+        );
+        assert_eq!(pending_addon_update("caveman", None, "4.0.1"), None);
 
         // Self-maintaining: rtk is refreshed at launch, headroom rides the
         // runtime upgrade. Neither gets an Update button, stale or not.
@@ -26766,58 +27334,243 @@ Always run the linter first.
     }
 
     #[test]
-    fn context7_helper_wraps_npx_in_cmd_on_windows() {
-        // Native Windows agents spawn MCP servers without a shell, and there
-        // npx is an npx.cmd shim ("Windows requires 'cmd /c' wrapper").
-        // Stub registrars print the spec the real helper registers.
-        let probe = r#"import os, sys, types, enum
-S = enum.Enum("S", {"REGISTERED": "registered", "MISMATCH": "mismatch", "FAILED": "failed"})
-class R:
-    name = "claude"
-    def detect(self): return True
-    def register_server(self, spec, force=False):
-        print("SPEC", spec.command, *spec.args)
-        return types.SimpleNamespace(status=S.REGISTERED, detail=None)
-class Off(R):
-    def detect(self): return False
-reg = types.ModuleType("headroom.mcp_registry")
-reg.ClaudeRegistrar, reg.CodexRegistrar, reg.GrokRegistrar, reg.OpencodeRegistrar = R, Off, Off, Off
-reg.ServerSpec = types.SimpleNamespace
-base = types.ModuleType("base"); base.RegisterStatus = S
-led = types.ModuleType("ledger")
-led.clear_install = led.record_install = lambda *a: None
-led.headroom_installed_matching = lambda *a: False
-sys.modules.update({"headroom": types.ModuleType("headroom"), "headroom.mcp_registry": reg,
-    "headroom.mcp_registry.base": base, "headroom.mcp_registry.ledger": led})
-sys.platform = sys.argv.pop(1)
-exec(os.environ["HELPER"])
-"#;
-        let spec = |platform: &str| {
-            let out = crate::proc::command("python3")
-                .args(["-c", probe, platform, "register", "@upstash/context7-mcp@9"])
-                .env("HELPER", super::CONTEXT7_MCP_HELPER)
+    fn codex_skill_nudge_follows_the_receipt_and_the_codex_registry() {
+        // Chisle's Codex build has no session hook, so without this block
+        // Codex runs its skill only when the model happens to pick it.
+        let (root, runtime, manager) = seed_test_runtime("codex-skill-nudge");
+        let _home = HomeGuard::new(&root);
+        let codex = root.join(".codex");
+        fs::create_dir_all(&codex).expect("codex home");
+        fs::write(
+            codex.join("config.toml"),
+            "[plugins.\"chisle@chisle\"]\nenabled = true\n",
+        )
+        .expect("codex config");
+        fs::write(codex.join("AGENTS.md"), "My own rules.\n").expect("agents");
+        let receipt = runtime.tools_dir.join("chisle.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let agents = || fs::read_to_string(codex.join("AGENTS.md")).expect("read agents");
+
+        manager.ensure_codex_skill_nudges();
+        let on = agents();
+        fs::write(&receipt, br#"{"version":"latest","enabled":false}"#).expect("receipt");
+        manager.ensure_codex_skill_nudges();
+        let off = agents();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(on.contains("load the `chisle:chisle` skill"), "{on}");
+        assert!(on.contains("My own rules."), "{on}");
+        // Caveman has neither a receipt nor a Codex registration.
+        assert!(!on.contains("caveman:caveman"), "{on}");
+        assert_eq!(off.trim(), "My own rules.");
+    }
+
+    #[test]
+    fn context7_move_retries_until_its_registration_lands() {
+        let (_root, runtime, manager) = seed_test_runtime("context7-move");
+        assert!(!manager.context7_needs_move(false), "not installed");
+        let receipt =
+            |body: &str| fs::write(runtime.tools_dir.join("context7.json"), body).unwrap();
+        // npx- and node-era receipts move over.
+        receipt(r#"{"version":"4.0.6","enabled":true}"#);
+        assert!(manager.context7_needs_move(false));
+        receipt(r#"{"version":"4.0.6","enabled":true,"package":true}"#);
+        assert!(manager.context7_needs_move(false));
+        manager.write_context7_receipt(true, false).unwrap();
+        assert!(!manager.context7_needs_move(false));
+        // With Grok there it moves until the package is registered and present:
+        // npm can finish while the registration after it fails.
+        assert!(manager.context7_needs_move(true));
+        let package = runtime
+            .tools_dir
+            .join("context7-mcp/node_modules/@upstash/context7-mcp");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::write(package.join("dist/index.js"), "").unwrap();
+        fs::write(
+            package.join("package.json"),
+            serde_json::json!({ "version": super::CONTEXT7_PINNED_VERSION, "bin": "dist/index.js" })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(manager.context7_needs_move(true));
+        manager.write_context7_receipt(true, true).unwrap();
+        assert!(!manager.context7_needs_move(true));
+        fs::remove_file(package.join("dist/index.js")).unwrap();
+        assert!(manager.context7_needs_move(true));
+        // A disabled one never moves.
+        manager.write_context7_receipt(false, false).unwrap();
+        assert!(!manager.context7_needs_move(true));
+    }
+
+    #[test]
+    fn addon_summary_lists_receipts_with_their_enabled_flag() {
+        let tools = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::addon_summary_in(tools.path()).as_deref(),
+            Some("none")
+        );
+        for (name, body) in [
+            ("headroom.json", r#"{"artifact":{}}"#),
+            ("serena.json", r#"{"enabled":false,"version":"1"}"#),
+            ("context7.json", r#"{"enabled":true}"#),
+            ("rtk.json", r#"{"artifact":{}}"#),
+        ] {
+            std::fs::write(tools.path().join(name), body).unwrap();
+        }
+        std::fs::create_dir(tools.path().join("context7-mcp")).unwrap();
+        assert_eq!(
+            super::addon_summary_in(tools.path()).as_deref(),
+            Some("context7,rtk,serena:off")
+        );
+    }
+
+    #[test]
+    fn context7_script_comes_from_the_pinned_package_bin() {
+        let prefix = tempfile::tempdir().unwrap();
+        let package = prefix.path().join("node_modules/@upstash/context7-mcp");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        std::fs::write(package.join("dist/index.js"), "").unwrap();
+        let manifest = |version: &str, bin: serde_json::Value| {
+            std::fs::write(
+                package.join("package.json"),
+                serde_json::json!({ "version": version, "bin": bin }).to_string(),
+            )
+            .unwrap()
+        };
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!({ "context7-mcp": "dist/index.js" }),
+        );
+        assert_eq!(
+            super::context7_script_in(prefix.path()),
+            Some(package.join("dist/index.js"))
+        );
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!("dist/index.js"),
+        );
+        assert!(super::context7_script_in(prefix.path()).is_some());
+        // Another version, or a bin that is not there, is no install.
+        manifest("1.0.0", serde_json::json!("dist/index.js"));
+        assert_eq!(super::context7_script_in(prefix.path()), None);
+        manifest(
+            super::CONTEXT7_PINNED_VERSION,
+            serde_json::json!("dist/gone.js"),
+        );
+        assert_eq!(super::context7_script_in(prefix.path()), None);
+    }
+
+    /// The real helper against the installed wheel's registrars, in a scratch
+    /// home: hosted entries for Claude Code, Codex and OpenCode, the local
+    /// script for Grok, an npx-era entry replaced, a rerun a no-op, and
+    /// unregister removing all of it. No `claude` on PATH, so nothing reaches
+    /// the real CLI or the real configs.
+    #[test]
+    fn context7_helper_registers_hosted_entries_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [
+            ".codex",
+            ".claude",
+            ".grok",
+            ".config/opencode",
+            ".headroom",
+        ] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
                 .output()
-                .ok()?;
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            assert!(
-                out.status.success(),
-                "{stdout}{}",
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            stdout
-                .lines()
-                .find(|l| l.starts_with("SPEC "))
-                .map(str::to_owned)
+            assert!(out.status.success(), "{text}");
+            text
         };
-        let Some(windows) = spec("win32") else {
-            eprintln!("skipping: no python3 on PATH");
-            return;
-        };
-        assert_eq!(windows, "SPEC cmd /c npx -y @upstash/context7-mcp@9");
+        // An npx-era install, recorded in the ledger like the old helper did.
+        run(&[
+            "-c",
+            r#"from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, OpencodeRegistrar, ServerSpec
+from headroom.mcp_registry.ledger import record_install
+old = ServerSpec(name="context7", command="npx", args=("-y", "@upstash/context7-mcp@4.0.6"))
+for r in (ClaudeRegistrar(claude_cli=None), CodexRegistrar(), OpencodeRegistrar()):
+    assert r.register_server(old).ok
+    record_install(r.name, old)"#,
+        ]);
+        let script = "/tools/context7-mcp/dist/index.js";
+        let helper = super::CONTEXT7_MCP_HELPER;
+        let url = super::CONTEXT7_HOSTED_URL;
+        let first = run(&["-c", helper, "register", url, script]);
+        for agent in [
+            "claude: registered",
+            "codex: registered",
+            "grok: registered",
+            "opencode: registered",
+        ] {
+            assert!(first.contains(agent), "{first}");
+        }
+        let read = |path: &str| std::fs::read_to_string(home.path().join(path)).unwrap();
+        let claude: serde_json::Value = serde_json::from_str(&read(".claude.json")).unwrap();
         assert_eq!(
-            spec("darwin").as_deref(),
-            Some("SPEC npx -y @upstash/context7-mcp@9")
+            claude["mcpServers"]["context7"],
+            serde_json::json!({ "type": "http", "url": url })
         );
+        let codex = read(".codex/config.toml");
+        assert!(codex.contains(&format!("url = \"{url}\"")), "{codex}");
+        assert!(!codex.contains("npx"), "{codex}");
+        let opencode: serde_json::Value =
+            serde_json::from_str(&read(".config/opencode/opencode.json")).unwrap();
+        assert_eq!(opencode["mcp"]["context7"]["type"], "remote");
+        assert_eq!(opencode["mcp"]["context7"]["url"], url);
+        let grok = read(".grok/config.toml");
+        assert!(
+            grok.contains("command = \"node\"") && grok.contains(script),
+            "{grok}"
+        );
+
+        let again = run(&["-c", helper, "register", url, script]);
+        assert!(!again.contains(": registered"), "a rerun rewrote: {again}");
+        let gone = run(&["-c", helper, "unregister"]);
+        assert_eq!(gone.matches(": removed").count(), 4, "{gone}");
+        assert!(!read(".codex/config.toml").contains("context7"));
+        assert!(!read(".claude.json").contains("context7"));
+
+        // The same npx-era entries with no ledger record (an uninstall purged
+        // ~/.headroom) are still replaced; a user's unpinned one is not.
+        run(&[
+            "-c",
+            r#"from headroom.mcp_registry import ClaudeRegistrar, CodexRegistrar, OpencodeRegistrar, ServerSpec
+old = ServerSpec(name="context7", command="cmd", args=("/c", "npx", "-y", "@upstash/context7-mcp@4.0.6"))
+for r in (ClaudeRegistrar(claude_cli=None), CodexRegistrar()):
+    assert r.register_server(old).ok
+own = ServerSpec(name="context7", command="npx", args=("-y", "@upstash/context7-mcp"))
+assert OpencodeRegistrar().register_server(own).ok"#,
+        ]);
+        let unrecorded = run(&["-c", helper, "register", url, script]);
+        for agent in [
+            "claude: registered",
+            "codex: registered",
+            "opencode: mismatch",
+        ] {
+            assert!(unrecorded.contains(agent), "{unrecorded}");
+        }
+        assert!(!read(".claude.json").contains("npx"));
+        assert!(!read(".codex/config.toml").contains("npx"));
+        assert!(read(".config/opencode/opencode.json").contains("npx"));
     }
 
     #[test]
@@ -27953,6 +28706,28 @@ exit 0
         );
     }
 
+    #[test]
+    fn pip_download_removed_from_its_unpack_dir_is_its_own_bucket() {
+        // RUST-6S on 0.9.40 (Windows): the tail stops at the conflict-check
+        // banner, so only pip's full output names the vanished wheel.
+        let stderr = concat!(
+            "ERROR: Error while checking for conflicts. Please file an issue on pip's issue ",
+            "tracker: https://github.com/pypa/pip/issues/new\n",
+            "Traceback (most recent call last):\n",
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages\\pip\\",
+            "_internal\\commands\\install.py\", line 585, in _determine_conflicts\n",
+            "FileNotFoundError: [Errno 2] No such file or directory: '~\\AppData\\Local\\Temp\\",
+            "pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "download-removed"
+        );
+    }
+
     /// The tail is still right when pip prints no `ERROR:` line at all, so the
     /// RUST-82 fix must not cost us the ordinary case.
     #[test]
@@ -28222,6 +28997,68 @@ exit 0
         ));
     }
 
+    /// Offline at a login launch, the version fetch must come back within the
+    /// retry on every platform. Backdating the round's start could not reach
+    /// before boot on Windows, so there it waited out the full 6-hour TTL.
+    #[test]
+    fn a_failed_plugin_version_round_is_due_again_within_the_retry() {
+        use std::time::Instant;
+        let cache: super::PluginLatestCache = std::sync::Arc::new(parking_lot::Mutex::new(Some((
+            Instant::now() + super::PLUGIN_LATEST_TTL,
+            Default::default(),
+        ))));
+        super::plugin_latest_round_failed(&cache);
+        let due = cache.lock().as_ref().unwrap().0;
+        assert!(due <= Instant::now() + super::PLUGIN_LATEST_RETRY);
+    }
+
+    #[test]
+    fn codex_plugin_disabled_reads_the_plugins_enabled_flag() {
+        let plugin = super::plugin_addon("chisle").unwrap();
+        let config = |body: &str| format!("[plugins.\"{}\"]\n{body}\n", plugin.plugin_ref);
+        assert!(super::codex_plugin_disabled_in(
+            &config("enabled = false"),
+            plugin
+        ));
+        assert!(!super::codex_plugin_disabled_in(
+            &config("enabled = true"),
+            plugin
+        ));
+        assert!(!super::codex_plugin_disabled_in(&config(""), plugin));
+        assert!(!super::codex_plugin_disabled_in("not = [toml", plugin));
+    }
+
+    #[test]
+    fn codex_cached_plugin_version_takes_the_newest_version_dir() {
+        let cache = tempfile::tempdir().unwrap();
+        let plugin = super::plugin_addon("ponytail").unwrap();
+        assert_eq!(codex_cached_plugin_version(cache.path(), plugin), None);
+        let dir = cache.path().join("ponytail").join("ponytail");
+        for name in ["4.9.0", "5.10.0", "latest"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        assert_eq!(
+            codex_cached_plugin_version(cache.path(), plugin).as_deref(),
+            Some("5.10.0")
+        );
+    }
+
+    #[test]
+    fn missing_plugin_prereqs_names_every_missing_one_at_once() {
+        assert_eq!(
+            MissingPluginPrereqs(vec!["node"]).to_string(),
+            NO_NODE_FOR_PLUGIN
+        );
+        let all = MissingPluginPrereqs(vec!["cli", "node", "git"]).to_string();
+        assert!(
+            all.starts_with(
+                "This addon needs the Claude Code or Codex CLI, Node.js (https://nodejs.org) and Git ("
+            ),
+            "{all}"
+        );
+        assert!(all.ends_with("restart Headroom and try again."), "{all}");
+    }
+
     #[test]
     fn plugin_install_failure_category_splits_the_rust_6k_grab_bag() {
         // Every string below is a real RUST-6K event body. They arrived under ONE
@@ -28308,6 +29145,50 @@ exit 0
                  caveman@caveman\nstdout:\n\nstderr:\nError: plugin `caveman` was not found in \
                  marketplace `caveman`",
                 "git-missing",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\nAdding \
+                 marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: Failed to \
+                 clone marketplace repository: Error loading required libraries.\nxcode-select: \
+                 Failed to locate 'git', requesting installation of command line developer \
+                 tools.\n: command failed (exit 1): ~/.local/bin/claude plugin install \
+                 chisle@chisle\nstdout:\n\nstderr:\n\u{2718} Failed to install plugin \
+                 \"chisle@chisle\": Plugin \"chisle\" not found in marketplace \"chisle\"",
+                "git-missing",
+            ),
+            (
+                "Codex: marketplace add failed first: command failed (exit 1): codex plugin \
+                 marketplace add JayPokale/Chisle\nstdout:\n\nstderr:\nError: git clone \
+                 https://github.com/JayPokale/Chisle.git failed with status exit status: 1\n\
+                 stderr:\nxcrun: error: invalid active developer path \
+                 (/Library/Developer/CommandLineTools), missing xcrun at: \
+                 /Library/Developer/CommandLineTools/usr/bin/xcrun",
+                "git-missing",
+            ),
+            (
+                // No developer tools at all (the release-train guest with
+                // /Library/Developer/CommandLineTools moved aside).
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 /Users/admin/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\n\
+                 Adding marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: \
+                 Failed to clone marketplace repository: xcode-select: note: No developer tools \
+                 were found, requesting install. If developer tools are located at a \
+                 non-default location on disk, use `sudo xcode-select --switch \
+                 path/to/Xcode.app` to specify the Xcode that you wish to use for command line \
+                 developer tools, and cancel the installation dialog.",
+                "git-missing",
+            ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add DietrichGebert/ponytail\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Invalid JSON syntax in settings file at ~\\.claude\\settings.json\n\
+                 : command failed (exit 1): ~\\.local\\bin\\claude.exe plugin install \
+                 ponytail@ponytail\nstdout:\nInstalling plugin \"ponytail@ponytail\"...\n\n\
+                 stderr:\n\u{d7} Failed to install plugin \"ponytail@ponytail\": Failed to update \
+                 settings: Invalid JSON syntax in settings file at ~\\.claude\\settings.json",
+                "settings-unparseable",
             ),
             ("Codex: something we have not seen", "other"),
         ];

@@ -169,6 +169,12 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if msg.starts_with("skipping Sentry capture for") {
         return true;
     }
+    // A settings file the user broke by hand: whichever flow tripped on it
+    // (setup repair, a hook removal, teardown) correctly left it alone, and
+    // the client that owns it cannot read it either (RUST-6X, RUST-Q7/Q8).
+    if msg.contains(crate::client_adapters::UNPARSEABLE_SETTINGS) {
+        return true;
+    }
     // tiktoken prefetch is best-effort warm-up, same contract as the kompress
     // prefetch below: the proxy lazy-loads the tokenizer on first request if
     // the prefetch fails, and the dominant failure is the host's own
@@ -360,8 +366,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // still-exiting backend that re-creates a file mid-walk ("Directory not
     // empty"), a venv Windows still holds open ("Access is denied", RUST-6T),
     // and settings files we deliberately leave alone when they don't parse
-    // ("refusing to overwrite potentially valid user settings", RUST-6X --
-    // that branch is the correct one, not a failure). The app is being removed
+    // (RUST-6X, now skipped for every flow above). The app is being removed
     // either way, so none of it is actionable in a release. Matched by prefix
     // across modules: the same teardown runs from client_adapters (files,
     // settings) and lib (plugins, MCP servers), and every sibling shape landed
@@ -1319,6 +1324,19 @@ mod tests {
             "cleanup: stripping hook from ~/.claude/settings.local.json failed: parsing \
              ~/.claude/settings.local.json failed (JSON/JSON5); refusing to overwrite \
              potentially valid user settings"
+        ));
+        // RUST-Q8 / RUST-Q7: the same refusal from setup repair and a hook
+        // removal, outside any teardown.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "repair_client_setups: re-apply for claude_code failed: parsing \
+             ~\\.claude\\settings.json failed (expected `,` or `]` at line 67 column 7); \
+             refusing to overwrite potentially valid user settings: --> 66:7"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "removing the Remote Control hooks failed: parsing ~\\.claude\\settings.json \
+             failed (JSON/JSON5); refusing to overwrite potentially valid user settings"
         ));
         // RUST-6T: same teardown, different module -- the venv is still open on
         // Windows when uninstall_and_quit deletes it.

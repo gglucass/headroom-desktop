@@ -94,6 +94,19 @@ fn extension_codex_candidates(home: &Path, exe: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Both plugin CLIs clone an addon's marketplace with git. Also tries Git for
+/// Windows' default dir, so one installed after launch is not reported
+/// missing; the install's own git-missing error then asks for the restart the
+/// CLI needs to see it.
+pub fn detect_git() -> Option<PathBuf> {
+    detect_cli("git").or_else(|| {
+        let dir = PathBuf::from(std::env::var_os("ProgramFiles")?)
+            .join("Git")
+            .join("cmd");
+        first_runnable(std::iter::once(dir.join("git.exe")))
+    })
+}
+
 /// Plugin addons' hooks run `node`. Also tries the Windows installer's default
 /// dir: Headroom's own PATH predates a Node installed after launch, so "install
 /// Node.js, then try again" would otherwise keep failing until a restart.
@@ -104,14 +117,14 @@ pub fn detect_node() -> Option<PathBuf> {
     })
 }
 
-/// npm installs npx beside node, so wherever `detect_node` found node (its
-/// Windows installer-dir fallback included), npx is there too: without this a
-/// Node installed after launch let every plugin addon install while Context7
-/// kept reporting "npx was not found" (a Windows customer, 2026-10-12).
-pub fn detect_npx() -> Option<PathBuf> {
-    detect_cli("npx").or_else(|| {
+/// npm sits beside node, so wherever `detect_node` found node (its Windows
+/// installer-dir fallback included), npm is there too: without this a Node
+/// installed after launch let every plugin addon install while Context7 kept
+/// reporting that it was not found (a Windows customer, 2026-10-12).
+pub fn detect_npm() -> Option<PathBuf> {
+    detect_cli("npm").or_else(|| {
         let dir = detect_node()?.parent()?.to_path_buf();
-        first_runnable(["npx.cmd", "npx"].into_iter().map(|name| dir.join(name)))
+        first_runnable(["npm.cmd", "npm"].into_iter().map(|name| dir.join(name)))
     })
 }
 

@@ -1193,6 +1193,16 @@ select {
   line-height: 1.45;
 }
 
+.upgrade-plan-card__tier-warning {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--warning-text);
+  background: var(--warning-tint);
+}
+
 /* Inherits the line's color so it stays legible in both themes. */
 .upgrade-plan-card__renewal-price {
   font-weight: 600;

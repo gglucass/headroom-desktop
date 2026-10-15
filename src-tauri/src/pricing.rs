@@ -160,6 +160,10 @@ struct IdentityPayload {
     /// enough that it never reported" (which stays null).
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_desktop: Option<&'static str>,
+    /// Installed addons (`tool_manager::addon_summary`), so "who runs
+    /// Context7 on Windows" has an answer: on 2026-10-14 it had none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addons: Option<String>,
 }
 
 /// Reqwest errors caused by the user's environment (offline, captive portal,
@@ -407,6 +411,7 @@ impl IdentityPayload {
             claude_usage_windows: None,
             claude_desktop: None,
             wsl_agents: None,
+            addons: None,
             ..self
         }
     }
@@ -418,7 +423,16 @@ impl IdentityPayload {
             chopratejas_instance_id: device.chopratejas_instance_id,
             claude_account_uuid: claude.and_then(|p| p.account_uuid.clone()),
             claude_email: claude.and_then(|p| p.email.clone()),
-            claude_plan_tier: claude.map(|p| p.plan_tier.clone()),
+            // A ~/.claude.json plan is display only, like in
+            // resolve_tier_mismatch: the server stores any known tier it is
+            // sent for billing, and the file can be another account's.
+            claude_plan_tier: claude.map(|p| {
+                if plan_is_from_claude_json(p) {
+                    ClaudePlanTier::Unknown
+                } else {
+                    p.plan_tier.clone()
+                }
+            }),
             claude_organization_type: claude.and_then(|p| p.organization_type.clone()),
             claude_rate_limit_tier: claude.and_then(|p| p.rate_limit_tier.clone()),
             claude_user_rate_limit_tier: claude.and_then(|p| p.user_rate_limit_tier.clone()),
@@ -438,6 +452,7 @@ impl IdentityPayload {
             accepted_terms_version: None,
             wsl_agents: crate::wsl_probe::result(),
             claude_desktop: Some(crate::client_adapters::claude_desktop_verdict()),
+            addons: crate::tool_manager::addon_summary(),
         }
     }
 
@@ -1117,7 +1132,9 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         tier_mismatch,
     );
     status.codex = fetch_codex_usage(state, status.account.as_ref(), subscription_clamped);
-    status.codex_plan_tier = Some(state.codex_plan_tier());
+    // The tier the clock judged, not only what a live request decoded: the
+    // under-tier card note and the paywall read it, and must agree with it.
+    status.codex_plan_tier = Some(codex_plan.unwrap_or(CodexPlanTier::Unknown));
     status.last_account_email = local_state.last_account_email.clone();
     maybe_apply_fake_weekly_gate(&mut status);
     // Attach the signed-in account to the Sentry scope so later captures from
@@ -2562,6 +2579,19 @@ fn resolve_tier_mismatch(
     codex_plan: Option<CodexPlanTier>,
     active_day_keys: &[String],
 ) -> Option<TierMismatch> {
+    // A plan read from ~/.claude.json while no bearer is live may be another
+    // account's (CLAUDE_CONFIG_DIR) or stale, so it neither starts nor clears
+    // the clock: an idle hour stays "no verdict" (#36).
+    let file_plan;
+    let claude = if plan_is_from_claude_json(claude) {
+        file_plan = ClaudeAccountProfile {
+            plan_tier: ClaudePlanTier::Unknown,
+            ..claude.clone()
+        };
+        &file_plan
+    } else {
+        claude
+    };
     let (paid_tier, recommended_tier, recommended_source) =
         match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
             Some(triple) => triple,
@@ -3042,10 +3072,79 @@ pub struct ProfileDetection {
     pub error_is_transient: bool,
 }
 
+/// `plan_detection_source` of a plan read from `~/.claude.json` rather than a
+/// live bearer. Display only: `resolve_tier_mismatch` judges it as Unknown.
+const CLAUDE_JSON_PLAN_SOURCE: &str = "claude_json.oauthAccount";
+
+fn plan_is_from_claude_json(profile: &ClaudeAccountProfile) -> bool {
+    profile.plan_detection_source.as_deref() == Some(CLAUDE_JSON_PLAN_SOURCE)
+}
+
+/// The plan Claude Code cached for its signed-in account in `~/.claude.json`
+/// (`oauthAccount`, the same org fields the live profile carries). Readable
+/// before any request has gone through the proxy. Only with the Claude Code
+/// connector on: a Codex-only user can carry an old login there. The
+/// remembered snapshot counts: quit empties the configured set until
+/// `restore_client_setups`, and the launch-time Unknown stood for the profile
+/// cache's 5 minutes.
+fn claude_json_plan_tier() -> Option<(ClaudePlanTier, Option<String>)> {
+    if !crate::client_adapters::claude_code_connector_wanted() {
+        return None;
+    }
+    let raw =
+        std::fs::read_to_string(crate::client_adapters::home_dir().join(".claude.json")).ok()?;
+    plan_tier_from_claude_json(&raw)
+}
+
+fn plan_tier_from_claude_json(raw: &str) -> Option<(ClaudePlanTier, Option<String>)> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let account = json.get("oauthAccount")?;
+    let field = |key: &str| {
+        account
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let organization_type = field("organizationType");
+    let rate_limit_tier = field("organizationRateLimitTier");
+    // Without either org field the classifier would read a missing
+    // subscription date as Free; that is "no data", not a plan.
+    if organization_type.is_none() && rate_limit_tier.is_none() {
+        return None;
+    }
+    let profile = ClaudeOauthProfile {
+        account: ClaudeOauthProfileAccount {
+            uuid: None,
+            email: None,
+            display_name: None,
+            created_at: None,
+        },
+        organization: Some(ClaudeOauthProfileOrganization {
+            uuid: None,
+            billing_type: field("billingType"),
+            subscription_created_at: field("subscriptionCreatedAt").and_then(|t| t.parse().ok()),
+            has_extra_usage_enabled: false,
+            organization_type,
+            rate_limit_tier,
+            user_rate_limit_tier: field("userRateLimitTier"),
+            seat_tier: field("seatTier"),
+        }),
+    };
+    match detect_plan_tier_from_profile(&profile).0 {
+        ClaudePlanTier::Unknown => None,
+        tier => Some((tier, Some(CLAUDE_JSON_PLAN_SOURCE.into()))),
+    }
+}
+
 pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
     let Some(token) = state.current_bearer_token() else {
         // No token yet — proxy hasn't seen a request through. Return a minimal
-        // profile so the app can show "send a message first" messaging.
+        // profile so the app can show "send a message first" messaging. The
+        // plan still comes from Claude Code's own cache when it has one, so the
+        // upgrade view never pitches a Max user Pro just because no request
+        // went through in the last hour (the bearer TTL).
+        let (plan_tier, plan_detection_source) =
+            claude_json_plan_tier().unwrap_or((ClaudePlanTier::Unknown, None));
         return ProfileDetection {
             profile: ClaudeAccountProfile {
                 auth_method: ClaudeAuthMethod::Unknown,
@@ -3057,8 +3156,8 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 account_created_at: None,
                 subscription_created_at: None,
                 has_extra_usage_enabled: false,
-                plan_tier: ClaudePlanTier::Unknown,
-                plan_detection_source: None,
+                plan_tier,
+                plan_detection_source,
                 organization_type: None,
                 rate_limit_tier: None,
                 user_rate_limit_tier: None,
@@ -4303,12 +4402,13 @@ mod tests {
         codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
         latch_clamp_start, merge_background_account_sync, parse_oauth_profile_value,
-        plan_tier_header_value, remote_account_to_profile, resolve_account_api_base_url,
-        resolve_tier_mismatch, tier_mismatch_grace_ends_at, ClaudeOauthProfile,
-        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
-        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
-        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
-        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
+        plan_tier_from_claude_json, plan_tier_header_value, remote_account_to_profile,
+        resolve_account_api_base_url, resolve_tier_mismatch, tier_mismatch_grace_ends_at,
+        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
+        HeadroomSubscriptionTier, IdentityFingerprint, IdentityPayload, LocalPricingState,
+        PricingPromo, RemoteAccountResponse, RemoteAccountSyncError,
+        CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -4606,6 +4706,7 @@ mod tests {
             codex_usage_windows: Some("primary=99@43200".into()),
             wsl_agents: Some("none".into()),
             claude_desktop: Some("absent"),
+            addons: Some("context7".into()),
             ..Default::default()
         }
         .without_analytics();
@@ -4623,6 +4724,7 @@ mod tests {
             "codexUsageWindows",
             "wslAgents",
             "claudeDesktop",
+            "addons",
         ] {
             assert!(json.get(dropped).is_none(), "{dropped} sent: {json}");
         }
@@ -5702,6 +5804,29 @@ mod tests {
         let org = profile.organization.expect("organization present");
         assert!(org.user_rate_limit_tier.is_none());
         assert!(org.seat_tier.is_none());
+    }
+
+    #[test]
+    fn claude_json_oauth_account_classifies_the_plan() {
+        // Shape Claude Code writes to ~/.claude.json (keys as of 2026-10).
+        let max20 = r#"{"oauthAccount":{"accountUuid":"a","billingType":"stripe_subscription",
+            "organizationRateLimitTier":"default_claude_max_20x","organizationType":"claude_max",
+            "seatTier":null,"subscriptionCreatedAt":"2025-09-02T11:17:30.062615Z"}}"#;
+        assert!(matches!(
+            plan_tier_from_claude_json(max20),
+            Some((ClaudePlanTier::Max20x, Some(_)))
+        ));
+        let pro = r#"{"oauthAccount":{"organizationRateLimitTier":"default_claude_ai",
+            "organizationType":"claude_pro","subscriptionCreatedAt":"2025-09-02T11:17:30Z"}}"#;
+        assert!(matches!(
+            plan_tier_from_claude_json(pro),
+            Some((ClaudePlanTier::Pro, _))
+        ));
+        // No login, an API-key setup, or an account without org fields is no
+        // data, never Free.
+        assert!(plan_tier_from_claude_json(r#"{"projects":{}}"#).is_none());
+        assert!(plan_tier_from_claude_json(r#"{"oauthAccount":{"accountUuid":"a"}}"#).is_none());
+        assert!(plan_tier_from_claude_json("not json").is_none());
     }
 
     #[test]
@@ -7931,6 +8056,98 @@ mod tests {
                 .is_none()
         );
         assert_eq!(persisted(), (None, None));
+    }
+
+    /// Right after a relaunch only the remembered snapshot holds Claude Code
+    /// (quit empties the configured set), and the plan must still be read.
+    #[test]
+    #[serial_test::serial]
+    fn claude_json_plan_is_read_before_setups_are_restored() {
+        let env = AuthedTestEnv::new("session-xyz");
+        std::fs::write(
+            env._scratch.path().join(".claude.json"),
+            r#"{"oauthAccount":{"organizationRateLimitTier":"default_claude_max_20x",
+                "organizationType":"claude_max"}}"#,
+        )
+        .unwrap();
+        let setup =
+            crate::storage::config_file(&crate::storage::app_data_dir(), "client-setup.json");
+        let write_setup = |remembered: &str| {
+            std::fs::write(
+                &setup,
+                format!(r#"{{"configuredClients":{{}},"rememberedClients":{{{remembered}}}}}"#),
+            )
+            .unwrap()
+        };
+
+        write_setup("");
+        assert!(super::claude_json_plan_tier().is_none(), "connector off");
+        write_setup(r#""claude_code":"2026-10-14T00:00:00Z""#);
+        assert!(matches!(
+            super::claude_json_plan_tier(),
+            Some((ClaudePlanTier::Max20x, _))
+        ));
+    }
+
+    /// The server stores any known tier it is sent, so a ~/.claude.json plan
+    /// goes out as unknown while a live one goes out as is.
+    #[test]
+    fn identity_reports_the_claude_json_plan_as_unknown() {
+        let live = empty_claude_profile(ClaudePlanTier::Max20x);
+        let from_file = ClaudeAccountProfile {
+            plan_detection_source: Some(super::CLAUDE_JSON_PLAN_SOURCE.into()),
+            ..live.clone()
+        };
+        let tier = |p: &ClaudeAccountProfile| {
+            super::IdentityPayload::build(Some(p), None).claude_plan_tier
+        };
+        assert_eq!(tier(&live), Some(ClaudePlanTier::Max20x));
+        assert_eq!(tier(&from_file), Some(ClaudePlanTier::Unknown));
+    }
+
+    /// The ~/.claude.json plan (no live bearer) is display-only: a Pro there
+    /// must not wipe a running clock, and a Max x20 there must not start one.
+    #[test]
+    #[serial_test::serial]
+    fn tier_mismatch_clock_ignores_the_claude_json_plan() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let persisted = || {
+            let local = super::load_or_initialize_local_state().unwrap();
+            (local.mismatch_since, local.mismatch_clamped_at)
+        };
+        let from_file = |tier| ClaudeAccountProfile {
+            plan_detection_source: Some(super::CLAUDE_JSON_PLAN_SOURCE.into()),
+            ..empty_claude_profile(tier)
+        };
+
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &from_file(ClaudePlanTier::Max20x),
+            None,
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(persisted(), (None, None), "file plan started the clock");
+
+        let since = Utc::now() - Duration::days(3);
+        let mut local = super::load_or_initialize_local_state().unwrap();
+        local.mismatch_since = Some(since);
+        super::write_local_state(&local).unwrap();
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &from_file(ClaudePlanTier::Pro),
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(
+            persisted(),
+            (Some(since), None),
+            "file plan cleared the clock"
+        );
     }
 
     #[test]

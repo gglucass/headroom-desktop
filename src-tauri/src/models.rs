@@ -1388,7 +1388,8 @@ pub struct HeadroomPricingStatus {
     /// enabled and the backend has captured at least one rate-limit snapshot.
     #[serde(default)]
     pub codex: Option<CodexUsage>,
-    /// ChatGPT plan decoded from the Codex OAuth JWT by the intercept proxy.
+    /// ChatGPT plan the tier-mismatch clock judges (live JWT capture merged
+    /// with auth.json, only with the Codex connector on; `unknown` otherwise).
     /// Populated by `get_pricing_status` only; drives the paywall tier
     /// recommendation pre-purchase (`tier_mismatch` requires an active
     /// subscription, so it can't serve that role).

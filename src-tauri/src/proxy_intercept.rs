@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use base64::Engine;
@@ -50,10 +50,43 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// holds a client + backend FD for the request's full lifetime (SSE streams
 /// run for minutes), so an unbounded spawn pile-up under 30+ Claude Code
 /// sessions can starve accept() with EMFILE even after the startup RLIMIT
-/// raise. When saturated, `handle` fails fast with 503 + Retry-After: CC/Codex
-/// retry transparently, unlike a dropped connect that kills the user's turn.
+/// raise. When saturated, `handle` fails fast with 503 + Retry-After, which
+/// Claude Code retries transparently, unlike a dropped connect that kills the
+/// user's turn. Codex shows the same 503 as a disconnect ("Reconnecting...
+/// n/5"), so a saturated Codex request goes direct to its provider instead.
 /// Overridable via HEADROOM_INTERCEPT_MAX_INFLIGHT.
 const DEFAULT_MAX_INFLIGHT: usize = 512;
+
+/// A backend relay with no bytes in either direction for this long is closed,
+/// releasing its in-flight permit. Every client has given up by then (Codex's
+/// stream idle timeout is 5 minutes, Claude Code's request timeout 10), so it
+/// only ever closes a relay nobody is waiting on. Without it such relays held
+/// their permits forever: on Windows the cap filled within minutes of a launch
+/// and every Codex request got a 503 from then on (RUST-GY, user 4055,
+/// 2026-10-09..14, no request through Headroom for four days). Upgraded
+/// (WebSocket) relays are exempt: idle is normal for them.
+const RELAY_IDLE_LIMIT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(600)
+};
+const RELAY_IDLE_CHECK: Duration = if cfg!(test) {
+    Duration::from_millis(250)
+} else {
+    Duration::from_secs(30)
+};
+/// How long a relay's client half may outlive the backend's response. Every
+/// forward is one request per connection (`force_connection_close`), so once
+/// the backend has finished nothing the client sends can be used, yet the
+/// relay waited for the client to close too: a close that never reached us
+/// (RUST-GY's leak) held the permit for the whole idle limit.
+const RESPONSE_DONE_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(5)
+};
+static IDLE_RELAYS_CLOSED: AtomicU64 = AtomicU64::new(0);
+static IDLE_RELAY_CLOSED_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 
 static BACKEND_INFLIGHT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
     std::sync::OnceLock::new();
@@ -306,30 +339,6 @@ fn seen_within(last_seen: &AtomicU64, ttl_secs: u64) -> bool {
     seen != 0 && now_epoch_secs().saturating_sub(seen) < ttl_secs
 }
 
-/// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
-/// runtime lifecycle when it *intentionally* stops+restarts the backend (an
-/// upgrade / requirements repair). A down window we caused ourselves is not an
-/// outage worth paging: the old backend is killed, the wheel reinstalled, then
-/// a fresh one spawned, and the down->up transition would otherwise fire a
-/// false `backend_unreachable`. Every observed instance of this warning came
-/// from a single rc-churn test box cycling release candidates.
-static SUPPRESS_RECONNECT_UNTIL: AtomicU64 = AtomicU64::new(0);
-
-/// Silence Codex reconnect warnings for `window` from now. Called around an
-/// app-initiated backend restart so the ensuing reconnect isn't misreported as
-/// an outage. `fetch_max` so overlapping restarts never shorten the window.
-// ponytail: fixed window (caller passes a generous ceiling covering
-// reinstall+boot); if upgrades ever routinely exceed it, gate on the live
-// `runtime_upgrade_in_progress` flag instead.
-pub fn suppress_codex_reconnect_reports_for(window: Duration) {
-    let until = now_epoch_secs().saturating_add(window.as_secs());
-    SUPPRESS_RECONNECT_UNTIL.fetch_max(until, Ordering::Relaxed);
-}
-
-fn codex_reconnect_reports_suppressed() -> bool {
-    now_epoch_secs() < SUPPRESS_RECONNECT_UNTIL.load(Ordering::Relaxed)
-}
-
 fn should_report_throttled(slot: &AtomicU64) -> bool {
     let now = now_epoch_secs();
     let mut last = slot.load(Ordering::Relaxed);
@@ -359,32 +368,6 @@ fn should_report_upstream_error(client: &'static str, status: u16) -> bool {
         None => slots.push(((client, status), now)),
     }
     true
-}
-
-fn report_codex_reconnect_incident(
-    cause: &'static str,
-    affected_requests: u64,
-    downtime: Option<Duration>,
-) {
-    if codex_reconnect_reports_suppressed() {
-        return;
-    }
-    sentry::with_scope(
-        |scope| {
-            scope.set_tag("codex_reconnect_cause", cause);
-            scope.set_extra("affected_requests", (affected_requests as i64).into());
-            if let Some(downtime) = downtime {
-                scope.set_extra("downtime_ms", (downtime.as_millis() as i64).into());
-            }
-            scope.set_fingerprint(Some(&["codex-reconnecting", cause]));
-        },
-        || {
-            sentry::capture_message(
-                &format!("Codex entered reconnect retry loop ({cause})"),
-                sentry::Level::Warning,
-            );
-        },
-    );
 }
 
 /// `ErrorKind` plus the raw OS code, which on Windows tells a reset (10054)
@@ -590,6 +573,94 @@ pub fn first_prompt_request_seen() -> bool {
 /// says the request was a client's). Wrapped around the backend->client half of
 /// the splices below.
 struct StampReader<R>(R, bool);
+
+/// A relay socket that stamps `last` (epoch seconds) whenever bytes are read
+/// from it, so `handle` can tell an idle relay from a live one (see
+/// `RELAY_IDLE_LIMIT`). Epoch, not `Instant`: a relay that slept through a
+/// system sleep is dead (its upstream connection is) and should look idle.
+struct Touched<S> {
+    inner: S,
+    last: Arc<AtomicU64>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Touched<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.last.store(now_epoch_secs(), Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Logs a relay `handle` closed for idling and, at most once a minute, tells
+/// Sentry which client and path it was, the one thing the in-flight cap
+/// report cannot say (RUST-GY).
+fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
+    let closed = IDLE_RELAYS_CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let path = path.split('?').next().unwrap_or_default();
+    log::info!(
+        "[proxy_intercept] closed a relay idle for {}s: {client} {path} (open {}s, {closed} closed this run)",
+        RELAY_IDLE_LIMIT.as_secs(),
+        open.as_secs()
+    );
+    // Open clearly less than the idle limit (a minute of slack for the two
+    // clocks' granularity) yet idle past it: the idle time is mostly a system
+    // sleep, which kills every connection. Closing it is right; reporting it
+    // would bury the leaks this report exists to find.
+    let slept = open + Duration::from_secs(60) < RELAY_IDLE_LIMIT;
+    if slept || !should_report_throttled(&IDLE_RELAY_CLOSED_LAST_REPORTED) {
+        return;
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("relay_client", client);
+            scope.set_tag("relay_path", path);
+            scope.set_extra("open_secs", (open.as_secs() as i64).into());
+            scope.set_extra("closed_this_run", (closed as i64).into());
+            scope.set_extra(
+                "permits_available",
+                (backend_inflight().available_permits() as i64).into(),
+            );
+            scope.set_fingerprint(Some(&["intercept-idle-relay-closed"]));
+        },
+        || {
+            sentry::capture_message(
+                "intercept closed an idle backend relay",
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
 
 impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
     fn poll_read(
@@ -2258,14 +2329,17 @@ async fn handle(
     // 503 retries transparently; a hung/dropped connect kills the turn. The
     // permit is held in `_permit` until `handle` returns (through the splice).
     let Ok(_permit) = backend_inflight().clone().try_acquire_owned() else {
-        log::info!("[proxy_intercept] backend in-flight cap reached; returning 503");
-        if is_codex
-            && !is_opencode
-            && !is_grok
-            && should_report_throttled(&CODEX_INFLIGHT_503_LAST_REPORTED)
-        {
-            report_codex_reconnect_incident("backend_inflight_cap", 1, None);
+        if is_codex && !is_opencode && !is_grok {
+            // Codex surfaces a 503 as a dropped connection, so it goes
+            // unoptimized to its provider instead, the backend-down fallback.
+            log::info!("[proxy_intercept] backend in-flight cap reached; forwarding Codex direct");
+            if should_report_throttled(&CODEX_INFLIGHT_503_LAST_REPORTED) {
+                report_inflight_cap_reached("codex");
+            }
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+            return;
         }
+        log::info!("[proxy_intercept] backend in-flight cap reached; returning 503");
         let _ = client
             .write_all(
                 b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2358,89 +2432,144 @@ async fn handle(
     // only) never fires for it — this proxy is the only component left in the
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
-    if is_models_fetch {
-        splice_with_models_lite_rewrite(client, backend).await;
-    } else if is_codex && !is_opencode && !is_grok {
-        let req_path = parsed_head
-            .as_ref()
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
-        let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
-        splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
-    } else {
-        // Same shape as copy_bidirectional, split so the backend->client half
-        // can stamp traffic liveness for the watchdog.
-        let (mut client_rd, mut client_wr) = client.split();
-        let (backend_rd, mut backend_wr) = backend.split();
-        let upstream = async {
-            let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
-            let _ = backend_wr.shutdown().await;
-        };
-        let downstream = async {
-            // Local proxy paths (/stats, /readyz probes) are our own traffic;
-            // a 404 there is the squatter case (RUST-87), not a client error.
-            // Client reachability probes are expected noise, see
-            // is_client_probe_path.
-            let error_path = parsed_head
+    let upgrade = request_has_header(&buf, "upgrade");
+    let relay_path = parsed_head
+        .as_ref()
+        .map(|head| head.path.clone())
+        .unwrap_or_default();
+    let activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+    let client = Touched {
+        inner: client,
+        last: Arc::clone(&activity),
+    };
+    let backend = Touched {
+        inner: backend,
+        last: Arc::clone(&activity),
+    };
+    let relay = async {
+        if is_models_fetch {
+            splice_with_models_lite_rewrite(client, backend).await;
+        } else if is_codex && !is_opencode && !is_grok {
+            let req_path = parsed_head
                 .as_ref()
-                .filter(|head| {
-                    is_provider_api_path(&head.path)
-                        && !is_local_proxy_path(&head.path)
-                        && !is_client_probe_path(&head.path)
-                })
-                .map(|head| head.path.clone());
-            let savings_session = parsed_head
+                .map(|p| p.path.clone())
+                .unwrap_or_default();
+            let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
+            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
+        } else {
+            // Same shape as copy_bidirectional, split so the backend->client half
+            // can stamp traffic liveness for the watchdog.
+            let (mut client_rd, mut client_wr) = tokio::io::split(client);
+            let (backend_rd, mut backend_wr) = tokio::io::split(backend);
+            let upstream = async {
+                let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+                let _ = backend_wr.shutdown().await;
+            };
+            let downstream = async {
+                // Local proxy paths (/stats, /readyz probes) are our own traffic;
+                // a 404 there is the squatter case (RUST-87), not a client error.
+                // Client reachability probes are expected noise, see
+                // is_client_probe_path.
+                let error_path = parsed_head
+                    .as_ref()
+                    .filter(|head| {
+                        is_provider_api_path(&head.path)
+                            && !is_local_proxy_path(&head.path)
+                            && !is_client_probe_path(&head.path)
+                    })
+                    .map(|head| head.path.clone());
+                let savings_session = parsed_head
+                    .as_ref()
+                    .filter(|head| client_key == "claude-code" && is_prompt_request_head(head))
+                    .and_then(|_| extract_header_value(&buf, "x-claude-code-session-id"))
+                    .filter(|id| is_claude_session_id(id));
+                // The request is with the backend now: statusline "compressing".
+                if let Some(id) = savings_session.as_deref() {
+                    crate::claude_statusline::record_request(id);
+                }
+                // The same two kinds of noise must not hold off the idle update.
+                let client_traffic = !parsed_head.as_ref().is_some_and(|head| {
+                    is_local_proxy_path(&head.path) || is_client_probe_path(&head.path)
+                });
+                let mut stamped = ResponseSniffer::new(
+                    StampReader(backend_rd, client_traffic),
+                    client_key,
+                    error_path,
+                )
+                .with_savings_session(savings_session);
+                let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
+                let _ = client_wr.shutdown().await;
+                copied
+            };
+            let relay = relay_until_response_done(upstream, downstream);
+            let is_readyz = parsed_head
                 .as_ref()
-                .filter(|head| client_key == "claude-code" && is_prompt_request_head(head))
-                .and_then(|_| extract_header_value(&buf, "x-claude-code-session-id"))
-                .filter(|id| is_claude_session_id(id));
-            // The request is with the backend now: statusline "compressing".
-            if let Some(id) = savings_session.as_deref() {
-                crate::claude_statusline::record_request(id);
+                .is_some_and(|head| head.path == "/readyz" || head.path.starts_with("/readyz?"));
+            if !is_readyz {
+                let _ = relay.await;
+                return;
             }
-            // The same two kinds of noise must not hold off the idle update.
-            let client_traffic = !parsed_head.as_ref().is_some_and(|head| {
-                is_local_proxy_path(&head.path) || is_client_probe_path(&head.path)
-            });
-            let mut stamped = ResponseSniffer::new(
-                StampReader(backend_rd, client_traffic),
-                client_key,
-                error_path,
-            )
-            .with_savings_session(savings_session);
-            let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
-            let _ = client_wr.shutdown().await;
-            copied
-        };
-        let relay = async { tokio::join!(upstream, downstream).1 };
-        let is_readyz = parsed_head
-            .as_ref()
-            .is_some_and(|head| head.path == "/readyz" || head.path.starts_with("/readyz?"));
-        if !is_readyz {
-            let _ = relay.await;
-            return;
+            // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
+            // still running then is a failure even if it never ends. Watch it
+            // without cutting it short: the relay itself behaves exactly as before.
+            tokio::pin!(relay);
+            let mut stalled = false;
+            let copied = tokio::select! {
+                copied = &mut relay => copied,
+                () = tokio::time::sleep(READYZ_RELAY_STALL) => {
+                    stalled = true;
+                    relay.await
+                }
+            };
+            let socket_error = !stalled && copied.is_err();
+            let failure = match copied {
+                _ if stalled => Some("stalled".to_string()),
+                Ok(0) => Some("backend sent nothing".to_string()),
+                Ok(_) => None,
+                Err(e) => Some(describe_io_error(&e)),
+            };
+            note_readyz_relay(failure, socket_error, head_read, accepted_at.elapsed());
         }
-        // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
-        // still running then is a failure even if it never ends. Watch it
-        // without cutting it short: the relay itself behaves exactly as before.
-        tokio::pin!(relay);
-        let mut stalled = false;
-        let copied = tokio::select! {
-            copied = &mut relay => copied,
-            () = tokio::time::sleep(READYZ_RELAY_STALL) => {
-                stalled = true;
-                relay.await
-            }
-        };
-        let socket_error = !stalled && copied.is_err();
-        let failure = match copied {
-            _ if stalled => Some("stalled".to_string()),
-            Ok(0) => Some("backend sent nothing".to_string()),
-            Ok(_) => None,
-            Err(e) => Some(describe_io_error(&e)),
-        };
-        note_readyz_relay(failure, socket_error, head_read, accepted_at.elapsed());
+    };
+    if upgrade {
+        relay.await;
+        return;
     }
+    tokio::pin!(relay);
+    loop {
+        tokio::select! {
+            () = &mut relay => return,
+            () = tokio::time::sleep(RELAY_IDLE_CHECK) => {
+                let idle = now_epoch_secs().saturating_sub(activity.load(Ordering::Relaxed));
+                if idle >= RELAY_IDLE_LIMIT.as_secs() {
+                    note_idle_relay_closed(client_key, &relay_path, accepted_at.elapsed());
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The in-flight cap turned a Codex request away from the backend (it went
+/// direct). Before the idle-relay close existed this fired with Codex already
+/// in its reconnect loop (RUST-GY); now it says the cap filled despite it.
+fn report_inflight_cap_reached(client: &'static str) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("relay_client", client);
+            scope.set_extra(
+                "idle_relays_closed_this_run",
+                (IDLE_RELAYS_CLOSED.load(Ordering::Relaxed) as i64).into(),
+            );
+            scope.set_fingerprint(Some(&["intercept-inflight-cap-direct"]));
+        },
+        || {
+            sentry::capture_message(
+                "backend in-flight cap reached; Codex forwarded direct",
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 /// Upper bound on a `/v1/models` response body we're willing to buffer for the
@@ -2459,7 +2588,10 @@ const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// by OpenAI when re-originated by a proxy). Fail-open: on non-200, compressed
 /// or chunked bodies, oversize payloads, truncated reads, or non-JSON content,
 /// the response is forwarded byte-for-byte untouched.
-async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: TcpStream) {
+async fn splice_with_models_lite_rewrite<S: AsyncRead + AsyncWrite + Unpin>(
+    mut client: S,
+    mut backend: S,
+) {
     let mut head = Vec::with_capacity(4096);
     let read_head = tokio::time::timeout(
         HEADER_READ_TIMEOUT,
@@ -2470,7 +2602,7 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
         if !head.is_empty() && client.write_all(&head).await.is_err() {
             return;
         }
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        splice_until_response_done(client, backend).await;
         return;
     }
 
@@ -2574,7 +2706,24 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
         }
     }
     // Remainder: body of a non-rewritable response and/or keep-alive reuse.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    splice_until_response_done(client, backend).await;
+}
+
+/// `copy_bidirectional` that ends like the plain relay: the client half gets
+/// `RESPONSE_DONE_GRACE` once the backend's response is done, so a client that
+/// never closes does not hold the in-flight permit until the idle close.
+async fn splice_until_response_done<S: AsyncRead + AsyncWrite + Unpin>(client: S, backend: S) {
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
+    let upstream = async {
+        let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+        let _ = backend_wr.shutdown().await;
+    };
+    let downstream = async {
+        let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
+        let _ = client_wr.shutdown().await;
+    };
+    relay_until_response_done(upstream, downstream).await;
 }
 
 /// Outcome of attempting the lite-flag rewrite on a models-catalog body.
@@ -2674,15 +2823,15 @@ fn set_response_content_length(head: &mut Vec<u8>, len: usize) {
 /// responses are neither buffered nor delayed beyond their header block. On any
 /// read error before the head completes, whatever was read is still forwarded,
 /// so the response is never corrupted.
-async fn splice_with_codex_capture(
-    mut client: TcpStream,
-    mut backend: TcpStream,
+async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
+    client: S,
+    backend: S,
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
     prompt: bool,
 ) {
-    let (mut client_rd, mut client_wr) = client.split();
-    let (mut backend_rd, mut backend_wr) = backend.split();
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
 
     // Set once the client stops sending — EOF or error on its read half. When
     // that happens *before* the backend finishes streaming, the client walked
@@ -2816,7 +2965,23 @@ async fn splice_with_codex_capture(
         let _ = client_wr.shutdown().await;
     };
 
-    tokio::join!(upstream, downstream);
+    relay_until_response_done(upstream, downstream).await;
+}
+
+/// Both halves of a relay, ending the client->backend one `RESPONSE_DONE_GRACE`
+/// after the backend->client one finishes. Returns the latter's output.
+async fn relay_until_response_done<T>(
+    upstream: impl std::future::Future<Output = ()>,
+    downstream: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(upstream, downstream);
+    tokio::select! {
+        () = &mut upstream => downstream.await,
+        out = &mut downstream => {
+            let _ = tokio::time::timeout(RESPONSE_DONE_GRACE, upstream).await;
+            out
+        }
+    }
 }
 
 /// Whether a Codex prompt failed in a way the user saw: `Some(true)` failed,
@@ -5318,17 +5483,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn codex_reconnect_reports_suppress_within_window() {
-        use std::sync::atomic::Ordering;
-        super::SUPPRESS_RECONNECT_UNTIL.store(0, Ordering::Release);
-        assert!(!super::codex_reconnect_reports_suppressed());
-        super::suppress_codex_reconnect_reports_for(Duration::from_secs(3600));
-        assert!(super::codex_reconnect_reports_suppressed());
-        super::SUPPRESS_RECONNECT_UNTIL.store(0, Ordering::Release);
-    }
-
-    #[test]
-    #[serial]
     fn launch_time_unreachable_does_not_arm_the_down_timer() {
         use std::sync::atomic::Ordering;
         let addr: SocketAddr = "127.0.0.1:6768".parse().unwrap();
@@ -5923,6 +6077,257 @@ mod tests {
 
         backend_task.await.expect("backend served both probes");
         run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// Starts the intercept on a free port against the current backend port
+    /// and `upstream_base`; returns its address and the task to abort.
+    async fn start_intercept(upstream_base: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let addr = listener.local_addr().expect("intercept addr");
+        drop(listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = run(
+                addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new(upstream_base),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+        for _ in 0..50 {
+            if TcpStream::connect(addr).await.is_ok() {
+                return (addr, task);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("intercept never came up");
+    }
+
+    /// RUST-GY: a backend that takes a request and never answers used to hold
+    /// its in-flight permit forever. Once the relay has been idle for
+    /// `RELAY_IDLE_LIMIT` the intercept closes both sides and the permit
+    /// returns.
+    #[tokio::test]
+    #[serial]
+    async fn idle_backend_relay_is_closed_and_frees_its_permit() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        // The backend reads the request and then says nothing, ever.
+        let (mut held, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = held.read(&mut request).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            super::backend_inflight().available_permits(),
+            permits - 1,
+            "the relay holds a permit while it waits"
+        );
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(8), client.read_to_end(&mut response))
+            .await
+            .expect("the idle relay is closed")
+            .expect("read to end");
+        assert!(
+            response.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let backend_eof = timeout(Duration::from_secs(2), held.read(&mut request))
+            .await
+            .expect("the backend side is closed too");
+        assert!(matches!(backend_eof, Ok(0) | Err(_)));
+        assert_eq!(super::backend_inflight().available_permits(), permits);
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A client that never closes after a complete response (its close lost
+    /// on the host, RUST-GY) gets the response and its permit back within
+    /// `RESPONSE_DONE_GRACE`, not the idle limit.
+    #[tokio::test]
+    #[serial]
+    async fn a_finished_response_frees_its_permit_though_the_client_stays_open() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        backend
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("respond");
+        drop(backend);
+
+        // The client keeps its socket open and never sends EOF.
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("the response ends")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"ok"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            super::backend_inflight().available_permits(),
+            permits,
+            "the permit returns well before the idle limit"
+        );
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// The same for a Codex models fetch, whose lite-flag rewrite splice is
+    /// separate from the plain one.
+    #[tokio::test]
+    #[serial]
+    async fn a_finished_models_fetch_frees_its_permit_though_the_client_stays_open() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        backend
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}",
+            )
+            .await
+            .expect("respond");
+        drop(backend);
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("the response ends")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"{\"models\":[]}"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            super::backend_inflight().available_permits(),
+            permits,
+            "the permit returns well before the idle limit"
+        );
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// With the in-flight cap full, Codex goes direct to its provider instead
+    /// of getting the 503 it shows as "Reconnecting... n/5"; Claude Code, which
+    /// retries a 503 transparently, still gets one.
+    #[tokio::test]
+    #[serial]
+    async fn a_full_inflight_cap_sends_codex_direct() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        let (addr, task) =
+            start_intercept(format!("http://127.0.0.1:{}", upstream_addr.port())).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let inflight = super::backend_inflight();
+        let all = inflight
+            .clone()
+            .try_acquire_many_owned(inflight.available_permits() as u32)
+            .expect("take every permit");
+
+        let send = |request: &'static [u8]| async move {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            client.write_all(request).await.expect("write");
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+            String::from_utf8_lossy(&response).into_owned()
+        };
+        let codex = send(
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let claude =
+            send(b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        drop(all);
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+
+        assert!(codex.starts_with("HTTP/1.1 200"), "codex: {codex:?}");
+        assert!(claude.starts_with("HTTP/1.1 503"), "claude: {claude:?}");
+        assert!(
+            timeout(Duration::from_millis(200), backend_listener.accept())
+                .await
+                .is_err(),
+            "nothing reaches the saturated backend"
+        );
+
+        task.abort();
         backend_port::reset_for_tests();
     }
 

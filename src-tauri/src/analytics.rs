@@ -50,6 +50,9 @@ const ALLOWED_EVENTS: &[&str] = &[
     "rtk_enabled",
     "rtk_disabled",
     "rtk_uninstalled",
+    // Carries addon + missing ("cli,node,git"): how often a missing
+    // prerequisite blocks a plugin addon install.
+    "addon_install_blocked",
     "ponytail_installed",
     "ponytail_enabled",
     "ponytail_disabled",

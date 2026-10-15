@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.9.40"
+version = "0.9.41"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -72,7 +72,7 @@ reqwest = { version = "=0.12.28", default-features = false, features = ["system-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Wdk_System_Threading"] }
 # Windows-only: std/tokio set SO_REUSEADDR on Unix but not here, so rebinding
 # the intercept port over a previous instance's draining TIME_WAIT sockets
 # needs the option set by hand before bind. See `reuse_bound_std_listener`.

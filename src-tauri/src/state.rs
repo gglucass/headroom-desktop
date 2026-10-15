@@ -877,6 +877,10 @@ impl AppState {
                 log::warn!("markitdown hook refresh failed during warm_runtime_on_launch: {err:#}");
             }
         }
+        self.tool_manager.ensure_codex_skill_nudges();
+        // npm can take a minute, and this runs before the proxy starts.
+        let tools = self.tool_manager.clone();
+        std::thread::spawn(move || tools.ensure_context7_registration());
 
         // Heals installs already in the field: older installs and pre-fix venv
         // swaps never vendored the MSVC runtime DLLs, so on a redist-less
@@ -1085,13 +1089,6 @@ impl AppState {
 
         *self.runtime_upgrade_in_progress.lock() = true;
         self.invalidate_runtime_status_cache();
-
-        // We're about to stop the old backend and spawn a fresh one. Suppress
-        // Codex reconnect warnings across the whole reinstall+boot so the
-        // self-inflicted down->up transition isn't paged as `backend_unreachable`.
-        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
-            std::time::Duration::from_secs(600),
-        );
 
         // Clear the flag on EVERY exit, including a panic anywhere in the
         // ~500-line body below. This runs on a bare spawned thread with no
@@ -3960,18 +3957,6 @@ impl AppState {
         let lock_held = _lifecycle_guard.is_some();
         let reap_own_children =
             lock_held || crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire);
-        // Every app-initiated stop is a down window we caused: a watchdog
-        // restart, a pricing-gate pause, a port rebind, quit. The down->up
-        // transition that follows is not an outage worth paging, and when the
-        // stop came from the watchdog auto-pause it duplicates
-        // `proxy_unreachable_post_boot` with none of its diagnostics
-        // (RUST-5J/5D). A backend that dies on its own never routes through
-        // here, so genuine crashes still report. The window has to outlast a
-        // cold boot (tiktoken prefetch alone gets 120s); the upgrade path
-        // above uses 600s for a reinstall+boot.
-        crate::proxy_intercept::suppress_codex_reconnect_reports_for(
-            std::time::Duration::from_secs(300),
-        );
         // `starting` belongs to the transition holding the lifecycle lock. An
         // unguarded stop clearing it mid-spawn told the watchdog the runtime
         // should be up, so 15s later it hung-killed the spawn it should have
@@ -9497,6 +9482,16 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 /// dashboard prefixes the first sentence with "Headroom is not hooked up right
 /// now:" as the headline and shows the rest underneath, so the first sentence
 /// states only the fact and stays short.
+/// Where this platform's users end a program by hand: the 6767 hint named Task
+/// Manager to Mac users too.
+const PROCESS_MONITOR: &str = if cfg!(target_os = "macos") {
+    "Activity Monitor"
+} else if cfg!(windows) {
+    "Task Manager"
+} else {
+    "your system monitor"
+};
+
 pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
     if let Some((_, holder)) = raw.split_once(" is held by ") {
@@ -9510,7 +9505,7 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
         };
         return format!(
             "Port {port} is in use by {holder}. {direct}\
-             Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
+             Quit that program, or end it in {PROCESS_MONITOR}, and Headroom reconnects on its own."
         );
     }
     // Two app instances (`restart_app`'s `open -n` relauncher bypasses
@@ -9987,10 +9982,10 @@ fn windows_process_sweep_script(
     )
 }
 
-/// Whether any process could be a target of the Windows sweep: one whose
-/// image path contains one of `image_dirs` (case-insensitive, as `-like`
-/// matches) and whose parent passes the sweep's parent rule. Run natively
-/// before PowerShell starts. The script's own image-path prefilter did not cut
+/// Every process that could be a target of the Windows sweep, as `(pid,
+/// parent pid, image path)`: one whose image path contains one of
+/// `image_dirs` (case-insensitive, as `-like` matches) and whose parent passes
+/// the sweep's parent rule. Run natively before PowerShell starts. The script's own image-path prefilter did not cut
 /// RUST-K3 (0.9.38 fired at 0.9.37's rate): the `headroom mcp serve` that
 /// Claude Code and Codex keep running is `Scripts\headroom.exe` over the
 /// venv's `Scripts\python.exe` launcher, so with any client session open that
@@ -10002,28 +9997,57 @@ fn windows_process_sweep_script(
 /// pattern's exe (see `windows_sweep_image_dirs`). An unreadable image path
 /// (system processes) is no candidate: `Get-Process` cannot read it either.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_sweep_has_candidates(
+fn windows_sweep_candidates(
     processes: &[(u32, u32)],
     image_dirs: &[String],
     self_pid: u32,
     parents: SweepParents,
     image_path: impl Fn(u32) -> Option<String>,
-) -> bool {
+) -> Vec<(u32, u32, String)> {
     let live: std::collections::HashSet<u32> = processes.iter().map(|&(pid, _)| pid).collect();
     let dirs: Vec<String> = image_dirs.iter().map(|dir| dir.to_lowercase()).collect();
-    processes.iter().any(|&(pid, ppid)| {
-        pid != self_pid
-            && match parents {
-                SweepParents::Any => true,
-                SweepParents::Orphans { own_children } => {
-                    (own_children && ppid == self_pid) || !live.contains(&ppid)
+    processes
+        .iter()
+        .filter(|&&(pid, ppid)| {
+            pid != self_pid
+                && match parents {
+                    SweepParents::Any => true,
+                    SweepParents::Orphans { own_children } => {
+                        (own_children && ppid == self_pid) || !live.contains(&ppid)
+                    }
                 }
-            }
-            && image_path(pid).is_some_and(|path| {
-                let path = path.to_lowercase();
-                dirs.iter().any(|dir| path.contains(dir.as_str()))
-            })
-    })
+        })
+        .filter_map(|&(pid, ppid)| {
+            let path = image_path(pid)?;
+            let lower = path.to_lowercase();
+            dirs.iter()
+                .any(|dir| lower.contains(dir.as_str()))
+                .then_some((pid, ppid, path))
+        })
+        .collect()
+}
+
+/// The sweep script's match for one candidate, decided natively: its command
+/// line or image names `exe`, and its command line holds `args_pattern`
+/// (case-insensitive, as `-like` is). `None` when that needs the command line
+/// and it cannot be read; the caller then runs the script. `command_line` is
+/// only called when the image alone cannot decide.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_sweep_matches(
+    image: &str,
+    command_line: impl FnOnce() -> Option<String>,
+    exe: &str,
+    args_pattern: &str,
+) -> Option<bool> {
+    let exe = exe.to_lowercase();
+    if args_pattern.is_empty() && image.to_lowercase().contains(&exe) {
+        return Some(true);
+    }
+    let command_line = command_line()?.to_lowercase();
+    Some(
+        (command_line.contains(&exe) || image.to_lowercase().contains(&exe))
+            && command_line.contains(&args_pattern.to_lowercase()),
+    )
 }
 
 /// Where a Windows sweep target's image can sit: the pattern's exe, the managed
@@ -10286,9 +10310,9 @@ fn kill_processes_by_command_pattern(
         // start, and on a slow AV host its 20s timeout (RUST-K3, still ~2 a day
         // on 0.9.39 after the native prefilter).
         let image_dirs = windows_sweep_image_dirs(exe);
-        let has_candidates = || {
+        let candidates = || {
             crate::winproc::process_parents().map(|processes| {
-                windows_sweep_has_candidates(
+                windows_sweep_candidates(
                     &processes,
                     &image_dirs,
                     std::process::id(),
@@ -10297,16 +10321,60 @@ fn kill_processes_by_command_pattern(
                 )
             })
         };
-        let mut pending = has_candidates();
+        let mut pending = candidates();
         for _ in 0..4 {
-            if pending != Some(true) {
+            if pending.as_ref().is_none_or(Vec::is_empty) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
-            pending = has_candidates();
+            pending = candidates();
         }
-        if pending == Some(false) {
-            return Ok(());
+        // A candidate that outlived the settle used to start PowerShell, and
+        // on a slow AV host it still ran out its 20s at quit (RUST-K3, 2 hosts
+        // on 0.9.40). Decide and kill natively; only a command line we cannot
+        // read falls back to the script.
+        if let Some(candidates) = pending {
+            let exe_text = exe.display().to_string();
+            // Each target is checked and killed through one handle, which keeps
+            // its pid from being reused in between. One gone by now, not ours
+            // to kill, or showing another image (a reused pid) is skipped.
+            let targets: Option<Vec<(u32, u32, crate::winproc::ProcessHandle)>> = candidates
+                .into_iter()
+                .filter_map(|(pid, ppid, image)| {
+                    let process = crate::winproc::ProcessHandle::open_to_terminate(pid)?;
+                    if !process.image_path()?.eq_ignore_ascii_case(&image) {
+                        return None;
+                    }
+                    match windows_sweep_matches(
+                        &image,
+                        || process.command_line(),
+                        &exe_text,
+                        args_pattern,
+                    ) {
+                        Some(true) => Some(Some((pid, ppid, process))),
+                        Some(false) => None,
+                        None => Some(None),
+                    }
+                })
+                .collect();
+            if let Some(targets) = targets {
+                for (pid, ppid, process) in targets {
+                    if !process.terminate() {
+                        log::info!(
+                            "process sweep: TerminateProcess {pid} refused for '{args_pattern}'"
+                        );
+                        continue;
+                    }
+                    log::info!(
+                        "process sweep: TerminateProcess {pid} (parent {ppid}) for '{args_pattern}'"
+                    );
+                    note_app_kill(
+                        "process_sweep",
+                        format!("TerminateProcess {pid} (parent {ppid})"),
+                    );
+                }
+                return Ok(());
+            }
         }
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
         let mut command = crate::proc::command("powershell");
@@ -12146,7 +12214,7 @@ mod tests {
         // Must not inherit the mid-diagnosis or foreign-holder remedies: no
         // program is squatting the port and nothing is being identified.
         assert!(!hint.contains("checking what holds it"), "{hint}");
-        assert!(!hint.contains("Task Manager"), "{hint}");
+        assert!(!hint.contains(super::PROCESS_MONITOR), "{hint}");
     }
 
     #[test]
@@ -12169,7 +12237,7 @@ mod tests {
     fn intercept_bind_hint_reads_the_bind_loops_verdicts() {
         let foreign = intercept_bind_hint("port 6767 is held by python.exe (pid 11236)");
         assert!(foreign.contains("python.exe (PID 11236)"), "{foreign}");
-        assert!(foreign.contains("Task Manager"), "{foreign}");
+        assert!(foreign.contains(super::PROCESS_MONITOR), "{foreign}");
         let draining =
             intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
         assert!(draining.contains("Nothing to do"), "{draining}");
@@ -12208,7 +12276,7 @@ mod tests {
         ] {
             let hint = intercept_bind_hint(raw);
             assert!(hint.contains("connect directly until the port is free"), "{hint}");
-            assert!(hint.contains("Task Manager"), "{hint}");
+            assert!(hint.contains(super::PROCESS_MONITOR), "{hint}");
         }
         let own = intercept_bind_hint(&format!(
             "port 6767 is held by {} (pid 7)",
@@ -15272,7 +15340,7 @@ mod tests {
     /// the venv-lock sweep must.
     #[test]
     fn the_windows_sweep_starts_powershell_only_for_a_candidate() {
-        use super::{windows_sweep_has_candidates, SweepParents};
+        use super::{windows_sweep_candidates, SweepParents};
         let runtime = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime";
         let venv = format!(r"{runtime}\venv");
         let headroom = format!(r"{venv}\Scripts\headroom.exe");
@@ -15301,7 +15369,7 @@ mod tests {
         let orphans = |own_children| SweepParents::Orphans { own_children };
         let dirs = |exe: &str| vec![exe.to_string(), runtime.to_string()];
         let hit = |table: &[(u32, u32)], exe: &str, parents| {
-            windows_sweep_has_candidates(table, &dirs(exe), me, parents, image)
+            !windows_sweep_candidates(table, &dirs(exe), me, parents, image).is_empty()
         };
 
         assert!(!hit(&table, &headroom, orphans(true)));
@@ -15333,18 +15401,61 @@ mod tests {
             runtime.to_string(),
             r"D:\Headroom\headroom\runtime".to_string(),
         ];
-        assert!(windows_sweep_has_candidates(
-            &table,
-            &real,
-            me,
-            orphans(false),
-            image
-        ));
+        assert!(!windows_sweep_candidates(&table, &real, me, orphans(false), image).is_empty());
         table.pop();
 
         // An orphan whose image cannot be read never counts.
         table.push((999, 7));
         assert!(!hit(&table, &headroom, orphans(true)));
+    }
+
+    /// RUST-K3 on 0.9.40: a candidate is decided natively with the script's
+    /// own match, so PowerShell starts only for an unreadable command line.
+    #[test]
+    fn the_windows_sweep_matches_a_candidate_like_its_script() {
+        use super::windows_sweep_matches;
+        let venv = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\venv";
+        let headroom = format!(r"{venv}\Scripts\headroom.exe");
+        let python = format!(r"{venv}\Scripts\python.exe");
+        let base = r"C:\Users\a\AppData\Local\Headroom\headroom\runtime\python\python.exe";
+        let line = |text: &str| {
+            let text = text.to_string();
+            move || Some(text)
+        };
+        let proxy = format!("\"{python}\" -m headroom.proxy.server --port 6768");
+        // The backend and its base-python child, named by command line.
+        assert_eq!(
+            windows_sweep_matches(&python, line(&proxy), &python, "-m headroom.proxy.server"),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line(&proxy), &python, "-M HEADROOM.PROXY.SERVER"),
+            Some(true)
+        );
+        // An MCP server is no proxy.
+        let mcp = format!("\"{headroom}\" mcp serve");
+        assert_eq!(
+            windows_sweep_matches(&headroom, line(&mcp), &headroom, "proxy --port"),
+            Some(false)
+        );
+        // The venv sweep: the image decides without reading the command line.
+        assert_eq!(
+            windows_sweep_matches(&headroom.to_uppercase(), || panic!(), venv, ""),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line(&proxy), venv, ""),
+            Some(true)
+        );
+        assert_eq!(
+            windows_sweep_matches(base, line("python.exe -c pass"), venv, ""),
+            Some(false)
+        );
+        // Unreadable command line: leave it to the script.
+        assert_eq!(
+            windows_sweep_matches(base, || None, &python, "-m headroom.proxy.server"),
+            None
+        );
     }
 
     /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1
@@ -15594,7 +15705,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
@@ -15644,7 +15755,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn a_lone_success_between_failures_does_not_reset_the_backoff() {
         // RUST-86: a starved backend flaps -- /stats times out only while the
         // proxy is busy -- so timeout/success/timeout was the common shape.
@@ -15786,7 +15897,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_fetch_warn)]
+    #[serial_test::serial]
     fn a_lone_stats_stall_stays_local_and_its_repeat_reports() {
         assert!(lone_stats_stall("timeout", None));
         assert!(lone_stats_stall(

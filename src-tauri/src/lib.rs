@@ -1982,10 +1982,18 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
         "ponytail" | "caveman" | "chisle" => {
-            let outdated = state
-                .tool_manager
-                .install_plugin(id)
-                .map_err(|err| err.to_string())?;
+            let outdated = state.tool_manager.install_plugin(id).map_err(|err| {
+                // Counts how often a missing Node.js or Git blocks an addon,
+                // to decide whether Headroom should supply them.
+                if let Some(missing) = err.downcast_ref::<tool_manager::MissingPluginPrereqs>() {
+                    analytics::track_event(
+                        app,
+                        "addon_install_blocked",
+                        Some(json!({ "addon": id, "missing": missing.0.join(",") })),
+                    );
+                }
+                err.to_string()
+            })?;
             if let Some(host) = outdated {
                 let name = match id {
                     "caveman" => "Caveman",
@@ -2367,6 +2375,14 @@ enum BootstrapFailureKind {
     /// it, and the retry got further only for _ssl's DLLs to be blocked the
     /// same way). The user action is a security setting, not Try again.
     AppControlBlocked,
+    /// Antivirus removed or blocked a file we had just written: pip's own
+    /// download vanished from its `pip-unpack-*` temp dir between download and
+    /// install (RUST-8K, 2026-10-14, same wheel on every attempt), or `_ssl`
+    /// would not load so urllib has no `HTTPSHandler` (RUST-8K, 2026-10-07;
+    /// that host's retry five hours later went through). Both told the user to
+    /// check their internet. Unlike App Control a retry can work once a scan
+    /// settles, so the message offers Try again before the quarantine.
+    SecuritySoftware,
     /// pip fell back to building a package from source and the build failed.
     /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
     /// this should be unreachable, so reaching it means *we* shipped a lock or
@@ -2388,6 +2404,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::Permission => "permission",
             BootstrapFailureKind::SslLibraryConflict => "ssl_library_conflict",
             BootstrapFailureKind::AppControlBlocked => "app_control_blocked",
+            BootstrapFailureKind::SecuritySoftware => "security_software",
             BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
@@ -2463,6 +2480,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslLibraryConflict
     } else if is_windows_app_control_block(&haystack) {
         BootstrapFailureKind::AppControlBlocked
+    } else if is_security_software_removal_signal(&haystack) {
+        BootstrapFailureKind::SecuritySoftware
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -2527,6 +2546,28 @@ pub(crate) fn is_windows_app_control_block(text: &str) -> bool {
     is_app_control_signal(text)
         || is_blocked_runtime_dll_signal(text)
         || is_venv_base_spawn_refused_signal(text)
+}
+
+/// True when security software removed or blocked a file we had just written:
+/// pip's own download ([`is_pip_download_removed_signal`]), or `_ssl`, which
+/// fails to load without saying why because urllib swallows the ImportError and
+/// only the missing `HTTPSHandler` shows. Shares its strings with
+/// `pip_failure_category`'s `download-removed` and `ssl-missing`.
+pub(crate) fn is_security_software_removal_signal(text: &str) -> bool {
+    is_pip_download_removed_signal(text)
+        || text
+            .to_ascii_lowercase()
+            .contains("cannot import name 'httpshandler'")
+}
+
+/// True when a wheel pip had just downloaded was gone when pip opened it again.
+/// pip writes every download into a `pip-unpack-*` temp dir and reads it back
+/// moments later, so ENOENT on that path means something took the file from
+/// under it. Errno 2 is the C runtime's text and WinError 2 the code, so both
+/// survive a localized Windows.
+pub(crate) fn is_pip_download_removed_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("pip-unpack-") && (lower.contains("[errno 2]") || lower.contains("[winerror 2]"))
 }
 
 /// True when Windows refused to load one of the bundled interpreter's own
@@ -2771,6 +2812,25 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              turn it off. On a work PC, ask your IT team to allow Headroom's install folder \
              (%LOCALAPPDATA%\\Headroom). Use Contact support below and we'll read \
              the details it sends."
+        }
+        BootstrapFailureKind::SecuritySoftware if cfg!(windows) => {
+            "Installation failed: security software on this PC removed or blocked a \
+             file Headroom had just downloaded. This is not a network problem. A \
+             scan that hasn't finished often causes it, so wait a minute and click \
+             Try again. If it fails again, open your antivirus's quarantine or \
+             protection history (for Microsoft Defender: Windows Security > Virus & \
+             threat protection > Protection history), restore and allow the Headroom \
+             or Python file it lists, then click Try again. Use Contact support below \
+             and we'll read the details it sends."
+        }
+        BootstrapFailureKind::SecuritySoftware => {
+            "Installation failed: security software on this computer removed or \
+             blocked a file Headroom had just downloaded. This is not a network \
+             problem. A scan that hasn't finished often causes it, so wait a minute \
+             and click Try again. If it fails again, check your antivirus's \
+             quarantine for a Headroom or Python file, restore and allow it, then \
+             click Try again. Use Contact support below and we'll read the details \
+             it sends."
         }
         BootstrapFailureKind::SourceBuild => {
             "Installation failed: Headroom couldn't assemble its runtime on this \
@@ -3998,6 +4058,9 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // The same verdict seen from inside Python, where the OS prose is
     // localized and carries no code (RUST-BB/BA/5C).
     if is_blocked_runtime_dll_signal(&lower) {
+        return true;
+    }
+    if is_security_software_removal_signal(&lower) {
         return true;
     }
     // The RUST-9F probe (tool_manager::probe_onnx_import) importing
@@ -6083,6 +6146,7 @@ async fn apply_client_setup(
             // 28) writes are unwritable-file environment issues, not app bugs --
             // surface to the user but keep them out of Sentry.
             if !msg.starts_with("Automatic setup is not supported yet")
+                && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
                 && !client_adapters::is_permission_denied(&err)
                 && !client_adapters::is_no_space(&err)
             {
@@ -7428,12 +7492,13 @@ fn fatal_build_error(err: tauri::Error) -> ! {
     let message = err.to_string();
     #[cfg(target_os = "windows")]
     if is_missing_webview_runtime(&message) {
-        show_webview2_dialog(concat!(
+        let _ = show_webview2_dialog(concat!(
             "Headroom needs the Microsoft Edge WebView2 runtime, ",
             "which is not installed on this PC.\n\n",
             "Open the download page? Install the Evergreen Runtime, ",
             "then start Headroom again."
-        ));
+        ))
+        .join();
     }
     panic!("error while building tauri application: {message}");
 }
@@ -7464,13 +7529,21 @@ fn fatal_app_state_error(err: anyhow::Error) -> ! {
     panic!("failed to create app state: {err:?}");
 }
 
+/// On its own thread: a modal dialog pumps its thread's messages, and on the
+/// event-loop thread that dispatches tao's windows, whose handler is either
+/// already running (setup) or not registered yet, so tao panics "either event
+/// handler is re-entrant" and the app dies once the dialog closes (Sentry
+/// RUST-Q6).
 #[cfg(target_os = "windows")]
-fn show_webview2_dialog(text: &str) {
+fn show_webview2_dialog(text: &'static str) -> std::thread::JoinHandle<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_YESNO};
 
-    if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
-        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
-    }
+    std::thread::spawn(move || {
+        if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
+            let _ =
+                open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
+        }
+    })
 }
 
 /// MessageBoxW rather than a Tauri dialog: there is no webview left to render
@@ -7726,6 +7799,26 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init());
+
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    // Without the runtime, Tauri answers each config window it cannot create
+    // with a modal dialog of its own, inside the event handler (RUST-Q6, see
+    // show_webview2_dialog), and the app then ran windowless anyway. Say it
+    // once ourselves and keep running without them, so configured clients
+    // keep their proxy.
+    #[cfg(target_os = "windows")]
+    if tauri::webview_version().is_err() {
+        for window in &mut context.config_mut().app.windows {
+            window.create = false;
+        }
+        show_webview2_dialog(concat!(
+            "Headroom needs the Microsoft Edge WebView2 runtime, ",
+            "which is not installed on this PC.\n\n",
+            "Open the download page? Install the Evergreen Runtime, ",
+            "then quit Headroom from its tray icon and start it again."
+        ));
+    }
 
     let app = builder
         .setup(move |app| {
@@ -8237,7 +8330,7 @@ pub fn run() {
             #[cfg(debug_assertions)]
             debug_force_proxy_bypass
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
@@ -11882,8 +11975,106 @@ static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::ne
 
 #[tauri::command]
 async fn start_main_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
-    note_main_window_drag_start(window.outer_position().ok());
-    window.start_dragging().map_err(|err| err.to_string())
+    let origin = window.outer_position().ok();
+    note_main_window_drag_start(origin);
+    window.start_dragging().map_err(|err| err.to_string())?;
+    // Windows only posts the drag here, so this returns while it runs.
+    #[cfg(target_os = "windows")]
+    if let (Some(origin), Ok(size)) = (origin, window.outer_size()) {
+        std::thread::spawn(move || snap_main_window_after_drag(&window, origin, size));
+    }
+    Ok(())
+}
+
+/// How close, in logical pixels, a dropped dashboard must be to a work-area
+/// edge before it snaps to it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const MAIN_WINDOW_SNAP_REACH: f64 = 40.0;
+
+/// Waits for the button that started the drag to come up, then snaps the
+/// dashboard to the work-area edges it was dropped near, so a drop by the
+/// tray lands neatly in the bottom-right corner (user request). Linux is not
+/// covered: GTK hands the move to the window manager and reports no release.
+#[cfg(target_os = "windows")]
+fn snap_main_window_after_drag(
+    window: &tauri::WebviewWindow,
+    origin: PhysicalPosition<i32>,
+    origin_size: PhysicalSize<u32>,
+) {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+
+    // GetAsyncKeyState reads the physical button; the drag is on the primary.
+    let primary = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
+        VK_RBUTTON
+    } else {
+        VK_LBUTTON
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while unsafe { GetAsyncKeyState(i32::from(primary)) } < 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (Ok(position), Ok(size), Ok(scale), Ok(Some(monitor))) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.scale_factor(),
+        window.current_monitor(),
+    ) else {
+        return;
+    };
+    // A click that never moved it, or a drop Windows itself tiled (maximized
+    // at the top edge, Snap Layouts in a corner), which changes the size.
+    if position == origin || size != origin_size {
+        return;
+    }
+    let area = monitor.work_area();
+    let target = snap_to_work_area_edges(
+        MonitorBounds {
+            x: area.position.x,
+            y: area.position.y,
+            width: i32::try_from(area.size.width).unwrap_or(i32::MAX),
+            height: i32::try_from(area.size.height).unwrap_or(i32::MAX),
+        },
+        position,
+        size,
+        (MAIN_WINDOW_SNAP_REACH * scale).round() as i32,
+    );
+    if target != position {
+        let _ = window.set_position(Position::Physical(target));
+    }
+}
+
+/// Moves each axis to the nearer work-area edge, inset by the tray gap, when
+/// the window lies within `reach` of it; otherwise leaves it where it is.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn snap_to_work_area_edges(
+    work_area: MonitorBounds,
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    reach: i32,
+) -> PhysicalPosition<i32> {
+    let snap = |at: i32, len: u32, start: i32, span: i32| {
+        let len = i32::try_from(len).unwrap_or(i32::MAX);
+        let near = start.saturating_add(TRAY_WINDOW_VERTICAL_GAP);
+        let far = start
+            .saturating_add(span)
+            .saturating_sub(len)
+            .saturating_sub(TRAY_WINDOW_VERTICAL_GAP);
+        if at.abs_diff(far) <= reach.unsigned_abs() {
+            far
+        } else if at.abs_diff(near) <= reach.unsigned_abs() {
+            near
+        } else {
+            at
+        }
+    };
+    PhysicalPosition::new(
+        snap(position.x, size.width, work_area.x, work_area.width),
+        snap(position.y, size.height, work_area.y, work_area.height),
+    )
 }
 
 /// Keeps the FIRST grab since the last focus loss: a later click that never
@@ -12218,13 +12409,13 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
-        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
-        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
-        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
-        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        savings_report, select_updater_endpoints, snap_to_work_area_edges,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
@@ -13730,6 +13921,25 @@ mod tests {
         assert!(guard < read, "{record}");
     }
 
+    /// A 1920x1040 work area (taskbar below it): a drop near the bottom-right
+    /// corner lands 10px inside it, one near no edge stays put.
+    #[test]
+    fn dropped_dashboard_snaps_to_nearby_work_area_edges() {
+        let area = MonitorBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let size = PhysicalSize::new(760, 632);
+        let snap =
+            |x, y| snap_to_work_area_edges(area, tauri::PhysicalPosition::new(x, y), size, 40);
+        assert_eq!(snap(1130, 380), tauri::PhysicalPosition::new(1150, 398));
+        assert_eq!(snap(600, 200), tauri::PhysicalPosition::new(600, 200));
+        assert_eq!(snap(-20, 30), tauri::PhysicalPosition::new(10, 10));
+        assert_eq!(snap(1090, 398), tauri::PhysicalPosition::new(1090, 398));
+    }
+
     #[test]
     fn tray_window_position_moves_above_when_bottom_would_overflow() {
         let target = compute_tray_window_position(
@@ -14541,6 +14751,52 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_a_removed_download_or_ssl_as_security_software() {
+        // RUST-8K, 2026-10-14, verbatim tail: the wheel pip downloaded was gone
+        // when its conflict check opened it, on every attempt. Filed `other`,
+        // which told the user to check their internet; they left.
+        let removed: anyhow::Error = make_command_failure(
+            "ERROR: Error while checking for conflicts. Please file an issue on pip's issue tracker\n\
+             FileNotFoundError: [Errno 2] No such file or directory: \
+             '~\\AppData\\Local\\Temp\\pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'\n\
+             ERROR: Could not install packages due to an OSError: [Errno 2] No such file or directory: \
+             '~\\AppData\\Local\\Temp\\pip-unpack-hczdp5my\\python_dateutil-2.9.0.post0-py2.py3-none-any.whl'",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&removed).as_str(),
+            "security_software"
+        );
+        assert!(is_endpoint_protection_signal(&format!("{removed:#}")));
+        // RUST-8K, 2026-10-07: `_ssl` would not load. That host's retry hours
+        // later went through, so this is not App Control's permanent wall.
+        let ssl: anyhow::Error = make_command_failure(
+            "ImportError: cannot import name 'HTTPSHandler' from 'urllib.request' \
+             (~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\urllib\\request.py). \
+             Did you mean: 'HTTPHandler'?",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&ssl).as_str(),
+            "security_software"
+        );
+        // A missing file anywhere else is not a removed download.
+        let other: anyhow::Error = make_command_failure(
+            "ERROR: Could not install packages due to an OSError: [Errno 2] No such file or \
+             directory: '/opt/x/site-packages/foo/RECORD'",
+        )
+        .into();
+        assert_eq!(classify_bootstrap_failure(&other).as_str(), "other");
+    }
+
+    #[test]
+    fn security_software_message_offers_a_retry_and_the_quarantine() {
+        let message = user_message_for(BootstrapFailureKind::SecuritySoftware);
+        assert!(message.contains("Try again"), "{message}");
+        assert!(message.contains("quarantine"), "{message}");
+    }
+
+    #[test]
     fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
         // Unreachable while every install passes `--only-binary=:all:`; if it
         // fires, a wheel we promised is missing for this machine.
@@ -14589,6 +14845,7 @@ mod tests {
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
             BootstrapFailureKind::AppControlBlocked,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
             BootstrapFailureKind::Other,
         ] {
@@ -14612,6 +14869,7 @@ mod tests {
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
             BootstrapFailureKind::AppControlBlocked,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
         ] {
             let msg = user_message_for(kind).to_ascii_lowercase();
@@ -14635,6 +14893,7 @@ mod tests {
             BootstrapFailureKind::NetworkDownload,
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
             BootstrapFailureKind::Other,
         ] {

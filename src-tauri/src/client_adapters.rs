@@ -158,6 +158,30 @@ fn rtk_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
+/// The Codex builds of some plugin addons carry the skill but no session hook,
+/// so Codex runs it only when the model happens to pick it: Chisle's
+/// `.codex-plugin` points an `instructions` key at its rules, a key Codex does
+/// not read, and caveman's has no hooks (caveman#1242). This managed
+/// `~/.codex/AGENTS.md` block switches the skill on for every session, the way
+/// the plugin's hooks do in Claude Code.
+pub fn set_codex_skill_nudge(id: &str, skill: &str, on: bool) -> Result<()> {
+    // AGENTS.md also carries the rtk and markitdown blocks, written under it.
+    let _setup = setup_write_lock();
+    let agents = rtk_codex_agents_path();
+    let block_id = format!("{id}_codex");
+    if on {
+        let body = format!(
+            "## {id} (Headroom addon)\n\
+             At the start of every session, load the `{skill}` skill and apply it\n\
+             for the rest of the session, until the user turns it off."
+        );
+        upsert_nudge_block(&agents, &block_id, &body)?;
+    } else {
+        remove_managed_block(&agents, &block_id)?;
+    }
+    Ok(())
+}
+
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
@@ -369,6 +393,12 @@ pub fn is_no_space(err: &anyhow::Error) -> bool {
         .iter()
         .any(|code| NO_SPACE_OS_ERRORS.contains(code))
 }
+
+/// Every settings-file parse refusal says this. The file is the user's and
+/// already invalid for the client that owns it, so leaving it alone is the
+/// correct branch, never a defect to report (RUST-6X, RUST-Q7/Q8).
+pub(crate) const UNPARSEABLE_SETTINGS: &str =
+    "refusing to overwrite potentially valid user settings";
 
 /// True when the error chain contains an io InvalidData -- in practice a
 /// `read_to_string` on a file that isn't valid UTF-8 (RUST-5X: a latin-1
@@ -1567,6 +1597,13 @@ pub fn list_client_connectors(
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
+    disable_client_setup_with(client_id, true)
+}
+
+/// `forget: false` unwires the client but keeps it in the restore snapshot
+/// (`remembered_*`, `setup_versions`): the pause/quit/crash path, which must
+/// bring it back on the next launch however far it got.
+fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
     let _setup = setup_write_lock();
     let mut state = load_setup_state();
 
@@ -1655,6 +1692,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         }
     }
 
+    let kept = (!forget).then(|| {
+        (
+            state.remembered_clients.clone(),
+            state.remembered_shell_files.clone(),
+            state.setup_versions.clone(),
+        )
+    });
     match client_id {
         "codex" | "codex_cli" => {
             state.configured_clients.remove("codex");
@@ -1698,6 +1742,11 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove(state_id);
         }
+    }
+    if let Some((clients, shell_files, versions)) = kept {
+        state.remembered_clients = clients;
+        state.remembered_shell_files = shell_files;
+        state.setup_versions = versions;
     }
     write_setup_state(&state)?;
     Ok(())
@@ -1787,40 +1836,61 @@ pub fn unwire_clients_after_crash(intercept_answers: impl FnOnce() -> bool) -> V
     state.configured_clients.into_keys().collect()
 }
 
-fn clear_and_remember_client_setups() -> Result<()> {
-    // Capture snapshot before disabling. We re-apply it afterwards because
-    // disable_client_setup also clears remembered_clients as a side effect,
-    // which would otherwise erase the snapshot we need for restore_client_setups.
+/// What a clear must bring back on the next launch: everything configured
+/// plus whatever an earlier clear already remembered, so a second clear is
+/// idempotent (after a pause only `remembered_clients` holds the set, and
+/// pause then Cmd-Q used to lose every connector). `setup_versions` lets the
+/// restore tell an update from a relaunch (configured_at in
+/// apply_client_setup).
+struct RestoreSnapshot {
+    clients: BTreeMap<String, String>,
+    shell_files: BTreeMap<String, Vec<String>>,
+    versions: BTreeMap<String, String>,
+}
+
+fn restore_snapshot() -> RestoreSnapshot {
     let pre = load_setup_state();
-    // Merge with any prior snapshot so a second clear is idempotent: after a
-    // pause, configured_clients is already empty and only remembered_clients
-    // holds the restore set — a quit-time clear must not wipe it (pause then
-    // Cmd-Q used to permanently lose all connectors).
-    let mut snapshot_clients = pre.remembered_clients.clone();
-    snapshot_clients.extend(pre.configured_clients.clone());
-    let mut snapshot_shell_files = pre.remembered_shell_files.clone();
-    snapshot_shell_files.extend(pre.managed_shell_files.clone());
-    // Kept so the next launch's restore can tell an update from a relaunch
-    // (see configured_at in apply_client_setup).
-    let snapshot_versions = pre.setup_versions.clone();
+    let mut clients = pre.remembered_clients;
+    clients.extend(pre.configured_clients);
+    let mut shell_files = pre.remembered_shell_files;
+    shell_files.extend(pre.managed_shell_files);
+    RestoreSnapshot {
+        clients,
+        shell_files,
+        versions: pre.setup_versions,
+    }
+}
 
+fn save_restore_snapshot(snapshot: &RestoreSnapshot) -> Result<()> {
+    if snapshot.clients.is_empty() {
+        return Ok(());
+    }
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    state.remembered_clients = snapshot.clients.clone();
+    state.remembered_shell_files = snapshot.shell_files.clone();
+    state.setup_versions = snapshot.versions.clone();
+    write_setup_state(&state)
+}
+
+fn clear_and_remember_client_setups() -> Result<()> {
+    // Saved before the disables, which keep it: the Windows installer kills
+    // every headroom-desktop.exe, the crash guard included, so this can stop
+    // between any two disables, and a client already unwired must still come
+    // back on the next launch. Saved only afterwards, the guard killed after
+    // its Claude Code disable left Claude Code direct for good (win-test,
+    // 2026-10-14).
+    // Best-effort: an unwritable setup state must not leave every client
+    // pointed at a dead intercept. The save after the disables still reports.
+    let snapshot = restore_snapshot();
+    if let Err(err) = save_restore_snapshot(&snapshot) {
+        log::warn!("saving the restore snapshot before the disables failed: {err:#}");
+    }
     for spec in MANAGED_CLIENT_SPECS {
-        let _ = disable_client_setup(spec.id);
+        let _ = disable_client_setup_with(spec.id, false);
     }
-    let _ = disable_client_setup("codex_gui");
-
-    // Re-save the remembered snapshot so restore_client_setups works on next launch.
-    if !snapshot_clients.is_empty() {
-        // Only here: disable_client_setup above takes the lock itself.
-        let _setup = setup_write_lock();
-        let mut state = load_setup_state();
-        state.remembered_clients = snapshot_clients;
-        state.remembered_shell_files = snapshot_shell_files;
-        state.setup_versions = snapshot_versions;
-        write_setup_state(&state)?;
-    }
-
-    Ok(())
+    let _ = disable_client_setup_with("codex_gui", false);
+    save_restore_snapshot(&snapshot)
 }
 
 /// Fully uninstalls Headroom's on-disk footprint on a best-effort basis:
@@ -2119,6 +2189,13 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
+    // The plugin addons' Codex skill nudges: uninstall_and_quit removes them
+    // through ToolManager::uninstall_plugin, which `--uninstall` does not have.
+    for (id, skill) in crate::tool_manager::CODEX_SKILL_NUDGES {
+        if let Err(err) = set_codex_skill_nudge(id, skill, false) {
+            log::warn!("cleanup: removing {id} AGENTS.md block failed: {err}");
+        }
+    }
     // MarkItDown's nudges, Bash rule and conversion cache: uninstall_and_quit
     // removes them through the ToolManager, which `--uninstall` does not have.
     // The unix shim path (ToolManager::markitdown_shim_path); Windows has no
@@ -2362,6 +2439,22 @@ fn mcp_command_in_headroom_footprint(command: &str) -> bool {
         || command_under_dir(command, &home_dir().join(".headroom"))
 }
 
+/// `[cmd /c] npx -y @upstash/context7-mcp@<version>`, the Context7 entry
+/// Headroom wrote through 0.9.40. Context7's own docs pin no version (or
+/// `@latest`), so a pinned one is ours; a bare `npx` stays the user's. Without
+/// this, an uninstall that purged the ledger left it spawning npx in every
+/// agent session.
+fn is_npx_era_context7(name: &str, launch: &[&str]) -> bool {
+    let launch = match launch {
+        ["cmd", "/c", rest @ ..] => rest,
+        _ => launch,
+    };
+    name == "context7"
+        && matches!(launch, ["npx", "-y", spec] if spec
+            .strip_prefix("@upstash/context7-mcp@")
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit())))
+}
+
 /// Is `command` a path inside `dir`? A literal `format!("{dir}/")` prefix never
 /// matched on Windows, where the configs hold `C:\Users\...\serena.exe` with
 /// backslashes and any drive-letter/user casing, so uninstall left entries
@@ -2388,18 +2481,36 @@ fn command_under_dir_for(command: &str, dir: &str, windows: bool) -> bool {
 
 /// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
 /// name — install always writes it with --force), or any entry whose command
-/// resolves into Headroom's install footprint (serena, codebase-memory).
-/// `command` is a string in Claude's config and an array in OpenCode's.
+/// or first argument resolves into Headroom's install footprint (serena and
+/// codebase-memory by command; context7 is `node <script in our tools dir>`).
+/// `command` is a string with `args` beside it in Claude's config and one
+/// array in OpenCode's.
 fn mcp_json_entry_is_headroom(name: &str, entry: &Value) -> bool {
-    if name == "headroom" {
+    if name == "headroom"
+        || entry.get("url").and_then(Value::as_str)
+            == Some(crate::tool_manager::CONTEXT7_HOSTED_URL)
+    {
         return true;
     }
-    let command = match entry.get("command") {
-        Some(Value::String(command)) => Some(command.as_str()),
-        Some(Value::Array(items)) => items.first().and_then(Value::as_str),
-        _ => None,
+    let launch: Vec<&str> = match entry.get("command") {
+        Some(Value::String(command)) => std::iter::once(command.as_str())
+            .chain(
+                entry
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     };
-    command.is_some_and(mcp_command_in_headroom_footprint)
+    is_npx_era_context7(name, &launch)
+        || launch
+            .into_iter()
+            .take(2)
+            .any(mcp_command_in_headroom_footprint)
 }
 
 /// Drop Headroom-owned entries from a `mcpServers`/`mcp` JSON map in place.
@@ -2525,13 +2636,15 @@ fn mcp_table_name(line: &str) -> Option<String> {
 /// subtables) and the Python registrar's
 /// `# --- [end ]Headroom MCP server[: name] ---` marker comments from a
 /// Codex-style TOML config. A table is ours when its name is `headroom` or
-/// its `command` launches from Headroom's install footprint; user-managed
-/// servers stay untouched.
+/// its `command` or first `args` entry launches from Headroom's install
+/// footprint (see `mcp_json_entry_is_headroom`); user-managed servers stay
+/// untouched.
 fn strip_headroom_mcp_toml(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
 
     // Pass 1: which server names are Headroom-owned.
     let mut owned: BTreeSet<String> = BTreeSet::new();
+    let mut launches: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
     let mut current: Option<String> = None;
     for line in &lines {
         if line.trim().starts_with('[') {
@@ -2540,15 +2653,43 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
         let Some(name) = current.as_deref() else {
             continue;
         };
+        if let Ok(table) = toml::from_str::<toml::Table>(line) {
+            let launch = launches.entry(name.to_string()).or_default();
+            if let Some(command) = table.get("command").and_then(toml::Value::as_str) {
+                launch.0 = Some(command.to_string());
+            }
+            if let Some(args) = table.get("args").and_then(toml::Value::as_array) {
+                launch.1 = args
+                    .iter()
+                    .filter_map(|arg| arg.as_str().map(str::to_string))
+                    .collect();
+            }
+        }
+        // The registrars write `command = "..."` and `args = [...]` inline.
+        let launch = toml::from_str::<toml::Table>(line).ok().and_then(|line| {
+            let value = match line.get("args") {
+                Some(toml::Value::Array(args)) => args.first(),
+                _ => line.get("command"),
+            };
+            value?.as_str().map(str::to_owned)
+        });
+        let hosted = toml::from_str::<toml::Table>(line)
+            .ok()
+            .and_then(|line| line.get("url")?.as_str().map(str::to_owned))
+            .is_some_and(|url| url == crate::tool_manager::CONTEXT7_HOSTED_URL);
         if name == "headroom"
-            || (line
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-                && toml_line_value(line)
-                    .as_deref()
-                    .is_some_and(mcp_command_in_headroom_footprint))
+            || hosted
+            || launch
+                .as_deref()
+                .is_some_and(mcp_command_in_headroom_footprint)
         {
             owned.insert(name.to_string());
+        }
+    }
+    for (name, (command, args)) in &launches {
+        let launch: Vec<&str> = command.iter().chain(args).map(String::as_str).collect();
+        if is_npx_era_context7(name, &launch) {
+            owned.insert(name.clone());
         }
     }
 
@@ -11317,10 +11458,13 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
     }
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
-        Err(_) => {
+        Err(strict) => {
+            // serde_json's line and column go in the message the user sees:
+            // json5 points one element early on a missing comma ("expected
+            // boolean or null" at the string before it, RUST-Q7/Q8).
             let value = json5::from_str(raw).with_context(|| {
                 format!(
-                    "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+                    "parsing {} failed ({strict}); {UNPARSEABLE_SETTINGS}",
                     path.display()
                 )
             })?;
@@ -11586,6 +11730,118 @@ mod tests {
         assert!(!super::remove_headroom_mcp_json_entries(
             untouched.as_object_mut().unwrap()
         ));
+    }
+
+    /// The npx-era Context7 entry is Headroom's in every shape it was written
+    /// (Claude's command + args, Windows' `cmd /c`, OpenCode's one array); an
+    /// unpinned or `@latest` one, or another server's name, is the user's.
+    #[test]
+    fn mcp_cleanup_removes_the_npx_era_context7_and_keeps_a_users_own() {
+        let pin = "@upstash/context7-mcp@4.0.6";
+        for owned in [
+            json!({ "command": "npx", "args": ["-y", pin] }),
+            json!({ "command": "cmd", "args": ["/c", "npx", "-y", pin] }),
+            json!({ "type": "local", "command": ["npx", "-y", pin] }),
+        ] {
+            let mut servers = json!({ "context7": owned });
+            assert!(
+                super::remove_headroom_mcp_json_entries(servers.as_object_mut().unwrap()),
+                "{owned}"
+            );
+        }
+        for kept in [
+            json!({ "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"] } }),
+            json!({ "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp@latest"] } }),
+            json!({ "docs": { "command": "npx", "args": ["-y", pin] } }),
+        ] {
+            let mut servers = kept.clone();
+            assert!(
+                !super::remove_headroom_mcp_json_entries(servers.as_object_mut().unwrap()),
+                "{kept}"
+            );
+        }
+
+        let toml = format!(
+            "[mcp_servers.context7]\ncommand = \"cmd\"\nargs = [\"/c\", \"npx\", \"-y\", \"{pin}\"]\n\n\
+             [mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"-y\", \"{pin}\"]\n"
+        );
+        let stripped = super::strip_headroom_mcp_toml(&toml);
+        assert!(!stripped.contains("mcp_servers.context7"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.docs]"), "{stripped}");
+    }
+
+    #[test]
+    fn mcp_cleanup_removes_our_hosted_context7_and_keeps_a_users_own() {
+        let url = crate::tool_manager::CONTEXT7_HOSTED_URL;
+        let mut servers = json!({
+            "context7": { "type": "http", "url": url },
+            "docs": { "type": "http", "url": "https://mcp.context7.com/mcp" },
+        });
+        let map = servers.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(
+            map.get("docs").is_some(),
+            "the user's own hosted entry stays"
+        );
+
+        let content = format!(
+            "# --- Headroom MCP server: context7 ---\n\
+             [mcp_servers.context7]\n\
+             url = \"{url}\"\n\
+             # --- end Headroom MCP server: context7 ---\n\
+             [mcp_servers.docs]\n\
+             url = \"https://mcp.context7.com/mcp\"\n"
+        );
+        let stripped = super::strip_headroom_mcp_toml(&content);
+        assert!(!stripped.contains("via=headroom"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.docs]"));
+    }
+
+    #[test]
+    fn mcp_cleanup_removes_a_node_entry_running_a_script_from_our_tools_dir() {
+        // Context7 registers `node <tools>/context7-mcp/.../dist/index.js`.
+        // The Windows uninstaller's `--uninstall` has no ToolManager to run
+        // the unregister helper, and deletes the tools dir, so an entry kept
+        // here spawns a failing server in every later agent session.
+        let _env_lock = crate::test_env_lock::lock_home();
+        let app_dir = crate::storage::app_data_dir().display().to_string();
+        let script = format!(
+            "{app_dir}/headroom/tools/context7-mcp/node_modules/@upstash/context7-mcp/dist/index.js"
+        );
+        let mut servers = json!({
+            "context7": { "command": "node", "args": [script] },
+            "mine": { "command": "node", "args": ["/Users/x/server.js"] },
+        });
+        let map = servers.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(map.get("mine").is_some());
+
+        let mut opencode = json!({
+            "context7": { "type": "local", "command": ["node", script] },
+            "mine": { "type": "local", "command": ["node", "/Users/x/server.js"] },
+        });
+        let map = opencode.as_object_mut().unwrap();
+        assert!(super::remove_headroom_mcp_json_entries(map));
+        assert!(map.get("context7").is_none());
+        assert!(map.get("mine").is_some());
+
+        let content = format!(
+            "# --- Headroom MCP server: context7 ---\n\
+             [mcp_servers.context7]\n\
+             command = \"node\"\n\
+             args = [{}]\n\
+             # --- end Headroom MCP server: context7 ---\n\
+             [mcp_servers.mine]\n\
+             command = \"node\"\n\
+             args = [\"/Users/x/server.js\"]\n",
+            super::toml_basic_string(&script)
+        );
+        let stripped = super::strip_headroom_mcp_toml(&content);
+        assert!(!stripped.contains("context7"), "{stripped}");
+        assert!(stripped.contains("[mcp_servers.mine]"));
+        assert!(stripped.contains("/Users/x/server.js"));
     }
 
     #[test]
@@ -11858,6 +12114,13 @@ mod tests {
         let raw = "{\n    \"chat.viewSessions.orientation\": \"stacked\"\n    \"a\": 1\n}\n";
         let err = parse_json_object(raw, Path::new("settings.json")).expect_err("missing comma");
         assert_eq!(vscode_settings_failure_level(&err), log::Level::Info);
+        // RUST-Q7/Q8: the message the user sees names the line to fix.
+        let shown = err.to_string();
+        assert!(
+            shown.contains("expected `,` or `}` at line 3 column 5"),
+            "{shown}"
+        );
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
 
         let io = anyhow::Error::from(std::io::Error::other("denied")).context("writing settings");
         assert_eq!(vscode_settings_failure_level(&io), log::Level::Warn);
@@ -14731,6 +14994,25 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn revert_external_mutations_strips_codex_skill_nudges() {
+        // `--uninstall` (NSIS, the Homebrew cask) never runs uninstall_plugin,
+        // so the addon's AGENTS.md block outlived Headroom.
+        let home = TestHome::new();
+        let agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        fs::write(&agents, "My own rules.\n").unwrap();
+        super::set_codex_skill_nudge("chisle", "chisle:chisle", true).unwrap();
+        assert!(fs::read_to_string(&agents)
+            .unwrap()
+            .contains("chisle:chisle"));
+
+        super::revert_external_mutations();
+
+        assert_eq!(fs::read_to_string(&agents).unwrap().trim(), "My own rules.");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn full_cleanup_sweeps_our_hf_models_but_spares_shared_ones() {
         // Regression: this used to remove only models--chopratejas--kompress-v2-base
         // and orphaned every other model the runtime pulls (~788MB measured on a
@@ -15811,6 +16093,35 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "claude_code dropped from configured_clients, got: {:?}",
             post.configured_clients
         );
+    }
+
+    /// What the crash guard leaves when the Windows installer kills it after
+    /// its first disable: the snapshot saved, Claude Code unwired, nothing
+    /// after. The next launch must still re-wire Claude Code.
+    #[test]
+    #[serial_test::serial]
+    fn a_clear_killed_after_its_first_disable_still_restores_that_client() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        super::save_restore_snapshot(&super::restore_snapshot()).unwrap();
+        super::disable_client_setup_with("claude_code", false).unwrap();
+        let state = super::load_setup_state();
+        assert!(!state.configured_clients.contains_key("claude_code"));
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "unwired but forgotten, got: {:?}",
+            state.remembered_clients
+        );
+
+        // A toggle-off still forgets it.
+        super::disable_client_setup("claude_code").unwrap();
+        assert!(!super::load_setup_state()
+            .remembered_clients
+            .contains_key("claude_code"));
     }
 
     #[test]
