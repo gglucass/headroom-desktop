@@ -1548,6 +1548,15 @@ pub fn claude_code_connector_wanted() -> bool {
     is_configured(&state, "claude_code") || state.remembered_clients.contains_key("claude_code")
 }
 
+/// Whether the tier-mismatch clock should judge the Codex plan. The remembered
+/// snapshot counts: launch evaluates the clock before `restore_client_setups`
+/// puts Codex back, and reading configured alone saw no Codex plan there, an
+/// affirmative "no mismatch" that cleared a Codex-driven clock every relaunch.
+pub fn codex_connector_wanted() -> bool {
+    let state = load_setup_state();
+    is_configured(&state, "codex_cli") || state.remembered_clients.contains_key("codex_cli")
+}
+
 /// Whether `client_id` is one of the connectors the Claude pricing gate keeps
 /// the backend up for (see `any_gate_exempt_client_enabled`).
 pub fn is_gate_exempt_client(client_id: &str) -> bool {
@@ -16178,6 +16187,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(super::claude_code_connector_wanted(), "vscode keeps it");
         super::disable_client_setup("vscode").expect("toggle vscode off");
         assert!(!super::claude_code_connector_wanted());
+    }
+
+    /// The mismatch clock's Codex plan: a quit keeps it until restore, so a
+    /// relaunch cannot clear a Codex-driven clock; only a toggle-off drops it.
+    #[test]
+    #[serial_test::serial]
+    fn codex_connector_wanted_survives_quit_not_toggle_off() {
+        let _home = TestHome::new();
+        assert!(!super::codex_connector_wanted());
+        super::apply_client_setup("codex").expect("apply");
+        assert!(super::codex_connector_wanted());
+
+        super::clear_client_setups().expect("quit-time clear");
+        assert!(!super::is_codex_enabled());
+        assert!(super::codex_connector_wanted(), "restore still pending");
+
+        super::disable_client_setup("codex").expect("toggle off");
+        assert!(!super::codex_connector_wanted());
     }
 
     /// Finding 38: a 6767 holder Headroom cannot identify (another signed-in

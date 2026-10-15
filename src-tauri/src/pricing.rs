@@ -1101,7 +1101,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
@@ -1646,7 +1646,7 @@ pub(crate) fn verify_auth_code_with_base_url(
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
@@ -1839,7 +1839,7 @@ pub(crate) fn activate_account_with_retry_backoff(
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
