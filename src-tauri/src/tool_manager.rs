@@ -11244,6 +11244,7 @@ impl ToolManager {
                 self.plugin_receipt_exists(plugin)
                     && self.tool_enabled(id)
                     && PluginHost::Codex.plugin_present(plugin)
+                    && !codex_plugin_disabled(plugin)
             });
             if let Err(err) = crate::client_adapters::set_codex_skill_nudge(id, skill, on) {
                 log::warn!("{id}: Codex skill nudge failed: {err:#}");
@@ -11536,6 +11537,28 @@ fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
         std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
     Some(text.lines().any(|line| line.trim_start() == header))
+}
+
+/// The plugin's Codex table says `enabled = false`: the user switched it off
+/// in Codex, so its skill nudge must not tell every session to load it. An
+/// unreadable config keeps the nudge as it is.
+fn codex_plugin_disabled(plugin: &PluginAddon) -> bool {
+    codex_plugin_disabled_in(
+        &std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml"))
+            .unwrap_or_default(),
+        plugin,
+    )
+}
+
+fn codex_plugin_disabled_in(config: &str, plugin: &PluginAddon) -> bool {
+    config.parse::<toml::Table>().ok().is_some_and(|config| {
+        config
+            .get("plugins")
+            .and_then(|plugins| plugins.get(plugin.plugin_ref))
+            .and_then(|table| table.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+    })
 }
 
 /// One row of `codex plugin list`: `<ref>  installed, enabled  4.10.0  <src>`,
@@ -28949,6 +28972,22 @@ exit 0
         super::plugin_latest_round_failed(&cache);
         let due = cache.lock().as_ref().unwrap().0;
         assert!(due <= Instant::now() + super::PLUGIN_LATEST_RETRY);
+    }
+
+    #[test]
+    fn codex_plugin_disabled_reads_the_plugins_enabled_flag() {
+        let plugin = super::plugin_addon("chisle").unwrap();
+        let config = |body: &str| format!("[plugins.\"{}\"]\n{body}\n", plugin.plugin_ref);
+        assert!(super::codex_plugin_disabled_in(
+            &config("enabled = false"),
+            plugin
+        ));
+        assert!(!super::codex_plugin_disabled_in(
+            &config("enabled = true"),
+            plugin
+        ));
+        assert!(!super::codex_plugin_disabled_in(&config(""), plugin));
+        assert!(!super::codex_plugin_disabled_in("not = [toml", plugin));
     }
 
     #[test]
