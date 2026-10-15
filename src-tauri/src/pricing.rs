@@ -1132,7 +1132,9 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         tier_mismatch,
     );
     status.codex = fetch_codex_usage(state, status.account.as_ref(), subscription_clamped);
-    status.codex_plan_tier = Some(state.codex_plan_tier());
+    // The tier the clock judged, not only what a live request decoded: the
+    // under-tier card note and the paywall read it, and must agree with it.
+    status.codex_plan_tier = Some(codex_plan.unwrap_or(CodexPlanTier::Unknown));
     status.last_account_email = local_state.last_account_email.clone();
     maybe_apply_fake_weekly_gate(&mut status);
     // Attach the signed-in account to the Sentry scope so later captures from
