@@ -2602,7 +2602,7 @@ async fn splice_with_models_lite_rewrite<S: AsyncRead + AsyncWrite + Unpin>(
         if !head.is_empty() && client.write_all(&head).await.is_err() {
             return;
         }
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        splice_until_response_done(client, backend).await;
         return;
     }
 
@@ -2706,7 +2706,24 @@ async fn splice_with_models_lite_rewrite<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     // Remainder: body of a non-rewritable response and/or keep-alive reuse.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    splice_until_response_done(client, backend).await;
+}
+
+/// `copy_bidirectional` that ends like the plain relay: the client half gets
+/// `RESPONSE_DONE_GRACE` once the backend's response is done, so a client that
+/// never closes does not hold the in-flight permit until the idle close.
+async fn splice_until_response_done<S: AsyncRead + AsyncWrite + Unpin>(client: S, backend: S) {
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
+    let upstream = async {
+        let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+        let _ = backend_wr.shutdown().await;
+    };
+    let downstream = async {
+        let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
+        let _ = client_wr.shutdown().await;
+    };
+    relay_until_response_done(upstream, downstream).await;
 }
 
 /// Outcome of attempting the lite-flag rewrite on a models-catalog body.
@@ -6188,6 +6205,56 @@ mod tests {
             .expect("read to end");
         assert!(
             response.ends_with(b"ok"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            super::backend_inflight().available_permits(),
+            permits,
+            "the permit returns well before the idle limit"
+        );
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// The same for a Codex models fetch, whose lite-flag rewrite splice is
+    /// separate from the plain one.
+    #[tokio::test]
+    #[serial]
+    async fn a_finished_models_fetch_frees_its_permit_though_the_client_stays_open() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        backend
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}",
+            )
+            .await
+            .expect("respond");
+        drop(backend);
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("the response ends")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"{\"models\":[]}"),
             "{}",
             String::from_utf8_lossy(&response)
         );
