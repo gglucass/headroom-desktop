@@ -9821,19 +9821,18 @@ fn group_kill_target(pid: i32) -> Option<String> {
 /// NTSTATUS 0xC0000142, surfaced by `ExitStatus::code()` as -1073741502 (the
 /// number in RUST-7N's title). Not cfg(windows)-gated so the conversion test
 /// below runs everywhere.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC0000142_u32 as i32;
 
-/// True when a powershell exit code means "the user session is ending", not
-/// "the sweep failed". Same rationale for every member (see the RUST-7N note
-/// at the call site): logoff/shutdown reaps the whole session, orphans
-/// included, so a sweep that was cut short here has nothing left to do, and
-/// the next launch's reclaim_orphan_proxy covers any survivor.
+/// True when a powershell (or headroom learn, RUST-QK) exit code means "the
+/// user session is ending", not "the sweep failed". Same rationale for every
+/// member (see the RUST-7N note at the call site): logoff/shutdown reaps the
+/// whole session, orphans included, so a sweep that was cut short here has
+/// nothing left to do, and the next launch's reclaim_orphan_proxy covers any
+/// survivor.
 /// - 0xC0000142 STATUS_DLL_INIT_FAILED: powershell cannot even start (RUST-7N).
 /// - 0x40010004 DBG_TERMINATE_PROCESS: powershell was terminated by the
 ///   session's console-control teardown mid-run (RUST-9A).
 /// - 0xC000013A STATUS_CONTROL_C_EXIT: same teardown, delivered as ctrl-close.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
     const DBG_TERMINATE_PROCESS: i32 = 0x40010004;
     const STATUS_CONTROL_C_EXIT: i32 = 0xC000013A_u32 as i32;

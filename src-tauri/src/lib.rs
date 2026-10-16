@@ -9976,7 +9976,14 @@ fn execute_headroom_learn_run(
                 let path_unreadable = diagnosis.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
                 let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
+                // Windows ending the session (a 3am update restart) killed the
+                // run mid-analysis; the next scan redoes it (RUST-QK).
+                let session_teardown = output
+                    .status
+                    .code()
+                    .is_some_and(crate::state::is_session_teardown_exit);
                 let user_env_condition = path_unreadable
+                    || session_teardown
                     || agent_cli_outdated
                     || learn_failure_is_agent_config_broken(diagnosis)
                     || agent_not_signed_in
