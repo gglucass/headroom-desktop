@@ -8,6 +8,9 @@ it unprompted and the harness enforces the rest. Do not re-add it.
 ## Testing Rules
 - After any code change, run the relevant tests/checks before declaring the task done. Do not ask the user to verify.
 - Rust changes: `cargo test --manifest-path src-tauri/Cargo.toml --lib <filter>` for the affected module, plus `cargo check --manifest-path src-tauri/Cargo.toml` if the change crosses module boundaries.
+- Full Rust suite, once per change set (never between edits): `lockf -k -t 900 /tmp/headroom-cargo.lock cargo test --manifest-path src-tauri/Cargo.toml --lib -- --skip against_the_installed_wheel`. The lock queues full suites across sessions, since two at once push a 16 GB Mac into swap; filtered tests, `check` and `clippy` run without it (overlapping those costs less than queueing them). Give the Bash call a long timeout.
+- The 43 `*_against_the_installed_wheel` tests boot the installed Python runtime. Run them (`cargo test --manifest-path src-tauri/Cargo.toml --lib against_the_installed_wheel`) when a change touches `SITECUSTOMIZE_PY`, the wheel pin or `src-tauri/python/*.lock`. CI's wheel job and the release-train gates run them on every push and rc.
+- After a failure, re-run only the failing tests until they pass, then the full-suite command once. Never re-run the whole suite to retry a failure.
 - Frontend changes: `npx tsc --noEmit` and any relevant Vitest suite. For visual changes, see Styling Rules.
 - If a test cannot be run in this environment, say so explicitly rather than skipping silently.
 
