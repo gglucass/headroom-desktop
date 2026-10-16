@@ -17319,12 +17319,19 @@ impl std::fmt::Display for CommandFailure {
             (None, Some(sig)) => format!("killed by signal {}", sig),
             (None, None) => "killed by signal".to_string(),
         };
+        // An inline `-c` script (the MCP registrar helpers) filled Sentry's
+        // 400-char message cap before the stderr that names the cause (RUST-QJ).
+        let args: Vec<&str> = self
+            .args
+            .iter()
+            .map(|arg| if arg.contains('\n') { "<script>" } else { arg })
+            .collect();
         write!(
             f,
             "command failed ({}): {} {}\nstdout:\n{}\nstderr:\n{}",
             status,
             self.program,
-            self.args.join(" "),
+            args.join(" "),
             self.stdout,
             self.stderr
         )
@@ -21896,6 +21903,28 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
             failure.stderr
         );
         assert_eq!(failure.program, "/bin/sh");
+    }
+
+    #[test]
+    fn command_failure_message_elides_an_inline_script() {
+        let failure = CommandFailure {
+            program: "python.exe".into(),
+            args: vec![
+                "-c".into(),
+                super::CONTEXT7_MCP_HELPER.into(),
+                "register".into(),
+            ],
+            stdout: "Codex: failed\n".into(),
+            stderr: "Codex: config.toml is not valid TOML\n".into(),
+            exit_code: Some(1),
+            signal: None,
+        };
+        let message = failure.to_string();
+        assert!(
+            message.starts_with("command failed (exit 1): python.exe -c <script> register\n"),
+            "{message}"
+        );
+        assert!(message.len() < 400, "{message}");
     }
 
     #[test]
