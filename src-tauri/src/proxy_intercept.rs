@@ -629,7 +629,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
 /// Logs a relay `handle` closed for idling and, at most once a minute, tells
 /// Sentry which client and path it was, the one thing the in-flight cap
 /// report cannot say (RUST-GY).
-fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
+fn note_idle_relay_closed(
+    client: &'static str,
+    path: &str,
+    open: Duration,
+    backend_answered: bool,
+) {
     let closed = IDLE_RELAYS_CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
     let path = path.split('?').next().unwrap_or_default();
     log::info!(
@@ -651,6 +656,10 @@ fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
             scope.set_tag("relay_path", path);
             scope.set_extra("open_secs", (open.as_secs() as i64).into());
             scope.set_extra("closed_this_run", (closed as i64).into());
+            // false: the backend never answered; true: its answer or close
+            // was lost on the way (RUST-QA's Windows host also resets
+            // loopback relays, RUST-NG).
+            scope.set_extra("backend_answered", backend_answered.into());
             scope.set_extra(
                 "permits_available",
                 (backend_inflight().available_permits() as i64).into(),
@@ -2570,7 +2579,12 @@ async fn handle(
                     .max(backend_activity.load(Ordering::Relaxed));
                 let idle = now_epoch_secs().saturating_sub(last);
                 if idle >= RELAY_IDLE_LIMIT.as_secs() {
-                    note_idle_relay_closed(client_key, &relay_path, accepted_at.elapsed());
+                    note_idle_relay_closed(
+                        client_key,
+                        &relay_path,
+                        accepted_at.elapsed(),
+                        backend_activity.load(Ordering::Relaxed) != 0,
+                    );
                     return;
                 }
             }
