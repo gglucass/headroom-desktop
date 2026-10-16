@@ -1268,8 +1268,8 @@ fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, Sy
 /// so no config Headroom owns can route them.
 /// "Restart your terminal" is advice that cannot work there.
 pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desktop app go \
-     straight to Anthropic, so Headroom can't optimize them. Run Claude Code in your \
-     terminal or IDE to keep saving.";
+     straight to Anthropic whatever you open first, so Headroom can't optimize them. Run \
+     Claude Code in your terminal or IDE to keep saving.";
 
 /// True when the transcript was written by Claude Code inside the Claude
 /// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
