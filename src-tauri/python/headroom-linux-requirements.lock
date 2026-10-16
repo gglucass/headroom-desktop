@@ -19,6 +19,8 @@
 # PYSEC-2026-3929 (tokenizer save_pretrained path traversal, fixed in 5.10.0).
 # fsspec 2026.4.0 -> 2026.6.0 and multidict 6.7.1 -> 6.9.1 (2026-10-06): the
 # same CVE top-up as the macOS lock (see its lineage).
+# 0.41.0's core requires_dist adds truststore>=0.10.0, so truststore 0.10.4
+# (the macOS and Windows locks' pin, a pure-Python wheel) is added here.
 ast-grep-cli==0.42.2 \
     --hash=sha256:26adbb32aed0093a37128cc7fa0230b13dc5f1b806e3b526479f55bef65946d2 \
     --hash=sha256:a2f4728d6cc75a67265afa0801dade15649eb9a5188333d1b0c51b4833f975d3
@@ -60,6 +62,8 @@ tiktoken==0.13.0 \
     --hash=sha256:a116178fa7e1b4065bff05214360373a65cac22f965be7b3f73d00a0dbfe7649
 tomlkit==0.15.1 \
     --hash=sha256:177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304
+truststore==0.10.4 \
+    --hash=sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981
 transformers==5.12.1 \
     --hash=sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a
 uvicorn==0.47.0 \
