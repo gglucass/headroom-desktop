@@ -8638,8 +8638,8 @@ export default function App() {
                   <UpstreamPanel
                     paused={Boolean(runtimeStatus?.paused && !runtimeStatus.autoPaused)}
                   />
-                  {/* The statusline is not installed on Windows (untested there). */}
-                  {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
+                  {/* Every platform: Windows installs the statusline too (Git Bash). */}
+                  <ClaudeStatuslinePanel />
                 </div>
               </details>
 
