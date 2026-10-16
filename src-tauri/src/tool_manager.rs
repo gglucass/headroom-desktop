@@ -2901,6 +2901,33 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: a crashed CLI's padding does not push out its error (diagnostics) --
+# Claude Code is a Bun binary, and Bun prints a crash as a source excerpt whose
+# caret line is padded out to the failing column, ahead of the error itself.
+# The analyzer keeps only the first 2000 chars of a failed CLI's stderr and the
+# padding filled them: Claude Code dying in fs.watch reported the excerpt and
+# never the errno (RUST-M8, macOS, 0.9.30 and 0.9.40). Runs of 64+ blanks are
+# squeezed to one before the cut. Not version-gated: stderr without such a run
+# passes through unchanged. Kill switch: HEADROOM_LEARN_STDERR_SQUEEZE=0.
+_hd_lsq_flag = _hd_os.environ.get("HEADROOM_LEARN_STDERR_SQUEEZE", "1")
+if _hd_lsq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import re as _hd_lsq_re
+        from headroom.learn import analyzer as _hd_lsq_mod
+
+        _hd_lsq_orig = _hd_lsq_mod._failure_detail
+        _hd_lsq_pad = _hd_lsq_re.compile(r"[ \t]{64,}")
+
+        def _hd_lsq_detail(stderr, *args, **kwargs):
+            if isinstance(stderr, str):
+                stderr = _hd_lsq_pad.sub(" ", stderr)
+            return _hd_lsq_orig(stderr, *args, **kwargs)
+
+        _hd_lsq_mod._failure_detail = _hd_lsq_detail
+        _hd_bound.add("learn_stderr_squeeze")
+    except Exception:
+        pass
+
 # --- Learn: a CLI that exits before reading the prompt says why (diagnostics) --
 # The claude-cli path writes the whole prompt to the child's stdin before it
 # starts reading the child's output, so a CLI that exits first (an old CLI
@@ -3870,6 +3897,7 @@ _HD_VENDORS = (
     "learn_no_tools",
     "learn_codex_retries",
     "learn_prompt_echo",
+    "learn_stderr_squeeze",
     "learn_stdin_early_exit",
     "image_memo",
     "image_worker_reap",
@@ -19556,6 +19584,42 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_stderr_squeeze_behaves_against_the_installed_wheel() {
+        // RUST-M8: a Bun crash's padded caret line no longer pushes the error
+        // past the analyzer's stderr cut; the kill switch restores the cut.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-sq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn import analyzer as a\n\
+                     d = a._failure_detail('29 | fs.watch(path)\\n' + ' ' * 3000 + '^\\nerror: EMFILE: too many open files, watch\\n', '')\n\
+                     print('EMFILE' in d, len(d) <= a._MAX_SNIPPET_LEN)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_STDERR_SQUEEZE", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True", "stderr:\n{off_err}");
     }
 
     #[test]

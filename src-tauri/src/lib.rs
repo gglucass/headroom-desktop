@@ -9063,6 +9063,10 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // RUST-M8: `You're out of extra usage · resets 1:40pm
         // (Europe/Lisbon)` -- the extra-usage pool, same family.
         "out of extra usage",
+        // RUST-QQ: Codex `ERROR: Your workspace is out of credits. Ask your
+        // workspace owner to refill in order to continue.` -- the ChatGPT
+        // workspace's credit pool.
+        "out of credits",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -16392,6 +16396,9 @@ Some unrelated content.
         // RUST-M8 verbatim.
         let extra = "You're out of extra usage \u{b7} resets 1:40pm (Europe/Lisbon)";
         assert_eq!(learn_failure_agent_limit_line(extra), Some(extra));
+        // RUST-QQ verbatim (Codex).
+        let workspace = "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.";
+        assert_eq!(learn_failure_agent_limit_line(workspace), Some(workspace));
     }
 
     #[test]

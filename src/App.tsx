@@ -1316,7 +1316,7 @@ function DailySavingsChart({
                     badge="measuring"
                     value="Nothing yet"
                     rows={[]}
-                    note="Headroom is asking the model for shorter replies. No output savings were recorded in this period yet."
+                    note="Headroom is asking the model for shorter replies, but no output savings were recorded in this period. A figure shows once there are enough of your replies to compare each one with earlier replies of the same kind, which can take a while after installing. Input savings are counted separately."
                   />
                 ) : null}
               </span>
