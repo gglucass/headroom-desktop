@@ -27,8 +27,10 @@ const STALE_STAGED_UPDATE = /no longer staged/i;
 // install_app_update's refusal when the app runs off the DMG or an
 // App-Translocated copy (READ_ONLY_BUNDLE_MESSAGE in lib.rs). The message is
 // the user's fix, not a defect to report (RUST-JK). Same for the bundle moved
-// or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ).
-const READ_ONLY_BUNDLE = /running from a read-only folder|moved or deleted while running/i;
+// or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ), and kept on another
+// disk than $TMPDIR (OTHER_VOLUME_BUNDLE_MESSAGE, RUST-QR).
+const READ_ONLY_BUNDLE =
+  /running from a read-only folder|moved or deleted while running|on a different disk than/i;
 
 // tauri-plugin-updater's macOS swap hit PermissionDenied, retried under an
 // AppleScript admin prompt, and that prompt was cancelled or failed (RUST-JD).

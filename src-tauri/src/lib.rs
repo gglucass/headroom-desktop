@@ -1173,6 +1173,16 @@ async fn install_app_update(
         return Err(MOVED_BUNDLE_MESSAGE.to_string());
     }
 
+    #[cfg(target_os = "macos")]
+    if bundle_is_on_another_volume() {
+        log::info!(
+            "update: refusing in-place install; bundle {:?} is on another volume than {:?}",
+            current_app_bundle_path(),
+            std::env::temp_dir()
+        );
+        return Err(OTHER_VOLUME_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -1478,6 +1488,34 @@ const MOVED_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it was moved or deleted while running. \
      Quit Headroom, open it from its current location, then check for updates again.";
 
+/// The message shown when the running bundle is on another volume than
+/// `$TMPDIR`. See `bundle_is_on_another_volume`.
+#[cfg(target_os = "macos")]
+const OTHER_VOLUME_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it is on a different disk than macOS's \
+     temporary folder. Move Headroom to your Applications folder and open it from there, \
+     then check for updates again.";
+
+/// The plugin's swap renames the bundle into a `$TMPDIR` folder and the new
+/// build out of another, and a rename cannot cross volumes, so a Headroom kept
+/// on a second disk failed every install, after the whole download, with a
+/// bare "Cross-device link (os error 18)" (RUST-QR).
+#[cfg(target_os = "macos")]
+fn bundle_is_on_another_volume() -> bool {
+    current_app_bundle_path().is_some_and(|bundle| on_other_volumes(&bundle, &std::env::temp_dir()))
+}
+
+/// False when either side cannot be read: the install's own error then says
+/// more than a guess would.
+#[cfg(target_os = "macos")]
+fn on_other_volumes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => false,
+    }
+}
+
 /// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
 /// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the
 /// path catches only one of the ways this happens (running straight off the
@@ -1519,6 +1557,7 @@ fn silent_install_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
         bundle_folder_accepts_writes(current_app_bundle_path().as_deref())
+            && !bundle_is_on_another_volume()
     }
     // The plugin renames the image aside and writes the new one at `APPIMAGE`,
     // the path it installs to. Keyed on the bundle type, not on `APPIMAGE`
@@ -12442,7 +12481,7 @@ mod tests {
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
-    use super::{dir_is_read_only, is_read_only_filesystem, symlink_free_exe};
+    use super::{dir_is_read_only, is_read_only_filesystem, on_other_volumes, symlink_free_exe};
     use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -18204,6 +18243,19 @@ Some unrelated content.
     /// merely unwritable folder (an `/Applications` this user does not own) is
     /// the updater's admin-prompt path and still installs, so blocking it would
     /// break updates that work today.
+    /// RUST-QR. `/dev` is devfs on every Mac, so it stands in for a second disk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn other_volume_guard_compares_devices() {
+        let temp = std::env::temp_dir();
+        assert!(!on_other_volumes(&temp, &temp));
+        assert!(on_other_volumes(std::path::Path::new("/dev"), &temp));
+        assert!(
+            !on_other_volumes(std::path::Path::new("/nonexistent-headroom"), &temp),
+            "an unreadable side must not block an install"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn read_only_bundle_guard_fires_on_erofs_only() {
