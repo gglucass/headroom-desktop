@@ -16697,7 +16697,7 @@ Some unrelated content.
     #[test]
     fn learn_failure_signature_source_takes_codex_verdict_not_its_banner() {
         // RUST-KT: codex's stderr after the marker, prompt echo dropped by the
-        // learn_prompt_echo vendor. The banner line grouped every Codex failure
+        // wheel (#3928; the learn_prompt_echo vendor before 0.41.0). The banner line grouped every Codex failure
         // as one cause-less issue; the request ids would split one per event.
         let codex = |verdict: &str| {
             format!(
