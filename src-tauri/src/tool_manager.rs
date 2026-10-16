@@ -3795,12 +3795,15 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # what that window's one mid-session backend restart cost (2026-10-16). No
 # CACHE-MISS-ATTRIBUTION line is logged for these (there is no tracker to
 # attribute with). A tracker whose client asked for a 1h breakpoint now lives
-# 65 minutes; every other tracker keeps the wheel's TTL. RAISES cache reads,
+# 61 minutes; every other tracker keeps the wheel's TTL. RAISES cache reads,
 # may LOWER tok_saved/tok_before (the re-run re-compressed history the freeze
 # keeps verbatim) and RAISE the app's input % (cache writes are new input), so
-# check all three with savings:did after the stable ships.
-# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel's tracker
-# already outlives a 1h breakpoint. Kill switch: HEADROOM_TRACKER_CACHE_TTL=0.
+# check all three with savings:did after the stable ships. Upstream #4023
+# (merged 2026-10-07, in wheel 0.41.0) fixes this the same way, with the same
+# 60s margin; drop the vendor on that bump.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel has #4023's
+# observe_cache_ttl or its tracker already outlives a 1h breakpoint. Kill
+# switch: HEADROOM_TRACKER_CACHE_TTL=0.
 _hd_tct_flag = _hd_os.environ.get("HEADROOM_TRACKER_CACHE_TTL", "1")
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     _hd_tct_flag.strip().lower() not in ("", "0", "false", "no", "off")
@@ -3834,7 +3837,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
             def _hd_tct_is_expired(self):
                 ttl = self.config.session_ttl_seconds
                 if _hd_tct_wants_1h(self):
-                    ttl = max(ttl, 3900)  # the 1h cache plus a 5-minute margin
+                    ttl = max(ttl, 3660)  # the 1h cache plus the store's 60s sweep
                 return (_hd_tct_time.time() - self._last_activity) > ttl
 
             _hd_tct_probe = _hd_tct_cls("anthropic")
@@ -3847,7 +3850,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                 }
             ]
             _hd_tct_probe._last_activity -= 700
-            if isinstance(_hd_tct_orig, property) and _hd_tct_orig.fget(_hd_tct_probe):
+            if (
+                not hasattr(_hd_tct_cls, "observe_cache_ttl")
+                and isinstance(_hd_tct_orig, property)
+                and _hd_tct_orig.fget(_hd_tct_probe)
+            ):
                 _hd_tct_cls.is_expired = property(_hd_tct_is_expired)
                 _hd_bound.add("tracker_cache_ttl")
     except Exception:
@@ -20361,7 +20368,7 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
     #[test]
     fn tracker_cache_ttl_behaves_against_the_installed_wheel() {
         // A conversation whose client asked for a 1h breakpoint keeps its
-        // tracker through a 20-minute pause and loses it after 65 minutes; one
+        // tracker through a 20-minute pause and loses it after 61 minutes; one
         // without the marker keeps the wheel's 600s. The kill switch restores
         // the wheel's 600s for both.
         let python =
