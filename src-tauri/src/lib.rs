@@ -18239,10 +18239,6 @@ Some unrelated content.
         );
     }
 
-    /// The guard must fire on a read-only FILESYSTEM and on nothing else. A
-    /// merely unwritable folder (an `/Applications` this user does not own) is
-    /// the updater's admin-prompt path and still installs, so blocking it would
-    /// break updates that work today.
     /// RUST-QR. `/dev` is devfs on every Mac, so it stands in for a second disk.
     #[cfg(target_os = "macos")]
     #[test]
@@ -18256,6 +18252,10 @@ Some unrelated content.
         );
     }
 
+    /// The guard must fire on a read-only FILESYSTEM and on nothing else. A
+    /// merely unwritable folder (an `/Applications` this user does not own) is
+    /// the updater's admin-prompt path and still installs, so blocking it would
+    /// break updates that work today.
     #[cfg(target_os = "macos")]
     #[test]
     fn read_only_bundle_guard_fires_on_erofs_only() {
