@@ -24312,6 +24312,7 @@ time.sleep(30)
     }
 
     #[test]
+    #[serial_test::serial]
     fn every_entrypoint_disables_the_wheel_rate_limiter() {
         backend_port::reset_for_tests();
 
