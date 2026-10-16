@@ -9732,7 +9732,7 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
+/// Terminate a process tree. Windows walks the subtree natively; Unix signals
 /// the process group by negating the pid.
 /// How long `stop_headroom` waits for a concurrent lifecycle transition before
 /// stopping the backend anyway.
@@ -9771,20 +9771,15 @@ pub(crate) fn recent_app_kills_summary() -> Vec<String> {
 
 pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
-        // Always /F: without it taskkill only posts WM_CLOSE, which a
-        // windowless python never reads, so the "graceful" stage did nothing
-        // and every stop sat out its full 2s wait before the forced one
-        // (several times over on quit). The proxy has no shutdown hook that a
-        // gentler stop would have run. Bounded like the sweep: taskkill
-        // enumerates the tree through the same machinery a wedged WMI stalls.
+        // Always forced, as the `taskkill /F` this replaced was: a windowless
+        // python reads no WM_CLOSE and the proxy has no shutdown hook, so a
+        // gentler stop only sat out its wait. Native, never a spawned
+        // taskkill, which cannot start while Windows shuts down (see
+        // `winproc::kill_tree`).
         let _ = force;
-        note_app_kill(
-            "terminate_process_tree",
-            format!("taskkill /T /F pid {pid}"),
-        );
-        let mut command = crate::proc::command("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-        let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
+        note_app_kill("terminate_process_tree", format!("tree kill pid {pid}"));
+        #[cfg(windows)]
+        crate::winproc::kill_tree(pid as u32);
     } else {
         let Some(target) = group_kill_target(pid) else {
             log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");

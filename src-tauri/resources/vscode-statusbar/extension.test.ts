@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 // `activate` (which needs the vscode API) is exercised in a real editor.
 import ext from "./extension.cjs";
 
-const { combine, fmt, pausedView, pickSession, projectDirs, projectSlug, routed, usageView, view } =
+const { combine, fmt, pausedView, installed, pickSession, projectDirs, projectSlug, usageView, view } =
   ext;
 
 describe("vscode status bar extension", () => {
@@ -66,8 +66,9 @@ describe("vscode status bar extension", () => {
       text: "$(zap) Headroom saved 31k",
       highlight: false
     });
-    expect(view(session(0, now - 60_000, 0), now)).toBeNull();
-    expect(view(null, now)).toBeNull();
+    // Never hidden: a routed conversation that saved nothing, or none yet.
+    expect(view(session(0, now - 60_000, 0), now)?.text).toBe("$(zap) Headroom on");
+    expect(view(null, now)?.text).toBe("$(zap) Headroom on");
   });
 
   it("adds Claude plan usage after the savings, yellow near the cap", () => {
@@ -120,11 +121,13 @@ describe("vscode status bar extension", () => {
     });
   });
 
-  it("hides once Headroom removed its statusline script (pause, quit, disconnect)", () => {
+  it("hides once the statusline is turned off or the app is gone", () => {
     const script = "/Users/x/.claude/hooks/headroom-statusline.sh";
-    expect(routed(script, (p: string) => p === script)).toBe(true);
-    expect(routed(script, () => false)).toBe(false);
-    // A headroom.json written before scriptPath existed keeps showing.
-    expect(routed(undefined, () => false)).toBe(true);
+    const app = "/Applications/Headroom.app/Contents/MacOS/headroom-desktop";
+    expect(installed(script, app, (p: string) => p === script || p === app)).toBe(true);
+    expect(installed(script, app, (p: string) => p === app)).toBe(false);
+    expect(installed(script, app, (p: string) => p === script)).toBe(false);
+    // A headroom.json written before either path existed keeps showing.
+    expect(installed(undefined, undefined, () => false)).toBe(true);
   });
 });

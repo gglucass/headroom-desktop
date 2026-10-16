@@ -8,7 +8,10 @@
 // Claude Code conversation in the window's status bar. A workspace's
 // conversations are the transcripts under ~/.claude/projects/<its slug>/.
 // After it, Claude's plan usage, which Headroom keeps in the same file. While
-// Headroom's pricing gate pauses Claude traffic, its notice replaces the saving.
+// Headroom's pricing gate pauses Claude traffic, or Headroom does not route
+// Claude Code at all (quit, pause, connector off), its notice replaces the
+// saving. Never hidden while Headroom is installed: a missing item told the
+// user nothing.
 "use strict";
 
 const fs = require("fs");
@@ -25,6 +28,8 @@ const SLUG_MAX = 200;
 const WARN_PERCENT = 80;
 const SAVINGS_TOOLTIP =
   "Input tokens Headroom saved in this workspace's latest Claude Code conversation";
+const ON_TOOLTIP =
+  "Headroom is on. Nothing to compress in this workspace's latest Claude Code conversation yet";
 
 /** Claude Code's ~/.claude/projects folder name for a working directory. */
 function projectSlug(dir) {
@@ -82,18 +87,20 @@ function fmt(n) {
   return `${tenths % 10 === 0 ? tenths / 10 : (tenths / 10).toFixed(1)}${unit}`;
 }
 
-/** False once Headroom deleted its terminal statusline script, which it does
- *  whenever Claude Code stops routing through it (pause, quit, connector off):
- *  the total would belong to conversations Headroom no longer sees. A
- *  headroom.json from before scriptPath has none and keeps showing. */
-function routed(scriptPath, exists) {
-  return !scriptPath || exists(scriptPath);
+/** False once the user turned the statusline off (Headroom deletes its
+ *  terminal script) or the Headroom app is gone (dragged to the Trash, which
+ *  runs no cleanup). A headroom.json from before a path was added keeps
+ *  showing. shortcut: appPath is baked in at install, so an app moved after it
+ *  hides the item until the next extension version reinstalls it. */
+function installed(scriptPath, appPath, exists) {
+  return (!scriptPath || exists(scriptPath)) && (!appPath || exists(appPath));
 }
 
-/** What the item shows at `now`, or null to hide it. A fresh saving outranks
- *  "compressing", as in the terminal line. */
+/** What the item shows at `now`. A fresh saving outranks "compressing", as in
+ *  the terminal line. */
 function view(session, now) {
-  if (!session) return null;
+  const on = { text: "$(zap) Headroom on", highlight: false, tooltip: ON_TOOLTIP };
+  if (!session) return on;
   const total = session.tokensSaved || 0;
   const last = session.lastSaved || 0;
   if (last > 0 && now - (session.lastSavedAtMs || 0) < FLASH_MS) {
@@ -103,12 +110,12 @@ function view(session, now) {
     return { text: "$(sync~spin) Headroom compressing", highlight: false };
   }
   if (total > 0) return { text: `$(zap) Headroom saved ${fmt(total)}`, highlight: false };
-  return null;
+  return on;
 }
 
-/** The gate's notice ("Headroom paused: trial ended. Upgrade in the Headroom
- *  app to resume"), its first sentence on the bar and the rest as the tooltip;
- *  null when Claude traffic is not paused. */
+/** The gate's or the off notice ("Headroom paused: trial ended. Upgrade in the
+ *  Headroom app to resume"), its first sentence on the bar and the rest as the
+ *  tooltip; null when Claude traffic is not paused. */
 function pausedView(paused) {
   if (!paused) return null;
   const [head, ...rest] = paused.split(". ");
@@ -155,8 +162,9 @@ function activate(context) {
   const vscode = require("vscode");
   let statePath;
   let scriptPath;
+  let appPath;
   try {
-    ({ statePath, scriptPath } = JSON.parse(
+    ({ statePath, scriptPath, appPath } = JSON.parse(
       fs.readFileSync(path.join(__dirname, "headroom.json"), "utf8")
     ));
   } catch {
@@ -207,7 +215,7 @@ function activate(context) {
         const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
         session = pickSession(state.sessions, belongs);
         planUsage = state.planUsage || null;
-        paused = state.paused || null;
+        paused = state.paused || state.off || null;
       }
     } catch {
       mtime = -1;
@@ -216,7 +224,7 @@ function activate(context) {
       paused = null;
     }
     const now = Date.now();
-    const shown = routed(scriptPath, fs.existsSync)
+    const shown = installed(scriptPath, appPath, fs.existsSync)
       ? combine(pausedView(paused) || view(session, now), usageView(planUsage, now))
       : null;
     if (!shown) {
@@ -253,7 +261,7 @@ module.exports = {
   pickSession,
   projectDirs,
   projectSlug,
-  routed,
+  installed,
   usageView,
   view
 };

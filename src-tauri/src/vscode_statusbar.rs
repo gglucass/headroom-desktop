@@ -5,7 +5,7 @@
 //! small extension in resources/vscode-statusbar into a .vsix and installs it
 //! through each editor's own CLI, into the default profile and every named
 //! profile with extensions of its own; it reads the same per-conversation file
-//! and hides whenever the terminal line's script is gone (pause, quit).
+//! and hides once the terminal line's script is gone (the opt-out) or the app is.
 //!
 //! Installed alongside the terminal statusline and under the same opt-out.
 //! Removed only when the user turns that off or uninstalls Headroom, never on
@@ -282,10 +282,14 @@ fn save_tracking(tracking: &Tracking) {
 /// The .vsix: a zip of the extension plus `headroom.json`, which tells it
 /// where this install keeps the per-conversation savings file, and the
 /// terminal statusline script whose absence means Claude Code is not routed.
-fn build_vsix(state_path: &Path, script_path: &Path) -> Result<Vec<u8>> {
+fn build_vsix(state_path: &Path, script_path: &Path, app_path: Option<&Path>) -> Result<Vec<u8>> {
     let version = extension_version();
-    let config =
-        serde_json::json!({ "statePath": state_path, "scriptPath": script_path }).to_string();
+    let config = serde_json::json!({
+        "statePath": state_path,
+        "scriptPath": script_path,
+        "appPath": app_path,
+    })
+    .to_string();
     let content_types = r#"<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/><Default Extension=".vsixmanifest" ContentType="text/xml"/></Types>"#;
     let manifest = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -409,6 +413,7 @@ fn install_where_needed(editors: &[Editor]) {
     let vsix = match build_vsix(
         &crate::claude_statusline::state_path(),
         &crate::client_adapters::claude_statusline_script_path(),
+        crate::own_executable().as_deref(),
     ) {
         Ok(vsix) => vsix,
         Err(err) => {
@@ -603,7 +608,8 @@ mod tests {
     #[test]
     fn vsix_carries_the_extension_and_this_install_s_state_path() {
         let state = Path::new("/Users/x/Library/Application Support/Headroom/config/s.json");
-        let bytes = build_vsix(state, Path::new("/Users/x/.claude/hooks/h.sh")).unwrap();
+        let app = Path::new("/Applications/Headroom.app/Contents/MacOS/headroom-desktop");
+        let bytes = build_vsix(state, Path::new("/Users/x/.claude/hooks/h.sh"), Some(app)).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let read = |zip: &mut zip::ZipArchive<_>, name: &str| {
             let mut out = String::new();
@@ -613,6 +619,7 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_str(&read(&mut zip, "extension/headroom.json")).unwrap();
         assert_eq!(config["statePath"], state.to_str().unwrap());
+        assert_eq!(config["appPath"], app.to_str().unwrap());
         assert_eq!(read(&mut zip, "extension/extension.js"), EXTENSION_JS);
         let manifest = read(&mut zip, "extension.vsixmanifest");
         assert!(manifest.contains(&format!(r#"Version="{}""#, extension_version())));

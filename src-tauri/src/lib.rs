@@ -7244,29 +7244,36 @@ fn last_exit_step(log: &str) -> Option<String> {
     })
 }
 
+/// The executable that outlives this run: an AppImage runs from a mount that
+/// is torn down with the app, so anything that must find the app after it
+/// exits (the crash guard, the Claude Code statusline) takes the image itself.
+pub(crate) fn own_executable() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("APPIMAGE")
+            .filter(|image| !image.is_empty())
+            // Only our own image: a shell started from another AppImage leaks
+            // its APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard
+            // would start that app. tauri-utils' current_exe makes the same check.
+            .filter(
+                |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
+                    (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
+                    _ => false,
+                },
+            )
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 /// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
 /// it a crash leaves the clients wired, as it always did.
 fn spawn_crash_guard() {
-    // An AppImage runs from a mount that is torn down with the app, so a guard
-    // started from `current_exe` would lose its own binary at the moment it is
-    // needed. Start the image itself instead.
-    #[cfg(target_os = "linux")]
-    let exe = std::env::var_os("APPIMAGE")
-        .filter(|image| !image.is_empty())
-        // Only our own image: a shell started from another AppImage leaks its
-        // APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard would
-        // start that app. tauri-utils' current_exe makes the same check.
-        .filter(
-            |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
-                (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
-                _ => false,
-            },
-        )
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_exe().ok());
-    #[cfg(not(target_os = "linux"))]
-    let exe = std::env::current_exe().ok();
-    let Some(exe) = exe else {
+    let Some(exe) = own_executable() else {
         log::warn!("crash guard: no executable path to start it from");
         return;
     };
