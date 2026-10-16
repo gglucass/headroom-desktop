@@ -14035,6 +14035,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dashboard_includes_managed_tools() {
         let base_dir = temp_test_dir("headroom-app-state");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
@@ -14769,6 +14770,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dashboard_read_path_preserves_pending_milestones_for_analytics() {
         // Regression guard: `state.dashboard()` (tray updater, bootstrap
         // finalize, account activation) must not advance the milestone
