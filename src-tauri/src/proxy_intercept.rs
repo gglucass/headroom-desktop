@@ -250,7 +250,11 @@ const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
 
 /// The status probe's own budget (`state::headroom_proxy_readyz`): a `/readyz`
 /// relay still running past it has already failed from the app's side.
-const READYZ_RELAY_STALL: Duration = Duration::from_secs(5);
+const READYZ_RELAY_STALL: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -2438,13 +2442,16 @@ async fn handle(
         .map(|head| head.path.clone())
         .unwrap_or_default();
     let activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+    // 0 until the backend sends its first byte, so a /readyz stall can tell a
+    // backend that has not answered from an answer lost in this relay.
+    let backend_activity = Arc::new(AtomicU64::new(0));
     let client = Touched {
         inner: client,
         last: Arc::clone(&activity),
     };
     let backend = Touched {
         inner: backend,
-        last: Arc::clone(&activity),
+        last: Arc::clone(&backend_activity),
     };
     let relay = async {
         if is_models_fetch {
@@ -2517,6 +2524,15 @@ async fn handle(
             let copied = tokio::select! {
                 copied = &mut relay => copied,
                 () = tokio::time::sleep(READYZ_RELAY_STALL) => {
+                    if backend_activity.load(Ordering::Relaxed) == 0 {
+                        // The backend has not answered: its event loop is
+                        // starved (a busy or booting runtime, RUST-NG's stalls
+                        // 2026-10-10..15), which its own port shows too. Not
+                        // an answer this relay lost, so neither a failure nor
+                        // a relay for the share.
+                        let _ = relay.await;
+                        return;
+                    }
                     stalled = true;
                     relay.await
                 }
@@ -2540,7 +2556,10 @@ async fn handle(
         tokio::select! {
             () = &mut relay => return,
             () = tokio::time::sleep(RELAY_IDLE_CHECK) => {
-                let idle = now_epoch_secs().saturating_sub(activity.load(Ordering::Relaxed));
+                let last = activity
+                    .load(Ordering::Relaxed)
+                    .max(backend_activity.load(Ordering::Relaxed));
+                let idle = now_epoch_secs().saturating_sub(last);
                 if idle >= RELAY_IDLE_LIMIT.as_secs() {
                     note_idle_relay_closed(client_key, &relay_path, accepted_at.elapsed());
                     return;
@@ -5978,7 +5997,8 @@ mod tests {
 
     /// Watching a `/readyz` relay must not change it: the answer still reaches
     /// the client, a delivered one is not counted as a failure, and an answer
-    /// the backend never sent is.
+    /// the backend never sent is. A stall is a failure only once the backend
+    /// has started answering; before that it is the backend's latency.
     #[tokio::test]
     #[serial]
     async fn readyz_relay_is_delivered_and_an_empty_answer_counts_as_failed() {
@@ -5996,6 +6016,21 @@ mod tests {
             // Second probe: the backend hangs up without answering.
             let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
             read_until_header_end(&mut sock).await;
+            drop(sock);
+            // Third: the backend answers only after the stall deadline.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            tokio::time::sleep(super::READYZ_RELAY_STALL * 2).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            drop(sock);
+            // Fourth: the answer starts in time and stalls in the relay.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n").await;
+            tokio::time::sleep(super::READYZ_RELAY_STALL * 2).await;
+            let _ = sock.write_all(b"Content-Length: 0\r\n\r\n").await;
         });
         backend_port::set(backend_addr.port());
 
@@ -6075,7 +6110,22 @@ mod tests {
             failures + 1
         );
 
-        backend_task.await.expect("backend served both probes");
+        assert!(probe().await.starts_with(b"HTTP/1.1 200"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(super::READYZ_RELAYS.load(Ordering::Acquire), relays + 2);
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        assert!(probe().await.starts_with(b"HTTP/1.1 200"));
+        settled(relays + 3).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 2
+        );
+
+        backend_task.await.expect("backend served every probe");
         run_task.abort();
         backend_port::reset_for_tests();
     }
