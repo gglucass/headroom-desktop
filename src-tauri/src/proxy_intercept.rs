@@ -578,10 +578,12 @@ pub fn first_prompt_request_seen() -> bool {
 /// the splices below.
 struct StampReader<R>(R, bool);
 
-/// A relay socket that stamps `last` (epoch seconds) whenever bytes are read
-/// from it, so `handle` can tell an idle relay from a live one (see
+/// A relay socket that stamps `last` (epoch milliseconds) whenever bytes are
+/// read from it, so `handle` can tell an idle relay from a live one (see
 /// `RELAY_IDLE_LIMIT`). Epoch, not `Instant`: a relay that slept through a
 /// system sleep is dead (its upstream connection is) and should look idle.
+/// Milliseconds, not seconds: whole seconds made the limit fire up to a second
+/// early, which under `cfg(test)`'s 2s limit could cut a relay idle for 1s.
 struct Touched<S> {
     inner: S,
     last: Arc<AtomicU64>,
@@ -596,7 +598,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Touched<S> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.last.store(now_epoch_secs(), Ordering::Relaxed);
+            self.last.store(now_epoch_millis(), Ordering::Relaxed);
         }
         poll
     }
@@ -2459,7 +2461,7 @@ async fn handle(
         .as_ref()
         .map(|head| head.path.clone())
         .unwrap_or_default();
-    let activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+    let activity = Arc::new(AtomicU64::new(now_epoch_millis()));
     // 0 until the backend sends its first byte, so a /readyz stall can tell a
     // backend that has not answered from an answer lost in this relay.
     let backend_activity = Arc::new(AtomicU64::new(0));
@@ -2577,8 +2579,8 @@ async fn handle(
                 let last = activity
                     .load(Ordering::Relaxed)
                     .max(backend_activity.load(Ordering::Relaxed));
-                let idle = now_epoch_secs().saturating_sub(last);
-                if idle >= RELAY_IDLE_LIMIT.as_secs() {
+                let idle = now_epoch_millis().saturating_sub(last);
+                if u128::from(idle) >= RELAY_IDLE_LIMIT.as_millis() {
                     note_idle_relay_closed(
                         client_key,
                         &relay_path,
@@ -3862,6 +3864,13 @@ fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -6235,6 +6244,59 @@ mod tests {
             .expect("the backend side is closed too");
         assert!(matches!(backend_eof, Ok(0) | Err(_)));
         assert_eq!(super::backend_inflight().available_permits(), permits);
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A relay quiet for less than `RELAY_IDLE_LIMIT` is never closed, even
+    /// when the quiet spell straddles two second boundaries. Stamped in whole
+    /// seconds, a 1.5s stall that began just before a boundary read as 2s idle
+    /// and the relay was cut mid-answer.
+    #[tokio::test]
+    #[serial]
+    async fn a_relay_quiet_for_less_than_the_idle_limit_is_not_closed() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        // Start the stall 50-100ms before a wall-clock second ends.
+        let into_second = super::now_epoch_millis() % 1000;
+        let wait = (1900 - into_second) % 1000;
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        backend
+            .write_all(b"HTTP/1.1 200 OK\r\n")
+            .await
+            .expect("first line");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = backend
+            .write_all(b"Content-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+        drop(backend);
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(8), client.read_to_end(&mut response))
+            .await
+            .expect("relay finished")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"\r\n\r\nok"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
 
         task.abort();
         backend_port::reset_for_tests();
