@@ -3036,6 +3036,7 @@ impl AppState {
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
                 output_shaper_active: stats.as_ref().and_then(|s| s.output_shaper_active),
+                output_warmup: crate::output_savings::warmup_progress(),
                 learner_progress,
                 reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
                 reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),

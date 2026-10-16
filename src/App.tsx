@@ -244,6 +244,7 @@ import type {
   AppliedPatterns,
   HourlySavingsPoint,
   OutputReduction,
+  OutputWarmup,
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
@@ -993,6 +994,7 @@ function DailySavingsChart({
   setChartMode,
   outputReduction,
   outputShaperActive,
+  outputWarmup,
   liveSavingsPulse
 }: {
   data: DailySavingsPoint[];
@@ -1002,6 +1004,7 @@ function DailySavingsChart({
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
   outputShaperActive: boolean;
+  outputWarmup: OutputWarmup | null;
   liveSavingsPulse: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
@@ -1307,6 +1310,17 @@ function DailySavingsChart({
                     rows={[]}
                     note="Tokens the model didn't have to write because Headroom asked for shorter replies. Rough: there isn't enough of your own usage yet to compare each reply with earlier replies of the same kind, so it is compared with the average length of your past replies. Becomes a percentage once there is."
                   />
+                ) : outputMeasuring && outputWarmup ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label="Output · learning"
+                    title="Output savings: learning your baseline"
+                    badge="first day"
+                    value={`${outputWarmup.replies} of ${outputWarmup.target} replies`}
+                    rows={[]}
+                    note={`To measure how much shorter Headroom makes your agent's replies, it first learns how long they usually are. It leaves your first ${outputWarmup.target} replies as they are, which is usually about a day of use. After that it asks for shorter replies and shows what that saves here. Conversations you start before then keep their normal length. Input savings are counted from the start.`}
+                  />
                 ) : outputMeasuring ? (
                   <WindowRateChip
                     dot="output"
@@ -1316,7 +1330,7 @@ function DailySavingsChart({
                     badge="measuring"
                     value="Nothing yet"
                     rows={[]}
-                    note="Headroom is asking the model for shorter replies, but no output savings were recorded in this period. A figure shows once there are enough of your replies to compare each one with earlier replies of the same kind, which can take a while after installing. Input savings are counted separately."
+                    note="Headroom is asking the model for shorter replies, but no output savings were recorded in this period. Input savings are counted separately."
                   />
                 ) : null}
               </span>
@@ -7291,6 +7305,7 @@ export default function App() {
                 // thin percentage (lib.rs).
                 outputReduction={dashboard.outputReduction}
                 outputShaperActive={dashboard.outputShaperActive === true}
+                outputWarmup={dashboard.outputWarmup ?? null}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">

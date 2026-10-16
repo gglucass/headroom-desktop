@@ -12695,6 +12695,7 @@ mod tests {
             session_savings_pct: 0.0,
             output_reduction: None,
             output_shaper_active: None,
+            output_warmup: None,
             learner_progress: None,
             reread_tokens: None,
             reread_compressed_tokens: None,

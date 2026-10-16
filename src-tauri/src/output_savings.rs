@@ -122,10 +122,10 @@ impl Accum {
 #[serde(default)]
 struct Baseline {
     strata: HashMap<String, Accum>,
-    /// The all-requests accumulator. Deliberately unused: crediting a stratum
-    /// the baseline never saw against the global mean is the overcount this
-    /// module exists to remove.
-    #[allow(dead_code)]
+    /// The all-requests accumulator. Never scored against: crediting a
+    /// stratum the baseline never saw against the global mean is the
+    /// overcount this module exists to remove. Its count is the warm-up's
+    /// progress ([`warmup_progress`]).
     glob: Accum,
 }
 
@@ -231,6 +231,47 @@ pub fn ledger_path() -> Option<PathBuf> {
     // profile folder on Windows whatever `HOME` says.
     let home = crate::client_adapters::home_dir();
     Some(home.join(".headroom").join("output_savings.json"))
+}
+
+/// Unshaped replies the backend learns as this install's baseline before it
+/// shapes anything, when nothing was seeded at install. Mirrors the
+/// sitecustomize `output_warmup` default (pinned by its vendor test).
+pub const OUTPUT_WARMUP_REPLIES: u64 = 200;
+
+/// The output warm-up while it runs: replies learned so far of the target.
+/// `None` once the baseline holds enough (seeded or learned), or with the
+/// warm-up switched off. A missing ledger is a warm-up that has not started;
+/// a torn one reads as `None` until the next build.
+// shortcut: assumes the backend runs the pinned wheel the vendor binds on; a
+// runtime stuck on another wheel would show the warm-up without running it.
+pub fn warmup_progress() -> Option<crate::models::OutputWarmup> {
+    warmup_from(
+        std::env::var("HEADROOM_OUTPUT_WARMUP").ok().as_deref(),
+        std::fs::read(ledger_path()?),
+    )
+}
+
+fn warmup_from(
+    env: Option<&str>,
+    ledger: std::io::Result<Vec<u8>>,
+) -> Option<crate::models::OutputWarmup> {
+    let target = match env.map(|v| v.trim().to_ascii_lowercase()) {
+        None => OUTPUT_WARMUP_REPLIES,
+        Some(v) if matches!(v.as_str(), "" | "0" | "false" | "no" | "off") => return None,
+        Some(v) => v.parse().unwrap_or(OUTPUT_WARMUP_REPLIES),
+    };
+    let replies = match ledger {
+        Ok(bytes) => {
+            serde_json::from_slice::<Ledger>(&bytes)
+                .ok()?
+                .baseline
+                .glob
+                .n
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return None,
+    };
+    (replies < target).then_some(crate::models::OutputWarmup { replies, target })
 }
 
 /// Outcome of one read of the on-disk ledger. `NoEvidence` and `Unscored` are
@@ -537,6 +578,24 @@ fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warmup_runs_until_the_baseline_holds_the_target() {
+        let ledger = |n: u64| Ok(format!(r#"{{"baseline":{{"glob":{{"n":{n}}}}}}}"#).into_bytes());
+        let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let at = |replies, target| Some(crate::models::OutputWarmup { replies, target });
+        // No ledger yet: the warm-up has not started.
+        assert_eq!(warmup_from(None, gone()), at(0, OUTPUT_WARMUP_REPLIES));
+        assert_eq!(warmup_from(None, ledger(37)), at(37, OUTPUT_WARMUP_REPLIES));
+        // Seeded from transcripts, or learned to the target: no warm-up.
+        assert_eq!(warmup_from(None, ledger(OUTPUT_WARMUP_REPLIES)), None);
+        assert_eq!(warmup_from(None, ledger(15_658)), None);
+        // The kill switch, a custom target, and a torn read.
+        assert_eq!(warmup_from(Some("0"), ledger(3)), None);
+        assert_eq!(warmup_from(Some(" Off "), gone()), None);
+        assert_eq!(warmup_from(Some("500"), ledger(300)), at(300, 500));
+        assert_eq!(warmup_from(None, Ok(br#"{"baseline":"#.to_vec())), None);
+    }
 
     /// Baseline covers `opus` only; treatment also ran `fable`. Mirrors the
     /// real shape of a seeded ledger.

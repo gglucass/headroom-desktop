@@ -2604,6 +2604,104 @@ if _hd_os.environ.get(
     except Exception:
         pass
 
+# --- Output baseline warm-up (desktop feature, not an upstream fix) -----------
+# Output savings are scored against the user's UNSHAPED reply lengths, which the
+# desktop seeds once from Claude Code transcripts written before install. An
+# install with none (new to Claude Code, Codex-only, coming from Claude Desktop)
+# never got a baseline, so its output figure read "measuring" forever: 27% of
+# 989 new users on 2026-10-16, 126 of them active 3+ days in their first week.
+# While the baseline holds fewer than HEADROOM_OUTPUT_WARMUP replies (default
+# 200, mirrored by output_savings::OUTPUT_WARMUP_REPLIES), each NEW conversation
+# runs unshaped for its whole life (its system tail never flips mid-way) and its
+# replies go into the baseline under their own label, never into the A/B control
+# arm, which stays the 3% holdout. From then on the install is scored like a
+# seeded one. Every caller imports assign_arm/stratum_label from
+# headroom.proxy.output_savings at call time and the recorder reads
+# parse_stratum_label from that module's globals, so rebinding both modules
+# reaches every path, including the two that carry no conversation label. The
+# recorder re-reads the disk baseline on each flush and adopts it whenever it
+# differs, which would drop every warm-up sample before it is written, so once
+# this process has recorded one it adopts only a larger (re-learned) disk
+# baseline. Not a wheel bug, so it never self-neutralizes. Exact-pin gated to
+# wheel 0.39.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+_hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_ow_flag not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_ow_meta
+
+        if _hd_ow_meta.version("headroom-ai") == "0.39.0":
+            import contextvars as _hd_ow_cv
+
+            from headroom.proxy import output_savings as _hd_ow_os
+            from headroom.proxy import output_savings_policy as _hd_ow_pol
+
+            _hd_ow_target = int(_hd_ow_flag) if _hd_ow_flag.isdigit() else 200
+            _HD_OW_LABEL = "output_shaper:warmup:"
+            # Conversations started in warm-up. In-process only: after a restart
+            # one is judged afresh, and a restart re-writes its cache anyway.
+            _hd_ow_convs = set()
+            _hd_ow_recorded = [False]
+            # Set by assign_arm, read by the stratum_label call that follows it
+            # in the same request (no await between the two on any path).
+            _hd_ow_req = _hd_ow_cv.ContextVar("hd_output_warmup", default=False)
+            _hd_ow_orig_assign = _hd_ow_pol.assign_arm
+            _hd_ow_orig_label = _hd_ow_pol.stratum_label
+            _hd_ow_orig_parse = _hd_ow_pol.parse_stratum_label
+            _hd_ow_orig_record = _hd_ow_os.SavingsLedger.record
+            _hd_ow_orig_reload = _hd_ow_os.SavingsRecorder._reload_baseline_locked
+
+            def _hd_ow_assign(conversation_key, holdout_fraction):
+                warm = conversation_key in _hd_ow_convs
+                if not warm and len(_hd_ow_convs) < 10000:
+                    baseline = _hd_ow_os.get_recorder()._ledger.baseline
+                    if baseline.total_samples < _hd_ow_target:
+                        _hd_ow_convs.add(conversation_key)
+                        warm = True
+                _hd_ow_req.set(warm)
+                if warm:
+                    return "control"
+                return _hd_ow_orig_assign(conversation_key, holdout_fraction)
+
+            def _hd_ow_label(arm, key):
+                if arm == "control" and _hd_ow_req.get():
+                    return _HD_OW_LABEL + key
+                return _hd_ow_orig_label(arm, key)
+
+            def _hd_ow_parse(label):
+                if label.startswith(_HD_OW_LABEL):
+                    return "warmup", label[len(_HD_OW_LABEL) :]
+                return _hd_ow_orig_parse(label)
+
+            def _hd_ow_record(self, arm, key, output_tokens, conversation=None):
+                if arm != "warmup":
+                    return _hd_ow_orig_record(self, arm, key, output_tokens, conversation)
+                self.baseline.observe(key, output_tokens)
+                _hd_ow_recorded[0] = True
+                return None
+
+            def _hd_ow_reload(self):
+                if not _hd_ow_recorded[0]:
+                    return _hd_ow_orig_reload(self)
+                try:
+                    disk = _hd_ow_os.SavingsLedger.load(self._path)
+                except OSError:
+                    return None
+                if disk.baseline.total_samples > self._ledger.baseline.total_samples:
+                    self._ledger.baseline = disk.baseline
+                return None
+
+            for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):
+                _hd_ow_mod.assign_arm = _hd_ow_assign
+                _hd_ow_mod.stratum_label = _hd_ow_label
+                _hd_ow_mod.parse_stratum_label = _hd_ow_parse
+            _hd_ow_os.SavingsLedger.record = _hd_ow_record
+            _hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload
+            _hd_bound.add("output_warmup")
+    except Exception:
+        pass
+
 # --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
 # The learn prompt asks for each rule's content as "1-3 bullet points", and a
 # model that returns them as a JSON array killed the whole analysis: 0.39.0's
@@ -3970,6 +4068,7 @@ _HD_VENDORS = (
     "proxied_guarded_upstreams",
     "upstream_tcp_keepalive",
     "holdout_key",
+    "output_warmup",
     "learn_rule_coerce",
     "learn_worktree_merge",
     "learn_drop_error_recovery",
@@ -18765,6 +18864,28 @@ asyncio.run(main())
     }
 
     #[test]
+    fn sitecustomize_vendors_output_warmup() {
+        // An install with no seeded baseline learns one from its first unshaped
+        // replies. Behaviour is proven by
+        // output_warmup_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the default the
+        // dashboard's progress mirrors, and the rebinds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains(&format!(
+            r#"_hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "{}")"#,
+            crate::output_savings::OUTPUT_WARMUP_REPLIES
+        )));
+        assert!(py.contains(&format!(
+            "else {}",
+            crate::output_savings::OUTPUT_WARMUP_REPLIES
+        )));
+        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
+        assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
+        assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));
+    }
+
+    #[test]
     fn sitecustomize_vendors_codex_whole_read() {
         // Codex code-mode `text(r)` wraps a file read in the exec result JSON,
         // which the wheel's content gate can judge as releasable JSON and
@@ -20889,6 +21010,76 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
             "kill switch arm:\n{off_err}"
         );
         assert_eq!(on, "400 400 True True True True", "stderr:\n{on_err}");
+    }
+
+    #[test]
+    fn output_warmup_behaves_against_the_installed_wheel() {
+        // With an empty baseline and a warm-up of 5, the first 5 conversations
+        // run unshaped under the warm-up label and feed the baseline; the next
+        // new conversation is shaped while a warm-up one stays unshaped; the
+        // baseline survives the recorder's flushes (its reload would otherwise
+        // drop it); the A/B control arm stays empty; and a shaped reply is then
+        // credited against the learned baseline (500 - 300). The kill switch
+        // restores the wheel: everything shaped, nothing learned, no credit.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-output-warmup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"
+import json, os, tempfile
+import sitecustomize
+from headroom.proxy import output_savings as om
+from headroom.proxy.output_savings import assign_arm, stratum_label, conversation_label
+path = os.path.join(tempfile.mkdtemp(), 'output_savings.json')
+om._RECORDER = om.SavingsRecorder(path, flush_every=2)
+rec = om._RECORDER
+key = 'opus|mech_cont|m|tools'
+def turn(conv, tokens):
+    arm = assign_arm(conv, 0.0)
+    labels = [stratum_label(arm, key), conversation_label(conv)]
+    if arm == 'treatment':
+        labels.append('output_shaper:verbosity:L2')
+    rec.record_from_labels(labels, tokens)
+    return arm, labels[0].split(':')[1]
+first = [turn('c%d' % i, 500) for i in range(5)]
+new, old = turn('fresh', 300), turn('c0', 500)
+rec.flush()
+disk = json.load(open(path))
+credit = rec.estimate_request_savings([stratum_label('treatment', key)], 300)
+print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}), first[0][1],
+      new[0], old[0], rec._ledger.baseline.total_samples, disk['baseline']['glob']['n'],
+      len(disk['control']), credit)
+"#;
+        let run = |warmup: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_OUTPUT_WARMUP", warmup)
+                .output()
+                .expect("run output warmup probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("5");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on, "True ['control'] warmup treatment control 6 6 0 200",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off, "False ['treatment'] stratum treatment treatment 0 0 0 0",
+            "kill switch arm:\n{off_err}"
+        );
     }
 
     #[test]
