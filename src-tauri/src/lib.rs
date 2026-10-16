@@ -1190,8 +1190,12 @@ async fn install_app_update(
 static UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 
 /// Minutes of awake time without client traffic before a ready update applies
-/// itself. Long enough that an agent between turns is not cut off mid-task.
-const IDLE_UPDATE_MINUTES: u32 = 30;
+/// itself. Long enough that an agent between turns is not cut off mid-task,
+/// and past Claude Code's 1h prompt cache: a backend restart drops every
+/// conversation's prefix tracker, so a restart while that cache was still warm
+/// made the next turn re-write the whole history (300k+ tokens on a long
+/// session). After 65 quiet minutes the cache has lapsed anyway.
+const IDLE_UPDATE_MINUTES: u32 = 65;
 
 /// `minutes` of idle so far, one minute later. Any client request or streamed
 /// response restarts the count, and so does a gap in the ticks: a laptop that
@@ -17360,7 +17364,7 @@ Some unrelated content.
     }
 
     #[test]
-    fn a_ready_update_waits_for_thirty_quiet_awake_minutes() {
+    fn a_ready_update_waits_for_sixty_five_quiet_awake_minutes() {
         let mut minutes = 0;
         for _ in 0..super::IDLE_UPDATE_MINUTES {
             minutes = super::idle_minutes_after(minutes, false, false);

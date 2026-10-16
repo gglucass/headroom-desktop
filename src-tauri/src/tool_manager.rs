@@ -3782,6 +3782,78 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's fingerprint.
         pass
 
+# --- Prefix tracker: outlive the cache the client asked for -------------------
+# The session store drops a conversation's tracker 600s after its last request
+# (prefix_freeze_session_ttl, not settable from the CLI or env), but Claude
+# Code marks its cache breakpoints ttl "1h". A resume 10-60 minutes later found
+# Anthropic's cache warm and the proxy with no tracker: frozen=0, the whole
+# history re-run, its output differing from the cached bytes, and the message
+# tier re-written (cache_read down to the system+tools prefix). On one machine
+# over two days the cliff sat exactly at 600s: 0 of 23 resumes after 5-10
+# minutes re-wrote more than half the prefix, 4 of 11 after 10-20 minutes did
+# (141k-316k each), and a 59-minute resume re-wrote 340k; 1.31M tokens, 2.6x
+# what that window's one mid-session backend restart cost (2026-10-16). No
+# CACHE-MISS-ATTRIBUTION line is logged for these (there is no tracker to
+# attribute with). A tracker whose client asked for a 1h breakpoint now lives
+# 65 minutes; every other tracker keeps the wheel's TTL. RAISES cache reads,
+# may LOWER tok_saved/tok_before (the re-run re-compressed history the freeze
+# keeps verbatim) and RAISE the app's input % (cache writes are new input), so
+# check all three with savings:did after the stable ships.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel's tracker
+# already outlives a 1h breakpoint. Kill switch: HEADROOM_TRACKER_CACHE_TTL=0.
+_hd_tct_flag = _hd_os.environ.get("HEADROOM_TRACKER_CACHE_TTL", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_tct_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_tct_meta
+
+        if _hd_tct_meta.version("headroom-ai") == "0.39.0":
+            import time as _hd_tct_time
+
+            from headroom.cache import prefix_tracker as _hd_tct_pt
+
+            _hd_tct_cls = _hd_tct_pt.PrefixCacheTracker
+            _hd_tct_orig = _hd_tct_cls.is_expired
+
+            def _hd_tct_wants_1h(tracker):
+                # Cached per message list: the tracker replaces it every turn.
+                msgs = tracker._last_original_messages
+                if getattr(tracker, "_hd_tct_seen", None) is not msgs:
+                    tracker._hd_tct_1h = any(
+                        isinstance(b, dict)
+                        and isinstance(b.get("cache_control"), dict)
+                        and b["cache_control"].get("ttl") == "1h"
+                        for m in msgs
+                        if isinstance(m, dict) and isinstance(m.get("content"), list)
+                        for b in m["content"]
+                    )
+                    tracker._hd_tct_seen = msgs
+                return tracker._hd_tct_1h
+
+            def _hd_tct_is_expired(self):
+                ttl = self.config.session_ttl_seconds
+                if _hd_tct_wants_1h(self):
+                    ttl = max(ttl, 3900)  # the 1h cache plus a 5-minute margin
+                return (_hd_tct_time.time() - self._last_activity) > ttl
+
+            _hd_tct_probe = _hd_tct_cls("anthropic")
+            _hd_tct_probe._last_original_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                    ],
+                }
+            ]
+            _hd_tct_probe._last_activity -= 700
+            if isinstance(_hd_tct_orig, property) and _hd_tct_orig.fget(_hd_tct_probe):
+                _hd_tct_cls.is_expired = property(_hd_tct_is_expired)
+                _hd_bound.add("tracker_cache_ttl")
+    except Exception:
+        # Fail-open to the wheel's 600s tracker life.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3907,6 +3979,7 @@ _HD_VENDORS = (
     "web_search_history",
     "buffered_upstream_stream",
     "deferred_tool_affinity",
+    "tracker_cache_ttl",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -20283,6 +20356,62 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False False False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn tracker_cache_ttl_behaves_against_the_installed_wheel() {
+        // A conversation whose client asked for a 1h breakpoint keeps its
+        // tracker through a 20-minute pause and loses it after 65 minutes; one
+        // without the marker keeps the wheel's 600s. The kill switch restores
+        // the wheel's 600s for both.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-tracker-ttl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sitecustomize, time\n\
+                     from headroom.cache import prefix_tracker as pt\n\
+                     def msgs(ttl):\n    \
+                         cc = {'type': 'ephemeral', **({'ttl': ttl} if ttl else {})}\n    \
+                         return [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi', 'cache_control': cc}]}]\n\
+                     s = pt.SessionTrackerStore()\n\
+                     for sid, ttl in (('long', '1h'), ('short', None)):\n    \
+                         t = s.get_or_create(sid, 'anthropic')\n    \
+                         t.update_from_response(5000, 0, msgs(ttl), original_messages=msgs(ttl))\n    \
+                         t._last_activity -= 1200\n\
+                     s._last_cleanup -= 120\n\
+                     s.get_or_create('other', 'anthropic')\n\
+                     kept = ('long' in s._trackers, 'short' in s._trackers)\n\
+                     if kept[0]:\n    \
+                         s._trackers['long']._last_activity -= 2800\n\
+                     print(*kept, s.peek('long') is None, 'tracker_cache_ttl' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_TRACKER_CACHE_TTL", kill)
+                .output()
+                .expect("run tracker cache ttl probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: tracker cache ttl vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True False True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False True False", "stderr:\n{off_err}");
     }
 
     #[test]
