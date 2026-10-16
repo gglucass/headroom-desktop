@@ -9504,6 +9504,21 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
         } else {
             "Your coding tools connect directly until the port is free. "
         };
+        // Paseo's daemon defaults to 6767 and its users run it on purpose, so
+        // "quit that program" is no remedy. Desktop reads config.json too.
+        if crate::proxy_intercept::is_paseo(&holder) {
+            let config = if cfg!(windows) {
+                r"%USERPROFILE%\.paseo\config.json"
+            } else {
+                "~/.paseo/config.json"
+            };
+            return format!(
+                "Port {port} is in use by {holder}. {direct}\
+                 Paseo listens on {port} by default; move it by setting \
+                 \"daemon\": {{\"listen\": \"127.0.0.1:6800\"}} in {config}, then quit and reopen Paseo. \
+                 Headroom reconnects on its own."
+            );
+        }
         return format!(
             "Port {port} is in use by {holder}. {direct}\
              Quit that program, or end it in {PROCESS_MONITOR}, and Headroom reconnects on its own."
@@ -12273,6 +12288,21 @@ mod tests {
             assert!(hint.contains("connect directly until the port is free"), "{hint}");
             assert!(hint.contains(super::PROCESS_MONITOR), "{hint}");
         }
+        // RUST-KD: Paseo's daemon defaults to 6767, so the remedy is moving it.
+        let paseo = intercept_bind_hint("port 6767 is held by Paseo Helper (pid 32414)");
+        assert!(
+            paseo.starts_with("Port 6767 is in use by Paseo Helper (PID 32414). "),
+            "{paseo}"
+        );
+        assert!(
+            paseo.contains("connect directly until the port is free"),
+            "{paseo}"
+        );
+        assert!(
+            paseo.contains(r#""daemon": {"listen": "127.0.0.1:6800"}"#),
+            "{paseo}"
+        );
+        assert!(!paseo.contains("Quit that program"), "{paseo}");
         let own = intercept_bind_hint(&format!(
             "port 6767 is held by {} (pid 7)",
             crate::proxy_intercept::OTHER_HEADROOM_COPY

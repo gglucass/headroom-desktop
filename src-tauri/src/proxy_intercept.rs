@@ -1171,6 +1171,12 @@ pub(crate) fn is_wsl() -> bool {
 /// loop leaves the clients wired to. `state::intercept_bind_hint` keys on it.
 pub(crate) const OTHER_HEADROOM_COPY: &str = "another copy of Headroom";
 
+/// Whether a 6767 holder is Paseo ("Paseo Helper" on macOS), whose agent daemon
+/// listens on 6767 by default (RUST-KD). Its hint says how to move it.
+pub(crate) fn is_paseo(holder: &str) -> bool {
+    holder.to_ascii_lowercase().starts_with("paseo")
+}
+
 /// Whether the port's holder is another window of this same Headroom, run by
 /// this same user: the one holder a second window may stand beside as a
 /// spectator, because clients reaching it are still optimized for this user.
@@ -1753,7 +1759,10 @@ fn serve(
                                         *bind_error.lock() = Some(format!(
                                             "port {INTERCEPT_PORT} is held by {holder} (pid {pid})"
                                         ));
-                                        if reported_errors.insert(format!("foreign:{key}:{name}")) {
+                                        // Paseo is known and its hint has the fix.
+                                        if !is_paseo(&name)
+                                            && reported_errors.insert(format!("foreign:{key}:{name}"))
+                                        {
                                             sentry::with_scope(
                                                 |scope| {
                                                     scope.set_extra(
