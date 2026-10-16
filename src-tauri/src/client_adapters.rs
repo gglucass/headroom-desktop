@@ -5639,8 +5639,11 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
             clean.then_some((backup, text))
         });
     match restored {
+        // Info: our own writes fsync before the rename, so the zeros are another
+        // writer's lost to a crash, and the restore has fixed it (RUST-QS).
+        // No clean backup still warns: that is the recovery falling short.
         Some((backup, text)) => {
-            log::warn!(
+            log::info!(
                 "{} held NUL bytes (zero-filled); restoring it from {}",
                 path.display(),
                 backup.display()
