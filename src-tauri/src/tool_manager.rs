@@ -20991,6 +20991,8 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
                 .env("PYTHONPATH", &dir)
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
                 .env("HEADROOM_HOLDOUT_KEY", kill)
+                // With no baseline (CI) the output warm-up vendor puts every new conversation in control.
+                .env("HEADROOM_OUTPUT_WARMUP", "0")
                 .output()
                 .expect("run holdout key probe");
             (
