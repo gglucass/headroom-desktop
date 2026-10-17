@@ -9420,14 +9420,20 @@ fn learn_failure_signature_source(text: &str) -> String {
         // RUST-KT: `codex exec` opens its stderr with this banner and states
         // its verdict last, as `ERROR: ...` after its `Reconnecting...` retries.
         // The status variant ends `, url: ..., cf-ray: ..., request id: ...`,
-        // unique per request, so it is cut there.
+        // unique per request, so it is cut there. Codex 0.163 words an
+        // app-server refusal `Error: turn/start: ...` instead (RUST-QV), its
+        // `, data: {...}` tail carrying a per-run character count.
         Some(&"Reading prompt from stdin...") => {
             let reason = lines[marker + 1..]
                 .iter()
                 .rev()
-                .find(|l| l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                .find(|l| {
+                    (l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                        || l.starts_with("Error: ")
+                })
                 .map_or("Reading prompt from stdin...", |l| {
-                    l.split_once(", url: ").map_or(*l, |(head, _)| head)
+                    let l = l.split_once(", url: ").map_or(*l, |(head, _)| head);
+                    l.split_once(", data: ").map_or(l, |(head, _)| head)
                 });
             format!("{} {reason}", lines[marker])
         }
@@ -16757,6 +16763,11 @@ Some unrelated content.
         assert!(learn_failure_signature_source(&other)
             .ends_with("stream disconnected before completion"));
         assert!(!learn_failure_is_agent_auth(&other));
+        // RUST-QV: Codex 0.163's app-server refusal, character count cut.
+        let too_large = codex("Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602), data: {\"input_error_code\":\"input_too_large\",\"max_chars\":1048576,\"actual_chars\":1786526}");
+        assert!(learn_failure_signature_source(&too_large).ends_with(
+            "failed (exit 1): Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602)"
+        ));
         // No verdict line (a wheel without the vendor cut it off): as before.
         assert!(learn_failure_signature_source(
             "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
