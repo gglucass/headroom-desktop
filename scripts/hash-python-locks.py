@@ -30,6 +30,7 @@ re-sync their dependencies.
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -105,7 +106,12 @@ LOCKS = {
 
 
 def _get_json(url: str):
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json"}
+    # Unauthenticated api.github.com allows 60 calls/hour per IP; GH_TOKEN=$(gh auth token) lifts it.
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 

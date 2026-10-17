@@ -77,6 +77,12 @@ pub(crate) struct Persisted {
     /// the script reads it with a regex.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) paused: Option<String>,
+    /// Set while Headroom does not route Claude Code at all (quit, pause,
+    /// connector off, crash guard): the readers stay installed through those
+    /// and say so, because the user still expects to be compressing. Same
+    /// format rules as `paused`, which outranks it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) off: Option<String>,
 }
 
 static STATE: Mutex<Option<Persisted>> = Mutex::new(None);
@@ -172,6 +178,7 @@ fn persist() {
             plan_usage: state.plan_usage,
             codex_plan_usage: state.codex_plan_usage.clone(),
             paused: state.paused.clone(),
+            off: state.off.clone(),
         })
         .unwrap_or_default()
     };
@@ -280,6 +287,22 @@ pub fn set_paused(notice: Option<&str>) {
     });
 }
 
+pub(crate) const OFF_NOTICE: &str = "Headroom off. Open the Headroom app to turn it back on";
+
+/// Claude Code stopped (or started again) routing through Headroom. Written
+/// before returning, not on the blocking pool: a quit exits right after.
+pub fn set_off(off: bool) {
+    let notice = off.then(|| OFF_NOTICE.to_string());
+    let changed = with_state(|state| {
+        let changed = state.off != notice;
+        state.off = notice;
+        changed
+    });
+    if changed && !cfg!(test) {
+        persist();
+    }
+}
+
 /// The last Codex windows recorded, this run or a previous one.
 pub fn codex_plan_usage() -> Option<Vec<LabeledPlanWindow>> {
     with_state(|state| state.codex_plan_usage.clone())
@@ -322,6 +345,11 @@ pub(crate) fn recorded(session_id: &str) -> Option<(u64, u64)> {
         .sessions
         .get(session_id)
         .map(|s| (s.tokens_saved, s.last_saved))
+}
+
+#[cfg(test)]
+pub(crate) fn off() -> Option<String> {
+    with_state(|state| state.off.clone())
 }
 
 #[cfg(test)]
@@ -390,6 +418,7 @@ mod tests {
                 window,
             }]),
             paused: None,
+            off: None,
         };
         let json = serde_json::to_string(&persisted).unwrap();
         assert!(
@@ -424,6 +453,7 @@ mod tests {
             );
         }
         assert!(paused_notice(Some(&TrialEnded)).contains("trial ended"));
+        assert!(OFF_NOTICE.is_ascii() && !OFF_NOTICE.contains(['"', '\\']));
     }
 
     #[test]

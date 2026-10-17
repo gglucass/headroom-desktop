@@ -286,9 +286,8 @@ pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
         let _ = write_setup_state(&state);
         return Err(err);
     }
-    // The editor status bar extension goes with it, but only here and on
-    // Headroom's uninstall: remove_claude_statusline also runs on every quit.
-    // Not an error to the toggle: the flag and the statusline are already off,
+    // The editor status bar extension goes with it, here and on Headroom's
+    // uninstall only (an editor CLI round trip per call). Not an error to the toggle: the flag and the statusline are already off,
     // and failing here left the UI showing "on" over a disabled state.
     // Released first: the uninstall runs editor CLIs (60s timeout each), and
     // a quit or pause meanwhile blocks on this lock on the UI thread.
@@ -525,8 +524,8 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 }
                 Err(err) => log::warn!("installing /remote-control command failed: {err}"),
             }
-            // Same: the per-conversation savings statusline. Rides routing, so
-            // it is never on screen while Claude Code bypasses Headroom.
+            // Same: the per-conversation savings statusline. Installed with
+            // routing; unwiring leaves it saying Headroom is off.
             match ensure_claude_statusline() {
                 Ok(mut line) => {
                     updates.0.append(&mut line.0);
@@ -1269,8 +1268,8 @@ fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, Sy
 /// so no config Headroom owns can route them.
 /// "Restart your terminal" is advice that cannot work there.
 pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desktop app go \
-     straight to Anthropic, so Headroom can't optimize them. Run Claude Code in your \
-     terminal or IDE to keep saving.";
+     straight to Anthropic whatever you open first, so Headroom can't optimize them. Run \
+     Claude Code in your terminal or IDE to keep saving.";
 
 /// True when the transcript was written by Claude Code inside the Claude
 /// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
@@ -1548,6 +1547,15 @@ pub fn claude_code_connector_wanted() -> bool {
     is_configured(&state, "claude_code") || state.remembered_clients.contains_key("claude_code")
 }
 
+/// Whether the tier-mismatch clock should judge the Codex plan. The remembered
+/// snapshot counts: launch evaluates the clock before `restore_client_setups`
+/// puts Codex back, and reading configured alone saw no Codex plan there, an
+/// affirmative "no mismatch" that cleared a Codex-driven clock every relaunch.
+pub fn codex_connector_wanted() -> bool {
+    let state = load_setup_state();
+    is_configured(&state, "codex_cli") || state.remembered_clients.contains_key("codex_cli")
+}
+
 /// Whether `client_id` is one of the connectors the Claude pricing gate keeps
 /// the backend up for (see `any_gate_exempt_client_enabled`).
 pub fn is_gate_exempt_client(client_id: &str) -> bool {
@@ -1666,7 +1674,9 @@ fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
             }
             let _ = remove_claude_guard_hook();
             let _ = remove_claude_remote_control_command();
-            let _ = remove_claude_statusline();
+            // The statusline stays and says Headroom is off: the user still
+            // expects to be compressing. Only its opt-out and uninstall remove it.
+            crate::claude_statusline::set_off(true);
             if let Ok(shell_targets) = resolve_client_shell_targets_for_cleanup(&state, client_id) {
                 let _ = remove_shell_block(&shell_targets, "claude_code");
                 // Also drop the managed_rtk PATH block so `rtk` isn't exported
@@ -5629,8 +5639,11 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
             clean.then_some((backup, text))
         });
     match restored {
+        // Info: our own writes fsync before the rename, so the zeros are another
+        // writer's lost to a crash, and the restore has fixed it (RUST-QS).
+        // No clean backup still warns: that is the recovery falling short.
         Some((backup, text)) => {
-            log::warn!(
+            log::info!(
                 "{} held NUL bytes (zero-filled); restoring it from {}",
                 path.display(),
                 backup.display()
@@ -8933,10 +8946,19 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// follow-up request never cuts a saving's highlight short. After it, the plan
 /// usage Claude Code passes in `rate_limits` (Pro and Max, once the session has
 /// had a response): "| usage: 5h 34%, week 62%", a window at 80% or more in yellow
-/// with its reset time, a window past its reset at 0. Silent until there is
-/// either, and on any error. While the pricing gate pauses Claude traffic, the
-/// gate's notice (`paused` in the state file) replaces the saving, in yellow,
-/// in every conversation: walled users rarely opened the app to find out.
+/// with its reset time, a window past its reset at 0.
+///
+/// Never blank while the user expects Headroom to be compressing, because a
+/// missing line told them nothing: "Headroom on" before the first request,
+/// "Headroom on, nothing to compress yet" while a routed conversation has saved
+/// nothing, and in yellow "Headroom not active in this session" once Claude
+/// Code reports a response (`current_usage`) Headroom never saw a request for
+/// (a session started before routing was set up). While the pricing gate
+/// pauses Claude traffic its notice (`paused`) replaces all of that, and while
+/// Headroom does not route Claude Code at all (quit, pause, connector off),
+/// `off` does, both in yellow in every conversation. Silent on unreadable
+/// input, and once `app` (the Headroom executable) is gone: the line outlives
+/// a quit, and an app dragged to the Trash runs no cleanup.
 ///
 /// Percentages are cut to whole numbers as strings: bash's float printf reads
 /// "23.5" as invalid under a comma-decimal locale.
@@ -8949,13 +8971,18 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// 2026-10-01). Stays bash 3.2
 /// compatible (macOS /bin/bash): EPOCHSECONDS (bash 5) falls back to `date`,
 /// no EPOCHREALTIME, no printf %T.
-fn build_claude_statusline_script(state_path: &Path) -> String {
+fn build_claude_statusline_script(state_path: &Path, app: Option<&Path>) -> String {
     let state = shell_double_quote(&state_path.to_string_lossy());
+    let app = app.map_or(String::new(), |app| {
+        shell_double_quote(&app.to_string_lossy())
+    });
     let warn = crate::TRAY_USAGE_RESET_SHOWN_AT_PERCENT as u32;
     format!(
         r#"#!/bin/bash
 # Headroom statusline (managed by Headroom Desktop - do not edit).
 state_file="{state}"
+app="{app}"
+if [ -n "$app" ] && [ ! -e "$app" ]; then exit 0; fi
 flash_secs=4
 compress_secs=2
 IFS= read -r -d '' input
@@ -8991,7 +9018,7 @@ fmt() {{
 saved=
 state=
 if [ -r "$state_file" ]; then IFS= read -r -d '' state < "$state_file"; fi
-if [[ $state =~ \"paused\":\"([^\"]*)\" ]]; then
+if [[ $state =~ \"paused\":\"([^\"]*)\" ]] || [[ $state =~ \"off\":\"([^\"]*)\" ]]; then
   saved=$'\033[33m'"${{BASH_REMATCH[1]}}"$'\033[0m'
 elif [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]]; then
   sid=${{BASH_REMATCH[1]}}
@@ -9006,7 +9033,13 @@ elif [[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]];
       saved=$'\033[32mHeadroom compressing...\033[0m'
     elif [ "$total" -gt 0 ]; then
       saved=$line
+    else
+      saved="Headroom on, nothing to compress yet"
     fi
+  elif [[ $input =~ \"current_usage\"[[:space:]]*:[[:space:]]*\{{ ]]; then
+    saved=$'\033[33mHeadroom not active in this session: restart Claude Code\033[0m'
+  else
+    saved="Headroom on"
   fi
 fi
 if [ -n "$usage" ]; then usage="usage: $usage"; fi
@@ -9143,6 +9176,7 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
 /// bash.exe the way theirs does (`hook_shell_command`). A no-op when the user
 /// turned it off or already has a statusline of their own.
 fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
+    crate::claude_statusline::set_off(false);
     if is_statusline_disabled() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -9151,7 +9185,10 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     let script = claude_statusline_script_path();
     let (did_change, backup) = write_file_if_changed(
         &script,
-        &build_claude_statusline_script(&crate::claude_statusline::state_path()),
+        &build_claude_statusline_script(
+            &crate::claude_statusline::state_path(),
+            crate::own_executable().as_deref(),
+        ),
         true,
     )?;
     if did_change {
@@ -16180,6 +16217,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!super::claude_code_connector_wanted());
     }
 
+    /// The mismatch clock's Codex plan: a quit keeps it until restore, so a
+    /// relaunch cannot clear a Codex-driven clock; only a toggle-off drops it.
+    #[test]
+    #[serial_test::serial]
+    fn codex_connector_wanted_survives_quit_not_toggle_off() {
+        let _home = TestHome::new();
+        assert!(!super::codex_connector_wanted());
+        super::apply_client_setup("codex").expect("apply");
+        assert!(super::codex_connector_wanted());
+
+        super::clear_client_setups().expect("quit-time clear");
+        assert!(!super::is_codex_enabled());
+        assert!(super::codex_connector_wanted(), "restore still pending");
+
+        super::disable_client_setup("codex").expect("toggle off");
+        assert!(!super::codex_connector_wanted());
+    }
+
     /// Finding 38: a 6767 holder Headroom cannot identify (another signed-in
     /// user's Headroom looks exactly like this) must stop receiving this
     /// user's credentials. The bind loop unwires every client the way a pause
@@ -18696,6 +18751,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let (changed, _) = ensure_claude_statusline().expect("reinstall");
         assert!(changed.is_empty(), "idempotent: {changed:?}");
 
+        // Unwiring (quit, pause, connector off) keeps it, saying Headroom is
+        // off; routing again clears that.
+        super::disable_client_setup("claude_code").expect("unwire");
+        assert!(is_our_statusline(&read()["statusLine"]));
+        assert!(claude_statusline_script_path().exists());
+        assert!(crate::claude_statusline::off().is_some());
+        ensure_claude_statusline().expect("rewire");
+        assert_eq!(crate::claude_statusline::off(), None);
+
         // The opt-out removes it and keeps later setups from putting it back.
         set_statusline_enabled(false).expect("disable");
         assert!(read().get("statusLine").is_none());
@@ -18750,7 +18814,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[cfg(unix)]
     #[test]
-    fn statusline_script_prints_this_conversation_and_is_otherwise_silent() {
+    fn statusline_script_prints_this_conversation_or_why_it_saves_nothing() {
         use crate::claude_statusline::{Persisted, Session, SCHEMA_VERSION};
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("claude-statusline.json");
@@ -18788,6 +18852,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             }),
             codex_plan_usage: None,
             paused: None,
+            off: None,
         };
         // Plus an entry as the previous build wrote it, without lastRequestAtMs.
         let json = serde_json::to_string(&persisted).unwrap().replacen(
@@ -18797,7 +18862,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         std::fs::write(&state, json).unwrap();
         let script = dir.path().join(CLAUDE_STATUSLINE_SCRIPT);
-        std::fs::write(&script, build_claude_statusline_script(&state)).unwrap();
+        let app = dir.path().join("Headroom");
+        std::fs::write(&app, "").unwrap();
+        std::fs::write(&script, build_claude_statusline_script(&state, Some(&app))).unwrap();
         let render = |stdin: &str| -> String {
             use std::io::Write;
             let mut child = crate::proc::command("/bin/bash")
@@ -18838,12 +18905,25 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             render(r#"{"session_id":"eeee-first-request"}"#),
             compressing
         );
-        assert_eq!(render(r#"{"session_id":"ffff-nothing-yet"}"#), "");
+        assert_eq!(
+            render(r#"{"session_id":"ffff-nothing-yet"}"#),
+            "Headroom on, nothing to compress yet\n"
+        );
         assert_eq!(
             render(r#"{"session_id":"0000-old-format"}"#),
             "Headroom saved 42 tokens this session\n"
         );
-        assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
+        // No request seen: a fresh session, or one that bypasses Headroom
+        // once Claude Code reports a response for it.
+        assert_eq!(render(r#"{"session_id":"unknown"}"#), "Headroom on\n");
+        assert_eq!(
+            render(r#"{"session_id":"unknown","context_window":{"current_usage":null}}"#),
+            "Headroom on\n"
+        );
+        assert_eq!(
+            render("{\n  \"session_id\": \"unknown\",\n  \"context_window\": {\n    \"current_usage\": {\n      \"input_tokens\": 8\n    }\n  }\n}"),
+            "\x1b[33mHeadroom not active in this session: restart Claude Code\x1b[0m\n"
+        );
         assert_eq!(render("not json"), "");
 
         // Plan usage from Claude Code's own `rate_limits`, after the savings,
@@ -18868,12 +18948,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "{near:?}"
         );
         assert!(near.ends_with(")\x1b[0m\n"), "{near:?}");
-        // Usage alone, before this conversation has saved anything.
+        // Before this conversation's first request.
         assert_eq!(
             render(
                 &limits("12", now + 3_600, "40", now + 300_000).replace("bbbb-quiet", "unknown")
             ),
-            "usage: 5h 12%, week 40%\n"
+            "Headroom on | usage: 5h 12%, week 40%\n"
         );
 
         // Gated: the notice replaces the saving in every conversation, usage stays.
@@ -18898,6 +18978,30 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             render(&limits("12", now + 3_600, "40", now + 300_000)),
             format!("{notice} | usage: 5h 12%, week 40%\n")
         );
+
+        // Unwired: the off notice, which the gate's outranks.
+        let off = Persisted {
+            off: Some(crate::claude_statusline::OFF_NOTICE.to_string()),
+            ..paused
+        };
+        std::fs::write(&state, serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(
+            render(r#"{"session_id":"aaaa-just-saved"}"#),
+            format!("{notice}\n")
+        );
+        let off = Persisted {
+            paused: None,
+            ..off
+        };
+        std::fs::write(&state, serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(
+            render(r#"{"session_id":"aaaa-just-saved"}"#),
+            "\x1b[33mHeadroom off. Open the Headroom app to turn it back on\x1b[0m\n"
+        );
+
+        // Silent once the app is gone: the line outlives a quit.
+        std::fs::remove_file(&app).unwrap();
+        assert_eq!(render(r#"{"session_id":"aaaa-just-saved"}"#), "");
     }
 
     #[cfg(unix)]

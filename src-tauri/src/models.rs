@@ -118,6 +118,15 @@ pub enum LaunchExperience {
 /// or "measured" (A/B holdout); the percentage carries a 95% confidence band
 /// (`ci_low_percent`..`ci_high_percent`). Output savings are counterfactual, so
 /// this is never presented as an exact count.
+/// An install with no seeded baseline learning one from its first unshaped
+/// replies (`output_savings::warmup_progress`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputWarmup {
+    pub replies: u64,
+    pub target: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputReduction {
@@ -377,6 +386,9 @@ pub struct DashboardState {
     /// on wheels that predate the rollout block.
     #[serde(default)]
     pub output_shaper_active: Option<bool>,
+    /// The output warm-up while it runs (no seeded baseline yet); `None` after.
+    #[serde(default)]
+    pub output_warmup: Option<OutputWarmup>,
     /// Auto-learning progress; `None` when the backend doesn't report it.
     #[serde(default)]
     pub learner_progress: Option<LearnerProgress>,

@@ -607,6 +607,8 @@ describe("unroutedBody", () => {
     // Says why, and that settings hold no fix (a customer searched them for weeks).
     expect(body).toContain("without going through Headroom");
     expect(body).toContain("Nothing to change in settings");
+    // Names the order: "open it first, or the other way around?" (2026-10-15).
+    expect(body).toContain("Always open Headroom first, then Claude Code.");
     expect(unroutedBody({ ...base, enabled: true, reapplied: true, diagnosis: null })).toBe(body);
   });
 

@@ -38,8 +38,9 @@ export function ClaudeStatuslinePanel() {
         <div>
           <h3>Claude Code status line</h3>
           <p className="panel-card__subtitle">
-            Show Headroom's savings per conversation, under the prompt in the terminal and in the
-            VS Code and Cursor status bar. Skipped in the terminal if you have your own status line.
+            Show Headroom's savings per conversation, or that Headroom is off, under the prompt in
+            the terminal and in the VS Code and Cursor status bar. Skipped in the terminal if you have
+            your own status line.
           </p>
         </div>
         <button

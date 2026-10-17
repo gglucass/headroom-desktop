@@ -27,8 +27,10 @@ const STALE_STAGED_UPDATE = /no longer staged/i;
 // install_app_update's refusal when the app runs off the DMG or an
 // App-Translocated copy (READ_ONLY_BUNDLE_MESSAGE in lib.rs). The message is
 // the user's fix, not a defect to report (RUST-JK). Same for the bundle moved
-// or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ).
-const READ_ONLY_BUNDLE = /running from a read-only folder|moved or deleted while running/i;
+// or deleted while running (MOVED_BUNDLE_MESSAGE, RUST-HZ), and kept on another
+// disk than $TMPDIR (OTHER_VOLUME_BUNDLE_MESSAGE, RUST-QR).
+const READ_ONLY_BUNDLE =
+  /running from a read-only folder|moved or deleted while running|on a different disk than/i;
 
 // tauri-plugin-updater's macOS swap hit PermissionDenied, retried under an
 // AppleScript admin prompt, and that prompt was cancelled or failed (RUST-JD).
@@ -256,16 +258,17 @@ function writeWaitingUpdate(record: WaitingUpdateRecord): void {
 // made unfireable: a user sitting on 0.9.15 for a fortnight is offered 0.9.19,
 // published yesterday, so `ageDays < 5` and nothing ever fired. Every release
 // reset the clock for everyone, including the people furthest behind (gaps
-// between 0.9.15 and 0.9.19 were 7, 4, 0 and 1 days). Since the quiet-update
-// default landed in 0.9.8 this nag was the only thing that reached Windows and
-// Linux. Windows now installs when idle and an AppImage stages like macOS, so
-// it is left for a .deb (which cannot install without the user's password) and
-// for installs whose quiet path keeps failing.
+// between 0.9.15 and 0.9.19 were 7, 4, 0 and 1 days). It also covers a build
+// staged for restart: the idle applier needs 65 awake minutes without traffic,
+// which a machine that is busy whenever awake never gets (a Windows user sat
+// on 0.9.31 for 10 days, 2026-10-17). Returns true when it fired, so the
+// caller can open the update dialog for the user's next look at Headroom.
 export async function maybeFireStaleAppUpdateNotification(
   availableUpdate: AvailableAppUpdate | null,
-  invokeFn: AppUpdateInvoker = invoke
-): Promise<void> {
-  if (!availableUpdate?.currentVersion) return;
+  invokeFn: AppUpdateInvoker = invoke,
+  staged = false
+): Promise<boolean> {
+  if (!availableUpdate?.currentVersion) return false;
 
   const onVersion = availableUpdate.currentVersion;
   const record = readWaitingUpdate(onVersion);
@@ -274,25 +277,28 @@ export async function maybeFireStaleAppUpdateNotification(
   // fresh install one release behind would be nagged on its first check.
   if (!record) {
     writeWaitingUpdate({ onVersion, since: Date.now() });
-    return;
+    return false;
   }
 
-  if (record.notified) return;
+  if (record.notified) return false;
 
   const waitingDays = (Date.now() - record.since) / (24 * 60 * 60 * 1000);
-  if (waitingDays < STALE_UPDATE_THRESHOLD_DAYS) return;
+  if (waitingDays < STALE_UPDATE_THRESHOLD_DAYS) return false;
 
+  const days = Math.floor(waitingDays);
   try {
     await invokeFn("show_notification", {
       title: "Headroom update waiting",
-      body: `Headroom ${availableUpdate.version} is ready, and ${onVersion} has had an update waiting for ${Math.floor(
-        waitingDays
-      )} days. Open Headroom to install it.`,
+      body: staged
+        ? `Headroom ${availableUpdate.version} is installed and has been waiting ${days} days for a restart. Open Headroom to restart into it.`
+        : `Headroom ${availableUpdate.version} is ready, and ${onVersion} has had an update waiting for ${days} days. Open Headroom to install it.`,
       action: "update",
     });
     writeWaitingUpdate({ ...record, notified: true });
+    return true;
   } catch {
     // best-effort
+    return false;
   }
 }
 

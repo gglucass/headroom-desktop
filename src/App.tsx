@@ -244,6 +244,7 @@ import type {
   AppliedPatterns,
   HourlySavingsPoint,
   OutputReduction,
+  OutputWarmup,
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
@@ -550,21 +551,23 @@ const STARTER_PROMPT =
 // real prompt is the actual gap here (10% of mature signups send exactly one
 // prompt ever), so hand over something paste-able that works in any repo.
 function StarterPrompt() {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  // WebKitGTK can refuse clipboard writes even on a click (RUST-QT: an
+  // unhandled NotAllowedError); the prompt stays selectable beside the button.
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(STARTER_PROMPT);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    window.setTimeout(() => setCopyState("idle"), 2000);
+  }
   return (
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
-        <button
-          className="secondary-button"
-          onClick={() => {
-            void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 2000);
-            });
-          }}
-          type="button"
-        >
-          {copied ? "Copied" : "Copy prompt"}
+        <button className="secondary-button" onClick={() => void copy()} type="button">
+          {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy prompt"}
         </button>
       </div>
   );
@@ -993,6 +996,7 @@ function DailySavingsChart({
   setChartMode,
   outputReduction,
   outputShaperActive,
+  outputWarmup,
   liveSavingsPulse
 }: {
   data: DailySavingsPoint[];
@@ -1002,6 +1006,7 @@ function DailySavingsChart({
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
   outputShaperActive: boolean;
+  outputWarmup: OutputWarmup | null;
   liveSavingsPulse: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
@@ -1307,6 +1312,17 @@ function DailySavingsChart({
                     rows={[]}
                     note="Tokens the model didn't have to write because Headroom asked for shorter replies. Rough: there isn't enough of your own usage yet to compare each reply with earlier replies of the same kind, so it is compared with the average length of your past replies. Becomes a percentage once there is."
                   />
+                ) : outputMeasuring && outputWarmup ? (
+                  <WindowRateChip
+                    dot="output"
+                    popSide="left"
+                    label="Output · learning"
+                    title="Output savings: learning your baseline"
+                    badge="first day"
+                    value={`${outputWarmup.replies} of ${outputWarmup.target} replies`}
+                    rows={[]}
+                    note={`To measure how much shorter Headroom makes your agent's replies, it first learns how long they usually are. It leaves your first ${outputWarmup.target} replies as they are, which is usually about a day of use. After that it asks for shorter replies and shows what that saves here. Conversations you start before then keep their normal length. Input savings are counted from the start.`}
+                  />
                 ) : outputMeasuring ? (
                   <WindowRateChip
                     dot="output"
@@ -1316,7 +1332,7 @@ function DailySavingsChart({
                     badge="measuring"
                     value="Nothing yet"
                     rows={[]}
-                    note="Headroom is asking the model for shorter replies. No output savings were recorded in this period yet."
+                    note="Headroom is asking the model for shorter replies, but no output savings were recorded in this period. Input savings are counted separately."
                   />
                 ) : null}
               </span>
@@ -2037,6 +2053,7 @@ export default function App() {
   // showing per app run instead of resurrecting itself on every poll.
   const forcedSetupStallFiredRef = useRef(false);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
+  const appUpdateAvailableRef = useRef<AvailableAppUpdate | null>(null);
   const appUpdateStagedVersionRef = useRef<string | null>(null);
   const appUpdateBusyRef = useRef(false);
   const appUpdateInstallBusyRef = useRef(false);
@@ -3122,7 +3139,8 @@ export default function App() {
 
   useEffect(() => {
     appUpdateKnownVersionRef.current = appUpdateAvailable?.version ?? null;
-  }, [appUpdateAvailable?.version]);
+    appUpdateAvailableRef.current = appUpdateAvailable;
+  }, [appUpdateAvailable]);
 
   useEffect(() => {
     appUpdateStagedVersionRef.current = appUpdateStagedVersion;
@@ -4042,6 +4060,14 @@ export default function App() {
       });
       applyAppUpdatePatch(patch);
 
+      // A staged update's echo comes back as an empty patch, so it skips the
+      // branch below; without this a build staged for restart was never
+      // prompted while the idle applier waited for a quiet hour.
+      if (background && !patch.availableUpdate && appUpdateStagedVersionRef.current) {
+        await promptIfUpdateStale(appUpdateAvailableRef.current, true);
+        return;
+      }
+
       if (background && patch.availableUpdate) {
         // Quiet releases on macOS and a Linux AppImage stage themselves:
         // silent download+install, then only a passive "restart to finish"
@@ -4055,15 +4081,12 @@ export default function App() {
           void installAvailableUpdate(patch.availableUpdate, { quiet: true });
           // A quiet install that fails every time (read-only or translocated
           // bundle) would leave this build unannounced forever. The stale
-          // reminder is its fallback: the clock starts now, and a staged
-          // update proves quiet installs work, so a newer release re-staging
-          // on top of it must not nag "install" for what only needs a restart.
-          if (
-            !appUpdateStagedVersionRef.current &&
-            !(await getCurrentWindow().isVisible().catch(() => false))
-          ) {
-            await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
-          }
+          // reminder is its fallback: the clock starts now. With a build
+          // already staged it asks for the restart instead of an install.
+          await promptIfUpdateStale(
+            patch.availableUpdate,
+            Boolean(appUpdateStagedVersionRef.current)
+          );
           return;
         }
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
@@ -4079,12 +4102,23 @@ export default function App() {
         // Never stack the stale reminder onto the tick that just announced
         // the release — first discovery of an old version used to fire both
         // notifications at once.
-        if (!windowVisible && !notifyFresh) {
-          await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
+        if (!notifyFresh) {
+          await promptIfUpdateStale(patch.availableUpdate, false);
         }
       }
     } finally {
       setAppUpdateBusy(false);
+    }
+  }
+
+  // After 5 days waiting: a notification now, and the update dialog on the
+  // user's next look at Headroom (a notification alone was easy to miss).
+  async function promptIfUpdateStale(update: AvailableAppUpdate | null, staged: boolean) {
+    if (await getCurrentWindow().isVisible().catch(() => false)) {
+      return;
+    }
+    if (await maybeFireStaleAppUpdateNotification(update, invoke, staged)) {
+      setShowAppUpdateDialog(true);
     }
   }
 
@@ -7291,6 +7325,7 @@ export default function App() {
                 // thin percentage (lib.rs).
                 outputReduction={dashboard.outputReduction}
                 outputShaperActive={dashboard.outputShaperActive === true}
+                outputWarmup={dashboard.outputWarmup ?? null}
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
@@ -8623,8 +8658,8 @@ export default function App() {
                   <UpstreamPanel
                     paused={Boolean(runtimeStatus?.paused && !runtimeStatus.autoPaused)}
                   />
-                  {/* The statusline is not installed on Windows (untested there). */}
-                  {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
+                  {/* Every platform: Windows installs the statusline too (Git Bash). */}
+                  <ClaudeStatuslinePanel />
                 </div>
               </details>
 

@@ -1173,6 +1173,16 @@ async fn install_app_update(
         return Err(MOVED_BUNDLE_MESSAGE.to_string());
     }
 
+    #[cfg(target_os = "macos")]
+    if bundle_is_on_another_volume() {
+        log::info!(
+            "update: refusing in-place install; bundle {:?} is on another volume than {:?}",
+            current_app_bundle_path(),
+            std::env::temp_dir()
+        );
+        return Err(OTHER_VOLUME_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -1190,8 +1200,12 @@ async fn install_app_update(
 static UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
 
 /// Minutes of awake time without client traffic before a ready update applies
-/// itself. Long enough that an agent between turns is not cut off mid-task.
-const IDLE_UPDATE_MINUTES: u32 = 30;
+/// itself. Long enough that an agent between turns is not cut off mid-task,
+/// and past Claude Code's 1h prompt cache: a backend restart drops every
+/// conversation's prefix tracker, so a restart while that cache was still warm
+/// made the next turn re-write the whole history (300k+ tokens on a long
+/// session). After 65 quiet minutes the cache has lapsed anyway.
+const IDLE_UPDATE_MINUTES: u32 = 65;
 
 /// `minutes` of idle so far, one minute later. Any client request or streamed
 /// response restarts the count, and so does a gap in the ticks: a laptop that
@@ -1474,6 +1488,34 @@ const MOVED_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it was moved or deleted while running. \
      Quit Headroom, open it from its current location, then check for updates again.";
 
+/// The message shown when the running bundle is on another volume than
+/// `$TMPDIR`. See `bundle_is_on_another_volume`.
+#[cfg(target_os = "macos")]
+const OTHER_VOLUME_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it is on a different disk than macOS's \
+     temporary folder. Move Headroom to your Applications folder and open it from there, \
+     then check for updates again.";
+
+/// The plugin's swap renames the bundle into a `$TMPDIR` folder and the new
+/// build out of another, and a rename cannot cross volumes, so a Headroom kept
+/// on a second disk failed every install, after the whole download, with a
+/// bare "Cross-device link (os error 18)" (RUST-QR).
+#[cfg(target_os = "macos")]
+fn bundle_is_on_another_volume() -> bool {
+    current_app_bundle_path().is_some_and(|bundle| on_other_volumes(&bundle, &std::env::temp_dir()))
+}
+
+/// False when either side cannot be read: the install's own error then says
+/// more than a guess would.
+#[cfg(target_os = "macos")]
+fn on_other_volumes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => false,
+    }
+}
+
 /// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
 /// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the
 /// path catches only one of the ways this happens (running straight off the
@@ -1515,6 +1557,7 @@ fn silent_install_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
         bundle_folder_accepts_writes(current_app_bundle_path().as_deref())
+            && !bundle_is_on_another_volume()
     }
     // The plugin renames the image aside and writes the new one at `APPIMAGE`,
     // the path it installs to. Keyed on the bundle type, not on `APPIMAGE`
@@ -7244,29 +7287,36 @@ fn last_exit_step(log: &str) -> Option<String> {
     })
 }
 
+/// The executable that outlives this run: an AppImage runs from a mount that
+/// is torn down with the app, so anything that must find the app after it
+/// exits (the crash guard, the Claude Code statusline) takes the image itself.
+pub(crate) fn own_executable() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("APPIMAGE")
+            .filter(|image| !image.is_empty())
+            // Only our own image: a shell started from another AppImage leaks
+            // its APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard
+            // would start that app. tauri-utils' current_exe makes the same check.
+            .filter(
+                |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
+                    (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
+                    _ => false,
+                },
+            )
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 /// Starts the crash guard (`handle_crash_guard_flag`). Best-effort: without
 /// it a crash leaves the clients wired, as it always did.
 fn spawn_crash_guard() {
-    // An AppImage runs from a mount that is torn down with the app, so a guard
-    // started from `current_exe` would lose its own binary at the moment it is
-    // needed. Start the image itself instead.
-    #[cfg(target_os = "linux")]
-    let exe = std::env::var_os("APPIMAGE")
-        .filter(|image| !image.is_empty())
-        // Only our own image: a shell started from another AppImage leaks its
-        // APPIMAGE/APPDIR into a .deb launch (RUST-CN), and the guard would
-        // start that app. tauri-utils' current_exe makes the same check.
-        .filter(
-            |_| match (std::env::var_os("APPDIR"), std::env::current_exe()) {
-                (Some(dir), Ok(exe)) => !dir.is_empty() && exe.starts_with(dir),
-                _ => false,
-            },
-        )
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_exe().ok());
-    #[cfg(not(target_os = "linux"))]
-    let exe = std::env::current_exe().ok();
-    let Some(exe) = exe else {
+    let Some(exe) = own_executable() else {
         log::warn!("crash guard: no executable path to start it from");
         return;
     };
@@ -8518,6 +8568,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
                 rate_limit_429s: day_counters.map(|c| c.rate_limit_429s.clone()),
                 failed_requests: day_counters.map(|c| c.failed_requests.clone()),
+                failure_kinds: day_counters.map(|c| c.failure_kinds.clone()),
             }
         })
         .collect();
@@ -9063,6 +9114,10 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // RUST-M8: `You're out of extra usage · resets 1:40pm
         // (Europe/Lisbon)` -- the extra-usage pool, same family.
         "out of extra usage",
+        // RUST-QQ: Codex `ERROR: Your workspace is out of credits. Ask your
+        // workspace owner to refill in order to continue.` -- the ChatGPT
+        // workspace's credit pool.
+        "out of credits",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -9366,14 +9421,20 @@ fn learn_failure_signature_source(text: &str) -> String {
         // RUST-KT: `codex exec` opens its stderr with this banner and states
         // its verdict last, as `ERROR: ...` after its `Reconnecting...` retries.
         // The status variant ends `, url: ..., cf-ray: ..., request id: ...`,
-        // unique per request, so it is cut there.
+        // unique per request, so it is cut there. Codex 0.163 words an
+        // app-server refusal `Error: turn/start: ...` instead (RUST-QV), its
+        // `, data: {...}` tail carrying a per-run character count.
         Some(&"Reading prompt from stdin...") => {
             let reason = lines[marker + 1..]
                 .iter()
                 .rev()
-                .find(|l| l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                .find(|l| {
+                    (l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
+                        || l.starts_with("Error: ")
+                })
                 .map_or("Reading prompt from stdin...", |l| {
-                    l.split_once(", url: ").map_or(*l, |(head, _)| head)
+                    let l = l.split_once(", url: ").map_or(*l, |(head, _)| head);
+                    l.split_once(", data: ").map_or(l, |(head, _)| head)
                 });
             format!("{} {reason}", lines[marker])
         }
@@ -9976,7 +10037,14 @@ fn execute_headroom_learn_run(
                 let path_unreadable = diagnosis.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
                 let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
+                // Windows ending the session (a 3am update restart) killed the
+                // run mid-analysis; the next scan redoes it (RUST-QK).
+                let session_teardown = output
+                    .status
+                    .code()
+                    .is_some_and(crate::state::is_session_teardown_exit);
                 let user_env_condition = path_unreadable
+                    || session_teardown
                     || agent_cli_outdated
                     || learn_failure_is_agent_config_broken(diagnosis)
                     || agent_not_signed_in
@@ -12420,7 +12488,7 @@ mod tests {
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
-    use super::{dir_is_read_only, is_read_only_filesystem, symlink_free_exe};
+    use super::{dir_is_read_only, is_read_only_filesystem, on_other_volumes, symlink_free_exe};
     use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -12673,6 +12741,7 @@ mod tests {
             session_savings_pct: 0.0,
             output_reduction: None,
             output_shaper_active: None,
+            output_warmup: None,
             learner_progress: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
@@ -16385,6 +16454,9 @@ Some unrelated content.
         // RUST-M8 verbatim.
         let extra = "You're out of extra usage \u{b7} resets 1:40pm (Europe/Lisbon)";
         assert_eq!(learn_failure_agent_limit_line(extra), Some(extra));
+        // RUST-QQ verbatim (Codex).
+        let workspace = "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.";
+        assert_eq!(learn_failure_agent_limit_line(workspace), Some(workspace));
     }
 
     #[test]
@@ -16692,6 +16764,11 @@ Some unrelated content.
         assert!(learn_failure_signature_source(&other)
             .ends_with("stream disconnected before completion"));
         assert!(!learn_failure_is_agent_auth(&other));
+        // RUST-QV: Codex 0.163's app-server refusal, character count cut.
+        let too_large = codex("Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602), data: {\"input_error_code\":\"input_too_large\",\"max_chars\":1048576,\"actual_chars\":1786526}");
+        assert!(learn_failure_signature_source(&too_large).ends_with(
+            "failed (exit 1): Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602)"
+        ));
         // No verdict line (a wheel without the vendor cut it off): as before.
         assert!(learn_failure_signature_source(
             "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
@@ -17339,7 +17416,7 @@ Some unrelated content.
     }
 
     #[test]
-    fn a_ready_update_waits_for_thirty_quiet_awake_minutes() {
+    fn a_ready_update_waits_for_sixty_five_quiet_awake_minutes() {
         let mut minutes = 0;
         for _ in 0..super::IDLE_UPDATE_MINUTES {
             minutes = super::idle_minutes_after(minutes, false, false);
@@ -18171,6 +18248,19 @@ Some unrelated content.
             take_pending_magic_link(),
             None,
             "a reload must not replay a spent code"
+        );
+    }
+
+    /// RUST-QR. `/dev` is devfs on every Mac, so it stands in for a second disk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn other_volume_guard_compares_devices() {
+        let temp = std::env::temp_dir();
+        assert!(!on_other_volumes(&temp, &temp));
+        assert!(on_other_volumes(std::path::Path::new("/dev"), &temp));
+        assert!(
+            !on_other_volumes(std::path::Path::new("/nonexistent-headroom"), &temp),
+            "an unreadable side must not block an install"
         );
     }
 
