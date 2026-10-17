@@ -8568,6 +8568,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
                 rate_limit_429s: day_counters.map(|c| c.rate_limit_429s.clone()),
                 failed_requests: day_counters.map(|c| c.failed_requests.clone()),
+                failure_kinds: day_counters.map(|c| c.failure_kinds.clone()),
             }
         })
         .collect();

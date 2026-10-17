@@ -771,8 +771,11 @@ impl<R> ResponseSniffer<R> {
             self.status = parse_response_status(&self.buf);
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
-            } else if self.count_failures && self.status.is_some_and(is_failed_request_status) {
-                crate::usage_counters::record_failure(self.client_key);
+            } else if let Some(status) = self
+                .status
+                .filter(|s| self.count_failures && is_failed_request_status(*s))
+            {
+                crate::usage_counters::record_failure(self.client_key, &status.to_string());
             }
             self.capturing = self.capture_path.is_some()
                 && self
@@ -3001,7 +3004,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             None => !client_gone.load(Ordering::Relaxed),
         };
         if failed && counted && is_provider_api_path(req_path) {
-            crate::usage_counters::record_failure("codex");
+            crate::usage_counters::record_failure("codex", &codex_failure_kind(status));
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -3258,6 +3261,16 @@ fn note_codex_prompt_outcome(
 /// separates provider outages from Headroom bugs by comparing versions.
 fn is_failed_request_status(status: u16) -> bool {
     status >= 400 && status != 429
+}
+
+/// `failure_kinds` key for a failed Codex request: a 2xx failed in-band, no
+/// status is a dropped response.
+fn codex_failure_kind(status: Option<u16>) -> String {
+    match status {
+        Some(status) if (200..300).contains(&status) => "stream".into(),
+        Some(status) => status.to_string(),
+        None => "dropped".into(),
+    }
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -5310,15 +5323,15 @@ mod tests {
 
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_class,
-        codex_error_shape_tag, codex_error_summary, codex_inband_message, codex_prompt_failed,
-        codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
-        extract_bearer, extract_header_value, find_header_end, grok_upstream_header,
-        held_by_our_other_window, intercept_request_counts, is_ccr_retrieve_path,
-        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
-        is_compression_refused_error, is_counted_request, is_failed_request_status,
-        is_geo_blocked_codex_error, is_grok_inference_path, is_grok_request,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        codex_error_shape_tag, codex_error_summary, codex_failure_kind, codex_inband_message,
+        codex_prompt_failed, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
+        grok_upstream_header, held_by_our_other_window, intercept_request_counts,
+        is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
+        is_codex_sse_response, is_compression_refused_error, is_counted_request,
+        is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
+        is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
         is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
@@ -7487,6 +7500,14 @@ mod tests {
         ] {
             assert!(!is_client_probe_path(real), "{real}");
         }
+    }
+
+    #[test]
+    fn codex_failure_kinds_name_the_status_a_dropped_response_or_an_in_band_failure() {
+        assert_eq!(codex_failure_kind(Some(401)), "401");
+        assert_eq!(codex_failure_kind(Some(502)), "502");
+        assert_eq!(codex_failure_kind(Some(200)), "stream");
+        assert_eq!(codex_failure_kind(None), "dropped");
     }
 
     #[test]
