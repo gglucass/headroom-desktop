@@ -712,6 +712,8 @@ struct ResponseSniffer<R> {
     /// Request path for error attribution; `None` disables error capture
     /// (local proxy paths like /stats, or an unparseable request head).
     capture_path: Option<String>,
+    /// Count a failed status in `failed_requests` (see `is_counted_request`).
+    count_failures: bool,
     /// Claude Code conversation this response belongs to. On a 2xx the head
     /// is read to its end and `x-headroom-tokens-saved` is booked against it
     /// for the statusline (claude_statusline.rs).
@@ -735,6 +737,7 @@ impl<R> ResponseSniffer<R> {
             status: None,
             done: false,
             client_key,
+            count_failures: capture_path.is_some(),
             capture_path,
             savings_session: None,
             usage_pending: false,
@@ -768,9 +771,7 @@ impl<R> ResponseSniffer<R> {
             self.status = parse_response_status(&self.buf);
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
-            } else if self.capture_path.is_some()
-                && self.status.is_some_and(is_failed_request_status)
-            {
+            } else if self.count_failures && self.status.is_some_and(is_failed_request_status) {
                 crate::usage_counters::record_failure(self.client_key);
             }
             self.capturing = self.capture_path.is_some()
@@ -2136,6 +2137,7 @@ async fn handle(
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
     // attributed to an agent.
+    let counted = parsed_head.as_ref().is_some_and(is_counted_request);
     if let Some(head) = parsed_head.as_ref() {
         if !is_local_proxy_path(&head.path) {
             match client_key {
@@ -2144,6 +2146,8 @@ async fn handle(
                 "codex" => INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel),
                 _ => INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel),
             };
+        }
+        if counted {
             crate::usage_counters::record_request(client_key);
             // Telemetry-only subset of `claude-code`, to size which Claude
             // Code surface the fleet actually uses: the VS Code panel renders
@@ -2482,7 +2486,8 @@ async fn handle(
                 .map(|p| p.path.clone())
                 .unwrap_or_default();
             let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
-            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
+            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt, counted)
+                .await;
         } else {
             // Same shape as copy_bidirectional, split so the backend->client half
             // can stamp traffic liveness for the watchdog.
@@ -2524,6 +2529,7 @@ async fn handle(
                     error_path,
                 )
                 .with_savings_session(savings_session);
+                stamped.count_failures &= counted;
                 let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
                 let _ = client_wr.shutdown().await;
                 copied
@@ -2873,6 +2879,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
     prompt: bool,
+    counted: bool,
 ) {
     let (mut client_rd, mut client_wr) = tokio::io::split(client);
     let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
@@ -2993,7 +3000,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             }
             None => !client_gone.load(Ordering::Relaxed),
         };
-        if failed && is_provider_api_path(req_path) {
+        if failed && counted && is_provider_api_path(req_path) {
             crate::usage_counters::record_failure("codex");
         }
         if prompt {
@@ -5018,6 +5025,19 @@ fn is_client_probe_path(path: &str) -> bool {
     matches!(path, "/" | "/api/hello" | "/v1/settings" | "/mcp")
 }
 
+/// Client traffic for the per-day `client_requests` / `failed_requests`
+/// counters, which headroom-web's stuck-host alert divides. Not our own polls
+/// (local proxy paths), not a HEAD (no prompt: the hourly `codex doctor` from
+/// Codex verify probes `HEAD /v1/responses` unauthenticated, a 401 by design,
+/// and was every Codex failure on a light Codex day), and not the backend's
+/// CCR retrieve route (the headroom MCP's own call, whose 404 is a CCR TTL
+/// miss, filed under `claude-code` even for a Codex user).
+fn is_counted_request(head: &ParsedRequestHead) -> bool {
+    !is_local_proxy_path(&head.path)
+        && !head.method.eq_ignore_ascii_case("HEAD")
+        && !is_ccr_retrieve_path(&head.path)
+}
+
 /// Every provider a supported client reaches through us lives under `/v1/`
 /// (Anthropic /v1/messages, OpenAI /v1/responses and /v1/chat/completions,
 /// x.ai /v1/...). Anything else on our port is a client's non-provider
@@ -5295,10 +5315,11 @@ mod tests {
         extract_bearer, extract_header_value, find_header_end, grok_upstream_header,
         held_by_our_other_window, intercept_request_counts, is_ccr_retrieve_path,
         is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
-        is_compression_refused_error, is_failed_request_status, is_geo_blocked_codex_error,
-        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
-        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_compression_refused_error, is_counted_request, is_failed_request_status,
+        is_geo_blocked_codex_error, is_grok_inference_path, is_grok_request,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -7466,6 +7487,30 @@ mod tests {
         ] {
             assert!(!is_client_probe_path(real), "{real}");
         }
+    }
+
+    #[test]
+    fn codex_doctor_probes_and_ccr_retrieves_are_not_counted_client_requests() {
+        let counted = |head: &[u8]| is_counted_request(&parse_request_head(head).unwrap());
+        // `codex doctor`'s unauthenticated probe pair: the HEAD 401s by design.
+        assert!(!counted(
+            b"HEAD /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
+        ));
+        assert!(counted(
+            b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
+        ));
+        // The headroom MCP's retrieve, a 404 on a CCR TTL miss.
+        assert!(!counted(
+            b"POST /v1/retrieve HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
+        assert!(!counted(b"GET /v1/retrieve/f2ac2682a439 HTTP/1.1\r\n\r\n"));
+        assert!(!counted(b"GET /stats HTTP/1.1\r\n\r\n"));
+        assert!(counted(
+            b"POST /v1/responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
+        assert!(counted(
+            b"POST /v1/messages?beta=true HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
     }
 
     #[test]
