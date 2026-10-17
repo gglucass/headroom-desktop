@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.9.41"
+version = "0.9.42"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -44,7 +44,10 @@ tauri-plugin-autostart = "2.5.1"
 tauri-plugin-deep-link = "2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2.10.0"
+# No default `zip` feature: it only unpacks .zip/.AppImage.tar.gz update bundles, and
+# every manifest platform ships the raw setup.exe/.AppImage (createUpdaterArtifacts:
+# true). Its zip ^4 carries RUSTSEC-2026-0367/0368/0369 with no fixed 4.x.
+tauri-plugin-updater = { version = "2.10.0", default-features = false, features = ["rustls-tls"] }
 time = "=0.3.47"
 toml = "0.8"
 tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread", "process", "fs", "time"] }
@@ -52,7 +55,9 @@ uuid = { version = "=1.22.0", features = ["v4", "serde"] }
 
 # Cross-platform, not only the Windows rtk unzip: the MSVC runtime DLL
 # vendoring helper and its tests compile everywhere; the call site is gated.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# zip 2's `deflate` backend (flate2 rust_backend); zip 9's `deflate` would switch every
+# flate2 user, the updater's .app.tar.gz unpack included, to zlib-rs.
+zip = { version = "9", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
 
 [dev-dependencies]
 tempfile = "3"

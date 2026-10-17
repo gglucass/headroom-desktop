@@ -3036,6 +3036,7 @@ impl AppState {
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
                 output_shaper_active: stats.as_ref().and_then(|s| s.output_shaper_active),
+                output_warmup: crate::output_savings::warmup_progress(),
                 learner_progress,
                 reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
                 reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),
@@ -9503,6 +9504,21 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
         } else {
             "Your coding tools connect directly until the port is free. "
         };
+        // Paseo's daemon defaults to 6767 and its users run it on purpose, so
+        // "quit that program" is no remedy. Desktop reads config.json too.
+        if crate::proxy_intercept::is_paseo(&holder) {
+            let config = if cfg!(windows) {
+                r"%USERPROFILE%\.paseo\config.json"
+            } else {
+                "~/.paseo/config.json"
+            };
+            return format!(
+                "Port {port} is in use by {holder}. {direct}\
+                 Paseo listens on {port} by default; move it by setting \
+                 \"daemon\": {{\"listen\": \"127.0.0.1:6800\"}} in {config}, then quit and reopen Paseo. \
+                 Headroom reconnects on its own."
+            );
+        }
         return format!(
             "Port {port} is in use by {holder}. {direct}\
              Quit that program, or end it in {PROCESS_MONITOR}, and Headroom reconnects on its own."
@@ -9732,7 +9748,7 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Terminate a process tree. Windows uses taskkill /T (subtree); Unix signals
+/// Terminate a process tree. Windows walks the subtree natively; Unix signals
 /// the process group by negating the pid.
 /// How long `stop_headroom` waits for a concurrent lifecycle transition before
 /// stopping the backend anyway.
@@ -9771,20 +9787,15 @@ pub(crate) fn recent_app_kills_summary() -> Vec<String> {
 
 pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
-        // Always /F: without it taskkill only posts WM_CLOSE, which a
-        // windowless python never reads, so the "graceful" stage did nothing
-        // and every stop sat out its full 2s wait before the forced one
-        // (several times over on quit). The proxy has no shutdown hook that a
-        // gentler stop would have run. Bounded like the sweep: taskkill
-        // enumerates the tree through the same machinery a wedged WMI stalls.
+        // Always forced, as the `taskkill /F` this replaced was: a windowless
+        // python reads no WM_CLOSE and the proxy has no shutdown hook, so a
+        // gentler stop only sat out its wait. Native, never a spawned
+        // taskkill, which cannot start while Windows shuts down (see
+        // `winproc::kill_tree`).
         let _ = force;
-        note_app_kill(
-            "terminate_process_tree",
-            format!("taskkill /T /F pid {pid}"),
-        );
-        let mut command = crate::proc::command("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-        let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
+        note_app_kill("terminate_process_tree", format!("tree kill pid {pid}"));
+        #[cfg(windows)]
+        crate::winproc::kill_tree(pid as u32);
     } else {
         let Some(target) = group_kill_target(pid) else {
             log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");
@@ -9821,19 +9832,18 @@ fn group_kill_target(pid: i32) -> Option<String> {
 /// NTSTATUS 0xC0000142, surfaced by `ExitStatus::code()` as -1073741502 (the
 /// number in RUST-7N's title). Not cfg(windows)-gated so the conversion test
 /// below runs everywhere.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC0000142_u32 as i32;
 
-/// True when a powershell exit code means "the user session is ending", not
-/// "the sweep failed". Same rationale for every member (see the RUST-7N note
-/// at the call site): logoff/shutdown reaps the whole session, orphans
-/// included, so a sweep that was cut short here has nothing left to do, and
-/// the next launch's reclaim_orphan_proxy covers any survivor.
+/// True when a powershell (or headroom learn, RUST-QK) exit code means "the
+/// user session is ending", not "the sweep failed". Same rationale for every
+/// member (see the RUST-7N note at the call site): logoff/shutdown reaps the
+/// whole session, orphans included, so a sweep that was cut short here has
+/// nothing left to do, and the next launch's reclaim_orphan_proxy covers any
+/// survivor.
 /// - 0xC0000142 STATUS_DLL_INIT_FAILED: powershell cannot even start (RUST-7N).
 /// - 0x40010004 DBG_TERMINATE_PROCESS: powershell was terminated by the
 ///   session's console-control teardown mid-run (RUST-9A).
 /// - 0xC000013A STATUS_CONTROL_C_EXIT: same teardown, delivered as ctrl-close.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
     const DBG_TERMINATE_PROCESS: i32 = 0x40010004;
     const STATUS_CONTROL_C_EXIT: i32 = 0xC000013A_u32 as i32;
@@ -12278,6 +12288,21 @@ mod tests {
             assert!(hint.contains("connect directly until the port is free"), "{hint}");
             assert!(hint.contains(super::PROCESS_MONITOR), "{hint}");
         }
+        // RUST-KD: Paseo's daemon defaults to 6767, so the remedy is moving it.
+        let paseo = intercept_bind_hint("port 6767 is held by Paseo Helper (pid 32414)");
+        assert!(
+            paseo.starts_with("Port 6767 is in use by Paseo Helper (PID 32414). "),
+            "{paseo}"
+        );
+        assert!(
+            paseo.contains("connect directly until the port is free"),
+            "{paseo}"
+        );
+        assert!(
+            paseo.contains(r#""daemon": {"listen": "127.0.0.1:6800"}"#),
+            "{paseo}"
+        );
+        assert!(!paseo.contains("Quit that program"), "{paseo}");
         let own = intercept_bind_hint(&format!(
             "port 6767 is held by {} (pid 7)",
             crate::proxy_intercept::OTHER_HEADROOM_COPY
@@ -14010,6 +14035,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dashboard_includes_managed_tools() {
         let base_dir = temp_test_dir("headroom-app-state");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
@@ -14744,6 +14770,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn dashboard_read_path_preserves_pending_milestones_for_analytics() {
         // Regression guard: `state.dashboard()` (tray updater, bootstrap
         // finalize, account activation) must not advance the milestone

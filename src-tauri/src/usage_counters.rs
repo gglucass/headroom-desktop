@@ -46,6 +46,12 @@ pub struct DayCounters {
     /// tells them apart across the fleet: an outage hits every version at
     /// once, a Headroom bug clusters on one.
     pub failed_requests: BTreeMap<String, u64>,
+    /// `failed_requests` split by what failed, keyed `<client>:<kind>`: the
+    /// HTTP status, `dropped` (no response) or `stream` (a Codex 2xx stream
+    /// failed in-band). Sentry never sees most failures (a 5xx, an expired
+    /// key's 401, a dropped response), so a stuck host's cause was unknowable
+    /// from the server (users 743 and 4433 on 2026-10-16).
+    pub failure_kinds: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -198,11 +204,16 @@ pub fn record_429(client: &str) {
     });
 }
 
-/// Count one request the user saw fail for a client bucket (today, local day).
-pub fn record_failure(client: &str) {
+/// Count one request the user saw fail for a client bucket (today, local day),
+/// and its `kind` (see `DayCounters::failure_kinds`).
+pub fn record_failure(client: &str, kind: &str) {
     with_store(|store| {
-        bump(&mut store.days, today_key(), client, |c| {
+        let day = today_key();
+        bump(&mut store.days, day.clone(), client, |c| {
             &mut c.failed_requests
+        });
+        bump(&mut store.days, day, &format!("{client}:{kind}"), |c| {
+            &mut c.failure_kinds
         });
         store.dirty = true;
     });
@@ -252,6 +263,7 @@ mod tests {
         bump(&mut days, day(), "claude-code", |c| &mut c.rate_limit_429s);
         bump(&mut days, day(), "codex", |c| &mut c.client_requests);
         bump(&mut days, day(), "codex", |c| &mut c.failed_requests);
+        bump(&mut days, day(), "codex:502", |c| &mut c.failure_kinds);
 
         let day = &days["2026-08-17"];
         assert_eq!(day.client_requests["claude-code"], 2);
@@ -260,6 +272,7 @@ mod tests {
         assert!(!day.rate_limit_429s.contains_key("codex"));
         assert_eq!(day.failed_requests["codex"], 1);
         assert!(!day.failed_requests.contains_key("claude-code"));
+        assert_eq!(day.failure_kinds["codex:502"], 1);
     }
 
     #[test]

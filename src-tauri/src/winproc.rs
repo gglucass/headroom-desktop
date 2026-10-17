@@ -12,7 +12,7 @@
 //!   keep working where AppLocker/SRP blocks powershell.exe.
 //! - The process table (pid, parent pid) from one kernel snapshot, plus each
 //!   process's command line and a TerminateProcess, so the process sweep runs
-//!   without starting PowerShell.
+//!   without starting PowerShell, and a tree kill runs without `taskkill`.
 //!
 //! Only proxy spawns join the job. The updater's installer, the relaunch
 //! helper and anything else that has to outlive the app never do.
@@ -23,7 +23,9 @@ use std::sync::OnceLock;
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -34,7 +36,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
@@ -229,6 +231,56 @@ impl ProcessHandle {
         // SAFETY: the handle is live; TerminateProcess fails cleanly without
         // the terminate right.
         unsafe { TerminateProcess(self.0, u32::MAX) != 0 }
+    }
+}
+
+impl ProcessHandle {
+    /// When the process started, in FILETIME ticks.
+    fn created(&self) -> Option<u64> {
+        let mut times = [FILETIME::default(); 4];
+        let [created, exited, kernel, user] = &mut times;
+        // SAFETY: four writable FILETIMEs and a live handle.
+        let ok = unsafe { GetProcessTimes(self.0, created, exited, kernel, user) };
+        (ok != 0)
+            .then(|| (u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+    }
+}
+
+/// What `taskkill /PID <pid> /T /F` does, without starting taskkill: terminate
+/// `pid`, then every descendant in one toolhelp snapshot. Once the session is
+/// ending (shut down, restart, sign out) Windows cannot start a process, so
+/// each taskkill a quit spawned died with 0xC0000142 behind an "Application
+/// Error" box that held up the shutdown until clicked, and its timeout spawned
+/// another taskkill to kill it: up to four boxes per shutdown.
+pub(crate) fn kill_tree(pid: u32) {
+    let Some(root) = ProcessHandle::open_to_terminate(pid) else {
+        return;
+    };
+    let processes = process_parents().unwrap_or_default();
+    // Every handle stays open until the kill, so no pid can be reused between
+    // the check and the TerminateProcess.
+    let mut tree = vec![(pid, root.created(), root)];
+    let mut next = 0;
+    while next < tree.len() {
+        let (parent, parent_created) = (tree[next].0, tree[next].1);
+        next += 1;
+        for &(child, ppid) in &processes {
+            if ppid != parent || tree.iter().any(|(known, ..)| *known == child) {
+                continue;
+            }
+            let Some(handle) = ProcessHandle::open_to_terminate(child) else {
+                continue;
+            };
+            let created = handle.created();
+            // A process older than its recorded parent was started by an
+            // earlier owner of that pid, not by this tree.
+            if created.zip(parent_created).is_some_and(|(c, p)| c >= p) {
+                tree.push((child, created, handle));
+            }
+        }
+    }
+    for (_, _, process) in &tree {
+        process.terminate();
     }
 }
 

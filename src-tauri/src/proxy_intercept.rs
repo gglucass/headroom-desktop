@@ -250,7 +250,11 @@ const INTERCEPT_FAILURE_LOG_LINES: u64 = 200;
 
 /// The status probe's own budget (`state::headroom_proxy_readyz`): a `/readyz`
 /// relay still running past it has already failed from the app's side.
-const READYZ_RELAY_STALL: Duration = Duration::from_secs(5);
+const READYZ_RELAY_STALL: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -574,10 +578,12 @@ pub fn first_prompt_request_seen() -> bool {
 /// the splices below.
 struct StampReader<R>(R, bool);
 
-/// A relay socket that stamps `last` (epoch seconds) whenever bytes are read
-/// from it, so `handle` can tell an idle relay from a live one (see
+/// A relay socket that stamps `last` (epoch milliseconds) whenever bytes are
+/// read from it, so `handle` can tell an idle relay from a live one (see
 /// `RELAY_IDLE_LIMIT`). Epoch, not `Instant`: a relay that slept through a
 /// system sleep is dead (its upstream connection is) and should look idle.
+/// Milliseconds, not seconds: whole seconds made the limit fire up to a second
+/// early, which under `cfg(test)`'s 2s limit could cut a relay idle for 1s.
 struct Touched<S> {
     inner: S,
     last: Arc<AtomicU64>,
@@ -592,7 +598,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Touched<S> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.last.store(now_epoch_secs(), Ordering::Relaxed);
+            self.last.store(now_epoch_millis(), Ordering::Relaxed);
         }
         poll
     }
@@ -625,7 +631,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
 /// Logs a relay `handle` closed for idling and, at most once a minute, tells
 /// Sentry which client and path it was, the one thing the in-flight cap
 /// report cannot say (RUST-GY).
-fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
+fn note_idle_relay_closed(
+    client: &'static str,
+    path: &str,
+    open: Duration,
+    backend_answered: bool,
+) {
     let closed = IDLE_RELAYS_CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
     let path = path.split('?').next().unwrap_or_default();
     log::info!(
@@ -647,6 +658,10 @@ fn note_idle_relay_closed(client: &'static str, path: &str, open: Duration) {
             scope.set_tag("relay_path", path);
             scope.set_extra("open_secs", (open.as_secs() as i64).into());
             scope.set_extra("closed_this_run", (closed as i64).into());
+            // false: the backend never answered; true: its answer or close
+            // was lost on the way (RUST-QA's Windows host also resets
+            // loopback relays, RUST-NG).
+            scope.set_extra("backend_answered", backend_answered.into());
             scope.set_extra(
                 "permits_available",
                 (backend_inflight().available_permits() as i64).into(),
@@ -697,6 +712,8 @@ struct ResponseSniffer<R> {
     /// Request path for error attribution; `None` disables error capture
     /// (local proxy paths like /stats, or an unparseable request head).
     capture_path: Option<String>,
+    /// Count a failed status in `failed_requests` (see `is_counted_request`).
+    count_failures: bool,
     /// Claude Code conversation this response belongs to. On a 2xx the head
     /// is read to its end and `x-headroom-tokens-saved` is booked against it
     /// for the statusline (claude_statusline.rs).
@@ -720,6 +737,7 @@ impl<R> ResponseSniffer<R> {
             status: None,
             done: false,
             client_key,
+            count_failures: capture_path.is_some(),
             capture_path,
             savings_session: None,
             usage_pending: false,
@@ -753,10 +771,11 @@ impl<R> ResponseSniffer<R> {
             self.status = parse_response_status(&self.buf);
             if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
-            } else if self.capture_path.is_some()
-                && self.status.is_some_and(is_failed_request_status)
+            } else if let Some(status) = self
+                .status
+                .filter(|s| self.count_failures && is_failed_request_status(*s))
             {
-                crate::usage_counters::record_failure(self.client_key);
+                crate::usage_counters::record_failure(self.client_key, &status.to_string());
             }
             self.capturing = self.capture_path.is_some()
                 && self
@@ -1166,6 +1185,12 @@ pub(crate) fn is_wsl() -> bool {
 /// `tool_manager::pid_is_same_user_headroom_desktop`), the one holder the bind
 /// loop leaves the clients wired to. `state::intercept_bind_hint` keys on it.
 pub(crate) const OTHER_HEADROOM_COPY: &str = "another copy of Headroom";
+
+/// Whether a 6767 holder is Paseo ("Paseo Helper" on macOS), whose agent daemon
+/// listens on 6767 by default (RUST-KD). Its hint says how to move it.
+pub(crate) fn is_paseo(holder: &str) -> bool {
+    holder.to_ascii_lowercase().starts_with("paseo")
+}
 
 /// Whether the port's holder is another window of this same Headroom, run by
 /// this same user: the one holder a second window may stand beside as a
@@ -1749,7 +1774,10 @@ fn serve(
                                         *bind_error.lock() = Some(format!(
                                             "port {INTERCEPT_PORT} is held by {holder} (pid {pid})"
                                         ));
-                                        if reported_errors.insert(format!("foreign:{key}:{name}")) {
+                                        // Paseo is known and its hint has the fix.
+                                        if !is_paseo(&name)
+                                            && reported_errors.insert(format!("foreign:{key}:{name}"))
+                                        {
                                             sentry::with_scope(
                                                 |scope| {
                                                     scope.set_extra(
@@ -2112,6 +2140,7 @@ async fn handle(
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
     // attributed to an agent.
+    let counted = parsed_head.as_ref().is_some_and(is_counted_request);
     if let Some(head) = parsed_head.as_ref() {
         if !is_local_proxy_path(&head.path) {
             match client_key {
@@ -2120,6 +2149,8 @@ async fn handle(
                 "codex" => INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel),
                 _ => INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel),
             };
+        }
+        if counted {
             crate::usage_counters::record_request(client_key);
             // Telemetry-only subset of `claude-code`, to size which Claude
             // Code surface the fleet actually uses: the VS Code panel renders
@@ -2437,14 +2468,17 @@ async fn handle(
         .as_ref()
         .map(|head| head.path.clone())
         .unwrap_or_default();
-    let activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+    let activity = Arc::new(AtomicU64::new(now_epoch_millis()));
+    // 0 until the backend sends its first byte, so a /readyz stall can tell a
+    // backend that has not answered from an answer lost in this relay.
+    let backend_activity = Arc::new(AtomicU64::new(0));
     let client = Touched {
         inner: client,
         last: Arc::clone(&activity),
     };
     let backend = Touched {
         inner: backend,
-        last: Arc::clone(&activity),
+        last: Arc::clone(&backend_activity),
     };
     let relay = async {
         if is_models_fetch {
@@ -2455,7 +2489,8 @@ async fn handle(
                 .map(|p| p.path.clone())
                 .unwrap_or_default();
             let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
-            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
+            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt, counted)
+                .await;
         } else {
             // Same shape as copy_bidirectional, split so the backend->client half
             // can stamp traffic liveness for the watchdog.
@@ -2497,6 +2532,7 @@ async fn handle(
                     error_path,
                 )
                 .with_savings_session(savings_session);
+                stamped.count_failures &= counted;
                 let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
                 let _ = client_wr.shutdown().await;
                 copied
@@ -2517,6 +2553,15 @@ async fn handle(
             let copied = tokio::select! {
                 copied = &mut relay => copied,
                 () = tokio::time::sleep(READYZ_RELAY_STALL) => {
+                    if backend_activity.load(Ordering::Relaxed) == 0 {
+                        // The backend has not answered: its event loop is
+                        // starved (a busy or booting runtime, RUST-NG's stalls
+                        // 2026-10-10..15), which its own port shows too. Not
+                        // an answer this relay lost, so neither a failure nor
+                        // a relay for the share.
+                        let _ = relay.await;
+                        return;
+                    }
                     stalled = true;
                     relay.await
                 }
@@ -2540,9 +2585,17 @@ async fn handle(
         tokio::select! {
             () = &mut relay => return,
             () = tokio::time::sleep(RELAY_IDLE_CHECK) => {
-                let idle = now_epoch_secs().saturating_sub(activity.load(Ordering::Relaxed));
-                if idle >= RELAY_IDLE_LIMIT.as_secs() {
-                    note_idle_relay_closed(client_key, &relay_path, accepted_at.elapsed());
+                let last = activity
+                    .load(Ordering::Relaxed)
+                    .max(backend_activity.load(Ordering::Relaxed));
+                let idle = now_epoch_millis().saturating_sub(last);
+                if u128::from(idle) >= RELAY_IDLE_LIMIT.as_millis() {
+                    note_idle_relay_closed(
+                        client_key,
+                        &relay_path,
+                        accepted_at.elapsed(),
+                        backend_activity.load(Ordering::Relaxed) != 0,
+                    );
                     return;
                 }
             }
@@ -2829,6 +2882,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
     prompt: bool,
+    counted: bool,
 ) {
     let (mut client_rd, mut client_wr) = tokio::io::split(client);
     let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
@@ -2949,8 +3003,8 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             }
             None => !client_gone.load(Ordering::Relaxed),
         };
-        if failed && is_provider_api_path(req_path) {
-            crate::usage_counters::record_failure("codex");
+        if failed && counted && is_provider_api_path(req_path) {
+            crate::usage_counters::record_failure("codex", &codex_failure_kind(status));
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -3207,6 +3261,16 @@ fn note_codex_prompt_outcome(
 /// separates provider outages from Headroom bugs by comparing versions.
 fn is_failed_request_status(status: u16) -> bool {
     status >= 400 && status != 429
+}
+
+/// `failure_kinds` key for a failed Codex request: a 2xx failed in-band, no
+/// status is a dropped response.
+fn codex_failure_kind(status: Option<u16>) -> String {
+    match status {
+        Some(status) if (200..300).contains(&status) => "stream".into(),
+        Some(status) => status.to_string(),
+        None => "dropped".into(),
+    }
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -3820,6 +3884,13 @@ fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -4967,6 +5038,19 @@ fn is_client_probe_path(path: &str) -> bool {
     matches!(path, "/" | "/api/hello" | "/v1/settings" | "/mcp")
 }
 
+/// Client traffic for the per-day `client_requests` / `failed_requests`
+/// counters, which headroom-web's stuck-host alert divides. Not our own polls
+/// (local proxy paths), not a HEAD (no prompt: the hourly `codex doctor` from
+/// Codex verify probes `HEAD /v1/responses` unauthenticated, a 401 by design,
+/// and was every Codex failure on a light Codex day), and not the backend's
+/// CCR retrieve route (the headroom MCP's own call, whose 404 is a CCR TTL
+/// miss, filed under `claude-code` even for a Codex user).
+fn is_counted_request(head: &ParsedRequestHead) -> bool {
+    !is_local_proxy_path(&head.path)
+        && !head.method.eq_ignore_ascii_case("HEAD")
+        && !is_ccr_retrieve_path(&head.path)
+}
+
 /// Every provider a supported client reaches through us lives under `/v1/`
 /// (Anthropic /v1/messages, OpenAI /v1/responses and /v1/chat/completions,
 /// x.ai /v1/...). Anything else on our port is a client's non-provider
@@ -5239,15 +5323,16 @@ mod tests {
 
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_class,
-        codex_error_shape_tag, codex_error_summary, codex_inband_message, codex_prompt_failed,
-        codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
-        extract_bearer, extract_header_value, find_header_end, grok_upstream_header,
-        held_by_our_other_window, intercept_request_counts, is_ccr_retrieve_path,
-        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
-        is_compression_refused_error, is_failed_request_status, is_geo_blocked_codex_error,
-        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
-        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        codex_error_shape_tag, codex_error_summary, codex_failure_kind, codex_inband_message,
+        codex_prompt_failed, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
+        grok_upstream_header, held_by_our_other_window, intercept_request_counts,
+        is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
+        is_codex_sse_response, is_compression_refused_error, is_counted_request,
+        is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
+        is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -5978,7 +6063,8 @@ mod tests {
 
     /// Watching a `/readyz` relay must not change it: the answer still reaches
     /// the client, a delivered one is not counted as a failure, and an answer
-    /// the backend never sent is.
+    /// the backend never sent is. A stall is a failure only once the backend
+    /// has started answering; before that it is the backend's latency.
     #[tokio::test]
     #[serial]
     async fn readyz_relay_is_delivered_and_an_empty_answer_counts_as_failed() {
@@ -5996,6 +6082,21 @@ mod tests {
             // Second probe: the backend hangs up without answering.
             let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
             read_until_header_end(&mut sock).await;
+            drop(sock);
+            // Third: the backend answers only after the stall deadline.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            tokio::time::sleep(super::READYZ_RELAY_STALL * 2).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            drop(sock);
+            // Fourth: the answer starts in time and stalls in the relay.
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            read_until_header_end(&mut sock).await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n").await;
+            tokio::time::sleep(super::READYZ_RELAY_STALL * 2).await;
+            let _ = sock.write_all(b"Content-Length: 0\r\n\r\n").await;
         });
         backend_port::set(backend_addr.port());
 
@@ -6075,7 +6176,22 @@ mod tests {
             failures + 1
         );
 
-        backend_task.await.expect("backend served both probes");
+        assert!(probe().await.starts_with(b"HTTP/1.1 200"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(super::READYZ_RELAYS.load(Ordering::Acquire), relays + 2);
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        assert!(probe().await.starts_with(b"HTTP/1.1 200"));
+        settled(relays + 3).await;
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 2
+        );
+
+        backend_task.await.expect("backend served every probe");
         run_task.abort();
         backend_port::reset_for_tests();
     }
@@ -6162,6 +6278,59 @@ mod tests {
             .expect("the backend side is closed too");
         assert!(matches!(backend_eof, Ok(0) | Err(_)));
         assert_eq!(super::backend_inflight().available_permits(), permits);
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A relay quiet for less than `RELAY_IDLE_LIMIT` is never closed, even
+    /// when the quiet spell straddles two second boundaries. Stamped in whole
+    /// seconds, a 1.5s stall that began just before a boundary read as 2s idle
+    /// and the relay was cut mid-answer.
+    #[tokio::test]
+    #[serial]
+    async fn a_relay_quiet_for_less_than_the_idle_limit_is_not_closed() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let (mut backend, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = backend.read(&mut request).await;
+        // Start the stall 50-100ms before a wall-clock second ends.
+        let into_second = super::now_epoch_millis() % 1000;
+        let wait = (1900 - into_second) % 1000;
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        backend
+            .write_all(b"HTTP/1.1 200 OK\r\n")
+            .await
+            .expect("first line");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = backend
+            .write_all(b"Content-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+        drop(backend);
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(8), client.read_to_end(&mut response))
+            .await
+            .expect("relay finished")
+            .expect("read to end");
+        assert!(
+            response.ends_with(b"\r\n\r\nok"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
 
         task.abort();
         backend_port::reset_for_tests();
@@ -7331,6 +7500,38 @@ mod tests {
         ] {
             assert!(!is_client_probe_path(real), "{real}");
         }
+    }
+
+    #[test]
+    fn codex_failure_kinds_name_the_status_a_dropped_response_or_an_in_band_failure() {
+        assert_eq!(codex_failure_kind(Some(401)), "401");
+        assert_eq!(codex_failure_kind(Some(502)), "502");
+        assert_eq!(codex_failure_kind(Some(200)), "stream");
+        assert_eq!(codex_failure_kind(None), "dropped");
+    }
+
+    #[test]
+    fn codex_doctor_probes_and_ccr_retrieves_are_not_counted_client_requests() {
+        let counted = |head: &[u8]| is_counted_request(&parse_request_head(head).unwrap());
+        // `codex doctor`'s unauthenticated probe pair: the HEAD 401s by design.
+        assert!(!counted(
+            b"HEAD /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
+        ));
+        assert!(counted(
+            b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
+        ));
+        // The headroom MCP's retrieve, a 404 on a CCR TTL miss.
+        assert!(!counted(
+            b"POST /v1/retrieve HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
+        assert!(!counted(b"GET /v1/retrieve/f2ac2682a439 HTTP/1.1\r\n\r\n"));
+        assert!(!counted(b"GET /stats HTTP/1.1\r\n\r\n"));
+        assert!(counted(
+            b"POST /v1/responses HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
+        assert!(counted(
+            b"POST /v1/messages?beta=true HTTP/1.1\r\nContent-Length: 2\r\n\r\n"
+        ));
     }
 
     #[test]

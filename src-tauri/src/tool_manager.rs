@@ -2604,6 +2604,120 @@ if _hd_os.environ.get(
     except Exception:
         pass
 
+# --- Output baseline warm-up (desktop feature, not an upstream fix) -----------
+# Output savings are scored against the user's UNSHAPED reply lengths, which the
+# desktop seeds once from Claude Code transcripts written before install. An
+# install with none (new to Claude Code, Codex-only, coming from Claude Desktop)
+# never got a baseline, so its output figure read "measuring" forever: 27% of
+# 989 new users on 2026-10-16, 126 of them active 3+ days in their first week.
+# While the baseline holds fewer than HEADROOM_OUTPUT_WARMUP replies (default
+# 200, mirrored by output_savings::OUTPUT_WARMUP_REPLIES), each NEW conversation
+# runs unshaped for its whole life (its system tail never flips mid-way) and its
+# replies go into the baseline under their own label, never into the A/B control
+# arm, which stays the 3% holdout. From then on the install is scored like a
+# seeded one. Every caller imports assign_arm/stratum_label from
+# headroom.proxy.output_savings at call time and the recorder reads
+# parse_stratum_label from that module's globals, so rebinding both modules
+# reaches every path, including the two that carry no conversation label. The
+# recorder re-reads the disk baseline on each flush and adopts it whenever it
+# differs, which would drop every warm-up sample before it is written, so once
+# this process has recorded one it adopts only a larger (re-learned) disk
+# baseline. The recorder also writes only every 25th record and never at exit,
+# so a backend restarted sooner lost its warm-up replies (the train guest sat at
+# 10 after 35 of them, 2026-10-17): each warm-up reply is written until the
+# baseline reaches the target. Not a wheel bug, so it never self-neutralizes.
+# Exact-pin gated to wheel 0.39.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+_hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_ow_flag not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_ow_meta
+
+        if _hd_ow_meta.version("headroom-ai") == "0.39.0":
+            import contextvars as _hd_ow_cv
+
+            from headroom.proxy import output_savings as _hd_ow_os
+            from headroom.proxy import output_savings_policy as _hd_ow_pol
+
+            _hd_ow_target = int(_hd_ow_flag) if _hd_ow_flag.isdigit() else 200
+            _HD_OW_LABEL = "output_shaper:warmup:"
+            # Conversations started in warm-up. In-process only: after a restart
+            # one is judged afresh, and a restart re-writes its cache anyway.
+            _hd_ow_convs = set()
+            _hd_ow_recorded = [False]
+            # Set by assign_arm, read by the stratum_label call that follows it
+            # in the same request (no await between the two on any path).
+            _hd_ow_req = _hd_ow_cv.ContextVar("hd_output_warmup", default=False)
+            _hd_ow_orig_assign = _hd_ow_pol.assign_arm
+            _hd_ow_orig_label = _hd_ow_pol.stratum_label
+            _hd_ow_orig_parse = _hd_ow_pol.parse_stratum_label
+            _hd_ow_orig_record = _hd_ow_os.SavingsLedger.record
+            _hd_ow_orig_reload = _hd_ow_os.SavingsRecorder._reload_baseline_locked
+            _hd_ow_orig_from_labels = _hd_ow_os.SavingsRecorder.record_from_labels
+
+            def _hd_ow_assign(conversation_key, holdout_fraction):
+                warm = conversation_key in _hd_ow_convs
+                if not warm and len(_hd_ow_convs) < 10000:
+                    baseline = _hd_ow_os.get_recorder()._ledger.baseline
+                    if baseline.total_samples < _hd_ow_target:
+                        _hd_ow_convs.add(conversation_key)
+                        warm = True
+                _hd_ow_req.set(warm)
+                if warm:
+                    return "control"
+                return _hd_ow_orig_assign(conversation_key, holdout_fraction)
+
+            def _hd_ow_label(arm, key):
+                if arm == "control" and _hd_ow_req.get():
+                    return _HD_OW_LABEL + key
+                return _hd_ow_orig_label(arm, key)
+
+            def _hd_ow_parse(label):
+                if label.startswith(_HD_OW_LABEL):
+                    return "warmup", label[len(_HD_OW_LABEL) :]
+                return _hd_ow_orig_parse(label)
+
+            def _hd_ow_record(self, arm, key, output_tokens, conversation=None):
+                if arm != "warmup":
+                    return _hd_ow_orig_record(self, arm, key, output_tokens, conversation)
+                self.baseline.observe(key, output_tokens)
+                _hd_ow_recorded[0] = True
+                return None
+
+            def _hd_ow_reload(self):
+                if not _hd_ow_recorded[0]:
+                    return _hd_ow_orig_reload(self)
+                try:
+                    disk = _hd_ow_os.SavingsLedger.load(self._path)
+                except OSError:
+                    return None
+                if disk.baseline.total_samples > self._ledger.baseline.total_samples:
+                    self._ledger.baseline = disk.baseline
+                return None
+
+            def _hd_ow_from_labels(self, labels, output_tokens):
+                labels = tuple(labels or ())
+                recorded = _hd_ow_orig_from_labels(self, labels, output_tokens)
+                if (
+                    recorded
+                    and self._ledger.baseline.total_samples <= _hd_ow_target
+                    and any(str(label).startswith(_HD_OW_LABEL) for label in labels)
+                ):
+                    self.flush()
+                return recorded
+
+            for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):
+                _hd_ow_mod.assign_arm = _hd_ow_assign
+                _hd_ow_mod.stratum_label = _hd_ow_label
+                _hd_ow_mod.parse_stratum_label = _hd_ow_parse
+            _hd_ow_os.SavingsLedger.record = _hd_ow_record
+            _hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload
+            _hd_ow_os.SavingsRecorder.record_from_labels = _hd_ow_from_labels
+            _hd_bound.add("output_warmup")
+    except Exception:
+        pass
+
 # --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
 # The learn prompt asks for each rule's content as "1-3 bullet points", and a
 # model that returns them as a JSON array killed the whole analysis: 0.39.0's
@@ -2898,6 +3012,33 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
         _hd_lpe_mod.run = _hd_lpe_run
         _hd_bound.add("learn_prompt_echo")
+    except Exception:
+        pass
+
+# --- Learn: a crashed CLI's padding does not push out its error (diagnostics) --
+# Claude Code is a Bun binary, and Bun prints a crash as a source excerpt whose
+# caret line is padded out to the failing column, ahead of the error itself.
+# The analyzer keeps only the first 2000 chars of a failed CLI's stderr and the
+# padding filled them: Claude Code dying in fs.watch reported the excerpt and
+# never the errno (RUST-M8, macOS, 0.9.30 and 0.9.40). Runs of 64+ blanks are
+# squeezed to one before the cut. Not version-gated: stderr without such a run
+# passes through unchanged. Kill switch: HEADROOM_LEARN_STDERR_SQUEEZE=0.
+_hd_lsq_flag = _hd_os.environ.get("HEADROOM_LEARN_STDERR_SQUEEZE", "1")
+if _hd_lsq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import re as _hd_lsq_re
+        from headroom.learn import analyzer as _hd_lsq_mod
+
+        _hd_lsq_orig = _hd_lsq_mod._failure_detail
+        _hd_lsq_pad = _hd_lsq_re.compile(r"[ \t]{64,}")
+
+        def _hd_lsq_detail(stderr, *args, **kwargs):
+            if isinstance(stderr, str):
+                stderr = _hd_lsq_pad.sub(" ", stderr)
+            return _hd_lsq_orig(stderr, *args, **kwargs)
+
+        _hd_lsq_mod._failure_detail = _hd_lsq_detail
+        _hd_bound.add("learn_stderr_squeeze")
     except Exception:
         pass
 
@@ -3755,6 +3896,85 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's fingerprint.
         pass
 
+# --- Prefix tracker: outlive the cache the client asked for -------------------
+# The session store drops a conversation's tracker 600s after its last request
+# (prefix_freeze_session_ttl, not settable from the CLI or env), but Claude
+# Code marks its cache breakpoints ttl "1h". A resume 10-60 minutes later found
+# Anthropic's cache warm and the proxy with no tracker: frozen=0, the whole
+# history re-run, its output differing from the cached bytes, and the message
+# tier re-written (cache_read down to the system+tools prefix). On one machine
+# over two days the cliff sat exactly at 600s: 0 of 23 resumes after 5-10
+# minutes re-wrote more than half the prefix, 4 of 11 after 10-20 minutes did
+# (141k-316k each), and a 59-minute resume re-wrote 340k; 1.31M tokens, 2.6x
+# what that window's one mid-session backend restart cost (2026-10-16). No
+# CACHE-MISS-ATTRIBUTION line is logged for these (there is no tracker to
+# attribute with). A tracker whose client asked for a 1h breakpoint now lives
+# 61 minutes; every other tracker keeps the wheel's TTL. RAISES cache reads,
+# may LOWER tok_saved/tok_before (the re-run re-compressed history the freeze
+# keeps verbatim) and RAISE the app's input % (cache writes are new input), so
+# check all three with savings:did after the stable ships. Upstream #4023
+# (merged 2026-10-07, in wheel 0.41.0) fixes this the same way, with the same
+# 60s margin; drop the vendor on that bump.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel has #4023's
+# observe_cache_ttl or its tracker already outlives a 1h breakpoint. Kill
+# switch: HEADROOM_TRACKER_CACHE_TTL=0.
+_hd_tct_flag = _hd_os.environ.get("HEADROOM_TRACKER_CACHE_TTL", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_tct_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_tct_meta
+
+        if _hd_tct_meta.version("headroom-ai") == "0.39.0":
+            import time as _hd_tct_time
+
+            from headroom.cache import prefix_tracker as _hd_tct_pt
+
+            _hd_tct_cls = _hd_tct_pt.PrefixCacheTracker
+            _hd_tct_orig = _hd_tct_cls.is_expired
+
+            def _hd_tct_wants_1h(tracker):
+                # Cached per message list: the tracker replaces it every turn.
+                msgs = tracker._last_original_messages
+                if getattr(tracker, "_hd_tct_seen", None) is not msgs:
+                    tracker._hd_tct_1h = any(
+                        isinstance(b, dict)
+                        and isinstance(b.get("cache_control"), dict)
+                        and b["cache_control"].get("ttl") == "1h"
+                        for m in msgs
+                        if isinstance(m, dict) and isinstance(m.get("content"), list)
+                        for b in m["content"]
+                    )
+                    tracker._hd_tct_seen = msgs
+                return tracker._hd_tct_1h
+
+            def _hd_tct_is_expired(self):
+                ttl = self.config.session_ttl_seconds
+                if _hd_tct_wants_1h(self):
+                    ttl = max(ttl, 3660)  # the 1h cache plus the store's 60s sweep
+                return (_hd_tct_time.time() - self._last_activity) > ttl
+
+            _hd_tct_probe = _hd_tct_cls("anthropic")
+            _hd_tct_probe._last_original_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                    ],
+                }
+            ]
+            _hd_tct_probe._last_activity -= 700
+            if (
+                not hasattr(_hd_tct_cls, "observe_cache_ttl")
+                and isinstance(_hd_tct_orig, property)
+                and _hd_tct_orig.fget(_hd_tct_probe)
+            ):
+                _hd_tct_cls.is_expired = property(_hd_tct_is_expired)
+                _hd_bound.add("tracker_cache_ttl")
+    except Exception:
+        # Fail-open to the wheel's 600s tracker life.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -3864,12 +4084,14 @@ _HD_VENDORS = (
     "proxied_guarded_upstreams",
     "upstream_tcp_keepalive",
     "holdout_key",
+    "output_warmup",
     "learn_rule_coerce",
     "learn_worktree_merge",
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_codex_retries",
     "learn_prompt_echo",
+    "learn_stderr_squeeze",
     "learn_stdin_early_exit",
     "image_memo",
     "image_worker_reap",
@@ -3879,6 +4101,7 @@ _HD_VENDORS = (
     "web_search_history",
     "buffered_upstream_stream",
     "deferred_tool_affinity",
+    "tracker_cache_ttl",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -4565,7 +4788,7 @@ fn extract_msvc_runtime_dlls(wheel_path: &Path, targets: &[&Path]) -> Result<usi
     let mut extracted = 0usize;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let Some(name) = msvc_runtime_dll_name(entry.name()).map(str::to_owned) else {
+        let Some(name) = msvc_runtime_dll_name(&entry.name()?).map(str::to_owned) else {
             continue;
         };
         let mut bytes = Vec::with_capacity(entry.size() as usize);
@@ -17319,12 +17542,19 @@ impl std::fmt::Display for CommandFailure {
             (None, Some(sig)) => format!("killed by signal {}", sig),
             (None, None) => "killed by signal".to_string(),
         };
+        // An inline `-c` script (the MCP registrar helpers) filled Sentry's
+        // 400-char message cap before the stderr that names the cause (RUST-QJ).
+        let args: Vec<&str> = self
+            .args
+            .iter()
+            .map(|arg| if arg.contains('\n') { "<script>" } else { arg })
+            .collect();
         write!(
             f,
             "command failed ({}): {} {}\nstdout:\n{}\nstderr:\n{}",
             status,
             self.program,
-            self.args.join(" "),
+            args.join(" "),
             self.stdout,
             self.stderr
         )
@@ -18650,6 +18880,29 @@ asyncio.run(main())
     }
 
     #[test]
+    fn sitecustomize_vendors_output_warmup() {
+        // An install with no seeded baseline learns one from its first unshaped
+        // replies. Behaviour is proven by
+        // output_warmup_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the default the
+        // dashboard's progress mirrors, and the rebinds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains(&format!(
+            r#"_hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "{}")"#,
+            crate::output_savings::OUTPUT_WARMUP_REPLIES
+        )));
+        assert!(py.contains(&format!(
+            "else {}",
+            crate::output_savings::OUTPUT_WARMUP_REPLIES
+        )));
+        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
+        assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
+        assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));
+        assert!(py.contains("_hd_ow_os.SavingsRecorder.record_from_labels = _hd_ow_from_labels"));
+    }
+
+    #[test]
     fn sitecustomize_vendors_codex_whole_read() {
         // Codex code-mode `text(r)` wraps a file read in the exec result JSON,
         // which the wheel's content gate can judge as releasable JSON and
@@ -19552,6 +19805,42 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     }
 
     #[test]
+    fn learn_stderr_squeeze_behaves_against_the_installed_wheel() {
+        // RUST-M8: a Bun crash's padded caret line no longer pushes the error
+        // past the analyzer's stderr cut; the kill switch restores the cut.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-sq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn import analyzer as a\n\
+                     d = a._failure_detail('29 | fs.watch(path)\\n' + ' ' * 3000 + '^\\nerror: EMFILE: too many open files, watch\\n', '')\n\
+                     print('EMFILE' in d, len(d) <= a._MAX_SNIPPET_LEN)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_STDERR_SQUEEZE", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True", "stderr:\n{off_err}");
+    }
+
+    #[test]
     fn learn_stdin_early_exit_behaves_against_the_installed_wheel() {
         // RUST-MZ: a claude CLI that exits before reading the prompt fails the
         // analyzer's stdin write; the CLI's own error comes back instead of
@@ -20215,6 +20504,62 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
     }
 
     #[test]
+    fn tracker_cache_ttl_behaves_against_the_installed_wheel() {
+        // A conversation whose client asked for a 1h breakpoint keeps its
+        // tracker through a 20-minute pause and loses it after 61 minutes; one
+        // without the marker keeps the wheel's 600s. The kill switch restores
+        // the wheel's 600s for both.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-tracker-ttl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import sitecustomize, time\n\
+                     from headroom.cache import prefix_tracker as pt\n\
+                     def msgs(ttl):\n    \
+                         cc = {'type': 'ephemeral', **({'ttl': ttl} if ttl else {})}\n    \
+                         return [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi', 'cache_control': cc}]}]\n\
+                     s = pt.SessionTrackerStore()\n\
+                     for sid, ttl in (('long', '1h'), ('short', None)):\n    \
+                         t = s.get_or_create(sid, 'anthropic')\n    \
+                         t.update_from_response(5000, 0, msgs(ttl), original_messages=msgs(ttl))\n    \
+                         t._last_activity -= 1200\n\
+                     s._last_cleanup -= 120\n\
+                     s.get_or_create('other', 'anthropic')\n\
+                     kept = ('long' in s._trackers, 'short' in s._trackers)\n\
+                     if kept[0]:\n    \
+                         s._trackers['long']._last_activity -= 2800\n\
+                     print(*kept, s.peek('long') is None, 'tracker_cache_ttl' in sitecustomize._hd_bound)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_TRACKER_CACHE_TTL", kill)
+                .output()
+                .expect("run tracker cache ttl probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: tracker cache ttl vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "True False True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False True False", "stderr:\n{off_err}");
+    }
+
+    #[test]
     fn learn_rule_coercion_behaves_against_the_installed_wheel() {
         // RUST-K5: list content becomes bullets, a non-string section drops
         // its rule, a null rules list reads as empty; the kill switch restores
@@ -20663,6 +21008,8 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
                 .env("PYTHONPATH", &dir)
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
                 .env("HEADROOM_HOLDOUT_KEY", kill)
+                // With no baseline (CI) the output warm-up vendor puts every new conversation in control.
+                .env("HEADROOM_OUTPUT_WARMUP", "0")
                 .output()
                 .expect("run holdout key probe");
             (
@@ -20682,6 +21029,82 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
             "kill switch arm:\n{off_err}"
         );
         assert_eq!(on, "400 400 True True True True", "stderr:\n{on_err}");
+    }
+
+    #[test]
+    fn output_warmup_behaves_against_the_installed_wheel() {
+        // With an empty baseline and a warm-up of 5, the first 5 conversations
+        // run unshaped under the warm-up label and feed the baseline; the next
+        // new conversation is shaped while a warm-up one stays unshaped; the
+        // baseline survives the recorder's flushes (its reload would otherwise
+        // drop it); the A/B control arm stays empty; and a shaped reply is then
+        // credited against the learned baseline (500 - 300); and a warm-up
+        // reply on a default recorder (writes every 25th) is on disk without a
+        // flush, as a backend restarted after one reply needs. The kill switch
+        // restores the wheel: everything shaped, nothing learned, no credit.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-output-warmup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"
+import json, os, tempfile
+import sitecustomize
+from headroom.proxy import output_savings as om
+from headroom.proxy.output_savings import assign_arm, stratum_label, conversation_label
+path = os.path.join(tempfile.mkdtemp(), 'output_savings.json')
+om._RECORDER = om.SavingsRecorder(path, flush_every=2)
+rec = om._RECORDER
+key = 'opus|mech_cont|m|tools'
+def turn(conv, tokens):
+    arm = assign_arm(conv, 0.0)
+    labels = [stratum_label(arm, key), conversation_label(conv)]
+    if arm == 'treatment':
+        labels.append('output_shaper:verbosity:L2')
+    rec.record_from_labels(labels, tokens)
+    return arm, labels[0].split(':')[1]
+first = [turn('c%d' % i, 500) for i in range(5)]
+new, old = turn('fresh', 300), turn('c0', 500)
+rec.flush()
+disk = json.load(open(path))
+rec_n = rec._ledger.baseline.total_samples
+credit = rec.estimate_request_savings([stratum_label('treatment', key)], 300)
+rec = om._RECORDER = om.SavingsRecorder(os.path.join(tempfile.mkdtemp(), 'output_savings.json'))
+turn('restarted', 400)
+kept = json.load(open(rec._path))['baseline']['glob']['n'] if rec._path.exists() else 0
+print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}), first[0][1],
+      new[0], old[0], rec_n, disk['baseline']['glob']['n'],
+      len(disk['control']), credit, kept)
+"#;
+        let run = |warmup: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_OUTPUT_WARMUP", warmup)
+                .output()
+                .expect("run output warmup probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("5");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on, "True ['control'] warmup treatment control 6 6 0 200 1",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off, "False ['treatment'] stratum treatment treatment 0 0 0 0 0",
+            "kill switch arm:\n{off_err}"
+        );
     }
 
     #[test]
@@ -21896,6 +22319,28 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
             failure.stderr
         );
         assert_eq!(failure.program, "/bin/sh");
+    }
+
+    #[test]
+    fn command_failure_message_elides_an_inline_script() {
+        let failure = CommandFailure {
+            program: "python.exe".into(),
+            args: vec![
+                "-c".into(),
+                super::CONTEXT7_MCP_HELPER.into(),
+                "register".into(),
+            ],
+            stdout: "Codex: failed\n".into(),
+            stderr: "Codex: config.toml is not valid TOML\n".into(),
+            exit_code: Some(1),
+            signal: None,
+        };
+        let message = failure.to_string();
+        assert!(
+            message.starts_with("command failed (exit 1): python.exe -c <script> register\n"),
+            "{message}"
+        );
+        assert!(message.len() < 400, "{message}");
     }
 
     #[test]
@@ -23890,6 +24335,7 @@ time.sleep(30)
     }
 
     #[test]
+    #[serial_test::serial]
     fn every_entrypoint_disables_the_wheel_rate_limiter() {
         backend_port::reset_for_tests();
 
@@ -27035,7 +27481,9 @@ Always run the linter first.
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
 
         manager
-            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            // The production timeout, not a short one: a freshly written script's first
+            // exec can take seconds under full-suite load, and the kill reads as a failure.
+            .smoke_test_headroom_with_timeout(super::HEADROOM_SMOKE_TEST_TIMEOUT)
             .expect("smoke test succeeds");
 
         let _ = fs::remove_dir_all(root);
@@ -27051,7 +27499,7 @@ Always run the linter first.
         );
 
         let err = manager
-            .smoke_test_headroom_with_timeout(Duration::from_secs(2))
+            .smoke_test_headroom_with_timeout(super::HEADROOM_SMOKE_TEST_TIMEOUT)
             .expect_err("smoke test should fail");
         let failure = err
             .chain()
@@ -28011,7 +28459,7 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
 
         manager
-            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
             .expect("smoke test succeeds");
 
         let _ = fs::remove_dir_all(root);
@@ -28028,7 +28476,7 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 3\n");
 
         manager
-            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
             .expect_err("smoke test should fail");
 
         let _ = fs::remove_dir_all(root);

@@ -358,6 +358,64 @@ fn capture_http_status(action_slug: &str, msg: &str, status: u16) {
     );
 }
 
+/// Every response from headroom-web carries a stamp from one of its layers:
+/// Cloudflare (`cf-ray`), Railway's edge (`x-railway-request-id`) or Rails
+/// itself (`x-runtime`), error pages included. A response with none of them
+/// never reached our infrastructure: a company proxy or TLS-inspecting
+/// firewall wrote it (RUST-QN/QP: a 2xx non-JSON page, then a 500, while
+/// Railway logged no request_code at all). Returns the user-facing message.
+fn intermediary_failure(action: &str, response: &reqwest::blocking::Response) -> Option<String> {
+    let headers = response.headers();
+    if ["cf-ray", "x-railway-request-id", "x-runtime"]
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return None;
+    }
+    Some(format!(
+        "Could not {action}: a proxy or firewall on this network answered instead of \
+         Headroom's server (status {}). Ask your IT team to allow extraheadroom.com, or try \
+         another network.",
+        response.status().as_u16()
+    ))
+}
+
+fn is_json_response(response: &reqwest::blocking::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("json"))
+}
+
+/// The user's network, not ours: once per session at Warning, like the
+/// transient transport class, with the proxy's `server` header so the product
+/// in the way is visible.
+fn capture_intermediary_response(
+    action_slug: &'static str,
+    msg: &str,
+    response: &reqwest::blocking::Response,
+) {
+    if !claim_transient_report_slot(action_slug, "intermediary") {
+        return;
+    }
+    let status = response.status().as_u16().to_string();
+    let server = response
+        .headers()
+        .get(reqwest::header::SERVER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["http-intermediary", action_slug]));
+            scope.set_tag("http.status", status.as_str());
+            scope.set_extra("server", server.into());
+        },
+        || sentry::capture_message(msg, sentry::Level::Warning),
+    );
+}
+
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
     match tier {
         ClaudePlanTier::Free => "free",
@@ -1101,7 +1159,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
@@ -1561,8 +1619,15 @@ pub(crate) fn request_auth_code_with_base_url(
         break response;
     };
 
+    let status = response.status().as_u16();
+    if !response.status().is_success() || !is_json_response(&response) {
+        if let Some(msg) = intermediary_failure("request a sign-in code", &response) {
+            capture_intermediary_response("auth-request-code", &msg, &response);
+            return Err(msg);
+        }
+    }
+
     if !response.status().is_success() {
-        let status = response.status().as_u16();
         let msg = format!("Could not request sign-in code (status {status}).");
         if status >= 500 {
             capture_http_status("auth-request-code", &msg, status);
@@ -1646,7 +1711,7 @@ pub(crate) fn verify_auth_code_with_base_url(
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
@@ -1839,7 +1904,7 @@ pub(crate) fn activate_account_with_retry_backoff(
     // payload reports to headroom-web. `None` = no Codex evidence at all →
     // no recommendation; explicit `Unknown` (evidence, unclassifiable plan)
     // still maps conservatively to Max x20.
-    let codex_plan = crate::client_adapters::is_codex_enabled()
+    let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
     let tier_mismatch = resolve_tier_mismatch(
@@ -1947,6 +2012,7 @@ pub struct SavingsDay {
     pub client_requests: Option<std::collections::BTreeMap<String, u64>>,
     pub rate_limit_429s: Option<std::collections::BTreeMap<String, u64>>,
     pub failed_requests: Option<std::collections::BTreeMap<String, u64>>,
+    pub failure_kinds: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// Fire-and-forget: reports a milestone to the server so it can trigger
@@ -6750,7 +6816,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
             let response = format!(
-                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "{status_line}\r\nX-Runtime: 0.001\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body_bytes.len(),
                 body_bytes
             );
@@ -7042,6 +7108,42 @@ mod tests {
 
         server.join().unwrap();
         assert!(err.contains("status 500"));
+        assert!(!err.contains("proxy"), "{err}");
+        drop_state(dir);
+    }
+
+    #[test]
+    fn request_auth_code_names_a_proxy_that_answered_instead() {
+        // RUST-QN: a company proxy's 200 HTML page, with none of the
+        // Cloudflare/Railway/Rails stamps every headroom-web response carries.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.read(&mut [0u8; 4096]);
+            let body = "<html>Blocked by policy</html>";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let (state, dir) = temp_app_state();
+
+        let err = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a proxy page is not a sign-in response");
+
+        server.join().unwrap();
+        assert!(err.contains("proxy or firewall"), "{err}");
+        assert!(err.contains("status 200"), "{err}");
         drop_state(dir);
     }
 
@@ -7381,7 +7483,7 @@ mod tests {
                     ("HTTP/1.1 200 OK", success_body.clone())
                 };
                 let response = format!(
-                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "{status}\r\nX-Runtime: 0.001\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );

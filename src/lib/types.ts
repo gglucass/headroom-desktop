@@ -104,6 +104,12 @@ export interface DailySavingsPoint {
 // Counterfactual output-token reduction from the proxy's output shaper.
 // `method` is "estimated" (synthetic control vs a learned baseline) or
 // "measured" (A/B holdout); the percentage carries a 95% confidence band.
+/** An install with no seeded baseline learning one from its first unshaped replies. */
+export interface OutputWarmup {
+  replies: number;
+  target: number;
+}
+
 export interface OutputReduction {
   method: string;
   /** Enabled addon that also shapes replies. On an estimated figure the
@@ -207,6 +213,8 @@ export interface DashboardState {
   outputReduction: OutputReduction | null;
   /** The backend's output shaper is switched on; absent when unknown. */
   outputShaperActive?: boolean | null;
+  /** The output warm-up while it runs; absent once a baseline exists. */
+  outputWarmup?: OutputWarmup | null;
   learnerProgress: LearnerProgress | null;
   savingsBreakdown: SavingsBreakdown | null;
   dailySavings: DailySavingsPoint[];

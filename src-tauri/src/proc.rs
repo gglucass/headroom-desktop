@@ -114,27 +114,7 @@ impl PipeDrain {
 /// so for a child that leads none this is ESRCH.
 pub fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
-    {
-        use std::process::Stdio;
-        let spawned = command("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(mut taskkill) = spawned {
-            // Bounded, and not via output_with_timeout (which calls this):
-            // taskkill /T enumerates through the machinery a wedged WMI stalls.
-            let started = std::time::Instant::now();
-            while matches!(taskkill.try_wait(), Ok(None))
-                && started.elapsed() < std::time::Duration::from_secs(5)
-            {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            let _ = taskkill.kill();
-            let _ = taskkill.wait();
-        }
-    }
+    crate::winproc::kill_tree(child.id());
     #[cfg(unix)]
     if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
         // Never 0 or 1: that would name our own group, or init's.
@@ -149,7 +129,7 @@ pub fn kill_tree(child: &mut std::process::Child) {
 /// what it starts: an npm-installed codex is a node shim whose native binary
 /// is a grandchild, and pip has subprocesses. Killed alone, the shim left the
 /// worker running and holding the pipes. Windows needs nothing here:
-/// `kill_tree` walks the tree with `taskkill /T`.
+/// `kill_tree` walks the process tree.
 pub fn own_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -352,6 +332,47 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "grandchild {pid} survived the timeout kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// The native tree kill reaches a grandchild, as `taskkill /T` did.
+    #[cfg(windows)]
+    #[test]
+    fn kill_tree_takes_the_grandchildren_without_taskkill() {
+        let mut child = super::command("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn cmd");
+        let cmd_pid = child.id();
+        let child_of_cmd = || {
+            crate::winproc::process_parents()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|&(_, ppid)| ppid == cmd_pid)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ping = loop {
+            if let Some(found) = child_of_cmd() {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd never started ping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        super::kill_tree(&mut child);
+        let _ = child.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::winproc::process_parents()
+            .unwrap_or_default()
+            .contains(&ping)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {ping:?} survived the tree kill"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

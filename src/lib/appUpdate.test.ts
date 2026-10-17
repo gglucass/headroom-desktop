@@ -450,6 +450,18 @@ describe("app update helpers", () => {
     ).toEqual({ statusCopy: moved });
     expect(Sentry.captureException).not.toHaveBeenCalled();
 
+    const otherDisk =
+      "Headroom cannot update itself because it is on a different disk than macOS's " +
+      "temporary folder. Move Headroom to your Applications folder and open it from there, " +
+      "then check for updates again.";
+    expect(
+      await runAppUpdateInstall({
+        availableUpdate,
+        invokeFn: vi.fn().mockRejectedValueOnce(otherDisk),
+      })
+    ).toEqual({ statusCopy: otherDisk });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
     await runAppUpdateInstall({
       availableUpdate,
       invokeFn: vi.fn().mockRejectedValueOnce("permission denied"),
@@ -671,6 +683,30 @@ describe("maybeFireStaleAppUpdateNotification", () => {
     });
   });
 
+  it("reports that it fired, so the caller opens the update dialog, and only once", async () => {
+    installStorage(waiting(6));
+    const invokeFn = vi.fn().mockResolvedValue(undefined);
+
+    await expect(maybeFireStaleAppUpdateNotification(availableUpdate, invokeFn)).resolves.toBe(true);
+    await expect(maybeFireStaleAppUpdateNotification(availableUpdate, invokeFn)).resolves.toBe(false);
+    expect(invokeFn).toHaveBeenCalledOnce();
+  });
+
+  it("asks a staged build for a restart, not an install", async () => {
+    // The idle applier needs a quiet awake hour; a machine busy whenever it
+    // is awake never gets one, so a staged build waited forever unprompted.
+    installStorage(waiting(6));
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+
+    await maybeFireStaleAppUpdateNotification(availableUpdate, invokeFn, true);
+
+    expect(invokeFn).toHaveBeenCalledWith("show_notification", {
+      title: "Headroom update waiting",
+      body: expect.stringMatching(/0\.3\.0 is installed and has been waiting 6 days for a restart/),
+      action: "update",
+    });
+  });
+
   it("fires on a fortnight-old build even when the release on offer is brand new", async () => {
     // The regression this replaced: publish-date gating made every fresh
     // release reset the clock, so the users furthest behind were never nagged.
@@ -760,6 +796,6 @@ describe("maybeFireStaleAppUpdateNotification", () => {
 
     await expect(
       maybeFireStaleAppUpdateNotification(availableUpdate, invokeFn)
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 });
