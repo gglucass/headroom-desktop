@@ -450,6 +450,18 @@ describe("app update helpers", () => {
     ).toEqual({ statusCopy: moved });
     expect(Sentry.captureException).not.toHaveBeenCalled();
 
+    const otherDisk =
+      "Headroom cannot update itself because it is on a different disk than macOS's " +
+      "temporary folder. Move Headroom to your Applications folder and open it from there, " +
+      "then check for updates again.";
+    expect(
+      await runAppUpdateInstall({
+        availableUpdate,
+        invokeFn: vi.fn().mockRejectedValueOnce(otherDisk),
+      })
+    ).toEqual({ statusCopy: otherDisk });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
     await runAppUpdateInstall({
       availableUpdate,
       invokeFn: vi.fn().mockRejectedValueOnce("permission denied"),
