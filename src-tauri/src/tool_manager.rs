@@ -4772,7 +4772,7 @@ fn extract_msvc_runtime_dlls(wheel_path: &Path, targets: &[&Path]) -> Result<usi
     let mut extracted = 0usize;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let Some(name) = msvc_runtime_dll_name(entry.name()).map(str::to_owned) else {
+        let Some(name) = msvc_runtime_dll_name(&entry.name()?).map(str::to_owned) else {
             continue;
         };
         let mut bytes = Vec::with_capacity(entry.size() as usize);
