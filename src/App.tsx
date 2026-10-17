@@ -551,21 +551,23 @@ const STARTER_PROMPT =
 // real prompt is the actual gap here (10% of mature signups send exactly one
 // prompt ever), so hand over something paste-able that works in any repo.
 function StarterPrompt() {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  // WebKitGTK can refuse clipboard writes even on a click (RUST-QT: an
+  // unhandled NotAllowedError); the prompt stays selectable beside the button.
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(STARTER_PROMPT);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    window.setTimeout(() => setCopyState("idle"), 2000);
+  }
   return (
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
-        <button
-          className="secondary-button"
-          onClick={() => {
-            void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 2000);
-            });
-          }}
-          type="button"
-        >
-          {copied ? "Copied" : "Copy prompt"}
+        <button className="secondary-button" onClick={() => void copy()} type="button">
+          {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy prompt"}
         </button>
       </div>
   );
