@@ -2053,6 +2053,7 @@ export default function App() {
   // showing per app run instead of resurrecting itself on every poll.
   const forcedSetupStallFiredRef = useRef(false);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
+  const appUpdateAvailableRef = useRef<AvailableAppUpdate | null>(null);
   const appUpdateStagedVersionRef = useRef<string | null>(null);
   const appUpdateBusyRef = useRef(false);
   const appUpdateInstallBusyRef = useRef(false);
@@ -3138,7 +3139,8 @@ export default function App() {
 
   useEffect(() => {
     appUpdateKnownVersionRef.current = appUpdateAvailable?.version ?? null;
-  }, [appUpdateAvailable?.version]);
+    appUpdateAvailableRef.current = appUpdateAvailable;
+  }, [appUpdateAvailable]);
 
   useEffect(() => {
     appUpdateStagedVersionRef.current = appUpdateStagedVersion;
@@ -4058,6 +4060,14 @@ export default function App() {
       });
       applyAppUpdatePatch(patch);
 
+      // A staged update's echo comes back as an empty patch, so it skips the
+      // branch below; without this a build staged for restart was never
+      // prompted while the idle applier waited for a quiet hour.
+      if (background && !patch.availableUpdate && appUpdateStagedVersionRef.current) {
+        await promptIfUpdateStale(appUpdateAvailableRef.current, true);
+        return;
+      }
+
       if (background && patch.availableUpdate) {
         // Quiet releases on macOS and a Linux AppImage stage themselves:
         // silent download+install, then only a passive "restart to finish"
@@ -4071,15 +4081,12 @@ export default function App() {
           void installAvailableUpdate(patch.availableUpdate, { quiet: true });
           // A quiet install that fails every time (read-only or translocated
           // bundle) would leave this build unannounced forever. The stale
-          // reminder is its fallback: the clock starts now, and a staged
-          // update proves quiet installs work, so a newer release re-staging
-          // on top of it must not nag "install" for what only needs a restart.
-          if (
-            !appUpdateStagedVersionRef.current &&
-            !(await getCurrentWindow().isVisible().catch(() => false))
-          ) {
-            await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
-          }
+          // reminder is its fallback: the clock starts now. With a build
+          // already staged it asks for the restart instead of an install.
+          await promptIfUpdateStale(
+            patch.availableUpdate,
+            Boolean(appUpdateStagedVersionRef.current)
+          );
           return;
         }
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
@@ -4095,12 +4102,23 @@ export default function App() {
         // Never stack the stale reminder onto the tick that just announced
         // the release — first discovery of an old version used to fire both
         // notifications at once.
-        if (!windowVisible && !notifyFresh) {
-          await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
+        if (!notifyFresh) {
+          await promptIfUpdateStale(patch.availableUpdate, false);
         }
       }
     } finally {
       setAppUpdateBusy(false);
+    }
+  }
+
+  // After 5 days waiting: a notification now, and the update dialog on the
+  // user's next look at Headroom (a notification alone was easy to miss).
+  async function promptIfUpdateStale(update: AvailableAppUpdate | null, staged: boolean) {
+    if (await getCurrentWindow().isVisible().catch(() => false)) {
+      return;
+    }
+    if (await maybeFireStaleAppUpdateNotification(update, invoke, staged)) {
+      setShowAppUpdateDialog(true);
     }
   }
 
