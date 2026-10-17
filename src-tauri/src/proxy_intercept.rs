@@ -4329,6 +4329,19 @@ async fn forward_direct_to_anthropic(
         return;
     };
 
+    // Routed, just not compressed: without this a session whose first request
+    // went direct (backend booting on first launch, in-flight cap full) reads
+    // "not active in this session: restart Claude Code" until a request reaches
+    // the backend, and restarting Claude Code changes nothing.
+    if is_prompt_request_head(&parsed) {
+        if let Some(id) =
+            extract_header_value(&header_buf[..header_end], "x-claude-code-session-id")
+                .filter(|id| is_claude_session_id(id))
+        {
+            crate::claude_statusline::record_routed(&id);
+        }
+    }
+
     // These paths are served by the local Python proxy, not Anthropic. In
     // bypass mode the proxy is intentionally down, so reply 503 instead of
     // forwarding upstream (which would either fail noisily or, worse, hit a
