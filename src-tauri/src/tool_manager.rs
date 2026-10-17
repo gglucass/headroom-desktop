@@ -2622,8 +2622,11 @@ if _hd_os.environ.get(
 # recorder re-reads the disk baseline on each flush and adopts it whenever it
 # differs, which would drop every warm-up sample before it is written, so once
 # this process has recorded one it adopts only a larger (re-learned) disk
-# baseline. Not a wheel bug, so it never self-neutralizes. Exact-pin gated to
-# wheel 0.39.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+# baseline. The recorder also writes only every 25th record and never at exit,
+# so a backend restarted sooner lost its warm-up replies (the train guest sat at
+# 10 after 35 of them, 2026-10-17): each warm-up reply is written until the
+# baseline reaches the target. Not a wheel bug, so it never self-neutralizes.
+# Exact-pin gated to wheel 0.39.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
 _hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
 if _hd_os.environ.get(
     "HEADROOM_SDK"
@@ -2651,6 +2654,7 @@ if _hd_os.environ.get(
             _hd_ow_orig_parse = _hd_ow_pol.parse_stratum_label
             _hd_ow_orig_record = _hd_ow_os.SavingsLedger.record
             _hd_ow_orig_reload = _hd_ow_os.SavingsRecorder._reload_baseline_locked
+            _hd_ow_orig_from_labels = _hd_ow_os.SavingsRecorder.record_from_labels
 
             def _hd_ow_assign(conversation_key, holdout_fraction):
                 warm = conversation_key in _hd_ow_convs
@@ -2692,12 +2696,24 @@ if _hd_os.environ.get(
                     self._ledger.baseline = disk.baseline
                 return None
 
+            def _hd_ow_from_labels(self, labels, output_tokens):
+                labels = tuple(labels or ())
+                recorded = _hd_ow_orig_from_labels(self, labels, output_tokens)
+                if (
+                    recorded
+                    and self._ledger.baseline.total_samples <= _hd_ow_target
+                    and any(str(label).startswith(_HD_OW_LABEL) for label in labels)
+                ):
+                    self.flush()
+                return recorded
+
             for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):
                 _hd_ow_mod.assign_arm = _hd_ow_assign
                 _hd_ow_mod.stratum_label = _hd_ow_label
                 _hd_ow_mod.parse_stratum_label = _hd_ow_parse
             _hd_ow_os.SavingsLedger.record = _hd_ow_record
             _hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload
+            _hd_ow_os.SavingsRecorder.record_from_labels = _hd_ow_from_labels
             _hd_bound.add("output_warmup")
     except Exception:
         pass
@@ -18883,6 +18899,7 @@ asyncio.run(main())
         assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
         assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
         assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));
+        assert!(py.contains("_hd_ow_os.SavingsRecorder.record_from_labels = _hd_ow_from_labels"));
     }
 
     #[test]
@@ -21021,7 +21038,9 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         // new conversation is shaped while a warm-up one stays unshaped; the
         // baseline survives the recorder's flushes (its reload would otherwise
         // drop it); the A/B control arm stays empty; and a shaped reply is then
-        // credited against the learned baseline (500 - 300). The kill switch
+        // credited against the learned baseline (500 - 300); and a warm-up
+        // reply on a default recorder (writes every 25th) is on disk without a
+        // flush, as a backend restarted after one reply needs. The kill switch
         // restores the wheel: everything shaped, nothing learned, no credit.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
@@ -21053,10 +21072,14 @@ first = [turn('c%d' % i, 500) for i in range(5)]
 new, old = turn('fresh', 300), turn('c0', 500)
 rec.flush()
 disk = json.load(open(path))
+rec_n = rec._ledger.baseline.total_samples
 credit = rec.estimate_request_savings([stratum_label('treatment', key)], 300)
+rec = om._RECORDER = om.SavingsRecorder(os.path.join(tempfile.mkdtemp(), 'output_savings.json'))
+turn('restarted', 400)
+kept = json.load(open(rec._path))['baseline']['glob']['n'] if rec._path.exists() else 0
 print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}), first[0][1],
-      new[0], old[0], rec._ledger.baseline.total_samples, disk['baseline']['glob']['n'],
-      len(disk['control']), credit)
+      new[0], old[0], rec_n, disk['baseline']['glob']['n'],
+      len(disk['control']), credit, kept)
 "#;
         let run = |warmup: &str| {
             let out = crate::proc::command(&python)
@@ -21075,11 +21098,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            on, "True ['control'] warmup treatment control 6 6 0 200",
+            on, "True ['control'] warmup treatment control 6 6 0 200 1",
             "stderr:\n{on_err}"
         );
         assert_eq!(
-            off, "False ['treatment'] stratum treatment treatment 0 0 0 0",
+            off, "False ['treatment'] stratum treatment treatment 0 0 0 0 0",
             "kill switch arm:\n{off_err}"
         );
     }
