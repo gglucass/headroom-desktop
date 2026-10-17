@@ -546,6 +546,11 @@ pub struct RuntimeStatus {
     /// resetting connections to the intercept; `None` once that stops.
     #[serde(default)]
     pub local_connection_filter_hint: Option<String>,
+    /// Prose, one per machine fault on Headroom's data folder (blocked,
+    /// read-only, full disk), from `env_fault`; empty once access works again.
+    /// Every such fault reaches the banner through this one list.
+    #[serde(default)]
+    pub environment_issues: Vec<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }

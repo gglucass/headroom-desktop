@@ -890,6 +890,28 @@ describe("calloutBannerFor", () => {
   const bindHint =
     "Port 6767 is in use by python3.12 (PID 4242). Quit that program, or end it in Task Manager, and Headroom reconnects on its own.";
 
+  it("names an unreadable data folder instead of 'no coding tools connected'", () => {
+    // Shape env_fault::issue_text produces. An unreadable client-setup.json
+    // loads as nothing connected, so connectorPhase reads "disabled" too.
+    const issue =
+      "Headroom can't read its data folder, so your settings and connected tools may look reset. Something on this computer is blocking access to ~/Library/Application Support/Headroom, usually security software or a locked file (Finder: Get Info > Locked). Allow Headroom in that software or unlock the folder; Headroom picks up again on its own.";
+    const status = runtime({ environmentIssues: [issue] });
+    expect(
+      calloutBannerFor({
+        runtimeStatus: status,
+        pricingStatus: pricing(),
+        runtimeIssues: [issue],
+        runtimeHealthy: false,
+        kompressWarming: false,
+        connectorPhase: "disabled"
+      })
+    ).toEqual({
+      tone: "degraded",
+      title:
+        "Headroom needs attention: Headroom can't read its data folder, so your settings and connected tools may look reset."
+    });
+  });
+
   it("names a failed 6767 bind ahead of any pricing banner, since no client can connect", () => {
     const status = runtime({
       running: false,
