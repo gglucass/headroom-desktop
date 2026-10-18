@@ -3804,7 +3804,12 @@ fn capture_watchdog_give_up(
 /// identical in Sentry.
 #[derive(Default, Clone)]
 pub(crate) struct UpgradeBootDiagnostics {
+    /// At failure time. `spawned_child` is the same check right after the
+    /// spawn: true then and false now means the child was stopped or reaped
+    /// mid-validation, and `stopped_by` names the `stop_headroom` caller.
     pub tracked_child: bool,
+    pub spawned_child: bool,
+    pub stopped_by: Option<String>,
     pub new_proxy_log_written: bool,
     pub proxy_port_bound: bool,
     pub python_installed: bool,
@@ -3965,6 +3970,10 @@ pub(crate) fn capture_upgrade_failure(
                     },
                 );
                 scope.set_extra("tracked_child", diag.tracked_child.into());
+                scope.set_extra("spawned_child", diag.spawned_child.into());
+                if let Some(at) = diag.stopped_by.as_deref() {
+                    scope.set_extra("stopped_by", at.into());
+                }
                 scope.set_extra("new_proxy_log_written", diag.new_proxy_log_written.into());
                 scope.set_extra("proxy_port_bound", diag.proxy_port_bound.into());
                 scope.set_extra("python_installed", diag.python_installed.into());

@@ -512,6 +512,11 @@ pub struct AppState {
     /// watchdog give-up capture as "still_alive_or_untracked" with no exit
     /// code (Sentry RUST-53). Cleared on each successful spawn.
     pub last_child_natural_exit: Mutex<Option<String>>,
+    /// Caller of the last `stop_headroom` since the upgrade's boot validation
+    /// spawned its child. RUST-R3 (0.9.42, two Windows hosts) ended with no
+    /// tracked child and no recorded exit, so something stopped it, and the
+    /// event could not say what.
+    pub stop_during_validation: Mutex<Option<&'static std::panic::Location<'static>>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     /// Cause class and technical detail of the most recent bootstrap failure,
     /// captured at the failure site where pip's stderr tail is still in hand.
@@ -731,6 +736,7 @@ impl AppState {
             }),
             last_startup_error: Mutex::new(None),
             last_child_natural_exit: Mutex::new(None),
+            stop_during_validation: Mutex::new(None),
             bootstrap_progress: Mutex::new(BootstrapProgress {
                 running: false,
                 complete: false,
@@ -1288,6 +1294,8 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
 
+        // The upgrade's own pre-install stop is not the one we are after.
+        *self.stop_during_validation.lock() = None;
         let ensure_err = self
             .ensure_headroom_running()
             .err()
@@ -1421,6 +1429,11 @@ impl AppState {
         );
         let boot_diagnostics = crate::UpgradeBootDiagnostics {
             tracked_child: self.headroom_process.lock().is_some(),
+            spawned_child: post_spawn.tracked_child,
+            stopped_by: self
+                .stop_during_validation
+                .lock()
+                .map(|at| format!("{}:{}", at.file(), at.line())),
             new_proxy_log_written,
             proxy_port_bound: proxy_port_accepts_connection(),
             port_occupant: crate::tool_manager::describe_proxy_port_occupant(
@@ -3921,7 +3934,11 @@ impl AppState {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
 
+    #[track_caller]
     pub fn stop_headroom(&self) {
+        if *self.runtime_upgrade_in_progress.lock() {
+            *self.stop_during_validation.lock() = Some(std::panic::Location::caller());
+        }
         // `ensure_headroom_running` holds this lock across a blocking backend
         // start, so a launch racing this stop can hold it for the length of that
         // spawn. Quit must not wait on it: `restart_app` calls us before it can
@@ -13868,6 +13885,25 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(!state.upgrade_install_blocks_spawn());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn stop_headroom_records_its_caller_only_during_an_upgrade() {
+        let base_dir = temp_test_dir("headroom-stop-caller");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        state.stop_headroom();
+        assert!(state.stop_during_validation.lock().is_none());
+
+        *state.runtime_upgrade_in_progress.lock() = true;
+        let line = line!() + 1;
+        state.stop_headroom();
+        let at = state
+            .stop_during_validation
+            .lock()
+            .expect("caller recorded");
+        assert_eq!((at.file(), at.line()), (file!(), line));
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
