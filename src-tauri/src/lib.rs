@@ -8956,6 +8956,27 @@ fn extract_llm_failure_warnings(stderr: &str) -> Option<String> {
     }
 }
 
+/// The normalized signature with only the text after the command capped. The
+/// command is fixed per build, so it never splits an issue, but capping the
+/// whole line let it eat the reason: a Windows CLI path left one letter of
+/// Codex's verdict (RUST-R5), and Claude's `--settings` JSON left none, so
+/// every Claude failure grouped into RUST-M8. Bounded, so a backtick pair in
+/// the stdout fallback cannot uncap the user's text.
+fn learn_failure_signature(head: &str) -> String {
+    let normalized = normalize_learn_failure_signature(head);
+    let command_end = normalized
+        .find('`')
+        .and_then(|open| {
+            normalized[open + 1..]
+                .find('`')
+                .map(|close| open + close + 2)
+        })
+        .filter(|&end| end <= 400)
+        .unwrap_or(0);
+    let (command, reason) = normalized.split_at(command_end);
+    format!("{command}{}", reason.chars().take(160).collect::<String>())
+}
+
 /// Strip the machine-specific part out of an LLM-failure signature so the same
 /// failure groups as one Sentry issue across the fleet.
 ///
@@ -9775,19 +9796,17 @@ fn execute_headroom_learn_run(
                     // usage limit, a dead local route, or our own 400. Warning
                     // (not Error) because some causes are user-environment;
                     // fingerprinted on the reason so the split is visible.
-                    let raw_signature: String = warnings
+                    let first_line = warnings
                         .lines()
                         .map(str::trim)
                         .find(|l| !l.is_empty())
-                        .unwrap_or("no reason")
-                        .chars()
-                        .take(160)
-                        .collect();
+                        .unwrap_or("no reason");
+                    let raw_signature: String = first_line.chars().take(160).collect();
                     // Fingerprint and title on the normalized form: the raw one
                     // carries the machine's resolved CLI path and split one
                     // failure class per user (RUST-A2/RUST-9Z). The unmodified
                     // text stays in `reason` and `stderr_tail` below.
-                    let signature = normalize_learn_failure_signature(&raw_signature);
+                    let signature = learn_failure_signature(first_line);
                     // Same user-environment carve-out as the non-zero-exit
                     // branch below (RUST-B6, RUST-BF): when the agent CLI has no
                     // signed-in session or its plan hit a usage limit, nothing
@@ -9972,13 +9991,7 @@ fn execute_headroom_learn_run(
                 } else {
                     learn_failure_signature_source(signature_source)
                 };
-                let signature: String = normalize_learn_failure_signature(
-                    signature_head
-                        .chars()
-                        .take(160)
-                        .collect::<String>()
-                        .as_str(),
-                );
+                let signature = learn_failure_signature(&signature_head);
                 // Redacted before Sentry sees them: the agent CLI's stderr on an
                 // auth failure is exactly where a key can appear, and one
                 // `sk-ant-…` costs the WHOLE field to the scrubber (RUST-BC's
@@ -12469,22 +12482,22 @@ mod tests {
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
         learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
-        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
-        learn_step_label, lifetime_token_milestone_kind, missing_dependency_modules,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, snap_to_work_area_edges,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        learn_failure_is_agent_unparseable_output, learn_failure_signature,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        missing_dependency_modules, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, savings_report, select_updater_endpoints,
+        snap_to_work_area_edges, startup_error_fingerprint_key, store_checked_update,
+        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -14172,6 +14185,45 @@ mod tests {
             normalize_learn_failure_signature(
                 "LLM analysis failed: `codex -p --output-format stream-json --verbose` failed (exit 1):",
             )
+        );
+    }
+
+    /// RUST-R5: the cap ran before normalization, so a Windows CLI path left
+    /// "E" of Codex's verdict. Only the reason is capped, after the command.
+    #[test]
+    fn learn_failure_signature_keeps_the_reason_past_a_long_command() {
+        let verdict = "ERROR: stream disconnected before completion: Incomplete response returned, reason: max_output_tokens";
+        let windows = learn_failure_signature(&format!(
+            "LLM analysis failed: `C:\\Users\\someone\\AppData\\Roaming\\npm\\codex.CMD exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1): {verdict}"
+        ));
+        assert!(windows.ends_with(verdict), "{windows}");
+        assert_eq!(
+            windows,
+            learn_failure_signature(&format!(
+                "LLM analysis failed: `/opt/homebrew/bin/codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1): {verdict}"
+            ))
+        );
+        // Claude's --settings JSON no longer crowds the reason out (RUST-M8).
+        let claude = learn_failure_signature(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages --tools  --strict-mcp-config --settings {\"disableAllHooks\":true}` failed (exit 1): Prompt is too long",
+        );
+        assert!(claude.ends_with("Prompt is too long"), "{claude}");
+        // The reason itself is still capped, and so is a line with no command.
+        let long = "x".repeat(500);
+        assert_eq!(
+            learn_failure_signature(&format!(
+                "LLM analysis failed: `codex exec` failed (exit 1): {long}"
+            ))
+            .chars()
+            .count(),
+            "LLM analysis failed: `codex exec`".len() + 160
+        );
+        assert_eq!(learn_failure_signature(&long).chars().count(), 160);
+        assert_eq!(
+            learn_failure_signature(&format!("`{long}` {long}"))
+                .chars()
+                .count(),
+            160
         );
     }
 
@@ -16706,13 +16758,7 @@ Some unrelated content.
                       \n\
                       Error: Invalid value for '--project': Path \
                       '/Volumes/zodlightning/sites/nutribaba' is not readable.\n";
-        let signature = normalize_learn_failure_signature(
-            learn_failure_signature_source(stderr)
-                .chars()
-                .take(160)
-                .collect::<String>()
-                .as_str(),
-        );
+        let signature = learn_failure_signature(&learn_failure_signature_source(stderr));
         assert!(
             !signature.contains("is not readable"),
             "signature must not be what the guard tests: {signature}"

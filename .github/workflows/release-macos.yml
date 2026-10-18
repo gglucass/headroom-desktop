@@ -579,11 +579,11 @@ jobs:
           appimage="$(ls "$bundle_dir"/appimage/*.AppImage)"
           deb="$(ls "$bundle_dir"/deb/*.deb)"
 
-          # Derive the updater artifact from the .sig rather than assuming it is
-          # the bare .AppImage: Linux has historically shipped as
-          # .AppImage.tar.gz. A bundler change then surfaces as a missing file
-          # here instead of a manifest whose signature does not match the bytes.
-          sig="$(ls "$bundle_dir"/appimage/*.sig 2>/dev/null | head -1)"
+          # Only a bare .AppImage is installable: the app builds tauri-plugin-updater
+          # without its `zip` feature (Cargo.toml), so an .AppImage.tar.gz update
+          # would be written over the user's AppImage as-is. A bundler change then
+          # fails here instead of shipping that.
+          sig="$(ls "$bundle_dir"/appimage/*.AppImage.sig 2>/dev/null | head -1)"
           [ -n "$sig" ] || { echo "no updater signature in $bundle_dir/appimage" >&2; exit 1; }
           updater_artifact="${sig%.sig}"
           [ -f "$updater_artifact" ] || { echo "signed artifact missing: $updater_artifact" >&2; exit 1; }
@@ -681,7 +681,7 @@ jobs:
           # pruned by the next rc, and so must never be a manifest target).
           mac_sig="$(ls "$workdir"/*_mac.app.tar.gz.sig)"
           win_sig="$(ls "$workdir"/*-setup.exe.sig)"
-          linux_sig="$(ls "$workdir"/*.AppImage.sig "$workdir"/*.AppImage.tar.gz.sig 2>/dev/null | head -1 || true)"
+          linux_sig="$(ls "$workdir"/*.AppImage.sig 2>/dev/null | head -1 || true)"
           [ -n "$linux_sig" ] || { echo "no linux updater signature in $STABLE_TAG" >&2; exit 1; }
           deb_sig="$(ls "$workdir"/*.deb.sig 2>/dev/null | head -1 || true)"
           [ -n "$deb_sig" ] || { echo "no linux deb updater signature in $STABLE_TAG" >&2; exit 1; }

@@ -152,6 +152,22 @@ fn apply_request(sessions: &mut BTreeMap<String, Session>, session_id: &str, now
     evict(sessions);
 }
 
+/// Books a conversation whose request reached Headroom but went straight to
+/// Anthropic (backend still booting, in-flight cap full), so the statusline
+/// says "Headroom on" rather than "not active: restart Claude Code", which a
+/// restart does not fix. Stamps `last_saved_at_ms` with `last_saved` 0: both
+/// readers flash only a nonzero saving, and eviction then sees it as recent.
+/// "compressing" stays off: nothing was compressed.
+fn apply_routed(sessions: &mut BTreeMap<String, Session>, session_id: &str, now_ms: i64) -> bool {
+    if sessions.contains_key(session_id) {
+        return false;
+    }
+    let session = sessions.entry(session_id.to_string()).or_default();
+    session.last_saved_at_ms = now_ms;
+    evict(sessions);
+    true
+}
+
 fn evict(sessions: &mut BTreeMap<String, Session>) {
     while sessions.len() > MAX_SESSIONS {
         let oldest = sessions
@@ -220,6 +236,11 @@ pub fn record_request(session_id: &str) {
         apply_request(&mut state.sessions, session_id, now_ms);
         true
     });
+}
+
+/// A request of this conversation reached Headroom but was not compressed.
+pub fn record_routed(session_id: &str) {
+    update(|state, now_ms| apply_routed(&mut state.sessions, session_id, now_ms));
 }
 
 /// Claude's latest plan usage. Written to disk only when what the readers
@@ -395,6 +416,30 @@ mod tests {
             (a.tokens_saved, a.last_saved, a.last_request_at_ms),
             (900, 900, 7)
         );
+    }
+
+    #[test]
+    fn a_routed_request_books_the_session_once_without_compressing() {
+        let mut sessions = BTreeMap::new();
+        for i in 0..MAX_SESSIONS as i64 {
+            apply(&mut sessions, &format!("s{i}"), 1, i);
+        }
+        assert!(apply_routed(&mut sessions, "new", 1_000));
+        let new = &sessions["new"];
+        assert_eq!(
+            (new.tokens_saved, new.last_saved, new.last_request_at_ms),
+            (0, 0, 0)
+        );
+        assert!(
+            !sessions.contains_key("s0"),
+            "the new session was evicted instead"
+        );
+        // Already booked: no rewrite, and a later saving accumulates as usual.
+        assert!(!apply_routed(&mut sessions, "new", 1_001));
+        apply(&mut sessions, "new", 500, 1_002);
+        assert_eq!(sessions["new"].tokens_saved, 500);
+        assert!(!apply_routed(&mut sessions, "s5", 1_003));
+        assert_eq!(sessions["s5"].last_saved_at_ms, 5);
     }
 
     /// Plan usage survives a restart: the tray reads it back before the first

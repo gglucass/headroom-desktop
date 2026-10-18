@@ -1161,6 +1161,8 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     if broken.is_empty() {
         return false;
     }
+    // Before the re-apply puts the guard back.
+    let guard_shape = (silent_failures == [CLAUDE_GUARD_NOT_FOUND]).then(claude_guard_shape);
     if let Err(err) = apply_client_setup(client_id) {
         log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
         return false;
@@ -1199,6 +1201,9 @@ fn repair_client_setup_now(client_id: &str) -> bool {
                 |scope| {
                     scope.set_tag("flow", "repair_client_setups");
                     scope.set_extra("failures", broken.clone().into());
+                    if let Some(shape) = guard_shape {
+                        scope.set_extra("guard_shape", shape.into());
+                    }
                     scope.set_fingerprint(Some(&[
                         "repair_client_setups",
                         client_id,
@@ -7880,6 +7885,36 @@ fn claude_guard_registered_any_interpreter() -> Result<bool> {
         &claude_settings_path(),
         &claude_guard_hook_path().display().to_string(),
     )
+}
+
+/// Where the guard was, in fixed words for Sentry: whether a writer dropped
+/// the whole hooks table, only our entry, or left one under another path
+/// (RUST-GS: two Windows hosts on 0.9.42 lost it twice in a day).
+fn claude_guard_shape() -> &'static str {
+    let path = claude_settings_path();
+    let Ok(raw) = read_held_or_disk(&path) else {
+        return "settings unreadable";
+    };
+    let Ok(settings) = parse_json_object(&raw, &path) else {
+        return "settings unparseable";
+    };
+    let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
+        return "no hooks table";
+    };
+    let Some(start) = hooks.get("SessionStart").and_then(Value::as_array) else {
+        return "no SessionStart hooks";
+    };
+    let script = claude_guard_hook_path();
+    let name = script
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    if start.iter().any(|entry| entry_contains_hook(entry, &name)) {
+        "guard under another path"
+    } else if start.is_empty() {
+        "SessionStart empty"
+    } else {
+        "SessionStart without the guard"
+    }
 }
 
 const CLAUDE_GUARD_NOT_FOUND: &str =
@@ -15761,8 +15796,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // the repair undoes. One pages nothing; another within a day pages.
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        super::apply_client_setup("claude_code").expect("apply succeeds");
         let settings = home.path().join(".claude").join("settings.json");
+        // A user hook keeps the hooks table once the guard goes: on Windows the
+        // guard is the only hook Headroom writes.
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
+        )
+        .unwrap();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
         let script = super::claude_guard_hook_path().display().to_string();
         super::remove_guard_hook_entries(&settings, &script, false, None).unwrap();
 
@@ -15770,6 +15813,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .expect("verify runs")
             .failures;
         assert_eq!(lost, vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()]);
+        assert_eq!(super::claude_guard_shape(), "no SessionStart hooks");
+        let mut moved = read_settings_json(&settings);
+        moved["hooks"]["SessionStart"] = serde_json::json!([{"hooks": [{
+            "type": "command",
+            "command": "python3 /elsewhere/.claude/hooks/headroom-claude-guard.py"
+        }]}]);
+        fs::write(&settings, serde_json::to_string(&moved).unwrap()).unwrap();
+        assert_eq!(super::claude_guard_shape(), "guard under another path");
         assert!(!super::repair_pages(&lost), "a first loss does not page");
         assert!(super::repair_pages(&lost), "a repeat within a day pages");
 
