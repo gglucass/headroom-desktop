@@ -3002,11 +3002,21 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 if sep:
                     head += "[prompt omitted]\n"
                     tail = tail.strip()
-                    room = max(_hd_lpe_cap - len(head), 0)
+                    # The verdict keeps at least half the cut: Codex's MCP
+                    # startup errors ahead of the echo once filled it and left
+                    # the verdict's last JSON lines (RUST-QV on 0.9.43).
+                    room = max(_hd_lpe_cap - len(head), _hd_lpe_cap // 2)
                     if len(tail) > room:
                         # Whole lines where possible: the verdict is the last one.
                         cut = tail[len(tail) - room :]
                         tail = cut.partition("\n")[2] or cut
+                    room = _hd_lpe_cap - len(tail) - len("[...]\n")
+                    if len(head) > room:
+                        # The head gives up its middle; its first line is what
+                        # the app's failure signature keys on.
+                        first, _, rest = head.partition("\n")
+                        rest = rest[len(rest) - max(room - len(first) - 1, 0) :]
+                        head = first + "\n[...]\n" + (rest.partition("\n")[2] or rest)
                     result.stderr = head + tail
             return result
 
@@ -3087,6 +3097,43 @@ if _hd_lse_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
         _hd_lse_mod.Popen = _hd_lse_popen
         _hd_bound.add("learn_stdin_early_exit")
+    except Exception:
+        pass
+
+# --- Learn: the digest's loop section fits its budget (vendor, upstream owed) --
+# _build_digest budgets the per-session event stream but renders every detected
+# loop ahead of it, each with every message index it repeated at. Codex learn is
+# one project holding every session the machine ever ran, so on a heavy user the
+# loops alone outgrew the digest and Codex refused every scan's 1.79M-char prompt
+# over its 1,048,576-char input cap (RUST-QV). Only the costliest
+# max_tokens // 400 loops are rendered (detect_loops sorts by waste), each with
+# its first 20 indices beside its count: under a quarter of the digest budget,
+# halving with it on the prompt-too-long retry. Loop weighting still sees every
+# loop. Exact-pin gated to wheel 0.39.0. Kill switch: HEADROOM_LEARN_LOOP_BUDGET=0.
+_hd_llb_flag = _hd_os.environ.get("HEADROOM_LEARN_LOOP_BUDGET", "1")
+if _hd_llb_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import dataclasses as _hd_llb_dc
+        import importlib.metadata as _hd_llb_meta
+
+        if _hd_llb_meta.version("headroom-ai") == "0.39.0":
+            from headroom.learn import analyzer as _hd_llb_mod
+
+            _hd_llb_orig = _hd_llb_mod._build_digest
+
+            def _hd_llb_digest(
+                project, sessions, loops=None, max_tokens=_hd_llb_mod._MAX_DIGEST_TOKENS
+            ):
+                if loops is None:
+                    loops = _hd_llb_mod.detect_loops(sessions)
+                loops = [
+                    _hd_llb_dc.replace(lp, msg_indices=lp.msg_indices[:20])
+                    for lp in loops[: max_tokens // 400]
+                ]
+                return _hd_llb_orig(project, sessions, loops=loops, max_tokens=max_tokens)
+
+            _hd_llb_mod._build_digest = _hd_llb_digest
+            _hd_bound.add("learn_loop_budget")
     except Exception:
         pass
 
@@ -4093,6 +4140,7 @@ _HD_VENDORS = (
     "learn_prompt_echo",
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
+    "learn_loop_budget",
     "image_memo",
     "image_worker_reap",
     "stream_uncached_input",
@@ -19779,12 +19827,14 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         std::fs::create_dir_all(&dir).expect("temp inject dir");
         std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
             .expect("write sitecustomize");
+        // RUST-QV (0.9.43): MCP startup errors ahead of the echo, and a verdict
+        // whose cause sits in the JSON lines after it.
         let probe = "import sys\n\
                      from headroom.learn import analyzer as a\n\
-                     cli = \"import sys; p = sys.stdin.read(); sys.stderr.write('Reading prompt from stdin...\\\\nuser\\\\n' + p + '\\\\n' + 'retry\\\\n' * 400 + 'ERROR: boom\\\\n'); sys.exit(1)\"\n\
+                     cli = \"import sys; p = sys.stdin.read(); sys.stderr.write('Reading prompt from stdin...\\\\n' + 'ERROR mcp\\\\n' * 177 + 'user\\\\n' + p + '\\\\n' + 'retry\\\\n' * 400 + 'ERROR: boom {\\\\n' + '  null,\\\\n' * 50 + '}\\\\n'); sys.exit(1)\"\n\
                      r = a.run([sys.executable, '-c', cli], input='SECRET\\r\\n' * 600, capture_output=True, text=True)\n\
                      d = a._failure_detail(r.stderr, r.stdout)\n\
-                     print(d.endswith('ERROR: boom'), 'SECRET' in d, len(d) <= a._MAX_SNIPPET_LEN)";
+                     print('ERROR: boom {' in d, 'SECRET' in d, len(d) <= a._MAX_SNIPPET_LEN, d.startswith('Reading prompt from stdin...'))";
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
                 .args(["-c", probe])
@@ -19800,8 +19850,50 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "True False True", "stderr:\n{on_err}");
-        assert_eq!(off, "False True True", "stderr:\n{off_err}");
+        assert_eq!(on, "True False True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_loop_budget_behaves_against_the_installed_wheel() {
+        // RUST-QV: thousands of loops with every message index outgrew Codex's
+        // 1,048,576-char input cap; the section now stays inside the digest
+        // budget and shrinks with it. The kill switch renders every loop again.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-lb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from pathlib import Path\n\
+                     from headroom.learn import analyzer as a\n\
+                     from headroom.learn.loops import LoopPattern\n\
+                     from headroom.learn.models import ProjectInfo\n\
+                     p = ProjectInfo(name='x', project_path=Path('.'), data_path=Path('.'))\n\
+                     loops = [LoopPattern('Bash', 's', 'x' * 120, 300, False, 10**6 - i, list(range(300))) for i in range(2000)]\n\
+                     full, small = a._build_digest(p, [], loops=loops), a._build_digest(p, [], loops=loops, max_tokens=10000)\n\
+                     print(len(full) <= 80000, len(small) <= 10000, 'repeated 300x' in small, len(loops[0].msg_indices))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_LOOP_BUDGET", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
+        assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
     }
 
     #[test]

@@ -9682,13 +9682,17 @@ fn should_reclaim_healthy_backend(
     upgrade_in_progress || (backend_serving && !backend_argv_is_current)
 }
 
+/// Never during an upgrade: it stopped our backend, so whatever answers is the
+/// old wheel or not ours. A 6767 held by another process (WinError 10013 on
+/// our bind) answered /readyz, nothing was spawned, and boot validation waited
+/// out a child that never existed (RUST-R3).
 fn runtime_already_serving(
     intercept_reachable: bool,
     backend_serving: bool,
     backend_argv_is_current: bool,
     upgrade_in_progress: bool,
 ) -> bool {
-    intercept_reachable || (!upgrade_in_progress && backend_serving && backend_argv_is_current)
+    !upgrade_in_progress && (intercept_reachable || (backend_serving && backend_argv_is_current))
 }
 
 /// Whether `/readyz` on `port` says the proxy is up, with the JSON body it
@@ -12680,10 +12684,12 @@ mod tests {
         assert!(!serving(false, false, true, false));
 
         // During an upgrade's boot validation the healthy backend is the OLD
-        // wheel: never adopt it, fall through to the force-reclaim spawn. The
-        // intercept rule is not affected by the flag.
+        // wheel: never adopt it, fall through to the force-reclaim spawn.
         assert!(!serving(false, true, true, true));
-        assert!(serving(true, false, false, true));
+        // Nor whatever answers on 6767 (RUST-R3): the new venv must be spawned
+        // or validation waits on no child.
+        assert!(!serving(true, false, false, true));
+        assert!(!serving(true, true, true, true));
     }
 
     #[test]
