@@ -15796,8 +15796,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // the repair undoes. One pages nothing; another within a day pages.
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
-        super::apply_client_setup("claude_code").expect("apply succeeds");
         let settings = home.path().join(".claude").join("settings.json");
+        // A user hook keeps the hooks table once the guard goes: on Windows the
+        // guard is the only hook Headroom writes.
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
+        )
+        .unwrap();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
         let script = super::claude_guard_hook_path().display().to_string();
         super::remove_guard_hook_entries(&settings, &script, false, None).unwrap();
 
