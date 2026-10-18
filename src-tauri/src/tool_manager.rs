@@ -2901,6 +2901,73 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: a rescan sees the block the last scan wrote (vendor, upstream owed) -
+# ClaudeCodeWriter writes a project's learned block to CLAUDE.local.md (the home
+# project's to ~/.claude/CLAUDE.md), but discover_projects points context_file,
+# the file _build_prior_patterns_section shows the model beside MEMORY.md, at
+# CLAUDE.md. So every rescan started from nothing, named its sections afresh (in
+# the sessions' language: Spanish one run, English the next), and
+# _merge_recommendations kept every old section whose heading was not reused
+# verbatim: duplicate sections piling up in ten projects (a customer,
+# 2026-10-18). context_file now names the writer's file whenever it holds the
+# block, and the prompt asks for a prior heading to be reused as written.
+# ClaudeCodeWriter ignores context_file, so only the analysis input changes.
+# Bound after the worktree merge, so its merged projects are covered too.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes once the plugin or the
+# analyzer names CLAUDE.local.md. Kill switch: HEADROOM_LEARN_PRIOR_LOCAL=0.
+_hd_lpl_flag = _hd_os.environ.get("HEADROOM_LEARN_PRIOR_LOCAL", "1")
+if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_lpl_meta
+
+        if _hd_lpl_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_lpl_inspect
+            from pathlib import Path as _hd_lpl_Path
+
+            from headroom.learn import analyzer as _hd_lpl_an
+            from headroom.learn import writer as _hd_lpl_wr
+            from headroom.learn.plugins import claude as _hd_lpl_mod
+
+            if not any(
+                "CLAUDE.local.md" in _hd_lpl_inspect.getsource(m)
+                for m in (_hd_lpl_mod, _hd_lpl_an)
+            ):
+                _hd_lpl_cls = _hd_lpl_mod.ClaudeCodePlugin
+                _hd_lpl_discover = _hd_lpl_cls.discover_projects
+                _hd_lpl_anchor = "- Sections from prior runs that you do NOT re-emit"
+
+                def _hd_lpl_discover_projects(self):
+                    projects = _hd_lpl_discover(self)
+                    for p in projects:
+                        # Where ClaudeCodeWriter._resolve_context_path writes
+                        # without --target. In place: a merged worktree project
+                        # carries attributes dataclasses.replace would drop.
+                        if p.project_path == _hd_lpl_Path.home():
+                            target = _hd_lpl_wr.claude_config_dir() / "CLAUDE.md"
+                        else:
+                            target = p.project_path / "CLAUDE.local.md"
+                        try:
+                            text = target.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            continue
+                        if _hd_lpl_wr.extract_marker_block(text):
+                            p.context_file = target
+                    return projects
+
+                if _hd_lpl_anchor in _hd_lpl_an._SYSTEM_PROMPT:
+                    _hd_lpl_an._SYSTEM_PROMPT = _hd_lpl_an._SYSTEM_PROMPT.replace(
+                        _hd_lpl_anchor,
+                        "- A section on a topic the prior block already has a heading\n"
+                        "  for reuses that heading exactly as written, in its language,\n"
+                        "  so it replaces the prior section instead of sitting beside it.\n"
+                        + _hd_lpl_anchor,
+                        1,
+                    )
+                _hd_lpl_cls.discover_projects = _hd_lpl_discover_projects
+                _hd_bound.add("learn_prior_local")
+    except Exception:
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -4134,6 +4201,7 @@ _HD_VENDORS = (
     "output_warmup",
     "learn_rule_coerce",
     "learn_worktree_merge",
+    "learn_prior_local",
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_codex_retries",
@@ -19894,6 +19962,54 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
         assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_prior_local_behaves_against_the_installed_wheel() {
+        // A rescan saw only CLAUDE.md, never the CLAUDE.local.md block the last
+        // scan wrote, so it renamed every section and both copies survived
+        // (Spanish and English, a customer 2026-10-18). The kill switch hides
+        // the block again.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-pl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, tempfile\n\
+                     from pathlib import Path\n\
+                     from headroom.learn import analyzer as a\n\
+                     from headroom.learn.plugins.claude import ClaudeCodePlugin\n\
+                     t = Path(tempfile.mkdtemp())\n\
+                     proj = t / 'site'\n\
+                     proj.mkdir()\n\
+                     (proj / 'CLAUDE.local.md').write_text('<!-- headroom:learn:start -->\\n## Headroom Learned Patterns\\n\\n### Entorno\\n- usa wp-cli\\n<!-- headroom:learn:end -->\\n')\n\
+                     d = t / 'cfg' / 'projects' / '-tmp-hdlpl'\n\
+                     d.mkdir(parents=True)\n\
+                     (d / 's.jsonl').write_text(json.dumps({'cwd': str(proj), 'type': 'user'}) + '\\n')\n\
+                     p = [p for p in ClaudeCodePlugin(t / 'cfg').discover_projects() if p.project_path == proj][0]\n\
+                     print('### Entorno' in a._build_prior_patterns_section(p), 'reuses that heading exactly' in a._SYSTEM_PROMPT)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_PRIOR_LOCAL", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False", "stderr:\n{off_err}");
     }
 
     #[test]

@@ -9574,22 +9574,21 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              netsh int ipv4 show excludedportrange protocol=tcp"
         );
     }
-    // WSAEACCES. Nothing is holding the port -- Windows refused us the socket
-    // outright -- so both the fallback below ("quit whatever holds the port")
-    // and the 10048 arm's "in use by another program" are confidently wrong
-    // here, which this file's own docstring bans. Same two causes and the same
-    // discriminating command as `crate::loopback_socket_denied_hint`, which
-    // covers the Python runtime hitting 10013 at startup; this is the
-    // intercept's own front door, so the remedy is phrased around the port and
-    // around the fact that the bind loop keeps retrying on its own.
+    // WSAEACCES. Windows refused us the socket: a reserved port range, security
+    // software, or another account's socket, none of which the user can "quit",
+    // so both the fallback below and the 10048 arm's "in use by another
+    // program" are wrong here. The bind loop has unwired the clients (RUST-EQ),
+    // and the reserved range, the usual cause, gets its fix: freeing WinNAT's
+    // claim and excluding 6767-6768 so it is not taken again.
     if crate::is_loopback_socket_denied_signal(raw) {
         return format!(
-            "Port {port} was refused by Windows itself, not taken by another program \
-             (WinError 10013). This is usually security software filtering loopback \
-             connections, or a reserved port range (Hyper-V, WSL2, Docker) covering it: run \
-             netsh int ipv4 show excludedportrange protocol=tcp in PowerShell to check, and \
-             allow Headroom in your antivirus or firewall's network protection. \
-             Headroom keeps retrying and reconnects on its own once it clears."
+            "Port {port} was refused by Windows (WinError 10013), so your coding tools \
+             connect directly for now. Usually a reserved port range (Hyper-V, WSL2, Docker) \
+             covers it: if netsh int ipv4 show excludedportrange protocol=tcp lists it, run \
+             net stop winnat; netsh int ipv4 add excludedportrange protocol=tcp \
+             startport={port} numberofports=2; net start winnat in an admin PowerShell. \
+             Otherwise allow Headroom in your antivirus or firewall's network protection. \
+             Headroom reconnects on its own once the port opens."
         );
     }
     if raw.contains("os error 10048") {
@@ -12344,7 +12343,10 @@ mod tests {
         );
         assert!(hint.contains("10013"), "{hint}");
         assert!(hint.contains("excludedportrange"), "{hint}");
-        // Never the wrong remedy: nothing is holding this port.
+        // RUST-EQ: the clients are unwired, and a reserved range gets its fix.
+        assert!(hint.contains("connect directly"), "{hint}");
+        assert!(hint.contains("startport=6767 numberofports=2"), "{hint}");
+        // Never the wrong remedy: nothing the user can quit holds this port.
         assert!(!hint.contains("Quit"), "{hint}");
         assert!(!hint.contains("in use by another program"), "{hint}");
         let first = hint.split(". ").next().unwrap();

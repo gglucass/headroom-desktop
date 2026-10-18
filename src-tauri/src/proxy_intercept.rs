@@ -1444,6 +1444,10 @@ fn serve(
                 // established that, a plain bind has nothing left to prove,
                 // and `run` does not return after it binds.
                 let mut reuse_addr = false;
+                // Whether the holder of a port Windows refuses us (10013) is
+                // this user's other window, decided once: the check shells
+                // out, and the loop retries for as long as Windows refuses.
+                let mut denied_by_twin: Option<bool> = None;
                 loop {
                     match run(
                         bind_addr,
@@ -1865,10 +1869,52 @@ fn serve(
                                 *bind_error.lock() = Some(e.to_string());
                                 log::warn!("[proxy_intercept] error: {e}; retrying");
                                 let key = os_error_key(&e);
+                                // WSAEACCES does not clear on a retry: a
+                                // reserved port range or another account's
+                                // socket holds 6767, and every wired client
+                                // failed against it until Headroom quit
+                                // (RUST-EQ). Unwire them as from any stranger;
+                                // `run` wires them back once the port is ours.
+                                let mut probe = None;
+                                if crate::is_loopback_socket_denied_signal(&e.to_string()) {
+                                    let twin = match denied_by_twin {
+                                        Some(twin) => twin,
+                                        None => {
+                                            let found = probe_port(INTERCEPT_PORT).await;
+                                            probe = Some(found);
+                                            let twin = held_by_our_other_window(found, || {
+                                                crate::tool_manager::port_held_by_desktop_twin(
+                                                    INTERCEPT_PORT,
+                                                )
+                                            });
+                                            denied_by_twin = Some(twin);
+                                            twin
+                                        }
+                                    };
+                                    if twin {
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is served by another Headroom instance"
+                                        ));
+                                    } else if crate::client_adapters::unwire_clients_for_port_holder()
+                                    {
+                                        log::warn!(
+                                            "[proxy_intercept] unwired clients: Windows refused port {INTERCEPT_PORT}"
+                                        );
+                                    }
+                                }
                                 if reported_errors.insert(key.clone()) {
                                     sentry::with_scope(
                                         |scope| {
                                             scope.set_extra("os_error", e.to_string().into());
+                                            // Refused = nothing listens (a
+                                            // reserved range); anything else
+                                            // is another account's listener.
+                                            if let Some(probe) = probe {
+                                                scope.set_extra(
+                                                    "probe",
+                                                    format!("{probe:?}").into(),
+                                                );
+                                            }
                                             scope.set_fingerprint(Some(&[
                                                 "proxy_intercept_bind_failed",
                                                 "error",
