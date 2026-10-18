@@ -628,6 +628,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
     }
 }
 
+/// Whether the wall clock moved a minute past a relay idle check since the
+/// previous one: a system sleep, which kills every connection. Wall clock,
+/// because Windows' `Instant` counts the sleep, so a relay's open time could
+/// not show it (RUST-QA's Windows relays "open" 717s..9297s).
+fn idle_check_slept(prev_ms: u64, now_ms: u64) -> bool {
+    u128::from(now_ms.saturating_sub(prev_ms))
+        > (RELAY_IDLE_CHECK + Duration::from_secs(60)).as_millis()
+}
+
 /// Logs a relay `handle` closed for idling and, at most once a minute, tells
 /// Sentry which client and path it was, the one thing the in-flight cap
 /// report cannot say (RUST-GY).
@@ -636,6 +645,7 @@ fn note_idle_relay_closed(
     path: &str,
     open: Duration,
     backend_answered: bool,
+    slept: bool,
 ) {
     let closed = IDLE_RELAYS_CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
     let path = path.split('?').next().unwrap_or_default();
@@ -644,11 +654,9 @@ fn note_idle_relay_closed(
         RELAY_IDLE_LIMIT.as_secs(),
         open.as_secs()
     );
-    // Open clearly less than the idle limit (a minute of slack for the two
-    // clocks' granularity) yet idle past it: the idle time is mostly a system
-    // sleep, which kills every connection. Closing it is right; reporting it
-    // would bury the leaks this report exists to find.
-    let slept = open + Duration::from_secs(60) < RELAY_IDLE_LIMIT;
+    // A relay that lived through a system sleep is dead (its upstream
+    // connection is). Closing it is right; reporting it would bury the leaks
+    // this report exists to find.
     if slept || !should_report_throttled(&IDLE_RELAY_CLOSED_LAST_REPORTED) {
         return;
     }
@@ -2581,20 +2589,26 @@ async fn handle(
         return;
     }
     tokio::pin!(relay);
+    let mut last_check = now_epoch_millis();
+    let mut slept = false;
     loop {
         tokio::select! {
             () = &mut relay => return,
             () = tokio::time::sleep(RELAY_IDLE_CHECK) => {
+                let now = now_epoch_millis();
+                slept |= idle_check_slept(last_check, now);
+                last_check = now;
                 let last = activity
                     .load(Ordering::Relaxed)
                     .max(backend_activity.load(Ordering::Relaxed));
-                let idle = now_epoch_millis().saturating_sub(last);
+                let idle = now.saturating_sub(last);
                 if u128::from(idle) >= RELAY_IDLE_LIMIT.as_millis() {
                     note_idle_relay_closed(
                         client_key,
                         &relay_path,
                         accepted_at.elapsed(),
                         backend_activity.load(Ordering::Relaxed) != 0,
+                        slept,
                     );
                     return;
                 }
@@ -6294,6 +6308,18 @@ mod tests {
 
         task.abort();
         backend_port::reset_for_tests();
+    }
+
+    /// RUST-QA: a sleep showed as a long-open idle relay on Windows. Only a
+    /// check that came over a minute late reads as a sleep.
+    #[test]
+    fn idle_check_reads_only_a_late_check_as_a_sleep() {
+        let check = super::RELAY_IDLE_CHECK.as_millis() as u64;
+        assert!(!super::idle_check_slept(1_000, 1_000 + check));
+        assert!(!super::idle_check_slept(1_000, 1_000 + check + 59_000));
+        assert!(super::idle_check_slept(1_000, 1_000 + check + 61_000));
+        // A wall clock stepped back is not a sleep.
+        assert!(!super::idle_check_slept(100_000, 1_000));
     }
 
     /// A relay quiet for less than `RELAY_IDLE_LIMIT` is never closed, even
