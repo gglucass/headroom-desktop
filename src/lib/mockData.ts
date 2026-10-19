@@ -48,5 +48,6 @@ export const mockDashboard: DashboardState = {
   // over the initial mock state before the real dashboard loads.
   requiredTermsVersion: 1,
   acceptedTermsVersion: 1,
-  termsUrl: "https://extraheadroom.com/terms"
+  termsUrl: "https://extraheadroom.com/terms",
+  tipUnseen: false
 };

@@ -420,6 +420,10 @@ pub struct DashboardState {
     pub accepted_terms_version: u32,
     /// Canonical Terms-of-Service URL the acceptance gate links to.
     pub terms_url: String,
+    /// The Activity tip has not been looked at yet: drives the dot on the
+    /// Activity tab (the menu bar icon reads it from state directly).
+    #[serde(default)]
+    pub tip_unseen: bool,
 }
 
 /// Why the last bootstrap failed, in the two forms a support report needs:
@@ -844,6 +848,44 @@ pub struct TrainSuggestionEvent {
     pub kind: String,
 }
 
+/// A one-time Activity tip: a saving the user's own Claude Code traffic shows
+/// they would get from one command in Claude Code. Headroom changes nothing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TipKind {
+    /// A request reached 400k tokens: `/autocompact 400k` caps what every
+    /// later turn re-sends.
+    CompactWindow,
+    /// Haiku 5.5 bills a request over 100k tokens at 5x: `/autocompact 100k`
+    /// keeps it under the step.
+    HaikuLongContext,
+    /// Fable 5.1 costs the same as Fable 5 except cache reads, at a quarter.
+    FableUpgrade,
+}
+
+impl TipKind {
+    /// Persisted fire-once key; matches the serde name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::CompactWindow => "compact_window",
+            Self::HaikuLongContext => "haiku_long_context",
+            Self::FableUpgrade => "fable_upgrade",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TipEvent {
+    pub kind: TipKind,
+    pub observed_at: DateTime<Utc>,
+    /// Size of the request that posted the tip.
+    pub context_tokens: u64,
+    /// Set once the Activity tab has shown it; clears both unread dots.
+    #[serde(default)]
+    pub seen: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ActivityEvent {
@@ -873,6 +915,7 @@ pub struct ActivityFeedSnapshot {
     pub learnings_milestone: Option<LearningsMilestoneEvent>,
     pub weekly_recap: Option<WeeklyRecapEvent>,
     pub train_suggestion: Option<TrainSuggestionEvent>,
+    pub tip: Option<TipEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

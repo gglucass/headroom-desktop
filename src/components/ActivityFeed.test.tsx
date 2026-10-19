@@ -15,6 +15,7 @@ import type {
   LearningsMilestoneEvent,
   RecordEvent,
   RtkTodayStats,
+  TipKind,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
@@ -37,13 +38,51 @@ const emptyTiles: ActivityFeedSnapshot = {
   serenaToday: null,
   learningsMilestone: null,
   weeklyRecap: null,
-  trainSuggestion: null
+  trainSuggestion: null,
+  tip: null
 };
 
 const baseFeed: ActivityFeedResponse = {
   tiles: emptyTiles,
   proxyReachable: true
 };
+
+describe("tips", () => {
+  const feedWith = (kind: TipKind): ActivityFeedResponse => ({
+    ...baseFeed,
+    tiles: {
+      ...emptyTiles,
+      tip: { kind, observedAt: "2026-10-19T10:00:00Z", contextTokens: 412_345, seen: false }
+    }
+  });
+  const tipFeed = feedWith("compact_window");
+
+  it("names the session size and the command", () => {
+    render(<ActivityFeed feed={tipFeed} error={null} />);
+    expect(screen.getByText(/reached 412k tokens/)).toBeTruthy();
+    expect(screen.getByText("/autocompact 400k")).toBeTruthy();
+  });
+
+  it("dismisses for good", async () => {
+    render(<ActivityFeed feed={tipFeed} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(invokeMock).toHaveBeenCalledWith("dismiss_tip");
+    expect(screen.queryByText("/autocompact 400k")).toBeNull();
+  });
+
+  it("gives each kind its own command", () => {
+    const { unmount } = render(<ActivityFeed feed={feedWith("haiku_long_context")} error={null} />);
+    expect(screen.getByText("/autocompact 100k")).toBeTruthy();
+    unmount();
+    render(<ActivityFeed feed={feedWith("fable_upgrade")} error={null} />);
+    expect(screen.getByText("/model claude-fable-5-1")).toBeTruthy();
+  });
+
+  it("renders nothing without a tip", () => {
+    render(<ActivityFeed feed={baseFeed} error={null} />);
+    expect(screen.queryByText("/autocompact 400k")).toBeNull();
+  });
+});
 
 function transformation(event: Partial<TransformationFeedEvent> = {}): TransformationFeedEvent {
   return {

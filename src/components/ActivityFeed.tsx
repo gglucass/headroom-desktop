@@ -13,6 +13,7 @@ import type {
   RecordTag,
   RtkTodayStats,
   SerenaTodayStats,
+  TipEvent,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   TransformationRequestMessage,
@@ -38,8 +39,9 @@ interface ActivityFeedProps {
 }
 
 // One entry per tile kind. `kind` matches the `ActivityFeedSnapshot` slot name
-// so the backend shape and frontend render stay in lockstep.
-type TileKind = keyof ActivityFeedSnapshot;
+// so the backend shape and frontend render stay in lockstep. The tip is a
+// one-off with no placeholder: absent, it renders nothing.
+type TileKind = Exclude<keyof ActivityFeedSnapshot, "tip">;
 
 const EMPTY_TILE_COPY: Record<
   TileKind,
@@ -138,6 +140,7 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="activity-feed__list">
+          {tiles.tip ? <TipRow key={tiles.tip.kind} event={tiles.tip} /> : null}
           {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
           {tiles.transformation ? (
             <TransformationRow event={tiles.transformation} />
@@ -970,6 +973,64 @@ function TrainSuggestionRow({
         <span className="activity-feed__project">{event.projectDisplayName}</span>
       </div>
       <p className="activity-feed__content">{copy}</p>
+    </li>
+  );
+}
+
+function tipCopy(event: TipEvent): ReactNode {
+  const size = `${Math.round(event.contextTokens / 1000)}k`;
+  switch (event.kind) {
+    case "compact_window":
+      return (
+        <>
+          A Claude Code session reached {size} tokens. Every turn re-sends the whole conversation,
+          so the longest sessions cost the most. Run <code>/autocompact 400k</code> in Claude Code
+          to compact sooner: on long sessions that cuts usage by around 10%, though each compaction
+          summarizes earlier detail.
+        </>
+      );
+    case "haiku_long_context":
+      return (
+        <>
+          A Haiku 5.5 request reached {size} tokens. Haiku bills every token of a request over 100k
+          at 5x the price. If that was your main session, run <code>/autocompact 100k</code> while
+          on Haiku to compact before the step.
+        </>
+      );
+    case "fable_upgrade":
+      return (
+        <>
+          A Claude Code session on Fable 5 reached {size} tokens. Fable 5.1 lists at the same price
+          but reads cache at a quarter of the cost, and on long sessions cache reads are most of
+          what you send. Switch with <code>/model claude-fable-5-1</code>.
+        </>
+      );
+    default:
+      return null;
+  }
+}
+
+function TipRow({ event }: { event: TipEvent }) {
+  // Hidden on click; the next feed poll drops the slot for good.
+  const [dismissed, setDismissed] = useState(false);
+  const copy = tipCopy(event);
+  if (dismissed || copy === null) return null;
+  const dismiss = () => {
+    setDismissed(true);
+    void invoke("dismiss_tip").catch(() => undefined);
+  };
+  return (
+    <li className="activity-feed__item activity-feed__item--tip">
+      <div className="activity-feed__row activity-feed__row--meta">
+        <span className="activity-feed__badge activity-feed__badge--tip">Tip</span>
+        <TimeChip iso={event.observedAt} />
+      </div>
+      <p className="activity-feed__content">{copy}</p>
+      <div className="activity-feed__row">
+        <button className="secondary-button secondary-button--small" onClick={dismiss} type="button">
+          Dismiss
+        </button>
+      </div>
     </li>
   );
 }

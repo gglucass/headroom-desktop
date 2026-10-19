@@ -226,6 +226,8 @@ export interface DashboardState {
   requiredTermsVersion: number;
   acceptedTermsVersion: number;
   termsUrl: string;
+  /** An Activity tip is posted and not looked at yet. */
+  tipUnseen: boolean;
 }
 
 export interface BootstrapProgress {
@@ -563,6 +565,15 @@ export interface TrainSuggestionEvent {
   kind: string;
 }
 
+export type TipKind = "compact_window" | "haiku_long_context" | "fable_upgrade";
+
+export interface TipEvent {
+  kind: TipKind;
+  observedAt: string;
+  contextTokens: number;
+  seen: boolean;
+}
+
 export interface ActivityFeedSnapshot {
   transformation: TransformationFeedEvent | null;
   record: RecordEvent | null;
@@ -571,6 +582,7 @@ export interface ActivityFeedSnapshot {
   learningsMilestone: LearningsMilestoneEvent | null;
   weeklyRecap: WeeklyRecapEvent | null;
   trainSuggestion: TrainSuggestionEvent | null;
+  tip: TipEvent | null;
 }
 
 export interface ActivityFeedResponse {

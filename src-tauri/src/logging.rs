@@ -740,9 +740,23 @@ fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
 pub(crate) fn before_send(
     event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
+    if echoes_env_fault(&event, crate::env_fault::active()) {
+        return None;
+    }
     crate::analytics::sharing_enabled()
         .then(|| sanitize_event(event))
         .flatten()
+}
+
+/// While Headroom's data folder is unusable everything fails at once: one Mac
+/// whose external home drive macOS blocked filed RUST-29, RUST-6S and RUST-RD
+/// in one second (pip's interpreter and the MCP helper could not open their
+/// own files there). `env_fault` reports that fault once; the rest is its echo.
+/// Panics (Fatal) still go through.
+fn echoes_env_fault(event: &sentry::protocol::Event<'static>, fault_active: bool) -> bool {
+    fault_active
+        && event.level < sentry::Level::Fatal
+        && event.tags.get("flow").map(String::as_str) != Some("env_fault")
 }
 
 pub(crate) fn sanitize_event(
@@ -1878,6 +1892,22 @@ mod tests {
         event.message = Some("signed out".into());
         let sent = super::sanitize_event(event).unwrap();
         assert!(!sent.tags.contains_key("headroom.tier"));
+    }
+
+    #[test]
+    fn a_data_folder_fault_silences_its_echoes_but_not_itself_or_panics() {
+        let mut echo = sentry::protocol::Event::new();
+        echo.level = sentry::Level::Error;
+        assert!(super::echoes_env_fault(&echo, true));
+        assert!(!super::echoes_env_fault(&echo, false));
+
+        let mut own = echo.clone();
+        own.tags.insert("flow".into(), "env_fault".into());
+        assert!(!super::echoes_env_fault(&own, true));
+
+        let mut panic = echo;
+        panic.level = sentry::Level::Fatal;
+        assert!(!super::echoes_env_fault(&panic, true));
     }
 
     #[test]

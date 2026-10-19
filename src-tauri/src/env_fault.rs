@@ -278,18 +278,33 @@ pub(crate) fn state_unreadable() -> bool {
     FAULTS.lock().sustained(Op::Read, Instant::now()).is_some()
 }
 
+/// True while any fault is sustained. Whatever else fails on that machine
+/// meanwhile (a child process that cannot open its own files in the folder)
+/// is the same fault, which `report` has already sent once.
+pub(crate) fn active() -> bool {
+    let now = Instant::now();
+    let faults = FAULTS.lock();
+    [Op::Read, Op::Write]
+        .into_iter()
+        .any(|op| faults.sustained(op, now).is_some())
+}
+
 /// Banner prose for each sustained fault, read first: an unreadable folder
 /// explains a write failure too, never the reverse.
 pub(crate) fn active_issues() -> Vec<String> {
     let now = Instant::now();
     let faults = FAULTS.lock();
-    let dir = display_dir(&crate::storage::app_data_dir());
+    let data_dir = crate::storage::app_data_dir();
+    let dir = display_dir(&data_dir);
+    // RUST-R1/R2/R4: a home folder on an external drive the user never let
+    // Headroom use reads as `~/...`, so the volume is checked on the real path.
+    let external_volume = cfg!(target_os = "macos") && data_dir.starts_with("/Volumes");
     [Op::Read, Op::Write]
         .into_iter()
         .filter_map(|op| {
             faults
                 .sustained(op, now)
-                .map(|fault| issue_text(op, fault.kind, &dir))
+                .map(|fault| issue_text(op, fault.kind, &dir, external_volume))
         })
         .collect()
 }
@@ -305,7 +320,7 @@ fn display_dir(dir: &Path) -> String {
 
 /// One issue as "<lead>. <detail>", the shape the dashboard's `splitIssue`
 /// cuts into a headline and the remedy under it.
-fn issue_text(op: Op, kind: FaultKind, dir: &str) -> String {
+fn issue_text(op: Op, kind: FaultKind, dir: &str, external_volume: bool) -> String {
     let lead = match op {
         Op::Read => "Headroom can't read its data folder, so your settings and connected tools may look reset.",
         Op::Write => "Headroom can't save to its data folder, so settings and savings history aren't being kept.",
@@ -316,6 +331,10 @@ fn issue_text(op: Op, kind: FaultKind, dir: &str) -> String {
         ""
     };
     let detail = match kind {
+        // EPERM on another drive is macOS privacy control, not security software.
+        FaultKind::Blocked if external_volume => format!(
+            "The folder {dir} is on an external drive macOS isn't letting Headroom use. Turn Headroom on under System Settings > Privacy & Security > Files and Folders (Removable Volumes, or Network Volumes for a network drive), or give it Full Disk Access, then quit and reopen Headroom."
+        ),
         FaultKind::Blocked => format!(
             "Something on this computer is blocking access to {dir}, usually security software or a locked file{locked}. Allow Headroom in that software or unlock the folder; Headroom picks up again on its own."
         ),
@@ -502,16 +521,20 @@ mod tests {
                 FaultKind::ReadOnly,
                 FaultKind::DiskFull,
             ] {
-                let text = issue_text(op, kind, "~/Headroom");
-                let cut = text.find(". ").expect("lead and detail");
-                let detail = &text[cut + 2..];
-                assert!(
-                    detail.starts_with(|c: char| c.is_ascii_uppercase()),
-                    "{text}"
-                );
-                assert!(text.contains("~/Headroom"), "{text}");
-                assert!(text.is_ascii(), "plain ASCII only: {text}");
+                for external_volume in [false, true] {
+                    let text = issue_text(op, kind, "~/Headroom", external_volume);
+                    let cut = text.find(". ").expect("lead and detail");
+                    let detail = &text[cut + 2..];
+                    assert!(
+                        detail.starts_with(|c: char| c.is_ascii_uppercase()),
+                        "{text}"
+                    );
+                    assert!(text.contains("~/Headroom"), "{text}");
+                    assert!(text.is_ascii(), "plain ASCII only: {text}");
+                }
             }
         }
+        assert!(issue_text(Op::Read, FaultKind::Blocked, "~/Headroom", true)
+            .contains("Removable Volumes"));
     }
 }

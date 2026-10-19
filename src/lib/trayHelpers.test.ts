@@ -39,7 +39,8 @@ const emptySnapshot: ActivityFeedResponse = {
     serenaToday: null,
     learningsMilestone: null,
     weeklyRecap: null,
-    trainSuggestion: null
+    trainSuggestion: null,
+    tip: null
   }
 };
 
@@ -58,7 +59,7 @@ describe("loadDashboard", () => {
 describe("activityFeedSignature", () => {
   it("returns a stable string for an empty snapshot", () => {
     const sig = activityFeedSignature(emptySnapshot);
-    expect(sig).toBe("1|t:-|r:-|b:-|s:-|l:-|wr:-|ts:-");
+    expect(sig).toBe("1|t:-|r:-|b:-|s:-|l:-|wr:-|ts:-|tip:-");
   });
 
   it("differentiates proxyReachable false from proxyReachable true", () => {
@@ -118,7 +119,7 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("t:2026-04-25T12:00:00Z");
   });
 
-  it("encodes record, rtkToday, learningsMilestone, weeklyRecap, trainSuggestion slots", () => {
+  it("encodes record, rtkToday, learningsMilestone, weeklyRecap, trainSuggestion, tip slots", () => {
     const sig = activityFeedSignature({
       proxyReachable: true,
       tiles: {
@@ -131,7 +132,13 @@ describe("activityFeedSignature", () => {
         trainSuggestion: {
           projectPath: "/Users/x/proj",
           observedAt: "2026-04-25T09:00:00Z"
-        } as never
+        } as never,
+        tip: {
+          kind: "compact_window",
+          observedAt: "2026-04-25T08:00:00Z",
+          contextTokens: 412000,
+          seen: true
+        }
       }
     });
     expect(sig).toContain("r:2026-04-25T11:00:00Z");
@@ -140,6 +147,8 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("l:2026-04-25T10:00:00Z");
     expect(sig).toContain("wr:2026-04-20");
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");
+    // `seen` is in the key so opening Activity re-renders the tile without its dot.
+    expect(sig).toContain("tip:compact_window:2026-04-25T08:00:00Z:1");
   });
 
 });

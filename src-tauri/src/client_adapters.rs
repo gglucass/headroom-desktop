@@ -8746,12 +8746,18 @@ fn edit_vscode_wrapper_key(raw: &str, wrapper: &str, add: bool, path: &Path) -> 
     let edited = if add {
         let comma = if expected.is_empty() { "\n" } else { "," };
         expected.insert(VSCODE_PROCESS_WRAPPER_KEY.to_string(), value.clone());
-        let open = raw.find('{')? + 1;
-        format!(
-            "{}\n    {key}: {value}{comma}{}",
-            &raw[..open],
-            &raw[open..]
-        )
+        // A whitespace-only file parses as `{}` but has no brace to insert after.
+        let raw = if raw.trim().is_empty() { "{}" } else { raw };
+        // The first `{` can sit in a leading comment (RUST-RE): try each in
+        // turn, since the re-parse check rejects every wrong spot.
+        return raw.match_indices('{').find_map(|(at, _)| {
+            let edited = format!(
+                "{}\n    {key}: {value}{comma}{}",
+                &raw[..=at],
+                &raw[at + 1..]
+            );
+            (parse_json_object(&edited, path).ok()? == expected).then_some(edited)
+        });
     } else {
         if expected.remove(VSCODE_PROCESS_WRAPPER_KEY)? != value {
             return None;
@@ -20340,6 +20346,22 @@ for line in sys.stdin:
         assert_eq!(edit_vscode_wrapper_key(user, w, false, path), None);
         // Unparseable settings are never touched.
         assert_eq!(edit_vscode_wrapper_key("{\"a\": ", w, true, path), None);
+
+        // A whitespace-only file, and a `{` in a leading comment (RUST-RE).
+        let added = edit_vscode_wrapper_key("\n", w, true, path).expect("add to blank");
+        assert_eq!(
+            parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],
+            w
+        );
+        for header in ["// { my settings }\n", "/* { */\n"] {
+            let raw = format!("{header}{user}");
+            let added = edit_vscode_wrapper_key(&raw, w, true, path).expect("add past comment");
+            assert!(added.starts_with(header));
+            assert_eq!(
+                parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],
+                w
+            );
+        }
     }
 
     /// Drives the wrapper the way the VS Code extension does, with a fake

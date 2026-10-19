@@ -79,6 +79,10 @@
   --activity-train-tint:       rgba(56, 120, 160, 0.18);
   --activity-learnings-strong: #3a4480;
   --activity-learnings-tint:   rgba(76, 90, 160, 0.18);
+  --activity-tip-strong:       #0a5fc2;
+  --activity-tip-tint:         rgba(0, 122, 255, 0.14);
+  /* Unread dot (nav tab); the menu bar icon draws the same blue. */
+  --unread:                    #007aff;
 
   /* Chips / badges */
   --chip-bg:            rgba(36, 31, 29, 0.08);
@@ -126,6 +130,9 @@
     --activity-train-tint:       rgba(80, 150, 200, 0.22);
     --activity-learnings-strong: #b0bce0;
     --activity-learnings-tint:   rgba(130, 145, 210, 0.22);
+    --activity-tip-strong:       #7cb8ff;
+    --activity-tip-tint:         rgba(10, 132, 255, 0.24);
+    --unread:                    #0a84ff;
 
     --chip-bg:            rgba(255, 255, 255, 0.1);
     --chip-text:          rgba(242, 237, 232, 0.8);
@@ -865,6 +872,7 @@ select {
 }
 
 .tray-nav__icon {
+  position: relative;
   display: grid;
   place-items: center;
   width: 46px;
@@ -891,6 +899,16 @@ select {
 .tray-nav__icon-svg {
   width: 26px;
   height: 26px;
+}
+
+.tray-nav__dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--unread);
 }
 
 .tray-nav__text {
@@ -5229,6 +5247,20 @@ html.window-hiding {
 .activity-feed__badge--train {
   background: var(--activity-train-tint);
   color: var(--activity-train-strong);
+}
+
+.activity-feed__badge--tip {
+  background: var(--activity-tip-tint);
+  color: var(--activity-tip-strong);
+}
+
+.activity-feed__content code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  border-radius: 4px;
+  padding: 1px 5px;
 }
 
 .activity-feed__scope {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
-    RecordTag, TrainSuggestionEvent, TransformationFeedEvent, WeeklyRecapEvent,
+    RecordTag, TipEvent, TipKind, TrainSuggestionEvent, TransformationFeedEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 
@@ -44,6 +44,17 @@ pub(crate) const STALE_TRAIN_REFIRE_DAYS: i64 = 5;
 // Only nudge Train for projects the user has touched recently. An abandoned
 // project with 50 sessions and no train run shouldn't claim the tile forever.
 pub(crate) const TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS: i64 = 2;
+// Context size (tokens actually sent) that posts the `/autocompact 400k` tip.
+// A replay of two weeks of heavy Claude Code use put the saving at ~10% for a
+// 400k window; users who never reach it would gain nothing, so never see it.
+pub(crate) const COMPACT_TIP_MIN_CONTEXT_TOKENS: u64 = 400_000;
+// Haiku 5.5 bills every token of a prompt over 100k at 5x (Anthropic pricing,
+// 2026-10). Its background calls in Claude Code peaked at 82k on a heavy
+// machine, so only a session or subagent running on Haiku crosses it.
+pub(crate) const HAIKU_PRICE_STEP_TOKENS: u64 = 100_000;
+// Fable 5.1 lists like Fable 5 but reads cache at $0.25 vs $1 / MTok. Cache
+// reads only dominate once a session is long, so short ones do not post it.
+pub(crate) const FABLE_TIP_MIN_CONTEXT_TOKENS: u64 = 100_000;
 
 // The "Recent large compression" tile should actually be *large*. A pipeline
 // run that stripped nothing (tokens_saved ~ 0, savings_percent near 0) would
@@ -192,6 +203,11 @@ struct PersistedActivityFacts {
     train_suggestions_fired: BTreeSet<String>,
     #[serde(default)]
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
+    // Fire-once per tip kind (`TipKind::key`), apart from the slot so a
+    // dismissed tip never re-arms. Strings, not the enum: a kind from a newer
+    // build must not fail this whole file on a downgrade.
+    #[serde(default)]
+    tips_fired: BTreeSet<String>,
 
     // -- latest-of-kind tile slots --
     // The Activity tab shows one tile per kind, populated by the most recent
@@ -209,6 +225,8 @@ struct PersistedActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     #[serde(default, deserialize_with = "de_or_none")]
     last_train_suggestion: Option<TrainSuggestionEvent>,
+    #[serde(default, deserialize_with = "de_or_none")]
+    last_tip: Option<TipEvent>,
 }
 
 pub struct ActivityFacts {
@@ -223,6 +241,7 @@ pub struct ActivityFacts {
     last_weekly_recap_check_at: Option<DateTime<Utc>>,
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
+    tips_fired: BTreeSet<String>,
     // Latest-of-kind tile slots. Each observe_* writes to its slot; the
     // snapshot builder reads them to populate the frontend response.
     last_transformation: Option<TransformationFeedEvent>,
@@ -230,6 +249,7 @@ pub struct ActivityFacts {
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
+    last_tip: Option<TipEvent>,
     dirty: bool,
     // Set when the file exists but could not be read. The in-memory facts
     // start empty, so saving them would overwrite the user's real history;
@@ -299,6 +319,7 @@ impl ActivityFacts {
             carried.last_weekly_recap_check_at = persisted.last_weekly_recap_check_at;
             carried.train_suggestions_fired = persisted.train_suggestions_fired;
             carried.stale_train_suggestions_fired_at = persisted.stale_train_suggestions_fired_at;
+            carried.tips_fired = persisted.tips_fired;
             carried.dirty = true;
             return Ok(carried);
         }
@@ -315,11 +336,13 @@ impl ActivityFacts {
             last_weekly_recap_check_at: persisted.last_weekly_recap_check_at,
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
+            tips_fired: persisted.tips_fired,
             last_transformation: persisted.last_transformation,
             last_record: persisted.last_record,
             last_learnings_milestone: persisted.last_learnings_milestone,
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
+            last_tip: persisted.last_tip,
             dirty: false,
             read_failed: false,
         })
@@ -338,11 +361,13 @@ impl ActivityFacts {
             last_weekly_recap_check_at: None,
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: BTreeMap::new(),
+            tips_fired: BTreeSet::new(),
             last_transformation: None,
             last_record: None,
             last_learnings_milestone: None,
             last_weekly_recap: None,
             last_train_suggestion: None,
+            last_tip: None,
             dirty: false,
             read_failed: false,
         }
@@ -359,7 +384,62 @@ impl ActivityFacts {
             learnings_milestone: self.last_learnings_milestone.clone(),
             weekly_recap: self.last_weekly_recap.clone(),
             train_suggestion: self.last_train_suggestion.clone(),
+            tip: self.last_tip.clone(),
         }
+    }
+
+    /// A tip is posted and the Activity tab has not shown it yet.
+    pub fn tip_unseen(&self) -> bool {
+        self.last_tip.as_ref().is_some_and(|tip| !tip.seen)
+    }
+
+    pub fn mark_tip_seen(&mut self) {
+        if let Some(tip) = self.last_tip.as_mut().filter(|tip| !tip.seen) {
+            tip.seen = true;
+            self.dirty = true;
+        }
+    }
+
+    pub fn dismiss_tip(&mut self) {
+        if self.last_tip.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Post the first tip this Claude Code request qualifies for that has not
+    /// fired yet. One tip at a time: a new one waits (its condition recurs in
+    /// later traffic) until the current one has been seen.
+    fn observe_tips(&mut self, event: &TransformationFeedEvent, observed_at: DateTime<Utc>) {
+        if event.provider.as_deref() != Some("anthropic")
+            || self.last_tip.as_ref().is_some_and(|tip| !tip.seen)
+        {
+            return;
+        }
+        let model = event.model.as_deref().unwrap_or_default();
+        let tokens = event.input_tokens_optimized.unwrap_or(0);
+        let haiku = model.starts_with("claude-haiku");
+        let candidates = [
+            (model.starts_with("claude-haiku-5-5") && tokens > HAIKU_PRICE_STEP_TOKENS)
+                .then_some(TipKind::HaikuLongContext),
+            (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
+                .then_some(TipKind::FableUpgrade),
+            (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS).then_some(TipKind::CompactWindow),
+        ];
+        let Some(kind) = candidates
+            .into_iter()
+            .flatten()
+            .find(|kind| !self.tips_fired.contains(kind.key()))
+        else {
+            return;
+        };
+        self.tips_fired.insert(kind.key().to_string());
+        self.last_tip = Some(TipEvent {
+            kind,
+            observed_at,
+            context_tokens: tokens,
+            seen: false,
+        });
+        self.dirty = true;
     }
 
     pub fn observe_transformation(
@@ -377,6 +457,8 @@ impl ActivityFacts {
         now: DateTime<Utc>,
     ) -> Vec<ActivityEvent> {
         let mut emitted = Vec::new();
+
+        self.observe_tips(event, observed_at);
 
         let tokens_saved = event
             .tokens_saved
@@ -875,17 +957,32 @@ impl ActivityFacts {
             last_weekly_recap_check_at: self.last_weekly_recap_check_at,
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
+            tips_fired: self.tips_fired.clone(),
             last_transformation: self.last_transformation.clone(),
             last_record: self.last_record.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),
             last_weekly_recap: self.last_weekly_recap.clone(),
             last_train_suggestion: self.last_train_suggestion.clone(),
+            last_tip: self.last_tip.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
         crate::client_adapters::atomic_write(&self.path, &bytes)?;
         self.dirty = false;
         Ok(())
     }
+}
+
+/// `claude-fable-5`, dated or with a `[1m]` suffix, but not `claude-fable-5-1`
+/// or any later point release.
+fn is_fable_5_0(model: &str) -> bool {
+    let Some(rest) = model.strip_prefix("claude-fable-5") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest.starts_with('[')
+        || rest
+            .strip_prefix('-')
+            .is_some_and(|date| date.len() >= 8 && date.bytes().take(8).all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -1004,6 +1101,118 @@ mod tests {
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 4, 22, h, m, 0).unwrap()
+    }
+
+    fn sized(provider: &str, model: &str, tokens: u64) -> TransformationFeedEvent {
+        TransformationFeedEvent {
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            input_tokens_optimized: Some(tokens),
+            ..mk_transformation(None, None, None)
+        }
+    }
+
+    fn posted(facts: &ActivityFacts) -> Option<(TipKind, u64)> {
+        facts
+            .activity_feed_snapshot()
+            .tip
+            .map(|tip| (tip.kind, tip.context_tokens))
+    }
+
+    #[test]
+    fn compact_tip_fires_once_on_the_first_400k_claude_request() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let opus = "claude-opus-5-5";
+
+        facts.observe_transformation_at(&sized("anthropic", opus, 399_999), at(10, 0), at(10, 0));
+        facts.observe_transformation_at(&sized("openai", "gpt-6", 900_000), at(10, 1), at(10, 1));
+        assert_eq!(posted(&facts), None);
+
+        facts.observe_transformation_at(&sized("anthropic", opus, 400_000), at(10, 2), at(10, 2));
+        assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 400_000)));
+        assert!(facts.tip_unseen());
+
+        facts.mark_tip_seen();
+        facts.save_if_dirty().unwrap();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        assert!(!facts.tip_unseen(), "seen survives a restart");
+
+        facts.dismiss_tip();
+        facts.observe_transformation_at(&sized("anthropic", opus, 700_000), at(11, 0), at(11, 0));
+        assert_eq!(posted(&facts), None, "a dismissed tip never comes back");
+    }
+
+    #[test]
+    fn tips_pick_the_kind_the_request_qualifies_for() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+
+        // Haiku under the price step, and old Fable on a short session: nothing.
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-haiku-5-5", 100_000),
+            at(9, 0),
+            at(9, 0),
+        );
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-fable-5", 99_999),
+            at(9, 1),
+            at(9, 1),
+        );
+        assert_eq!(posted(&facts), None);
+
+        // Haiku over the step gets its own tip even at 400k+, never the compact one.
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-haiku-5-5", 450_000),
+            at(9, 2),
+            at(9, 2),
+        );
+        assert_eq!(posted(&facts), Some((TipKind::HaikuLongContext, 450_000)));
+
+        // One at a time: an unseen tip is never replaced.
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-fable-5[1m]", 500_000),
+            at(9, 3),
+            at(9, 3),
+        );
+        assert_eq!(posted(&facts), Some((TipKind::HaikuLongContext, 450_000)));
+
+        // Seen, the next one may take the slot; Fable 5 outranks the compact tip.
+        facts.mark_tip_seen();
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-fable-5[1m]", 500_000),
+            at(9, 4),
+            at(9, 4),
+        );
+        assert_eq!(posted(&facts), Some((TipKind::FableUpgrade, 500_000)));
+
+        // With Fable's fired, the same request falls through to the compact tip.
+        facts.dismiss_tip();
+        facts.observe_transformation_at(
+            &sized("anthropic", "claude-fable-5[1m]", 500_000),
+            at(9, 5),
+            at(9, 5),
+        );
+        assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 500_000)));
+    }
+
+    #[test]
+    fn fable_5_0_matches_only_the_old_model() {
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-20260301",
+        ] {
+            assert!(is_fable_5_0(model), "{model}");
+        }
+        for model in [
+            "claude-fable-5-1",
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "fable-5",
+        ] {
+            assert!(!is_fable_5_0(model), "{model}");
+        }
     }
 
     fn is_daily_record(e: &ActivityEvent) -> bool {

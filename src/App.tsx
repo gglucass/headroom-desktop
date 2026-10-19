@@ -1891,7 +1891,8 @@ export default function App() {
       serenaToday: null,
       learningsMilestone: null,
       weeklyRecap: null,
-      trainSuggestion: null
+      trainSuggestion: null,
+      tip: null
     },
     proxyReachable: false
   });
@@ -1909,6 +1910,10 @@ export default function App() {
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
   const activityTabTrackedRef = useRef(false);
+  // Hides the dot the moment Activity opens instead of at the next dashboard
+  // poll. Holds the `tipUnseen` it cleared, so a later tip shows its own dot.
+  const [tipMarkedSeen, setTipMarkedSeen] = useState(false);
+  const activityDot = dashboard.tipUnseen && !tipMarkedSeen && activeView !== "notifications";
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   // Request bytes forwarded unoptimized while gated; see unsavedWhileBlockedLabel.
@@ -3291,6 +3296,18 @@ export default function App() {
       trackAnalyticsEvent("activity_tab_opened");
     }
   }, [activeView]);
+
+  // Looking at Activity clears the tip's dots, here and on the menu bar.
+  useEffect(() => {
+    if (!dashboard.tipUnseen) {
+      setTipMarkedSeen(false);
+      return;
+    }
+    if (activeView !== "notifications" || !trayWindowFocused) return;
+    setTipMarkedSeen(true);
+    void invoke("mark_tip_seen").catch(() => undefined);
+    // The feed's tip identity re-runs this when a second tip posts while Activity is open.
+  }, [activeView, trayWindowFocused, dashboard.tipUnseen, activityFeed.tiles.tip?.observedAt]);
 
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
   // switching tabs reveals already-populated content instead of triggering
@@ -7014,9 +7031,13 @@ export default function App() {
             >
               <span className="tray-nav__icon" aria-hidden="true">
                 <item.icon className="tray-nav__icon-svg" size={26} weight={activeView === item.id ? "fill" : "regular"} />
+                {item.id === "notifications" && activityDot ? <span className="tray-nav__dot" /> : null}
               </span>
               <span className="tray-nav__text">
                 <strong>{item.label}</strong>
+                {item.id === "notifications" && activityDot ? (
+                  <span className="visually-hidden"> (new tip)</span>
+                ) : null}
               </span>
             </button>
           ))}

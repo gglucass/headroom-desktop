@@ -2569,6 +2569,23 @@ impl AppState {
         events
     }
 
+    /// Drives the unread dot on the Activity tab and the menu bar icon.
+    pub fn tip_unseen(&self) -> bool {
+        self.activity_facts.lock().tip_unseen()
+    }
+
+    pub fn mark_tip_seen(&self) {
+        let mut facts = self.activity_facts.lock();
+        facts.mark_tip_seen();
+        let _ = facts.save_if_dirty();
+    }
+
+    pub fn dismiss_tip(&self) {
+        let mut facts = self.activity_facts.lock();
+        facts.dismiss_tip();
+        let _ = facts.save_if_dirty();
+    }
+
     /// Request ids behind the large-compression and record tiles: the only
     /// requests whose bodies the desktop holds (`capture_tile_bodies`).
     pub fn activity_tile_request_ids(&self) -> Vec<String> {
@@ -3066,6 +3083,7 @@ impl AppState {
                 required_terms_version: REQUIRED_TERMS_VERSION,
                 accepted_terms_version,
                 terms_url: TERMS_URL.to_string(),
+                tip_unseen: self.tip_unseen(),
             },
             pending_milestones,
         )
