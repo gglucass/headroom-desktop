@@ -2573,26 +2573,28 @@ impl AppState {
     /// Runs every observer tick before the feed batch (see observe_signal_tips).
     pub fn observe_tip_signals(&self) {
         // The transcript scan reads up to 10 session files per project: at most
-        // every 6h, and never once the tip has fired.
+        // every 6h, and only until the tip fires, then while it shows (to take
+        // it down once the project starts light).
         static LAST_STARTUP_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
         const STARTUP_SCAN_EVERY: Duration = Duration::from_secs(6 * 3600);
 
         let observed = crate::tip_signals::observed();
-        let heavy_startup = if self
-            .activity_facts
-            .lock()
-            .tip_fired(crate::models::TipKind::HeavyStartup)
-        {
-            None
-        } else {
+        let scan = {
+            let facts = self.activity_facts.lock();
+            let kind = crate::models::TipKind::HeavyStartup;
+            !facts.tip_fired(kind) || facts.showing_tip(kind)
+        };
+        let startup_medians = if scan {
             let mut last = LAST_STARTUP_SCAN.lock();
             if last.is_some_and(|at| at.elapsed() < STARTUP_SCAN_EVERY) {
-                None
+                Vec::new()
             } else {
                 *last = Some(Instant::now());
                 drop(last);
-                heavy_startup_project(std::time::SystemTime::now())
+                startup_medians(std::time::SystemTime::now())
             }
+        } else {
+            Vec::new()
         };
         let signals = crate::activity_facts::TipSignals {
             extra_usage_in_use: observed.extra_usage_in_use,
@@ -2608,7 +2610,7 @@ impl AppState {
             codex_usage: crate::claude_statusline::codex_plan_usage().unwrap_or_default(),
             claude_in_use: crate::usage_counters::requests_since_yesterday("claude-code") > 0,
             codex_in_use: crate::usage_counters::requests_since_yesterday("codex") > 0,
-            heavy_startup,
+            startup_medians,
         };
         let mut facts = self.activity_facts.lock();
         facts.observe_signal_tips(&signals, Utc::now());
@@ -4862,15 +4864,20 @@ fn claude_auto_continue_on() -> bool {
         .is_some_and(|settings| settings["autoContinueAtUsageLimit"] == Value::Bool(true))
 }
 
-/// The project whose recent interactive Claude Code sessions start heaviest
-/// before the first prompt, as (folder name, median tokens), when that median
-/// reaches `HEAVY_STARTUP_MIN_TOKENS` over at least 5 sessions of the last 7
-/// days. Reads each session's first usage line; never content.
-fn heavy_startup_project(now: std::time::SystemTime) -> Option<(String, u64)> {
+/// Each project's median token count before the first prompt, as (folder
+/// name, median), over its newest interactive Claude Code sessions of the last
+/// 7 days, when it has at least 5. Reads each session's first usage line;
+/// never content.
+fn startup_medians(now: std::time::SystemTime) -> Vec<(String, u64)> {
     const RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
-    let cutoff = now.checked_sub(RECENT)?;
-    let mut heaviest: Option<(String, u64)> = None;
-    for dir in std::fs::read_dir(claude_projects_dir()).ok()?.flatten() {
+    let Some(cutoff) = now.checked_sub(RECENT) else {
+        return Vec::new();
+    };
+    let Ok(dirs) = std::fs::read_dir(claude_projects_dir()) else {
+        return Vec::new();
+    };
+    let mut medians = Vec::new();
+    for dir in dirs.flatten() {
         let recent: Vec<PathBuf> = list_session_jsonl_files(&dir.path())
             .into_iter()
             .filter(|file| {
@@ -4891,19 +4898,14 @@ fn heavy_startup_project(now: std::time::SystemTime) -> Option<(String, u64)> {
         }
         let mut tokens: Vec<u64> = starts.iter().map(|(_, tokens)| *tokens).collect();
         tokens.sort_unstable();
-        let median = tokens[tokens.len() / 2];
-        if median >= crate::activity_facts::HEAVY_STARTUP_MIN_TOKENS
-            && heaviest.as_ref().is_none_or(|(_, best)| median > *best)
-        {
-            let name = Path::new(&starts[0].0)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&starts[0].0)
-                .to_string();
-            heaviest = Some((name, median));
-        }
+        let name = Path::new(&starts[0].0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&starts[0].0)
+            .to_string();
+        medians.push((name, tokens[tokens.len() / 2]));
     }
-    heaviest
+    medians
 }
 
 /// (cwd, prompt tokens) of a session's first main-thread reply: what Claude

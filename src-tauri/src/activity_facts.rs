@@ -67,6 +67,11 @@ const WEEK_SECS: i64 = 7 * 24 * 3600;
 // A project's interactive sessions start at this median or more before the
 // first prompt. Claude Code alone starts near 19k (a heavy machine, 2026-10).
 pub(crate) const HEAVY_STARTUP_MIN_TOKENS: u64 = 50_000;
+// ...and this much over the user's lightest project, when there is one: the
+// rest (account skills, connectors, plugins) loads in every project, so trimming
+// the project's files cannot remove it. headroom-desktop, with ~6.5k of its own
+// instruction files, measured 12k over evalship at 60k (2026-10).
+const HEAVY_STARTUP_MIN_EXCESS_TOKENS: u64 = 20_000;
 // Codex compacts near its 258k window by default. Fleet, 2026-10: 79 Codex
 // users had days averaging 150k+ per request.
 pub(crate) const CODEX_COMPACT_TIP_MIN_TOKENS: u64 = 150_000;
@@ -88,8 +93,9 @@ pub struct TipSignals {
     /// Each tool sent requests through Headroom today or yesterday.
     pub claude_in_use: bool,
     pub codex_in_use: bool,
-    /// (project folder name, median session start in tokens).
-    pub heavy_startup: Option<(String, u64)>,
+    /// (project folder name, median session start in tokens) for each project
+    /// with enough recent sessions. Empty on a tick that did not scan.
+    pub startup_medians: Vec<(String, u64)>,
 }
 
 /// The fullest of a plan's windows when every one is under
@@ -498,6 +504,10 @@ impl ActivityFacts {
         self.tips_fired.contains(kind.key())
     }
 
+    pub fn showing_tip(&self, kind: TipKind) -> bool {
+        self.last_tip.as_ref().is_some_and(|tip| tip.kind == kind)
+    }
+
     /// Post the first candidate that has not fired yet. One tip at a time: a
     /// new one waits (its condition recurs) until the current one is seen.
     fn post_first_tip(&mut self, candidates: impl IntoIterator<Item = Option<TipEvent>>) {
@@ -561,6 +571,21 @@ impl ActivityFacts {
     pub fn observe_signal_tips(&mut self, signals: &TipSignals, now: DateTime<Utc>) {
         self.idle_resume_at = signals.idle_resume_at;
         self.codex_in_use = signals.codex_in_use;
+        let medians = &signals.startup_medians;
+        let lightest = medians.iter().map(|(_, median)| *median).min().unwrap_or(0);
+        let heavy = |median: u64| {
+            median >= HEAVY_STARTUP_MIN_TOKENS
+                && (medians.len() < 2 || median - lightest >= HEAVY_STARTUP_MIN_EXCESS_TOKENS)
+        };
+        // A heavy-startup tip leaves once its project measures light again.
+        if self.last_tip.as_ref().is_some_and(|tip| {
+            tip.kind == TipKind::HeavyStartup
+                && medians.iter().any(|(project, median)| {
+                    tip.project.as_ref() == Some(project) && !heavy(*median)
+                })
+        }) {
+            self.dismiss_tip();
+        }
         let pace = |kind, week: Option<PlanWindow>| {
             let (used_percent, resets_at, limit_at) = weekly_pace(week?, now)?;
             Some(TipEvent {
@@ -624,11 +649,13 @@ impl ActivityFacts {
                 .extra_usage_in_use
                 .then(|| TipEvent::new(TipKind::ExtraUsageCache, now, 0)),
             signals
-                .heavy_startup
-                .clone()
+                .startup_medians
+                .iter()
+                .filter(|(_, median)| heavy(*median))
+                .max_by_key(|(_, median)| *median)
                 .map(|(project, median)| TipEvent {
-                    project: Some(project),
-                    ..TipEvent::new(TipKind::HeavyStartup, now, median)
+                    project: Some(project.clone()),
+                    ..TipEvent::new(TipKind::HeavyStartup, now, *median)
                 }),
         ]);
     }
@@ -1477,7 +1504,11 @@ mod tests {
         assert_eq!(posted(&facts), Some((TipKind::ExtraUsageCache, 0)));
 
         facts.mark_tip_seen();
-        signals.heavy_startup = Some(("headroom-desktop".into(), 69_399));
+        signals.startup_medians = vec![
+            ("light".into(), 30_000),
+            ("headroom-desktop".into(), 69_399),
+            ("heavy".into(), 55_000),
+        ];
         facts.observe_signal_tips(&signals, at(10, 3));
         let tip = facts.activity_feed_snapshot().tip.unwrap();
         assert_eq!(tip.kind, TipKind::HeavyStartup);
@@ -1485,6 +1516,52 @@ mod tests {
             (tip.project.as_deref(), tip.context_tokens),
             (Some("headroom-desktop"), 69_399)
         );
+
+        // Another project measuring light, or a tick that did not scan, keeps it.
+        signals.startup_medians = vec![("light".into(), 30_000)];
+        facts.observe_signal_tips(&signals, at(10, 4));
+        signals.startup_medians.clear();
+        facts.observe_signal_tips(&signals, at(10, 5));
+        assert!(facts.showing_tip(TipKind::HeavyStartup));
+
+        signals.startup_medians = vec![("headroom-desktop".into(), 42_000)];
+        facts.observe_signal_tips(&signals, at(10, 6));
+        assert!(
+            facts.activity_feed_snapshot().tip.is_none(),
+            "trimmed below the bar"
+        );
+    }
+
+    #[test]
+    fn heavy_startup_counts_only_what_a_project_adds_over_the_lightest() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let mut signals = TipSignals {
+            startup_medians: vec![
+                ("evalship".into(), 47_966),
+                ("headroom-desktop".into(), 59_541),
+            ],
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&signals, at(10, 0));
+        assert_eq!(
+            posted(&facts),
+            None,
+            "12k over the lightest is account weight"
+        );
+
+        // Nothing to compare against: the whole start counts.
+        signals.startup_medians = vec![("headroom-desktop".into(), 59_541)];
+        facts.observe_signal_tips(&signals, at(10, 1));
+        assert_eq!(posted(&facts), Some((TipKind::HeavyStartup, 59_541)));
+
+        // A lighter project turning up shows the weight was never this one's.
+        signals.startup_medians = vec![
+            ("evalship".into(), 47_966),
+            ("headroom-desktop".into(), 59_541),
+        ];
+        facts.observe_signal_tips(&signals, at(10, 2));
+        assert_eq!(posted(&facts), None);
     }
 
     #[test]

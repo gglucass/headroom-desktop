@@ -1062,9 +1062,8 @@ function tipCopy(event: TipEvent): ReactNode {
       return (
         <>
           Sessions in {event.project} start at {size} tokens before your first prompt, and every
-          turn re-sends them. Run <code>/context</code> there to see what loads, and move rule sets
-          Claude rarely needs out of CLAUDE.md into a doc, with one line in CLAUDE.md saying when
-          to read it.
+          turn re-sends them. Paste this prompt into a Claude Code session there: Claude lists what
+          loads and proposes what to move out. This tip goes away once sessions there start lighter.
         </>
       );
     case "compact_window":
@@ -1097,15 +1096,40 @@ function tipCopy(event: TipEvent): ReactNode {
   }
 }
 
+// A prompt for the user to paste into Claude Code, for tips whose fix needs judgment.
+function tipPrompt(event: TipEvent): string | null {
+  if (event.kind !== "heavy_startup") return null;
+  return [
+    `My Claude Code sessions in this project start at about ${Math.round(event.contextTokens / 1000)}k tokens before my first prompt, and every turn re-sends them. Find what loads at session start and cut it, without losing anything I rely on.`,
+    "1. List what loads and roughly what each costs. Most of it is in your own context: the CLAUDE.md, CLAUDE.local.md and memory files and the files they @-import, the skills list, MCP tool names and server instructions, and hook output. Check ~/.claude/settings.json, .claude/settings.json and .mcp.json for where each comes from.",
+    "2. Propose cuts, biggest first: move rule sets only one kind of task needs into a doc or a skill, with one line in CLAUDE.md saying when to read it; delete rules that repeat what the code or your defaults already do; name the MCP servers, plugins and skills this project never uses.",
+    "3. Show me the plan with the tokens each cut saves, and wait for my OK before changing anything."
+  ].join("\n\n");
+}
+
 function TipRow({ event }: { event: TipEvent }) {
   // Hidden on click; the next feed poll drops the slot for good.
   const [dismissed, setDismissed] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const copy = tipCopy(event);
+  const prompt = tipPrompt(event);
   if (dismissed || copy === null) return null;
   const dismiss = () => {
     setDismissed(true);
     trackAnalyticsEvent("activity_tip_dismissed", { kind: event.kind });
     void invoke("dismiss_tip").catch(() => undefined);
+  };
+  // WebKitGTK can refuse clipboard writes (RUST-QT); the prompt then shows, selectable.
+  const copyPrompt = async () => {
+    if (prompt === null) return;
+    trackAnalyticsEvent("activity_tip_prompt_copied", { kind: event.kind });
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 2000);
+    } catch {
+      setCopyState("failed");
+    }
   };
   return (
     <li className="activity-feed__item activity-feed__item--tip">
@@ -1114,7 +1138,17 @@ function TipRow({ event }: { event: TipEvent }) {
         <TimeChip iso={event.observedAt} />
       </div>
       <p className="activity-feed__content">{copy}</p>
+      {copyState === "failed" ? <pre className="activity-feed__prompt">{prompt}</pre> : null}
       <div className="activity-feed__row">
+        {prompt !== null ? (
+          <button
+            className="secondary-button secondary-button--small"
+            onClick={() => void copyPrompt()}
+            type="button"
+          >
+            {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy prompt"}
+          </button>
+        ) : null}
         <button className="secondary-button secondary-button--small" onClick={dismiss} type="button">
           Dismiss
         </button>

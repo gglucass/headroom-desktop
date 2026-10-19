@@ -77,6 +77,11 @@ const ALLOWED_EVENTS: &[&str] = &[
     // ok=true/false so the button's success rate is measurable.
     "claude_code_installer_run",
     "activity_tab_opened",
+    // Activity tips, each carrying only `kind`: shown, dismissed, and the fix
+    // prompt copied. Dropped here until 0.9.45, so no tip data predates it.
+    "activity_tip_seen",
+    "activity_tip_dismissed",
+    "activity_tip_prompt_copied",
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;

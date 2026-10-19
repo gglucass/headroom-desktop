@@ -132,6 +132,34 @@ describe("tips", () => {
     expect(screen.getByText(/used 78% of your weekly Claude limit/)).toBeTruthy();
   });
 
+  it("copies a fix prompt for a heavy startup, and shows it when the clipboard refuses", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const feed = {
+      ...baseFeed,
+      tiles: {
+        ...emptyTiles,
+        tip: {
+          kind: "heavy_startup" as const,
+          observedAt: "2026-10-19T10:00:00Z",
+          contextTokens: 69_499,
+          project: "headroom-desktop",
+          seen: false
+        }
+      }
+    };
+    const { unmount } = render(<ActivityFeed feed={feed} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(writeText.mock.calls[0][0]).toMatch(/start at about 69k tokens before my first prompt/);
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
+    unmount();
+
+    writeText.mockRejectedValue(new Error("NotAllowedError"));
+    render(<ActivityFeed feed={feed} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(screen.getByText(/wait for my OK before changing anything/)).toBeTruthy();
+  });
+
   it("covers the Codex and switch kinds", () => {
     const tip = (kind: TipKind, extra: Partial<TipEvent> = {}) => (
       <ActivityFeed
