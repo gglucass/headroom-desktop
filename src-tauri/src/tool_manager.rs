@@ -4199,6 +4199,11 @@ impl ToolManager {
                     // loopback. Env, not --host: the `-m headroom.proxy.server`
                     // fallback lets HEADROOM_HOST override its --host.
                     .env("HEADROOM_HOST", "127.0.0.1")
+                    // The `headroom` CLI applies ~/.headroom/settings.json with
+                    // setdefault, and an OSS user's stored `uds` would bind the
+                    // backend to a unix socket the desktop never probes. Empty
+                    // wins the setdefault, and Click ignores an empty envvar.
+                    .env("HEADROOM_UDS", "")
                     // 0.40.0's hard watchdog (#3180) exits the backend when one
                     // native call holds the GIL for 90s. Its faulthandler timer
                     // waits on the wall clock on our Linux Python (no
