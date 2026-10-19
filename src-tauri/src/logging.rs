@@ -243,6 +243,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The 10013 unwire is reported by the same retry's once-per-error
+    // `proxy_intercept_bind_failed` capture (RUST-EQ), whose `probe` extra
+    // tells a reserved range from another account's listener; bridged, the
+    // warn filed every such host a second time as RUST-RC.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("[proxy_intercept] unwired clients: Windows refused port")
+    {
+        return true;
+    }
     // report_codex_upstream_error logs the RAW upstream body locally and then
     // captures a separate, status-fingerprinted event with only the structural
     // summary. The bridge defeated both halves (RUST-5Q): the raw body — which
@@ -1222,6 +1231,12 @@ mod tests {
             "headroom_desktop_lib::proxy_intercept",
             "[proxy_intercept] error: An attempt was made to access a socket in a way \
              forbidden by its access permissions. (os error 10013); retrying"
+        ));
+        // Its unwire, verbatim from the emit site: the same capture covers it
+        // (RUST-RC).
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] unwired clients: Windows refused port 6767"
         ));
         // The rule is scoped to the retry marker, not blanket-by-target: a
         // proxy_intercept warning that fires once and has no emit-site capture
