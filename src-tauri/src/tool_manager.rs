@@ -11185,7 +11185,16 @@ impl ToolManager {
             Duration::from_secs(60),
         );
         crate::client_adapters::protect_foreign_mcp_tables();
-        result
+        result.map_err(|err| {
+            let user_config = err
+                .downcast_ref::<CommandFailure>()
+                .is_some_and(|failure| mcp_helper_failed_on_user_config(&failure.stderr));
+            if user_config {
+                err.context(crate::client_adapters::UNPARSEABLE_SETTINGS)
+            } else {
+                err
+            }
+        })
     }
 
     /// Remove the managed rtk binary and its receipt. Shell PATH and Claude Code
@@ -17699,6 +17708,26 @@ fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True when every registrar an MCP helper's exit line names (`codex: <why>;
+/// claude: <why>`) failed on a config file the user broke, which the client
+/// that owns it cannot read either (RUST-R6: `~/.codex/config.toml is not valid
+/// TOML`, retried and reported on every launch). One real failure beside it
+/// still reports.
+fn mcp_helper_failed_on_user_config(stderr: &str) -> bool {
+    let Some(line) = stderr.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let failures: usize = ["claude: ", "codex: ", "grok: ", "opencode: "]
+        .iter()
+        .map(|name| {
+            usize::from(line.starts_with(name)) + line.matches(&format!("; {name}")).count()
+        })
+        .sum();
+    let unparseable =
+        line.matches(" is not valid TOML").count() + line.matches(" is not valid JSON").count();
+    failures > 0 && failures == unparseable
+}
+
 /// First Claude Code release with `claude plugin marketplace add`. 2.0.12-2.0.15
 /// have `plugin` but reject `marketplace` as an unknown command.
 const CLAUDE_PLUGIN_MIN_VERSION: [u32; 3] = [2, 0, 17];
@@ -22563,6 +22592,19 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             "{message}"
         );
         assert!(message.len() < 400, "{message}");
+    }
+
+    #[test]
+    fn mcp_helper_failure_on_user_config_is_told_apart() {
+        use super::mcp_helper_failed_on_user_config as user_config;
+        // RUST-R6, the wheel's registrar wording.
+        let toml = "codex: /Users/u/.codex/config.toml is not valid TOML (Cannot overwrite a value (at line 12, column 5))";
+        assert!(user_config(&format!("Traceback noise\n{toml}\n")));
+        let json = "opencode: /Users/u/.config/opencode/opencode.json exists but is not valid JSON (Expecting ',' delimiter: line 3 column 5 (char 40)); fix it by hand";
+        assert!(user_config(&format!("{toml}; {json}")));
+        assert!(!user_config(&format!("{toml}; claude: removal failed")));
+        assert!(!user_config("codex: removal failed"));
+        assert!(!user_config(""));
     }
 
     #[test]
