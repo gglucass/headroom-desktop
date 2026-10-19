@@ -3297,9 +3297,12 @@ export default function App() {
     }
   }, [activeView]);
 
-  // Looking at Activity clears the tip's dots, here and on the menu bar.
+  // Looking at Activity clears the tip's dots, here and on the menu bar. The
+  // feed's own flag too: `dashboard` only refreshes on Home, so a tip posted
+  // while Activity is open would otherwise never be marked seen.
+  const tipUnseen = dashboard.tipUnseen || activityFeed.tiles.tip?.seen === false;
   useEffect(() => {
-    if (!dashboard.tipUnseen) {
+    if (!tipUnseen) {
       setTipMarkedSeen(false);
       return;
     }
@@ -3307,7 +3310,7 @@ export default function App() {
     setTipMarkedSeen(true);
     void invoke("mark_tip_seen").catch(() => undefined);
     // The feed's tip identity re-runs this when a second tip posts while Activity is open.
-  }, [activeView, trayWindowFocused, dashboard.tipUnseen, activityFeed.tiles.tip?.observedAt]);
+  }, [activeView, trayWindowFocused, tipUnseen, activityFeed.tiles.tip?.observedAt]);
 
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
   // switching tabs reveals already-populated content instead of triggering

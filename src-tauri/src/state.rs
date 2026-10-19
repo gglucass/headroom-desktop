@@ -4858,10 +4858,11 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
 
 /// Claude Code's own setting to wait out a usage limit and resume the task.
 fn claude_auto_continue_on() -> bool {
+    // Claude Code reads the setting as `?? true` (2.1.303): absent is on.
     std::fs::read(user_home_dir().join(".claude").join("settings.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|settings| settings["autoContinueAtUsageLimit"] == Value::Bool(true))
+        .is_none_or(|settings| settings["autoContinueAtUsageLimit"] != Value::Bool(false))
 }
 
 /// Each project's median token count before the first prompt, as (folder
