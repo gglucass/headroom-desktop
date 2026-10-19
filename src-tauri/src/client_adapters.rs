@@ -10617,6 +10617,43 @@ fn claude_settings_path() -> PathBuf {
     home_dir().join(".claude").join("settings.json")
 }
 
+/// Sets one value in ~/.claude/settings.json, creating the objects on its
+/// path (an Activity tip's apply button).
+pub fn set_claude_setting(path: &[&str], value: Value) -> Result<()> {
+    let _guard = setup_write_lock();
+    set_json_setting_at(&claude_settings_path(), path, value)
+}
+
+fn set_json_setting_at(settings_path: &Path, path: &[&str], value: Value) -> Result<()> {
+    let mut root = if settings_path.exists() {
+        let raw = std::fs::read_to_string(settings_path)
+            .with_context(|| format!("reading {}", settings_path.display()))?;
+        parse_json_object(&raw, settings_path)?
+    } else {
+        Default::default()
+    };
+    let (last, parents) = path.split_last().context("empty settings path")?;
+    let mut object = &mut root;
+    for key in parents {
+        object = object
+            .entry(*key)
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .with_context(|| format!("{key} in {} is not an object", settings_path.display()))?;
+    }
+    object.insert((*last).to_string(), value);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    backup_if_exists(settings_path)?;
+    atomic_write(
+        settings_path,
+        &serde_json::to_vec_pretty(&Value::Object(root)).context("serializing settings")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))
+}
+
 fn headroom_rtk_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
@@ -11815,7 +11852,9 @@ mod tests {
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
         VSCODE_PROCESS_WRAPPER_KEY,
     };
-    use super::{build_claude_remote_control_wrapper, build_windows_wrapper_exe};
+    use super::{
+        build_claude_remote_control_wrapper, build_windows_wrapper_exe, set_json_setting_at,
+    };
     #[cfg(unix)]
     use super::{
         build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
@@ -12268,6 +12307,38 @@ mod tests {
             .remembered_shell_files
             .contains_key("claude_code"));
         assert!(normalized.remembered_shell_files.contains_key("codex"));
+    }
+
+    #[test]
+    fn set_json_setting_keeps_the_rest_and_creates_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude").join("settings.json");
+        set_json_setting_at(&path, &["autoContinueAtUsageLimit"], Value::Bool(true)).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"env": {"A": "1"}, "modelSettings": {"claude-haiku-5-5": {"effortLevel": "high"}}}"#,
+        )
+        .unwrap();
+        let haiku = ["modelSettings", "claude-haiku-5-5", "autoCompactWindow"];
+        set_json_setting_at(&path, &haiku, 100_000.into()).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["env"]["A"], "1");
+        assert_eq!(
+            written["modelSettings"]["claude-haiku-5-5"]["effortLevel"],
+            "high"
+        );
+        assert_eq!(
+            written["modelSettings"]["claude-haiku-5-5"]["autoCompactWindow"],
+            100_000
+        );
+
+        std::fs::write(&path, r#"{"modelSettings": "oops"}"#).unwrap();
+        assert!(set_json_setting_at(&path, &haiku, 100_000.into()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"modelSettings": "oops"}"#
+        );
     }
 
     #[test]

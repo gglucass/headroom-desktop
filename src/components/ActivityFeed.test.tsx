@@ -41,7 +41,7 @@ const emptyTiles: ActivityFeedSnapshot = {
   learningsMilestone: null,
   weeklyRecap: null,
   trainSuggestion: null,
-  tip: null
+  tips: []
 };
 
 const baseFeed: ActivityFeedResponse = {
@@ -58,96 +58,87 @@ describe("weekdayTime", () => {
 });
 
 describe("tips", () => {
-  const feedWith = (kind: TipKind): ActivityFeedResponse => ({
+  const tipOf = (kind: TipKind, extra: Partial<TipEvent> = {}): TipEvent => ({
+    kind,
+    observedAt: "2026-10-19T10:00:00Z",
+    contextTokens: 412_345,
+    seen: false,
+    ...extra
+  });
+  const feedWith = (...tips: TipEvent[]): ActivityFeedResponse => ({
     ...baseFeed,
-    tiles: {
-      ...emptyTiles,
-      tip: { kind, observedAt: "2026-10-19T10:00:00Z", contextTokens: 412_345, seen: false }
-    }
+    tiles: { ...emptyTiles, tips }
   });
-  const tipFeed = feedWith("compact_window");
 
-  it("names the session size and the command", () => {
-    render(<ActivityFeed feed={tipFeed} error={null} />);
+  it("shows every posted tip, each with its own title", () => {
+    render(<ActivityFeed feed={feedWith(tipOf("compact_window"), tipOf("idle_break"))} error={null} />);
+    expect(screen.getByText("Compact long sessions sooner")).toBeTruthy();
+    expect(screen.getByText("Compact before long breaks")).toBeTruthy();
     expect(screen.getByText(/reached 412k tokens/)).toBeTruthy();
-    expect(screen.getByText("/autocompact 400k")).toBeTruthy();
   });
 
-  it("dismisses for good", async () => {
-    render(<ActivityFeed feed={tipFeed} error={null} />);
-    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(invokeMock).toHaveBeenCalledWith("dismiss_tip");
-    expect(screen.queryByText("/autocompact 400k")).toBeNull();
+  it("dismisses one tip by its kind", async () => {
+    render(<ActivityFeed feed={feedWith(tipOf("compact_window"), tipOf("idle_break"))} error={null} />);
+    await userEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[0]);
+    expect(invokeMock).toHaveBeenCalledWith("dismiss_tip", { kind: "compact_window" });
+    expect(screen.queryByText("Compact long sessions sooner")).toBeNull();
+    expect(screen.getByText("Compact before long breaks")).toBeTruthy();
   });
 
-  it("gives each kind its own command", () => {
-    const { unmount } = render(<ActivityFeed feed={feedWith("haiku_long_context")} error={null} />);
-    expect(screen.getByText("/autocompact 100k")).toBeTruthy();
+  it("applies a setting tip, and names the command when it cannot", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    const { unmount } = render(<ActivityFeed feed={feedWith(tipOf("auto_continue"))} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    expect(invokeMock).toHaveBeenCalledWith("apply_tip", { kind: "auto_continue" });
+    expect(screen.getByText(/Saved to ~\/.claude\/settings.json/)).toBeTruthy();
     unmount();
-    render(<ActivityFeed feed={feedWith("fable_upgrade")} error={null} />);
+
+    invokeMock.mockRejectedValueOnce("settings.json is not an object");
+    render(<ActivityFeed feed={feedWith(tipOf("haiku_long_context"))} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Compact Haiku at 100k" }));
+    expect(screen.getByText("/autocompact 100k")).toBeTruthy();
+  });
+
+  it("shows and copies a command", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<ActivityFeed feed={feedWith(tipOf("fable_upgrade"))} error={null} />);
     expect(screen.getByText("/model claude-fable-5-1")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith("/model claude-fable-5-1");
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
   });
 
   it("words the signal tips from their own fields", () => {
     const { unmount } = render(
       <ActivityFeed
-        feed={{
-          ...baseFeed,
-          tiles: {
-            ...emptyTiles,
-            tip: {
-              kind: "heavy_startup",
-              observedAt: "2026-10-19T10:00:00Z",
-              contextTokens: 69_499,
-              project: "headroom-desktop",
-              seen: false
-            }
-          }
-        }}
+        feed={feedWith(tipOf("heavy_startup", { contextTokens: 69_499, project: "headroom-desktop" }))}
         error={null}
       />
     );
-    expect(screen.getByText(/Sessions in headroom-desktop start at 69k tokens/)).toBeTruthy();
+    expect(screen.getByText("Sessions in headroom-desktop start at 69k tokens")).toBeTruthy();
     unmount();
     render(
       <ActivityFeed
-        feed={{
-          ...baseFeed,
-          tiles: {
-            ...emptyTiles,
-            tip: {
-              kind: "weekly_pace",
-              observedAt: "2026-10-19T10:00:00Z",
-              contextTokens: 0,
-              usedPercent: 78.4,
-              resetsAt: "2026-10-23T09:00:00Z",
-              limitAt: "2026-10-21T15:00:00Z",
-              seen: false
-            }
-          }
-        }}
+        feed={feedWith(
+          tipOf("weekly_pace", {
+            contextTokens: 0,
+            usedPercent: 78.4,
+            resetsAt: "2026-10-23T09:00:00Z",
+            limitAt: "2026-10-21T15:00:00Z"
+          })
+        )}
         error={null}
       />
     );
-    expect(screen.getByText(/used 78% of your weekly Claude limit/)).toBeTruthy();
+    expect(screen.getByText(/On pace to hit your weekly Claude limit/)).toBeTruthy();
+    expect(screen.getByText(/78% used, resets/)).toBeTruthy();
   });
 
   it("copies a fix prompt for a heavy startup, and shows it when the clipboard refuses", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    const feed = {
-      ...baseFeed,
-      tiles: {
-        ...emptyTiles,
-        tip: {
-          kind: "heavy_startup" as const,
-          observedAt: "2026-10-19T10:00:00Z",
-          contextTokens: 69_499,
-          project: "headroom-desktop",
-          seen: false
-        }
-      }
-    };
+    const feed = feedWith(tipOf("heavy_startup", { contextTokens: 69_499, project: "headroom-desktop" }));
     const { unmount } = render(<ActivityFeed feed={feed} error={null} />);
     await userEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
     expect(writeText.mock.calls[0][0]).toMatch(/start at about 69k tokens before my first prompt/);
@@ -162,30 +153,22 @@ describe("tips", () => {
 
   it("covers the Codex and switch kinds", () => {
     const tip = (kind: TipKind, extra: Partial<TipEvent> = {}) => (
-      <ActivityFeed
-        feed={{
-          ...baseFeed,
-          tiles: {
-            ...emptyTiles,
-            tip: { kind, observedAt: "2026-10-19T10:00:00Z", contextTokens: 160_000, seen: false, ...extra }
-          }
-        }}
-        error={null}
-      />
+      <ActivityFeed feed={feedWith(tipOf(kind, { contextTokens: 160_000, ...extra }))} error={null} />
     );
     const { unmount } = render(tip("codex_compact"));
     expect(screen.getByText("model_auto_compact_token_limit = 150000")).toBeTruthy();
     unmount();
     const second = render(tip("switch_to_codex", { usedPercent: 31.6 }));
-    expect(screen.getByText(/limit until it resets.*fullest window\s+is at 32%/s)).toBeTruthy();
+    expect(screen.getByText("Claude Code is limited until it resets")).toBeTruthy();
+    expect(screen.getByText(/fullest window is at 32%/)).toBeTruthy();
     second.unmount();
     render(tip("switch_to_claude", { usedPercent: 40, resetsAt: "2026-10-19T15:00:00Z" }));
-    expect(screen.getByText(/Codex is at its usage limit until \w+/)).toBeTruthy();
+    expect(screen.getByText(/Codex is limited until \w+/)).toBeTruthy();
   });
 
   it("renders nothing without a tip", () => {
     render(<ActivityFeed feed={baseFeed} error={null} />);
-    expect(screen.queryByText("/autocompact 400k")).toBeNull();
+    expect(screen.queryByText(/^Tip$/)).toBeNull();
   });
 });
 

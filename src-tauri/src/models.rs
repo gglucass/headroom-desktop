@@ -878,8 +878,9 @@ pub struct TrainSuggestionEvent {
     pub kind: String,
 }
 
-/// A one-time Activity tip: a saving the user's own Claude Code traffic shows
-/// they would get from one command in Claude Code. Headroom changes nothing.
+/// An Activity tip: a saving the user's own Claude Code or Codex traffic shows
+/// they would get from one change. Headroom changes nothing unless the user
+/// clicks the tip's apply button (`apply_tip`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TipKind {
@@ -924,6 +925,14 @@ impl TipEvent {
             limit_at: None,
             project: None,
             seen: false,
+        }
+    }
+
+    /// Persisted fire-once key: the kind, per project for `HeavyStartup`.
+    pub fn fire_key(&self) -> String {
+        match (self.kind, &self.project) {
+            (TipKind::HeavyStartup, Some(project)) => format!("heavy_startup:{project}"),
+            _ => self.kind.key().to_string(),
         }
     }
 }
@@ -1003,7 +1012,8 @@ pub struct ActivityFeedSnapshot {
     pub learnings_milestone: Option<LearningsMilestoneEvent>,
     pub weekly_recap: Option<WeeklyRecapEvent>,
     pub train_suggestion: Option<TrainSuggestionEvent>,
-    pub tip: Option<TipEvent>,
+    /// Newest first; empty renders nothing.
+    pub tips: Vec<TipEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -48,7 +48,9 @@ export function activityFeedSignature(feed: ActivityFeedResponse): string {
     tiles.trainSuggestion
       ? `ts:${tiles.trainSuggestion.projectPath}:${tiles.trainSuggestion.observedAt}`
       : "ts:-",
-    tiles.tip ? `tip:${tiles.tip.kind}:${tiles.tip.observedAt}:${tiles.tip.seen ? 1 : 0}` : "tip:-"
+    tiles.tips.length
+      ? `tip:${tiles.tips.map((tip) => `${tip.kind}:${tip.observedAt}:${tip.seen ? 1 : 0}`).join(",")}`
+      : "tip:-"
   ];
   return parts.join("|");
 }

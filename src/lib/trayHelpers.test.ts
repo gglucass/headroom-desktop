@@ -40,7 +40,7 @@ const emptySnapshot: ActivityFeedResponse = {
     learningsMilestone: null,
     weeklyRecap: null,
     trainSuggestion: null,
-    tip: null
+    tips: []
   }
 };
 
@@ -133,12 +133,15 @@ describe("activityFeedSignature", () => {
           projectPath: "/Users/x/proj",
           observedAt: "2026-04-25T09:00:00Z"
         } as never,
-        tip: {
-          kind: "compact_window",
-          observedAt: "2026-04-25T08:00:00Z",
-          contextTokens: 412000,
-          seen: true
-        }
+        tips: [
+          {
+            kind: "compact_window",
+            observedAt: "2026-04-25T08:00:00Z",
+            contextTokens: 412000,
+            seen: true
+          },
+          { kind: "idle_break", observedAt: "2026-04-25T07:00:00Z", contextTokens: 0, seen: false }
+        ]
       }
     });
     expect(sig).toContain("r:2026-04-25T11:00:00Z");
@@ -148,7 +151,7 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("wr:2026-04-20");
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");
     // `seen` is in the key so opening Activity re-renders the tile without its dot.
-    expect(sig).toContain("tip:compact_window:2026-04-25T08:00:00Z:1");
+    expect(sig).toContain("tip:compact_window:2026-04-25T08:00:00Z:1,idle_break:2026-04-25T07:00:00Z:0");
   });
 
 });

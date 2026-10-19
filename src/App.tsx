@@ -1892,7 +1892,7 @@ export default function App() {
       learningsMilestone: null,
       weeklyRecap: null,
       trainSuggestion: null,
-      tip: null
+      tips: []
     },
     proxyReachable: false
   });
@@ -3297,10 +3297,12 @@ export default function App() {
     }
   }, [activeView]);
 
-  // Looking at Activity clears the tip's dots, here and on the menu bar. The
-  // feed's own flag too: `dashboard` only refreshes on Home, so a tip posted
+  // Looking at Activity clears the tips' dots, here and on the menu bar. The
+  // feed's own flags too: `dashboard` only refreshes on Home, so a tip posted
   // while Activity is open would otherwise never be marked seen.
-  const tipUnseen = dashboard.tipUnseen || activityFeed.tiles.tip?.seen === false;
+  const feedTips = activityFeed.tiles.tips;
+  const tipUnseen = dashboard.tipUnseen || feedTips.some((tip) => !tip.seen);
+  const tipIdentity = feedTips.map((tip) => tip.observedAt).join();
   useEffect(() => {
     if (!tipUnseen) {
       setTipMarkedSeen(false);
@@ -3309,8 +3311,8 @@ export default function App() {
     if (activeView !== "notifications" || !trayWindowFocused) return;
     setTipMarkedSeen(true);
     void invoke("mark_tip_seen").catch(() => undefined);
-    // The feed's tip identity re-runs this when a second tip posts while Activity is open.
-  }, [activeView, trayWindowFocused, tipUnseen, activityFeed.tiles.tip?.observedAt]);
+    // The feed's tip identity re-runs this when another tip posts while Activity is open.
+  }, [activeView, trayWindowFocused, tipUnseen, tipIdentity]);
 
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
   // switching tabs reveals already-populated content instead of triggering

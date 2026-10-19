@@ -2572,19 +2572,14 @@ impl AppState {
     /// Feed the tips what the intercept, plan usage and transcripts show.
     /// Runs every observer tick before the feed batch (see observe_signal_tips).
     pub fn observe_tip_signals(&self) {
-        // The transcript scan reads up to 10 session files per project: at most
-        // every 6h, and only until the tip fires, then while it shows (to take
-        // it down once the project starts light).
+        // The transcript scan reads up to 10 session files per project, at most
+        // every 6h: each project gets its own heavy-startup tip, and a showing
+        // one leaves once its project starts light.
         static LAST_STARTUP_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
         const STARTUP_SCAN_EVERY: Duration = Duration::from_secs(6 * 3600);
 
         let observed = crate::tip_signals::observed();
-        let scan = {
-            let facts = self.activity_facts.lock();
-            let kind = crate::models::TipKind::HeavyStartup;
-            !facts.tip_fired(kind) || facts.showing_tip(kind)
-        };
-        let startup_medians = if scan {
+        let startup_medians = {
             let mut last = LAST_STARTUP_SCAN.lock();
             if last.is_some_and(|at| at.elapsed() < STARTUP_SCAN_EVERY) {
                 Vec::new()
@@ -2593,13 +2588,17 @@ impl AppState {
                 drop(last);
                 startup_medians(std::time::SystemTime::now())
             }
-        } else {
-            Vec::new()
         };
+        // Read while the tip shows too, so turning it on in /config takes it down.
+        let auto_continue_tip = self
+            .activity_facts
+            .lock()
+            .showing_tip(crate::models::TipKind::AutoContinue);
         let signals = crate::activity_facts::TipSignals {
             extra_usage_in_use: observed.extra_usage_in_use,
             usage_limit_hit: observed.usage_limit_hit,
-            auto_continue_on: observed.usage_limit_hit && claude_auto_continue_on(),
+            auto_continue_on: (observed.usage_limit_hit || auto_continue_tip)
+                && claude_auto_continue_on(),
             idle_resume_at: observed
                 .idle_resume_at_ms
                 .and_then(DateTime::from_timestamp_millis),
@@ -2622,17 +2621,17 @@ impl AppState {
         self.activity_facts.lock().tip_unseen()
     }
 
-    /// The kind of the tip this marked seen, if one was unseen.
-    pub fn mark_tip_seen(&self) -> Option<crate::models::TipKind> {
+    /// The kinds of the tips this marked seen.
+    pub fn mark_tips_seen(&self) -> Vec<crate::models::TipKind> {
         let mut facts = self.activity_facts.lock();
-        let seen = facts.mark_tip_seen();
+        let seen = facts.mark_tips_seen();
         let _ = facts.save_if_dirty();
         seen
     }
 
-    pub fn dismiss_tip(&self) {
+    pub fn dismiss_tip(&self, kind: crate::models::TipKind) {
         let mut facts = self.activity_facts.lock();
-        facts.dismiss_tip();
+        facts.dismiss_tip(kind);
         let _ = facts.save_if_dirty();
     }
 

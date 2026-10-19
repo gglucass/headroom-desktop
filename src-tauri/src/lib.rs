@@ -5149,11 +5149,11 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
         })
 }
 
-/// The Activity tab showed the tip: clears its unread dots.
+/// The Activity tab showed the tips: clears their unread dots.
 #[tauri::command]
 async fn mark_tip_seen(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(kind) = app.state::<AppState>().mark_tip_seen() {
+        for kind in app.state::<AppState>().mark_tips_seen() {
             analytics::track_event(
                 &app,
                 "activity_tip_seen",
@@ -5166,12 +5166,45 @@ async fn mark_tip_seen(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn dismiss_tip(app: AppHandle) -> Result<(), String> {
+async fn dismiss_tip(app: AppHandle, kind: models::TipKind) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<AppState>().dismiss_tip();
+        app.state::<AppState>().dismiss_tip(kind);
     })
     .await
     .map_err(|err| err.to_string())
+}
+
+/// A tip's apply button: writes the Claude Code setting the tip names to
+/// ~/.claude/settings.json (Claude Code picks it up live), then takes it down.
+#[tauri::command]
+async fn apply_tip(app: AppHandle, kind: models::TipKind) -> Result<(), String> {
+    use models::TipKind;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, value): (&[&str], serde_json::Value) = match kind {
+            TipKind::AutoContinue => (&["autoContinueAtUsageLimit"], true.into()),
+            // What `/autocompact` saves, for every model rather than this one.
+            TipKind::CompactWindow => (
+                &["autoCompactWindow"],
+                activity_facts::COMPACT_TIP_MIN_CONTEXT_TOKENS.into(),
+            ),
+            TipKind::HaikuLongContext => (
+                &["modelSettings", "claude-haiku-5-5", "autoCompactWindow"],
+                activity_facts::HAIKU_PRICE_STEP_TOKENS.into(),
+            ),
+            _ => return Err(format!("{} has nothing to apply", kind.key())),
+        };
+        let result = client_adapters::set_claude_setting(path, value);
+        analytics::track_event(
+            &app,
+            "activity_tip_applied",
+            Some(serde_json::json!({ "kind": kind.key(), "ok": result.is_ok() })),
+        );
+        result.map_err(|err| format!("{err:#}"))?;
+        app.state::<AppState>().dismiss_tip(kind);
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
@@ -8388,6 +8421,7 @@ pub fn run() {
             get_activity_feed,
             mark_tip_seen,
             dismiss_tip,
+            apply_tip,
             list_live_learnings,
             list_live_learnings_for_projects,
             delete_live_learning,
@@ -9759,8 +9793,9 @@ fn execute_headroom_learn_run(
     // the UI, and the idle cap above still ends a stall within three.
     command.env("HEADROOM_LEARN_CLI_TIMEOUT_SECS", "900");
     // The analysis is one `claude -p --tools ""` request that nothing reads
-    // back, and Claude Code writes `-p` prompts to the 1h cache at 2x input:
-    // uncached bills the whole digest at 1x instead. Other CLIs ignore it.
+    // back, and Claude Code writes `-p` prompts to the 1h cache at 2x input.
+    // Direct, this bills the digest at 1x; through our proxy it still gets a
+    // 5m breakpoint, so 1.25x (measured 2026-10-19). Other CLIs ignore it.
     command.env("DISABLE_PROMPT_CACHING", "1");
     match agent {
         LearnAgent::Claude => {

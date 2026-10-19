@@ -598,7 +598,8 @@ export interface ActivityFeedSnapshot {
   learningsMilestone: LearningsMilestoneEvent | null;
   weeklyRecap: WeeklyRecapEvent | null;
   trainSuggestion: TrainSuggestionEvent | null;
-  tip: TipEvent | null;
+  /** Newest first, at most three, one per kind. */
+  tips: TipEvent[];
 }
 
 export interface ActivityFeedResponse {

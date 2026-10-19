@@ -77,6 +77,8 @@ const HEAVY_STARTUP_MIN_EXCESS_TOKENS: u64 = 20_000;
 pub(crate) const CODEX_COMPACT_TIP_MIN_TOKENS: u64 = 150_000;
 // The other plan "has room" when none of its windows is past this.
 const SWITCH_MAX_OTHER_USED_PERCENT: f64 = 80.0;
+// Tips shown at once. More wait (their conditions recur) for a dismiss or expiry.
+const MAX_TIPS: usize = 3;
 
 /// What a tick knows beyond the feed, for the tips the feed cannot show.
 #[derive(Debug, Default, Clone)]
@@ -169,6 +171,16 @@ pub struct WeeklyTotals {
 /// error up and failing the whole outer parse. Sibling fields keep their
 /// values, the affected slot just goes empty until the next live observation
 /// repaints it.
+/// Each tip on its own: a kind from a newer build drops that tip, not the list.
+fn de_tips<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<TipEvent>, D::Error> {
+    let values = Option::<Vec<serde_json::Value>>::deserialize(d)?;
+    Ok(values
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
 fn de_or_none<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -288,11 +300,15 @@ struct PersistedActivityFacts {
     train_suggestions_fired: BTreeSet<String>,
     #[serde(default)]
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
-    // Fire-once per tip kind (`TipKind::key`), apart from the slot so a
+    // Fire-once per tip (`TipEvent::fire_key`), apart from the slot so a
     // dismissed tip never re-arms. Strings, not the enum: a kind from a newer
     // build must not fail this whole file on a downgrade.
     #[serde(default)]
     tips_fired: BTreeSet<String>,
+    // A tip tied to a plan limit fires once per limit window: kind key -> the
+    // reset it fired before. Re-arms when that reset passes.
+    #[serde(default)]
+    tips_fired_until: BTreeMap<String, DateTime<Utc>>,
 
     // -- latest-of-kind tile slots --
     // The Activity tab shows one tile per kind, populated by the most recent
@@ -310,8 +326,8 @@ struct PersistedActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     #[serde(default, deserialize_with = "de_or_none")]
     last_train_suggestion: Option<TrainSuggestionEvent>,
-    #[serde(default, deserialize_with = "de_or_none")]
-    last_tip: Option<TipEvent>,
+    #[serde(default, deserialize_with = "de_tips")]
+    tips: Vec<TipEvent>,
 }
 
 pub struct ActivityFacts {
@@ -327,6 +343,7 @@ pub struct ActivityFacts {
     train_suggestions_fired: BTreeSet<String>,
     stale_train_suggestions_fired_at: BTreeMap<String, DateTime<Utc>>,
     tips_fired: BTreeSet<String>,
+    tips_fired_until: BTreeMap<String, DateTime<Utc>>,
     // Latest-of-kind tile slots. Each observe_* writes to its slot; the
     // snapshot builder reads them to populate the frontend response.
     last_transformation: Option<TransformationFeedEvent>,
@@ -334,7 +351,8 @@ pub struct ActivityFacts {
     last_learnings_milestone: Option<LearningsMilestoneEvent>,
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
-    last_tip: Option<TipEvent>,
+    // Newest first, at most MAX_TIPS, one per kind.
+    tips: Vec<TipEvent>,
     // In memory only, from the last observe_signal_tips: the last conversation
     // back after its cache expired (joined against the feed's rewrites), and
     // whether Codex is in use (an `openai` feed row may be another client).
@@ -410,6 +428,7 @@ impl ActivityFacts {
             carried.train_suggestions_fired = persisted.train_suggestions_fired;
             carried.stale_train_suggestions_fired_at = persisted.stale_train_suggestions_fired_at;
             carried.tips_fired = persisted.tips_fired;
+            carried.tips_fired_until = persisted.tips_fired_until;
             carried.dirty = true;
             return Ok(carried);
         }
@@ -427,12 +446,13 @@ impl ActivityFacts {
             train_suggestions_fired: persisted.train_suggestions_fired,
             stale_train_suggestions_fired_at: persisted.stale_train_suggestions_fired_at,
             tips_fired: persisted.tips_fired,
+            tips_fired_until: persisted.tips_fired_until,
             last_transformation: persisted.last_transformation,
             last_record: persisted.last_record,
             last_learnings_milestone: persisted.last_learnings_milestone,
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
-            last_tip: persisted.last_tip,
+            tips: persisted.tips,
             idle_resume_at: None,
             codex_in_use: false,
             dirty: false,
@@ -454,12 +474,13 @@ impl ActivityFacts {
             train_suggestions_fired: BTreeSet::new(),
             stale_train_suggestions_fired_at: BTreeMap::new(),
             tips_fired: BTreeSet::new(),
+            tips_fired_until: BTreeMap::new(),
             last_transformation: None,
             last_record: None,
             last_learnings_milestone: None,
             last_weekly_recap: None,
             last_train_suggestion: None,
-            last_tip: None,
+            tips: Vec::new(),
             idle_resume_at: None,
             codex_in_use: false,
             dirty: false,
@@ -478,52 +499,78 @@ impl ActivityFacts {
             learnings_milestone: self.last_learnings_milestone.clone(),
             weekly_recap: self.last_weekly_recap.clone(),
             train_suggestion: self.last_train_suggestion.clone(),
-            tip: self.last_tip.clone(),
+            tips: self.tips.clone(),
         }
     }
 
     /// A tip is posted and the Activity tab has not shown it yet.
     pub fn tip_unseen(&self) -> bool {
-        self.last_tip.as_ref().is_some_and(|tip| !tip.seen)
+        self.tips.iter().any(|tip| !tip.seen)
     }
 
-    pub fn mark_tip_seen(&mut self) -> Option<TipKind> {
-        let tip = self.last_tip.as_mut().filter(|tip| !tip.seen)?;
-        tip.seen = true;
-        self.dirty = true;
-        Some(tip.kind)
-    }
-
-    pub fn dismiss_tip(&mut self) {
-        if self.last_tip.take().is_some() {
-            self.dirty = true;
+    /// The kinds this marked seen.
+    pub fn mark_tips_seen(&mut self) -> Vec<TipKind> {
+        let mut seen = Vec::new();
+        for tip in self.tips.iter_mut().filter(|tip| !tip.seen) {
+            tip.seen = true;
+            seen.push(tip.kind);
         }
+        self.dirty |= !seen.is_empty();
+        seen
     }
 
-    pub fn tip_fired(&self, kind: TipKind) -> bool {
-        self.tips_fired.contains(kind.key())
+    pub fn dismiss_tip(&mut self, kind: TipKind) {
+        let before = self.tips.len();
+        self.tips.retain(|tip| tip.kind != kind);
+        self.dirty |= self.tips.len() != before;
     }
 
     pub fn showing_tip(&self, kind: TipKind) -> bool {
-        self.last_tip.as_ref().is_some_and(|tip| tip.kind == kind)
+        self.tips.iter().any(|tip| tip.kind == kind)
     }
 
-    /// Post the first candidate that has not fired yet. One tip at a time: a
-    /// new one waits (its condition recurs) until the current one is seen.
-    fn post_first_tip(&mut self, candidates: impl IntoIterator<Item = Option<TipEvent>>) {
-        if self.last_tip.as_ref().is_some_and(|tip| !tip.seen) {
-            return;
+    #[cfg(test)]
+    fn tip_fired(&self, kind: TipKind) -> bool {
+        self.tips_fired.contains(kind.key())
+    }
+
+    fn fired(&self, tip: &TipEvent) -> bool {
+        self.tips_fired.contains(&tip.fire_key())
+            || (tip.resets_at.is_some() && self.tips_fired_until.contains_key(tip.kind.key()))
+    }
+
+    /// Post every candidate that has not fired, while there is room: one tip
+    /// per kind, the first candidate on top.
+    fn post_tips(&mut self, candidates: impl IntoIterator<Item = TipEvent>) {
+        let mut posted = Vec::new();
+        for tip in candidates {
+            if self.tips.len() + posted.len() >= MAX_TIPS {
+                break;
+            }
+            let showing = |kind| {
+                self.tips
+                    .iter()
+                    .chain(&posted)
+                    .any(|shown: &TipEvent| shown.kind == kind)
+            };
+            if self.fired(&tip) || showing(tip.kind) {
+                continue;
+            }
+            match tip.resets_at {
+                Some(resets_at) => {
+                    self.tips_fired_until
+                        .insert(tip.kind.key().to_string(), resets_at);
+                }
+                None => {
+                    self.tips_fired.insert(tip.fire_key());
+                }
+            }
+            posted.push(tip);
         }
-        let Some(tip) = candidates
-            .into_iter()
-            .flatten()
-            .find(|tip| !self.tip_fired(tip.kind))
-        else {
-            return;
-        };
-        self.tips_fired.insert(tip.kind.key().to_string());
-        self.last_tip = Some(tip);
-        self.dirty = true;
+        if !posted.is_empty() {
+            self.tips.splice(0..0, posted);
+            self.dirty = true;
+        }
     }
 
     /// Tips a Claude Code or Codex request in the feed qualifies for.
@@ -549,20 +596,25 @@ impl ActivityFacts {
                 && observed_at <= resumed + Duration::minutes(15)
         });
         let tip = |kind| TipEvent::new(kind, observed_at, tokens);
-        self.post_first_tip([
-            (model.starts_with("claude-haiku-5-5") && tokens > HAIKU_PRICE_STEP_TOKENS)
-                .then(|| tip(TipKind::HaikuLongContext)),
-            (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
-                .then(|| tip(TipKind::FableUpgrade)),
-            (claude
-                && after_idle_resume
-                && rewritten >= IDLE_TIP_MIN_REWRITE_TOKENS
-                && rewritten.saturating_mul(10) >= tokens.saturating_mul(9))
-            .then(|| tip(TipKind::IdleBreak)),
-            (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS)
-                .then(|| tip(TipKind::CompactWindow)),
-            (codex && tokens >= CODEX_COMPACT_TIP_MIN_TOKENS).then(|| tip(TipKind::CodexCompact)),
-        ]);
+        self.post_tips(
+            [
+                (model.starts_with("claude-haiku-5-5") && tokens > HAIKU_PRICE_STEP_TOKENS)
+                    .then(|| tip(TipKind::HaikuLongContext)),
+                (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
+                    .then(|| tip(TipKind::FableUpgrade)),
+                (claude
+                    && after_idle_resume
+                    && rewritten >= IDLE_TIP_MIN_REWRITE_TOKENS
+                    && rewritten.saturating_mul(10) >= tokens.saturating_mul(9))
+                .then(|| tip(TipKind::IdleBreak)),
+                (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS)
+                    .then(|| tip(TipKind::CompactWindow)),
+                (codex && tokens >= CODEX_COMPACT_TIP_MIN_TOKENS)
+                    .then(|| tip(TipKind::CodexCompact)),
+            ]
+            .into_iter()
+            .flatten(),
+        );
     }
 
     /// Tips from what the intercept, the plan usage headers and the session
@@ -577,15 +629,22 @@ impl ActivityFacts {
             median >= HEAVY_STARTUP_MIN_TOKENS
                 && (medians.len() < 2 || median - lightest >= HEAVY_STARTUP_MIN_EXCESS_TOKENS)
         };
-        // A heavy-startup tip leaves once its project measures light again.
-        if self.last_tip.as_ref().is_some_and(|tip| {
-            tip.kind == TipKind::HeavyStartup
-                && medians.iter().any(|(project, median)| {
-                    tip.project.as_ref() == Some(project) && !heavy(*median)
-                })
-        }) {
-            self.dismiss_tip();
-        }
+        // A tip leaves once what it is about is over: its limit window reset,
+        // auto-continue turned on, or its project measuring light again.
+        let before = self.tips.len();
+        self.tips.retain(|tip| {
+            let over = tip.resets_at.is_some_and(|at| at <= now)
+                || (tip.kind == TipKind::AutoContinue && signals.auto_continue_on)
+                || (tip.kind == TipKind::HeavyStartup
+                    && medians.iter().any(|(project, median)| {
+                        tip.project.as_ref() == Some(project) && !heavy(*median)
+                    }));
+            !over
+        });
+        let fired_before = self.tips_fired_until.len();
+        self.tips_fired_until
+            .retain(|_, resets_at| *resets_at > now);
+        self.dirty |= self.tips.len() != before || self.tips_fired_until.len() != fired_before;
         let pace = |kind, week: Option<PlanWindow>| {
             let (used_percent, resets_at, limit_at) = weekly_pace(week?, now)?;
             Some(TipEvent {
@@ -625,7 +684,12 @@ impl ActivityFacts {
             .find(|w| w.label == "week")
             .map(|w| w.window)
             .filter(|_| signals.codex_in_use);
-        self.post_first_tip([
+        let mut heavy_projects: Vec<_> = medians
+            .iter()
+            .filter(|(_, median)| heavy(*median))
+            .collect();
+        heavy_projects.sort_by_key(|(_, median)| std::cmp::Reverse(*median));
+        let candidates = [
             switch(
                 TipKind::SwitchToCodex,
                 claude_limit_lifts,
@@ -648,16 +712,15 @@ impl ActivityFacts {
             signals
                 .extra_usage_in_use
                 .then(|| TipEvent::new(TipKind::ExtraUsageCache, now, 0)),
-            signals
-                .startup_medians
-                .iter()
-                .filter(|(_, median)| heavy(*median))
-                .max_by_key(|(_, median)| *median)
-                .map(|(project, median)| TipEvent {
-                    project: Some(project.clone()),
-                    ..TipEvent::new(TipKind::HeavyStartup, now, *median)
-                }),
-        ]);
+        ];
+        // The heaviest project that has not had its tip yet.
+        let startup = heavy_projects
+            .into_iter()
+            .map(|(project, median)| TipEvent {
+                project: Some(project.clone()),
+                ..TipEvent::new(TipKind::HeavyStartup, now, *median)
+            });
+        self.post_tips(candidates.into_iter().flatten().chain(startup));
     }
 
     pub fn observe_transformation(
@@ -1176,12 +1239,13 @@ impl ActivityFacts {
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
             tips_fired: self.tips_fired.clone(),
+            tips_fired_until: self.tips_fired_until.clone(),
             last_transformation: self.last_transformation.clone(),
             last_record: self.last_record.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),
             last_weekly_recap: self.last_weekly_recap.clone(),
             last_train_suggestion: self.last_train_suggestion.clone(),
-            last_tip: self.last_tip.clone(),
+            tips: self.tips.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
         crate::client_adapters::atomic_write(&self.path, &bytes)?;
@@ -1331,11 +1395,17 @@ mod tests {
         }
     }
 
+    /// The top tip.
     fn posted(facts: &ActivityFacts) -> Option<(TipKind, u64)> {
         facts
             .activity_feed_snapshot()
-            .tip
+            .tips
+            .first()
             .map(|tip| (tip.kind, tip.context_tokens))
+    }
+
+    fn showing(facts: &ActivityFacts) -> Vec<TipKind> {
+        facts.tips.iter().map(|tip| tip.kind).collect()
     }
 
     #[test]
@@ -1352,12 +1422,12 @@ mod tests {
         assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 400_000)));
         assert!(facts.tip_unseen());
 
-        facts.mark_tip_seen();
+        assert_eq!(facts.mark_tips_seen(), vec![TipKind::CompactWindow]);
         facts.save_if_dirty().unwrap();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         assert!(!facts.tip_unseen(), "seen survives a restart");
 
-        facts.dismiss_tip();
+        facts.dismiss_tip(TipKind::CompactWindow);
         facts.observe_transformation_at(&sized("anthropic", opus, 700_000), at(11, 0), at(11, 0));
         assert_eq!(posted(&facts), None, "a dismissed tip never comes back");
     }
@@ -1388,31 +1458,37 @@ mod tests {
         );
         assert_eq!(posted(&facts), Some((TipKind::HaikuLongContext, 450_000)));
 
-        // One at a time: an unseen tip is never replaced.
-        facts.observe_transformation_at(
-            &sized("anthropic", "claude-fable-5[1m]", 500_000),
-            at(9, 3),
-            at(9, 3),
+        // Tips stack, newest on top, a request's first candidate first.
+        let fable = sized("anthropic", "claude-fable-5[1m]", 500_000);
+        facts.observe_transformation_at(&fable, at(9, 3), at(9, 3));
+        assert_eq!(
+            showing(&facts),
+            [
+                TipKind::FableUpgrade,
+                TipKind::CompactWindow,
+                TipKind::HaikuLongContext
+            ]
         );
-        assert_eq!(posted(&facts), Some((TipKind::HaikuLongContext, 450_000)));
 
-        // Seen, the next one may take the slot; Fable 5 outranks the compact tip.
-        facts.mark_tip_seen();
-        facts.observe_transformation_at(
-            &sized("anthropic", "claude-fable-5[1m]", 500_000),
-            at(9, 4),
-            at(9, 4),
+        // Full, a new one waits; a dismissed one never comes back.
+        let resumed = TipSignals {
+            idle_resume_at: Some(at(9, 4)),
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&resumed, at(9, 4));
+        facts.observe_transformation_at(&rewrite(10_000, 300_000), at(9, 4), at(9, 4));
+        assert!(!facts.showing_tip(TipKind::IdleBreak));
+        facts.dismiss_tip(TipKind::FableUpgrade);
+        facts.observe_transformation_at(&fable, at(9, 5), at(9, 5));
+        facts.observe_transformation_at(&rewrite(10_000, 300_000), at(9, 5), at(9, 5));
+        assert_eq!(
+            showing(&facts),
+            [
+                TipKind::IdleBreak,
+                TipKind::CompactWindow,
+                TipKind::HaikuLongContext
+            ]
         );
-        assert_eq!(posted(&facts), Some((TipKind::FableUpgrade, 500_000)));
-
-        // With Fable's fired, the same request falls through to the compact tip.
-        facts.dismiss_tip();
-        facts.observe_transformation_at(
-            &sized("anthropic", "claude-fable-5[1m]", 500_000),
-            at(9, 5),
-            at(9, 5),
-        );
-        assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 500_000)));
     }
 
     #[test]
@@ -1497,20 +1573,23 @@ mod tests {
         signals.auto_continue_on = false;
         signals.extra_usage_in_use = true;
         facts.observe_signal_tips(&signals, at(10, 1));
-        assert_eq!(posted(&facts), Some((TipKind::AutoContinue, 0)));
+        assert_eq!(
+            showing(&facts),
+            [TipKind::AutoContinue, TipKind::ExtraUsageCache]
+        );
 
-        facts.mark_tip_seen();
+        // Turned on in /config: the tip leaves.
+        signals.auto_continue_on = true;
         facts.observe_signal_tips(&signals, at(10, 2));
-        assert_eq!(posted(&facts), Some((TipKind::ExtraUsageCache, 0)));
+        assert_eq!(showing(&facts), [TipKind::ExtraUsageCache]);
 
-        facts.mark_tip_seen();
         signals.startup_medians = vec![
             ("light".into(), 30_000),
             ("headroom-desktop".into(), 69_399),
             ("heavy".into(), 55_000),
         ];
         facts.observe_signal_tips(&signals, at(10, 3));
-        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        let tip = facts.tips[0].clone();
         assert_eq!(tip.kind, TipKind::HeavyStartup);
         assert_eq!(
             (tip.project.as_deref(), tip.context_tokens),
@@ -1524,12 +1603,22 @@ mod tests {
         facts.observe_signal_tips(&signals, at(10, 5));
         assert!(facts.showing_tip(TipKind::HeavyStartup));
 
-        signals.startup_medians = vec![("headroom-desktop".into(), 42_000)];
+        // Trimmed below the bar, it leaves, and the next heavy project gets its own, once.
+        signals.startup_medians = vec![
+            ("light".into(), 30_000),
+            ("headroom-desktop".into(), 42_000),
+            ("heavy".into(), 55_000),
+        ];
         facts.observe_signal_tips(&signals, at(10, 6));
-        assert!(
-            facts.activity_feed_snapshot().tip.is_none(),
-            "trimmed below the bar"
-        );
+        let projects: Vec<_> = facts
+            .tips
+            .iter()
+            .map(|tip| tip.project.as_deref())
+            .collect();
+        assert_eq!(projects, [Some("heavy"), None]);
+        facts.dismiss_tip(TipKind::HeavyStartup);
+        facts.observe_signal_tips(&signals, at(10, 7));
+        assert!(!facts.showing_tip(TipKind::HeavyStartup));
     }
 
     #[test]
@@ -1649,15 +1738,27 @@ mod tests {
 
         signals.codex_usage = codex(30.0);
         facts.observe_signal_tips(&signals, now);
-        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        let tip = facts.tips[0].clone();
         assert_eq!(
             (tip.kind, tip.used_percent, tip.resets_at),
             (TipKind::SwitchToCodex, Some(30.0), Some(later))
         );
 
+        // Dismissed, it stays down for this limit and leaves when it lifts.
+        facts.dismiss_tip(TipKind::SwitchToCodex);
+        facts.observe_signal_tips(&signals, now);
+        assert_eq!(posted(&facts), None);
+        // The next limit brings it back, and it leaves once that one lifts.
+        let next = at(20, 0);
+        signals.usage_limit_resets_at = Some(next);
+        facts.observe_signal_tips(&signals, at(16, 0));
+        assert_eq!(posted(&facts), Some((TipKind::SwitchToCodex, 0)));
+        signals.usage_limit_resets_at = None;
+        facts.observe_signal_tips(&signals, next);
+        assert_eq!(posted(&facts), None);
+
         // The other way: Codex at its limit, Claude with room, Claude's
         // expired limit ignored.
-        facts.dismiss_tip();
         let signals = TipSignals {
             usage_limit_resets_at: Some(at(9, 0)),
             claude_in_use: true,
@@ -1669,7 +1770,7 @@ mod tests {
             ..TipSignals::default()
         };
         facts.observe_signal_tips(&signals, now);
-        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        let tip = facts.tips[0].clone();
         assert_eq!(
             (tip.kind, tip.used_percent, tip.resets_at),
             (TipKind::SwitchToClaude, Some(40.0), Some(later))
@@ -1696,7 +1797,7 @@ mod tests {
             ..TipSignals::default()
         };
         facts.observe_signal_tips(&signals, now);
-        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        let tip = facts.tips[0].clone();
         assert_eq!(
             (tip.kind, tip.used_percent),
             (TipKind::CodexWeeklyPace, Some(80.0))
@@ -1730,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tip_kind_from_a_newer_build_drops_only_the_tip_slot() {
+    fn a_tip_kind_from_a_newer_build_drops_only_that_tip() {
         let (_tmp, base) = base_dir();
         let path = base.join("config").join("activity-facts.json");
         std::fs::write(
@@ -1738,14 +1839,15 @@ mod tests {
             format!(
                 r#"{{"schemaVersion": {SCHEMA_VERSION}, "allTimeRecordTokens": 77,
                 "tipsFired": ["compact_window", "future_kind"],
-                "lastTip": {{"kind": "future_kind", "observedAt": "2026-10-19T10:00:00Z", "seen": false}}}}"#
+                "tips": [{{"kind": "future_kind", "observedAt": "2026-10-19T10:00:00Z", "seen": false}},
+                    {{"kind": "compact_window", "observedAt": "2026-10-19T09:00:00Z", "seen": true}}]}}"#
             ),
         )
         .unwrap();
         let facts = ActivityFacts::load_or_create(&base).unwrap();
         assert_eq!(facts.all_time_record_tokens, 77);
         assert!(facts.tip_fired(TipKind::CompactWindow));
-        assert_eq!(posted(&facts), None);
+        assert_eq!(showing(&facts), [TipKind::CompactWindow]);
         assert!(
             !facts.tip_unseen(),
             "an unreadable tip must not light the dots"
@@ -1790,12 +1892,14 @@ mod tests {
             };
             feed.apply_new_input_basis();
             facts.observe_transformation_at(&feed, event.ts, event.ts);
-            if let Some(tip) = facts.activity_feed_snapshot().tip.filter(|tip| !tip.seen) {
+            for tip in facts.tips.iter().filter(|tip| !tip.seen) {
                 eprintln!(
                     "{} {:?} {} tokens ({})",
                     tip.observed_at, tip.kind, tip.context_tokens, event.model
                 );
-                facts.mark_tip_seen();
+            }
+            for kind in facts.mark_tips_seen() {
+                facts.dismiss_tip(kind);
             }
         }
         eprintln!("replayed {} events", events.len());

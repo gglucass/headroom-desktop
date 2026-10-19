@@ -5267,6 +5267,36 @@ html.window-hiding {
   user-select: text;
 }
 
+.activity-feed__tip-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text-primary);
+}
+
+.activity-feed__tip-actions {
+  align-items: center;
+}
+
+.activity-feed__command {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  border-radius: 6px;
+  padding: 7px 10px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.activity-feed__tip-done {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--success);
+}
+
 .activity-feed__content code {
   font-family: var(--font-mono);
   font-size: 0.92em;

@@ -40,9 +40,9 @@ interface ActivityFeedProps {
 }
 
 // One entry per tile kind. `kind` matches the `ActivityFeedSnapshot` slot name
-// so the backend shape and frontend render stay in lockstep. The tip is a
-// one-off with no placeholder: absent, it renders nothing.
-type TileKind = Exclude<keyof ActivityFeedSnapshot, "tip">;
+// so the backend shape and frontend render stay in lockstep. Tips have no
+// placeholder: none posted, they render nothing.
+type TileKind = Exclude<keyof ActivityFeedSnapshot, "tips">;
 
 const EMPTY_TILE_COPY: Record<
   TileKind,
@@ -104,7 +104,8 @@ export function ActivityFeed({
   // "Waiting for proxy" only fires when we've got nothing to show AND the
   // proxy isn't answering. If any slot is populated (persisted state from a
   // prior session), fall through to render it even while the proxy is down.
-  const hasAnyTile = Object.values(tiles).some((v) => v != null);
+  const { tips, ...slots } = tiles;
+  const hasAnyTile = tips.length > 0 || Object.values(slots).some((v) => v != null);
 
   return (
     <>
@@ -141,7 +142,9 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="activity-feed__list">
-          {tiles.tip ? <TipRow key={tiles.tip.kind} event={tiles.tip} /> : null}
+          {tiles.tips.map((tip) => (
+            <TipRow key={tip.kind} event={tip} />
+          ))}
           {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
           {tiles.transformation ? (
             <TransformationRow event={tiles.transformation} />
@@ -986,173 +989,246 @@ export function weekdayTime(iso: string, now: Date = new Date()): string {
   return `${at.toLocaleDateString(undefined, { weekday: "long" })} ${time}`;
 }
 
-function tipCopy(event: TipEvent): ReactNode {
+// What a tip's button does: copy a prompt, show and copy a command or config
+// line, or make the Claude Code setting change itself (`apply_tip`).
+type TipAction =
+  | { type: "prompt"; text: string }
+  | { type: "command"; text: string }
+  | { type: "apply"; label: string; fallback: ReactNode };
+
+interface TipView {
+  title: string;
+  body: ReactNode;
+  action?: TipAction;
+}
+
+function tipView(event: TipEvent): TipView | null {
   const size = `${Math.round(event.contextTokens / 1000)}k`;
   const until = event.resetsAt ? `until ${weekdayTime(event.resetsAt)}` : "until it resets";
   const room = `${Math.round(event.usedPercent ?? 0)}%`;
+  const pace = (plan: string) => {
+    if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
+    return {
+      title: `On pace to hit your weekly ${plan} limit ${weekdayTime(event.limitAt)}`,
+      used: `${Math.round(event.usedPercent)}% used, resets ${weekdayTime(event.resetsAt)}.`
+    };
+  };
   switch (event.kind) {
-    case "codex_compact":
-      return (
-        <>
-          A Codex session reached {size} tokens. Every turn re-sends the whole conversation, so long
-          sessions use your limit fastest. Run <code>/compact</code> in Codex at natural breaks, or
-          set <code>model_auto_compact_token_limit = 150000</code> in ~/.codex/config.toml to compact
-          sooner, though each compaction summarizes earlier detail.
-        </>
-      );
-    case "codex_weekly_pace":
-      if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
-      return (
-        <>
-          You've used {Math.round(event.usedPercent)}% of your weekly Codex limit, which resets{" "}
-          {weekdayTime(event.resetsAt)}. At this pace you'll reach it around{" "}
-          {weekdayTime(event.limitAt)}. Long sessions use the most: <code>/compact</code> them,
-          and pick a lower reasoning effort with <code>/model</code> for routine work.
-        </>
-      );
+    case "compact_window":
+      return {
+        title: "Compact long sessions sooner",
+        body: `A Claude Code session reached ${size} tokens, and every turn re-sends all of it. Compacting at 400k cuts usage on long sessions by about 10%, though it summarizes earlier detail.`,
+        action: {
+          type: "apply",
+          label: "Compact at 400k",
+          fallback: (
+            <>
+              Run <code>/autocompact 400k</code> in Claude Code instead.
+            </>
+          )
+        }
+      };
+    case "haiku_long_context":
+      return {
+        title: "Haiku bills past 100k at 5x",
+        body: `A Haiku 5.5 request reached ${size} tokens. Compacting Haiku sessions at 100k keeps them under the price step.`,
+        action: {
+          type: "apply",
+          label: "Compact Haiku at 100k",
+          fallback: (
+            <>
+              Run <code>/autocompact 100k</code> while on Haiku instead.
+            </>
+          )
+        }
+      };
+    case "fable_upgrade":
+      return {
+        title: "Switch to Fable 5.1",
+        body: `Same price as Fable 5, with cache reads at a quarter of the cost. A session reached ${size} tokens, and on long sessions cache reads are most of what you send.`,
+        action: { type: "command", text: "/model claude-fable-5-1" }
+      };
+    case "weekly_pace": {
+      const claude = pace("Claude");
+      if (!claude) return null;
+      return {
+        title: claude.title,
+        body: (
+          <>
+            {claude.used} <code>/clear</code> between unrelated tasks and <code>/compact</code> at
+            natural breaks.
+          </>
+        )
+      };
+    }
+    case "codex_weekly_pace": {
+      const codex = pace("Codex");
+      if (!codex) return null;
+      return {
+        title: codex.title,
+        body: (
+          <>
+            {codex.used} <code>/compact</code> long sessions, and pick a lower reasoning effort in{" "}
+            <code>/model</code> for routine work.
+          </>
+        )
+      };
+    }
     case "switch_to_codex":
-      return (
-        <>
-          Claude Code is at its usage limit {until}. Your Codex plan has room (its fullest window
-          is at {room}), so you can keep working in Codex meanwhile.
-        </>
-      );
+      return {
+        title: `Claude Code is limited ${until}`,
+        body: `Codex has room (its fullest window is at ${room}), so you can keep working there meanwhile.`
+      };
     case "switch_to_claude":
-      return (
-        <>
-          Codex is at its usage limit {until}. Your Claude plan has room (its fullest window is at{" "}
-          {room}), so you can keep working in Claude Code meanwhile.
-        </>
-      );
-    case "weekly_pace":
-      if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
-      return (
-        <>
-          You've used {Math.round(event.usedPercent)}% of your weekly Claude limit, which resets{" "}
-          {weekdayTime(event.resetsAt)}. At this pace you'll reach it around{" "}
-          {weekdayTime(event.limitAt)}. Long sessions use the most: <code>/clear</code> between
-          unrelated tasks and <code>/compact</code> at natural breaks.
-        </>
-      );
+      return {
+        title: `Codex is limited ${until}`,
+        body: `Claude Code has room (its fullest window is at ${room}), so you can keep working there meanwhile.`
+      };
     case "extra_usage_cache":
-      return (
-        <>
-          Claude Code is running on extra usage, billed per token. While it is, the prompt cache
-          lasts 5 minutes instead of an hour, so a longer pause re-sends the whole conversation at
-          the cache-write price. Run <code>/compact</code> before stepping away.
-        </>
-      );
+      return {
+        title: "On extra usage, the cache lasts 5 minutes",
+        body: "Claude Code is billing per token. A longer pause re-sends the whole conversation at the cache-write price, so compact before stepping away.",
+        action: { type: "command", text: "/compact" }
+      };
     case "auto_continue":
-      return (
-        <>
-          Claude Code hit your plan's usage limit. Turn on "Continue automatically at usage limit"
-          in <code>/config</code> and it waits for the reset and resumes the task by itself.
-        </>
-      );
+      return {
+        title: "Resume automatically after a usage limit",
+        body: "Claude Code hit your plan's limit. With auto-continue on, it waits for the reset and picks the task back up.",
+        action: {
+          type: "apply",
+          label: "Turn on",
+          fallback: (
+            <>
+              Turn on "Continue automatically at usage limit" in <code>/config</code> instead.
+            </>
+          )
+        }
+      };
     case "idle_break":
-      return (
-        <>
-          A Claude Code session came back after more than an hour and re-sent its whole {size}{" "}
-          conversation at the cache-write price: the prompt cache only lasts an hour. Before a long
-          break, run <code>/compact</code> so the session you come back to is small.
-        </>
-      );
+      return {
+        title: "Compact before long breaks",
+        body: `A session came back after more than an hour and re-sent all ${size} tokens at the cache-write price: the prompt cache only lasts an hour.`,
+        action: { type: "command", text: "/compact" }
+      };
     case "heavy_startup":
       if (!event.project) return null;
-      return (
-        <>
-          Sessions in {event.project} start at {size} tokens before your first prompt, and every
-          turn re-sends them. Paste this prompt into a Claude Code session there: Claude lists what
-          loads and proposes what to move out. This tip goes away once sessions there start lighter.
-        </>
-      );
-    case "compact_window":
-      return (
-        <>
-          A Claude Code session reached {size} tokens. Every turn re-sends the whole conversation,
-          so the longest sessions cost the most. Run <code>/autocompact 400k</code> in Claude Code
-          to compact sooner: on long sessions that cuts usage by around 10%, though each compaction
-          summarizes earlier detail.
-        </>
-      );
-    case "haiku_long_context":
-      return (
-        <>
-          A Haiku 5.5 request reached {size} tokens. Haiku bills every token of a request over 100k
-          at 5x the price. If that was your main session, run <code>/autocompact 100k</code> while
-          on Haiku to compact before the step.
-        </>
-      );
-    case "fable_upgrade":
-      return (
-        <>
-          A Claude Code session on Fable 5 reached {size} tokens. Fable 5.1 lists at the same price
-          but reads cache at a quarter of the cost, and on long sessions cache reads are most of
-          what you send. Switch with <code>/model claude-fable-5-1</code>.
-        </>
-      );
+      return {
+        title: `Sessions in ${event.project} start at ${size} tokens`,
+        body: "Every turn re-sends that. Paste this prompt into Claude Code there and it finds what to cut. This tip goes away once sessions start lighter.",
+        action: { type: "prompt", text: heavyStartupPrompt(event.contextTokens) }
+      };
+    case "codex_compact":
+      return {
+        title: "Compact long Codex sessions sooner",
+        body: `A Codex session reached ${size} tokens. Add this line to ~/.codex/config.toml to compact at 150k, though compaction summarizes earlier detail.`,
+        action: { type: "command", text: "model_auto_compact_token_limit = 150000" }
+      };
     default:
       return null;
   }
 }
 
-// A prompt for the user to paste into Claude Code, for tips whose fix needs judgment.
-function tipPrompt(event: TipEvent): string | null {
-  if (event.kind !== "heavy_startup") return null;
+// The heavy-startup fix needs judgment, so Claude Code gets a prompt, not a setting.
+function heavyStartupPrompt(contextTokens: number): string {
   return [
-    `My Claude Code sessions in this project start at about ${Math.round(event.contextTokens / 1000)}k tokens before my first prompt, and every turn re-sends them. Find what loads at session start and cut it, without losing anything I rely on.`,
-    "1. List what loads and roughly what each costs. Most of it is in your own context: the CLAUDE.md, CLAUDE.local.md and memory files and the files they @-import, the skills list, MCP tool names and server instructions, and hook output. Check ~/.claude/settings.json, ~/.claude.json, .claude/settings.json and .mcp.json for where each comes from.",
-    "2. Propose cuts, biggest first: move rule sets only one kind of task needs into a doc or a skill, with one line in CLAUDE.md saying when to read it; delete rules that repeat what the code or your defaults already do; name the MCP servers, plugins and skills this project never uses, and how to switch each off for this project only without removing it elsewhere or for teammates.",
+    `My Claude Code sessions in this project start at about ${Math.round(contextTokens / 1000)}k tokens before my first prompt, and every turn re-sends them. Find what loads at session start and cut it, without losing anything I rely on.`,
+    "1. List what loads and roughly what each costs. Most of it is in your own context: the CLAUDE.md, CLAUDE.local.md and memory files and the files they @-import, the skills list, MCP tool names and server instructions, built-in tool definitions (Artifact, where present, is about 10k tokens), and hook output. Check ~/.claude/settings.json, ~/.claude.json, .claude/settings.json and .mcp.json for where each comes from.",
+    "2. Propose cuts, biggest first: move rule sets only one kind of task needs into a doc or a skill, with one line in CLAUDE.md saying when to read it; delete rules that repeat what the code or your defaults already do; name the MCP servers, plugins and skills this project never uses, and how to switch each off for this project only without removing it elsewhere or for teammates. In .claude/settings.local.json, `skillOverrides` sets a skill to \"off\", or to \"name-only\" for one I use rarely; an `env` entry of CLAUDE_CODE_DISABLE_ARTIFACT=1 or CLAUDE_CODE_DISABLE_WORKFLOWS=1 drops a built-in tool I never call. Check my transcripts in ~/.claude/projects before calling anything unused.",
     "3. Show me the plan with the tokens each cut saves, and wait for my OK before changing anything."
   ].join("\n\n");
 }
 
 function TipRow({ event }: { event: TipEvent }) {
-  // Hidden on click; the next feed poll drops the slot for good.
+  // Hidden on click; the next feed poll drops the tip for good.
   const [dismissed, setDismissed] = useState(false);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const copy = tipCopy(event);
-  const prompt = tipPrompt(event);
-  if (dismissed || copy === null) return null;
+  const [applyState, setApplyState] = useState<"idle" | "busy" | "done" | "failed">("idle");
+  const view = tipView(event);
+  if (dismissed || view === null) return null;
+  const { action } = view;
   const dismiss = () => {
     setDismissed(true);
     trackAnalyticsEvent("activity_tip_dismissed", { kind: event.kind });
-    void invoke("dismiss_tip").catch(() => undefined);
+    void invoke("dismiss_tip", { kind: event.kind }).catch(() => undefined);
   };
-  // WebKitGTK can refuse clipboard writes (RUST-QT); the prompt then shows, selectable.
-  const copyPrompt = async () => {
-    if (prompt === null) return;
+  // WebKitGTK can refuse clipboard writes (RUST-QT); the text then shows, selectable.
+  const copy = async (text: string) => {
     trackAnalyticsEvent("activity_tip_prompt_copied", { kind: event.kind });
     try {
-      await navigator.clipboard.writeText(prompt);
+      await navigator.clipboard.writeText(text);
       setCopyState("copied");
       window.setTimeout(() => setCopyState("idle"), 2000);
     } catch {
       setCopyState("failed");
     }
   };
+  // The backend takes the tip down on success; the next poll drops the row.
+  const apply = async () => {
+    setApplyState("busy");
+    try {
+      await invoke("apply_tip", { kind: event.kind });
+      setApplyState("done");
+    } catch {
+      setApplyState("failed");
+    }
+  };
+  const copyLabel = copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy";
   return (
     <li className="activity-feed__item activity-feed__item--tip">
       <div className="activity-feed__row activity-feed__row--meta">
         <span className="activity-feed__badge activity-feed__badge--tip">Tip</span>
         <TimeChip iso={event.observedAt} />
       </div>
-      <p className="activity-feed__content">{copy}</p>
-      {copyState === "failed" ? <pre className="activity-feed__prompt">{prompt}</pre> : null}
-      <div className="activity-feed__row">
-        {prompt !== null ? (
-          <button
-            className="secondary-button secondary-button--small"
-            onClick={() => void copyPrompt()}
-            type="button"
-          >
-            {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy prompt"}
+      <p className="activity-feed__tip-title">{view.title}</p>
+      <p className="activity-feed__content">{view.body}</p>
+      {action?.type === "prompt" && copyState === "failed" ? (
+        <pre className="activity-feed__prompt">{action.text}</pre>
+      ) : null}
+      {action?.type === "apply" && applyState === "failed" ? (
+        <p className="activity-feed__content">
+          Couldn't change ~/.claude/settings.json. {action.fallback}
+        </p>
+      ) : null}
+      {applyState === "done" ? (
+        <p className="activity-feed__tip-done">Done. Saved to ~/.claude/settings.json.</p>
+      ) : (
+        <div className="activity-feed__row activity-feed__tip-actions">
+          {action?.type === "command" ? (
+            <>
+              <code className="activity-feed__command">{action.text}</code>
+              <button
+                className="secondary-button secondary-button--small"
+                onClick={() => void copy(action.text)}
+                type="button"
+              >
+                {copyLabel}
+              </button>
+            </>
+          ) : null}
+          {action?.type === "prompt" ? (
+            <button
+              className="primary-button primary-button--small"
+              onClick={() => void copy(action.text)}
+              type="button"
+            >
+              {copyLabel === "Copy" ? "Copy prompt" : copyLabel}
+            </button>
+          ) : null}
+          {action?.type === "apply" && applyState !== "failed" ? (
+            <button
+              className="primary-button primary-button--small"
+              disabled={applyState === "busy"}
+              onClick={() => void apply()}
+              type="button"
+            >
+              {action.label}
+            </button>
+          ) : null}
+          <button className="secondary-button secondary-button--small" onClick={dismiss} type="button">
+            Dismiss
           </button>
-        ) : null}
-        <button className="secondary-button secondary-button--small" onClick={dismiss} type="button">
-          Dismiss
-        </button>
-      </div>
+        </div>
+      )}
     </li>
   );
 }
