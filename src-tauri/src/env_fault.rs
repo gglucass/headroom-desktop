@@ -218,21 +218,30 @@ pub(crate) fn failed(path: &Path, op: Op, err: &std::io::Error) -> &'static str 
     let Some(kind) = classify(err) else {
         return "";
     };
-    let became_sustained = FAULTS.lock().fail(op, kind, Instant::now());
+    let now = Instant::now();
+    let (became_sustained, sustained) = {
+        let mut faults = FAULTS.lock();
+        let became = faults.fail(op, kind, now);
+        (became, faults.sustained(op, now).is_some())
+    };
     if became_sustained {
+        log::info!(
+            "env_fault: sustained {} fault ({}) on {}: {err}",
+            op.label(),
+            kind.label(),
+            path.display()
+        );
+    }
+    if sustained {
         report(op, kind, path, err);
     }
     NOTE
 }
 
 fn report(op: Op, kind: FaultKind, path: &Path, err: &std::io::Error) {
-    log::info!(
-        "env_fault: sustained {} fault ({}) on {}: {err}",
-        op.label(),
-        kind.label(),
-        path.display()
-    );
-    if !kind.reported() {
+    // A fault sustained before sentry::init (the launch-time setup read) waits
+    // for a client rather than spending its one report on nothing.
+    if !kind.reported() || sentry::Hub::current().client().is_none() {
         return;
     }
     {
@@ -444,6 +453,8 @@ mod tests {
     /// error messages carry the Sentry note, and access coming back clears it.
     #[cfg(unix)]
     #[test]
+    // Serial: it makes state_unreadable() true process-wide for a moment.
+    #[serial_test::serial]
     fn an_inaccessible_data_folder_reaches_the_banner_and_clears_on_recovery() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |path: &Path, bits| {
@@ -470,6 +481,12 @@ mod tests {
         *TEST_ROOT.lock() = Some(temp.path().join("Headroom"));
         let _root = ScopedRoot;
         *FAULTS.lock() = Faults::default();
+
+        // The setup loader's retry is one access: first tries alone never count.
+        for _ in 0..2 {
+            assert!(crate::client_adapters::setup_first_try_fails(&setup));
+        }
+        assert!(!state_unreadable(), "first tries are not failures");
 
         let err = crate::state::read_state_file(&setup).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);

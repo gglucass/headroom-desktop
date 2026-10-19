@@ -3080,7 +3080,9 @@ fn configured_timestamp(state: &ClientSetupState, client_id: &str) -> Option<Str
 
 fn load_setup_state() -> ClientSetupState {
     let path = setup_state_path();
-    if !path.exists() {
+    // Not `!exists()`: a folder that refuses stat must reach the read below,
+    // which reports it to env_fault, not pass for a first launch.
+    if let Ok(false) = path.try_exists() {
         return ClientSetupState::default();
     }
 
@@ -3091,11 +3093,11 @@ fn load_setup_state() -> ClientSetupState {
     // a transient race or a partially-written file from an older build, and
     // returning the empty default flips `is_claude_code_enabled` to false,
     // which the tray reads as "Claude Code disconnected" and notifies on.
-    match try_load_setup_state(&path) {
+    match try_load_setup_state(&path, false) {
         Ok(state) => normalize_setup_state(state),
         Err(first_err) => {
             std::thread::sleep(std::time::Duration::from_millis(15));
-            match try_load_setup_state(&path) {
+            match try_load_setup_state(&path, true) {
                 Ok(state) => normalize_setup_state(state),
                 Err(second_err) => {
                     // Only a parse failure is evidence that the bytes on disk
@@ -3154,10 +3156,25 @@ impl std::fmt::Display for SetupStateLoadError {
     }
 }
 
-fn try_load_setup_state(path: &Path) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
+/// env_fault's end-to-end test: whether a first try (which never counts) fails.
+#[cfg(test)]
+pub(crate) fn setup_first_try_fails(path: &Path) -> bool {
+    try_load_setup_state(path, false).is_err()
+}
+
+fn try_load_setup_state(
+    path: &Path,
+    last_try: bool,
+) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
     // Not `state::read_state_file`: `load_setup_state` runs its own retry.
     let read = std::fs::read(path);
-    let note = crate::env_fault::note(path, crate::env_fault::Op::Read, &read);
+    // One load is one access to env_fault, as in read_state_file: a failed
+    // first try counts only if the retry fails too.
+    let note = if read.is_ok() || last_try {
+        crate::env_fault::note(path, crate::env_fault::Op::Read, &read)
+    } else {
+        ""
+    };
     let bytes = read
         .with_context(|| format!("reading {}{note}", path.display()))
         .map_err(SetupStateLoadError::Io)?;
@@ -12155,7 +12172,7 @@ mod tests {
         // which is the same class of evidence as ENFILE.
         std::fs::remove_file(&path).expect("remove");
         std::fs::create_dir(&path).expect("dir in its place");
-        assert!(super::try_load_setup_state(&path).is_err_and(|e| e.is_io()));
+        assert!(super::try_load_setup_state(&path, true).is_err_and(|e| e.is_io()));
         assert!(
             super::load_setup_state().configured_clients.is_empty(),
             "callers still get the default"
