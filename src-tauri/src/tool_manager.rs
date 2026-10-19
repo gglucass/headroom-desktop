@@ -17687,6 +17687,17 @@ fn is_outdated_codex(err: &anyhow::Error) -> bool {
         .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
 }
 
+/// True when Claude Code's manifest validator refuses a field it predates
+/// (RUST-RA: ponytail 5.3 added `userConfig` and `types`, and an older CLI
+/// answered "Unrecognized key(s) in object: 'types', 'userConfig'"; 2.1.296
+/// takes them). Same class as [`is_outdated_codex`].
+fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CommandFailure>().is_some_and(|failure| {
+        failure.stderr.contains("invalid manifest file")
+            && failure.stderr.contains("Unrecognized key(s)")
+    })
+}
+
 /// First Claude Code release with `claude plugin marketplace add`. 2.0.12-2.0.15
 /// have `plugin` but reject `marketplace` as an unknown command.
 const CLAUDE_PLUGIN_MIN_VERSION: [u32; 3] = [2, 0, 17];
@@ -17723,6 +17734,8 @@ fn settle_plugin_hosts(
             Ok(()) => installed_any = true,
             Err(err)
                 if err.is::<OutdatedClaudeCli>()
+                    || (matches!(host, PluginHost::ClaudeCode)
+                        && is_outdated_claude_manifest(&err))
                     || (matches!(host, PluginHost::Codex) && is_outdated_codex(&err)) =>
             {
                 log::info!("{id} [{}]: CLI too old for plugins; skipped", host.label());
@@ -28450,6 +28463,23 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         .to_string();
         assert!(mixed.starts_with("installing the ponytail plugin failed: Codex: "));
         assert!(mixed.ends_with("Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."));
+
+        // RUST-RA: an older CLI refusing manifest fields it predates.
+        let manifest = Err(anyhow::Error::new(CommandFailure {
+            program: "claude".into(),
+            args: vec!["plugin".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "✘ Failed to install plugin \"ponytail@ponytail\": Plugin has an invalid manifest file at ~/.claude/plugins/cache/temp_local_1/.claude-plugin/plugin.json. Validation errors: : Unrecognized key(s) in object: 'types', 'userConfig'".into(),
+            exit_code: Some(1),
+            signal: None,
+        }));
+        let refused = settle_plugin_hosts("ponytail", [(PluginHost::ClaudeCode, manifest)])
+            .expect_err("nothing installed")
+            .to_string();
+        assert_eq!(
+            refused,
+            "Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."
+        );
     }
 
     #[test]
