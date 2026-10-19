@@ -790,18 +790,18 @@ impl<R> ResponseSniffer<R> {
                 return;
             }
             self.status = parse_response_status(&self.buf);
-            if self.status == Some(429) {
-                crate::usage_counters::record_429(self.client_key);
-            } else if let Some(status) = self
-                .status
-                .filter(|s| self.count_failures && is_failed_request_status(*s))
-            {
-                crate::usage_counters::record_failure(self.client_key, &status.to_string());
-            }
             self.capturing = self.capture_path.is_some()
                 && self
                     .status
                     .is_some_and(|s| is_reportable_upstream_error(&s));
+            if self.status == Some(429) {
+                crate::usage_counters::record_429(self.client_key);
+            } else if let Some(status) = self.status.filter(|s| {
+                // A captured failure is counted on drop, with its body's label.
+                self.count_failures && !self.capturing && is_failed_request_status(*s)
+            }) {
+                crate::usage_counters::record_failure(self.client_key, &status.to_string());
+            }
             if !self.status.is_some_and(|s| (200..300).contains(&s)) {
                 self.savings_session = None;
             }
@@ -854,7 +854,15 @@ impl<R> ResponseSniffer<R> {
 
 impl<R> Drop for ResponseSniffer<R> {
     fn drop(&mut self) {
-        let (Some(status), Some(path)) = (self.status, self.capture_path.as_deref()) else {
+        let Some(status) = self.status else {
+            return;
+        };
+        if self.capturing && self.count_failures && is_failed_request_status(status) {
+            let body = find_header_end(&self.buf)
+                .map_or(&[][..], |end| &self.buf[(end + 4).min(self.buf.len())..]);
+            crate::usage_counters::record_failure(self.client_key, &failure_kind(status, body));
+        }
+        let Some(path) = self.capture_path.as_deref() else {
             return;
         };
         if !is_reportable_upstream_error(&status) || self.buf.is_empty() {
@@ -3345,6 +3353,17 @@ fn note_codex_prompt_outcome(
 /// separates provider outages from Headroom bugs by comparing versions.
 fn is_failed_request_status(status: u16) -> bool {
     status >= 400 && status != 429
+}
+
+/// `failure_kinds` kind for a failed response: its status, plus the content-free
+/// label of a known Anthropic error ("400:prompt_too_long"). Sentry keeps one
+/// warning per host per day, so a stuck host's mail could only say "400 x262"
+/// (users 3312 and 4543, 2026-10-19, ~29% of their Claude Code requests).
+fn failure_kind(status: u16, body: &[u8]) -> String {
+    match anthropic_error_shape(body) {
+        Some(label) => format!("{status}:{label}"),
+        None => status.to_string(),
+    }
 }
 
 /// `failure_kinds` key for a failed Codex request: a 2xx failed in-band, no
@@ -8114,6 +8133,15 @@ mod tests {
         ] {
             assert!(!is_provider_api_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn failure_kind_labels_known_anthropic_errors_and_keeps_the_rest_bare() {
+        let too_long = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215023 tokens > 200000 maximum"},"request_id":"req_1"}"#;
+        assert_eq!(super::failure_kind(400, too_long), "400:prompt_too_long");
+        let unknown = br#"{"type":"error","error":{"type":"invalid_request_error","message":"something new"}}"#;
+        assert_eq!(super::failure_kind(400, unknown), "400");
+        assert_eq!(super::failure_kind(502, b""), "502");
     }
 
     #[test]
