@@ -189,6 +189,13 @@ fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) 
     if !windows {
         return base;
     }
+    // `npm install -g` puts `claude.cmd` here, but the dir is on PATH only for
+    // processes started after Node was installed, and a Headroom launched at
+    // login (or relaunched by an update) keeps the old PATH: an npm-installed
+    // claude read as "Install the Claude Code CLI" in Optimize (a customer,
+    // 2026-10-18).
+    let mut base = base;
+    base.push(windows_npm_prefix(&home).join(name));
 
     let mut candidates = Vec::with_capacity(base.len() * 5);
     for path in base {
@@ -198,6 +205,14 @@ fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) 
         candidates.push(path);
     }
     candidates
+}
+
+/// `%APPDATA%\npm`, npm's default global prefix on Windows.
+fn windows_npm_prefix(home: &Path) -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+        .join("npm")
 }
 
 /// Version-managed node trees (nvm/mise/fnm) keep binaries under
@@ -974,6 +989,16 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|path| path == Path::new("/Users/test/.local/bin/headroom.cmd")));
+    }
+
+    #[test]
+    fn known_windows_paths_include_the_npm_global_prefix() {
+        let home = PathBuf::from("/Users/test");
+        let npm_claude = super::windows_npm_prefix(&home).join("claude.cmd");
+        assert!(
+            known_path_candidates_for_platform(home.clone(), "claude", true).contains(&npm_claude)
+        );
+        assert!(!known_path_candidates_for_platform(home, "claude", false).contains(&npm_claude));
     }
 
     #[test]

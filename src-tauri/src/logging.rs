@@ -243,6 +243,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The 10013 unwire is reported by the same retry's once-per-error
+    // `proxy_intercept_bind_failed` capture (RUST-EQ), whose `probe` extra
+    // tells a reserved range from another account's listener; bridged, the
+    // warn filed every such host a second time as RUST-RC.
+    if target.starts_with("headroom_desktop_lib::proxy_intercept")
+        && msg.starts_with("[proxy_intercept] unwired clients: Windows refused port")
+    {
+        return true;
+    }
     // report_codex_upstream_error logs the RAW upstream body locally and then
     // captures a separate, status-fingerprinted event with only the structural
     // summary. The bridge defeated both halves (RUST-5Q): the raw body — which
@@ -265,7 +274,10 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // spawn error is rare and the restart self-heals on next request), so they
     // are pure noise. The "download error" variant is NOT suppressed — it
     // carries a classified cause and is the systemic signal worth tracking.
-    if target.starts_with("headroom_desktop_lib::state")
+    // The restart variant, like the upgrade spawn warn below, is logged by
+    // `log_headroom_start_failure` in lib.rs since 8446dbf4, so it arrives
+    // under the crate root's target, not state's (RUST-RB).
+    if (target.starts_with("headroom_desktop_lib::state") || target == "headroom_desktop_lib")
         && (msg.starts_with("kompress prefetch failed")
             || msg.starts_with("kompress prefetch: restart after download failed"))
     {
@@ -316,7 +328,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // Bridged, the spawn warn grouped on its message, which embeds the venv
     // path and the prior-attempts wording, so one host filed RUST-CW and
     // RUST-CZ a minute apart with RUST-CX beside them.
-    if target.starts_with("headroom_desktop_lib::state")
+    if (target.starts_with("headroom_desktop_lib::state") || target == "headroom_desktop_lib")
         && (msg.starts_with("run_upgrade_with_ui: new proxy failed to spawn")
             || msg.starts_with("run_upgrade_with_ui: skipping boot validation"))
     {
@@ -1220,6 +1232,12 @@ mod tests {
             "[proxy_intercept] error: An attempt was made to access a socket in a way \
              forbidden by its access permissions. (os error 10013); retrying"
         ));
+        // Its unwire, verbatim from the emit site: the same capture covers it
+        // (RUST-RC).
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] unwired clients: Windows refused port 6767"
+        ));
         // The rule is scoped to the retry marker, not blanket-by-target: a
         // proxy_intercept warning that fires once and has no emit-site capture
         // still reaches Sentry. (The real non-retry lines this file knows about
@@ -1306,7 +1324,7 @@ mod tests {
             "kompress prefetch failed: some error"
         ));
         assert!(skip_sentry(
-            "headroom_desktop_lib::state",
+            "headroom_desktop_lib",
             "kompress prefetch: restart after download failed: boom"
         ));
     }
@@ -1646,9 +1664,10 @@ mod tests {
 
     #[test]
     fn skips_upgrade_spawn_failure_and_not_started_warns() {
-        // RUST-CZ: the spawn error, message-grouped on the venv path.
+        // RUST-CZ: the spawn error, message-grouped on the venv path. Logged
+        // from lib.rs's `log_headroom_start_failure` (RUST-RB).
         assert!(skip_sentry(
-            "headroom_desktop_lib::state",
+            "headroom_desktop_lib",
             "run_upgrade_with_ui: new proxy failed to spawn: unable to keep headroom running in \
              background (prior attempts: headroom.exe: exited with status exit code: 1 before \
              opening port 6768): exited with status exit code: 1 before opening port 6768 \

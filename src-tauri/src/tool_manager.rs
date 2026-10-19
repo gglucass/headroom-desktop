@@ -2901,6 +2901,73 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: a rescan sees the block the last scan wrote (vendor, upstream owed) -
+# ClaudeCodeWriter writes a project's learned block to CLAUDE.local.md (the home
+# project's to ~/.claude/CLAUDE.md), but discover_projects points context_file,
+# the file _build_prior_patterns_section shows the model beside MEMORY.md, at
+# CLAUDE.md. So every rescan started from nothing, named its sections afresh (in
+# the sessions' language: Spanish one run, English the next), and
+# _merge_recommendations kept every old section whose heading was not reused
+# verbatim: duplicate sections piling up in ten projects (a customer,
+# 2026-10-18). context_file now names the writer's file whenever it holds the
+# block, and the prompt asks for a prior heading to be reused as written.
+# ClaudeCodeWriter ignores context_file, so only the analysis input changes.
+# Bound after the worktree merge, so its merged projects are covered too.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes once the plugin or the
+# analyzer names CLAUDE.local.md. Kill switch: HEADROOM_LEARN_PRIOR_LOCAL=0.
+_hd_lpl_flag = _hd_os.environ.get("HEADROOM_LEARN_PRIOR_LOCAL", "1")
+if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_lpl_meta
+
+        if _hd_lpl_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_lpl_inspect
+            from pathlib import Path as _hd_lpl_Path
+
+            from headroom.learn import analyzer as _hd_lpl_an
+            from headroom.learn import writer as _hd_lpl_wr
+            from headroom.learn.plugins import claude as _hd_lpl_mod
+
+            if not any(
+                "CLAUDE.local.md" in _hd_lpl_inspect.getsource(m)
+                for m in (_hd_lpl_mod, _hd_lpl_an)
+            ):
+                _hd_lpl_cls = _hd_lpl_mod.ClaudeCodePlugin
+                _hd_lpl_discover = _hd_lpl_cls.discover_projects
+                _hd_lpl_anchor = "- Sections from prior runs that you do NOT re-emit"
+
+                def _hd_lpl_discover_projects(self):
+                    projects = _hd_lpl_discover(self)
+                    for p in projects:
+                        # Where ClaudeCodeWriter._resolve_context_path writes
+                        # without --target. In place: a merged worktree project
+                        # carries attributes dataclasses.replace would drop.
+                        if p.project_path == _hd_lpl_Path.home():
+                            target = _hd_lpl_wr.claude_config_dir() / "CLAUDE.md"
+                        else:
+                            target = p.project_path / "CLAUDE.local.md"
+                        try:
+                            text = target.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            continue
+                        if _hd_lpl_wr.extract_marker_block(text):
+                            p.context_file = target
+                    return projects
+
+                if _hd_lpl_anchor in _hd_lpl_an._SYSTEM_PROMPT:
+                    _hd_lpl_an._SYSTEM_PROMPT = _hd_lpl_an._SYSTEM_PROMPT.replace(
+                        _hd_lpl_anchor,
+                        "- A section on a topic the prior block already has a heading\n"
+                        "  for reuses that heading exactly as written, in its language,\n"
+                        "  so it replaces the prior section instead of sitting beside it.\n"
+                        + _hd_lpl_anchor,
+                        1,
+                    )
+                _hd_lpl_cls.discover_projects = _hd_lpl_discover_projects
+                _hd_bound.add("learn_prior_local")
+    except Exception:
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -3002,11 +3069,21 @@ if _hd_lpe_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 if sep:
                     head += "[prompt omitted]\n"
                     tail = tail.strip()
-                    room = max(_hd_lpe_cap - len(head), 0)
+                    # The verdict keeps at least half the cut: Codex's MCP
+                    # startup errors ahead of the echo once filled it and left
+                    # the verdict's last JSON lines (RUST-QV on 0.9.43).
+                    room = max(_hd_lpe_cap - len(head), _hd_lpe_cap // 2)
                     if len(tail) > room:
                         # Whole lines where possible: the verdict is the last one.
                         cut = tail[len(tail) - room :]
                         tail = cut.partition("\n")[2] or cut
+                    room = _hd_lpe_cap - len(tail) - len("[...]\n")
+                    if len(head) > room:
+                        # The head gives up its middle; its first line is what
+                        # the app's failure signature keys on.
+                        first, _, rest = head.partition("\n")
+                        rest = rest[len(rest) - max(room - len(first) - 1, 0) :]
+                        head = first + "\n[...]\n" + (rest.partition("\n")[2] or rest)
                     result.stderr = head + tail
             return result
 
@@ -3087,6 +3164,43 @@ if _hd_lse_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
         _hd_lse_mod.Popen = _hd_lse_popen
         _hd_bound.add("learn_stdin_early_exit")
+    except Exception:
+        pass
+
+# --- Learn: the digest's loop section fits its budget (vendor, upstream owed) --
+# _build_digest budgets the per-session event stream but renders every detected
+# loop ahead of it, each with every message index it repeated at. Codex learn is
+# one project holding every session the machine ever ran, so on a heavy user the
+# loops alone outgrew the digest and Codex refused every scan's 1.79M-char prompt
+# over its 1,048,576-char input cap (RUST-QV). Only the costliest
+# max_tokens // 400 loops are rendered (detect_loops sorts by waste), each with
+# its first 20 indices beside its count: under a quarter of the digest budget,
+# halving with it on the prompt-too-long retry. Loop weighting still sees every
+# loop. Exact-pin gated to wheel 0.39.0. Kill switch: HEADROOM_LEARN_LOOP_BUDGET=0.
+_hd_llb_flag = _hd_os.environ.get("HEADROOM_LEARN_LOOP_BUDGET", "1")
+if _hd_llb_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import dataclasses as _hd_llb_dc
+        import importlib.metadata as _hd_llb_meta
+
+        if _hd_llb_meta.version("headroom-ai") == "0.39.0":
+            from headroom.learn import analyzer as _hd_llb_mod
+
+            _hd_llb_orig = _hd_llb_mod._build_digest
+
+            def _hd_llb_digest(
+                project, sessions, loops=None, max_tokens=_hd_llb_mod._MAX_DIGEST_TOKENS
+            ):
+                if loops is None:
+                    loops = _hd_llb_mod.detect_loops(sessions)
+                loops = [
+                    _hd_llb_dc.replace(lp, msg_indices=lp.msg_indices[:20])
+                    for lp in loops[: max_tokens // 400]
+                ]
+                return _hd_llb_orig(project, sessions, loops=loops, max_tokens=max_tokens)
+
+            _hd_llb_mod._build_digest = _hd_llb_digest
+            _hd_bound.add("learn_loop_budget")
     except Exception:
         pass
 
@@ -4087,12 +4201,14 @@ _HD_VENDORS = (
     "output_warmup",
     "learn_rule_coerce",
     "learn_worktree_merge",
+    "learn_prior_local",
     "learn_drop_error_recovery",
     "learn_no_tools",
     "learn_codex_retries",
     "learn_prompt_echo",
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
+    "learn_loop_budget",
     "image_memo",
     "image_worker_reap",
     "stream_uncached_input",
@@ -17571,6 +17687,18 @@ fn is_outdated_codex(err: &anyhow::Error) -> bool {
         .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
 }
 
+/// True when Claude Code's manifest validator refuses a field it predates
+/// (RUST-RA: ponytail 5.3 added `userConfig` and `types`, and an older CLI
+/// answered "Unrecognized key(s) in object: 'types', 'userConfig'"; 2.1.296
+/// takes them). 2.1.50 words it `Unrecognized keys: "types", "userConfig"`.
+/// Same class as [`is_outdated_codex`].
+fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CommandFailure>().is_some_and(|failure| {
+        failure.stderr.contains("invalid manifest file")
+            && failure.stderr.contains("Unrecognized key")
+    })
+}
+
 /// First Claude Code release with `claude plugin marketplace add`. 2.0.12-2.0.15
 /// have `plugin` but reject `marketplace` as an unknown command.
 const CLAUDE_PLUGIN_MIN_VERSION: [u32; 3] = [2, 0, 17];
@@ -17607,6 +17735,8 @@ fn settle_plugin_hosts(
             Ok(()) => installed_any = true,
             Err(err)
                 if err.is::<OutdatedClaudeCli>()
+                    || (matches!(host, PluginHost::ClaudeCode)
+                        && is_outdated_claude_manifest(&err))
                     || (matches!(host, PluginHost::Codex) && is_outdated_codex(&err)) =>
             {
                 log::info!("{id} [{}]: CLI too old for plugins; skipped", host.label());
@@ -19779,12 +19909,14 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         std::fs::create_dir_all(&dir).expect("temp inject dir");
         std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
             .expect("write sitecustomize");
+        // RUST-QV (0.9.43): MCP startup errors ahead of the echo, and a verdict
+        // whose cause sits in the JSON lines after it.
         let probe = "import sys\n\
                      from headroom.learn import analyzer as a\n\
-                     cli = \"import sys; p = sys.stdin.read(); sys.stderr.write('Reading prompt from stdin...\\\\nuser\\\\n' + p + '\\\\n' + 'retry\\\\n' * 400 + 'ERROR: boom\\\\n'); sys.exit(1)\"\n\
+                     cli = \"import sys; p = sys.stdin.read(); sys.stderr.write('Reading prompt from stdin...\\\\n' + 'ERROR mcp\\\\n' * 177 + 'user\\\\n' + p + '\\\\n' + 'retry\\\\n' * 400 + 'ERROR: boom {\\\\n' + '  null,\\\\n' * 50 + '}\\\\n'); sys.exit(1)\"\n\
                      r = a.run([sys.executable, '-c', cli], input='SECRET\\r\\n' * 600, capture_output=True, text=True)\n\
                      d = a._failure_detail(r.stderr, r.stdout)\n\
-                     print(d.endswith('ERROR: boom'), 'SECRET' in d, len(d) <= a._MAX_SNIPPET_LEN)";
+                     print('ERROR: boom {' in d, 'SECRET' in d, len(d) <= a._MAX_SNIPPET_LEN, d.startswith('Reading prompt from stdin...'))";
         let run = |kill: &str| {
             let out = crate::proc::command(&python)
                 .args(["-c", probe])
@@ -19800,8 +19932,98 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let (on, on_err) = run("1");
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "True False True", "stderr:\n{on_err}");
-        assert_eq!(off, "False True True", "stderr:\n{off_err}");
+        assert_eq!(on, "True False True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True True True", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_loop_budget_behaves_against_the_installed_wheel() {
+        // RUST-QV: thousands of loops with every message index outgrew Codex's
+        // 1,048,576-char input cap; the section now stays inside the digest
+        // budget and shrinks with it. The kill switch renders every loop again.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-lb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from pathlib import Path\n\
+                     from headroom.learn import analyzer as a\n\
+                     from headroom.learn.loops import LoopPattern\n\
+                     from headroom.learn.models import ProjectInfo\n\
+                     p = ProjectInfo(name='x', project_path=Path('.'), data_path=Path('.'))\n\
+                     loops = [LoopPattern('Bash', 's', 'x' * 120, 300, False, 10**6 - i, list(range(300))) for i in range(2000)]\n\
+                     full, small = a._build_digest(p, [], loops=loops), a._build_digest(p, [], loops=loops, max_tokens=10000)\n\
+                     print(len(full) <= 80000, len(small) <= 10000, 'repeated 300x' in small, len(loops[0].msg_indices))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_LOOP_BUDGET", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
+        assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_prior_local_behaves_against_the_installed_wheel() {
+        // A rescan saw only CLAUDE.md, never the CLAUDE.local.md block the last
+        // scan wrote, so it renamed every section and both copies survived
+        // (Spanish and English, a customer 2026-10-18). The kill switch hides
+        // the block again.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-pl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import json, tempfile\n\
+                     from pathlib import Path\n\
+                     from headroom.learn import analyzer as a\n\
+                     from headroom.learn.plugins.claude import ClaudeCodePlugin\n\
+                     t = Path(tempfile.mkdtemp())\n\
+                     proj = t / 'site'\n\
+                     proj.mkdir()\n\
+                     (proj / 'CLAUDE.local.md').write_text('<!-- headroom:learn:start -->\\n## Headroom Learned Patterns\\n\\n### Entorno\\n- usa wp-cli\\n<!-- headroom:learn:end -->\\n')\n\
+                     d = t / 'cfg' / 'projects' / '-tmp-hdlpl'\n\
+                     d.mkdir(parents=True)\n\
+                     (d / 's.jsonl').write_text(json.dumps({'cwd': str(proj), 'type': 'user'}) + '\\n')\n\
+                     p = [p for p in ClaudeCodePlugin(t / 'cfg').discover_projects() if p.project_path == proj][0]\n\
+                     print('### Entorno' in a._build_prior_patterns_section(p), 'reuses that heading exactly' in a._SYSTEM_PROMPT)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_PRIOR_LOCAL", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False False", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -28242,6 +28464,44 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         .to_string();
         assert!(mixed.starts_with("installing the ponytail plugin failed: Codex: "));
         assert!(mixed.ends_with("Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."));
+
+        // RUST-RA: an older CLI refusing manifest fields it predates.
+        let manifest = Err(anyhow::Error::new(CommandFailure {
+            program: "claude".into(),
+            args: vec!["plugin".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "✘ Failed to install plugin \"ponytail@ponytail\": Plugin has an invalid manifest file at ~/.claude/plugins/cache/temp_local_1/.claude-plugin/plugin.json. Validation errors: : Unrecognized key(s) in object: 'types', 'userConfig'".into(),
+            exit_code: Some(1),
+            signal: None,
+        }));
+        let refused = settle_plugin_hosts("ponytail", [(PluginHost::ClaudeCode, manifest)])
+            .expect_err("nothing installed")
+            .to_string();
+        assert_eq!(
+            refused,
+            "Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."
+        );
+
+        // Claude Code 2.1.50's wording, verbatim from the train guest, beside
+        // a Codex that installed: the update nudge, not a partial-install error.
+        let manifest = Err(anyhow::Error::new(CommandFailure {
+            program: "claude".into(),
+            args: vec!["plugin".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "Installing plugin \"ponytail@ponytail\"...\n✘ Failed to install plugin \"ponytail@ponytail\": Plugin has an invalid manifest file at /Users/admin/.claude/plugins/cache/temp_local_1792388307683_9vyaec/.claude-plugin/plugin.json. Validation errors: : Unrecognized keys: \"types\", \"userConfig\"".into(),
+            exit_code: Some(1),
+            signal: None,
+        }));
+        let (outdated, errors) = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, manifest),
+                (PluginHost::Codex, Ok(())),
+            ],
+        )
+        .expect("Codex installed");
+        assert_eq!(outdated, ["Claude Code"]);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

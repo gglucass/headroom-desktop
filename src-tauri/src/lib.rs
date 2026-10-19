@@ -3804,7 +3804,12 @@ fn capture_watchdog_give_up(
 /// identical in Sentry.
 #[derive(Default, Clone)]
 pub(crate) struct UpgradeBootDiagnostics {
+    /// At failure time. `spawned_child` is the same check right after the
+    /// spawn: true then and false now means the child was stopped or reaped
+    /// mid-validation, and `stopped_by` names the `stop_headroom` caller.
     pub tracked_child: bool,
+    pub spawned_child: bool,
+    pub stopped_by: Option<String>,
     pub new_proxy_log_written: bool,
     pub proxy_port_bound: bool,
     pub python_installed: bool,
@@ -3965,6 +3970,10 @@ pub(crate) fn capture_upgrade_failure(
                     },
                 );
                 scope.set_extra("tracked_child", diag.tracked_child.into());
+                scope.set_extra("spawned_child", diag.spawned_child.into());
+                if let Some(at) = diag.stopped_by.as_deref() {
+                    scope.set_extra("stopped_by", at.into());
+                }
                 scope.set_extra("new_proxy_log_written", diag.new_proxy_log_written.into());
                 scope.set_extra("proxy_port_bound", diag.proxy_port_bound.into());
                 scope.set_extra("python_installed", diag.python_installed.into());
@@ -9444,18 +9453,28 @@ fn learn_failure_signature_source(text: &str) -> String {
         // The status variant ends `, url: ..., cf-ray: ..., request id: ...`,
         // unique per request, so it is cut there. Codex 0.163 words an
         // app-server refusal `Error: turn/start: ...` instead (RUST-QV), its
-        // `, data: {...}` tail carrying a per-run character count.
+        // `, data: {...}` tail carrying a per-run character count. Codex 0.45
+        // prints a status body as indented JSON, so its line ends `{` and the
+        // cause is the body's `"message"` line.
         Some(&"Reading prompt from stdin...") => {
-            let reason = lines[marker + 1..]
+            let after = &lines[marker + 1..];
+            let reason = after
                 .iter()
-                .rev()
-                .find(|l| {
+                .rposition(|l| {
                     (l.starts_with("ERROR: ") && !l.starts_with("ERROR: Reconnecting"))
                         || l.starts_with("Error: ")
                 })
-                .map_or("Reading prompt from stdin...", |l| {
-                    let l = l.split_once(", url: ").map_or(*l, |(head, _)| head);
-                    l.split_once(", data: ").map_or(l, |(head, _)| head)
+                .map_or("Reading prompt from stdin...".to_string(), |at| {
+                    let l = after[at];
+                    let l = l.split_once(", url: ").map_or(l, |(head, _)| head);
+                    let l = l.split_once(", data: ").map_or(l, |(head, _)| head);
+                    match after[at + 1..]
+                        .iter()
+                        .find(|m| m.starts_with("\"message\": "))
+                    {
+                        Some(message) if l.ends_with('{') => format!("{l} {message}"),
+                        _ => l.to_string(),
+                    }
                 });
             format!("{} {reason}", lines[marker])
         }
@@ -16814,6 +16833,11 @@ Some unrelated content.
         let too_large = codex("Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602), data: {\"input_error_code\":\"input_too_large\",\"max_chars\":1048576,\"actual_chars\":1786526}");
         assert!(learn_failure_signature_source(&too_large).ends_with(
             "failed (exit 1): Error: turn/start: turn/start failed: Input exceeds the maximum length of 1048576 characters. (code -32602)"
+        ));
+        // RUST-QV on 0.9.43: Codex 0.45's indented JSON status body.
+        let json_body = codex("ERROR: unexpected status 400 Bad Request: {\n  \"error\": {\n    \"message\": \"Unsupported model\",\n    \"type\": \"invalid_request_error\",\n    \"param\": null,\n    \"code\": null\n  }\n}");
+        assert!(learn_failure_signature_source(&json_body).ends_with(
+            "failed (exit 1): ERROR: unexpected status 400 Bad Request: { \"message\": \"Unsupported model\","
         ));
         // No verdict line (a wheel without the vendor cut it off): as before.
         assert!(learn_failure_signature_source(

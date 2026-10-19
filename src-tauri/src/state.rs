@@ -512,6 +512,11 @@ pub struct AppState {
     /// watchdog give-up capture as "still_alive_or_untracked" with no exit
     /// code (Sentry RUST-53). Cleared on each successful spawn.
     pub last_child_natural_exit: Mutex<Option<String>>,
+    /// Caller of the last `stop_headroom` since the upgrade's boot validation
+    /// spawned its child. RUST-R3 (0.9.42, two Windows hosts) ended with no
+    /// tracked child and no recorded exit, so something stopped it, and the
+    /// event could not say what.
+    pub stop_during_validation: Mutex<Option<&'static std::panic::Location<'static>>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     /// Cause class and technical detail of the most recent bootstrap failure,
     /// captured at the failure site where pip's stderr tail is still in hand.
@@ -731,6 +736,7 @@ impl AppState {
             }),
             last_startup_error: Mutex::new(None),
             last_child_natural_exit: Mutex::new(None),
+            stop_during_validation: Mutex::new(None),
             bootstrap_progress: Mutex::new(BootstrapProgress {
                 running: false,
                 complete: false,
@@ -1288,6 +1294,8 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
 
+        // The upgrade's own pre-install stop is not the one we are after.
+        *self.stop_during_validation.lock() = None;
         let ensure_err = self
             .ensure_headroom_running()
             .err()
@@ -1421,6 +1429,11 @@ impl AppState {
         );
         let boot_diagnostics = crate::UpgradeBootDiagnostics {
             tracked_child: self.headroom_process.lock().is_some(),
+            spawned_child: post_spawn.tracked_child,
+            stopped_by: self
+                .stop_during_validation
+                .lock()
+                .map(|at| format!("{}:{}", at.file(), at.line())),
             new_proxy_log_written,
             proxy_port_bound: proxy_port_accepts_connection(),
             port_occupant: crate::tool_manager::describe_proxy_port_occupant(
@@ -3921,7 +3934,11 @@ impl AppState {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
 
+    #[track_caller]
     pub fn stop_headroom(&self) {
+        if *self.runtime_upgrade_in_progress.lock() {
+            *self.stop_during_validation.lock() = Some(std::panic::Location::caller());
+        }
         // `ensure_headroom_running` holds this lock across a blocking backend
         // start, so a launch racing this stop can hold it for the length of that
         // spawn. Quit must not wait on it: `restart_app` calls us before it can
@@ -9557,22 +9574,21 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              netsh int ipv4 show excludedportrange protocol=tcp"
         );
     }
-    // WSAEACCES. Nothing is holding the port -- Windows refused us the socket
-    // outright -- so both the fallback below ("quit whatever holds the port")
-    // and the 10048 arm's "in use by another program" are confidently wrong
-    // here, which this file's own docstring bans. Same two causes and the same
-    // discriminating command as `crate::loopback_socket_denied_hint`, which
-    // covers the Python runtime hitting 10013 at startup; this is the
-    // intercept's own front door, so the remedy is phrased around the port and
-    // around the fact that the bind loop keeps retrying on its own.
+    // WSAEACCES. Windows refused us the socket: a reserved port range, security
+    // software, or another account's socket, none of which the user can "quit",
+    // so both the fallback below and the 10048 arm's "in use by another
+    // program" are wrong here. The bind loop has unwired the clients (RUST-EQ),
+    // and the reserved range, the usual cause, gets its fix: freeing WinNAT's
+    // claim and excluding 6767-6768 so it is not taken again.
     if crate::is_loopback_socket_denied_signal(raw) {
         return format!(
-            "Port {port} was refused by Windows itself, not taken by another program \
-             (WinError 10013). This is usually security software filtering loopback \
-             connections, or a reserved port range (Hyper-V, WSL2, Docker) covering it: run \
-             netsh int ipv4 show excludedportrange protocol=tcp in PowerShell to check, and \
-             allow Headroom in your antivirus or firewall's network protection. \
-             Headroom keeps retrying and reconnects on its own once it clears."
+            "Port {port} was refused by Windows (WinError 10013), so your coding tools \
+             connect directly for now. Usually a reserved port range (Hyper-V, WSL2, Docker) \
+             covers it: if netsh int ipv4 show excludedportrange protocol=tcp lists it, run \
+             net stop winnat; netsh int ipv4 add excludedportrange protocol=tcp \
+             startport={port} numberofports=2; net start winnat in an admin PowerShell. \
+             Otherwise allow Headroom in your antivirus or firewall's network protection. \
+             Headroom reconnects on its own once the port opens."
         );
     }
     if raw.contains("os error 10048") {
@@ -9665,13 +9681,17 @@ fn should_reclaim_healthy_backend(
     upgrade_in_progress || (backend_serving && !backend_argv_is_current)
 }
 
+/// Never during an upgrade: it stopped our backend, so whatever answers is the
+/// old wheel or not ours. A 6767 held by another process (WinError 10013 on
+/// our bind) answered /readyz, nothing was spawned, and boot validation waited
+/// out a child that never existed (RUST-R3).
 fn runtime_already_serving(
     intercept_reachable: bool,
     backend_serving: bool,
     backend_argv_is_current: bool,
     upgrade_in_progress: bool,
 ) -> bool {
-    intercept_reachable || (!upgrade_in_progress && backend_serving && backend_argv_is_current)
+    !upgrade_in_progress && (intercept_reachable || (backend_serving && backend_argv_is_current))
 }
 
 /// Whether `/readyz` on `port` says the proxy is up, with the JSON body it
@@ -12323,7 +12343,10 @@ mod tests {
         );
         assert!(hint.contains("10013"), "{hint}");
         assert!(hint.contains("excludedportrange"), "{hint}");
-        // Never the wrong remedy: nothing is holding this port.
+        // RUST-EQ: the clients are unwired, and a reserved range gets its fix.
+        assert!(hint.contains("connect directly"), "{hint}");
+        assert!(hint.contains("startport=6767 numberofports=2"), "{hint}");
+        // Never the wrong remedy: nothing the user can quit holds this port.
         assert!(!hint.contains("Quit"), "{hint}");
         assert!(!hint.contains("in use by another program"), "{hint}");
         let first = hint.split(". ").next().unwrap();
@@ -12663,10 +12686,12 @@ mod tests {
         assert!(!serving(false, false, true, false));
 
         // During an upgrade's boot validation the healthy backend is the OLD
-        // wheel: never adopt it, fall through to the force-reclaim spawn. The
-        // intercept rule is not affected by the flag.
+        // wheel: never adopt it, fall through to the force-reclaim spawn.
         assert!(!serving(false, true, true, true));
-        assert!(serving(true, false, false, true));
+        // Nor whatever answers on 6767 (RUST-R3): the new venv must be spawned
+        // or validation waits on no child.
+        assert!(!serving(true, false, false, true));
+        assert!(!serving(true, true, true, true));
     }
 
     #[test]
@@ -13868,6 +13893,25 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(!state.upgrade_install_blocks_spawn());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn stop_headroom_records_its_caller_only_during_an_upgrade() {
+        let base_dir = temp_test_dir("headroom-stop-caller");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        state.stop_headroom();
+        assert!(state.stop_during_validation.lock().is_none());
+
+        *state.runtime_upgrade_in_progress.lock() = true;
+        let line = line!() + 1;
+        state.stop_headroom();
+        let at = state
+            .stop_during_validation
+            .lock()
+            .expect("caller recorded");
+        assert_eq!((at.file(), at.line()), (file!(), line));
         let _ = std::fs::remove_dir_all(base_dir);
     }
 

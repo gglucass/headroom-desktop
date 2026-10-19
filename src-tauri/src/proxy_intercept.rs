@@ -1444,6 +1444,10 @@ fn serve(
                 // established that, a plain bind has nothing left to prove,
                 // and `run` does not return after it binds.
                 let mut reuse_addr = false;
+                // Whether the holder of a port Windows refuses us (10013) is
+                // this user's other window, decided once: the check shells
+                // out, and the loop retries for as long as Windows refuses.
+                let mut denied_by_twin: Option<bool> = None;
                 loop {
                     match run(
                         bind_addr,
@@ -1865,10 +1869,52 @@ fn serve(
                                 *bind_error.lock() = Some(e.to_string());
                                 log::warn!("[proxy_intercept] error: {e}; retrying");
                                 let key = os_error_key(&e);
+                                // WSAEACCES does not clear on a retry: a
+                                // reserved port range or another account's
+                                // socket holds 6767, and every wired client
+                                // failed against it until Headroom quit
+                                // (RUST-EQ). Unwire them as from any stranger;
+                                // `run` wires them back once the port is ours.
+                                let mut probe = None;
+                                if crate::is_loopback_socket_denied_signal(&e.to_string()) {
+                                    let twin = match denied_by_twin {
+                                        Some(twin) => twin,
+                                        None => {
+                                            let found = probe_port(INTERCEPT_PORT).await;
+                                            probe = Some(found);
+                                            let twin = held_by_our_other_window(found, || {
+                                                crate::tool_manager::port_held_by_desktop_twin(
+                                                    INTERCEPT_PORT,
+                                                )
+                                            });
+                                            denied_by_twin = Some(twin);
+                                            twin
+                                        }
+                                    };
+                                    if twin {
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is served by another Headroom instance"
+                                        ));
+                                    } else if crate::client_adapters::unwire_clients_for_port_holder()
+                                    {
+                                        log::warn!(
+                                            "[proxy_intercept] unwired clients: Windows refused port {INTERCEPT_PORT}"
+                                        );
+                                    }
+                                }
                                 if reported_errors.insert(key.clone()) {
                                     sentry::with_scope(
                                         |scope| {
                                             scope.set_extra("os_error", e.to_string().into());
+                                            // Refused = nothing listens (a
+                                            // reserved range); anything else
+                                            // is another account's listener.
+                                            if let Some(probe) = probe {
+                                                scope.set_extra(
+                                                    "probe",
+                                                    format!("{probe:?}").into(),
+                                                );
+                                            }
                                             scope.set_fingerprint(Some(&[
                                                 "proxy_intercept_bind_failed",
                                                 "error",
@@ -3771,16 +3817,45 @@ fn codex_error_shape_tag(body: &[u8]) -> String {
     }
 }
 
-/// Classify an Anthropic invalid_request 400 by signature, so the tool-search
-/// and tool_use/tool_result adjacency 400s stop hiding inside the generic RUST-BT bucket. Substring match
-/// on the raw bytes because these stream as SSE (JSON parse fails). Returns a
-/// fixed, content-free classification (never the offending tool name), or None
-/// when the body is not one of these shapes (fall back to the codex classifier).
+/// Classify an Anthropic 4xx by its message's signature, so known causes stop
+/// hiding inside the generic RUST-BT (400) and RUST-BS (404) buckets: 78 and 58
+/// hosts in the week to 2026-10-18, every event a bare `invalid_request_error`
+/// or `not_found_error`, which left stuck host 743 (59 of 161 failed) with no
+/// lead. Substring match on the raw bytes because some stream as SSE (JSON
+/// parse fails). Returns a fixed, content-free classification (never the
+/// message, a tool name or a model id), or None when the body is not one of
+/// these shapes (fall back to the codex classifier).
 fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
     }
-    if contains(body, b"not found in available tools") {
+    if contains(body, b"not_found_error") && contains(body, b"model: ") {
+        Some("model_not_found")
+    } else if contains(body, b"prompt is too long") {
+        Some("prompt_too_long")
+    } else if contains(body, b"unexpected `tool_use_id` found in `tool_result`") {
+        Some("orphan_tool_result")
+    } else if contains(body, b"latest assistant message cannot be modified") {
+        Some("thinking_block_modified")
+    } else if contains(body, b"signature` in `thinking` block") {
+        Some("thinking_signature_invalid")
+    } else if contains(body, b"text content blocks must")
+        || contains(body, b"cannot be set for empty text blocks")
+    {
+        Some("empty_text_block")
+    } else if contains(body, b"blocks with cache_control") {
+        Some("too_many_cache_breakpoints")
+    } else if contains(body, b"image exceeds") || contains(body, b"image dimensions exceed") {
+        Some("image_too_large")
+    } else if contains(body, b"Could not process image") {
+        Some("image_unprocessable")
+    } else if contains(body, b"roles must alternate") {
+        Some("roles_must_alternate")
+    } else if contains(body, b"maximum allowed number of output tokens") {
+        Some("max_tokens_too_large")
+    } else if contains(body, b"credit balance is too low") {
+        Some("credit_balance_low")
+    } else if contains(body, b"not found in available tools") {
         Some("tool_reference_not_found")
     } else if contains(body, b"All tools cannot be deferred") {
         Some("all_tools_deferred")
@@ -9525,6 +9600,31 @@ mod tests {
         let tag = super::anthropic_error_shape(adjacency);
         assert_eq!(tag, Some("tool_use_without_result"));
         assert!(!tag.unwrap().contains("toolu_") && !tag.unwrap().contains("255"));
+
+        // The RUST-BT/BS messages, each to a label that carries no request
+        // content: no token counts, indexes, model ids or image sizes.
+        for (body, label) in [
+            (&br#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-9"},"request_id":"req_1"}"#[..], "model_not_found"),
+            (br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215023 tokens > 200000 maximum"}}"#, "prompt_too_long"),
+            (b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.4.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01A. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.\"}}\n\n", "orphan_tool_result"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.9.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}"#, "thinking_block_modified"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#, "thinking_signature_invalid"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.3.content.1: text content blocks must be non-empty"}}"#, "empty_text_block"),
+            (br#"{"error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}"#, "too_many_cache_breakpoints"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.7.content.2.image.source.base64: image exceeds 5 MB maximum: 6291456 bytes > 5242880 bytes"}}"#, "image_too_large"),
+            (br#"{"error":{"type":"invalid_request_error","message":"Could not process image"}}"#, "image_unprocessable"),
+        ] {
+            let tag = super::anthropic_error_shape(body);
+            assert_eq!(tag, Some(label), "{}", String::from_utf8_lossy(body));
+            assert!(!tag.unwrap().chars().any(|c| c.is_ascii_digit()), "{label}");
+        }
+        // A 404 that names no model is not a model miss.
+        assert_eq!(
+            super::anthropic_error_shape(
+                br#"{"error":{"type":"not_found_error","message":"Not Found"}}"#
+            ),
+            None
+        );
 
         // Unrelated bodies fall through to the codex classifier.
         assert_eq!(
