@@ -17690,11 +17690,12 @@ fn is_outdated_codex(err: &anyhow::Error) -> bool {
 /// True when Claude Code's manifest validator refuses a field it predates
 /// (RUST-RA: ponytail 5.3 added `userConfig` and `types`, and an older CLI
 /// answered "Unrecognized key(s) in object: 'types', 'userConfig'"; 2.1.296
-/// takes them). Same class as [`is_outdated_codex`].
+/// takes them). 2.1.50 words it `Unrecognized keys: "types", "userConfig"`.
+/// Same class as [`is_outdated_codex`].
 fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CommandFailure>().is_some_and(|failure| {
         failure.stderr.contains("invalid manifest file")
-            && failure.stderr.contains("Unrecognized key(s)")
+            && failure.stderr.contains("Unrecognized key")
     })
 }
 
@@ -28480,6 +28481,27 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             refused,
             "Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."
         );
+
+        // Claude Code 2.1.50's wording, verbatim from the train guest, beside
+        // a Codex that installed: the update nudge, not a partial-install error.
+        let manifest = Err(anyhow::Error::new(CommandFailure {
+            program: "claude".into(),
+            args: vec!["plugin".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "Installing plugin \"ponytail@ponytail\"...\n✘ Failed to install plugin \"ponytail@ponytail\": Plugin has an invalid manifest file at /Users/admin/.claude/plugins/cache/temp_local_1792388307683_9vyaec/.claude-plugin/plugin.json. Validation errors: : Unrecognized keys: \"types\", \"userConfig\"".into(),
+            exit_code: Some(1),
+            signal: None,
+        }));
+        let (outdated, errors) = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, manifest),
+                (PluginHost::Codex, Ok(())),
+            ],
+        )
+        .expect("Codex installed");
+        assert_eq!(outdated, ["Claude Code"]);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
