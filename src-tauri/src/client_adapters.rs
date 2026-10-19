@@ -509,6 +509,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut legacy_updates = remove_legacy_vscode_base_url_keys();
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
+            let mut granular = route_granular_claude_logins();
+            updates.0.append(&mut granular.0);
+            updates.1.append(&mut granular.1);
 
             // Loud-fail guard so a closed app or lost ANTHROPIC_BASE_URL routing
             // surfaces in Claude instead of silently hitting Anthropic directly.
@@ -1668,6 +1671,7 @@ fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
                 None,
             );
             remove_legacy_vscode_base_url_keys();
+            unroute_granular_claude_logins();
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
             for settings_path in claude_settings_candidates() {
@@ -2163,6 +2167,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     ) {
         log::warn!("cleanup: removing ANTHROPIC_BASE_URL from Claude settings failed: {err}");
     }
+    unroute_granular_claude_logins();
     if let Err(err) = remove_claude_settings_env(
         HEADROOM_ENABLE_TOOL_SEARCH_KEY,
         HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
@@ -4166,6 +4171,69 @@ fn configure_claude_base_url() -> Result<(Vec<String>, Vec<String>, Option<Strin
     ))
 }
 
+/// settings.json of each extra Claude login in Granular (granular.build). It
+/// runs one with `CLAUDE_CONFIG_DIR=<userData>/connections/<id>` and drops an
+/// inherited ANTHROPIC_BASE_URL, so that login reads this file, never
+/// ~/.claude's, and bypassed Headroom; its machine login and API keys use
+/// ~/.claude. Codex and Gemini logins share `connections/`, but only Claude
+/// Code writes `.claude.json` (Granular's own `auth status` probe does).
+/// Granular ships for macOS and Windows only.
+fn granular_claude_settings_paths() -> Vec<PathBuf> {
+    let user_data = if cfg!(windows) {
+        match std::env::var_os("APPDATA") {
+            Some(dir) => PathBuf::from(dir),
+            None => return Vec::new(),
+        }
+    } else {
+        home_dir().join("Library").join("Application Support")
+    };
+    let Ok(entries) = std::fs::read_dir(user_data.join("granular").join("connections")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join(".claude.json").is_file())
+        .map(|dir| dir.join("settings.json"))
+        .collect()
+}
+
+/// Routes Granular's extra Claude logins like ~/.claude, best-effort. A URL
+/// the user set for one login stays, so nothing needs preserving on disable.
+/// shortcut: a login added while Headroom runs is routed at the next apply
+/// (launch or resume); watch `connections/` if users notice.
+fn route_granular_claude_logins() -> (Vec<String>, Vec<String>) {
+    let mut updates = (Vec::new(), Vec::new());
+    for path in granular_claude_settings_paths() {
+        match configure_claude_settings_env_impl(
+            &path,
+            "ANTHROPIC_BASE_URL",
+            HEADROOM_ANTHROPIC_BASE_URL,
+            false,
+        ) {
+            Ok((mut changed, mut backups, _)) => {
+                updates.0.append(&mut changed);
+                updates.1.append(&mut backups);
+            }
+            Err(err) => log::warn!("routing Granular login {} failed: {err}", path.display()),
+        }
+    }
+    updates
+}
+
+fn unroute_granular_claude_logins() {
+    for path in granular_claude_settings_paths() {
+        if let Err(err) = remove_claude_settings_env_at(
+            &path,
+            "ANTHROPIC_BASE_URL",
+            HEADROOM_ANTHROPIC_BASE_URL,
+            None,
+        ) {
+            log::warn!("unrouting Granular login {} failed: {err}", path.display());
+        }
+    }
+}
+
 /// The URL a Claude Code or VS Code disable puts back in place of Headroom's:
 /// the provider the cc-switch reconciler last replaced (newer than anything
 /// apply saw, and gone with the backend otherwise), else the pre-Headroom URL
@@ -4187,7 +4255,7 @@ fn configure_claude_settings_env(
     env_key: &str,
     env_value: &str,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    configure_claude_settings_env_impl(env_key, env_value, true)
+    configure_claude_settings_env_impl(&claude_settings_path(), env_key, env_value, true)
 }
 
 /// Like `configure_claude_settings_env`, but leaves a pre-existing, non-empty
@@ -4198,19 +4266,19 @@ fn configure_claude_settings_env_if_absent(
     env_key: &str,
     env_value: &str,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    configure_claude_settings_env_impl(env_key, env_value, false)
+    configure_claude_settings_env_impl(&claude_settings_path(), env_key, env_value, false)
 }
 
 fn configure_claude_settings_env_impl(
+    settings_path: &Path,
     env_key: &str,
     env_value: &str,
     overwrite_existing: bool,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    let settings_path = claude_settings_path();
-    let mut content = if held_or_exists(&settings_path) {
-        let raw = read_held_or_disk(&settings_path)
+    let mut content = if held_or_exists(settings_path) {
+        let raw = read_held_or_disk(settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
-        Value::Object(parse_json_object(&raw, &settings_path)?)
+        Value::Object(parse_json_object(&raw, settings_path)?)
     } else {
         Value::Object(Default::default())
     };
@@ -4262,9 +4330,9 @@ fn configure_claude_settings_env_impl(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let backup = backup_if_exists(&settings_path)?;
+    let backup = backup_if_exists(settings_path)?;
     atomic_write(
-        &settings_path,
+        settings_path,
         &serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
@@ -4776,14 +4844,27 @@ fn remove_claude_settings_env(
     expected_value: &str,
     restore_value: Option<&str>,
 ) -> Result<()> {
-    let settings_path = claude_settings_path();
-    if !held_or_exists(&settings_path) {
+    remove_claude_settings_env_at(
+        &claude_settings_path(),
+        env_key,
+        expected_value,
+        restore_value,
+    )
+}
+
+fn remove_claude_settings_env_at(
+    settings_path: &Path,
+    env_key: &str,
+    expected_value: &str,
+    restore_value: Option<&str>,
+) -> Result<()> {
+    if !held_or_exists(settings_path) {
         return Ok(());
     }
 
-    let raw = read_held_or_disk(&settings_path)
+    let raw = read_held_or_disk(settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
-    let mut root = parse_json_object(&raw, &settings_path)?;
+    let mut root = parse_json_object(&raw, settings_path)?;
     let mut changed = false;
 
     if let Some(Value::Object(env_obj)) = root.get_mut("env") {
@@ -4808,9 +4889,9 @@ fn remove_claude_settings_env(
         return Ok(());
     }
 
-    let _ = backup_if_exists(&settings_path)?;
+    let _ = backup_if_exists(settings_path)?;
     atomic_write(
-        &settings_path,
+        settings_path,
         &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for connector removal")?,
     )?;
@@ -15251,6 +15332,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .preserved_base_urls
                 .contains_key("claude_code"),
             "preserved entry consumed after restore"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_routes_and_disable_unroutes_granular_claude_logins() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+        let connections = if cfg!(windows) {
+            home.path().join("AppData").join("Roaming")
+        } else {
+            home.path().join("Library").join("Application Support")
+        }
+        .join("granular")
+        .join("connections");
+        let login = connections.join("conn-login");
+        let own_url = connections.join("conn-own-url");
+        let codex = connections.join("conn-codex");
+        for dir in [&login, &own_url, &codex] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(login.join(".claude.json"), "{}").unwrap();
+        fs::write(own_url.join(".claude.json"), "{}").unwrap();
+        let gateway = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#;
+        fs::write(own_url.join("settings.json"), gateway).unwrap();
+        fs::write(codex.join("auth.json"), "{}").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert_eq!(
+            read_settings_json(&login.join("settings.json"))["env"]["ANTHROPIC_BASE_URL"],
+            super::HEADROOM_ANTHROPIC_BASE_URL
+        );
+        assert_eq!(
+            fs::read_to_string(own_url.join("settings.json")).unwrap(),
+            gateway,
+            "a login's own base URL wins"
+        );
+        assert!(
+            !codex.join("settings.json").exists(),
+            "Codex login left alone"
+        );
+
+        super::disable_client_setup("claude_code").expect("disable");
+        let after = read_settings_json(&login.join("settings.json"));
+        assert!(
+            after.get("env").is_none(),
+            "unrouted on disable, got:\n{after:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(own_url.join("settings.json")).unwrap(),
+            gateway
         );
     }
 
