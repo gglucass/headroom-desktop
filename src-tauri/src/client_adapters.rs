@@ -3150,8 +3150,11 @@ impl std::fmt::Display for SetupStateLoadError {
 }
 
 fn try_load_setup_state(path: &Path) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))
+    // Not `state::read_state_file`: `load_setup_state` runs its own retry.
+    let read = std::fs::read(path);
+    let note = crate::env_fault::note(path, crate::env_fault::Op::Read, &read);
+    let bytes = read
+        .with_context(|| format!("reading {}{note}", path.display()))
         .map_err(SetupStateLoadError::Io)?;
     serde_json::from_slice::<ClientSetupState>(&bytes)
         .with_context(|| format!("parsing {}", path.display()))
@@ -3325,8 +3328,10 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // One guard here covers every caller instead of auditing all of them.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| anyhow!("creating {}: {err}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+                anyhow!("creating {}: {err}{note}", parent.display())
+            })?;
         }
     }
     // The io error goes in the *message*, not a source: every caller logs this
@@ -3365,7 +3370,8 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         // unique per write, so nothing ever reclaims it. On a full disk that is
         // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
         let _ = std::fs::remove_file(&tmp_path);
-        anyhow!("writing {}: {err}", tmp_path.display())
+        let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+        anyhow!("writing {}: {err}{note}", tmp_path.display())
     })?;
     // Windows: AV scanners / the search indexer briefly hold the destination
     // (or the just-written tmp) open, so the rename fails ERROR_ACCESS_DENIED
@@ -3375,19 +3381,22 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     let renamed =
         // direct-write: this is atomic_write
         rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp);
-    copy_if_cross_device(renamed, &tmp_path, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        anyhow!(
-            "renaming {} -> {}: {err}{}",
-            tmp_path.display(),
-            path.display(),
-            if is_locked_file(path) {
-                LOCKED_FILE_NOTE
-            } else {
-                ""
-            }
-        )
-    })
+    copy_if_cross_device(renamed, &tmp_path, path)
+        .map_err(|err| {
+            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+            let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+            anyhow!(
+                "renaming {} -> {}: {err}{}{note}",
+                tmp_path.display(),
+                path.display(),
+                if is_locked_file(path) {
+                    LOCKED_FILE_NOTE
+                } else {
+                    ""
+                }
+            )
+        })
+        .inspect(|()| crate::env_fault::succeeded(path, crate::env_fault::Op::Write))
 }
 
 /// Copies the tmp over `path` when the rename failed as a cross-device move.

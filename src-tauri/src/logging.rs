@@ -161,6 +161,12 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if is_disk_full(msg) || is_system_fd_exhaustion(msg) {
         return true;
     }
+    // A machine fault on Headroom's data folder: `env_fault` sends one event
+    // per fault itself, so the line from whichever file tripped on it is a
+    // duplicate (RUST-R1/R2 were one blocked folder seen from two files).
+    if msg.contains(crate::env_fault::NOTE) {
+        return true;
+    }
     // A line announcing that a Sentry capture was skipped must never itself be
     // captured -- the bridge forwarding it re-created exactly the event the
     // skip existed to prevent, minus all its structure (RUST-AR: the
@@ -1190,6 +1196,23 @@ mod tests {
     /// ENFILE is a machine-wide resource we cannot free, and it fails every
     /// file touch identically (RUST-A3 writing, RUST-5T reading). EMFILE is the
     /// per-process limit and would mean we leak descriptors -- keep reporting it.
+    /// RUST-R1/R2: one blocked data folder, seen from two files, was two
+    /// issues. `env_fault` reports the fault once; the per-file lines drop.
+    #[test]
+    fn skips_lines_env_fault_already_reported() {
+        let noted = format!(
+            "failed to persist usage-counters.json: writing ~/Library/Application Support/Headroom/config/usage-counters.json.tmp.81367.851: Operation not permitted (os error 1){}",
+            crate::env_fault::NOTE
+        );
+        assert!(skip_sentry("headroom_desktop_lib::usage_counters", &noted));
+        // The same failure outside the data folder carries no note and is
+        // still reported by its own call site.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to write ~/.claude/settings.json: Operation not permitted (os error 1)"
+        ));
+    }
+
     #[test]
     fn skips_system_wide_fd_exhaustion_but_not_our_own() {
         assert!(skip_sentry(

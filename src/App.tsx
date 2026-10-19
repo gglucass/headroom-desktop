@@ -6485,9 +6485,14 @@ export default function App() {
   );
 
   const runtimeIssues: string[] = [];
+  // Headroom cannot read or save its own data folder: everything below may be
+  // a side effect of it (an unreadable setup reads as nothing connected), so
+  // it leads. Every machine fault the backend classifies arrives here.
+  const environmentIssues = runtimeStatus?.environmentIssues ?? [];
+  runtimeIssues.push(...environmentIssues);
   // A traffic filter resetting 6767 flaps the status probe, so "runtime
   // offline" and "proxy unreachable" would come and go while the runtime is
-  // fine (RUST-NG). This names the actual cause, so it goes first.
+  // fine (RUST-NG). This names the actual cause, so it goes ahead of them.
   if (runtimeStatus?.localConnectionFilterHint) {
     runtimeIssues.push(runtimeStatus.localConnectionFilterHint);
   }
@@ -6527,6 +6532,7 @@ export default function App() {
       runtimeStatus.mcpConfigured !== false &&
       !runtimeStatus.upstreamTlsInterceptionHint &&
       !runtimeStatus.localConnectionFilterHint &&
+      environmentIssues.length === 0 &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice = platformPreviewNoticeFor(

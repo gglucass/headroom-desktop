@@ -3828,6 +3828,7 @@ impl AppState {
             .map(str::to_string),
             local_connection_filter_hint: crate::proxy_intercept::local_connection_filter_hint()
                 .map(str::to_string),
+            environment_issues: crate::env_fault::active_issues(),
             runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
@@ -5062,14 +5063,24 @@ fn persist_launch_profile(path: Option<&std::path::Path>, profile: &LaunchProfil
 /// backoff. A read error on an EXISTING file (ENFILE, EIO) says nothing about
 /// its bytes, so a caller may reset or move aside only a file it actually
 /// parsed: conflating the two lost real state in RUST-5T (see
-/// `load_setup_state`). NotFound is returned at once, unretried.
+/// `load_setup_state`). NotFound is returned at once, unretried. The outcome
+/// feeds `env_fault`; a machine fault keeps its kind and gains `env_fault::NOTE`
+/// in its message.
 pub(crate) fn read_state_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    std::fs::read(path).or_else(|err| {
+    let read = std::fs::read(path).or_else(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             return Err(err);
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
         std::fs::read(path)
+    });
+    let note = crate::env_fault::note(path, crate::env_fault::Op::Read, &read);
+    read.map_err(|err| {
+        if note.is_empty() {
+            err
+        } else {
+            std::io::Error::new(err.kind(), format!("{err}{note}"))
+        }
     })
 }
 

@@ -6,6 +6,7 @@ mod claude_cli;
 mod claude_statusline;
 mod client_adapters;
 mod device;
+mod env_fault;
 mod keychain;
 mod logging;
 mod memory_scrubber;
@@ -10614,10 +10615,15 @@ static LAST_USER_CONNECTOR_DISABLE: Mutex<Option<std::time::Instant>> = Mutex::n
 /// Nor while the clients are unwired from an unidentified 6767 holder:
 /// reconnecting would route them to that listener, and the port-reclaim
 /// rewire brings them back on its own.
+///
+/// Nor while Headroom cannot read its own data folder: the setup state then
+/// loads as the empty default, which reads as every client disconnected. The
+/// Home banner names the real cause (`env_fault`).
 fn disconnect_notice_due(last_non_booting: Option<TrayRuntimeVisual>) -> bool {
     const USER_DISABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
     last_non_booting == Some(TrayRuntimeVisual::Running)
         && !client_adapters::clients_unwired_for_port_holder()
+        && !env_fault::state_unreadable()
         && !LAST_USER_CONNECTOR_DISABLE
             .lock()
             .is_some_and(|at| at.elapsed() < USER_DISABLE_WINDOW)

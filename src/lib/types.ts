@@ -349,6 +349,9 @@ export interface RuntimeStatus {
   /** Prose hint while a traffic filter (AdGuard, antivirus web protection) is
    *  resetting connections to port 6767; cleared once the resets age out. */
   localConnectionFilterHint?: string | null;
+  /** Prose, one per machine fault on Headroom's own data folder (blocked,
+   *  read-only, full disk); empty once access works again. */
+  environmentIssues?: string[];
   runtimeUpgradeFailure?: RuntimeUpgradeFailure | null;
   rtk: {
     installed: boolean;
