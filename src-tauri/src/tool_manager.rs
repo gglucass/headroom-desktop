@@ -142,10 +142,6 @@ fn startup_stall_dump_env(stall_path: &Path) -> Vec<(&'static str, std::ffi::OsS
             "HEADROOM_STARTUP_STALL_DUMP_SECS",
             STARTUP_STALL_DUMP_SECS.to_string().into(),
         ),
-        // faulthandler has one timer: 0.41.0's hard watchdog (90s, exit=True)
-        // replaces this dump and exits a backend whose antivirus-scanned DLL
-        // load holds the GIL past 90s, where healthy binds took up to ~516s.
-        ("HEADROOM_HARD_WATCHDOG_SECS", "0".into()),
     ]
 }
 
@@ -165,6 +161,28 @@ fn process_trust_env() -> Vec<(&'static str, &'static str)> {
     } else {
         Vec::new()
     }
+}
+
+/// The bundle to hand the backend as the additive `HEADROOM_CA_BUNDLE`. Since
+/// 0.40.0 `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` REPLACE the trust store and
+/// skip process trust, where the 0.39.0 os_truststore vendor loaded them on top
+/// of the OS store. Our own bootstrap remediation tells users to set both, and
+/// a bundle holding only the company root would fail every host the company
+/// does not re-sign (off VPN, say). macOS and Windows, as process_trust_env;
+/// an explicit Headroom TLS setting is left alone. Same first-existing-file
+/// order as the wheel's `find_ca_bundle`.
+fn additive_ca_bundle(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
+    if !cfg!(any(target_os = "macos", windows))
+        || set("HEADROOM_CA_BUNDLE").is_some()
+        || set("HEADROOM_CERT_STORE").is_some()
+    {
+        return None;
+    }
+    ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]
+        .into_iter()
+        .filter_map(set)
+        .find(|path| Path::new(path).is_file())
 }
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
@@ -4133,6 +4151,23 @@ impl ToolManager {
                     // (Windows), so ask for it everywhere.
                     .env("HEADROOM_MALLOC_TRIM", "1")
                     .envs(process_trust_env())
+                    // Since 0.40.0 (#3852) a non-loopback HEADROOM_HOST with no
+                    // proxy token exits the backend at startup; 0.39.0 only
+                    // warned. Users who exported it for the OSS proxy (the
+                    // 0.0.0.0 orphans RUST-ED reclaims) would get no backend.
+                    // The intercept is the front door, so the backend stays on
+                    // loopback. Env, not --host: the `-m headroom.proxy.server`
+                    // fallback lets HEADROOM_HOST override its --host.
+                    .env("HEADROOM_HOST", "127.0.0.1")
+                    // 0.40.0's hard watchdog (#3180) exits the backend when one
+                    // native call holds the GIL for 90s. Its faulthandler timer
+                    // waits on the wall clock on our Linux Python (no
+                    // sem_clockwait) while its heartbeat sleeps on the monotonic
+                    // one, so a suspend past 90s can fire it on resume; on
+                    // Windows an antivirus-scanned DLL load held the GIL longer
+                    // in backends that bound healthy at ~516s. 0.39.0 had none,
+                    // and a hung backend is the desktop watchdog's to restart.
+                    .env("HEADROOM_HARD_WATCHDOG_SECS", "0")
                     // Wheels since 0.39.0 refuse every x-headroom-base-url
                     // upstream (Grok, OpenCode) on a proxy route, and httpx
                     // takes the macOS/Windows system proxy settings, so both
@@ -4418,6 +4453,12 @@ impl ToolManager {
                 // there if a crash ever shows up past the port opening.
                 if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
                     command.env("HEADROOM_DISABLE_KOMPRESS", "1");
+                }
+                if let Some(bundle) = additive_ca_bundle(|name| std::env::var(name).ok()) {
+                    command
+                        .env("HEADROOM_CA_BUNDLE", bundle)
+                        .env_remove("SSL_CERT_FILE")
+                        .env_remove("REQUESTS_CA_BUNDLE");
                 }
                 command.envs(startup_stall_dump_env(&stall_path));
                 // Windows: AV/Defender briefly holds the just-installed (or
@@ -18011,14 +18052,6 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
     fn startup_stall_dump_arms_only_on_windows_and_only_before_the_kill() {
         let env = super::startup_stall_dump_env(Path::new("startup-stall.txt"));
         assert_eq!(env.is_empty(), !cfg!(windows), "{env:?}");
-        // The wheel's hard watchdog shares faulthandler's one timer and would
-        // replace this dump with an exit at 90s.
-        assert_eq!(
-            env.iter()
-                .any(|(k, v)| *k == "HEADROOM_HARD_WATCHDOG_SECS" && v == "0"),
-            cfg!(windows),
-            "{env:?}"
-        );
         // Not before the Windows loop's real end: a backend that binds late
         // but healthy must never take the GIL-free dump.
         let ms = super::STARTUP_STALL_DUMP_SECS * 1000;
@@ -18040,6 +18073,46 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             "{env:?}"
         );
         assert_eq!(env.is_empty(), !cfg!(any(target_os = "macos", windows)));
+    }
+
+    /// A replacing bundle reaches the backend as the additive one, so the OS
+    /// store stays trusted as it was under the os_truststore vendor.
+    #[test]
+    fn replacing_ca_bundle_reaches_the_backend_as_an_additive_one() {
+        let dir = std::env::temp_dir().join(format!("headroom-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pem = dir.join("corp.pem");
+        std::fs::write(&pem, "pem").expect("pem");
+        let pem = pem.to_string_lossy().into_owned();
+        let missing = dir.join("gone.pem").to_string_lossy().into_owned();
+        let bundle = |vars: &[(&str, &str)]| {
+            super::additive_ca_bundle(|name| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        let mapped = cfg!(any(target_os = "macos", windows)).then(|| pem.clone());
+
+        assert_eq!(bundle(&[("SSL_CERT_FILE", &pem)]), mapped);
+        assert_eq!(bundle(&[("REQUESTS_CA_BUNDLE", &pem)]), mapped);
+        // A missing file replaces nothing in the wheel either.
+        assert_eq!(
+            bundle(&[("SSL_CERT_FILE", &missing), ("REQUESTS_CA_BUNDLE", &pem)]),
+            mapped
+        );
+        assert_eq!(bundle(&[("SSL_CERT_FILE", &missing)]), None);
+        assert_eq!(bundle(&[]), None);
+        // The user's own Headroom TLS setting wins.
+        assert_eq!(
+            bundle(&[("SSL_CERT_FILE", &pem), ("HEADROOM_CA_BUNDLE", &pem)]),
+            None
+        );
+        assert_eq!(
+            bundle(&[("SSL_CERT_FILE", &pem), ("HEADROOM_CERT_STORE", "bundled")]),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RUST-P1: a Windows backend that printed its banner and nothing else
