@@ -1102,7 +1102,7 @@ function tipPrompt(event: TipEvent): string | null {
   return [
     `My Claude Code sessions in this project start at about ${Math.round(event.contextTokens / 1000)}k tokens before my first prompt, and every turn re-sends them. Find what loads at session start and cut it, without losing anything I rely on.`,
     "1. List what loads and roughly what each costs. Most of it is in your own context: the CLAUDE.md, CLAUDE.local.md and memory files and the files they @-import, the skills list, MCP tool names and server instructions, and hook output. Check ~/.claude/settings.json, .claude/settings.json and .mcp.json for where each comes from.",
-    "2. Propose cuts, biggest first: move rule sets only one kind of task needs into a doc or a skill, with one line in CLAUDE.md saying when to read it; delete rules that repeat what the code or your defaults already do; name the MCP servers, plugins and skills this project never uses.",
+    "2. Propose cuts, biggest first: move rule sets only one kind of task needs into a doc or a skill, with one line in CLAUDE.md saying when to read it; delete rules that repeat what the code or your defaults already do; name the MCP servers, plugins and skills this project never uses, and how to switch each off for this project only without removing it elsewhere.",
     "3. Show me the plan with the tokens each cut saves, and wait for my OK before changing anything."
   ].join("\n\n");
 }
