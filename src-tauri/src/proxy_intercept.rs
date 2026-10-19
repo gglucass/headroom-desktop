@@ -300,18 +300,22 @@ const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 /// (5xx is not captured). 0 = never seen.
 static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
-const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point SSL_CERT_FILE at your organization's CA bundle and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
+const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point HEADROOM_CA_BUNDLE at your organization's root certificate and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
 
 /// True when an upstream error body is the backend's own connection failure on
 /// certificate verification (Python ssl's `CERTIFICATE_VERIFY_FAILED`, or the
 /// self-signed-chain reason it carries). Same signals `classify_bootstrap_failure`
 /// keys on for the install path. Substring match: the body is SSE for Claude
-/// (`event: error\ndata: {...}`) and JSON for Codex.
+/// (`event: error\ndata: {...}`) and JSON for Codex. Since wheel 0.40.0 (#3851)
+/// the body no longer carries the exception text, only `tls_diagnostics`'
+/// sentence for a certificate it could not verify; its bare `upstream_tls_error`
+/// code also covers handshake failures that are not inspection.
 fn is_tls_interception_error(body: &[u8]) -> bool {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
     }
-    contains(body, b"CERTIFICATE_VERIFY_FAILED")
+    contains(body, b"could not verify the TLS certificate")
+        || contains(body, b"CERTIFICATE_VERIFY_FAILED")
         || contains(body, b"self-signed certificate in certificate chain")
         || contains(body, b"self signed certificate in certificate chain")
 }
@@ -3241,12 +3245,18 @@ fn backend_could_not_reach_provider(body: &[u8]) -> bool {
 }
 
 /// The `type`/`code` of every 5xx error object the backend writes on the
-/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`).
+/// Responses and passthrough paths (wheel `handlers/openai.py`; since 0.40.0's
+/// #3851 the codes come from `public_errors`, whose `internal_error` replaced
+/// `backend_error`).
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
     "connection_error",
     "upstream_protocol_error",
+    "upstream_unreachable",
+    "upstream_timeout",
+    "upstream_tls_error",
+    "internal_error",
 ];
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
@@ -7436,6 +7446,9 @@ mod tests {
         for body in [
             &br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#[..],
             br#"{"error":{"type":"api_error","code":"backend_error","message":"x"}}"#,
+            // Wheel 0.41.0's public_errors bodies.
+            br#"{"error":{"message":"The proxy could not complete the request.","type":"api_error","code":"internal_error"}}"#,
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API. Headroom could not verify the TLS certificate for chatgpt.com (unable to get local issuer certificate).","type":"connection_error","code":"upstream_tls_error"}}"#,
         ] {
             assert_eq!(
                 codex_prompt_failed(Some(502), false, false, body),
@@ -7770,6 +7783,15 @@ mod tests {
         assert!(is_tls_interception_error(
             br#"{"error":{"message":"self signed certificate in certificate chain"}}"#
         ));
+        // Wheel 0.41.0: public_errors' sentence plus tls_diagnostics' hint, no
+        // exception text, and the usual Zscaler reason.
+        assert!(is_tls_interception_error(
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API. Headroom could not verify the TLS certificate for api.anthropic.com (unable to get local issuer certificate).","type":"connection_error","code":"upstream_tls_error"}}"#
+        ));
+        // The same code without the hint is a handshake failure, not inspection.
+        assert!(!is_tls_interception_error(
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API.","type":"connection_error","code":"upstream_tls_error"}}"#
+        ));
         // A provider-side 502 stays a transient.
         assert!(!is_tls_interception_error(b"<html>502 Bad Gateway</html>"));
         assert!(!is_tls_interception_error(b""));
@@ -7780,7 +7802,7 @@ mod tests {
             super::now_epoch_secs(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("SSL_CERT_FILE")));
+        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("HEADROOM_CA_BUNDLE")));
         super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(
             super::now_epoch_secs() - super::UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS - 1,
             std::sync::atomic::Ordering::Relaxed,

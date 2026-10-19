@@ -1,7 +1,8 @@
 """Offline checks for the desktop cache-integrity observer; no Sentry/provider calls.
 
 Run with managed Python and --sitecustomize pointing to the candidate injection.
---broken-lineage disables the repair to verify detection of the original defect.
+--broken-lineage disables the wheel's transient-system lineage (HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0,
+native since 0.41.0) to verify detection of the original defect.
 """
 
 import argparse
@@ -45,7 +46,10 @@ def main():
         return cost.build_prefix_cache_stats(metrics, None)["desktop_integrity"]
 
     def resolve(store, messages, affinity="same"):
-        return store.resolve_tracker("session", "anthropic", messages, affinity)
+        # cache_ttl_seconds as the 0.41.0 Anthropic handler passes it: a wrapper
+        # without it raised TypeError on every Anthropic request.
+        return store.resolve_tracker("session", "anthropic", messages, affinity,
+                                     cache_ttl_seconds=3600)
 
     def seeded(floor=4):
         store = pt.SessionTrackerStore()
@@ -148,7 +152,7 @@ def main():
     print("PASS: concurrent contexts isolated; observer failure does not affect response state")
 
     from headroom.proxy import server
-    assert server._build_prefix_cache_stats(metrics, None)["desktop_integrity"] == stats()
+    assert server.build_prefix_cache_stats(metrics, None)["desktop_integrity"] == stats()
     print("PASS: the server's /stats helper exposes the same diagnostic snapshot")
 
     if args.capture:
