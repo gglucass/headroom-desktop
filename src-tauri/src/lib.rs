@@ -4252,7 +4252,7 @@ pub(crate) fn is_disk_full_signal(text: &str) -> bool {
         // Windows ERROR_DISK_FULL from our own downloads and unpacking. The code
         // is locale-independent; on Linux errno 112 is EHOSTDOWN, hence the gate.
         || lower.contains("not enough space on the disk")
-        || (cfg!(windows) && lower.contains("os error 112"))
+        || (cfg!(windows) && lower.contains("(os error 112)"))
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because

@@ -106,7 +106,7 @@ fn is_transient_transport_error(msg: &str) -> bool {
 // itself once the user clears the disk.
 fn is_disk_full(msg: &str) -> bool {
     msg.contains("No space left on device") // unix ENOSPC
-        || (cfg!(windows) && msg.contains("os error 112")) // Windows ERROR_DISK_FULL
+        || (cfg!(windows) && msg.contains("(os error 112)")) // Windows ERROR_DISK_FULL, not 1120-1129
 }
 
 // Non-2xx response from the update endpoint. Most commonly a transient 5xx

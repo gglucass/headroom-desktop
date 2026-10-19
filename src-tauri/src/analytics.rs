@@ -627,6 +627,11 @@ mod tests {
         "bootstrap_failed",
         "bootstrap_skipped",
         "bootstrap_started",
+        // Install milestones (trackInstallMilestoneOnce), never ingested.
+        "claude_code_detected",
+        "first_optimized_request",
+        "first_savings_recorded",
+        "optimization_enabled",
         "client_setup_disabled",
         "client_unrouted_detected",
         "first_savings_notification_shown",
@@ -670,7 +675,11 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            for call in ["track_event(", "trackAnalyticsEvent("] {
+            for call in [
+                "track_event(",
+                "trackAnalyticsEvent(",
+                "trackInstallMilestoneOnce(",
+            ] {
                 for (at, _) in text.match_indices(call) {
                     let args = &text[at + call.len()..];
                     // The name is the first literal before the first `)`.
