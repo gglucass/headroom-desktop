@@ -249,12 +249,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // The 10013 unwire is reported by the same retry's once-per-error
-    // `proxy_intercept_bind_failed` capture (RUST-EQ), whose `probe` extra
-    // tells a reserved range from another account's listener; bridged, the
-    // warn filed every such host a second time as RUST-RC.
+    // Both unwires are reported by the same retry's once-per-error
+    // `proxy_intercept_bind_failed` capture: the 10013 one by RUST-EQ, whose
+    // `probe` extra tells a reserved range from another account's listener,
+    // and the stranger-holder one by the foreign/unidentified capture (RUST-EE,
+    // RUST-KD; Paseo is skipped there on purpose). Bridged, the warns filed
+    // every such host a second time as RUST-RC and RUST-KF.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
-        && msg.starts_with("[proxy_intercept] unwired clients: Windows refused port")
+        && msg.starts_with("[proxy_intercept] unwired clients")
     {
         return true;
     }
@@ -1260,6 +1262,12 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
             "[proxy_intercept] unwired clients: Windows refused port 6767"
+        ));
+        // And the stranger-holder unwire, which fires beside the foreign
+        // capture (RUST-KF beside RUST-EE).
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] unwired clients from the holder of port 6767"
         ));
         // The rule is scoped to the retry marker, not blanket-by-target: a
         // proxy_intercept warning that fires once and has no emit-site capture

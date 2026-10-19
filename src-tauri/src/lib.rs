@@ -2433,6 +2433,10 @@ enum BootstrapFailureKind {
     /// a vendored wheel that does not cover this machine. Never tell the user
     /// to install Xcode: needing a compiler at all is our bug, not their setup.
     SourceBuild,
+    /// The disk filled up mid-install. It fell through to `Other`, whose message
+    /// sends the user to their network, and `capture_bootstrap_failure` skips
+    /// Sentry for it, so nothing else ever named the cause (support 2026-10-19).
+    DiskFull,
     Other,
 }
 
@@ -2450,6 +2454,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::AppControlBlocked => "app_control_blocked",
             BootstrapFailureKind::SecuritySoftware => "security_software",
             BootstrapFailureKind::SourceBuild => "build",
+            BootstrapFailureKind::DiskFull => "disk_full",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -2526,6 +2531,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::AppControlBlocked
     } else if is_security_software_removal_signal(&haystack) {
         BootstrapFailureKind::SecuritySoftware
+    } else if is_disk_full_signal(&haystack) {
+        BootstrapFailureKind::DiskFull
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -2882,6 +2889,11 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              your system. Nothing is missing on your machine - this is a bug in \
              the version you're running. Click Check for updates to get a newer \
              Headroom. If no update is offered, use Contact support below."
+        }
+        BootstrapFailureKind::DiskFull => {
+            "Installation failed: your disk is full, so Headroom couldn't finish \
+             saving the files it needs. Free up a few gigabytes of disk space, then \
+             click Try again."
         }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
@@ -4236,6 +4248,10 @@ pub(crate) fn is_disk_full_signal(text: &str) -> bool {
         || lower.contains("errno 28")
         || lower.contains("enospc")
         || lower.contains("disk full")
+        // Windows ERROR_DISK_FULL from our own downloads and unpacking. The code
+        // is locale-independent; on Linux errno 112 is EHOSTDOWN, hence the gate.
+        || lower.contains("not enough space on the disk")
+        || (cfg!(windows) && lower.contains("os error 112"))
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because
@@ -14936,6 +14952,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_names_a_full_disk() {
+        let pip: anyhow::Error = make_command_failure(
+            "WARNING: Retrying after connection timed out\n\
+             ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device",
+        )
+        .into();
+        assert_eq!(classify_bootstrap_failure(&pip).as_str(), "disk_full");
+        let ours = anyhow::anyhow!(
+            "extract python runtime: There is not enough space on the disk. (os error 112)"
+        );
+        assert_eq!(classify_bootstrap_failure(&ours).as_str(), "disk_full");
+        let message = user_message_for(BootstrapFailureKind::DiskFull);
+        assert!(
+            message.contains("disk space") && message.contains("Try again"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn security_software_message_offers_a_retry_and_the_quarantine() {
         let message = user_message_for(BootstrapFailureKind::SecuritySoftware);
         assert!(message.contains("Try again"), "{message}");
@@ -15017,6 +15052,7 @@ mod tests {
             BootstrapFailureKind::AppControlBlocked,
             BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
+            BootstrapFailureKind::DiskFull,
         ] {
             let msg = user_message_for(kind).to_ascii_lowercase();
             assert!(
