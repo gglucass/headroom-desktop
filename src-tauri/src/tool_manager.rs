@@ -9105,6 +9105,28 @@ impl ToolManager {
                 .downcast_ref::<CommandFailure>()
                 .is_some_and(|failure| mcp_helper_failed_on_user_config(&failure.stderr));
             if user_config {
+                // The registrars parse stricter than the clients (a TOML 1.1
+                // trailing comma, JSONC comments): some of these configs are
+                // valid and the addon silently never registers. One grouped
+                // warning (sanitize_event: once per host per day) keeps the
+                // count visible; the log lines stay out of Sentry.
+                let line = err
+                    .downcast_ref::<CommandFailure>()
+                    .and_then(|failure| failure.stderr.lines().rev().find(|l| !l.trim().is_empty()))
+                    .unwrap_or_default()
+                    .to_string();
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_fingerprint(Some(&["mcp-helper-user-config"]));
+                        scope.set_extra("registrar_line", line.into());
+                    },
+                    || {
+                        sentry::capture_message(
+                            "MCP helper: a client config the registrar cannot parse",
+                            sentry::Level::Warning,
+                        )
+                    },
+                );
                 err.context(crate::client_adapters::UNPARSEABLE_SETTINGS)
             } else {
                 err
