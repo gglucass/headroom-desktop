@@ -1467,6 +1467,10 @@ fn serve(
                 // above it, it is stuck and worth saying so.
                 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
                 let launched_at = tokio::time::Instant::now();
+                // DRAIN_GRACE runs from the last time anything held the port
+                // live, not from launch: RUST-JY's wslrelay.exe let go 38h in
+                // and its seconds-old TIME_WAIT was reported as stuck.
+                let mut listener_seen_at = launched_at;
                 let mut consecutive_failures = 0usize;
                 // Set only by the `Draining` verdict, which is the one case
                 // where nothing is listening and the port is held purely by
@@ -1504,6 +1508,9 @@ fn serve(
                             // wait for it to go away. Anything else, HTTP or
                             // not, goes through the diagnosis below.
                             let probe = probe_port(INTERCEPT_PORT).await;
+                            if probe != PortProbe::Refused {
+                                listener_seen_at = tokio::time::Instant::now();
+                            }
                             let twin = held_by_our_other_window(probe, || {
                                 crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
                             });
@@ -1689,10 +1696,13 @@ fn serve(
                                 let occupant =
                                     crate::tool_manager::listener_process(INTERCEPT_PORT);
                                 let key = os_error_key(&e);
+                                if occupant.is_some() {
+                                    listener_seen_at = tokio::time::Instant::now();
+                                }
                                 let verdict = classify_held_port(
                                     occupant,
                                     probe,
-                                    launched_at.elapsed(),
+                                    listener_seen_at.elapsed(),
                                     DRAIN_GRACE,
                                 );
                                 // Nothing listening means the only thing
