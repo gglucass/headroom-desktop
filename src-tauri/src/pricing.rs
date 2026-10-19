@@ -380,6 +380,20 @@ fn intermediary_failure(action: &str, response: &reqwest::blocking::Response) ->
     ))
 }
 
+/// A 401 from headroom-web ends the session. A proxy or firewall's 401 says
+/// nothing about it, so the token stays and the user hears that their network
+/// answered; clearing it signed users out on every launch behind such a proxy.
+fn end_session_on_401(action: &str, response: &reqwest::blocking::Response) -> Result<(), String> {
+    if response.status().as_u16() != 401 {
+        return Ok(());
+    }
+    if let Some(msg) = intermediary_failure(action, response) {
+        return Err(msg);
+    }
+    clear_session_token()?;
+    Err("Your Headroom session expired. Sign in again.".into())
+}
+
 fn is_json_response(response: &reqwest::blocking::Response) -> bool {
     response
         .headers()
@@ -1865,10 +1879,7 @@ pub(crate) fn activate_account_with_retry_backoff(
     let payload = serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved });
     let response = send_activation_request(&identity, &token, base_url, &payload, retry_backoff)?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("activate Headroom desktop access", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2186,10 +2197,7 @@ pub(crate) fn create_checkout_session_with_base_url(
         .send()
         .map_err(|err| transport_failure("start checkout", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("start checkout", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2234,10 +2242,7 @@ pub(crate) fn change_subscription_plan_with_base_url(
         .send()
         .map_err(|err| transport_failure("change your plan", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("change your plan", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2266,10 +2271,7 @@ pub(crate) fn reactivate_subscription_with_base_url(base_url: &str) -> Result<()
         .send()
         .map_err(|err| transport_failure("reactivate your subscription", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("reactivate your subscription", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2301,10 +2303,7 @@ pub(crate) fn apply_referral_code_with_base_url(base_url: &str, code: &str) -> R
         .send()
         .map_err(|err| transport_failure("add your referral code", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("add your referral code", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2341,10 +2340,7 @@ pub(crate) fn get_billing_portal_url_with_base_url(
         .send()
         .map_err(|err| transport_failure("open the billing portal", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("open the billing portal", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2384,10 +2380,7 @@ pub(crate) fn submit_cancellation_intent_with_base_url(
         .send()
         .map_err(|err| transport_failure("send your note", &err))?;
 
-    if response.status().as_u16() == 401 {
-        clear_session_token()?;
-        return Err("Your Headroom session expired. Sign in again.".into());
-    }
+    end_session_on_401("send your note", &response)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -6850,6 +6843,29 @@ mod tests {
         (port, handle)
     }
 
+    /// A 401 no headroom-web layer stamped: a company proxy or firewall.
+    fn spawn_proxy_401_server() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        (port, handle)
+    }
+
+    fn stored_session_token() -> Option<String> {
+        crate::keychain::read_secret(
+            super::HEADROOM_ACCOUNT_KEYCHAIN_SERVICE,
+            super::HEADROOM_ACCOUNT_SESSION_ACCOUNT,
+        )
+        .expect("read session token")
+    }
+
     #[test]
     fn request_auth_code_decodes_headroom_web_response() {
         let body = serde_json::json!({
@@ -7774,6 +7790,26 @@ mod tests {
         drop_state(dir);
     }
 
+    /// Activation runs on every launch: a proxy's 401 must not sign the user
+    /// out each time.
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_keeps_session_on_a_proxy_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_proxy_401_server();
+        let (state, dir) = temp_app_state();
+
+        let err =
+            super::activate_account_with_base_url(&state, 0, &format!("http://127.0.0.1:{port}"))
+                .expect_err("a proxy's 401");
+        server.join().unwrap();
+        assert!(err.contains("proxy or firewall"), "{err}");
+        assert!(err.contains("activate Headroom desktop access"), "{err}");
+        assert_eq!(stored_session_token().as_deref(), Some("session-xyz"));
+
+        drop_state(dir);
+    }
+
     #[test]
     #[serial_test::serial]
     fn activate_account_requires_session_token() {
@@ -7895,6 +7931,26 @@ mod tests {
         )
         .unwrap();
         assert!(stored.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_checkout_session_keeps_session_on_a_proxy_401() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_proxy_401_server();
+
+        let err = super::create_checkout_session_with_base_url(
+            HeadroomSubscriptionTier::Pro,
+            BillingPeriod::Annual,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("a proxy's 401");
+        server.join().unwrap();
+        assert!(
+            err.contains("Could not start checkout: a proxy or firewall"),
+            "{err}"
+        );
+        assert_eq!(stored_session_token().as_deref(), Some("session-xyz"));
     }
 
     #[test]
