@@ -265,7 +265,10 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // spawn error is rare and the restart self-heals on next request), so they
     // are pure noise. The "download error" variant is NOT suppressed — it
     // carries a classified cause and is the systemic signal worth tracking.
-    if target.starts_with("headroom_desktop_lib::state")
+    // The restart variant, like the upgrade spawn warn below, is logged by
+    // `log_headroom_start_failure` in lib.rs since 8446dbf4, so it arrives
+    // under the crate root's target, not state's (RUST-RB).
+    if (target.starts_with("headroom_desktop_lib::state") || target == "headroom_desktop_lib")
         && (msg.starts_with("kompress prefetch failed")
             || msg.starts_with("kompress prefetch: restart after download failed"))
     {
@@ -316,7 +319,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // Bridged, the spawn warn grouped on its message, which embeds the venv
     // path and the prior-attempts wording, so one host filed RUST-CW and
     // RUST-CZ a minute apart with RUST-CX beside them.
-    if target.starts_with("headroom_desktop_lib::state")
+    if (target.starts_with("headroom_desktop_lib::state") || target == "headroom_desktop_lib")
         && (msg.starts_with("run_upgrade_with_ui: new proxy failed to spawn")
             || msg.starts_with("run_upgrade_with_ui: skipping boot validation"))
     {
@@ -1306,7 +1309,7 @@ mod tests {
             "kompress prefetch failed: some error"
         ));
         assert!(skip_sentry(
-            "headroom_desktop_lib::state",
+            "headroom_desktop_lib",
             "kompress prefetch: restart after download failed: boom"
         ));
     }
@@ -1646,9 +1649,10 @@ mod tests {
 
     #[test]
     fn skips_upgrade_spawn_failure_and_not_started_warns() {
-        // RUST-CZ: the spawn error, message-grouped on the venv path.
+        // RUST-CZ: the spawn error, message-grouped on the venv path. Logged
+        // from lib.rs's `log_headroom_start_failure` (RUST-RB).
         assert!(skip_sentry(
-            "headroom_desktop_lib::state",
+            "headroom_desktop_lib",
             "run_upgrade_with_ui: new proxy failed to spawn: unable to keep headroom running in \
              background (prior attempts: headroom.exe: exited with status exit code: 1 before \
              opening port 6768): exited with status exit code: 1 before opening port 6768 \
