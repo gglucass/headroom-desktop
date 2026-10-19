@@ -169,20 +169,20 @@ fn process_trust_env() -> Vec<(&'static str, &'static str)> {
 /// of the OS store. Our own bootstrap remediation tells users to set both, and
 /// a bundle holding only the company root would fail every host the company
 /// does not re-sign (off VPN, say). macOS and Windows, as process_trust_env;
-/// an explicit Headroom TLS setting is left alone. Same first-existing-file
-/// order as the wheel's `find_ca_bundle`.
+/// HEADROOM_CERT_STORE is left alone. A user's own HEADROOM_CA_BUNDLE is kept,
+/// but the replacing vars still go: the wheel checks them first and would
+/// never load it. Same first-existing-file order as the wheel's
+/// `find_ca_bundle`.
 fn additive_ca_bundle(var: impl Fn(&str) -> Option<String>) -> Option<String> {
     let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
-    if !cfg!(any(target_os = "macos", windows))
-        || set("HEADROOM_CA_BUNDLE").is_some()
-        || set("HEADROOM_CERT_STORE").is_some()
-    {
+    if !cfg!(any(target_os = "macos", windows)) || set("HEADROOM_CERT_STORE").is_some() {
         return None;
     }
-    ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]
+    let replacing = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]
         .into_iter()
         .filter_map(set)
-        .find(|path| Path::new(path).is_file())
+        .find(|path| Path::new(path).is_file())?;
+    Some(set("HEADROOM_CA_BUNDLE").unwrap_or(replacing))
 }
 
 const HEADROOM_REQUIREMENTS_LOCK: &str = include_str!("../python/headroom-requirements.lock");
@@ -18187,11 +18187,14 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         );
         assert_eq!(bundle(&[("SSL_CERT_FILE", &missing)]), None);
         assert_eq!(bundle(&[]), None);
-        // The user's own Headroom TLS setting wins.
+        // The user's own additive bundle wins, and the replacing var still
+        // goes: left set, the wheel would load only it.
+        let own = cfg!(any(target_os = "macos", windows)).then(|| "own.pem".to_string());
         assert_eq!(
-            bundle(&[("SSL_CERT_FILE", &pem), ("HEADROOM_CA_BUNDLE", &pem)]),
-            None
+            bundle(&[("SSL_CERT_FILE", &pem), ("HEADROOM_CA_BUNDLE", "own.pem")]),
+            own
         );
+        assert_eq!(bundle(&[("HEADROOM_CA_BUNDLE", "own.pem")]), None);
         assert_eq!(
             bundle(&[("SSL_CERT_FILE", &pem), ("HEADROOM_CERT_STORE", "bundled")]),
             None
