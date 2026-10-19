@@ -8256,12 +8256,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             );
         match (cache_write, uncached) {
             (None, None) => None,
-            (write, uncached) => Some(
-                write
-                    .unwrap_or(0)
-                    .saturating_add(uncached.unwrap_or(0))
-                    .saturating_sub(openai_inferred_write_duplicate(&root)),
-            ),
+            (write, uncached) => Some(write.unwrap_or(0).saturating_add(uncached.unwrap_or(0))),
         }
     };
     let total_after_compression = value_at_path_u64(&root, &["tokens", "input"])
@@ -8644,21 +8639,6 @@ fn parse_model_rates(root: &Value) -> Vec<crate::models::ModelSavingsRate> {
             .then(b.requests.cmp(&a.requests))
     });
     rates
-}
-
-/// Codex's new input that `prefix_cache.totals` counts twice. OpenAI bills no
-/// cache writes, so the wheel infers one equal to the uncached input, and on
-/// /v1/responses (Codex) reports that same input as uncached too (0.41.0,
-/// `cache_inferred`): a true 50% Codex rate read as 33%. OpenAI's new input is
-/// one of the two, so the smaller is the duplicate. Exact only while every
-/// OpenAI write is inferred: upstream #4237 (after 0.41.0) reports real
-/// Responses writes, disjoint from uncached, which this would undercount
-/// (`codex_new_input_correction_is_pinned` fails on the bump to say so).
-fn openai_inferred_write_duplicate(root: &Value) -> u64 {
-    let openai = |field| {
-        value_at_path_u64(root, &["prefix_cache", "by_provider", "openai", field]).unwrap_or(0)
-    };
-    openai("cache_write_tokens").min(openai("uncached_input_tokens"))
 }
 
 fn value_at_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
@@ -15396,31 +15376,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_new_input_is_counted_once_in_the_denominator() {
-        // Wheel 0.41.0 on /v1/responses: Codex's 2,000 new tokens appear as both
-        // an inferred write and uncached input; Anthropic's buckets are disjoint.
-        let parsed = parse_headroom_stats_from_json(
-            r#"{
-                "prefix_cache": {
-                    "totals": { "cache_write_tokens": 9000, "uncached_input_tokens": 2100 },
-                    "by_provider": {
-                        "anthropic": { "cache_write_tokens": 7000, "uncached_input_tokens": 100 },
-                        "openai": { "cache_write_tokens": 2000, "uncached_input_tokens": 2000 }
-                    }
-                }
-            }"#,
-        )
-        .expect("parsed stats");
-        assert_eq!(parsed.session_total_tokens_sent, Some(9_100));
-    }
-
-    #[test]
     fn codex_new_input_correction_is_pinned() {
-        // openai_inferred_write_duplicate (here) and TransformationFeedEvent::
-        // new_input (models.rs) treat every OpenAI write as inferred, true of
-        // 0.41.0. From #4237 on, Responses usage can carry a real write that
-        // is disjoint from uncached: count those by the wheel's cache_inferred
-        // flag, or drop the correction if the new wheel sums only real writes.
+        // TransformationFeedEvent::new_input (models.rs) counts an OpenAI row's
+        // write and uncached input once (their max): right on 0.41.0, where a
+        // write is either inferred (equal to uncached, or alone) or a reported
+        // 0. A wheel that reports real OpenAI writes beside uncached input
+        // (after #4237) needs the sum there; upstream #4285 also stops /stats
+        // totals counting inferred writes twice, so recheck both on the bump.
         assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.41.0");
     }
 
