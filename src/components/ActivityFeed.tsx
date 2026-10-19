@@ -977,9 +977,61 @@ function TrainSuggestionRow({
   );
 }
 
+// "Wednesday 14:00": within a week, the weekday says which day.
+function weekdayTime(iso: string): string {
+  return new Date(iso).toLocaleString(undefined, {
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
 function tipCopy(event: TipEvent): ReactNode {
   const size = `${Math.round(event.contextTokens / 1000)}k`;
   switch (event.kind) {
+    case "weekly_pace":
+      if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
+      return (
+        <>
+          You've used {Math.round(event.usedPercent)}% of your weekly Claude limit, which resets{" "}
+          {weekdayTime(event.resetsAt)}. At this pace you'll reach it around{" "}
+          {weekdayTime(event.limitAt)}. Long sessions use the most: <code>/clear</code> between
+          unrelated tasks and <code>/compact</code> at natural breaks.
+        </>
+      );
+    case "extra_usage_cache":
+      return (
+        <>
+          Claude Code is running on extra usage, billed per token. While it is, the prompt cache
+          lasts 5 minutes instead of an hour, so a longer pause re-sends the whole conversation at
+          the cache-write price. Run <code>/compact</code> before stepping away.
+        </>
+      );
+    case "auto_continue":
+      return (
+        <>
+          Claude Code hit your plan's usage limit. Turn on "Continue automatically at usage limit"
+          in <code>/config</code> and it waits for the reset and resumes the task by itself.
+        </>
+      );
+    case "idle_break":
+      return (
+        <>
+          A Claude Code session came back after more than an hour and re-sent its whole {size}{" "}
+          conversation at the cache-write price: the prompt cache only lasts an hour. Before a long
+          break, run <code>/compact</code> so the session you come back to is small.
+        </>
+      );
+    case "heavy_startup":
+      if (!event.project) return null;
+      return (
+        <>
+          Sessions in {event.project} start at {size} tokens before your first prompt, and every
+          turn re-sends them. Run <code>/context</code> in a new session to see what loads, and move
+          rarely needed CLAUDE.md sections into skills or path-scoped rules, which load only when
+          needed.
+        </>
+      );
     case "compact_window":
       return (
         <>

@@ -78,6 +78,50 @@ describe("tips", () => {
     expect(screen.getByText("/model claude-fable-5-1")).toBeTruthy();
   });
 
+  it("words the signal tips from their own fields", () => {
+    const { unmount } = render(
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          tiles: {
+            ...emptyTiles,
+            tip: {
+              kind: "heavy_startup",
+              observedAt: "2026-10-19T10:00:00Z",
+              contextTokens: 69_499,
+              project: "headroom-desktop",
+              seen: false
+            }
+          }
+        }}
+        error={null}
+      />
+    );
+    expect(screen.getByText(/Sessions in headroom-desktop start at 69k tokens/)).toBeTruthy();
+    unmount();
+    render(
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          tiles: {
+            ...emptyTiles,
+            tip: {
+              kind: "weekly_pace",
+              observedAt: "2026-10-19T10:00:00Z",
+              contextTokens: 0,
+              usedPercent: 78.4,
+              resetsAt: "2026-10-23T09:00:00Z",
+              limitAt: "2026-10-21T15:00:00Z",
+              seen: false
+            }
+          }
+        }}
+        error={null}
+      />
+    );
+    expect(screen.getByText(/used 78% of your weekly Claude limit/)).toBeTruthy();
+  });
+
   it("renders nothing without a tip", () => {
     render(<ActivityFeed feed={baseFeed} error={null} />);
     expect(screen.queryByText("/autocompact 400k")).toBeNull();

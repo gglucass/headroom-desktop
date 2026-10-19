@@ -2569,6 +2569,46 @@ impl AppState {
         events
     }
 
+    /// Feed the tips what the intercept, plan usage and transcripts show.
+    /// Runs every observer tick before the feed batch (see observe_signal_tips).
+    pub fn observe_tip_signals(&self) {
+        // The transcript scan reads up to 10 session files per project: at most
+        // every 6h, and never once the tip has fired.
+        static LAST_STARTUP_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
+        const STARTUP_SCAN_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+        let observed = crate::tip_signals::observed();
+        let heavy_startup = if self
+            .activity_facts
+            .lock()
+            .tip_fired(crate::models::TipKind::HeavyStartup)
+        {
+            None
+        } else {
+            let mut last = LAST_STARTUP_SCAN.lock();
+            if last.is_some_and(|at| at.elapsed() < STARTUP_SCAN_EVERY) {
+                None
+            } else {
+                *last = Some(Instant::now());
+                drop(last);
+                heavy_startup_project(std::time::SystemTime::now())
+            }
+        };
+        let signals = crate::activity_facts::TipSignals {
+            extra_usage_in_use: observed.extra_usage_in_use,
+            usage_limit_hit: observed.usage_limit_hit,
+            auto_continue_on: observed.usage_limit_hit && claude_auto_continue_on(),
+            idle_resume_at: observed
+                .idle_resume_at_ms
+                .and_then(DateTime::from_timestamp_millis),
+            weekly: crate::claude_statusline::plan_usage().and_then(|usage| usage.seven_day),
+            heavy_startup,
+        };
+        let mut facts = self.activity_facts.lock();
+        facts.observe_signal_tips(&signals, Utc::now());
+        let _ = facts.save_if_dirty();
+    }
+
     /// Drives the unread dot on the Activity tab and the menu bar icon.
     pub fn tip_unseen(&self) -> bool {
         self.activity_facts.lock().tip_unseen()
@@ -4804,6 +4844,102 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
             .ok()
     });
     files
+}
+
+/// Claude Code's own setting to wait out a usage limit and resume the task.
+fn claude_auto_continue_on() -> bool {
+    std::fs::read(user_home_dir().join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|settings| settings["autoContinueAtUsageLimit"] == Value::Bool(true))
+}
+
+/// The project whose recent interactive Claude Code sessions start heaviest
+/// before the first prompt, as (folder name, median tokens), when that median
+/// reaches `HEAVY_STARTUP_MIN_TOKENS` over at least 5 sessions of the last 7
+/// days. Reads each session's first usage line; never content.
+fn heavy_startup_project(now: std::time::SystemTime) -> Option<(String, u64)> {
+    const RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
+    let cutoff = now.checked_sub(RECENT)?;
+    let mut heaviest: Option<(String, u64)> = None;
+    for dir in std::fs::read_dir(claude_projects_dir()).ok()?.flatten() {
+        let recent: Vec<PathBuf> = list_session_jsonl_files(&dir.path())
+            .into_iter()
+            .filter(|file| {
+                std::fs::metadata(file)
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|modified| modified >= cutoff)
+            })
+            .collect();
+        // Oldest first, so the newest ten.
+        let starts: Vec<(String, u64)> = recent
+            .iter()
+            .rev()
+            .take(10)
+            .filter_map(|file| session_start_tokens(file))
+            .collect();
+        if starts.len() < 5 {
+            continue;
+        }
+        let mut tokens: Vec<u64> = starts.iter().map(|(_, tokens)| *tokens).collect();
+        tokens.sort_unstable();
+        let median = tokens[tokens.len() / 2];
+        if median >= crate::activity_facts::HEAVY_STARTUP_MIN_TOKENS
+            && heaviest.as_ref().is_none_or(|(_, best)| median > *best)
+        {
+            let name = Path::new(&starts[0].0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&starts[0].0)
+                .to_string();
+            heaviest = Some((name, median));
+        }
+    }
+    heaviest
+}
+
+/// (cwd, prompt tokens) of a session's first main-thread reply: what Claude
+/// Code loads before work starts, plus the first prompt (the median absorbs a
+/// long one). None for headless runs (`claude -p`, the SDK, Headroom's own
+/// learn scans), which are not the user's sessions.
+fn session_start_tokens(path: &Path) -> Option<(String, u64)> {
+    use std::io::{BufRead, BufReader, Read};
+    let reader = BufReader::new(std::fs::File::open(path).ok()?.take(4 * 1024 * 1024));
+    for line in reader.split(b'\n').take(400) {
+        let line = line.ok()?;
+        const NEEDLE: &[u8] = b"\"usage\"";
+        if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if entry["type"] != "assistant" || entry["isSidechain"] == Value::Bool(true) {
+            continue;
+        }
+        if entry["entrypoint"]
+            .as_str()
+            .is_none_or(|e| e.starts_with("sdk"))
+        {
+            return None;
+        }
+        let usage = &entry["message"]["usage"];
+        let tokens = [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .filter_map(|field| usage[field].as_u64())
+        .sum::<u64>();
+        return (tokens > 0).then(|| {
+            (
+                entry["cwd"].as_str().unwrap_or_default().to_string(),
+                tokens,
+            )
+        });
+    }
+    None
 }
 
 /// On Windows, `std::fs::canonicalize` returns extended-length paths
@@ -11175,6 +11311,31 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_start_reads_the_first_interactive_reply() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, lines: &[&str]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let reply = |entrypoint: &str, sidechain: bool, read: u64| {
+            format!(
+                r#"{{"type":"assistant","isSidechain":{sidechain},"entrypoint":"{entrypoint}","cwd":"/w/proj","message":{{"usage":{{"input_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":{read}}}}}}}"#
+            )
+        };
+        let user = r#"{"type":"user","message":{"content":"hi"}}"#;
+        let side = reply("cli", true, 1);
+        let main = reply("claude-vscode", false, 60_000);
+        let interactive = write("a.jsonl", &[user, &side, &main, &reply("cli", false, 9)]);
+        assert_eq!(
+            super::session_start_tokens(&interactive),
+            Some(("/w/proj".to_string(), 61_005))
+        );
+        let headless = write("b.jsonl", &[user, &reply("sdk-cli", false, 60_000)]);
+        assert_eq!(super::session_start_tokens(&headless), None);
+    }
+
     use std::fs;
     use std::path::PathBuf;
 
@@ -14072,6 +14233,7 @@ mod tests {
             turn_id: None,
             uncached_input_tokens: None,
             cache_write_tokens: None,
+            cache_read_tokens: None,
         };
 
         let first =

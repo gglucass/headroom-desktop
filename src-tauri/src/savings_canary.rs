@@ -584,6 +584,7 @@ mod tests {
             turn_id: None,
             uncached_input_tokens: None,
             cache_write_tokens: None,
+            cache_read_tokens: None,
         }
     }
 

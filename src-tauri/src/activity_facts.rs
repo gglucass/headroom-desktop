@@ -6,8 +6,9 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
-    ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, RecordEvent,
-    RecordTag, TipEvent, TipKind, TrainSuggestionEvent, TransformationFeedEvent, WeeklyRecapEvent,
+    ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, PlanWindow,
+    RecordEvent, RecordTag, TipEvent, TipKind, TrainSuggestionEvent, TransformationFeedEvent,
+    WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 
@@ -55,6 +56,54 @@ pub(crate) const HAIKU_PRICE_STEP_TOKENS: u64 = 100_000;
 // Fable 5.1 lists like Fable 5 but reads cache at $0.25 vs $1 / MTok. Cache
 // reads only dominate once a session is long, so short ones do not post it.
 pub(crate) const FABLE_TIP_MIN_CONTEXT_TOKENS: u64 = 100_000;
+// A conversation back from a break past its hour of cache that wrote at least
+// this much again. Smaller rewrites cost too little to be worth a tip.
+pub(crate) const IDLE_TIP_MIN_REWRITE_TOKENS: u64 = 100_000;
+// Weekly pace: only judged once this much of the limit is used (earlier the
+// projection swings), and only when the pace runs out half a day early or more.
+const WEEKLY_PACE_MIN_USED_PERCENT: f64 = 50.0;
+const WEEKLY_PACE_MIN_SHORTFALL_HOURS: i64 = 12;
+const WEEK_SECS: i64 = 7 * 24 * 3600;
+// A project's interactive sessions start at this median or more before the
+// first prompt. Claude Code alone starts near 19k (a heavy machine, 2026-10).
+pub(crate) const HEAVY_STARTUP_MIN_TOKENS: u64 = 50_000;
+
+/// What a tick knows beyond the feed, for the tips the feed cannot show.
+#[derive(Debug, Default, Clone)]
+pub struct TipSignals {
+    pub extra_usage_in_use: bool,
+    pub usage_limit_hit: bool,
+    /// `autoContinueAtUsageLimit` is already on in ~/.claude/settings.json.
+    pub auto_continue_on: bool,
+    pub idle_resume_at: Option<DateTime<Utc>>,
+    pub weekly: Option<PlanWindow>,
+    /// (project folder name, median session start in tokens).
+    pub heavy_startup: Option<(String, u64)>,
+}
+
+/// (used percent, reset, when this pace reaches the limit) when the weekly
+/// window runs out at least `WEEKLY_PACE_MIN_SHORTFALL_HOURS` before it resets.
+fn weekly_pace(
+    week: PlanWindow,
+    now: DateTime<Utc>,
+) -> Option<(f64, DateTime<Utc>, DateTime<Utc>)> {
+    let left = week.resets_at - now.timestamp();
+    if !(WEEKLY_PACE_MIN_USED_PERCENT..100.0).contains(&week.used_percent)
+        || !(3600..=WEEK_SECS).contains(&left)
+    {
+        return None;
+    }
+    let elapsed = (WEEK_SECS - left) as f64;
+    let limit_at = week.resets_at - WEEK_SECS + (elapsed * 100.0 / week.used_percent) as i64;
+    if limit_at > week.resets_at - WEEKLY_PACE_MIN_SHORTFALL_HOURS * 3600 {
+        return None;
+    }
+    Some((
+        week.used_percent,
+        DateTime::from_timestamp(week.resets_at, 0)?,
+        DateTime::from_timestamp(limit_at, 0)?,
+    ))
+}
 
 // The "Recent large compression" tile should actually be *large*. A pipeline
 // run that stripped nothing (tokens_saved ~ 0, savings_percent near 0) would
@@ -250,6 +299,9 @@ pub struct ActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
     last_tip: Option<TipEvent>,
+    // In memory only: the last conversation back after its cache expired,
+    // joined against the feed's rewrites (see observe_signal_tips).
+    idle_resume_at: Option<DateTime<Utc>>,
     dirty: bool,
     // Set when the file exists but could not be read. The in-memory facts
     // start empty, so saving them would overwrite the user's real history;
@@ -343,6 +395,7 @@ impl ActivityFacts {
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
             last_tip: persisted.last_tip,
+            idle_resume_at: None,
             dirty: false,
             read_failed: false,
         })
@@ -368,6 +421,7 @@ impl ActivityFacts {
             last_weekly_recap: None,
             last_train_suggestion: None,
             last_tip: None,
+            idle_resume_at: None,
             dirty: false,
             read_failed: false,
         }
@@ -406,40 +460,86 @@ impl ActivityFacts {
         }
     }
 
-    /// Post the first tip this Claude Code request qualifies for that has not
-    /// fired yet. One tip at a time: a new one waits (its condition recurs in
-    /// later traffic) until the current one has been seen.
-    fn observe_tips(&mut self, event: &TransformationFeedEvent, observed_at: DateTime<Utc>) {
-        if event.provider.as_deref() != Some("anthropic")
-            || self.last_tip.as_ref().is_some_and(|tip| !tip.seen)
-        {
+    pub fn tip_fired(&self, kind: TipKind) -> bool {
+        self.tips_fired.contains(kind.key())
+    }
+
+    /// Post the first candidate that has not fired yet. One tip at a time: a
+    /// new one waits (its condition recurs) until the current one is seen.
+    fn post_first_tip(&mut self, candidates: impl IntoIterator<Item = Option<TipEvent>>) {
+        if self.last_tip.as_ref().is_some_and(|tip| !tip.seen) {
             return;
         }
-        let model = event.model.as_deref().unwrap_or_default();
-        let tokens = event.input_tokens_optimized.unwrap_or(0);
-        let haiku = model.starts_with("claude-haiku");
-        let candidates = [
-            (model.starts_with("claude-haiku-5-5") && tokens > HAIKU_PRICE_STEP_TOKENS)
-                .then_some(TipKind::HaikuLongContext),
-            (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
-                .then_some(TipKind::FableUpgrade),
-            (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS).then_some(TipKind::CompactWindow),
-        ];
-        let Some(kind) = candidates
+        let Some(tip) = candidates
             .into_iter()
             .flatten()
-            .find(|kind| !self.tips_fired.contains(kind.key()))
+            .find(|tip| !self.tip_fired(tip.kind))
         else {
             return;
         };
-        self.tips_fired.insert(kind.key().to_string());
-        self.last_tip = Some(TipEvent {
-            kind,
-            observed_at,
-            context_tokens: tokens,
-            seen: false,
-        });
+        self.tips_fired.insert(tip.kind.key().to_string());
+        self.last_tip = Some(tip);
         self.dirty = true;
+    }
+
+    /// Tips a Claude Code request in the feed qualifies for.
+    fn observe_tips(&mut self, event: &TransformationFeedEvent, observed_at: DateTime<Utc>) {
+        if event.provider.as_deref() != Some("anthropic") {
+            return;
+        }
+        let model = event.model.as_deref().unwrap_or_default();
+        let tokens = event.context_tokens().unwrap_or(0);
+        let haiku = model.starts_with("claude-haiku");
+        // Written again rather than read from cache: what an expired prompt cache costs.
+        let rewritten = event
+            .uncached_input_tokens
+            .unwrap_or(0)
+            .saturating_add(event.cache_write_tokens.unwrap_or(0));
+        let after_idle_resume = self.idle_resume_at.is_some_and(|resumed| {
+            observed_at >= resumed - Duration::seconds(10)
+                && observed_at <= resumed + Duration::minutes(15)
+        });
+        let tip = |kind| TipEvent::new(kind, observed_at, tokens);
+        self.post_first_tip([
+            (model.starts_with("claude-haiku-5-5") && tokens > HAIKU_PRICE_STEP_TOKENS)
+                .then(|| tip(TipKind::HaikuLongContext)),
+            (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
+                .then(|| tip(TipKind::FableUpgrade)),
+            (after_idle_resume
+                && rewritten >= IDLE_TIP_MIN_REWRITE_TOKENS
+                && rewritten.saturating_mul(10) >= tokens.saturating_mul(9))
+            .then(|| tip(TipKind::IdleBreak)),
+            (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS)
+                .then(|| tip(TipKind::CompactWindow)),
+        ]);
+    }
+
+    /// Tips from what the intercept, the plan usage headers and the session
+    /// transcripts show, not the feed. Called once per observer tick, before
+    /// the feed batch, so the idle-resume join sees this tick's signal.
+    pub fn observe_signal_tips(&mut self, signals: &TipSignals, now: DateTime<Utc>) {
+        self.idle_resume_at = signals.idle_resume_at;
+        let pace = signals.weekly.and_then(|week| weekly_pace(week, now));
+        self.post_first_tip([
+            (signals.usage_limit_hit && !signals.auto_continue_on)
+                .then(|| TipEvent::new(TipKind::AutoContinue, now, 0)),
+            pace.map(|(used_percent, resets_at, limit_at)| TipEvent {
+                used_percent: Some(used_percent),
+                resets_at: Some(resets_at),
+                limit_at: Some(limit_at),
+                ..TipEvent::new(TipKind::WeeklyPace, now, 0)
+            }),
+            signals
+                .extra_usage_in_use
+                .then(|| TipEvent::new(TipKind::ExtraUsageCache, now, 0)),
+            signals
+                .heavy_startup
+                .clone()
+                .map(|(project, median)| TipEvent {
+                    project: Some(project),
+                    ..TipEvent::new(TipKind::HeavyStartup, now, median)
+                }),
+        ]);
     }
 
     pub fn observe_transformation(
@@ -1089,6 +1189,7 @@ mod tests {
             turn_id: None,
             uncached_input_tokens: None,
             cache_write_tokens: None,
+            cache_read_tokens: None,
         }
     }
 
@@ -1194,6 +1295,105 @@ mod tests {
             at(9, 5),
         );
         assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 500_000)));
+    }
+
+    #[test]
+    fn tips_size_the_whole_prompt_not_the_new_input() {
+        // What the feed fetch hands the observer: apply_new_input_basis has
+        // already turned input_tokens_optimized into new input alone.
+        let mut event = TransformationFeedEvent {
+            uncached_input_tokens: Some(2_000),
+            cache_write_tokens: Some(8_000),
+            cache_read_tokens: Some(440_000),
+            ..sized("anthropic", "claude-opus-5-5", 0)
+        };
+        event.apply_new_input_basis();
+        assert_eq!(event.input_tokens_optimized, Some(10_000));
+        assert_eq!(event.context_tokens(), Some(450_000));
+
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        facts.observe_transformation_at(&event, at(10, 0), at(10, 0));
+        assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 450_000)));
+    }
+
+    fn rewrite(cache_read: u64, rewritten: u64) -> TransformationFeedEvent {
+        TransformationFeedEvent {
+            uncached_input_tokens: Some(1_000),
+            cache_write_tokens: Some(rewritten - 1_000),
+            cache_read_tokens: Some(cache_read),
+            ..sized("anthropic", "claude-opus-5-5", 0)
+        }
+    }
+
+    #[test]
+    fn idle_break_needs_a_resume_and_a_whole_context_rewrite() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let resumed = TipSignals {
+            idle_resume_at: Some(at(10, 0)),
+            ..TipSignals::default()
+        };
+
+        // A rewrite with no resume nearby: a cache bust, not a break.
+        facts.observe_transformation_at(&rewrite(0, 300_000), at(9, 0), at(9, 0));
+        // A resumed conversation that read its cache: nothing expired.
+        facts.observe_signal_tips(&resumed, at(10, 0));
+        facts.observe_transformation_at(&rewrite(250_000, 20_000), at(10, 1), at(10, 1));
+        assert_eq!(posted(&facts), None);
+
+        facts.observe_transformation_at(&rewrite(10_000, 300_000), at(10, 2), at(10, 2));
+        assert_eq!(posted(&facts), Some((TipKind::IdleBreak, 310_000)));
+    }
+
+    #[test]
+    fn weekly_pace_projects_when_the_limit_runs_out() {
+        let now = at(12, 0);
+        let week = |used_percent, days_left: i64| PlanWindow {
+            used_percent,
+            resets_at: now.timestamp() + days_left * 24 * 3600,
+        };
+        // 4 of 7 days gone, 80% used: 100% lands at day 5, two days early.
+        let (used, resets, limit) = weekly_pace(week(80.0, 3), now).expect("on pace to run out");
+        assert_eq!(used, 80.0);
+        assert_eq!((resets - limit).num_hours(), 48);
+        // On track, under the floor, already out, or a stale window: nothing.
+        assert_eq!(weekly_pace(week(55.0, 3), now), None);
+        assert_eq!(weekly_pace(week(45.0, 6), now), None);
+        assert_eq!(weekly_pace(week(100.0, 2), now), None);
+        assert_eq!(weekly_pace(week(80.0, -1), now), None);
+    }
+
+    #[test]
+    fn signal_tips_follow_their_signals() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let mut signals = TipSignals {
+            usage_limit_hit: true,
+            auto_continue_on: true,
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&signals, at(10, 0));
+        assert_eq!(posted(&facts), None, "auto-continue is already on");
+
+        signals.auto_continue_on = false;
+        signals.extra_usage_in_use = true;
+        facts.observe_signal_tips(&signals, at(10, 1));
+        assert_eq!(posted(&facts), Some((TipKind::AutoContinue, 0)));
+
+        facts.mark_tip_seen();
+        facts.observe_signal_tips(&signals, at(10, 2));
+        assert_eq!(posted(&facts), Some((TipKind::ExtraUsageCache, 0)));
+
+        facts.mark_tip_seen();
+        signals.heavy_startup = Some(("headroom-desktop".into(), 69_399));
+        facts.observe_signal_tips(&signals, at(10, 3));
+        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        assert_eq!(tip.kind, TipKind::HeavyStartup);
+        assert_eq!(
+            (tip.project.as_deref(), tip.context_tokens),
+            (Some("headroom-desktop"), 69_399)
+        );
     }
 
     #[test]

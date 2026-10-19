@@ -674,6 +674,8 @@ pub struct TransformationFeedEvent {
     pub uncached_input_tokens: Option<u64>,
     #[serde(default, alias = "cache_write_tokens")]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default, alias = "cache_read_tokens")]
+    pub cache_read_tokens: Option<u64>,
     // The feed's request_messages / compressed_messages / response_content
     // bodies are not modelled: the fetch asks the backend to omit them
     // (`include_messages=0`, lib.rs) and serde ignores them when an older
@@ -696,6 +698,20 @@ impl TransformationFeedEvent {
     /// Left as-is when the backend does not report the split; percent and
     /// pair are `None` when nothing new entered context, matching the chart,
     /// which skips such buckets.
+    /// The whole prompt the provider received: the cache split's three parts.
+    /// `input_tokens_optimized` cannot say it once `apply_new_input_basis` ran
+    /// (new input only), so it is the fallback for a feed with no split.
+    pub fn context_tokens(&self) -> Option<u64> {
+        match (self.uncached_input_tokens, self.cache_write_tokens) {
+            (Some(uncached), Some(cache_write)) => Some(
+                uncached
+                    .saturating_add(cache_write)
+                    .saturating_add(self.cache_read_tokens.unwrap_or(0)),
+            ),
+            _ => self.input_tokens_optimized,
+        }
+    }
+
     pub fn apply_new_input_basis(&mut self) {
         let (Some(uncached), Some(cache_write)) =
             (self.uncached_input_tokens, self.cache_write_tokens)
@@ -861,6 +877,32 @@ pub enum TipKind {
     HaikuLongContext,
     /// Fable 5.1 costs the same as Fable 5 except cache reads, at a quarter.
     FableUpgrade,
+    /// On pace to use up the weekly plan limit before it resets.
+    WeeklyPace,
+    /// Extra usage is paying, and its prompt cache lasts 5 minutes, not an hour.
+    ExtraUsageCache,
+    /// Hit the plan's usage limit: Claude Code can wait out the reset itself.
+    AutoContinue,
+    /// A conversation came back after its hour of prompt cache and wrote its
+    /// whole context again.
+    IdleBreak,
+    /// A project's sessions start heavy before the first prompt.
+    HeavyStartup,
+}
+
+impl TipEvent {
+    pub fn new(kind: TipKind, observed_at: DateTime<Utc>, context_tokens: u64) -> Self {
+        Self {
+            kind,
+            observed_at,
+            context_tokens,
+            used_percent: None,
+            resets_at: None,
+            limit_at: None,
+            project: None,
+            seen: false,
+        }
+    }
 }
 
 impl TipKind {
@@ -870,6 +912,11 @@ impl TipKind {
             Self::CompactWindow => "compact_window",
             Self::HaikuLongContext => "haiku_long_context",
             Self::FableUpgrade => "fable_upgrade",
+            Self::WeeklyPace => "weekly_pace",
+            Self::ExtraUsageCache => "extra_usage_cache",
+            Self::AutoContinue => "auto_continue",
+            Self::IdleBreak => "idle_break",
+            Self::HeavyStartup => "heavy_startup",
         }
     }
 }
@@ -879,8 +926,20 @@ impl TipKind {
 pub struct TipEvent {
     pub kind: TipKind,
     pub observed_at: DateTime<Utc>,
-    /// Size of the request that posted the tip.
+    /// Size of the request that posted the tip, or for `HeavyStartup` the
+    /// project's median session start. 0 when the kind has none.
+    #[serde(default)]
     pub context_tokens: u64,
+    /// `WeeklyPace`: weekly limit used, its reset, and when this pace hits it.
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub resets_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub limit_at: Option<DateTime<Utc>>,
+    /// `HeavyStartup`: the project's folder name.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Set once the Activity tab has shown it; clears both unread dots.
     #[serde(default)]
     pub seen: bool,

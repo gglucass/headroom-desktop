@@ -19,6 +19,7 @@ mod proxy_intercept;
 mod savings_canary;
 mod state;
 mod storage;
+mod tip_signals;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
@@ -5338,6 +5339,7 @@ fn run_activity_observation(app: &AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
 
     let _ = state.maybe_emit_weekly_recap();
+    state.observe_tip_signals();
 
     // Instant of the first failing pull in the current failing streak, cleared
     // by every success: what turns "the backend is restarting" into "this

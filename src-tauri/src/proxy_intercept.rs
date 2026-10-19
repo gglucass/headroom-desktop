@@ -816,6 +816,12 @@ impl<R> ResponseSniffer<R> {
             if let Some(usage) = parse_claude_plan_usage(&self.buf) {
                 crate::claude_statusline::record_plan_usage(usage);
             }
+            let header = |name: &str| extract_header_value(&self.buf, name);
+            crate::tip_signals::note_claude_response(
+                header("anthropic-ratelimit-unified-overage-in-use").as_deref() == Some("true"),
+                self.status == Some(429)
+                    && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected"),
+            );
         }
         // 2xx for a Claude Code conversation: read on to the end of the head,
         // book its saving, stop. The cap bounds a head that never ends.

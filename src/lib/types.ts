@@ -565,12 +565,24 @@ export interface TrainSuggestionEvent {
   kind: string;
 }
 
-export type TipKind = "compact_window" | "haiku_long_context" | "fable_upgrade";
+export type TipKind =
+  | "compact_window"
+  | "haiku_long_context"
+  | "fable_upgrade"
+  | "weekly_pace"
+  | "extra_usage_cache"
+  | "auto_continue"
+  | "idle_break"
+  | "heavy_startup";
 
 export interface TipEvent {
   kind: TipKind;
   observedAt: string;
   contextTokens: number;
+  usedPercent?: number | null;
+  resetsAt?: string | null;
+  limitAt?: string | null;
+  project?: string | null;
   seen: boolean;
 }
 
