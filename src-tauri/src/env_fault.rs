@@ -287,15 +287,18 @@ pub(crate) fn state_unreadable() -> bool {
     FAULTS.lock().sustained(Op::Read, Instant::now()).is_some()
 }
 
-/// True while any fault is sustained. Whatever else fails on that machine
-/// meanwhile (a child process that cannot open its own files in the folder)
-/// is the same fault, which `report` has already sent once.
+/// True while a reported fault is sustained. Whatever else fails on that
+/// machine meanwhile (a child process that cannot open its own files in the
+/// folder) is the same fault, which `report` has already sent once. Disk-full
+/// is never reported, so it mutes nothing: no echo to stand in for.
 pub(crate) fn active() -> bool {
     let now = Instant::now();
     let faults = FAULTS.lock();
-    [Op::Read, Op::Write]
-        .into_iter()
-        .any(|op| faults.sustained(op, now).is_some())
+    [Op::Read, Op::Write].into_iter().any(|op| {
+        faults
+            .sustained(op, now)
+            .is_some_and(|fault| fault.kind.reported())
+    })
 }
 
 /// Banner prose for each sustained fault, read first: an unreadable folder
@@ -322,7 +325,10 @@ pub(crate) fn active_issues() -> Vec<String> {
 fn display_dir(dir: &Path) -> String {
     let home: PathBuf = crate::client_adapters::home_dir();
     match dir.strip_prefix(&home) {
-        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        // The platform's separator, so Windows reads `~\AppData\Local\...`.
+        Ok(rest) if !home.as_os_str().is_empty() => {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+        }
         _ => dir.display().to_string(),
     }
 }
@@ -446,6 +452,24 @@ mod tests {
         assert!(faults.sustained(Op::Write, later).is_none());
         // And a failure after the gap starts a new count.
         assert!(!faults.fail(Op::Write, FaultKind::DiskFull, later));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_a_reported_fault_mutes_sentry() {
+        let now = Instant::now();
+        let mut faults = Faults::default();
+        faults.fail(Op::Write, FaultKind::DiskFull, now);
+        faults.fail(Op::Write, FaultKind::DiskFull, now);
+        *FAULTS.lock() = faults;
+        assert!(
+            !active(),
+            "disk-full is never reported, so nothing is its echo"
+        );
+        FAULTS.lock().fail(Op::Read, FaultKind::Blocked, now);
+        FAULTS.lock().fail(Op::Read, FaultKind::Blocked, now);
+        assert!(active());
+        *FAULTS.lock() = Faults::default();
     }
 
     /// End to end through the real choke points: a data folder the account
