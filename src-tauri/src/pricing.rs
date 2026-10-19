@@ -1090,6 +1090,22 @@ enum RemoteAccountSyncError {
     Other(#[allow(dead_code)] String),
     /// A local content filter dropped the connection (`is_local_filter_drop`).
     FilterBlocked(#[allow(dead_code)] String),
+    /// The request never reached headroom-web: the send failed (TLS
+    /// interception, a timeout, a reset). grace/start uses the same client, so
+    /// a network that never reaches us is the server-silent alarm's case.
+    Transport(#[allow(dead_code)] String),
+    /// A proxy or firewall answered instead of headroom-web, carrying the
+    /// user-facing text from `intermediary_failure`.
+    Intermediary(String),
+}
+
+impl RemoteAccountSyncError {
+    /// False when the user's network failed the request, which says nothing
+    /// about the Bearer channel the auth-silent alarm watches (RUST-8Z: a
+    /// company proxy's 403 and a TLS-inspecting connect, each for days).
+    fn reached_headroom(&self) -> bool {
+        matches!(self, Self::Unauthorized | Self::Other(_))
+    }
 }
 
 /// When any caller last ran `get_pricing_status`; the background pricing
@@ -1120,9 +1136,10 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
             let envelope_result = fetch_remote_account(token, &identity);
             match &envelope_result {
                 Ok(_) => stamp_account_sync_ok(&mut local_state),
-                Err(err) => {
+                Err(err) if err.reached_headroom() => {
                     maybe_report_auth_silent(&local_state, &format!("account sync failed: {err:?}"))
                 }
+                Err(err) => log::info!("account sync failed on this network: {err:?}"),
             }
             let promo = envelope_result
                 .as_ref()
@@ -3956,7 +3973,7 @@ fn merge_background_account_sync(
         }
         // Network failures carry no evidence about the session; never count
         // them toward escalation.
-        Err(RemoteAccountSyncError::Other(_)) => (
+        Err(RemoteAccountSyncError::Other(_) | RemoteAccountSyncError::Transport(_)) => (
             true,
             None,
             Some(
@@ -3964,6 +3981,7 @@ fn merge_background_account_sync(
                     .into(),
             ),
         ),
+        Err(RemoteAccountSyncError::Intermediary(msg)) => (true, None, Some(msg)),
         Err(RemoteAccountSyncError::FilterBlocked(_)) => (
             true,
             None,
@@ -4320,16 +4338,23 @@ fn fetch_remote_account_with_base_url(
         .map_err(RemoteAccountSyncError::Other)?
         .get(join_url(base_url, "desktop/account"))
         .header("Authorization", format!("Bearer {token}"));
-    // Chain for the auth-silent alarm's `error` extra, same reason as
-    // fetch_grace_start; the user sees merge_background_account_sync's text.
+    // Chain for the sync-failure log, same reason as fetch_grace_start; the
+    // user sees merge_background_account_sync's text.
     let response = identity.apply_headers(builder).send().map_err(|err| {
         let text = format!("send: {}", transport_cause_chain(&err));
         if is_local_filter_drop(&err) {
             RemoteAccountSyncError::FilterBlocked(text)
         } else {
-            RemoteAccountSyncError::Other(text)
+            RemoteAccountSyncError::Transport(text)
         }
     })?;
+
+    // Before the 401 check: a proxy's own 401 says nothing about the session.
+    if !response.status().is_success() || !is_json_response(&response) {
+        if let Some(msg) = intermediary_failure("refresh your plan details", &response) {
+            return Err(RemoteAccountSyncError::Intermediary(msg));
+        }
+    }
 
     if response.status().as_u16() == 401 {
         return Err(RemoteAccountSyncError::Unauthorized);
@@ -7147,6 +7172,47 @@ mod tests {
         drop_state(dir);
     }
 
+    /// RUST-8Z: a company proxy's 403 on the account sync is the user's
+    /// network, told to the user and kept out of the auth-silent alarm; the
+    /// same status from headroom-web still reaches the alarm.
+    #[test]
+    fn account_sync_tells_a_proxy_403_from_headroom_web() {
+        use std::io::{Read, Write};
+        let identity = super::IdentityPayload::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let err = super::fetch_remote_account_with_base_url(
+            "token",
+            &identity,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("a proxy's 403");
+        server.join().unwrap();
+        assert!(!err.reached_headroom(), "{err:?}");
+        let (authenticated, _, message) =
+            super::merge_background_account_sync(Some("token"), Err(err));
+        assert!(authenticated);
+        assert!(message.unwrap().contains("proxy or firewall"));
+
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 403 Forbidden");
+        let err = super::fetch_remote_account_with_base_url(
+            "token",
+            &identity,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("headroom-web's 403");
+        server.join().unwrap();
+        assert!(err.reached_headroom(), "{err:?}");
+    }
+
     #[test]
     #[serial_test::serial]
     fn verify_auth_code_decodes_and_writes_session_token() {
@@ -7628,7 +7694,7 @@ mod tests {
             match super::fetch_remote_account_with_base_url("secret-token", &identity, refused)
                 .err()
             {
-                Some(super::RemoteAccountSyncError::Other(text)) => text,
+                Some(super::RemoteAccountSyncError::Transport(text)) => text,
                 other => panic!("expected a transport error, got {other:?}"),
             };
         for err in [&grace, &funnel, &account] {
