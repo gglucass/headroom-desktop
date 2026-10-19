@@ -1406,6 +1406,45 @@ if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: the learned block stays under a size budget (posture) -------------
+# _merge_recommendations carries every prior section a rescan does not re-emit,
+# forever, so a project's learned block only grows, and Claude Code re-sends it
+# with every request in that project. One machine reached 14 sections (five of
+# them renamed duplicates) and ~3.2k tokens a request (2026-10-19). Past the
+# budget (chars of the rendered block) the carried sections go, least
+# estimated_tokens_saved first; the run's own sections always stay. Not
+# version-gated: a wheel without the function leaves this inert. Kill switch:
+# HEADROOM_LEARN_BLOCK_CAP=0; any other number is the budget.
+try:
+    _hd_lbc_budget = int(_hd_os.environ.get("HEADROOM_LEARN_BLOCK_CAP", "6000"))
+except ValueError:
+    _hd_lbc_budget = 6000
+if _hd_lbc_budget > 0:
+    try:
+        from headroom.learn import writer as _hd_lbc_wr
+
+        _hd_lbc_merge = _hd_lbc_wr._merge_recommendations
+        _hd_lbc_build = _hd_lbc_wr._build_section
+
+        def _hd_lbc_merge_capped(file_path, new_recommendations, *args, **kwargs):
+            merged = _hd_lbc_merge(file_path, new_recommendations, *args, **kwargs)
+            if len(_hd_lbc_build(merged)) <= _hd_lbc_budget:
+                return merged
+            fresh = {r.section for r in new_recommendations}
+            carried = [r for r in merged if r.section not in fresh]
+            drop = set()
+            for r in sorted(carried, key=lambda r: r.estimated_tokens_saved):
+                drop.add(id(r))
+                kept = [m for m in merged if id(m) not in drop]
+                if len(_hd_lbc_build(kept)) <= _hd_lbc_budget:
+                    return kept
+            return [m for m in merged if id(m) not in drop]
+
+        _hd_lbc_wr._merge_recommendations = _hd_lbc_merge_capped
+        _hd_bound.add("learn_block_cap")
+    except Exception:
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -2058,6 +2097,7 @@ _HD_VENDORS = (
     "output_warmup",
     "learn_rule_coerce",
     "learn_prior_local",
+    "learn_block_cap",
     "learn_drop_error_recovery",
     "learn_codex_retries",
     "learn_stderr_squeeze",
@@ -17222,6 +17262,50 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True True", "stderr:\n{on_err}");
         assert_eq!(off, "False False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_block_cap_behaves_against_the_installed_wheel() {
+        // A rescan carried every prior section forever, so the learned block
+        // only grew (14 sections, ~3.2k tokens a request on one machine,
+        // 2026-10-19). Over budget the least valuable carried sections go and
+        // the run's own section stays; the kill switch keeps everything.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-bc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import tempfile\n\
+                     from pathlib import Path\n\
+                     from headroom.learn import writer as w\n\
+                     from headroom.learn.models import Recommendation as R, RecommendationTarget as T\n\
+                     f = Path(tempfile.mkdtemp()) / 'CLAUDE.local.md'\n\
+                     f.write_text(w._build_section([R(target=T.CONTEXT_FILE, section=f'Old {i}', content='- ' + 'x' * 900, estimated_tokens_saved=i) for i in range(10)]) + '\\n')\n\
+                     m = w._merge_recommendations(f, [R(target=T.CONTEXT_FILE, section='New', content='- ' + 'y' * 900)])\n\
+                     s = [r.section for r in m]\n\
+                     print(len(w._build_section(m)) <= 6000, s[0] == 'New', 'Old 9' in s, 'Old 0' not in s)";
+        let run = |cap: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_BLOCK_CAP", cap)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("6000");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, "True True True True", "stderr:\n{on_err}");
+        assert_eq!(off, "False True True False", "stderr:\n{off_err}");
     }
 
     #[test]

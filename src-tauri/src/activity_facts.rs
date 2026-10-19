@@ -6,9 +6,9 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
-    ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, LearningsMilestoneEvent, PlanWindow,
-    RecordEvent, RecordTag, TipEvent, TipKind, TrainSuggestionEvent, TransformationFeedEvent,
-    WeeklyRecapEvent,
+    ActivityEvent, ActivityFeedSnapshot, ClaudeCodeProject, ClaudePlanUsage, LabeledPlanWindow,
+    LearningsMilestoneEvent, PlanWindow, RecordEvent, RecordTag, TipEvent, TipKind,
+    TrainSuggestionEvent, TransformationFeedEvent, WeeklyRecapEvent,
 };
 use crate::storage::config_file;
 
@@ -67,6 +67,11 @@ const WEEK_SECS: i64 = 7 * 24 * 3600;
 // A project's interactive sessions start at this median or more before the
 // first prompt. Claude Code alone starts near 19k (a heavy machine, 2026-10).
 pub(crate) const HEAVY_STARTUP_MIN_TOKENS: u64 = 50_000;
+// Codex compacts near its 258k window by default. Fleet, 2026-10: 79 Codex
+// users had days averaging 150k+ per request.
+pub(crate) const CODEX_COMPACT_TIP_MIN_TOKENS: u64 = 150_000;
+// The other plan "has room" when none of its windows is past this.
+const SWITCH_MAX_OTHER_USED_PERCENT: f64 = 80.0;
 
 /// What a tick knows beyond the feed, for the tips the feed cannot show.
 #[derive(Debug, Default, Clone)]
@@ -75,10 +80,35 @@ pub struct TipSignals {
     pub usage_limit_hit: bool,
     /// `autoContinueAtUsageLimit` is already on in ~/.claude/settings.json.
     pub auto_continue_on: bool,
+    /// When Claude's last usage limit lifts, from the rejecting response.
+    pub usage_limit_resets_at: Option<DateTime<Utc>>,
     pub idle_resume_at: Option<DateTime<Utc>>,
-    pub weekly: Option<PlanWindow>,
+    pub claude_usage: Option<ClaudePlanUsage>,
+    pub codex_usage: Vec<LabeledPlanWindow>,
+    /// Each tool sent requests through Headroom today or yesterday.
+    pub claude_in_use: bool,
+    pub codex_in_use: bool,
     /// (project folder name, median session start in tokens).
     pub heavy_startup: Option<(String, u64)>,
+}
+
+/// The fullest of a plan's windows when every one is under
+/// `SWITCH_MAX_OTHER_USED_PERCENT`; a window past its reset counts as empty.
+fn other_plan_room(windows: &[PlanWindow], now: DateTime<Utc>) -> Option<f64> {
+    if windows.is_empty() {
+        return None;
+    }
+    let fullest = windows
+        .iter()
+        .map(|w| {
+            if w.resets_at <= now.timestamp() {
+                0.0
+            } else {
+                w.used_percent
+            }
+        })
+        .fold(0.0, f64::max);
+    (fullest < SWITCH_MAX_OTHER_USED_PERCENT).then_some(fullest)
 }
 
 /// (used percent, reset, when this pace reaches the limit) when the weekly
@@ -299,9 +329,11 @@ pub struct ActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
     last_tip: Option<TipEvent>,
-    // In memory only: the last conversation back after its cache expired,
-    // joined against the feed's rewrites (see observe_signal_tips).
+    // In memory only, from the last observe_signal_tips: the last conversation
+    // back after its cache expired (joined against the feed's rewrites), and
+    // whether Codex is in use (an `openai` feed row may be another client).
     idle_resume_at: Option<DateTime<Utc>>,
+    codex_in_use: bool,
     dirty: bool,
     // Set when the file exists but could not be read. The in-memory facts
     // start empty, so saving them would overwrite the user's real history;
@@ -396,6 +428,7 @@ impl ActivityFacts {
             last_train_suggestion: persisted.last_train_suggestion,
             last_tip: persisted.last_tip,
             idle_resume_at: None,
+            codex_in_use: false,
             dirty: false,
             read_failed: false,
         })
@@ -422,6 +455,7 @@ impl ActivityFacts {
             last_train_suggestion: None,
             last_tip: None,
             idle_resume_at: None,
+            codex_in_use: false,
             dirty: false,
             read_failed: false,
         }
@@ -447,11 +481,11 @@ impl ActivityFacts {
         self.last_tip.as_ref().is_some_and(|tip| !tip.seen)
     }
 
-    pub fn mark_tip_seen(&mut self) {
-        if let Some(tip) = self.last_tip.as_mut().filter(|tip| !tip.seen) {
-            tip.seen = true;
-            self.dirty = true;
-        }
+    pub fn mark_tip_seen(&mut self) -> Option<TipKind> {
+        let tip = self.last_tip.as_mut().filter(|tip| !tip.seen)?;
+        tip.seen = true;
+        self.dirty = true;
+        Some(tip.kind)
     }
 
     pub fn dismiss_tip(&mut self) {
@@ -482,14 +516,19 @@ impl ActivityFacts {
         self.dirty = true;
     }
 
-    /// Tips a Claude Code request in the feed qualifies for.
+    /// Tips a Claude Code or Codex request in the feed qualifies for.
     fn observe_tips(&mut self, event: &TransformationFeedEvent, observed_at: DateTime<Utc>) {
-        if event.provider.as_deref() != Some("anthropic") {
+        let provider = event.provider.as_deref().unwrap_or_default();
+        let model = event.model.as_deref().unwrap_or_default();
+        let claude = provider == "anthropic";
+        let codex = self.codex_in_use
+            && provider.eq_ignore_ascii_case("openai")
+            && (model.starts_with("gpt-") || model.contains("codex"));
+        if !claude && !codex {
             return;
         }
-        let model = event.model.as_deref().unwrap_or_default();
         let tokens = event.context_tokens().unwrap_or(0);
-        let haiku = model.starts_with("claude-haiku");
+        let haiku = !claude || model.starts_with("claude-haiku");
         // Written again rather than read from cache: what an expired prompt cache costs.
         let rewritten = event
             .uncached_input_tokens
@@ -505,12 +544,14 @@ impl ActivityFacts {
                 .then(|| tip(TipKind::HaikuLongContext)),
             (is_fable_5_0(model) && tokens >= FABLE_TIP_MIN_CONTEXT_TOKENS)
                 .then(|| tip(TipKind::FableUpgrade)),
-            (after_idle_resume
+            (claude
+                && after_idle_resume
                 && rewritten >= IDLE_TIP_MIN_REWRITE_TOKENS
                 && rewritten.saturating_mul(10) >= tokens.saturating_mul(9))
             .then(|| tip(TipKind::IdleBreak)),
             (!haiku && tokens >= COMPACT_TIP_MIN_CONTEXT_TOKENS)
                 .then(|| tip(TipKind::CompactWindow)),
+            (codex && tokens >= CODEX_COMPACT_TIP_MIN_TOKENS).then(|| tip(TipKind::CodexCompact)),
         ]);
     }
 
@@ -519,16 +560,66 @@ impl ActivityFacts {
     /// the feed batch, so the idle-resume join sees this tick's signal.
     pub fn observe_signal_tips(&mut self, signals: &TipSignals, now: DateTime<Utc>) {
         self.idle_resume_at = signals.idle_resume_at;
-        let pace = signals.weekly.and_then(|week| weekly_pace(week, now));
-        self.post_first_tip([
-            (signals.usage_limit_hit && !signals.auto_continue_on)
-                .then(|| TipEvent::new(TipKind::AutoContinue, now, 0)),
-            pace.map(|(used_percent, resets_at, limit_at)| TipEvent {
+        self.codex_in_use = signals.codex_in_use;
+        let pace = |kind, week: Option<PlanWindow>| {
+            let (used_percent, resets_at, limit_at) = weekly_pace(week?, now)?;
+            Some(TipEvent {
                 used_percent: Some(used_percent),
                 resets_at: Some(resets_at),
                 limit_at: Some(limit_at),
-                ..TipEvent::new(TipKind::WeeklyPace, now, 0)
-            }),
+                ..TipEvent::new(kind, now, 0)
+            })
+        };
+        let claude_windows: Vec<PlanWindow> = signals
+            .claude_usage
+            .iter()
+            .flat_map(|usage| [usage.five_hour, usage.seven_day])
+            .flatten()
+            .collect();
+        let codex_windows: Vec<PlanWindow> = signals.codex_usage.iter().map(|w| w.window).collect();
+        let claude_limit_lifts = signals.usage_limit_resets_at.filter(|at| *at > now);
+        let codex_limit_lifts = codex_windows
+            .iter()
+            .filter(|w| w.used_percent >= 100.0 && w.resets_at > now.timestamp())
+            .map(|w| w.resets_at)
+            .max()
+            .and_then(|at| DateTime::from_timestamp(at, 0));
+        let switch =
+            |kind, lifts: Option<DateTime<Utc>>, other_in_use: bool, other: &[PlanWindow]| {
+                let room = other_plan_room(other, now).filter(|_| other_in_use)?;
+                lifts?;
+                Some(TipEvent {
+                    used_percent: Some(room),
+                    resets_at: lifts,
+                    ..TipEvent::new(kind, now, 0)
+                })
+            };
+        let codex_week = signals
+            .codex_usage
+            .iter()
+            .find(|w| w.label == "week")
+            .map(|w| w.window)
+            .filter(|_| signals.codex_in_use);
+        self.post_first_tip([
+            switch(
+                TipKind::SwitchToCodex,
+                claude_limit_lifts,
+                signals.codex_in_use,
+                &codex_windows,
+            ),
+            switch(
+                TipKind::SwitchToClaude,
+                codex_limit_lifts,
+                signals.claude_in_use,
+                &claude_windows,
+            ),
+            (signals.usage_limit_hit && !signals.auto_continue_on)
+                .then(|| TipEvent::new(TipKind::AutoContinue, now, 0)),
+            pace(
+                TipKind::WeeklyPace,
+                signals.claude_usage.and_then(|u| u.seven_day),
+            ),
+            pace(TipKind::CodexWeeklyPace, codex_week),
             signals
                 .extra_usage_in_use
                 .then(|| TipEvent::new(TipKind::ExtraUsageCache, now, 0)),
@@ -1394,6 +1485,243 @@ mod tests {
             (tip.project.as_deref(), tip.context_tokens),
             (Some("headroom-desktop"), 69_399)
         );
+    }
+
+    #[test]
+    fn codex_compact_needs_codex_in_use_and_a_codex_model() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let big = |model: &str| TransformationFeedEvent {
+            uncached_input_tokens: Some(10_000),
+            cache_write_tokens: Some(0),
+            cache_read_tokens: Some(150_000),
+            ..sized("openai", model, 0)
+        };
+        facts.observe_transformation_at(&big("gpt-6-sol"), at(10, 0), at(10, 0));
+        assert_eq!(
+            posted(&facts),
+            None,
+            "no Codex traffic: maybe another client"
+        );
+
+        let codex = TipSignals {
+            codex_in_use: true,
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&codex, at(10, 1));
+        facts.observe_transformation_at(&big("deepseek-chat"), at(10, 2), at(10, 2));
+        assert_eq!(posted(&facts), None);
+        facts.observe_transformation_at(&big("gpt-6-sol"), at(10, 3), at(10, 3));
+        assert_eq!(posted(&facts), Some((TipKind::CodexCompact, 160_000)));
+
+        // A /v1/responses row reports its new input as both uncached and an
+        // inferred write: counted once.
+        let responses = TransformationFeedEvent {
+            uncached_input_tokens: Some(2_000),
+            cache_write_tokens: Some(2_000),
+            cache_read_tokens: Some(150_000),
+            ..sized("openai", "gpt-6-sol", 0)
+        };
+        assert_eq!(responses.context_tokens(), Some(152_000));
+        // Its savings rate uses the same single count: 1,000 saved of 2,000 new.
+        let mut rated = TransformationFeedEvent {
+            tokens_saved: Some(2_000),
+            ..responses
+        };
+        rated.apply_new_input_basis();
+        assert_eq!(rated.savings_percent, Some(50.0));
+        // Bedrock bills writes apart from uncached input, like Anthropic.
+        let bedrock = TransformationFeedEvent {
+            uncached_input_tokens: Some(100),
+            cache_write_tokens: Some(900),
+            cache_read_tokens: Some(0),
+            ..sized("bedrock", "claude-opus-5-5", 0)
+        };
+        assert_eq!(bedrock.context_tokens(), Some(1_000));
+    }
+
+    fn window(used_percent: f64, resets_at: DateTime<Utc>) -> PlanWindow {
+        PlanWindow {
+            used_percent,
+            resets_at: resets_at.timestamp(),
+        }
+    }
+
+    #[test]
+    fn switch_tips_need_one_plan_limited_and_the_other_with_room() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let now = at(10, 0);
+        let later = at(15, 0);
+        let codex = |used| {
+            vec![LabeledPlanWindow {
+                label: "5h".into(),
+                window: window(used, later),
+            }]
+        };
+        let mut signals = TipSignals {
+            usage_limit_hit: true,
+            auto_continue_on: true,
+            usage_limit_resets_at: Some(later),
+            codex_in_use: true,
+            codex_usage: codex(85.0),
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&signals, now);
+        assert_eq!(posted(&facts), None, "Codex is nearly out too");
+
+        signals.codex_usage = codex(30.0);
+        facts.observe_signal_tips(&signals, now);
+        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        assert_eq!(
+            (tip.kind, tip.used_percent, tip.resets_at),
+            (TipKind::SwitchToCodex, Some(30.0), Some(later))
+        );
+
+        // The other way: Codex at its limit, Claude with room, Claude's
+        // expired limit ignored.
+        facts.dismiss_tip();
+        let signals = TipSignals {
+            usage_limit_resets_at: Some(at(9, 0)),
+            claude_in_use: true,
+            claude_usage: Some(ClaudePlanUsage {
+                five_hour: Some(window(99.0, at(9, 30))),
+                seven_day: Some(window(40.0, later)),
+            }),
+            codex_usage: codex(100.0),
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&signals, now);
+        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        assert_eq!(
+            (tip.kind, tip.used_percent, tip.resets_at),
+            (TipKind::SwitchToClaude, Some(40.0), Some(later))
+        );
+    }
+
+    #[test]
+    fn codex_weekly_pace_reads_the_week_window() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let now = at(10, 0);
+        let signals = TipSignals {
+            codex_in_use: true,
+            codex_usage: vec![
+                LabeledPlanWindow {
+                    label: "5h".into(),
+                    window: window(90.0, at(12, 0)),
+                },
+                LabeledPlanWindow {
+                    label: "week".into(),
+                    window: window(80.0, now + Duration::days(3)),
+                },
+            ],
+            ..TipSignals::default()
+        };
+        facts.observe_signal_tips(&signals, now);
+        let tip = facts.activity_feed_snapshot().tip.unwrap();
+        assert_eq!(
+            (tip.kind, tip.used_percent),
+            (TipKind::CodexWeeklyPace, Some(80.0))
+        );
+    }
+
+    #[test]
+    fn a_tip_from_the_wire_feed_is_sized_like_the_fetch_leaves_it() {
+        // The backend's /transformations/feed row, snake_case as server.py sends it.
+        let mut event: TransformationFeedEvent = serde_json::from_value(serde_json::json!({
+            "request_id": "r1",
+            "timestamp": "2026-10-19T10:00:00Z",
+            "provider": "anthropic",
+            "model": "claude-opus-5-5",
+            "input_tokens_original": 431_000,
+            "input_tokens_optimized": 430_000,
+            "tokens_saved": 1_000,
+            "savings_percent": 0.2,
+            "transforms_applied": [],
+            "turn_id": "t1",
+            "uncached_input_tokens": 3,
+            "cache_write_tokens": 9_997,
+            "cache_read_tokens": 420_000
+        }))
+        .unwrap();
+        event.apply_new_input_basis();
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        facts.observe_transformation(&event, at(10, 0));
+        assert_eq!(posted(&facts), Some((TipKind::CompactWindow, 430_000)));
+    }
+
+    #[test]
+    fn a_tip_kind_from_a_newer_build_drops_only_the_tip_slot() {
+        let (_tmp, base) = base_dir();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schemaVersion": {SCHEMA_VERSION}, "allTimeRecordTokens": 77,
+                "tipsFired": ["compact_window", "future_kind"],
+                "lastTip": {{"kind": "future_kind", "observedAt": "2026-10-19T10:00:00Z", "seen": false}}}}"#
+            ),
+        )
+        .unwrap();
+        let facts = ActivityFacts::load_or_create(&base).unwrap();
+        assert_eq!(facts.all_time_record_tokens, 77);
+        assert!(facts.tip_fired(TipKind::CompactWindow));
+        assert_eq!(posted(&facts), None);
+        assert!(
+            !facts.tip_unseen(),
+            "an unreadable tip must not light the dots"
+        );
+    }
+
+    /// Replays a recorded event stream through the real tip logic and prints
+    /// which tips would have fired, dismissing each as a user would.
+    /// `HEADROOM_TIP_REPLAY=<events.json> cargo test --lib tip_replay -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads a recorded history file"]
+    fn tip_replay() {
+        #[derive(serde::Deserialize)]
+        struct Recorded {
+            ts: DateTime<Utc>,
+            provider: String,
+            model: String,
+            uncached: u64,
+            write: u64,
+            read: u64,
+            idle_resume: bool,
+        }
+        let path = std::env::var("HEADROOM_TIP_REPLAY").expect("HEADROOM_TIP_REPLAY");
+        let events: Vec<Recorded> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        for event in &events {
+            facts.observe_signal_tips(
+                &TipSignals {
+                    codex_in_use: true,
+                    idle_resume_at: event.idle_resume.then_some(event.ts),
+                    ..TipSignals::default()
+                },
+                event.ts,
+            );
+            let mut feed = TransformationFeedEvent {
+                timestamp: Some(event.ts.to_rfc3339()),
+                uncached_input_tokens: Some(event.uncached),
+                cache_write_tokens: Some(event.write),
+                cache_read_tokens: Some(event.read),
+                ..sized(&event.provider, &event.model, 0)
+            };
+            feed.apply_new_input_basis();
+            facts.observe_transformation_at(&feed, event.ts, event.ts);
+            if let Some(tip) = facts.activity_feed_snapshot().tip.filter(|tip| !tip.seen) {
+                eprintln!(
+                    "{} {:?} {} tokens ({})",
+                    tip.observed_at, tip.kind, tip.context_tokens, event.model
+                );
+                facts.mark_tip_seen();
+            }
+        }
+        eprintln!("replayed {} events", events.len());
     }
 
     #[test]

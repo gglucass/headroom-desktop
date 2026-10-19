@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent 
 import { invoke } from "@tauri-apps/api/core";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
+import { trackAnalyticsEvent } from "../lib/analytics";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
 import type {
@@ -116,7 +117,7 @@ export function ActivityFeed({
             <h1>Activity (beta)</h1>
           </div>
           <p className="activity-card__blurb">
-            Large compressions, learnings and daily records.
+            Large compressions, learnings, daily records and tips.
           </p>
         </header>
       </article>
@@ -977,18 +978,52 @@ function TrainSuggestionRow({
   );
 }
 
-// "Wednesday 14:00": within a week, the weekday says which day.
-function weekdayTime(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, {
-    weekday: "long",
-    hour: "2-digit",
-    minute: "2-digit"
-  });
+// "Wednesday 14:00": within a week, the weekday says which day; today says "today".
+export function weekdayTime(iso: string, now: Date = new Date()): string {
+  const at = new Date(iso);
+  const time = at.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  if (at.toDateString() === now.toDateString()) return `today at ${time}`;
+  return `${at.toLocaleDateString(undefined, { weekday: "long" })} ${time}`;
 }
 
 function tipCopy(event: TipEvent): ReactNode {
   const size = `${Math.round(event.contextTokens / 1000)}k`;
+  const until = event.resetsAt ? `until ${weekdayTime(event.resetsAt)}` : "until it resets";
+  const room = `${Math.round(event.usedPercent ?? 0)}%`;
   switch (event.kind) {
+    case "codex_compact":
+      return (
+        <>
+          A Codex session reached {size} tokens. Every turn re-sends the whole conversation, so long
+          sessions use your limit fastest. Run <code>/compact</code> in Codex at natural breaks, or
+          set <code>model_auto_compact_token_limit = 150000</code> in ~/.codex/config.toml to compact
+          sooner, though each compaction summarizes earlier detail.
+        </>
+      );
+    case "codex_weekly_pace":
+      if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
+      return (
+        <>
+          You've used {Math.round(event.usedPercent)}% of your weekly Codex limit, which resets{" "}
+          {weekdayTime(event.resetsAt)}. At this pace you'll reach it around{" "}
+          {weekdayTime(event.limitAt)}. Long sessions use the most: <code>/compact</code> them,
+          and pick a lower reasoning effort with <code>/model</code> for routine work.
+        </>
+      );
+    case "switch_to_codex":
+      return (
+        <>
+          Claude Code is at its usage limit {until}. Your Codex plan has room (its fullest window
+          is at {room}), so you can keep working in Codex meanwhile.
+        </>
+      );
+    case "switch_to_claude":
+      return (
+        <>
+          Codex is at its usage limit {until}. Your Claude plan has room (its fullest window is at{" "}
+          {room}), so you can keep working in Claude Code meanwhile.
+        </>
+      );
     case "weekly_pace":
       if (event.usedPercent == null || !event.resetsAt || !event.limitAt) return null;
       return (
@@ -1027,9 +1062,9 @@ function tipCopy(event: TipEvent): ReactNode {
       return (
         <>
           Sessions in {event.project} start at {size} tokens before your first prompt, and every
-          turn re-sends them. Run <code>/context</code> in a new session to see what loads, and move
-          rarely needed CLAUDE.md sections into skills or path-scoped rules, which load only when
-          needed.
+          turn re-sends them. Run <code>/context</code> there to see what loads, and move rule sets
+          Claude rarely needs out of CLAUDE.md into a doc, with one line in CLAUDE.md saying when
+          to read it.
         </>
       );
     case "compact_window":
@@ -1069,6 +1104,7 @@ function TipRow({ event }: { event: TipEvent }) {
   if (dismissed || copy === null) return null;
   const dismiss = () => {
     setDismissed(true);
+    trackAnalyticsEvent("activity_tip_dismissed", { kind: event.kind });
     void invoke("dismiss_tip").catch(() => undefined);
   };
   return (

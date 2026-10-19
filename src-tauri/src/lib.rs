@@ -5153,7 +5153,13 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
 #[tauri::command]
 async fn mark_tip_seen(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<AppState>().mark_tip_seen();
+        if let Some(kind) = app.state::<AppState>().mark_tip_seen() {
+            analytics::track_event(
+                &app,
+                "activity_tip_seen",
+                Some(serde_json::json!({ "kind": kind.key() })),
+            );
+        }
     })
     .await
     .map_err(|err| err.to_string())
@@ -9752,6 +9758,10 @@ fn execute_headroom_learn_run(
     // Fifteen minutes: this is a background job with its own step timer in
     // the UI, and the idle cap above still ends a stall within three.
     command.env("HEADROOM_LEARN_CLI_TIMEOUT_SECS", "900");
+    // The analysis is one `claude -p --tools ""` request that nothing reads
+    // back, and Claude Code writes `-p` prompts to the 1h cache at 2x input:
+    // uncached bills the whole digest at 1x instead. Other CLIs ignore it.
+    command.env("DISABLE_PROMPT_CACHING", "1");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
@@ -13530,6 +13540,23 @@ mod tests {
         ));
         assert!(!super::live_savings_pulse_enabled_from("0.9.18", None));
         assert!(!super::live_savings_pulse_enabled_from("0.9.18", Some("1")));
+    }
+
+    #[test]
+    fn tip_dot_is_drawn_top_right_in_the_unread_blue() {
+        let (w, h) = (32u32, 32u32);
+        let dotted =
+            super::add_badge_dot(vec![0u8; (w * h * 4) as usize], w, h, super::UNREAD_DOT_RGB);
+        let pixel = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            dotted[i..i + 4].to_vec()
+        };
+        assert_eq!(pixel(w - 5, 5), vec![0, 122, 255, 255]);
+        assert_eq!(
+            pixel(2, h - 2),
+            vec![0, 0, 0, 0],
+            "the rest of the icon is untouched"
+        );
     }
 
     #[test]

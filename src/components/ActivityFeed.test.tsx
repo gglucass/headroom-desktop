@@ -7,7 +7,8 @@ import {
   collapseDiff,
   diffLines,
   formatRequestMessages,
-  groupTransforms
+  groupTransforms,
+  weekdayTime
 } from "./ActivityFeed";
 import type {
   ActivityFeedResponse,
@@ -15,6 +16,7 @@ import type {
   LearningsMilestoneEvent,
   RecordEvent,
   RtkTodayStats,
+  TipEvent,
   TipKind,
   TrainSuggestionEvent,
   TransformationFeedEvent,
@@ -46,6 +48,14 @@ const baseFeed: ActivityFeedResponse = {
   tiles: emptyTiles,
   proxyReachable: true
 };
+
+describe("weekdayTime", () => {
+  it("says today for a time later today and the weekday otherwise", () => {
+    const now = new Date(2026, 9, 19, 10, 0);
+    expect(weekdayTime(new Date(2026, 9, 19, 17, 0).toISOString(), now)).toMatch(/^today at /);
+    expect(weekdayTime(new Date(2026, 9, 21, 17, 0).toISOString(), now)).toMatch(/^Wednesday /);
+  });
+});
 
 describe("tips", () => {
   const feedWith = (kind: TipKind): ActivityFeedResponse => ({
@@ -120,6 +130,29 @@ describe("tips", () => {
       />
     );
     expect(screen.getByText(/used 78% of your weekly Claude limit/)).toBeTruthy();
+  });
+
+  it("covers the Codex and switch kinds", () => {
+    const tip = (kind: TipKind, extra: Partial<TipEvent> = {}) => (
+      <ActivityFeed
+        feed={{
+          ...baseFeed,
+          tiles: {
+            ...emptyTiles,
+            tip: { kind, observedAt: "2026-10-19T10:00:00Z", contextTokens: 160_000, seen: false, ...extra }
+          }
+        }}
+        error={null}
+      />
+    );
+    const { unmount } = render(tip("codex_compact"));
+    expect(screen.getByText("model_auto_compact_token_limit = 150000")).toBeTruthy();
+    unmount();
+    const second = render(tip("switch_to_codex", { usedPercent: 31.6 }));
+    expect(screen.getByText(/limit until it resets.*fullest window\s+is at 32%/s)).toBeTruthy();
+    second.unmount();
+    render(tip("switch_to_claude", { usedPercent: 40, resetsAt: "2026-10-19T15:00:00Z" }));
+    expect(screen.getByText(/Codex is at its usage limit until \w+/)).toBeTruthy();
   });
 
   it("renders nothing without a tip", () => {

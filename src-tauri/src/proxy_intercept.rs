@@ -817,10 +817,13 @@ impl<R> ResponseSniffer<R> {
                 crate::claude_statusline::record_plan_usage(usage);
             }
             let header = |name: &str| extract_header_value(&self.buf, name);
+            let usage_limit = self.status == Some(429)
+                && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected");
             crate::tip_signals::note_claude_response(
                 header("anthropic-ratelimit-unified-overage-in-use").as_deref() == Some("true"),
-                self.status == Some(429)
-                    && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected"),
+                usage_limit.then(|| {
+                    header("anthropic-ratelimit-unified-reset").and_then(|v| v.trim().parse().ok())
+                }),
             );
         }
         // 2xx for a Claude Code conversation: read on to the end of the head,
@@ -3888,6 +3891,10 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
         Some("thinking_block_modified")
     } else if contains(body, b"signature` in `thinking` block") {
         Some("thinking_signature_invalid")
+    } else if contains(body, b"Extra inputs are not permitted") {
+        // A field the API does not accept, usually one the proxy added (0.9.39-rc.1
+        // forwarded a stream-only `estimated_tokens` on thinking blocks).
+        Some("extra_input_field")
     } else if contains(body, b"text content blocks must")
         || contains(body, b"cannot be set for empty text blocks")
     {
@@ -7644,8 +7651,15 @@ mod tests {
             b"HTTP/1.1 429 Too Many Requests\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\n",
         );
         capped.observe(
+            b"anthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-reset: 4102444800\r\nanthropic-ratelimit-unified-overage-in-use: true\r\n",
+        );
+        capped.observe(
             b"anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{\"type\":\"error\"}",
         );
+        // The same head feeds the Activity tips (tip_signals.rs).
+        let signals = crate::tip_signals::observed();
+        assert!(signals.usage_limit_hit && signals.extra_usage_in_use);
+        assert_eq!(signals.usage_limit_resets_at, Some(4_102_444_800));
         let five = crate::claude_statusline::plan_usage()
             .and_then(|u| u.five_hour)
             .expect("5h window from the 429");
@@ -9731,6 +9745,7 @@ mod tests {
             (b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.4.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01A. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.\"}}\n\n", "orphan_tool_result"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.9.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}"#, "thinking_block_modified"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#, "thinking_signature_invalid"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.21.content.0.thinking.estimated_tokens: Extra inputs are not permitted"}}"#, "extra_input_field"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.3.content.1: text content blocks must be non-empty"}}"#, "empty_text_block"),
             (br#"{"error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}"#, "too_many_cache_breakpoints"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.7.content.2.image.source.base64: image exceeds 5 MB maximum: 6291456 bytes > 5242880 bytes"}}"#, "image_too_large"),

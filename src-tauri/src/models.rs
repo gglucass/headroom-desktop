@@ -702,23 +702,37 @@ impl TransformationFeedEvent {
     /// `input_tokens_optimized` cannot say it once `apply_new_input_basis` ran
     /// (new input only), so it is the fallback for a feed with no split.
     pub fn context_tokens(&self) -> Option<u64> {
-        match (self.uncached_input_tokens, self.cache_write_tokens) {
-            (Some(uncached), Some(cache_write)) => Some(
-                uncached
-                    .saturating_add(cache_write)
-                    .saturating_add(self.cache_read_tokens.unwrap_or(0)),
-            ),
-            _ => self.input_tokens_optimized,
+        match self.new_input() {
+            Some(fresh) => Some(fresh.saturating_add(self.cache_read_tokens.unwrap_or(0))),
+            None => self.input_tokens_optimized,
         }
     }
 
+    /// Uncached plus cache-write input, or None when the feed has no split.
+    /// Only Anthropic (direct, Bedrock, Vertex) bills writes apart from
+    /// uncached input. Everything else here comes through the OpenAI handler,
+    /// which infers a write equal to the uncached input and, on /v1/responses
+    /// (Codex), reports that same input as uncached too (wheel 0.41.0): one
+    /// figure, counted once. `provider` is the feed's display label ("OpenAI",
+    /// "OpenRouter", ...), so it is matched loosely.
+    fn new_input(&self) -> Option<u64> {
+        let (uncached, cache_write) = (self.uncached_input_tokens?, self.cache_write_tokens?);
+        let provider = self
+            .provider
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Some(if provider.contains("anthropic") || provider == "bedrock" {
+            uncached.saturating_add(cache_write)
+        } else {
+            uncached.max(cache_write)
+        })
+    }
+
     pub fn apply_new_input_basis(&mut self) {
-        let (Some(uncached), Some(cache_write)) =
-            (self.uncached_input_tokens, self.cache_write_tokens)
-        else {
+        let Some(new_input) = self.new_input() else {
             return;
         };
-        let new_input = uncached.saturating_add(cache_write);
         if new_input == 0 {
             self.savings_percent = None;
             self.input_tokens_original = None;
@@ -888,6 +902,15 @@ pub enum TipKind {
     IdleBreak,
     /// A project's sessions start heavy before the first prompt.
     HeavyStartup,
+    /// A Codex request reached `CODEX_COMPACT_TIP_MIN_TOKENS`: `/compact`, or
+    /// `model_auto_compact_token_limit` in ~/.codex/config.toml.
+    CodexCompact,
+    /// On pace to use up the weekly Codex limit before it resets.
+    CodexWeeklyPace,
+    /// Claude is at its usage limit while the Codex plan has room.
+    SwitchToCodex,
+    /// Codex is at its usage limit while the Claude plan has room.
+    SwitchToClaude,
 }
 
 impl TipEvent {
@@ -917,6 +940,10 @@ impl TipKind {
             Self::AutoContinue => "auto_continue",
             Self::IdleBreak => "idle_break",
             Self::HeavyStartup => "heavy_startup",
+            Self::CodexCompact => "codex_compact",
+            Self::CodexWeeklyPace => "codex_weekly_pace",
+            Self::SwitchToCodex => "switch_to_codex",
+            Self::SwitchToClaude => "switch_to_claude",
         }
     }
 }
@@ -930,7 +957,9 @@ pub struct TipEvent {
     /// project's median session start. 0 when the kind has none.
     #[serde(default)]
     pub context_tokens: u64,
-    /// `WeeklyPace`: weekly limit used, its reset, and when this pace hits it.
+    /// `WeeklyPace`/`CodexWeeklyPace`: weekly limit used, its reset, and when
+    /// this pace hits it. `SwitchTo*`: the other plan's fullest window, and
+    /// when the limited one lifts (`resets_at`, absent when unknown).
     #[serde(default)]
     pub used_percent: Option<f64>,
     #[serde(default)]

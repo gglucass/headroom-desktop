@@ -573,7 +573,11 @@ export type TipKind =
   | "extra_usage_cache"
   | "auto_continue"
   | "idle_break"
-  | "heavy_startup";
+  | "heavy_startup"
+  | "codex_compact"
+  | "codex_weekly_pace"
+  | "switch_to_codex"
+  | "switch_to_claude";
 
 export interface TipEvent {
   kind: TipKind;
