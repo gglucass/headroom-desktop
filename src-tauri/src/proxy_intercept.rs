@@ -255,6 +255,15 @@ const READYZ_RELAY_STALL: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(5)
 };
+/// Every `/readyz` caller is a status probe with a budget of seconds, so a relay
+/// open this long has no reader. Without the bound one whose backend close never
+/// arrived held its permit to the idle limit: 17 of RUST-QA's 22 idle closes
+/// (2026-10-14..18, all Windows) were these.
+const READYZ_RELAY_LIMIT: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(30)
+};
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -2601,7 +2610,12 @@ async fn handle(
             }
             // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
             // still running then is a failure even if it never ends. Watch it
-            // without cutting it short: the relay itself behaves exactly as before.
+            // without cutting it short, up to READYZ_RELAY_LIMIT.
+            let relay = async {
+                tokio::time::timeout(READYZ_RELAY_LIMIT, relay)
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+            };
             tokio::pin!(relay);
             let mut stalled = false;
             let copied = tokio::select! {
@@ -6381,6 +6395,58 @@ mod tests {
         assert!(matches!(backend_eof, Ok(0) | Err(_)));
         assert_eq!(super::backend_inflight().available_permits(), permits);
 
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// RUST-QA: a `/readyz` answer whose backend close never arrives ends at
+    /// `READYZ_RELAY_LIMIT`, before the idle limit, and is a stalled relay.
+    #[tokio::test]
+    #[serial]
+    async fn readyz_relay_without_a_backend_close_ends_at_its_limit() {
+        use std::sync::atomic::Ordering;
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+        let idle_closed = super::IDLE_RELAYS_CLOSED.load(Ordering::Acquire);
+        let failures = super::READYZ_RELAY_FAILURES.load(Ordering::Acquire);
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write readyz probe");
+        let _ = client.shutdown().await;
+        // The backend answers and keeps its socket open.
+        let (mut held, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        read_until_header_end(&mut held).await;
+        held.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answer");
+
+        let mut answer = Vec::new();
+        timeout(super::RELAY_IDLE_LIMIT, client.read_to_end(&mut answer))
+            .await
+            .expect("the relay ends before the idle limit")
+            .expect("read to end");
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(super::backend_inflight().available_permits(), permits);
+        assert_eq!(
+            super::IDLE_RELAYS_CLOSED.load(Ordering::Acquire),
+            idle_closed
+        );
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        drop(held);
         task.abort();
         backend_port::reset_for_tests();
     }
