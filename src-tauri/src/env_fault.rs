@@ -483,6 +483,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn only_a_reported_fault_mutes_sentry() {
+        // The guard's stand-in root keeps other tests' reads and writes under
+        // the data folder from clearing these faults mid-test.
+        let _guard = hold_read_fault();
         let now = Instant::now();
         let mut faults = Faults::default();
         faults.fail(Op::Write, FaultKind::DiskFull, now);
@@ -495,7 +498,6 @@ mod tests {
         FAULTS.lock().fail(Op::Read, FaultKind::Blocked, now);
         FAULTS.lock().fail(Op::Read, FaultKind::Blocked, now);
         assert!(active());
-        *FAULTS.lock() = Faults::default();
     }
 
     /// End to end through the real choke points: a data folder the account
