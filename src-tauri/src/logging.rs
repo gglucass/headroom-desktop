@@ -152,6 +152,7 @@ fn is_unreportable(msg: &str) -> bool {
         || is_system_fd_exhaustion(msg)
         || is_windows_session_end_panic(msg)
         || msg.contains(crate::client_adapters::LOCKED_FILE_NOTE)
+        || msg.contains(crate::env_fault::NOTE)
 }
 
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
@@ -164,6 +165,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // A machine fault on Headroom's data folder: `env_fault` sends one event
     // per fault itself, so the line from whichever file tripped on it is a
     // duplicate (RUST-R1/R2 were one blocked folder seen from two files).
+    // `is_unreportable` drops the same note from direct captures.
     if msg.contains(crate::env_fault::NOTE) {
         return true;
     }
@@ -1940,6 +1942,18 @@ mod tests {
         let mut other = sentry::protocol::Event::new();
         other.message = Some("Could not persist reconciled grace state: Permission denied".into());
         assert!(super::sanitize_event(other).is_some());
+
+        // A data-folder fault env_fault classified: it reports the fault
+        // once itself, so a direct capture of the failing write is a
+        // per-file duplicate (pricing.rs's grace-state capture, lib.rs's
+        // client_setup_failed).
+        let mut fault = sentry::protocol::Event::new();
+        fault.message = Some(format!(
+            "Could not persist reconciled grace state: renaming .tmp: Operation not \
+             permitted (os error 1){}",
+            crate::env_fault::NOTE
+        ));
+        assert!(super::sanitize_event(fault).is_none());
     }
 
     #[cfg(target_os = "macos")]
