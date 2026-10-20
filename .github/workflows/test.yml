@@ -299,11 +299,9 @@ jobs:
         # --no-deps) and run them for real. Any skip fails the step: under the
         # exact pin every vendor must bind, and after a wheel bump a skip is
         # the cue to drop or re-pin that vendor (Wheel Bump Rules, CLAUDE.md).
-        # macOS because the truststore vendor runs only here and on Windows.
-        # The two probes with sub-second deadlines run alone, after the rest:
-        # fourteen probes at once on a 3-vCPU runner starved the
-        # responses-budget probe into a false "fixed request still timed out".
-        # The others have no tight deadline and run three at a time.
+        # Three at a time: none of the remaining probes has a tight deadline
+        # (the two sub-second ones, responses budget and quarantine, left with
+        # their vendors on the 0.41.0 pin).
         shell: bash
         env:
           HEADROOM_DATA_DIR: ${{ runner.temp }}/headroom-wheel
@@ -329,17 +327,13 @@ jobs:
           test -x "$bin"
           wait "$runtime"
           cd src-tauri
-          {
-            "$bin" against_the_installed_wheel --skip responses_shared_budget \
-              --skip quarantine_spare_capacity --nocapture --test-threads=3
-            "$bin" responses_shared_budget_behaves quarantine_spare_capacity_vendor_behaves \
-              --nocapture --test-threads=1
-          } 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
+          "$bin" against_the_installed_wheel --nocapture --test-threads=3 2>&1 \
+            | tee "$RUNNER_TEMP/wheel-tests.log"
           if grep 'skipping:' "$RUNNER_TEMP/wheel-tests.log"; then
             echo "::error::a vendor test skipped against headroom-ai $pin"
             exit 1
           fi
-          test "$(grep -cE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/wheel-tests.log")" -eq 2
+          test "$(grep -cE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/wheel-tests.log")" -eq 1
 
   macos-intel-lock:
     # Intel Macs still receive the shipped app: the release builds

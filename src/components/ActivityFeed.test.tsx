@@ -7,7 +7,8 @@ import {
   collapseDiff,
   diffLines,
   formatRequestMessages,
-  groupTransforms
+  groupTransforms,
+  weekdayTime
 } from "./ActivityFeed";
 import type {
   ActivityFeedResponse,
@@ -15,6 +16,8 @@ import type {
   LearningsMilestoneEvent,
   RecordEvent,
   RtkTodayStats,
+  TipEvent,
+  TipKind,
   TrainSuggestionEvent,
   TransformationFeedEvent,
   WeeklyRecapEvent
@@ -37,13 +40,137 @@ const emptyTiles: ActivityFeedSnapshot = {
   serenaToday: null,
   learningsMilestone: null,
   weeklyRecap: null,
-  trainSuggestion: null
+  trainSuggestion: null,
+  tips: []
 };
 
 const baseFeed: ActivityFeedResponse = {
   tiles: emptyTiles,
   proxyReachable: true
 };
+
+describe("weekdayTime", () => {
+  it("says today for a time later today and the weekday otherwise", () => {
+    const now = new Date(2026, 9, 19, 10, 0);
+    expect(weekdayTime(new Date(2026, 9, 19, 17, 0).toISOString(), now)).toMatch(/^today at /);
+    expect(weekdayTime(new Date(2026, 9, 21, 17, 0).toISOString(), now)).toMatch(/^Wednesday /);
+  });
+});
+
+describe("tips", () => {
+  const tipOf = (kind: TipKind, extra: Partial<TipEvent> = {}): TipEvent => ({
+    kind,
+    observedAt: "2026-10-19T10:00:00Z",
+    contextTokens: 412_345,
+    seen: false,
+    ...extra
+  });
+  const feedWith = (...tips: TipEvent[]): ActivityFeedResponse => ({
+    ...baseFeed,
+    tiles: { ...emptyTiles, tips }
+  });
+
+  it("shows every posted tip, each with its own title", () => {
+    render(<ActivityFeed feed={feedWith(tipOf("compact_window"), tipOf("idle_break"))} error={null} />);
+    expect(screen.getByText("Compact long sessions sooner")).toBeTruthy();
+    expect(screen.getByText("Compact before long breaks")).toBeTruthy();
+    expect(screen.getByText(/reached 412k tokens/)).toBeTruthy();
+  });
+
+  it("dismisses one tip by its kind", async () => {
+    render(<ActivityFeed feed={feedWith(tipOf("compact_window"), tipOf("idle_break"))} error={null} />);
+    await userEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[0]);
+    expect(invokeMock).toHaveBeenCalledWith("dismiss_tip", { kind: "compact_window" });
+    expect(screen.queryByText("Compact long sessions sooner")).toBeNull();
+    expect(screen.getByText("Compact before long breaks")).toBeTruthy();
+  });
+
+  it("applies a setting tip, and names the command when it cannot", async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+    const { unmount } = render(<ActivityFeed feed={feedWith(tipOf("auto_continue"))} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    expect(invokeMock).toHaveBeenCalledWith("apply_tip", { kind: "auto_continue" });
+    expect(screen.getByText(/Saved to ~\/.claude\/settings.json/)).toBeTruthy();
+    unmount();
+
+    invokeMock.mockRejectedValueOnce("settings.json is not an object");
+    render(<ActivityFeed feed={feedWith(tipOf("haiku_long_context"))} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Compact Haiku at 100k" }));
+    expect(screen.getByText("/autocompact 100k")).toBeTruthy();
+  });
+
+  it("shows and copies a command", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<ActivityFeed feed={feedWith(tipOf("fable_upgrade"))} error={null} />);
+    expect(screen.getByText("/model claude-fable-5-1")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith("/model claude-fable-5-1");
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
+  });
+
+  it("words the signal tips from their own fields", () => {
+    const { unmount } = render(
+      <ActivityFeed
+        feed={feedWith(tipOf("heavy_startup", { contextTokens: 69_499, project: "headroom-desktop" }))}
+        error={null}
+      />
+    );
+    expect(screen.getByText("Sessions in headroom-desktop start at 69k tokens")).toBeTruthy();
+    unmount();
+    render(
+      <ActivityFeed
+        feed={feedWith(
+          tipOf("weekly_pace", {
+            contextTokens: 0,
+            usedPercent: 78.4,
+            resetsAt: "2026-10-23T09:00:00Z",
+            limitAt: "2026-10-21T15:00:00Z"
+          })
+        )}
+        error={null}
+      />
+    );
+    expect(screen.getByText(/On pace to hit your weekly Claude limit/)).toBeTruthy();
+    expect(screen.getByText(/78% used, resets/)).toBeTruthy();
+  });
+
+  it("copies a fix prompt for a heavy startup, and shows it when the clipboard refuses", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const feed = feedWith(tipOf("heavy_startup", { contextTokens: 69_499, project: "headroom-desktop" }));
+    const { unmount } = render(<ActivityFeed feed={feed} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(writeText.mock.calls[0][0]).toMatch(/start at about 69k tokens before my first prompt/);
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
+    unmount();
+
+    writeText.mockRejectedValue(new Error("NotAllowedError"));
+    render(<ActivityFeed feed={feed} error={null} />);
+    await userEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(screen.getByText(/wait for my OK before changing anything/)).toBeTruthy();
+  });
+
+  it("covers the Codex and switch kinds", () => {
+    const tip = (kind: TipKind, extra: Partial<TipEvent> = {}) => (
+      <ActivityFeed feed={feedWith(tipOf(kind, { contextTokens: 160_000, ...extra }))} error={null} />
+    );
+    const { unmount } = render(tip("codex_compact"));
+    expect(screen.getByText("model_auto_compact_token_limit = 150000")).toBeTruthy();
+    unmount();
+    const second = render(tip("switch_to_codex", { usedPercent: 31.6 }));
+    expect(screen.getByText("Claude Code is limited until it resets")).toBeTruthy();
+    expect(screen.getByText(/fullest window is at 32%/)).toBeTruthy();
+    second.unmount();
+    render(tip("switch_to_claude", { usedPercent: 40, resetsAt: "2026-10-19T15:00:00Z" }));
+    expect(screen.getByText(/Codex is limited until \w+/)).toBeTruthy();
+  });
+
+  it("renders nothing without a tip", () => {
+    render(<ActivityFeed feed={baseFeed} error={null} />);
+    expect(screen.queryByText(/^Tip$/)).toBeNull();
+  });
+});
 
 function transformation(event: Partial<TransformationFeedEvent> = {}): TransformationFeedEvent {
   return {

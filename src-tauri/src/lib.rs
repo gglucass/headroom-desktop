@@ -6,6 +6,7 @@ mod claude_cli;
 mod claude_statusline;
 mod client_adapters;
 mod device;
+mod env_fault;
 mod keychain;
 mod logging;
 mod memory_scrubber;
@@ -18,6 +19,7 @@ mod proxy_intercept;
 mod savings_canary;
 mod state;
 mod storage;
+mod tip_signals;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
@@ -2432,6 +2434,10 @@ enum BootstrapFailureKind {
     /// a vendored wheel that does not cover this machine. Never tell the user
     /// to install Xcode: needing a compiler at all is our bug, not their setup.
     SourceBuild,
+    /// The disk filled up mid-install. It fell through to `Other`, whose message
+    /// sends the user to their network, and `capture_bootstrap_failure` skips
+    /// Sentry for it, so nothing else ever named the cause (support 2026-10-19).
+    DiskFull,
     Other,
 }
 
@@ -2449,6 +2455,7 @@ impl BootstrapFailureKind {
             BootstrapFailureKind::AppControlBlocked => "app_control_blocked",
             BootstrapFailureKind::SecuritySoftware => "security_software",
             BootstrapFailureKind::SourceBuild => "build",
+            BootstrapFailureKind::DiskFull => "disk_full",
             BootstrapFailureKind::Other => "other",
         }
     }
@@ -2525,6 +2532,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::AppControlBlocked
     } else if is_security_software_removal_signal(&haystack) {
         BootstrapFailureKind::SecuritySoftware
+    } else if is_disk_full_signal(&haystack) {
+        BootstrapFailureKind::DiskFull
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -2881,6 +2890,11 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              your system. Nothing is missing on your machine - this is a bug in \
              the version you're running. Click Check for updates to get a newer \
              Headroom. If no update is offered, use Contact support below."
+        }
+        BootstrapFailureKind::DiskFull => {
+            "Installation failed: your disk is full, so Headroom couldn't finish \
+             saving the files it needs. Free up a few gigabytes of disk space, then \
+             click Try again."
         }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
@@ -4235,6 +4249,10 @@ pub(crate) fn is_disk_full_signal(text: &str) -> bool {
         || lower.contains("errno 28")
         || lower.contains("enospc")
         || lower.contains("disk full")
+        // Windows ERROR_DISK_FULL from our own downloads and unpacking. The code
+        // is locale-independent; on Linux errno 112 is EHOSTDOWN, hence the gate.
+        || lower.contains("not enough space on the disk")
+        || (cfg!(windows) && lower.contains("(os error 112)"))
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because
@@ -5131,6 +5149,64 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
         })
 }
 
+/// The Activity tab showed the tips: clears their unread dots.
+#[tauri::command]
+async fn mark_tip_seen(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        for kind in app.state::<AppState>().mark_tips_seen() {
+            analytics::track_event(
+                &app,
+                "activity_tip_seen",
+                Some(serde_json::json!({ "kind": kind.key() })),
+            );
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn dismiss_tip(app: AppHandle, kind: models::TipKind) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>().dismiss_tip(kind);
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// A tip's apply button: writes the Claude Code setting the tip names to
+/// ~/.claude/settings.json (Claude Code picks it up live), then takes it down.
+#[tauri::command]
+async fn apply_tip(app: AppHandle, kind: models::TipKind) -> Result<(), String> {
+    use models::TipKind;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, value): (&[&str], serde_json::Value) = match kind {
+            TipKind::AutoContinue => (&["autoContinueAtUsageLimit"], true.into()),
+            // What `/autocompact` saves, for every model rather than this one.
+            TipKind::CompactWindow => (
+                &["autoCompactWindow"],
+                activity_facts::COMPACT_TIP_MIN_CONTEXT_TOKENS.into(),
+            ),
+            TipKind::HaikuLongContext => (
+                &["modelSettings", "claude-haiku-5-5", "autoCompactWindow"],
+                activity_facts::HAIKU_PRICE_STEP_TOKENS.into(),
+            ),
+            _ => return Err(format!("{} has nothing to apply", kind.key())),
+        };
+        let result = client_adapters::set_claude_setting(path, value);
+        analytics::track_event(
+            &app,
+            "activity_tip_applied",
+            Some(serde_json::json!({ "kind": kind.key(), "ok": result.is_ok() })),
+        );
+        result.map_err(|err| format!("{err:#}"))?;
+        app.state::<AppState>().dismiss_tip(kind);
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
 /// writing to ActivityFacts, persisting — happens on a dedicated background
 /// timer (see `spawn_activity_observer`), so this command never mutates state.
@@ -5302,6 +5378,7 @@ fn run_activity_observation(app: &AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
 
     let _ = state.maybe_emit_weekly_recap();
+    state.observe_tip_signals();
 
     // Instant of the first failing pull in the current failing streak, cleared
     // by every success: what turns "the backend is restarting" into "this
@@ -5870,7 +5947,7 @@ fn show_dashboard_window(app: AppHandle) -> Result<(), String> {
 
     ensure_runtime_ready_for_tray(&app);
     hide_launcher_window(&app).map_err(|err| err.to_string())?;
-    show_main_window(&app, None).map_err(|err| err.to_string())
+    show_main_window(&app, None, false).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -7822,7 +7899,7 @@ pub fn run() {
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
-            let _ = show_primary_window(app);
+            let _ = show_primary_window(app, true);
             // On Windows/Linux the OS answers a `headroom://` link by spawning
             // a NEW process with the URL in argv; the running instance is never
             // notified, and the new one dies here. Replay argv into the primary
@@ -8213,7 +8290,7 @@ pub fn run() {
             let quiet_relaunch =
                 storage::take_quiet_relaunch(&storage::app_data_dir(), chrono::Utc::now());
             if state.should_present_on_launch() && !launched_from_autostart && !quiet_relaunch {
-                let _ = show_primary_window(app.handle());
+                let _ = show_primary_window(app.handle(), true);
             }
             if state.tool_manager.python_runtime_installed() {
                 state.set_runtime_starting(true);
@@ -8342,6 +8419,9 @@ pub fn run() {
             get_headroom_billing_portal_url,
             submit_headroom_cancellation_intent,
             get_activity_feed,
+            mark_tip_seen,
+            dismiss_tip,
+            apply_tip,
             list_live_learnings,
             list_live_learnings_for_projects,
             delete_live_learning,
@@ -8401,7 +8481,7 @@ pub fn run() {
         // relaunch did nothing visible while the app sat in the menu bar.
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
-            if let Err(err) = show_primary_window(app) {
+            if let Err(err) = show_primary_window(app, false) {
                 log::warn!("reopen: could not show window: {err}");
             }
             return;
@@ -9712,6 +9792,11 @@ fn execute_headroom_learn_run(
     // Fifteen minutes: this is a background job with its own step timer in
     // the UI, and the idle cap above still ends a stall within three.
     command.env("HEADROOM_LEARN_CLI_TIMEOUT_SECS", "900");
+    // The analysis is one `claude -p --tools ""` request that nothing reads
+    // back, and Claude Code writes `-p` prompts to the 1h cache at 2x input.
+    // Direct, this bills the digest at 1x; through our proxy it still gets a
+    // 5m breakpoint, so 1.25x (measured 2026-10-19). Other CLIs ignore it.
+    command.env("DISABLE_PROMPT_CACHING", "1");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
@@ -10462,7 +10547,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" | "savings" => {
-                if show_primary_window(app).unwrap_or(false) {
+                if show_primary_window(app, false).unwrap_or(false) {
                     let app_bg = app.clone();
                     std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
                 }
@@ -10485,7 +10570,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 });
             }
             "invite" => {
-                if show_primary_window(app).unwrap_or(false) {
+                if show_primary_window(app, false).unwrap_or(false) {
                     let _ = app.emit("open-view", "invite");
                 }
             }
@@ -10614,10 +10699,15 @@ static LAST_USER_CONNECTOR_DISABLE: Mutex<Option<std::time::Instant>> = Mutex::n
 /// Nor while the clients are unwired from an unidentified 6767 holder:
 /// reconnecting would route them to that listener, and the port-reclaim
 /// rewire brings them back on its own.
+///
+/// Nor while Headroom cannot read its own data folder: the setup state then
+/// loads as the empty default, which reads as every client disconnected. The
+/// Home banner names the real cause (`env_fault`).
 fn disconnect_notice_due(last_non_booting: Option<TrayRuntimeVisual>) -> bool {
     const USER_DISABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
     last_non_booting == Some(TrayRuntimeVisual::Running)
         && !client_adapters::clients_unwired_for_port_holder()
+        && !env_fault::state_unreadable()
         && !LAST_USER_CONNECTOR_DISABLE
             .lock()
             .is_some_and(|at| at.elapsed() < USER_DISABLE_WINDOW)
@@ -10646,6 +10736,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_seen_tokens: Option<u64> = None;
         let mut pulse_frames_left: usize = 0;
         let mut pulse_drawn_last_tick = false;
+        let mut tip_dot_drawn = false;
         let mut last_tooltip: Option<String> = None;
         let mut last_pause_label: Option<&str> = None;
         let mut last_menu_info: Option<(String, Vec<String>)> = None;
@@ -10801,16 +10892,24 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                         };
                         let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
                         let changed_dollars = last_displayed_dollars != Some(dollars);
+                        let tip_dot = app.state::<AppState>().tip_unseen();
                         if changed_visual
                             || changed_dollars
                             || pulse.is_some()
                             || pulse_drawn_last_tick
+                            || tip_dot != tip_dot_drawn
                         {
                             let (bw, bh) = icons.running_dims;
                             let base = match pulse {
                                 Some(strength) => tint_toward_accent(&icons.running_rgba, strength),
                                 None => icons.running_rgba.clone(),
                             };
+                            let base = if tip_dot {
+                                add_badge_dot(base, bw, bh, UNREAD_DOT_RGB)
+                            } else {
+                                base
+                            };
+                            tip_dot_drawn = tip_dot;
                             let (new_rgba, new_w, new_h) =
                                 build_running_with_savings(&base, bw, bh, dollars);
                             let _ = tray.set_icon(Some(tauri::image::Image::new_owned(
@@ -11612,7 +11711,12 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
     let height = decoded.height();
     let rgba = decoded.into_vec();
 
-    let off_rgba = add_red_badge_dot(to_grayscale_strength(&rgba, 1.0), width, height);
+    let off_rgba = add_badge_dot(
+        to_grayscale_strength(&rgba, 1.0),
+        width,
+        height,
+        BROKEN_DOT_RGB,
+    );
     // Paused intentionally has no badge — distinguishes "user chose off" from
     // "broken and needs attention" at a glance.
     let paused_rgba = to_grayscale_strength(&rgba, 1.0);
@@ -11687,7 +11791,12 @@ fn rotate_90_cw(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
+/// Red means broken (off, unhealthy, disconnected); blue means something new
+/// waits in Activity, the macOS unread colour, so a tip never reads as a fault.
+const BROKEN_DOT_RGB: [u8; 3] = [217, 76, 76];
+const UNREAD_DOT_RGB: [u8; 3] = [0, 122, 255];
+
+fn add_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let w = width as i32;
     let h = height as i32;
     let cx = w - 5;
@@ -11700,9 +11809,7 @@ fn add_red_badge_dot(mut rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
             let dy = y - cy;
             if dx * dx + dy * dy <= radius * radius {
                 let idx = ((y as usize * width as usize) + x as usize) * 4;
-                rgba[idx] = 217;
-                rgba[idx + 1] = 76;
-                rgba[idx + 2] = 76;
+                rgba[idx..idx + 3].copy_from_slice(&rgb);
                 rgba[idx + 3] = 255;
             }
         }
@@ -11721,7 +11828,9 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
             // underneath it strands the user mid-flow.
             // WSLg has no system tray, so a window hidden on blur had no way
             // back short of relaunching from a terminal.
-            let may_hide = !INSTALLING_UPDATE.load(Ordering::Acquire) && !proxy_intercept::is_wsl();
+            let may_hide = !INSTALLING_UPDATE.load(Ordering::Acquire)
+                && !proxy_intercept::is_wsl()
+                && !MAIN_WINDOW_WINDOWED.load(Ordering::Acquire);
             let window = window.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(
@@ -11901,7 +12010,7 @@ fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Resu
     if window.is_visible()? {
         window.hide()?;
     } else {
-        show_main_window(app, anchor_rect)?;
+        show_main_window(app, anchor_rect, false)?;
         // Start/verify headroom in the background so the window appears immediately.
         let app_bg = app.clone();
         std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
@@ -11975,7 +12084,11 @@ async fn accept_terms(app: AppHandle, version: u32) {
     });
 }
 
-fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
+fn show_main_window(
+    app: &AppHandle,
+    anchor_rect: Option<Rect>,
+    windowed: bool,
+) -> tauri::Result<()> {
     let Some(window) = app.get_webview_window("main") else {
         return Err(tauri::Error::WebviewNotFound);
     };
@@ -11993,7 +12106,14 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
         position_near_panel(&window)?;
     }
 
+    // macOS stays a menu-bar popover: an accessory app has no Dock icon to
+    // bring a window back from.
+    let windowed = windowed && cfg!(not(target_os = "macos"));
+    MAIN_WINDOW_WINDOWED.store(windowed, Ordering::Release);
     window.show()?;
+    // After show(): the shell re-adds the button of a window it shows.
+    #[cfg(not(target_os = "macos"))]
+    let _ = window.set_skip_taskbar(!windowed);
     let _ = window.unminimize();
     window.set_focus()?;
     Ok(())
@@ -12006,11 +12126,11 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 /// launcher's "Get started" screen unconditionally, whose only button hides
 /// the window; on Windows, where the tray icon sits behind the overflow
 /// chevron, that left returning users with no visible way to the dashboard
-/// (and its Upgrade button).
-fn show_primary_window(app: &AppHandle) -> tauri::Result<bool> {
+/// (and its Upgrade button). `windowed`: see `MAIN_WINDOW_WINDOWED`.
+fn show_primary_window(app: &AppHandle, windowed: bool) -> tauri::Result<bool> {
     if onboarding_complete(app) {
         hide_launcher_window(app)?;
-        show_main_window(app, None)?;
+        show_main_window(app, None, windowed)?;
         Ok(true)
     } else {
         show_launcher_window(app)?;
@@ -12069,6 +12189,11 @@ static MAIN_WINDOW_PLACEMENT: Mutex<MainWindowPlacement> = Mutex::new(MainWindow
 /// Whether the dashboard stands at its saved position: this open restored it,
 /// or a drag put it there. False while it is anchored to the tray.
 static MAIN_WINDOW_AT_SAVED_SPOT: AtomicBool = AtomicBool::new(false);
+/// Opened from the Start menu or a shortcut on Windows and Linux, the
+/// dashboard is a taskbar window that stays up on blur: as a tray popover it
+/// vanished on the first click elsewhere, and the tray icon sits behind the
+/// overflow chevron (user report). A tray open makes it a popover again.
+static MAIN_WINDOW_WINDOWED: AtomicBool = AtomicBool::new(false);
 /// Outer position when the user grabbed the sidebar, so a click that never
 /// moved the window does not pin it away from the tray.
 static MAIN_WINDOW_DRAG_ORIGIN: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
@@ -12788,6 +12913,7 @@ mod tests {
             required_terms_version: 1,
             accepted_terms_version: 1,
             terms_url: String::new(),
+            tip_unseen: false,
         }
     }
 
@@ -13130,6 +13256,12 @@ mod tests {
         let due = super::disconnect_notice_due(Some(TrayRuntimeVisual::Running));
         crate::client_adapters::set_clients_unwired_for_port_holder(false);
         assert!(!due, "announced a port-holder unwire as a disconnect");
+        // An unreadable data folder loads the setup as the empty default,
+        // which reads as every client disconnected (RUST-R1/R2).
+        let fault = crate::env_fault::hold_read_fault();
+        let due = super::disconnect_notice_due(Some(TrayRuntimeVisual::Running));
+        drop(fault);
+        assert!(!due, "announced an unreadable data folder as a disconnect");
     }
 
     #[test]
@@ -13449,6 +13581,23 @@ mod tests {
         ));
         assert!(!super::live_savings_pulse_enabled_from("0.9.18", None));
         assert!(!super::live_savings_pulse_enabled_from("0.9.18", Some("1")));
+    }
+
+    #[test]
+    fn tip_dot_is_drawn_top_right_in_the_unread_blue() {
+        let (w, h) = (32u32, 32u32);
+        let dotted =
+            super::add_badge_dot(vec![0u8; (w * h * 4) as usize], w, h, super::UNREAD_DOT_RGB);
+        let pixel = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            dotted[i..i + 4].to_vec()
+        };
+        assert_eq!(pixel(w - 5, 5), vec![0, 122, 255, 255]);
+        assert_eq!(
+            pixel(2, h - 2),
+            vec![0, 0, 0, 0],
+            "the rest of the icon is untouched"
+        );
     }
 
     #[test]
@@ -14930,6 +15079,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_names_a_full_disk() {
+        let pip: anyhow::Error = make_command_failure(
+            "WARNING: Retrying after connection timed out\n\
+             ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device",
+        )
+        .into();
+        assert_eq!(classify_bootstrap_failure(&pip).as_str(), "disk_full");
+        let ours = anyhow::anyhow!(
+            "extract python runtime: There is not enough space on the disk. (os error 112)"
+        );
+        assert_eq!(classify_bootstrap_failure(&ours).as_str(), "disk_full");
+        let message = user_message_for(BootstrapFailureKind::DiskFull);
+        assert!(
+            message.contains("disk space") && message.contains("Try again"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn security_software_message_offers_a_retry_and_the_quarantine() {
         let message = user_message_for(BootstrapFailureKind::SecuritySoftware);
         assert!(message.contains("Try again"), "{message}");
@@ -15011,6 +15179,7 @@ mod tests {
             BootstrapFailureKind::AppControlBlocked,
             BootstrapFailureKind::SecuritySoftware,
             BootstrapFailureKind::SourceBuild,
+            BootstrapFailureKind::DiskFull,
         ] {
             let msg = user_message_for(kind).to_ascii_lowercase();
             assert!(
@@ -16808,7 +16977,7 @@ Some unrelated content.
     #[test]
     fn learn_failure_signature_source_takes_codex_verdict_not_its_banner() {
         // RUST-KT: codex's stderr after the marker, prompt echo dropped by the
-        // learn_prompt_echo vendor. The banner line grouped every Codex failure
+        // wheel (#3928; the learn_prompt_echo vendor before 0.41.0). The banner line grouped every Codex failure
         // as one cause-less issue; the request ids would split one per event.
         let codex = |verdict: &str| {
             format!(

@@ -25,6 +25,10 @@ const ALLOWED_EVENTS: &[&str] = &[
     "app_started",
     "account_activated",
     "checkout_started",
+    // The launcher paywall: shown, and a checkout completed from it. Added in
+    // 0.6.1 but never listed here, so dropped until 0.9.45.
+    "paywall_shown",
+    "paywall_checkout_completed",
     "subscription_plan_changed",
     "subscription_reactivated",
     "invite_code_used",
@@ -77,6 +81,13 @@ const ALLOWED_EVENTS: &[&str] = &[
     // ok=true/false so the button's success rate is measurable.
     "claude_code_installer_run",
     "activity_tab_opened",
+    // Activity tips, each carrying `kind`: shown, dismissed, the fix prompt
+    // or command copied, and applied (with `ok`). Dropped here until 0.9.45,
+    // so no tip data predates it.
+    "activity_tip_seen",
+    "activity_tip_dismissed",
+    "activity_tip_prompt_copied",
+    "activity_tip_applied",
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -607,6 +618,94 @@ mod tests {
             "https://eu.aptabase.com/api/v0/events"
         );
         std::env::remove_var("HEADROOM_APTABASE_APP_KEY");
+    }
+
+    // Tracked at call sites but deliberately not ingested (Aptabase quota).
+    const NOT_INGESTED: &[&str] = &[
+        "app_quit_requested",
+        "auth_code_requested",
+        "auth_verified",
+        "bootstrap_completed",
+        "bootstrap_failed",
+        "bootstrap_skipped",
+        "bootstrap_started",
+        // Install milestones (trackInstallMilestoneOnce), never ingested.
+        "claude_code_detected",
+        "first_optimized_request",
+        "first_savings_recorded",
+        "optimization_enabled",
+        "client_setup_disabled",
+        "client_unrouted_detected",
+        "first_savings_notification_shown",
+        "runtime_auto_paused",
+        "runtime_force_restarted",
+        "runtime_paused",
+        "runtime_resumed",
+        "runtime_upgrade_completed",
+        "runtime_upgrade_failed",
+        "runtime_upgrade_started",
+        "uninstall_completed",
+        "upstream_override_saved",
+    ];
+
+    /// A literal event name at a call site is either allowlisted or listed as
+    /// not ingested, so a new event is never dropped by surprise (as
+    /// client_setup_applied, paywall_shown and the activity tips were).
+    /// Names built at runtime (`format!`, consts) are not seen.
+    #[test]
+    fn every_tracked_event_is_allowlisted_or_listed_as_not_ingested() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut pending = vec![root.join("src"), root.join("src-tauri").join("src")];
+        let mut unlisted = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.path()),
+                );
+                continue;
+            }
+            let file = path.to_string_lossy();
+            if file.contains(".test.")
+                || ![".rs", ".ts", ".tsx"].iter().any(|ext| file.ends_with(ext))
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for call in [
+                "track_event(",
+                "trackAnalyticsEvent(",
+                "trackInstallMilestoneOnce(",
+            ] {
+                for (at, _) in text.match_indices(call) {
+                    let args = &text[at + call.len()..];
+                    // The name is the first literal before the first `)`.
+                    let (Some(quote), Some(close)) = (args.find('"'), args.find(')')) else {
+                        continue;
+                    };
+                    if quote > close {
+                        continue;
+                    }
+                    let name = args[quote + 1..].split('"').next().unwrap_or_default();
+                    let plain = !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                    if plain && !ALLOWED_EVENTS.contains(&name) && !NOT_INGESTED.contains(&name) {
+                        unlisted.push(format!("{name} ({file})"));
+                    }
+                }
+            }
+        }
+        assert!(
+            unlisted.is_empty(),
+            "add to ALLOWED_EVENTS or NOT_INGESTED: {unlisted:?}"
+        );
     }
 
     #[test]

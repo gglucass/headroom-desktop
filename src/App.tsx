@@ -202,6 +202,7 @@ import {
   writeCachedPricing
 } from "./lib/pricing";
 import {
+  activityDotVisible,
   activityFeedSignature,
   homeDashboardPoll,
   launcherVerifyGate,
@@ -1891,7 +1892,8 @@ export default function App() {
       serenaToday: null,
       learningsMilestone: null,
       weeklyRecap: null,
-      trainSuggestion: null
+      trainSuggestion: null,
+      tips: []
     },
     proxyReachable: false
   });
@@ -1909,6 +1911,9 @@ export default function App() {
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
   const activityTabTrackedRef = useRef(false);
+  // Hides the dot the moment Activity opens instead of at the next dashboard
+  // poll. Holds the tips it cleared, so a later tip shows its own dot.
+  const [seenTipIdentity, setSeenTipIdentity] = useState<string | null>(null);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   // Request bytes forwarded unoptimized while gated; see unsavedWhileBlockedLabel.
@@ -3291,6 +3296,20 @@ export default function App() {
       trackAnalyticsEvent("activity_tab_opened");
     }
   }, [activeView]);
+
+  // Looking at Activity clears the tips' dots, here and on the menu bar. The
+  // feed's own flags too: `dashboard` only refreshes on Home, so a tip posted
+  // while Activity is open would otherwise never be marked seen.
+  const feedTips = activityFeed.tiles.tips;
+  const tipUnseen = dashboard.tipUnseen || feedTips.some((tip) => !tip.seen);
+  const tipIdentity = feedTips.map((tip) => tip.observedAt).join();
+  const activityDot = activityDotVisible(dashboard.tipUnseen, seenTipIdentity, tipIdentity, activeView);
+  useEffect(() => {
+    if (!tipUnseen || activeView !== "notifications" || !trayWindowFocused) return;
+    setSeenTipIdentity(tipIdentity);
+    void invoke("mark_tip_seen").catch(() => undefined);
+    // The feed's tip identity re-runs this when another tip posts while Activity is open.
+  }, [activeView, trayWindowFocused, tipUnseen, tipIdentity]);
 
   // Pre-warm Optimize + Activity data the moment the tray gains focus, so
   // switching tabs reveals already-populated content instead of triggering
@@ -6485,9 +6504,14 @@ export default function App() {
   );
 
   const runtimeIssues: string[] = [];
+  // Headroom cannot read or save its own data folder: everything below may be
+  // a side effect of it (an unreadable setup reads as nothing connected), so
+  // it leads. Every machine fault the backend classifies arrives here.
+  const environmentIssues = runtimeStatus?.environmentIssues ?? [];
+  runtimeIssues.push(...environmentIssues);
   // A traffic filter resetting 6767 flaps the status probe, so "runtime
   // offline" and "proxy unreachable" would come and go while the runtime is
-  // fine (RUST-NG). This names the actual cause, so it goes first.
+  // fine (RUST-NG). This names the actual cause, so it goes ahead of them.
   if (runtimeStatus?.localConnectionFilterHint) {
     runtimeIssues.push(runtimeStatus.localConnectionFilterHint);
   }
@@ -6527,6 +6551,7 @@ export default function App() {
       runtimeStatus.mcpConfigured !== false &&
       !runtimeStatus.upstreamTlsInterceptionHint &&
       !runtimeStatus.localConnectionFilterHint &&
+      environmentIssues.length === 0 &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice = platformPreviewNoticeFor(
@@ -7008,9 +7033,13 @@ export default function App() {
             >
               <span className="tray-nav__icon" aria-hidden="true">
                 <item.icon className="tray-nav__icon-svg" size={26} weight={activeView === item.id ? "fill" : "regular"} />
+                {item.id === "notifications" && activityDot ? <span className="tray-nav__dot" /> : null}
               </span>
               <span className="tray-nav__text">
                 <strong>{item.label}</strong>
+                {item.id === "notifications" && activityDot ? (
+                  <span className="visually-hidden"> (new tip)</span>
+                ) : null}
               </span>
             </button>
           ))}

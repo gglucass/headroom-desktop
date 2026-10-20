@@ -73,7 +73,7 @@ static STORE: Mutex<Option<Store>> = Mutex::new(None);
 impl Store {
     fn load_or_create(base_dir: &Path) -> Self {
         let path = crate::storage::config_file(base_dir, FILE_NAME);
-        let days = match std::fs::read(&path) {
+        let days = match crate::state::read_state_file(&path) {
             Ok(bytes) => match serde_json::from_slice::<PersistedCounters>(&bytes) {
                 Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted.days,
                 Ok(persisted) => {

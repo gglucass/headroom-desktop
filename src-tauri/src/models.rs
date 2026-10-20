@@ -420,6 +420,10 @@ pub struct DashboardState {
     pub accepted_terms_version: u32,
     /// Canonical Terms-of-Service URL the acceptance gate links to.
     pub terms_url: String,
+    /// The Activity tip has not been looked at yet: drives the dot on the
+    /// Activity tab (the menu bar icon reads it from state directly).
+    #[serde(default)]
+    pub tip_unseen: bool,
 }
 
 /// Why the last bootstrap failed, in the two forms a support report needs:
@@ -546,6 +550,11 @@ pub struct RuntimeStatus {
     /// resetting connections to the intercept; `None` once that stops.
     #[serde(default)]
     pub local_connection_filter_hint: Option<String>,
+    /// Prose, one per machine fault on Headroom's data folder (blocked,
+    /// read-only, full disk), from `env_fault`; empty once access works again.
+    /// Every such fault reaches the banner through this one list.
+    #[serde(default)]
+    pub environment_issues: Vec<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }
@@ -665,6 +674,8 @@ pub struct TransformationFeedEvent {
     pub uncached_input_tokens: Option<u64>,
     #[serde(default, alias = "cache_write_tokens")]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default, alias = "cache_read_tokens")]
+    pub cache_read_tokens: Option<u64>,
     // The feed's request_messages / compressed_messages / response_content
     // bodies are not modelled: the fetch asks the backend to omit them
     // (`include_messages=0`, lib.rs) and serde ignores them when an older
@@ -687,13 +698,41 @@ impl TransformationFeedEvent {
     /// Left as-is when the backend does not report the split; percent and
     /// pair are `None` when nothing new entered context, matching the chart,
     /// which skips such buckets.
+    /// The whole prompt the provider received: the cache split's three parts.
+    /// `input_tokens_optimized` cannot say it once `apply_new_input_basis` ran
+    /// (new input only), so it is the fallback for a feed with no split.
+    pub fn context_tokens(&self) -> Option<u64> {
+        match self.new_input() {
+            Some(fresh) => Some(fresh.saturating_add(self.cache_read_tokens.unwrap_or(0))),
+            None => self.input_tokens_optimized,
+        }
+    }
+
+    /// Uncached plus cache-write input, or None when the feed has no split.
+    /// Only Anthropic (direct, Bedrock, Vertex) bills writes apart from
+    /// uncached input. Everything else here comes through the OpenAI handler,
+    /// which infers a write equal to the uncached input and, on /v1/responses
+    /// (Codex), reports that same input as uncached too (wheel 0.41.0): one
+    /// figure, counted once. `provider` is the feed's display label ("OpenAI",
+    /// "OpenRouter", ...), so it is matched loosely.
+    fn new_input(&self) -> Option<u64> {
+        let (uncached, cache_write) = (self.uncached_input_tokens?, self.cache_write_tokens?);
+        let provider = self
+            .provider
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Some(if provider.contains("anthropic") || provider == "bedrock" {
+            uncached.saturating_add(cache_write)
+        } else {
+            uncached.max(cache_write)
+        })
+    }
+
     pub fn apply_new_input_basis(&mut self) {
-        let (Some(uncached), Some(cache_write)) =
-            (self.uncached_input_tokens, self.cache_write_tokens)
-        else {
+        let Some(new_input) = self.new_input() else {
             return;
         };
-        let new_input = uncached.saturating_add(cache_write);
         if new_input == 0 {
             self.savings_percent = None;
             self.input_tokens_original = None;
@@ -839,6 +878,111 @@ pub struct TrainSuggestionEvent {
     pub kind: String,
 }
 
+/// An Activity tip: a saving the user's own Claude Code or Codex traffic shows
+/// they would get from one change. Headroom changes nothing unless the user
+/// clicks the tip's apply button (`apply_tip`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TipKind {
+    /// A request reached 400k tokens: `/autocompact 400k` caps what every
+    /// later turn re-sends.
+    CompactWindow,
+    /// Haiku 5.5 bills a request over 100k tokens at 5x: `/autocompact 100k`
+    /// keeps it under the step.
+    HaikuLongContext,
+    /// Fable 5.1 costs the same as Fable 5 except cache reads, at a quarter.
+    FableUpgrade,
+    /// On pace to use up the weekly plan limit before it resets.
+    WeeklyPace,
+    /// Extra usage is paying, and its prompt cache lasts 5 minutes, not an hour.
+    ExtraUsageCache,
+    /// Hit the plan's usage limit: Claude Code can wait out the reset itself.
+    AutoContinue,
+    /// A conversation came back after its hour of prompt cache and wrote its
+    /// whole context again.
+    IdleBreak,
+    /// A project's sessions start heavy before the first prompt.
+    HeavyStartup,
+    /// A Codex request reached `CODEX_COMPACT_TIP_MIN_TOKENS`: `/compact`, or
+    /// `model_auto_compact_token_limit` in ~/.codex/config.toml.
+    CodexCompact,
+    /// On pace to use up the weekly Codex limit before it resets.
+    CodexWeeklyPace,
+    /// Claude is at its usage limit while the Codex plan has room.
+    SwitchToCodex,
+    /// Codex is at its usage limit while the Claude plan has room.
+    SwitchToClaude,
+}
+
+impl TipEvent {
+    pub fn new(kind: TipKind, observed_at: DateTime<Utc>, context_tokens: u64) -> Self {
+        Self {
+            kind,
+            observed_at,
+            context_tokens,
+            used_percent: None,
+            resets_at: None,
+            limit_at: None,
+            project: None,
+            seen: false,
+        }
+    }
+
+    /// Persisted fire-once key: the kind, per project for `HeavyStartup`.
+    pub fn fire_key(&self) -> String {
+        match (self.kind, &self.project) {
+            (TipKind::HeavyStartup, Some(project)) => format!("heavy_startup:{project}"),
+            _ => self.kind.key().to_string(),
+        }
+    }
+}
+
+impl TipKind {
+    /// Persisted fire-once key; matches the serde name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::CompactWindow => "compact_window",
+            Self::HaikuLongContext => "haiku_long_context",
+            Self::FableUpgrade => "fable_upgrade",
+            Self::WeeklyPace => "weekly_pace",
+            Self::ExtraUsageCache => "extra_usage_cache",
+            Self::AutoContinue => "auto_continue",
+            Self::IdleBreak => "idle_break",
+            Self::HeavyStartup => "heavy_startup",
+            Self::CodexCompact => "codex_compact",
+            Self::CodexWeeklyPace => "codex_weekly_pace",
+            Self::SwitchToCodex => "switch_to_codex",
+            Self::SwitchToClaude => "switch_to_claude",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TipEvent {
+    pub kind: TipKind,
+    pub observed_at: DateTime<Utc>,
+    /// Size of the request that posted the tip, or for `HeavyStartup` the
+    /// project's median session start. 0 when the kind has none.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// `WeeklyPace`/`CodexWeeklyPace`: weekly limit used, its reset, and when
+    /// this pace hits it. `SwitchTo*`: the other plan's fullest window, and
+    /// when the limited one lifts (`resets_at`, absent when unknown).
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub resets_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub limit_at: Option<DateTime<Utc>>,
+    /// `HeavyStartup`: the project's folder name.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Set once the Activity tab has shown it; clears both unread dots.
+    #[serde(default)]
+    pub seen: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "camelCase")]
 pub enum ActivityEvent {
@@ -868,6 +1012,8 @@ pub struct ActivityFeedSnapshot {
     pub learnings_milestone: Option<LearningsMilestoneEvent>,
     pub weekly_recap: Option<WeeklyRecapEvent>,
     pub train_suggestion: Option<TrainSuggestionEvent>,
+    /// Newest first; empty renders nothing.
+    pub tips: Vec<TipEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

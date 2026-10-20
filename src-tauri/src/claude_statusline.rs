@@ -233,6 +233,9 @@ pub fn record(session_id: &str, tokens_saved: i64) {
 /// A request of this conversation just went to the backend for compression.
 pub fn record_request(session_id: &str) {
     update(|state, now_ms| {
+        if let Some(session) = state.sessions.get(session_id) {
+            crate::tip_signals::note_request_gap(session.last_active_ms(), now_ms);
+        }
         apply_request(&mut state.sessions, session_id, now_ms);
         true
     });

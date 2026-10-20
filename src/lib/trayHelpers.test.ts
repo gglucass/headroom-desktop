@@ -2,6 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  activityDotVisible,
   activityFeedSignature,
   homeDashboardPoll,
   launcherVerifyGate,
@@ -39,7 +40,8 @@ const emptySnapshot: ActivityFeedResponse = {
     serenaToday: null,
     learningsMilestone: null,
     weeklyRecap: null,
-    trainSuggestion: null
+    trainSuggestion: null,
+    tips: []
   }
 };
 
@@ -58,7 +60,7 @@ describe("loadDashboard", () => {
 describe("activityFeedSignature", () => {
   it("returns a stable string for an empty snapshot", () => {
     const sig = activityFeedSignature(emptySnapshot);
-    expect(sig).toBe("1|t:-|r:-|b:-|s:-|l:-|wr:-|ts:-");
+    expect(sig).toBe("1|t:-|r:-|b:-|s:-|l:-|wr:-|ts:-|tip:-");
   });
 
   it("differentiates proxyReachable false from proxyReachable true", () => {
@@ -118,7 +120,7 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("t:2026-04-25T12:00:00Z");
   });
 
-  it("encodes record, rtkToday, learningsMilestone, weeklyRecap, trainSuggestion slots", () => {
+  it("encodes record, rtkToday, learningsMilestone, weeklyRecap, trainSuggestion, tip slots", () => {
     const sig = activityFeedSignature({
       proxyReachable: true,
       tiles: {
@@ -131,7 +133,16 @@ describe("activityFeedSignature", () => {
         trainSuggestion: {
           projectPath: "/Users/x/proj",
           observedAt: "2026-04-25T09:00:00Z"
-        } as never
+        } as never,
+        tips: [
+          {
+            kind: "compact_window",
+            observedAt: "2026-04-25T08:00:00Z",
+            contextTokens: 412000,
+            seen: true
+          },
+          { kind: "idle_break", observedAt: "2026-04-25T07:00:00Z", contextTokens: 0, seen: false }
+        ]
       }
     });
     expect(sig).toContain("r:2026-04-25T11:00:00Z");
@@ -140,6 +151,8 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("l:2026-04-25T10:00:00Z");
     expect(sig).toContain("wr:2026-04-20");
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");
+    // `seen` is in the key so opening Activity re-renders the tile without its dot.
+    expect(sig).toContain("tip:compact_window:2026-04-25T08:00:00Z:1,idle_break:2026-04-25T07:00:00Z:0");
   });
 
 });
@@ -174,6 +187,19 @@ describe("useWindowFocused", () => {
     expect(result.current).toBe(true);
     act(() => emitFocus(false));
     expect(result.current).toBe(false);
+  });
+});
+
+describe("activityDotVisible", () => {
+  it("shows a tip posted after Activity was seen while the Home flag is still stale", () => {
+    // Tip A seen on Activity; the dashboard only refreshes on Home, so its
+    // flag stays true from A while the user is elsewhere.
+    expect(activityDotVisible(true, "A", "A", "notifications")).toBe(false);
+    expect(activityDotVisible(true, "A", "A", "settings")).toBe(false);
+    // Tip B posts while the tray is hidden; the user reopens it on Home.
+    expect(activityDotVisible(true, "A", "A,B", "home")).toBe(true);
+    expect(activityDotVisible(false, "A", "A,B", "home")).toBe(false);
+    expect(activityDotVisible(true, null, "", "home")).toBe(true);
   });
 });
 

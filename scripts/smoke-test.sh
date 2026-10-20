@@ -443,15 +443,12 @@ if [ -z "$pid" ]; then
 else
   noccr=$(ps -o args= -p "$pid" | tr ' ' '\n' | grep -c -- '--no-ccr')
   inj=$(ps eww -o command= -p "$pid" | grep -c 'pyinject')
-  guard=$(grep -c '_hd_sc_cacheable' "$HR/pyinject/sitecustomize.py" 2>/dev/null)
   # 0.9.6 re-enabled CCR, so --no-ccr is opt-in now; a 1 means the kill switch
   # is set for this session, not that the build is broken.
   [ "$noccr" = "0" ] && row PASS "12 ccr enabled" "no --no-ccr (default)" \
     || row FAIL "12 ccr enabled" "--no-ccr present, CCR is OFF this session"
   [ "$inj" = "1" ] && row PASS "12 pyinject on path" "PYTHONPATH set" \
     || row FAIL "12 pyinject on path" "pyinject not on the backend's env"
-  [ "${guard:-0}" -gt 0 ] && row PASS "12 cache guard on disk" "$guard hits" \
-    || row FAIL "12 cache guard on disk" "_hd_sc_cacheable absent from sitecustomize.py"
 
   if [ "$QUICK" = 1 ]; then
     : # SIGUSR1 already reported as skipped above

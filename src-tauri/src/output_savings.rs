@@ -66,6 +66,12 @@ const MIN_BASELINE_N: u64 = 10;
 /// conversation are one observation, not five.
 const MEASURED_MIN_CLUSTERS: usize = 5;
 
+/// Conversations each arm of every stratum it uses needs before the holdout
+/// may take the headline from the synthetic control, mirroring the backend
+/// (0.41.0). The band is computed per request, so five long control
+/// conversations read as +/-4pp where the honest band is tens of points.
+const MEASURED_SUPERSEDE_MIN_CLUSTERS: usize = 30;
+
 /// Running count / sum / sum-of-squares, mirroring the backend's `_Accum` so
 /// mean and variance come out bit-comparable.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,7 +361,9 @@ fn estimate_from_bytes(bytes: &[u8]) -> LedgerEstimate {
     let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
         return LedgerEstimate::NoEvidence;
     };
-    let best = measured_if_ready(&ledger).or_else(|| estimate_from_baseline(&ledger));
+    let best = measured_if_ready(&ledger, MEASURED_SUPERSEDE_MIN_CLUSTERS)
+        .or_else(|| estimate_from_baseline(&ledger))
+        .or_else(|| measured_if_ready(&ledger, MEASURED_MIN_CLUSTERS));
     classify(&ledger, best)
 }
 
@@ -366,7 +374,9 @@ fn estimated_from_bytes(bytes: &[u8]) -> LedgerEstimate {
     match estimate_from_baseline(&ledger) {
         // Scoreable by the holdout alone (control n of 5-9 everywhere): not
         // Unscored, which would make the tracker discard its sampled buckets.
-        None if measured_if_ready(&ledger).is_some() => LedgerEstimate::NoEvidence,
+        None if measured_if_ready(&ledger, MEASURED_MIN_CLUSTERS).is_some() => {
+            LedgerEstimate::NoEvidence
+        }
         estimated => classify(&ledger, estimated),
     }
 }
@@ -418,8 +428,9 @@ fn estimate_from_baseline(ledger: &Ledger) -> Option<OutputEstimate> {
 }
 
 /// A/B measurement: per-stratum control mean minus treatment mean, over strata
-/// with data in both arms. `None` until the holdout has produced any.
-fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
+/// with at least `min_clusters` conversations in both arms. `None` until the
+/// holdout has produced any.
+fn estimate_from_holdout(ledger: &Ledger, min_clusters: usize) -> Option<OutputEstimate> {
     let mut saved = 0.0;
     let mut baseline_tokens = 0.0;
     let mut var = 0.0;
@@ -427,7 +438,11 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
     let mut covered_output = 0.0;
 
     for (key, t) in &ledger.treatment {
-        let Some(c) = ledger.control.get(key).filter(|c| holdout_scores(t, c)) else {
+        let Some(c) = ledger
+            .control
+            .get(key)
+            .filter(|c| holdout_scores(t, c, min_clusters))
+        else {
             continue;
         };
         let n = t.qn as f64;
@@ -449,12 +464,9 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
 }
 
 /// Whether the holdout can score a stratum: conversation-qualified rows in both
-/// arms, from at least [`MEASURED_MIN_CLUSTERS`] conversations each.
-fn holdout_scores(t: &Accum, c: &Accum) -> bool {
-    t.qn > 0
-        && c.qn > 0
-        && t.clusters.len() >= MEASURED_MIN_CLUSTERS
-        && c.clusters.len() >= MEASURED_MIN_CLUSTERS
+/// arms, from at least `min_clusters` conversations each.
+fn holdout_scores(t: &Accum, c: &Accum, min_clusters: usize) -> bool {
+    t.qn > 0 && c.qn > 0 && t.clusters.len() >= min_clusters && c.clusters.len() >= min_clusters
 }
 
 /// A stratum the daily A/B series can price: the shaped arm's
@@ -482,7 +494,10 @@ fn holdout_strata_from_bytes(bytes: &[u8]) -> Option<HashMap<String, HoldoutStra
             .treatment
             .iter()
             .filter_map(|(key, t)| {
-                let c = ledger.control.get(key).filter(|c| holdout_scores(t, c))?;
+                let c = ledger
+                    .control
+                    .get(key)
+                    .filter(|c| holdout_scores(t, c, MEASURED_MIN_CLUSTERS))?;
                 let stratum = HoldoutStratum {
                     shaped_replies: t.qn,
                     shaped_tokens: t.qsum,
@@ -504,15 +519,16 @@ fn holdout_strata_from_bytes(bytes: &[u8]) -> Option<HashMap<String, HoldoutStra
 /// denominator held promotion back by however much history a machine had:
 /// 54k such rows on one machine against a few thousand a day of new ones.
 ///
-/// A ready holdout wins even where the synthetic control covers more traffic.
+/// A holdout ready at [`MEASURED_SUPERSEDE_MIN_CLUSTERS`] wins even where the
+/// synthetic control covers more traffic.
 /// That control scores against a baseline frozen before install, which ran
 /// 20-65% above the concurrent control arm in the same stratum (model and
 /// workload drift); a rule refusing "a measurement of less traffic" kept that
 /// biased figure up on every machine, since it covers ~90% of qualified
 /// traffic and a holdout at 3% never will. It also made a reply addon's users
 /// (Chisle, Caveman, Ponytail) the only ones who could see the holdout.
-fn measured_if_ready(ledger: &Ledger) -> Option<OutputEstimate> {
-    let measured = estimate_from_holdout(ledger)?;
+fn measured_if_ready(ledger: &Ledger, min_clusters: usize) -> Option<OutputEstimate> {
+    let measured = estimate_from_holdout(ledger, min_clusters)?;
     if measured.coverage_percent < MEASURED_MIN_COVERAGE_PCT {
         return None;
     }
@@ -634,6 +650,16 @@ mod tests {
         MIXED.replace("\"control\": {}", &format!("\"control\": {control}"))
     }
 
+    /// Thirty conversations a side, what a holdout needs to take the headline
+    /// (`HOLDOUT` itself has five: enough to score, not to supersede).
+    fn solid(json: &str) -> String {
+        let thirty: Vec<String> = (1..=30).map(|i| format!("\"c{i}\"")).collect();
+        json.replace(
+            r#"["c1", "c2", "c3", "c4", "c5"]"#,
+            &format!("[{}]", thirty.join(", ")),
+        )
+    }
+
     fn with_control(control: &str) -> String {
         let idx = HOLDOUT
             .find("\"control\"")
@@ -707,7 +733,7 @@ mod tests {
 
     #[test]
     fn measured_replaces_estimated_once_it_is_solid() {
-        let e = estimate(HOLDOUT);
+        let e = estimate(&solid(HOLDOUT));
         assert_eq!(e.method, "measured");
         assert!((e.reduction_percent - 20.0).abs() < 1e-9);
         assert_eq!(e.requests, 1000);
@@ -721,10 +747,10 @@ mod tests {
         // measured side is on the qn basis, so its coverage gate has to be
         // too, or it cannot promote until new traffic outweighs all of that
         // history.
-        let e = estimate(&HOLDOUT.replace(
+        let e = estimate(&solid(&HOLDOUT.replace(
             r#"{"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
             r#"{"n": 11000, "sum": 8800000, "sumsq": 7049990000,"#,
-        ));
+        )));
         assert_eq!(e.method, "measured");
         assert_eq!(e.requests, 1000);
         assert!((e.coverage_percent - 100.0).abs() < 1e-9);
@@ -861,17 +887,38 @@ mod tests {
         assert_eq!(few.method, "estimated");
     }
 
+    /// 0.41.0's supersede gate: five conversations a side score a stratum but
+    /// leave the headline to the synthetic control, which the holdout only
+    /// replaces where there is none.
+    #[test]
+    fn a_holdout_under_thirty_conversations_keeps_the_estimate_unless_there_is_none() {
+        assert_eq!(estimate(HOLDOUT).method, "estimated");
+        // Under MIN_BASELINE_N control replies, so the arm is no baseline either.
+        let thin = with_control(
+            r#""control": {"opus|ask|l|tools": {"n": 8, "sum": 8000, "sumsq": 8079200,
+                                               "qn": 8, "qsum": 8000, "qsumsq": 8079200,
+                                               "clusters": ["c1", "c2", "c3", "c4", "c5"]}}"#,
+        );
+        let no_baseline = thin.replace(
+            r#""strata": {"opus|ask|l|tools": {"n": 100, "sum": 95000, "sumsq": 90490000}},
+        "glob":   {"n": 100, "sum": 95000, "sumsq": 90490000}"#,
+            r#""strata": {}"#,
+        );
+        assert_ne!(no_baseline, thin);
+        assert_eq!(estimate(&no_baseline).method, "measured");
+    }
+
     #[test]
     fn a_solid_holdout_measuring_longer_replies_reports_the_negative() {
         // Control replies come out SHORTER than treatment (700 vs 800). Once
         // the holdout is solid that finding replaces the synthetic estimate,
         // sign and all: floored, it read "Output 0%" for a shaper that made
         // replies 14% longer.
-        let e = estimate(&with_control(
+        let e = estimate(&solid(&with_control(
             r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 70000, "sumsq": 49010000,
                                                "qn": 100, "qsum": 70000, "qsumsq": 49010000,
                                                "clusters": ["c1", "c2", "c3", "c4", "c5"]}}"#,
-        ));
+        )));
         assert_eq!(e.method, "measured");
         assert!((e.reduction_percent + 14.285_714).abs() < 1e-5);
         assert_eq!(e.tokens_saved, 0);
@@ -912,7 +959,7 @@ mod tests {
                                                       "qn": 2000, "qsum": 40000, "qsumsq": 800000,
                                                       "clusters": ["s1", "s2", "s3", "s4", "s5"]},"#,
         );
-        let e = estimate(&json);
+        let e = estimate(&solid(&json));
         assert_eq!(e.method, "measured");
         assert_eq!(e.requests, 1000);
         assert!((e.coverage_percent - 95.238_095).abs() < 1e-5);
@@ -934,7 +981,7 @@ mod tests {
                 r#""strata": {"#,
                 r#""strata": {"opus|ask|xl|tools": {"n": 100, "sum": 120000, "sumsq": 144990000},"#,
             );
-        let m = estimate(&json);
+        let m = estimate(&solid(&json));
         assert_eq!(m.method, "measured");
         assert_eq!(m.requests, 1000);
         assert!((m.reduction_percent - 20.0).abs() < 1e-9);

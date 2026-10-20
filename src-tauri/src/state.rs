@@ -2569,6 +2569,72 @@ impl AppState {
         events
     }
 
+    /// Feed the tips what the intercept, plan usage and transcripts show.
+    /// Runs every observer tick before the feed batch (see observe_signal_tips).
+    pub fn observe_tip_signals(&self) {
+        // The transcript scan reads up to 10 session files per project, at most
+        // every 6h: each project gets its own heavy-startup tip, and a showing
+        // one leaves once its project starts light.
+        static LAST_STARTUP_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
+        const STARTUP_SCAN_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+        let observed = crate::tip_signals::observed();
+        let startup_medians = {
+            let mut last = LAST_STARTUP_SCAN.lock();
+            if last.is_some_and(|at| at.elapsed() < STARTUP_SCAN_EVERY) {
+                Vec::new()
+            } else {
+                *last = Some(Instant::now());
+                drop(last);
+                startup_medians(std::time::SystemTime::now())
+            }
+        };
+        // Read while the tip shows too, so turning it on in /config takes it down.
+        let auto_continue_tip = self
+            .activity_facts
+            .lock()
+            .showing_tip(crate::models::TipKind::AutoContinue);
+        let signals = crate::activity_facts::TipSignals {
+            extra_usage_in_use: observed.extra_usage_in_use,
+            usage_limit_hit: observed.usage_limit_hit,
+            auto_continue_on: (observed.usage_limit_hit || auto_continue_tip)
+                && claude_auto_continue_on(),
+            idle_resume_at: observed
+                .idle_resume_at_ms
+                .and_then(DateTime::from_timestamp_millis),
+            usage_limit_resets_at: observed
+                .usage_limit_resets_at
+                .and_then(|at| DateTime::from_timestamp(at, 0)),
+            claude_usage: crate::claude_statusline::plan_usage(),
+            codex_usage: crate::claude_statusline::codex_plan_usage().unwrap_or_default(),
+            claude_in_use: crate::usage_counters::requests_since_yesterday("claude-code") > 0,
+            codex_in_use: crate::usage_counters::requests_since_yesterday("codex") > 0,
+            startup_medians,
+        };
+        let mut facts = self.activity_facts.lock();
+        facts.observe_signal_tips(&signals, Utc::now());
+        let _ = facts.save_if_dirty();
+    }
+
+    /// Drives the unread dot on the Activity tab and the menu bar icon.
+    pub fn tip_unseen(&self) -> bool {
+        self.activity_facts.lock().tip_unseen()
+    }
+
+    /// The kinds of the tips this marked seen.
+    pub fn mark_tips_seen(&self) -> Vec<crate::models::TipKind> {
+        let mut facts = self.activity_facts.lock();
+        let seen = facts.mark_tips_seen();
+        let _ = facts.save_if_dirty();
+        seen
+    }
+
+    pub fn dismiss_tip(&self, kind: crate::models::TipKind) {
+        let mut facts = self.activity_facts.lock();
+        facts.dismiss_tip(kind);
+        let _ = facts.save_if_dirty();
+    }
+
     /// Request ids behind the large-compression and record tiles: the only
     /// requests whose bodies the desktop holds (`capture_tile_bodies`).
     pub fn activity_tile_request_ids(&self) -> Vec<String> {
@@ -3066,6 +3132,7 @@ impl AppState {
                 required_terms_version: REQUIRED_TERMS_VERSION,
                 accepted_terms_version,
                 terms_url: TERMS_URL.to_string(),
+                tip_unseen: self.tip_unseen(),
             },
             pending_milestones,
         )
@@ -3828,6 +3895,7 @@ impl AppState {
             .map(str::to_string),
             local_connection_filter_hint: crate::proxy_intercept::local_connection_filter_hint()
                 .map(str::to_string),
+            environment_issues: crate::env_fault::active_issues(),
             runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
@@ -4787,6 +4855,110 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Claude Code's own setting to wait out a usage limit and resume the task.
+fn claude_auto_continue_on() -> bool {
+    // Claude Code reads the setting as `?? true` (2.1.303): absent is on.
+    std::fs::read(user_home_dir().join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_none_or(|settings| settings["autoContinueAtUsageLimit"] != Value::Bool(false))
+}
+
+/// Each project's median token count before the first prompt, as (folder
+/// name, median), over its newest interactive Claude Code sessions of the last
+/// 7 days, when it has at least 5. Reads each session's first usage line;
+/// never content.
+fn startup_medians(now: std::time::SystemTime) -> Vec<(String, u64)> {
+    const RECENT: Duration = Duration::from_secs(7 * 24 * 3600);
+    let Some(cutoff) = now.checked_sub(RECENT) else {
+        return Vec::new();
+    };
+    let Ok(dirs) = std::fs::read_dir(claude_projects_dir()) else {
+        return Vec::new();
+    };
+    dirs.flatten()
+        .filter_map(|dir| project_startup_median(&dir.path(), cutoff))
+        .collect()
+}
+
+/// `startup_medians` for one project folder of `~/.claude/projects`.
+fn project_startup_median(dir: &Path, cutoff: std::time::SystemTime) -> Option<(String, u64)> {
+    let recent: Vec<PathBuf> = list_session_jsonl_files(dir)
+        .into_iter()
+        .filter(|file| {
+            std::fs::metadata(file)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified >= cutoff)
+        })
+        .collect();
+    // Oldest first, so the newest ten interactive ones. Headless runs drop out
+    // before the cap: a project whose newest ten were `claude -p` was never
+    // measured.
+    // shortcut: tries the newest 100 sessions, raise it if automation outruns that.
+    let starts: Vec<(String, u64)> = recent
+        .iter()
+        .rev()
+        .take(100)
+        .filter_map(|file| session_start_tokens(file))
+        .take(10)
+        .collect();
+    if starts.len() < 5 {
+        return None;
+    }
+    let mut tokens: Vec<u64> = starts.iter().map(|(_, tokens)| *tokens).collect();
+    tokens.sort_unstable();
+    let name = Path::new(&starts[0].0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&starts[0].0)
+        .to_string();
+    Some((name, tokens[tokens.len() / 2]))
+}
+
+/// (cwd, prompt tokens) of a session's first main-thread reply: what Claude
+/// Code loads before work starts, plus the first prompt (the median absorbs a
+/// long one). None for headless runs (`claude -p`, the SDK, Headroom's own
+/// learn scans), which are not the user's sessions.
+fn session_start_tokens(path: &Path) -> Option<(String, u64)> {
+    use std::io::{BufRead, BufReader, Read};
+    let reader = BufReader::new(std::fs::File::open(path).ok()?.take(4 * 1024 * 1024));
+    for line in reader.split(b'\n').take(400) {
+        let line = line.ok()?;
+        const NEEDLE: &[u8] = b"\"usage\"";
+        if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if entry["type"] != "assistant" || entry["isSidechain"] == Value::Bool(true) {
+            continue;
+        }
+        if entry["entrypoint"]
+            .as_str()
+            .is_none_or(|e| e.starts_with("sdk"))
+        {
+            return None;
+        }
+        let usage = &entry["message"]["usage"];
+        let tokens = [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .filter_map(|field| usage[field].as_u64())
+        .sum::<u64>();
+        return (tokens > 0).then(|| {
+            (
+                entry["cwd"].as_str().unwrap_or_default().to_string(),
+                tokens,
+            )
+        });
+    }
+    None
+}
+
 /// On Windows, `std::fs::canonicalize` returns extended-length paths
 /// (`\\?\C:\...`). This string leaves the app as `headroom learn --project
 /// <path>`, where the pinned Python CLI matches it against transcript `cwd`
@@ -5062,14 +5234,24 @@ fn persist_launch_profile(path: Option<&std::path::Path>, profile: &LaunchProfil
 /// backoff. A read error on an EXISTING file (ENFILE, EIO) says nothing about
 /// its bytes, so a caller may reset or move aside only a file it actually
 /// parsed: conflating the two lost real state in RUST-5T (see
-/// `load_setup_state`). NotFound is returned at once, unretried.
+/// `load_setup_state`). NotFound is returned at once, unretried. The outcome
+/// feeds `env_fault`; a machine fault keeps its kind and gains `env_fault::NOTE`
+/// in its message.
 pub(crate) fn read_state_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    std::fs::read(path).or_else(|err| {
+    let read = std::fs::read(path).or_else(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             return Err(err);
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
         std::fs::read(path)
+    });
+    let note = crate::env_fault::note(path, crate::env_fault::Op::Read, &read);
+    read.map_err(|err| {
+        if note.is_empty() {
+            err
+        } else {
+            std::io::Error::new(err.kind(), format!("{err}{note}"))
+        }
     })
 }
 
@@ -11146,6 +11328,65 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_start_reads_the_first_interactive_reply() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, lines: &[&str]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let reply = |entrypoint: &str, sidechain: bool, read: u64| {
+            format!(
+                r#"{{"type":"assistant","isSidechain":{sidechain},"entrypoint":"{entrypoint}","cwd":"/w/proj","message":{{"usage":{{"input_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":{read}}}}}}}"#
+            )
+        };
+        let user = r#"{"type":"user","message":{"content":"hi"}}"#;
+        let side = reply("cli", true, 1);
+        let main = reply("claude-vscode", false, 60_000);
+        let interactive = write("a.jsonl", &[user, &side, &main, &reply("cli", false, 9)]);
+        assert_eq!(
+            super::session_start_tokens(&interactive),
+            Some(("/w/proj".to_string(), 61_005))
+        );
+        let headless = write("b.jsonl", &[user, &reply("sdk-cli", false, 60_000)]);
+        assert_eq!(super::session_start_tokens(&headless), None);
+    }
+
+    #[test]
+    fn startup_median_skips_headless_runs_before_taking_the_newest_ten() {
+        // A project automated more than used by hand: its newest ten sessions
+        // are `claude -p` runs, the interactive ones older.
+        let dir = tempfile::TempDir::new().unwrap();
+        let now = std::time::SystemTime::now();
+        let reply = |entrypoint: &str, read: u64| {
+            format!(
+                r#"{{"type":"assistant","entrypoint":"{entrypoint}","cwd":"/w/proj","message":{{"usage":{{"input_tokens":0,"cache_read_input_tokens":{read}}}}}}}"#
+            )
+        };
+        let session = |name: String, line: String, age_secs: u64| {
+            let path = dir.path().join(name);
+            fs::write(&path, line).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age_secs))
+                .unwrap();
+        };
+        for i in 0..6u64 {
+            session(format!("i{i}.jsonl"), reply("cli", 40_000 + i), 3_600 + i);
+        }
+        for i in 0..10u64 {
+            session(format!("h{i}.jsonl"), reply("sdk-cli", 90_000), i);
+        }
+        let cutoff = now - std::time::Duration::from_secs(7 * 24 * 3600);
+        assert_eq!(
+            super::project_startup_median(dir.path(), cutoff),
+            Some(("proj".to_string(), 40_003))
+        );
+    }
+
     use std::fs;
     use std::path::PathBuf;
 
@@ -14043,6 +14284,7 @@ mod tests {
             turn_id: None,
             uncached_input_tokens: None,
             cache_write_tokens: None,
+            cache_read_tokens: None,
         };
 
         let first =
@@ -15172,6 +15414,17 @@ mod tests {
         assert_eq!(parsed.savings_history.len(), 1);
         // No traffic_learner block in this payload (older backend shape).
         assert!(parsed.learner_progress.is_none());
+    }
+
+    #[test]
+    fn codex_new_input_correction_is_pinned() {
+        // TransformationFeedEvent::new_input (models.rs) counts an OpenAI row's
+        // write and uncached input once (their max): right on 0.41.0, where a
+        // write is either inferred (equal to uncached, or alone) or a reported
+        // 0. A wheel that reports real OpenAI writes beside uncached input
+        // (after #4237) needs the sum there; upstream #4285 also stops /stats
+        // totals counting inferred writes twice, so recheck both on the bump.
+        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.41.0");
     }
 
     /// The /stats contract, in one place: every primary JSON path this app

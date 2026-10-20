@@ -106,7 +106,7 @@ fn is_transient_transport_error(msg: &str) -> bool {
 // itself once the user clears the disk.
 fn is_disk_full(msg: &str) -> bool {
     msg.contains("No space left on device") // unix ENOSPC
-        || (cfg!(windows) && msg.contains("os error 112")) // Windows ERROR_DISK_FULL
+        || (cfg!(windows) && msg.contains("(os error 112)")) // Windows ERROR_DISK_FULL, not 1120-1129
 }
 
 // Non-2xx response from the update endpoint. Most commonly a transient 5xx
@@ -152,6 +152,7 @@ fn is_unreportable(msg: &str) -> bool {
         || is_system_fd_exhaustion(msg)
         || is_windows_session_end_panic(msg)
         || msg.contains(crate::client_adapters::LOCKED_FILE_NOTE)
+        || msg.contains(crate::env_fault::NOTE)
 }
 
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
@@ -159,6 +160,13 @@ fn is_unreportable(msg: &str) -> bool {
 fn skip_sentry(target: &str, msg: &str) -> bool {
     // Environmental and target-agnostic: keep the local log, drop the event.
     if is_disk_full(msg) || is_system_fd_exhaustion(msg) {
+        return true;
+    }
+    // A machine fault on Headroom's data folder: `env_fault` sends one event
+    // per fault itself, so the line from whichever file tripped on it is a
+    // duplicate (RUST-R1/R2 were one blocked folder seen from two files).
+    // `is_unreportable` drops the same note from direct captures.
+    if msg.contains(crate::env_fault::NOTE) {
         return true;
     }
     // A line announcing that a Sentry capture was skipped must never itself be
@@ -243,12 +251,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
-    // The 10013 unwire is reported by the same retry's once-per-error
-    // `proxy_intercept_bind_failed` capture (RUST-EQ), whose `probe` extra
-    // tells a reserved range from another account's listener; bridged, the
-    // warn filed every such host a second time as RUST-RC.
+    // Both unwires are reported by the same retry's once-per-error
+    // `proxy_intercept_bind_failed` capture: the 10013 one by RUST-EQ, whose
+    // `probe` extra tells a reserved range from another account's listener,
+    // and the stranger-holder one by the foreign/unidentified capture (RUST-EE,
+    // RUST-KD; Paseo is skipped there on purpose). Bridged, the warns filed
+    // every such host a second time as RUST-RC and RUST-KF.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
-        && msg.starts_with("[proxy_intercept] unwired clients: Windows refused port")
+        && msg.starts_with("[proxy_intercept] unwired clients")
     {
         return true;
     }
@@ -732,9 +742,23 @@ fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
 pub(crate) fn before_send(
     event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
+    if echoes_env_fault(&event, crate::env_fault::active()) {
+        return None;
+    }
     crate::analytics::sharing_enabled()
         .then(|| sanitize_event(event))
         .flatten()
+}
+
+/// While Headroom's data folder is unusable everything fails at once: one Mac
+/// whose external home drive macOS blocked filed RUST-29, RUST-6S and RUST-RD
+/// in one second (pip's interpreter and the MCP helper could not open their
+/// own files there). `env_fault` reports that fault once; the rest is its echo.
+/// Panics (Fatal) still go through.
+fn echoes_env_fault(event: &sentry::protocol::Event<'static>, fault_active: bool) -> bool {
+    fault_active
+        && event.level < sentry::Level::Fatal
+        && event.tags.get("flow").map(String::as_str) != Some("env_fault")
 }
 
 pub(crate) fn sanitize_event(
@@ -1190,6 +1214,23 @@ mod tests {
     /// ENFILE is a machine-wide resource we cannot free, and it fails every
     /// file touch identically (RUST-A3 writing, RUST-5T reading). EMFILE is the
     /// per-process limit and would mean we leak descriptors -- keep reporting it.
+    /// RUST-R1/R2: one blocked data folder, seen from two files, was two
+    /// issues. `env_fault` reports the fault once; the per-file lines drop.
+    #[test]
+    fn skips_lines_env_fault_already_reported() {
+        let noted = format!(
+            "failed to persist usage-counters.json: writing ~/Library/Application Support/Headroom/config/usage-counters.json.tmp.81367.851: Operation not permitted (os error 1){}",
+            crate::env_fault::NOTE
+        );
+        assert!(skip_sentry("headroom_desktop_lib::usage_counters", &noted));
+        // The same failure outside the data folder carries no note and is
+        // still reported by its own call site.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to write ~/.claude/settings.json: Operation not permitted (os error 1)"
+        ));
+    }
+
     #[test]
     fn skips_system_wide_fd_exhaustion_but_not_our_own() {
         assert!(skip_sentry(
@@ -1237,6 +1278,12 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
             "[proxy_intercept] unwired clients: Windows refused port 6767"
+        ));
+        // And the stranger-holder unwire, which fires beside the foreign
+        // capture (RUST-KF beside RUST-EE).
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] unwired clients from the holder of port 6767"
         ));
         // The rule is scoped to the retry marker, not blanket-by-target: a
         // proxy_intercept warning that fires once and has no emit-site capture
@@ -1850,6 +1897,22 @@ mod tests {
     }
 
     #[test]
+    fn a_data_folder_fault_silences_its_echoes_but_not_itself_or_panics() {
+        let mut echo = sentry::protocol::Event::new();
+        echo.level = sentry::Level::Error;
+        assert!(super::echoes_env_fault(&echo, true));
+        assert!(!super::echoes_env_fault(&echo, false));
+
+        let mut own = echo.clone();
+        own.tags.insert("flow".into(), "env_fault".into());
+        assert!(!super::echoes_env_fault(&own, true));
+
+        let mut panic = echo;
+        panic.level = sentry::Level::Fatal;
+        assert!(!super::echoes_env_fault(&panic, true));
+    }
+
+    #[test]
     fn sanitize_event_attributes_events_to_the_install_without_an_account() {
         let _ = super::SENTRY_INSTALL.set("f00dcafe".repeat(8));
         let mut event = sentry::protocol::Event::new();
@@ -1879,6 +1942,18 @@ mod tests {
         let mut other = sentry::protocol::Event::new();
         other.message = Some("Could not persist reconciled grace state: Permission denied".into());
         assert!(super::sanitize_event(other).is_some());
+
+        // A data-folder fault env_fault classified: it reports the fault
+        // once itself, so a direct capture of the failing write is a
+        // per-file duplicate (pricing.rs's grace-state capture, lib.rs's
+        // client_setup_failed).
+        let mut fault = sentry::protocol::Event::new();
+        fault.message = Some(format!(
+            "Could not persist reconciled grace state: renaming .tmp: Operation not \
+             permitted (os error 1){}",
+            crate::env_fault::NOTE
+        ));
+        assert!(super::sanitize_event(fault).is_none());
     }
 
     #[cfg(target_os = "macos")]

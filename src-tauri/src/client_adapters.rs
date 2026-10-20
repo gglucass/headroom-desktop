@@ -509,6 +509,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut legacy_updates = remove_legacy_vscode_base_url_keys();
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
+            let mut granular = route_granular_claude_logins();
+            updates.0.append(&mut granular.0);
+            updates.1.append(&mut granular.1);
 
             // Loud-fail guard so a closed app or lost ANTHROPIC_BASE_URL routing
             // surfaces in Claude instead of silently hitting Anthropic directly.
@@ -1668,6 +1671,7 @@ fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
                 None,
             );
             remove_legacy_vscode_base_url_keys();
+            unroute_granular_claude_logins();
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
             for settings_path in claude_settings_candidates() {
@@ -2163,6 +2167,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     ) {
         log::warn!("cleanup: removing ANTHROPIC_BASE_URL from Claude settings failed: {err}");
     }
+    unroute_granular_claude_logins();
     if let Err(err) = remove_claude_settings_env(
         HEADROOM_ENABLE_TOOL_SEARCH_KEY,
         HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
@@ -3075,7 +3080,9 @@ fn configured_timestamp(state: &ClientSetupState, client_id: &str) -> Option<Str
 
 fn load_setup_state() -> ClientSetupState {
     let path = setup_state_path();
-    if !path.exists() {
+    // Not `!exists()`: a folder that refuses stat must reach the read below,
+    // which reports it to env_fault, not pass for a first launch.
+    if let Ok(false) = path.try_exists() {
         return ClientSetupState::default();
     }
 
@@ -3086,11 +3093,11 @@ fn load_setup_state() -> ClientSetupState {
     // a transient race or a partially-written file from an older build, and
     // returning the empty default flips `is_claude_code_enabled` to false,
     // which the tray reads as "Claude Code disconnected" and notifies on.
-    match try_load_setup_state(&path) {
+    match try_load_setup_state(&path, false) {
         Ok(state) => normalize_setup_state(state),
         Err(first_err) => {
             std::thread::sleep(std::time::Duration::from_millis(15));
-            match try_load_setup_state(&path) {
+            match try_load_setup_state(&path, true) {
                 Ok(state) => normalize_setup_state(state),
                 Err(second_err) => {
                     // Only a parse failure is evidence that the bytes on disk
@@ -3149,9 +3156,27 @@ impl std::fmt::Display for SetupStateLoadError {
     }
 }
 
-fn try_load_setup_state(path: &Path) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))
+/// env_fault's end-to-end test: whether a first try (which never counts) fails.
+#[cfg(test)]
+pub(crate) fn setup_first_try_fails(path: &Path) -> bool {
+    try_load_setup_state(path, false).is_err()
+}
+
+fn try_load_setup_state(
+    path: &Path,
+    last_try: bool,
+) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
+    // Not `state::read_state_file`: `load_setup_state` runs its own retry.
+    let read = std::fs::read(path);
+    // One load is one access to env_fault, as in read_state_file: a failed
+    // first try counts only if the retry fails too.
+    let note = if read.is_ok() || last_try {
+        crate::env_fault::note(path, crate::env_fault::Op::Read, &read)
+    } else {
+        ""
+    };
+    let bytes = read
+        .with_context(|| format!("reading {}{note}", path.display()))
         .map_err(SetupStateLoadError::Io)?;
     serde_json::from_slice::<ClientSetupState>(&bytes)
         .with_context(|| format!("parsing {}", path.display()))
@@ -3325,8 +3350,10 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // One guard here covers every caller instead of auditing all of them.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| anyhow!("creating {}: {err}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+                anyhow!("creating {}: {err}{note}", parent.display())
+            })?;
         }
     }
     // The io error goes in the *message*, not a source: every caller logs this
@@ -3365,7 +3392,8 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         // unique per write, so nothing ever reclaims it. On a full disk that is
         // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
         let _ = std::fs::remove_file(&tmp_path);
-        anyhow!("writing {}: {err}", tmp_path.display())
+        let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+        anyhow!("writing {}: {err}{note}", tmp_path.display())
     })?;
     // Windows: AV scanners / the search indexer briefly hold the destination
     // (or the just-written tmp) open, so the rename fails ERROR_ACCESS_DENIED
@@ -3375,19 +3403,22 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     let renamed =
         // direct-write: this is atomic_write
         rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp);
-    copy_if_cross_device(renamed, &tmp_path, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        anyhow!(
-            "renaming {} -> {}: {err}{}",
-            tmp_path.display(),
-            path.display(),
-            if is_locked_file(path) {
-                LOCKED_FILE_NOTE
-            } else {
-                ""
-            }
-        )
-    })
+    copy_if_cross_device(renamed, &tmp_path, path)
+        .map_err(|err| {
+            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+            let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
+            anyhow!(
+                "renaming {} -> {}: {err}{}{note}",
+                tmp_path.display(),
+                path.display(),
+                if is_locked_file(path) {
+                    LOCKED_FILE_NOTE
+                } else {
+                    ""
+                }
+            )
+        })
+        .inspect(|()| crate::env_fault::succeeded(path, crate::env_fault::Op::Write))
 }
 
 /// Copies the tmp over `path` when the rename failed as a cross-device move.
@@ -4157,6 +4188,69 @@ fn configure_claude_base_url() -> Result<(Vec<String>, Vec<String>, Option<Strin
     ))
 }
 
+/// settings.json of each extra Claude login in Granular (granular.build). It
+/// runs one with `CLAUDE_CONFIG_DIR=<userData>/connections/<id>` and drops an
+/// inherited ANTHROPIC_BASE_URL, so that login reads this file, never
+/// ~/.claude's, and bypassed Headroom; its machine login and API keys use
+/// ~/.claude. Codex and Gemini logins share `connections/`, but only Claude
+/// Code writes `.claude.json` (Granular's own `auth status` probe does).
+/// Granular ships for macOS and Windows only.
+fn granular_claude_settings_paths() -> Vec<PathBuf> {
+    let user_data = if cfg!(windows) {
+        match std::env::var_os("APPDATA") {
+            Some(dir) => PathBuf::from(dir),
+            None => return Vec::new(),
+        }
+    } else {
+        home_dir().join("Library").join("Application Support")
+    };
+    let Ok(entries) = std::fs::read_dir(user_data.join("granular").join("connections")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join(".claude.json").is_file())
+        .map(|dir| dir.join("settings.json"))
+        .collect()
+}
+
+/// Routes Granular's extra Claude logins like ~/.claude, best-effort. A URL
+/// the user set for one login stays, so nothing needs preserving on disable.
+/// shortcut: a login added while Headroom runs is routed at the next apply
+/// (launch or resume); watch `connections/` if users notice.
+fn route_granular_claude_logins() -> (Vec<String>, Vec<String>) {
+    let mut updates = (Vec::new(), Vec::new());
+    for path in granular_claude_settings_paths() {
+        match configure_claude_settings_env_impl(
+            &path,
+            "ANTHROPIC_BASE_URL",
+            HEADROOM_ANTHROPIC_BASE_URL,
+            false,
+        ) {
+            Ok((mut changed, mut backups, _)) => {
+                updates.0.append(&mut changed);
+                updates.1.append(&mut backups);
+            }
+            Err(err) => log::warn!("routing Granular login {} failed: {err}", path.display()),
+        }
+    }
+    updates
+}
+
+fn unroute_granular_claude_logins() {
+    for path in granular_claude_settings_paths() {
+        if let Err(err) = remove_claude_settings_env_at(
+            &path,
+            "ANTHROPIC_BASE_URL",
+            HEADROOM_ANTHROPIC_BASE_URL,
+            None,
+        ) {
+            log::warn!("unrouting Granular login {} failed: {err}", path.display());
+        }
+    }
+}
+
 /// The URL a Claude Code or VS Code disable puts back in place of Headroom's:
 /// the provider the cc-switch reconciler last replaced (newer than anything
 /// apply saw, and gone with the backend otherwise), else the pre-Headroom URL
@@ -4178,7 +4272,7 @@ fn configure_claude_settings_env(
     env_key: &str,
     env_value: &str,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    configure_claude_settings_env_impl(env_key, env_value, true)
+    configure_claude_settings_env_impl(&claude_settings_path(), env_key, env_value, true)
 }
 
 /// Like `configure_claude_settings_env`, but leaves a pre-existing, non-empty
@@ -4189,19 +4283,19 @@ fn configure_claude_settings_env_if_absent(
     env_key: &str,
     env_value: &str,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    configure_claude_settings_env_impl(env_key, env_value, false)
+    configure_claude_settings_env_impl(&claude_settings_path(), env_key, env_value, false)
 }
 
 fn configure_claude_settings_env_impl(
+    settings_path: &Path,
     env_key: &str,
     env_value: &str,
     overwrite_existing: bool,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    let settings_path = claude_settings_path();
-    let mut content = if held_or_exists(&settings_path) {
-        let raw = read_held_or_disk(&settings_path)
+    let mut content = if held_or_exists(settings_path) {
+        let raw = read_held_or_disk(settings_path)
             .with_context(|| format!("reading {}", settings_path.display()))?;
-        Value::Object(parse_json_object(&raw, &settings_path)?)
+        Value::Object(parse_json_object(&raw, settings_path)?)
     } else {
         Value::Object(Default::default())
     };
@@ -4253,9 +4347,9 @@ fn configure_claude_settings_env_impl(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let backup = backup_if_exists(&settings_path)?;
+    let backup = backup_if_exists(settings_path)?;
     atomic_write(
-        &settings_path,
+        settings_path,
         &serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
@@ -4767,14 +4861,27 @@ fn remove_claude_settings_env(
     expected_value: &str,
     restore_value: Option<&str>,
 ) -> Result<()> {
-    let settings_path = claude_settings_path();
-    if !held_or_exists(&settings_path) {
+    remove_claude_settings_env_at(
+        &claude_settings_path(),
+        env_key,
+        expected_value,
+        restore_value,
+    )
+}
+
+fn remove_claude_settings_env_at(
+    settings_path: &Path,
+    env_key: &str,
+    expected_value: &str,
+    restore_value: Option<&str>,
+) -> Result<()> {
+    if !held_or_exists(settings_path) {
         return Ok(());
     }
 
-    let raw = read_held_or_disk(&settings_path)
+    let raw = read_held_or_disk(settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
-    let mut root = parse_json_object(&raw, &settings_path)?;
+    let mut root = parse_json_object(&raw, settings_path)?;
     let mut changed = false;
 
     if let Some(Value::Object(env_obj)) = root.get_mut("env") {
@@ -4799,9 +4906,9 @@ fn remove_claude_settings_env(
         return Ok(());
     }
 
-    let _ = backup_if_exists(&settings_path)?;
+    let _ = backup_if_exists(settings_path)?;
     atomic_write(
-        &settings_path,
+        settings_path,
         &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for connector removal")?,
     )?;
@@ -8656,12 +8763,18 @@ fn edit_vscode_wrapper_key(raw: &str, wrapper: &str, add: bool, path: &Path) -> 
     let edited = if add {
         let comma = if expected.is_empty() { "\n" } else { "," };
         expected.insert(VSCODE_PROCESS_WRAPPER_KEY.to_string(), value.clone());
-        let open = raw.find('{')? + 1;
-        format!(
-            "{}\n    {key}: {value}{comma}{}",
-            &raw[..open],
-            &raw[open..]
-        )
+        // A whitespace-only file parses as `{}` but has no brace to insert after.
+        let raw = if raw.trim().is_empty() { "{}" } else { raw };
+        // The first `{` can sit in a leading comment (RUST-RE): try each in
+        // turn, since the re-parse check rejects every wrong spot.
+        return raw.match_indices('{').find_map(|(at, _)| {
+            let edited = format!(
+                "{}\n    {key}: {value}{comma}{}",
+                &raw[..=at],
+                &raw[at + 1..]
+            );
+            (parse_json_object(&edited, path).ok()? == expected).then_some(edited)
+        });
     } else {
         if expected.remove(VSCODE_PROCESS_WRAPPER_KEY)? != value {
             return None;
@@ -10504,6 +10617,43 @@ fn claude_settings_path() -> PathBuf {
     home_dir().join(".claude").join("settings.json")
 }
 
+/// Sets one value in ~/.claude/settings.json, creating the objects on its
+/// path (an Activity tip's apply button).
+pub fn set_claude_setting(path: &[&str], value: Value) -> Result<()> {
+    let _guard = setup_write_lock();
+    set_json_setting_at(&claude_settings_path(), path, value)
+}
+
+fn set_json_setting_at(settings_path: &Path, path: &[&str], value: Value) -> Result<()> {
+    let mut root = if settings_path.exists() {
+        let raw = std::fs::read_to_string(settings_path)
+            .with_context(|| format!("reading {}", settings_path.display()))?;
+        parse_json_object(&raw, settings_path)?
+    } else {
+        Default::default()
+    };
+    let (last, parents) = path.split_last().context("empty settings path")?;
+    let mut object = &mut root;
+    for key in parents {
+        object = object
+            .entry(*key)
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .with_context(|| format!("{key} in {} is not an object", settings_path.display()))?;
+    }
+    object.insert((*last).to_string(), value);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    backup_if_exists(settings_path)?;
+    atomic_write(
+        settings_path,
+        &serde_json::to_vec_pretty(&Value::Object(root)).context("serializing settings")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))
+}
+
 fn headroom_rtk_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
@@ -11702,7 +11852,9 @@ mod tests {
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
         VSCODE_PROCESS_WRAPPER_KEY,
     };
-    use super::{build_claude_remote_control_wrapper, build_windows_wrapper_exe};
+    use super::{
+        build_claude_remote_control_wrapper, build_windows_wrapper_exe, set_json_setting_at,
+    };
     #[cfg(unix)]
     use super::{
         build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
@@ -12059,7 +12211,7 @@ mod tests {
         // which is the same class of evidence as ENFILE.
         std::fs::remove_file(&path).expect("remove");
         std::fs::create_dir(&path).expect("dir in its place");
-        assert!(super::try_load_setup_state(&path).is_err_and(|e| e.is_io()));
+        assert!(super::try_load_setup_state(&path, true).is_err_and(|e| e.is_io()));
         assert!(
             super::load_setup_state().configured_clients.is_empty(),
             "callers still get the default"
@@ -12155,6 +12307,38 @@ mod tests {
             .remembered_shell_files
             .contains_key("claude_code"));
         assert!(normalized.remembered_shell_files.contains_key("codex"));
+    }
+
+    #[test]
+    fn set_json_setting_keeps_the_rest_and_creates_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude").join("settings.json");
+        set_json_setting_at(&path, &["autoContinueAtUsageLimit"], Value::Bool(true)).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"env": {"A": "1"}, "modelSettings": {"claude-haiku-5-5": {"effortLevel": "high"}}}"#,
+        )
+        .unwrap();
+        let haiku = ["modelSettings", "claude-haiku-5-5", "autoCompactWindow"];
+        set_json_setting_at(&path, &haiku, 100_000.into()).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["env"]["A"], "1");
+        assert_eq!(
+            written["modelSettings"]["claude-haiku-5-5"]["effortLevel"],
+            "high"
+        );
+        assert_eq!(
+            written["modelSettings"]["claude-haiku-5-5"]["autoCompactWindow"],
+            100_000
+        );
+
+        std::fs::write(&path, r#"{"modelSettings": "oops"}"#).unwrap();
+        assert!(set_json_setting_at(&path, &haiku, 100_000.into()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"modelSettings": "oops"}"#
+        );
     }
 
     #[test]
@@ -15242,6 +15426,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .preserved_base_urls
                 .contains_key("claude_code"),
             "preserved entry consumed after restore"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_routes_and_disable_unroutes_granular_claude_logins() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+        let connections = if cfg!(windows) {
+            home.path().join("AppData").join("Roaming")
+        } else {
+            home.path().join("Library").join("Application Support")
+        }
+        .join("granular")
+        .join("connections");
+        let login = connections.join("conn-login");
+        let own_url = connections.join("conn-own-url");
+        let codex = connections.join("conn-codex");
+        for dir in [&login, &own_url, &codex] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(login.join(".claude.json"), "{}").unwrap();
+        fs::write(own_url.join(".claude.json"), "{}").unwrap();
+        let gateway = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#;
+        fs::write(own_url.join("settings.json"), gateway).unwrap();
+        fs::write(codex.join("auth.json"), "{}").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert_eq!(
+            read_settings_json(&login.join("settings.json"))["env"]["ANTHROPIC_BASE_URL"],
+            super::HEADROOM_ANTHROPIC_BASE_URL
+        );
+        assert_eq!(
+            fs::read_to_string(own_url.join("settings.json")).unwrap(),
+            gateway,
+            "a login's own base URL wins"
+        );
+        assert!(
+            !codex.join("settings.json").exists(),
+            "Codex login left alone"
+        );
+
+        super::disable_client_setup("claude_code").expect("disable");
+        let after = read_settings_json(&login.join("settings.json"));
+        assert!(
+            after.get("env").is_none(),
+            "unrouted on disable, got:\n{after:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(own_url.join("settings.json")).unwrap(),
+            gateway
         );
     }
 
@@ -20198,6 +20434,22 @@ for line in sys.stdin:
         assert_eq!(edit_vscode_wrapper_key(user, w, false, path), None);
         // Unparseable settings are never touched.
         assert_eq!(edit_vscode_wrapper_key("{\"a\": ", w, true, path), None);
+
+        // A whitespace-only file, and a `{` in a leading comment (RUST-RE).
+        let added = edit_vscode_wrapper_key("\n", w, true, path).expect("add to blank");
+        assert_eq!(
+            parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],
+            w
+        );
+        for header in ["// { my settings }\n", "/* { */\n"] {
+            let raw = format!("{header}{user}");
+            let added = edit_vscode_wrapper_key(&raw, w, true, path).expect("add past comment");
+            assert!(added.starts_with(header));
+            assert_eq!(
+                parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],
+                w
+            );
+        }
     }
 
     /// Drives the wrapper the way the VS Code extension does, with a fake

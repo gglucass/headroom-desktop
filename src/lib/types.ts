@@ -226,6 +226,8 @@ export interface DashboardState {
   requiredTermsVersion: number;
   acceptedTermsVersion: number;
   termsUrl: string;
+  /** An Activity tip is posted and not looked at yet. */
+  tipUnseen: boolean;
 }
 
 export interface BootstrapProgress {
@@ -349,6 +351,9 @@ export interface RuntimeStatus {
   /** Prose hint while a traffic filter (AdGuard, antivirus web protection) is
    *  resetting connections to port 6767; cleared once the resets age out. */
   localConnectionFilterHint?: string | null;
+  /** Prose, one per machine fault on Headroom's own data folder (blocked,
+   *  read-only, full disk); empty once access works again. */
+  environmentIssues?: string[];
   runtimeUpgradeFailure?: RuntimeUpgradeFailure | null;
   rtk: {
     installed: boolean;
@@ -560,6 +565,31 @@ export interface TrainSuggestionEvent {
   kind: string;
 }
 
+export type TipKind =
+  | "compact_window"
+  | "haiku_long_context"
+  | "fable_upgrade"
+  | "weekly_pace"
+  | "extra_usage_cache"
+  | "auto_continue"
+  | "idle_break"
+  | "heavy_startup"
+  | "codex_compact"
+  | "codex_weekly_pace"
+  | "switch_to_codex"
+  | "switch_to_claude";
+
+export interface TipEvent {
+  kind: TipKind;
+  observedAt: string;
+  contextTokens: number;
+  usedPercent?: number | null;
+  resetsAt?: string | null;
+  limitAt?: string | null;
+  project?: string | null;
+  seen: boolean;
+}
+
 export interface ActivityFeedSnapshot {
   transformation: TransformationFeedEvent | null;
   record: RecordEvent | null;
@@ -568,6 +598,8 @@ export interface ActivityFeedSnapshot {
   learningsMilestone: LearningsMilestoneEvent | null;
   weeklyRecap: WeeklyRecapEvent | null;
   trainSuggestion: TrainSuggestionEvent | null;
+  /** Newest first, at most three, one per kind. */
+  tips: TipEvent[];
 }
 
 export interface ActivityFeedResponse {

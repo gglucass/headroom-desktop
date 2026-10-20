@@ -255,6 +255,15 @@ const READYZ_RELAY_STALL: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(5)
 };
+/// Every `/readyz` caller is a status probe with a budget of seconds, so a relay
+/// open this long has no reader. Without the bound one whose backend close never
+/// arrived held its permit to the idle limit: 17 of RUST-QA's 22 idle closes
+/// (2026-10-14..18, all Windows) were these.
+const READYZ_RELAY_LIMIT: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(30)
+};
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -291,18 +300,22 @@ const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 /// (5xx is not captured). 0 = never seen.
 static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
-const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point SSL_CERT_FILE at your organization's CA bundle and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
+const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point HEADROOM_CA_BUNDLE at your organization's root certificate and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
 
 /// True when an upstream error body is the backend's own connection failure on
 /// certificate verification (Python ssl's `CERTIFICATE_VERIFY_FAILED`, or the
 /// self-signed-chain reason it carries). Same signals `classify_bootstrap_failure`
 /// keys on for the install path. Substring match: the body is SSE for Claude
-/// (`event: error\ndata: {...}`) and JSON for Codex.
+/// (`event: error\ndata: {...}`) and JSON for Codex. Since wheel 0.40.0 (#3851)
+/// the body no longer carries the exception text, only `tls_diagnostics`'
+/// sentence for a certificate it could not verify; its bare `upstream_tls_error`
+/// code also covers handshake failures that are not inspection.
 fn is_tls_interception_error(body: &[u8]) -> bool {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
     }
-    contains(body, b"CERTIFICATE_VERIFY_FAILED")
+    contains(body, b"could not verify the TLS certificate")
+        || contains(body, b"CERTIFICATE_VERIFY_FAILED")
         || contains(body, b"self-signed certificate in certificate chain")
         || contains(body, b"self signed certificate in certificate chain")
 }
@@ -777,18 +790,18 @@ impl<R> ResponseSniffer<R> {
                 return;
             }
             self.status = parse_response_status(&self.buf);
-            if self.status == Some(429) {
-                crate::usage_counters::record_429(self.client_key);
-            } else if let Some(status) = self
-                .status
-                .filter(|s| self.count_failures && is_failed_request_status(*s))
-            {
-                crate::usage_counters::record_failure(self.client_key, &status.to_string());
-            }
             self.capturing = self.capture_path.is_some()
                 && self
                     .status
                     .is_some_and(|s| is_reportable_upstream_error(&s));
+            if self.status == Some(429) {
+                crate::usage_counters::record_429(self.client_key);
+            } else if let Some(status) = self.status.filter(|s| {
+                // A captured failure is counted on drop, with its body's label.
+                self.count_failures && !self.capturing && is_failed_request_status(*s)
+            }) {
+                crate::usage_counters::record_failure(self.client_key, &status.to_string());
+            }
             if !self.status.is_some_and(|s| (200..300).contains(&s)) {
                 self.savings_session = None;
             }
@@ -803,6 +816,15 @@ impl<R> ResponseSniffer<R> {
             if let Some(usage) = parse_claude_plan_usage(&self.buf) {
                 crate::claude_statusline::record_plan_usage(usage);
             }
+            let header = |name: &str| extract_header_value(&self.buf, name);
+            let usage_limit = self.status == Some(429)
+                && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected");
+            crate::tip_signals::note_claude_response(
+                header("anthropic-ratelimit-unified-overage-in-use").as_deref() == Some("true"),
+                usage_limit.then(|| {
+                    header("anthropic-ratelimit-unified-reset").and_then(|v| v.trim().parse().ok())
+                }),
+            );
         }
         // 2xx for a Claude Code conversation: read on to the end of the head,
         // book its saving, stop. The cap bounds a head that never ends.
@@ -841,7 +863,15 @@ impl<R> ResponseSniffer<R> {
 
 impl<R> Drop for ResponseSniffer<R> {
     fn drop(&mut self) {
-        let (Some(status), Some(path)) = (self.status, self.capture_path.as_deref()) else {
+        let Some(status) = self.status else {
+            return;
+        };
+        if self.capturing && self.count_failures && is_failed_request_status(status) {
+            let body = find_header_end(&self.buf)
+                .map_or(&[][..], |end| &self.buf[(end + 4).min(self.buf.len())..]);
+            crate::usage_counters::record_failure(self.client_key, &failure_kind(status, body));
+        }
+        let Some(path) = self.capture_path.as_deref() else {
             return;
         };
         if !is_reportable_upstream_error(&status) || self.buf.is_empty() {
@@ -1437,6 +1467,10 @@ fn serve(
                 // above it, it is stuck and worth saying so.
                 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
                 let launched_at = tokio::time::Instant::now();
+                // DRAIN_GRACE runs from the last time anything held the port
+                // live, not from launch: RUST-JY's wslrelay.exe let go 38h in
+                // and its seconds-old TIME_WAIT was reported as stuck.
+                let mut listener_seen_at = launched_at;
                 let mut consecutive_failures = 0usize;
                 // Set only by the `Draining` verdict, which is the one case
                 // where nothing is listening and the port is held purely by
@@ -1474,6 +1508,9 @@ fn serve(
                             // wait for it to go away. Anything else, HTTP or
                             // not, goes through the diagnosis below.
                             let probe = probe_port(INTERCEPT_PORT).await;
+                            if probe != PortProbe::Refused {
+                                listener_seen_at = tokio::time::Instant::now();
+                            }
                             let twin = held_by_our_other_window(probe, || {
                                 crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
                             });
@@ -1659,10 +1696,13 @@ fn serve(
                                 let occupant =
                                     crate::tool_manager::listener_process(INTERCEPT_PORT);
                                 let key = os_error_key(&e);
+                                if occupant.is_some() {
+                                    listener_seen_at = tokio::time::Instant::now();
+                                }
                                 let verdict = classify_held_port(
                                     occupant,
                                     probe,
-                                    launched_at.elapsed(),
+                                    listener_seen_at.elapsed(),
                                     DRAIN_GRACE,
                                 );
                                 // Nothing listening means the only thing
@@ -2601,7 +2641,12 @@ async fn handle(
             }
             // The app's status probe gives up after READYZ_RELAY_STALL, so a relay
             // still running then is a failure even if it never ends. Watch it
-            // without cutting it short: the relay itself behaves exactly as before.
+            // without cutting it short, up to READYZ_RELAY_LIMIT.
+            let relay = async {
+                tokio::time::timeout(READYZ_RELAY_LIMIT, relay)
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+            };
             tokio::pin!(relay);
             let mut stalled = false;
             let copied = tokio::select! {
@@ -3227,12 +3272,18 @@ fn backend_could_not_reach_provider(body: &[u8]) -> bool {
 }
 
 /// The `type`/`code` of every 5xx error object the backend writes on the
-/// Responses and passthrough paths (wheel 0.39.0 `handlers/openai.py`).
+/// Responses and passthrough paths (wheel `handlers/openai.py`; since 0.40.0's
+/// #3851 the codes come from `public_errors`, whose `internal_error` replaced
+/// `backend_error`).
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
     "connection_error",
     "upstream_protocol_error",
+    "upstream_unreachable",
+    "upstream_timeout",
+    "upstream_tls_error",
+    "internal_error",
 ];
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
@@ -3321,6 +3372,17 @@ fn note_codex_prompt_outcome(
 /// separates provider outages from Headroom bugs by comparing versions.
 fn is_failed_request_status(status: u16) -> bool {
     status >= 400 && status != 429
+}
+
+/// `failure_kinds` kind for a failed response: its status, plus the content-free
+/// label of a known Anthropic error ("400:prompt_too_long"). Sentry keeps one
+/// warning per host per day, so a stuck host's mail could only say "400 x262"
+/// (users 3312 and 4543, 2026-10-19, ~29% of their Claude Code requests).
+fn failure_kind(status: u16, body: &[u8]) -> String {
+    match anthropic_error_shape(body) {
+        Some(label) => format!("{status}:{label}"),
+        None => status.to_string(),
+    }
 }
 
 /// `failure_kinds` key for a failed Codex request: a 2xx failed in-band, no
@@ -3839,6 +3901,10 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
         Some("thinking_block_modified")
     } else if contains(body, b"signature` in `thinking` block") {
         Some("thinking_signature_invalid")
+    } else if contains(body, b"Extra inputs are not permitted") {
+        // A field the API does not accept, usually one the proxy added (0.9.39-rc.1
+        // forwarded a stream-only `estimated_tokens` on thinking blocks).
+        Some("extra_input_field")
     } else if contains(body, b"text content blocks must")
         || contains(body, b"cannot be set for empty text blocks")
     {
@@ -6385,6 +6451,58 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
+    /// RUST-QA: a `/readyz` answer whose backend close never arrives ends at
+    /// `READYZ_RELAY_LIMIT`, before the idle limit, and is a stalled relay.
+    #[tokio::test]
+    #[serial]
+    async fn readyz_relay_without_a_backend_close_ends_at_its_limit() {
+        use std::sync::atomic::Ordering;
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        let permits = super::backend_inflight().available_permits();
+        let idle_closed = super::IDLE_RELAYS_CLOSED.load(Ordering::Acquire);
+        let failures = super::READYZ_RELAY_FAILURES.load(Ordering::Acquire);
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write readyz probe");
+        let _ = client.shutdown().await;
+        // The backend answers and keeps its socket open.
+        let (mut held, _) = timeout(Duration::from_secs(5), backend_listener.accept())
+            .await
+            .expect("forwarded to the backend")
+            .expect("accept");
+        read_until_header_end(&mut held).await;
+        held.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answer");
+
+        let mut answer = Vec::new();
+        timeout(super::RELAY_IDLE_LIMIT, client.read_to_end(&mut answer))
+            .await
+            .expect("the relay ends before the idle limit")
+            .expect("read to end");
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(super::backend_inflight().available_permits(), permits);
+        assert_eq!(
+            super::IDLE_RELAYS_CLOSED.load(Ordering::Acquire),
+            idle_closed
+        );
+        assert_eq!(
+            super::READYZ_RELAY_FAILURES.load(Ordering::Acquire),
+            failures + 1
+        );
+
+        drop(held);
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
     /// RUST-QA: a sleep showed as a long-open idle relay on Windows. Only a
     /// check that came over a minute late reads as a sleep.
     #[test]
@@ -7370,6 +7488,9 @@ mod tests {
         for body in [
             &br#"{"error":{"type":"upstream_protocol_error","message":"closed"}}"#[..],
             br#"{"error":{"type":"api_error","code":"backend_error","message":"x"}}"#,
+            // Wheel 0.41.0's public_errors bodies.
+            br#"{"error":{"message":"The proxy could not complete the request.","type":"api_error","code":"internal_error"}}"#,
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API. Headroom could not verify the TLS certificate for chatgpt.com (unable to get local issuer certificate).","type":"connection_error","code":"upstream_tls_error"}}"#,
         ] {
             assert_eq!(
                 codex_prompt_failed(Some(502), false, false, body),
@@ -7540,8 +7661,15 @@ mod tests {
             b"HTTP/1.1 429 Too Many Requests\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\n",
         );
         capped.observe(
+            b"anthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-reset: 4102444800\r\nanthropic-ratelimit-unified-overage-in-use: true\r\n",
+        );
+        capped.observe(
             b"anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{\"type\":\"error\"}",
         );
+        // The same head feeds the Activity tips (tip_signals.rs).
+        let signals = crate::tip_signals::observed();
+        assert!(signals.usage_limit_hit && signals.extra_usage_in_use);
+        assert_eq!(signals.usage_limit_resets_at, Some(4_102_444_800));
         let five = crate::claude_statusline::plan_usage()
             .and_then(|u| u.five_hour)
             .expect("5h window from the 429");
@@ -7704,6 +7832,15 @@ mod tests {
         assert!(is_tls_interception_error(
             br#"{"error":{"message":"self signed certificate in certificate chain"}}"#
         ));
+        // Wheel 0.41.0: public_errors' sentence plus tls_diagnostics' hint, no
+        // exception text, and the usual Zscaler reason.
+        assert!(is_tls_interception_error(
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API. Headroom could not verify the TLS certificate for api.anthropic.com (unable to get local issuer certificate).","type":"connection_error","code":"upstream_tls_error"}}"#
+        ));
+        // The same code without the hint is a handshake failure, not inspection.
+        assert!(!is_tls_interception_error(
+            br#"{"error":{"message":"Could not establish a trusted TLS connection to the upstream API.","type":"connection_error","code":"upstream_tls_error"}}"#
+        ));
         // A provider-side 502 stays a transient.
         assert!(!is_tls_interception_error(b"<html>502 Bad Gateway</html>"));
         assert!(!is_tls_interception_error(b""));
@@ -7714,7 +7851,7 @@ mod tests {
             super::now_epoch_secs(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("SSL_CERT_FILE")));
+        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("HEADROOM_CA_BUNDLE")));
         super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(
             super::now_epoch_secs() - super::UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS - 1,
             std::sync::atomic::Ordering::Relaxed,
@@ -8026,6 +8163,15 @@ mod tests {
         ] {
             assert!(!is_provider_api_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn failure_kind_labels_known_anthropic_errors_and_keeps_the_rest_bare() {
+        let too_long = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215023 tokens > 200000 maximum"},"request_id":"req_1"}"#;
+        assert_eq!(super::failure_kind(400, too_long), "400:prompt_too_long");
+        let unknown = br#"{"type":"error","error":{"type":"invalid_request_error","message":"something new"}}"#;
+        assert_eq!(super::failure_kind(400, unknown), "400");
+        assert_eq!(super::failure_kind(502, b""), "502");
     }
 
     #[test]
@@ -9609,6 +9755,7 @@ mod tests {
             (b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.4.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01A. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.\"}}\n\n", "orphan_tool_result"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.9.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}"#, "thinking_block_modified"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#, "thinking_signature_invalid"),
+            (br#"{"error":{"type":"invalid_request_error","message":"messages.21.content.0.thinking.estimated_tokens: Extra inputs are not permitted"}}"#, "extra_input_field"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.3.content.1: text content blocks must be non-empty"}}"#, "empty_text_block"),
             (br#"{"error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}"#, "too_many_cache_breakpoints"),
             (br#"{"error":{"type":"invalid_request_error","message":"messages.7.content.2.image.source.base64: image exceeds 5 MB maximum: 6291456 bytes > 5242880 bytes"}}"#, "image_too_large"),
