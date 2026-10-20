@@ -5324,7 +5324,19 @@ impl LaunchProfile {
                     path.display()
                 );
                 persist_path = None;
-                Self::fresh()
+                // The file exists, so terms and setup were done on an earlier
+                // launch. Fresh defaults showed the terms gate and setup again,
+                // which could not save and hid Home's data-folder banner
+                // (win-test, 0.9.45-rc.13). The flags keep one-shot notices quiet.
+                LaunchProfile {
+                    launch_count: 1,
+                    setup_wizard_complete: true,
+                    accepted_terms_version: REQUIRED_TERMS_VERSION,
+                    onboarding_recovery_notified: true,
+                    first_savings_notified: true,
+                    unrouted_usage_notified: true,
+                    ..Self::fresh()
+                }
             }
         };
 
@@ -18293,8 +18305,12 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("degrades, never fails");
         assert_eq!(
             state.accepted_terms_version(),
-            0,
-            "session runs on defaults"
+            super::REQUIRED_TERMS_VERSION,
+            "a returning user, not the terms gate"
+        );
+        assert!(
+            state.launch_profile.lock().setup_wizard_complete,
+            "nor setup"
         );
         state.mark_terms_accepted(3);
         let _ = state.savings_tracker.lock().persist_state();
