@@ -7406,7 +7406,9 @@ fn spawn_crash_guard() {
         log::warn!("crash guard: no executable path to start it from");
         return;
     };
-    match spawn_crash_guard_process(&exe) {
+    // RUST-M9: Windows denied this spawn (os error 5) on the first launch of a
+    // freshly installed build, the scanner hold persisted writes retry through.
+    match client_adapters::retry_transient_denied(|| spawn_crash_guard_process(&exe)) {
         // Never written to and never closed: the OS closes it when we die,
         // and that is the guard's signal.
         Ok(pipe) => std::mem::forget(pipe),

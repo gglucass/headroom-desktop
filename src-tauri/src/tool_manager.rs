@@ -7574,7 +7574,9 @@ impl ToolManager {
         // should still run. Warn-only — a broken optional addon must not fail
         // the core Headroom upgrade.
         if let Err(err) = self.smoke_test_markitdown() {
-            log::warn!("markitdown smoke test failed after upgrade: {err:#}");
+            let exception = command_failure_last_line(&err)
+                .map_or_else(String::new, |line| format!("{line}; "));
+            log::warn!("markitdown smoke test failed after upgrade: {exception}{err:#}");
         }
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
@@ -15858,6 +15860,19 @@ impl std::fmt::Display for CommandFailure {
 
 impl std::error::Error for CommandFailure {}
 
+/// The last non-empty stderr line of the `CommandFailure` in `err`'s chain: a
+/// Python traceback's exception, which the traceback's head pushed past
+/// Sentry's 400-char message cap (RUST-RS).
+fn command_failure_last_line(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<CommandFailure>())?
+        .stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// True when a failure is an older Codex CLI that predates `codex plugin add`
 /// (`error: unrecognized subcommand 'add'`). Not retryable -- the user must
 /// update Codex -- so install treats it as a soft skip + nudge, not an error.
@@ -16229,6 +16244,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::codex_list_line_installed;
+    use super::command_failure_last_line;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
@@ -19025,6 +19041,24 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             exit_code: Some(1),
             signal: None,
         })
+    }
+
+    #[test]
+    fn command_failure_last_line_is_the_traceback_exception() {
+        let err = cmd_failure_with_stderr(
+            "Traceback (most recent call last):\r\n  \
+             File \"<frozen runpy>\", line 198, in _run_module_as_main\r\n\
+             ImportError: DLL load failed\r\n\r\n",
+        )
+        .context("running markitdown smoke test");
+        assert_eq!(
+            command_failure_last_line(&err).as_deref(),
+            Some("ImportError: DLL load failed")
+        );
+        assert_eq!(
+            command_failure_last_line(&anyhow::anyhow!("no command")),
+            None
+        );
     }
 
     #[test]

@@ -5834,13 +5834,13 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
     if !existing.contains('\0') {
         return existing.to_string();
     }
-    let restored = headroom_backups_newest_first(path)
-        .into_iter()
-        .find_map(|backup| {
-            let text = std::fs::read_to_string(&backup).ok()?;
-            let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
-            clean.then_some((backup, text))
-        });
+    let backups = headroom_backups_newest_first(path);
+    let backup_count = backups.len();
+    let restored = backups.into_iter().find_map(|backup| {
+        let text = std::fs::read_to_string(&backup).ok()?;
+        let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
+        clean.then_some((backup, text))
+    });
     match restored {
         // Info: our own writes fsync before the rename, so the zeros are another
         // writer's lost to a crash, and the restore has fixed it (RUST-QS).
@@ -5853,9 +5853,11 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
             );
             text
         }
+        // A nonzero count means every backup was zeroed too: Headroom backed
+        // up the zeros again (RUST-QS) rather than finding no backups at all.
         None => {
             log::warn!(
-                "{} held NUL bytes (zero-filled) and no clean backup exists; dropping them",
+                "{} held NUL bytes (zero-filled) and none of its {backup_count} backups is clean; dropping them",
                 path.display()
             );
             existing.replace('\0', "")
