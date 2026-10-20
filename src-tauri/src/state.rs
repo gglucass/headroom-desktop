@@ -4876,36 +4876,43 @@ fn startup_medians(now: std::time::SystemTime) -> Vec<(String, u64)> {
     let Ok(dirs) = std::fs::read_dir(claude_projects_dir()) else {
         return Vec::new();
     };
-    let mut medians = Vec::new();
-    for dir in dirs.flatten() {
-        let recent: Vec<PathBuf> = list_session_jsonl_files(&dir.path())
-            .into_iter()
-            .filter(|file| {
-                std::fs::metadata(file)
-                    .and_then(|meta| meta.modified())
-                    .is_ok_and(|modified| modified >= cutoff)
-            })
-            .collect();
-        // Oldest first, so the newest ten.
-        let starts: Vec<(String, u64)> = recent
-            .iter()
-            .rev()
-            .take(10)
-            .filter_map(|file| session_start_tokens(file))
-            .collect();
-        if starts.len() < 5 {
-            continue;
-        }
-        let mut tokens: Vec<u64> = starts.iter().map(|(_, tokens)| *tokens).collect();
-        tokens.sort_unstable();
-        let name = Path::new(&starts[0].0)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&starts[0].0)
-            .to_string();
-        medians.push((name, tokens[tokens.len() / 2]));
+    dirs.flatten()
+        .filter_map(|dir| project_startup_median(&dir.path(), cutoff))
+        .collect()
+}
+
+/// `startup_medians` for one project folder of `~/.claude/projects`.
+fn project_startup_median(dir: &Path, cutoff: std::time::SystemTime) -> Option<(String, u64)> {
+    let recent: Vec<PathBuf> = list_session_jsonl_files(dir)
+        .into_iter()
+        .filter(|file| {
+            std::fs::metadata(file)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified >= cutoff)
+        })
+        .collect();
+    // Oldest first, so the newest ten interactive ones. Headless runs drop out
+    // before the cap: a project whose newest ten were `claude -p` was never
+    // measured.
+    // shortcut: tries the newest 100 sessions, raise it if automation outruns that.
+    let starts: Vec<(String, u64)> = recent
+        .iter()
+        .rev()
+        .take(100)
+        .filter_map(|file| session_start_tokens(file))
+        .take(10)
+        .collect();
+    if starts.len() < 5 {
+        return None;
     }
-    medians
+    let mut tokens: Vec<u64> = starts.iter().map(|(_, tokens)| *tokens).collect();
+    tokens.sort_unstable();
+    let name = Path::new(&starts[0].0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&starts[0].0)
+        .to_string();
+    Some((name, tokens[tokens.len() / 2]))
 }
 
 /// (cwd, prompt tokens) of a session's first main-thread reply: what Claude
@@ -11344,6 +11351,40 @@ mod tests {
         );
         let headless = write("b.jsonl", &[user, &reply("sdk-cli", false, 60_000)]);
         assert_eq!(super::session_start_tokens(&headless), None);
+    }
+
+    #[test]
+    fn startup_median_skips_headless_runs_before_taking_the_newest_ten() {
+        // A project automated more than used by hand: its newest ten sessions
+        // are `claude -p` runs, the interactive ones older.
+        let dir = tempfile::TempDir::new().unwrap();
+        let now = std::time::SystemTime::now();
+        let reply = |entrypoint: &str, read: u64| {
+            format!(
+                r#"{{"type":"assistant","entrypoint":"{entrypoint}","cwd":"/w/proj","message":{{"usage":{{"input_tokens":0,"cache_read_input_tokens":{read}}}}}}}"#
+            )
+        };
+        let session = |name: String, line: String, age_secs: u64| {
+            let path = dir.path().join(name);
+            fs::write(&path, line).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age_secs))
+                .unwrap();
+        };
+        for i in 0..6u64 {
+            session(format!("i{i}.jsonl"), reply("cli", 40_000 + i), 3_600 + i);
+        }
+        for i in 0..10u64 {
+            session(format!("h{i}.jsonl"), reply("sdk-cli", 90_000), i);
+        }
+        let cutoff = now - std::time::Duration::from_secs(7 * 24 * 3600);
+        assert_eq!(
+            super::project_startup_median(dir.path(), cutoff),
+            Some(("proj".to_string(), 40_003))
+        );
     }
 
     use std::fs;
