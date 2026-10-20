@@ -1862,7 +1862,10 @@ fn schedule_windows_uninstaller() -> Option<std::path::PathBuf> {
         log::info!("uninstall: no NSIS uninstaller at {uninstaller:?}, skipping");
         return None;
     }
-    match crate::proc::command(&uninstaller).arg("/S").spawn() {
+    // RUST-RV: os error 5 on the launch, like the crash guard's RUST-M9.
+    match client_adapters::retry_transient_denied(|| {
+        crate::proc::command(&uninstaller).arg("/S").spawn()
+    }) {
         Ok(_) => {
             log::info!("uninstall: launched NSIS uninstaller {uninstaller:?}");
             Some(uninstaller)
@@ -9173,6 +9176,9 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         // `codex exec` with no login: `ERROR: unexpected status 401
         // Unauthorized: Missing bearer or basic authentication in header`.
         "missing bearer or basic authentication",
+        // RUST-RT: `codex exec` with a revoked refresh token: `ERROR: Your
+        // access token could not be refreshed. Please log out and sign in again.`
+        "access token could not be refreshed",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -16600,6 +16606,10 @@ Some unrelated content.
         // RUST-BN verbatim: expired session the CLI could not refresh.
         assert!(learn_failure_is_agent_auth(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nFailed to authenticate: OAuth session expired and could not be refreshed"
+        ));
+        // RUST-RT verbatim: Codex's verdict on a revoked refresh token.
+        assert!(learn_failure_is_agent_auth(
+            "ERROR: Your access token could not be refreshed. Please log out and sign in again."
         ));
     }
 
