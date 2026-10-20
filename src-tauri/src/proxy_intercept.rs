@@ -3109,7 +3109,10 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             None => !client_gone.load(Ordering::Relaxed),
         };
         if failed && counted && is_provider_api_path(req_path) {
-            crate::usage_counters::record_failure("codex", &codex_failure_kind(status));
+            crate::usage_counters::record_failure(
+                "codex",
+                &codex_failure_kind(status, &error_body),
+            );
         }
         if prompt {
             note_codex_prompt_outcome(
@@ -3255,6 +3258,13 @@ fn provider_failed_turn(body: &[u8]) -> bool {
 /// RUST-KN's 151/163/187-byte bodies were all this). A TLS-intercepting proxy
 /// is the exception: it fails only Headroom's own trust store, so it counts.
 fn backend_could_not_reach_provider(body: &[u8]) -> bool {
+    error_body_json(body).is_some_and(|v| v["error"]["type"] == "connection_error")
+        && !is_tls_interception_error(body)
+}
+
+/// An error body's JSON: the body itself, or the `data:` line of the backend's
+/// `event: error` SSE frame.
+fn error_body_json(body: &[u8]) -> Option<serde_json::Value> {
     let body = body.trim_ascii();
     let json = match body
         .windows(BACKEND_SSE_ERROR.len())
@@ -3266,9 +3276,23 @@ fn backend_could_not_reach_provider(body: &[u8]) -> bool {
             .unwrap_or_default(),
         None => body,
     };
-    serde_json::from_slice::<serde_json::Value>(json)
-        .is_ok_and(|v| v["error"]["type"] == "connection_error")
-        && !is_tls_interception_error(body)
+    serde_json::from_slice(json).ok()
+}
+
+/// The `HEADROOM_ERROR_IDS` entry a backend error body carries, `code` before
+/// `type`: since 0.40.0 the `code` is the public vocabulary
+/// (`upstream_protocol_error` = the connection broke mid-reply,
+/// `upstream_unreachable`/`upstream_timeout` = never reached, `internal_error`
+/// = ours) while the Anthropic `type` folds those into two values.
+fn backend_error_code(body: &[u8]) -> Option<&'static str> {
+    let json = error_body_json(body)?;
+    ["code", "type"].iter().find_map(|key| {
+        let id = json["error"][*key].as_str()?;
+        HEADROOM_ERROR_IDS
+            .iter()
+            .copied()
+            .find(|known| *known == id)
+    })
 }
 
 /// The `type`/`code` of every 5xx error object the backend writes on the
@@ -3378,18 +3402,25 @@ fn is_failed_request_status(status: u16) -> bool {
 /// label of a known Anthropic error ("400:prompt_too_long"). Sentry keeps one
 /// warning per host per day, so a stuck host's mail could only say "400 x262"
 /// (users 3312 and 4543, 2026-10-19, ~29% of their Claude Code requests).
+/// A 5xx also says who wrote it: the backend's own code
+/// ("502:upstream_protocol_error"), "provider", or bare for the intercept's
+/// empty one, since Sentry keeps no 5xx and user 3400's 2,366 bare 502s on
+/// 2026-10-19 could have been any of them.
 fn failure_kind(status: u16, body: &[u8]) -> String {
-    match anthropic_error_shape(body) {
+    let origin =
+        || backend_error_code(body).or_else(|| provider_wrote_error(body).then_some("provider"));
+    match anthropic_error_shape(body).or_else(|| (status >= 500).then(origin).flatten()) {
         Some(label) => format!("{status}:{label}"),
         None => status.to_string(),
     }
 }
 
 /// `failure_kinds` key for a failed Codex request: a 2xx failed in-band, no
-/// status is a dropped response.
-fn codex_failure_kind(status: Option<u16>) -> String {
+/// status is a dropped response, a 5xx says who wrote it (`failure_kind`).
+fn codex_failure_kind(status: Option<u16>, body: &[u8]) -> String {
     match status {
         Some(status) if (200..300).contains(&status) => "stream".into(),
+        Some(status) if status >= 500 => failure_kind(status, body),
         Some(status) => status.to_string(),
         None => "dropped".into(),
     }
@@ -7746,10 +7777,15 @@ mod tests {
 
     #[test]
     fn codex_failure_kinds_name_the_status_a_dropped_response_or_an_in_band_failure() {
-        assert_eq!(codex_failure_kind(Some(401)), "401");
-        assert_eq!(codex_failure_kind(Some(502)), "502");
-        assert_eq!(codex_failure_kind(Some(200)), "stream");
-        assert_eq!(codex_failure_kind(None), "dropped");
+        assert_eq!(codex_failure_kind(Some(401), b""), "401");
+        assert_eq!(codex_failure_kind(Some(502), b""), "502");
+        let unreachable = br#"{"error":{"message":"Failed to connect to upstream API.","type":"connection_error","code":"upstream_unreachable"}}"#;
+        assert_eq!(
+            codex_failure_kind(Some(502), unreachable),
+            "502:upstream_unreachable"
+        );
+        assert_eq!(codex_failure_kind(Some(200), b""), "stream");
+        assert_eq!(codex_failure_kind(None, b""), "dropped");
     }
 
     #[test]
@@ -8172,6 +8208,20 @@ mod tests {
         let unknown = br#"{"type":"error","error":{"type":"invalid_request_error","message":"something new"}}"#;
         assert_eq!(super::failure_kind(400, unknown), "400");
         assert_eq!(super::failure_kind(502, b""), "502");
+        // A 5xx names its writer: the backend's public code (plain JSON or its
+        // SSE frame, `code` over the folded `type`), else the provider.
+        let cut = br#"{"type":"error","error":{"type":"api_error","message":"Upstream API closed the connection or sent a malformed response.","code":"upstream_protocol_error"}}"#;
+        assert_eq!(super::failure_kind(502, cut), "502:upstream_protocol_error");
+        let frame = b"9a\r\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"connection_error\",\"message\":\"Upstream API did not respond in time.\",\"code\":\"upstream_timeout\"}}\n\n\r\n";
+        assert_eq!(super::failure_kind(502, frame), "502:upstream_timeout");
+        let anthropic = br#"{"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_1"}"#;
+        assert_eq!(super::failure_kind(502, anthropic), "502:provider");
+        assert_eq!(
+            super::failure_kind(502, b"<html>502 Bad Gateway</html>"),
+            "502:provider"
+        );
+        // A 4xx never gets an origin label.
+        assert_eq!(super::failure_kind(400, cut), "400");
     }
 
     #[test]
