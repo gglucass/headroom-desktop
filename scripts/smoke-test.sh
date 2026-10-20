@@ -508,6 +508,9 @@ if [ -n "$snap" ] && [ "$snap" != "null" ] && [ -f "$BASELINE" ]; then
   # means the baseline predates a restart (a leftover file from an earlier pass
   # scored -28 reqs / -3.1M tok_before on 0.9.22-rc.6). Re-baseline, not FAIL.
   [ "$dc" -lt 0 ] || [ "$db" -lt 0 ] || [ "$dr" -lt 0 ] && stale=1
+  # A full run restarted the backend in checks 6/9 above, so a baseline on disk
+  # predates that restart even when its counters match (0.9.45-rc.13 pass).
+  [ "$QUICK" = 1 ] || stale=1
 fi
 if [ -z "$snap" ] || [ "$snap" = "null" ]; then
   row FAIL "7 optimizing" "/stats unreadable"
