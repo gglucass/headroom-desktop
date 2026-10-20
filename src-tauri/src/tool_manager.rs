@@ -2008,6 +2008,216 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
         # Fail-open to the wheel's fingerprint.
         pass
 
+# --- Stream: a client that hangs up after the terminal event (#4286) ----------
+# The direct HTTP SSE loop yields each upstream chunk to the client BEFORE it
+# parses it. Codex closes the connection as soon as it reads
+# response.completed, so the generator is closed at that yield: the terminal
+# event and the usage in the same chunk are never parsed, completed_normally
+# stays False, and since #3747 (0.40.0) the turn finalizes as a 502.
+# emit_request_outcome drops a 502 whole (no /stats request, no savings, no
+# PERF line) and the finalizer skips the prefix tracker, so the next turn of
+# that conversation starts at frozen=0. 0.9.45-rc.12 recorded 0 of 8 Codex
+# requests in the train's guest where 0.39.0 recorded 3 of 3 (2026-10-20).
+# Upstream PR #4286 (open) parses each chunk before yielding it and records a
+# hang-up after the client was handed the terminal event as completed; a
+# hang-up before it stays a 502. Its _stream_response_inner hunks are applied
+# VERBATIM to the installed method's source and compiled in the module's own
+# globals; each must match its expected count or nothing binds. Its Bedrock
+# and LiteLLM-backend hunks are left out: the desktop runs neither. Bookkeeping
+# only, the bytes the client gets are unchanged; but Codex turns now update the
+# prefix tracker, so check BOTH tok_saved/tok_before and cache_read/forwarded
+# for Codex with savings:did after the stable ships.
+# Exact-pin gated to wheel 0.41.0; self-neutralizes when the method already
+# tracks client_left_after_terminal. Kill switch:
+# HEADROOM_STREAM_HANGUP_AFTER_TERMINAL=0.
+_HD_STH_HUNKS = (
+    (
+        '''        completed_normally = False
+        pending_messages: list[dict] = []
+''',
+        '''        completed_normally = False
+        # Set when the client hangs up after the terminal event; it marks
+        # the outcome only, so pending messages are not drained into a
+        # stream nobody reads.
+        client_left_after_terminal = False
+        # A terminal event the client was handed, not just one parsed from
+        # upstream: the memory filter holds message_stop until the end.
+        client_got_terminal = False
+        pending_messages: list[dict] = []
+''',
+        1,
+    ),
+    (
+        '''            else None
+        )
+
+        try:
+            async with contextlib.aclosing(upstream_response) as response:
+''',
+        '''            else None
+        )
+
+        def _client_frame(frame: bytes) -> bytes:
+            """``_guard_client_bytes``, noting when the terminal event goes out."""
+            nonlocal client_got_terminal
+            guarded = _guard_client_bytes(frame)
+            if guarded and not client_got_terminal:
+                if memory_filter is None:
+                    # Unfiltered, the client gets each whole chunk once it
+                    # is parsed, so every event the parser has seen.
+                    client_got_terminal = stream_state["stream_terminal"]
+                else:
+                    # Filtered frames are complete events the filter decoded.
+                    client_got_terminal = any(
+                        _sse_event_outcome(name, data, stream_state["sse_dialect"])[1]
+                        for name, data in parse_sse_events_from_byte_buffer(bytearray(frame))
+                    )
+            return guarded
+
+        try:
+            async with contextlib.aclosing(upstream_response) as response:
+''',
+        1,
+    ),
+    (
+        '''                    # Always stream immediately \u2014 buffering breaks
+                    # real-time clients (LangGraph, LangChain, etc.)
+                    # The context guard runs last, on exactly what the
+                    # client receives (after the memory filter), and may
+                    # hold back bytes only until the first complete event.
+                    client_frames = (
+                        [chunk] if memory_filter is None else memory_filter.feed(chunk)
+                    )
+                    for frame in client_frames:
+                        guarded_frame = _guard_client_bytes(frame)
+                        if guarded_frame:
+                            yield guarded_frame
+
+''',
+        "",
+        1,
+    ),
+    (
+        '''                    # Parse complete SSE events from buffer
+                    usage = self._parse_sse_usage_from_buffer(stream_state, provider)
+''',
+        '''                    # Parse complete SSE events from buffer. A failure (e.g.
+                    # invalid UTF-8) is raised once the chunk is forwarded:
+                    # malformed upstream content still reaches the client.
+                    parse_error: Exception | None = None
+                    try:
+                        usage = self._parse_sse_usage_from_buffer(stream_state, provider)
+                    except Exception as e:
+                        usage, parse_error = None, e
+''',
+        1,
+    ),
+    (
+        '''                                "cache_creation_ephemeral_1h_input_tokens"
+                            ]
+
+            # Memory tool handling after stream completes
+''',
+        '''                                "cache_creation_ephemeral_1h_input_tokens"
+                            ]
+
+                    # Always stream immediately \u2014 buffering breaks
+                    # real-time clients (LangGraph, LangChain, etc.)
+                    # The context guard runs last, on exactly what the
+                    # client receives (after the memory filter), and may
+                    # hold back bytes only until the first complete event.
+                    # Yielded only after the chunk is parsed: a client may
+                    # hang up on the terminal event (Codex does), closing
+                    # this generator at the yield.
+                    client_frames = (
+                        [chunk] if memory_filter is None else memory_filter.feed(chunk)
+                    )
+                    for frame in client_frames:
+                        guarded_frame = _client_frame(frame)
+                        if guarded_frame:
+                            yield guarded_frame
+                    if parse_error is not None:
+                        raise parse_error
+
+            # Memory tool handling after stream completes
+''',
+        1,
+    ),
+    # The memory filter's closing and continuation frames.
+    ("guarded_frame = _guard_client_bytes(frame)", "guarded_frame = _client_frame(frame)", 3),
+    (
+        '''        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+''',
+        '''        except (GeneratorExit, asyncio.CancelledError):
+            # Codex closes the connection as soon as it reads
+            # response.completed, before the upstream EOF ends the loop.
+            client_left_after_terminal = (
+                client_got_terminal and not stream_state["stream_failed"]
+            )
+            raise
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+''',
+        1,
+    ),
+    (
+        '''                    upstream_response.status_code, completed_normally
+                ),
+''',
+        '''                    upstream_response.status_code,
+                    completed_normally or client_left_after_terminal,
+                ),
+''',
+        1,
+    ),
+)
+_hd_sth_flag = _hd_os.environ.get("HEADROOM_STREAM_HANGUP_AFTER_TERMINAL", "1")
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
+    _hd_sth_flag.strip().lower() not in ("", "0", "false", "no", "off")
+):
+    try:
+        import importlib.metadata as _hd_sth_meta
+
+        if _hd_sth_meta.version("headroom-ai") == "0.41.0":
+            import __future__ as _hd_sth_future
+            import inspect as _hd_sth_inspect
+            import textwrap as _hd_sth_textwrap
+
+            from headroom.proxy import helpers as _hd_sth_helpers
+            from headroom.proxy.handlers import streaming as _hd_sth_mod
+
+            _hd_sth_src = _hd_sth_textwrap.dedent(
+                _hd_sth_inspect.getsource(_hd_sth_mod.StreamingMixin._stream_response_inner)
+            )
+            if "client_left_after_terminal" not in _hd_sth_src:
+                for _hd_sth_old, _hd_sth_new, _hd_sth_n in _HD_STH_HUNKS:
+                    if _hd_sth_src.count(_hd_sth_old) != _hd_sth_n:
+                        raise LookupError(_hd_sth_old.strip().splitlines()[0])
+                    _hd_sth_src = _hd_sth_src.replace(_hd_sth_old, _hd_sth_new)
+                _hd_sth_ns = {}
+                # streaming.py defers annotations; the recompiled method must too.
+                exec(
+                    compile(
+                        _hd_sth_src,
+                        "<headroom-desktop: upstream #4286 _stream_response_inner>",
+                        "exec",
+                        flags=_hd_sth_future.annotations.compiler_flag,
+                        dont_inherit=True,
+                    ),
+                    vars(_hd_sth_mod),
+                    _hd_sth_ns,
+                )
+                # The PR imports it at module level; the method reads it as a global.
+                _hd_sth_mod.parse_sse_events_from_byte_buffer = (
+                    _hd_sth_helpers.parse_sse_events_from_byte_buffer
+                )
+                _hd_sth_fn = _hd_sth_ns["_stream_response_inner"]
+                _hd_sth_fn.__qualname__ = "StreamingMixin._stream_response_inner"
+                _hd_sth_mod.StreamingMixin._stream_response_inner = _hd_sth_fn
+                _hd_bound.add("stream_hangup_after_terminal")
+    except Exception:
+        # Fail-open to the wheel's stream loop.
+        pass
+
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -2114,6 +2324,7 @@ _HD_VENDORS = (
     "web_search_history",
     "buffered_upstream_stream",
     "deferred_tool_affinity",
+    "stream_hangup_after_terminal",
     "loop_stall_dump",
     "startup_stall_dump",
 )
@@ -17712,6 +17923,87 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False False False", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn stream_hangup_after_terminal_behaves_against_the_installed_wheel() {
+        // Codex hangs up on response.completed before the upstream EOF: that
+        // turn records 200 with its usage; a hang-up before the terminal event
+        // stays a 502. The kill switch restores the wheel's 502 with no usage.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-stream-hangup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        // Upstream PR #4286's test harness: a mocked upstream that sends the
+        // terminal event and never reaches EOF.
+        let probe = r#"import asyncio, json, sitecustomize
+from unittest.mock import AsyncMock, MagicMock
+import httpx
+from headroom.proxy.server import HeadroomProxy
+def ev(n, p): return f'event: {n}\ndata: {json.dumps(p)}\n\n'.encode()
+START = ev('response.created', {'type': 'response.created', 'response': {'id': 'r1'}})
+DONE = ev('response.completed', {'type': 'response.completed', 'response': {'id': 'r1', 'status': 'completed', 'usage': {'input_tokens': 1000, 'input_tokens_details': {'cached_tokens': 600}, 'output_tokens': 5}}})
+def proxy():
+    p = object.__new__(HeadroomProxy)
+    p.http_client = MagicMock(spec=httpx.AsyncClient)
+    p._config = MagicMock()
+    p._config.ccr_inject_tool = False
+    p._config.retry_max_attempts = 1
+    p.config = p._config
+    p._record_request_outcome = AsyncMock()
+    r = MagicMock()
+    r.headers = httpx.Headers({'content-type': 'text/event-stream'})
+    r.status_code = 200
+    async def chunks():
+        yield START
+        yield DONE
+        await asyncio.Event().wait()
+    r.aiter_bytes = chunks
+    r.aclose = AsyncMock()
+    p.http_client.build_request = MagicMock(return_value=MagicMock())
+    p.http_client.send = AsyncMock(return_value=r)
+    return p
+async def turn(stop):
+    p = proxy()
+    resp = await p._stream_response(url='https://chatgpt.com/backend-api/codex/responses', headers={'authorization': 'Bearer t'}, body={'model': 'gpt-5.4', 'stream': True, 'input': 'ok'}, provider='openai', model='gpt-5.4', request_id='t', original_tokens=10, optimized_tokens=10, tokens_saved=0, transforms_applied=[], tags={}, optimization_latency=0.0)
+    seen = b''
+    while stop not in seen:
+        seen += await resp.body_iterator.__anext__()
+    await resp.body_iterator.aclose()
+    o = p._record_request_outcome.await_args.args[0]
+    return f'{o.status_code}:{o.provider_input_tokens}'
+async def main():
+    print(await turn(b'response.completed'), await turn(b'response.created'), 'stream_hangup_after_terminal' in sitecustomize._hd_bound)
+asyncio.run(main())
+"#;
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STREAM_HANGUP_AFTER_TERMINAL", kill)
+                .output()
+                .expect("run stream hangup probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on.ends_with("False") {
+            eprintln!("skipping: stream hangup vendor did not bind (wheel bumped?)");
+            return;
+        }
+        assert_eq!(on, "200:1000 502:0 True", "stderr:\n{on_err}");
+        assert_eq!(off, "502:0 502:0 False", "stderr:\n{off_err}");
     }
 
     #[test]
