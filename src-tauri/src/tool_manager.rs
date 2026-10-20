@@ -14235,7 +14235,7 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
 /// `    ProxyServer    REG_SZ    socks4://127.0.0.1:10808`.
 /// Localized Windows translates headers and INFO lines but never the value
 /// rows' REG_* type token, so matching name + type token is locale-safe.
-fn parse_reg_value(reg_output: &str, value_name: &str) -> Option<String> {
+pub(crate) fn parse_reg_value(reg_output: &str, value_name: &str) -> Option<String> {
     for line in reg_output.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() != Some(value_name) {
