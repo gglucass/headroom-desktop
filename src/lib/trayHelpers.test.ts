@@ -2,6 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  activityDotVisible,
   activityFeedSignature,
   homeDashboardPoll,
   launcherVerifyGate,
@@ -186,6 +187,19 @@ describe("useWindowFocused", () => {
     expect(result.current).toBe(true);
     act(() => emitFocus(false));
     expect(result.current).toBe(false);
+  });
+});
+
+describe("activityDotVisible", () => {
+  it("shows a tip posted after Activity was seen while the Home flag is still stale", () => {
+    // Tip A seen on Activity; the dashboard only refreshes on Home, so its
+    // flag stays true from A while the user is elsewhere.
+    expect(activityDotVisible(true, "A", "A", "notifications")).toBe(false);
+    expect(activityDotVisible(true, "A", "A", "settings")).toBe(false);
+    // Tip B posts while the tray is hidden; the user reopens it on Home.
+    expect(activityDotVisible(true, "A", "A,B", "home")).toBe(true);
+    expect(activityDotVisible(false, "A", "A,B", "home")).toBe(false);
+    expect(activityDotVisible(true, null, "", "home")).toBe(true);
   });
 });
 

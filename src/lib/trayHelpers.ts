@@ -94,6 +94,19 @@ export function useWindowFocused(): boolean {
   return focused;
 }
 
+/// Whether the Activity tab shows its unread-tip dot. `seenTips` is the feed's
+/// tip set the user last looked at on Activity: `dashboardTipUnseen` refreshes
+/// only on Home, so it can still be true from those tips, and a tip posted
+/// since changes `tips` and shows its own dot.
+export function activityDotVisible(
+  dashboardTipUnseen: boolean,
+  seenTips: string | null,
+  tips: string,
+  view: TrayView
+): boolean {
+  return dashboardTipUnseen && seenTips !== tips && view !== "notifications";
+}
+
 /// Runtime status poll cadence for the main window. It keeps a slow poll while
 /// hidden: the "Headroom stopped running" notification only fires while the
 /// window is hidden, so a focused-only poll could never raise it.

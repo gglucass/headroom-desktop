@@ -202,6 +202,7 @@ import {
   writeCachedPricing
 } from "./lib/pricing";
 import {
+  activityDotVisible,
   activityFeedSignature,
   homeDashboardPoll,
   launcherVerifyGate,
@@ -1911,9 +1912,8 @@ export default function App() {
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
   const activityTabTrackedRef = useRef(false);
   // Hides the dot the moment Activity opens instead of at the next dashboard
-  // poll. Holds the `tipUnseen` it cleared, so a later tip shows its own dot.
-  const [tipMarkedSeen, setTipMarkedSeen] = useState(false);
-  const activityDot = dashboard.tipUnseen && !tipMarkedSeen && activeView !== "notifications";
+  // poll. Holds the tips it cleared, so a later tip shows its own dot.
+  const [seenTipIdentity, setSeenTipIdentity] = useState<string | null>(null);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
   // Request bytes forwarded unoptimized while gated; see unsavedWhileBlockedLabel.
@@ -3303,13 +3303,10 @@ export default function App() {
   const feedTips = activityFeed.tiles.tips;
   const tipUnseen = dashboard.tipUnseen || feedTips.some((tip) => !tip.seen);
   const tipIdentity = feedTips.map((tip) => tip.observedAt).join();
+  const activityDot = activityDotVisible(dashboard.tipUnseen, seenTipIdentity, tipIdentity, activeView);
   useEffect(() => {
-    if (!tipUnseen) {
-      setTipMarkedSeen(false);
-      return;
-    }
-    if (activeView !== "notifications" || !trayWindowFocused) return;
-    setTipMarkedSeen(true);
+    if (!tipUnseen || activeView !== "notifications" || !trayWindowFocused) return;
+    setSeenTipIdentity(tipIdentity);
     void invoke("mark_tip_seen").catch(() => undefined);
     // The feed's tip identity re-runs this when another tip posts while Activity is open.
   }, [activeView, trayWindowFocused, tipUnseen, tipIdentity]);
