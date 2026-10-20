@@ -15224,6 +15224,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     } else if lower.contains("permission denied")
         || lower.contains("access is denied")
         || lower.contains("errno 13")
+        // ERROR_ACCESS_DENIED, whose prose Windows localizes (RUST-RA:
+        // Portuguese "Acesso negado. (os error 5)" from Codex `plugin add`
+        // fell to "other"). On Unix 5 is EIO.
+        || (cfg!(windows) && lower.contains("(os error 5)"))
     {
         "permission"
     } else if lower.contains("was not registered") {
@@ -26809,6 +26813,13 @@ exit 0
             ),
             ("Codex: something we have not seen", "other"),
         ];
+        // RUST-RA, real: Windows localizes ERROR_ACCESS_DENIED's prose.
+        let localized = "Codex: command failed (exit 1): ~\\AppData\\Roaming\\npm\\codex.cmd plugin \
+                         add caveman@caveman\nstdout:\n\nstderr:\nError: Acesso negado. (os error 5)";
+        assert_eq!(
+            plugin_install_failure_category(localized),
+            if cfg!(windows) { "permission" } else { "other" }
+        );
         let mut seen = std::collections::BTreeSet::new();
         for (detail, expected) in cases {
             assert_eq!(
