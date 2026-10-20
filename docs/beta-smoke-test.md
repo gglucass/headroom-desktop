@@ -228,10 +228,8 @@ The same class as check 11, one layer down: the desktop can *decide* on a flag a
 PID=$(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)
 ps -o args= -p $PID | tr ' ' '\n' | grep -c -- '--no-ccr'
 ps eww -o command= -p $PID | grep -c 'pyinject'
-grep -c '_hd_sc_cacheable' \
-  ~/Library/Application\ Support/Headroom/headroom/pyinject/sitecustomize.py
 ```
-Expect: `0` on line 1 by default - 0.9.6 re-enabled CCR and `--no-ccr` is now opt-in (`desktop_forces_no_ccr` in `tool_manager.rs` only pushes it when the app was launched with `HEADROOM_DESKTOP_NO_CCR=1`), so a `1` there means the kill switch is set and CCR is OFF for this session. Then `1` (PYTHONPATH points at the injection dir), and non-zero (the response-cache guard is in the file on disk, not just in the Rust literal). The general rule still holds for any flag that IS expected: a `0` with the flag present in `tool_manager.rs` means the backend predates the change - restart it and re-run, rather than trusting the source.
+Expect: `0` on line 1 by default - 0.9.6 re-enabled CCR and `--no-ccr` is now opt-in (`desktop_forces_no_ccr` in `tool_manager.rs` only pushes it when the app was launched with `HEADROOM_DESKTOP_NO_CCR=1`), so a `1` there means the kill switch is set and CCR is OFF for this session. Then `1` (PYTHONPATH points at the injection dir). The response-cache guard (`_hd_sc_cacheable`) is no longer checked: wheel 0.41.0 ships it natively (#3930) and the vendor was deleted. The general rule still holds for any flag that IS expected: a `0` with the flag present in `tool_manager.rs` means the backend predates the change - restart it and re-run, rather than trusting the source.
 
 Resolve the pid exactly as written. A bare `lsof -ti :6768` matches two processes - the backend that *listens* on 6768 and the desktop that holds a client connection to it - and `head -1` returns the lower pid, which is the desktop on any launch where it started first. Both counts then come back `0` and a healthy build reads as a hard FAIL (observed on the 0.8.1-rc.2 pass). `-sTCP:LISTEN` narrows it to the backend, but only when the protocol and port are a *single* selection (`-ti TCP:6768`): lsof ORs multiple `-i` arguments, so the plausible-looking `lsof -iTCP -sTCP:LISTEN -ti :6768` selects every TCP listener on the machine and `head -1` picks whatever unrelated daemon sorts first.
 
