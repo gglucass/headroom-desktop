@@ -172,10 +172,18 @@ fn process_trust_env() -> Vec<(&'static str, &'static str)> {
 /// HEADROOM_CERT_STORE is left alone. A user's own HEADROOM_CA_BUNDLE is kept,
 /// but the replacing vars still go: the wheel checks them first and would
 /// never load it. Same first-existing-file order as the wheel's
-/// `find_ca_bundle`.
-fn additive_ca_bundle(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+/// `find_ca_bundle`. A pre-0.40 runtime (a failed upgrade rolled back to it)
+/// has no HEADROOM_CA_BUNDLE, so it keeps the replacing vars: removed, it
+/// would trust certifi alone.
+fn additive_ca_bundle(
+    installed_version: Option<&str>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
-    if !cfg!(any(target_os = "macos", windows)) || set("HEADROOM_CERT_STORE").is_some() {
+    if !cfg!(any(target_os = "macos", windows))
+        || !runtime_version_at_least(installed_version, (0, 40))
+        || set("HEADROOM_CERT_STORE").is_some()
+    {
         return None;
     }
     let replacing = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]
@@ -4499,7 +4507,11 @@ impl ToolManager {
                 if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
                     command.env("HEADROOM_DISABLE_KOMPRESS", "1");
                 }
-                if let Some(bundle) = additive_ca_bundle(|name| std::env::var(name).ok()) {
+                if let Some(bundle) =
+                    additive_ca_bundle(self.installed_headroom_version().as_deref(), |name| {
+                        std::env::var(name).ok()
+                    })
+                {
                     command
                         .env("HEADROOM_CA_BUNDLE", bundle)
                         .env_remove("SSL_CERT_FILE")
@@ -18196,16 +18208,23 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         std::fs::write(&pem, "pem").expect("pem");
         let pem = pem.to_string_lossy().into_owned();
         let missing = dir.join("gone.pem").to_string_lossy().into_owned();
-        let bundle = |vars: &[(&str, &str)]| {
-            super::additive_ca_bundle(|name| {
+        let bundle_on = |version: Option<&str>, vars: &[(&str, &str)]| {
+            super::additive_ca_bundle(version, |name| {
                 vars.iter()
                     .find(|(k, _)| *k == name)
                     .map(|(_, v)| v.to_string())
             })
         };
+        let bundle = |vars: &[(&str, &str)]| bundle_on(None, vars);
         let mapped = cfg!(any(target_os = "macos", windows)).then(|| pem.clone());
 
         assert_eq!(bundle(&[("SSL_CERT_FILE", &pem)]), mapped);
+        assert_eq!(
+            bundle_on(Some("0.41.0"), &[("SSL_CERT_FILE", &pem)]),
+            mapped
+        );
+        // A rolled-back 0.39.0 runtime never reads HEADROOM_CA_BUNDLE.
+        assert_eq!(bundle_on(Some("0.39.0"), &[("SSL_CERT_FILE", &pem)]), None);
         assert_eq!(bundle(&[("REQUESTS_CA_BUNDLE", &pem)]), mapped);
         // A missing file replaces nothing in the wheel either.
         assert_eq!(
