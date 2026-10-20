@@ -1185,7 +1185,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             if silent_failures.is_empty() {
                 return false;
             }
-            if !repair_pages(&silent_failures) {
+            if cc_switch_dropped_the_hooks(guard_shape) || !repair_pages(&silent_failures) {
                 return true;
             }
             // WHICH check failed, in the fingerprint and in full as an
@@ -7992,6 +7992,21 @@ fn claude_guard_registered_any_interpreter() -> Result<bool> {
         &claude_settings_path(),
         &claude_guard_hook_path().display().to_string(),
     )
+}
+
+/// cc-switch overwrites the whole settings.json on every provider switch and
+/// the reconciler puts back only ANTHROPIC_BASE_URL, so the hooks table goes
+/// and the re-apply is the fix: not a page (RUST-GS on 0.9.43, "no hooks
+/// table" twice in a day). The reconciler saves its capture on that switch,
+/// and a changed settings.json is re-verified within a 5-minute tick.
+fn cc_switch_dropped_the_hooks(guard_shape: Option<&str>) -> bool {
+    guard_shape == Some("no hooks table")
+        && std::fs::metadata(crate::tool_manager::cc_switch_capture_path())
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| {
+                at.elapsed()
+                    .is_ok_and(|age| age < Duration::from_secs(15 * 60))
+            })
 }
 
 /// Where the guard was, in fixed words for Sentry: whether a writer dropped
@@ -16076,6 +16091,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(super::repair_pages(&other), "any other cause pages");
         assert!(super::repair_client_setup_now("claude_code"));
         assert!(super::claude_guard_registered().unwrap(), "guard back");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_cc_switch_provider_switch_dropping_the_hooks_does_not_page() {
+        let _home = TestHome::new();
+        let gone = Some("no hooks table");
+        assert!(
+            !super::cc_switch_dropped_the_hooks(gone),
+            "no capture, another writer"
+        );
+        write_cc_switch_capture("https://api.deepseek.com/anthropic");
+        assert!(super::cc_switch_dropped_the_hooks(gone));
+        assert!(!super::cc_switch_dropped_the_hooks(Some(
+            "no SessionStart hooks"
+        )));
+        fs::File::options()
+            .write(true)
+            .open(crate::tool_manager::cc_switch_capture_path())
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            !super::cc_switch_dropped_the_hooks(gone),
+            "an old switch is not this loss"
+        );
     }
 
     #[test]
