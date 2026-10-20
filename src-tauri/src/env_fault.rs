@@ -179,6 +179,32 @@ static REPORTED: Mutex<Vec<(Op, FaultKind)>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static TEST_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) struct ReadFaultGuard;
+
+#[cfg(test)]
+impl Drop for ReadFaultGuard {
+    fn drop(&mut self) {
+        *FAULTS.lock() = Faults::default();
+        *TEST_ROOT.lock() = None;
+    }
+}
+
+/// Holds a sustained read fault until the guard drops, for tests of the logic
+/// that holds off on one. The stand-in root keeps other tests' successful
+/// reads from clearing it. Process-wide, so callers are serial.
+#[cfg(test)]
+pub(crate) fn hold_read_fault() -> ReadFaultGuard {
+    *TEST_ROOT.lock() = Some(PathBuf::from("/nonexistent/headroom-read-fault"));
+    let now = Instant::now();
+    let mut faults = FAULTS.lock();
+    *faults = Faults::default();
+    for _ in 0..SUSTAINED_FAILURES {
+        faults.fail(Op::Read, FaultKind::Blocked, now);
+    }
+    ReadFaultGuard
+}
+
 fn in_scope(path: &Path) -> bool {
     #[cfg(test)]
     if let Some(root) = TEST_ROOT.lock().as_ref() {

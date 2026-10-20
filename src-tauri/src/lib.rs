@@ -13256,6 +13256,12 @@ mod tests {
         let due = super::disconnect_notice_due(Some(TrayRuntimeVisual::Running));
         crate::client_adapters::set_clients_unwired_for_port_holder(false);
         assert!(!due, "announced a port-holder unwire as a disconnect");
+        // An unreadable data folder loads the setup as the empty default,
+        // which reads as every client disconnected (RUST-R1/R2).
+        let fault = crate::env_fault::hold_read_fault();
+        let due = super::disconnect_notice_due(Some(TrayRuntimeVisual::Running));
+        drop(fault);
+        assert!(!due, "announced an unreadable data folder as a disconnect");
     }
 
     #[test]
