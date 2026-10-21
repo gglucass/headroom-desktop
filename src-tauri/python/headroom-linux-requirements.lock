@@ -19,6 +19,9 @@
 # PYSEC-2026-3929 (tokenizer save_pretrained path traversal, fixed in 5.10.0).
 # fsspec 2026.4.0 -> 2026.6.0 and multidict 6.7.1 -> 6.9.1 (2026-10-06): the
 # same CVE top-up as the macOS lock (see its lineage).
+# certifi 2026.6.17 -> 2026.10.19 (2026-10-21): the same CVE top-up as the
+# macOS lock (see its lineage).
+# pip 26.2.2 added (2026-10-21) for the same incident (see the macOS lock).
 # 0.41.0's core requires_dist adds truststore>=0.10.0, so truststore 0.10.4
 # (the macOS and Windows locks' pin, a pure-Python wheel) is added here.
 ast-grep-cli==0.42.2 \
@@ -47,6 +50,8 @@ openai==2.37.0 \
 orjson==3.11.9 \
     --hash=sha256:26a473dbb4162108b27901492546f83c76fdcea3d0eadff00ae7a07e18dcce09 \
     --hash=sha256:be4fa4f0af7fa18951f7ab3fc2148e223af211bf03f59e1c6034ec3f97f21d61
+pip==26.2.2 \
+    --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70
 pydantic==2.13.4 \
     --hash=sha256:45a282cde31d808236fd7ea9d919b128653c8b38b393d1c4ab335c62924d9aba
 pyyaml==6.0.3 \
@@ -106,8 +111,8 @@ anyio==4.14.2 \
     --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494
 attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
-certifi==2026.6.17 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.10.19 \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
 cffi==2.0.0 \
     --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
     --hash=sha256:b21e08af67b8a103c71a250401c78d5e0893beff75e28c53c98f4de42f774062

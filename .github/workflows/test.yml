@@ -369,6 +369,8 @@ jobs:
     # Known tradeoff: an advisory published upstream can red an unrelated PR.
     # If that gets noisy, ignore the specific ID here rather than dropping the
     # job -- `cargo audit --ignore RUSTSEC-YYYY-NNNN`, `pip-audit --ignore-vuln`.
+    # Every audit runs even when an earlier one fails, so one red run lists all
+    # of them (rc4's cargo-audit failure hid pip-audit's for a day).
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -393,19 +395,23 @@ jobs:
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
       - name: Set up Node.js
+        if: ${{ !cancelled() }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
       - name: Frontend dependency advisories
+        if: ${{ !cancelled() }}
         # --omit=dev: a devDependency advisory is not in the shipped bundle and
         # would block releases on something users never run.
         run: npm audit --audit-level=high --omit=dev
       - name: Set up Python (runtime advisories)
+        if: ${{ !cancelled() }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - name: Python runtime advisories
+        if: ${{ !cancelled() }}
         # Audits the pins each platform installs, not the lock files as-is:
         # pip-audit evaluates environment markers against the runner, so a
         # direct audit silently skips the Intel-Mac-only pins. --export
@@ -421,6 +427,19 @@ jobs:
         #   GHSA-g6cj-pr64-35w5 / GHSA-jwv3-5hgf-82ww / GHSA-m2h6-j472-rp4c,
         #   verified unreachable 2026-08-17 (see headroom-requirements.lock).
         #   Drop with that pin.
+        # - CVE-2026-112395/112397/112400/112404/112895/112896/112897/112899:
+        #   pillow 12.3.0 in the macOS and Windows locks (Linux pins none). The
+        #   fix is pillow 13.0.0, and fastembed caps pillow<13.0 in both 0.8.0
+        #   (our pin) and 0.9.0 (latest as of 2026-10-21), so no lock resolves.
+        #   headroom-ai decodes agent-traffic images with a bare Image.open, so
+        #   the three TIFF decode bugs (112395, 112404, 112897) are reachable: a
+        #   crafted image can crash the proxy or put proxy heap bytes into its
+        #   pixels. Out-of-bounds reads only, no code execution. The other five
+        #   need calls headroom never makes: a TIFF re-encode (112896; it saves
+        #   JPEG), ImageMorph (112397), PDF append (112895), GIF reuse after a
+        #   caught DecompressionBombError (112400), EPS load(scale) (112899).
+        #   Drop all eight with the pillow 13 bump once a fastembed release
+        #   allows it.
         shell: bash
         run: |
           python -m pip install --quiet pip-audit==2.10.1
@@ -433,6 +452,14 @@ jobs:
               --ignore-vuln PYSEC-2026-3447 \
               --ignore-vuln PYSEC-2026-3552 \
               --ignore-vuln PYSEC-2026-3553 \
-              --ignore-vuln PYSEC-2026-3554 || status=1
+              --ignore-vuln PYSEC-2026-3554 \
+              --ignore-vuln CVE-2026-112395 \
+              --ignore-vuln CVE-2026-112397 \
+              --ignore-vuln CVE-2026-112400 \
+              --ignore-vuln CVE-2026-112404 \
+              --ignore-vuln CVE-2026-112895 \
+              --ignore-vuln CVE-2026-112896 \
+              --ignore-vuln CVE-2026-112897 \
+              --ignore-vuln CVE-2026-112899 || status=1
           done
           exit "$status"

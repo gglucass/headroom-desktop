@@ -2098,7 +2098,13 @@ impl AppState {
         true
     }
 
+    /// The version the identity push reports. 0 while the profile is unreadable:
+    /// that session assumes acceptance (`load_or_create`), and the server would
+    /// record it for a user who closed the terms gate on their first launch.
     pub fn accepted_terms_version(&self) -> u32 {
+        if self.launch_profile_path.is_none() {
+            return 0;
+        }
         self.launch_profile.lock().accepted_terms_version
     }
 
@@ -5324,7 +5330,19 @@ impl LaunchProfile {
                     path.display()
                 );
                 persist_path = None;
-                Self::fresh()
+                // The file exists, so terms and setup were done on an earlier
+                // launch. Fresh defaults showed the terms gate and setup again,
+                // which could not save and hid Home's data-folder banner
+                // (win-test, 0.9.45-rc.13). The flags keep one-shot notices quiet.
+                LaunchProfile {
+                    launch_count: 1,
+                    setup_wizard_complete: true,
+                    accepted_terms_version: REQUIRED_TERMS_VERSION,
+                    onboarding_recovery_notified: true,
+                    first_savings_notified: true,
+                    unrouted_usage_notified: true,
+                    ..Self::fresh()
+                }
             }
         };
 
@@ -18292,9 +18310,18 @@ mod tests {
 
         let state = AppState::new_in(base_dir.clone()).expect("degrades, never fails");
         assert_eq!(
+            state.launch_profile.lock().accepted_terms_version,
+            super::REQUIRED_TERMS_VERSION,
+            "a returning user, not the terms gate"
+        );
+        assert_eq!(
             state.accepted_terms_version(),
             0,
-            "session runs on defaults"
+            "an assumed acceptance is never reported to the server"
+        );
+        assert!(
+            state.launch_profile.lock().setup_wizard_complete,
+            "nor setup"
         );
         state.mark_terms_accepted(3);
         let _ = state.savings_tracker.lock().persist_state();

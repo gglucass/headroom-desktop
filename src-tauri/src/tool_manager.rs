@@ -6297,6 +6297,13 @@ impl ToolManager {
         )
         .context("creating Headroom-managed virtualenv")?;
 
+        // `venv` keeps an existing site-packages, so a pip torn by an earlier
+        // attempt (killed mid self-upgrade) would survive ensurepip. If the
+        // removal fails, the `pip --version` check below still decides.
+        if let Err(err) = remove_venv_pip(&self.runtime.managed_python()) {
+            log::info!("[tool_manager] could not clear the venv's old pip: {err:#}");
+        }
+
         run_python_command(
             &self.runtime.managed_python(),
             &["-m", "ensurepip", "--upgrade", "--default-pip"],
@@ -7574,7 +7581,9 @@ impl ToolManager {
         // should still run. Warn-only — a broken optional addon must not fail
         // the core Headroom upgrade.
         if let Err(err) = self.smoke_test_markitdown() {
-            log::warn!("markitdown smoke test failed after upgrade: {err:#}");
+            let exception = command_failure_last_line(&err)
+                .map_or_else(String::new, |line| format!("{line}; "));
+            log::warn!("markitdown smoke test failed after upgrade: {exception}{err:#}");
         }
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
@@ -7957,9 +7966,9 @@ impl ToolManager {
     /// in stderr, the venv is missing one or more pinned dependencies despite
     /// the receipt's `requirementsLockSha256` saying otherwise (seen on
     /// upgrades from very-old desktop versions where a partial install left
-    /// the receipt stamped but the venv incomplete). Self-heal by running the
-    /// requirements repair, which re-installs the full lock file and retries
-    /// MCP install internally.
+    /// the receipt stamped but the venv incomplete). Self-heal with the repair
+    /// the missing module needs (our wheel, the module's lock pins, or the full
+    /// lock re-sync), then retry the MCP install.
     pub fn ensure_mcp_configured(&self) -> Result<()> {
         if self.headroom_mcp_configured() == Some(true)
             && matches!(
@@ -7983,18 +7992,41 @@ impl ToolManager {
         let method = match self.install_headroom_mcp() {
             Ok(method) => method,
             Err(err) if looks_like_corrupt_venv_error(&err) => {
-                log::warn!(
-                    "MCP install hit a Python import error; running requirements repair: {err:#}"
-                );
-                sentry::capture_message(
-                    "MCP install hit corrupt-venv signal; auto-running requirements repair",
-                    sentry::Level::Info,
-                );
-                self.repair_stale_requirements_with_progress(|_| {})
+                // Info: install_headroom_mcp already reported this failure with
+                // its stderr; a second and third event were the same incident
+                // (RUST-RX/RY/RZ).
+                log::info!("MCP install hit a Python import error; repairing the venv: {err:#}");
+                let stderr = err
+                    .downcast_ref::<CommandFailure>()
+                    .map_or("", |failure| failure.stderr.as_str());
+                if crate::is_missing_headroom_module_signal(stderr) {
+                    // Our own wheel is not in the lock, so the lock re-sync below
+                    // never put back a torn `headroom` package (RUST-RX lost
+                    // `headroom/providers/opencode`); the proxy start path's
+                    // RUST-CY repair, run here before the proxy starts.
+                    let version = self
+                        .installed_headroom_version()
+                        .unwrap_or_else(|| HEADROOM_PINNED_VERSION.to_string());
+                    self.pip_force_reinstall_headroom_version(&version)
+                        .context("auto-repairing venv after MCP install import error")?;
+                    self.install_headroom_mcp()?
+                } else {
+                    // A dist-info that outlived its files reads as installed to
+                    // the plain re-sync, so missing modules get their pins forced.
+                    let missing: Vec<String> = crate::missing_dependency_modules(stderr)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    if missing.is_empty() {
+                        self.repair_stale_requirements_with_progress(|_| {})
+                    } else {
+                        self.repair_missing_dependencies(&missing)
+                    }
                     .context("auto-repairing venv after MCP install import error")?;
-                // repair_stale_requirements_with_progress runs install_headroom_mcp
-                // and writes the mcp section of the receipt itself, so we're done.
-                return Ok(());
+                    // Both end in repair_stale_requirements_with_progress, which runs
+                    // install_headroom_mcp and writes the receipt's mcp section itself.
+                    return Ok(());
+                }
             }
             Err(err) => return Err(err),
         };
@@ -14235,7 +14267,7 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
 /// `    ProxyServer    REG_SZ    socks4://127.0.0.1:10808`.
 /// Localized Windows translates headers and INFO lines but never the value
 /// rows' REG_* type token, so matching name + type token is locale-safe.
-fn parse_reg_value(reg_output: &str, value_name: &str) -> Option<String> {
+pub(crate) fn parse_reg_value(reg_output: &str, value_name: &str) -> Option<String> {
     for line in reg_output.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() != Some(value_name) {
@@ -15019,11 +15051,25 @@ fn retire_venv(venv: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
-/// a torn pip torn: it installs with `--upgrade`, which reads the surviving
-/// dist-info as "already satisfied". Without the dist-info it writes every
-/// file again (and it runs pip from its bundled wheel, not the broken one).
+/// Puts a fresh pip into the venv `python` belongs to (and it runs pip from
+/// ensurepip's bundled wheel, not the broken one).
 fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
+    remove_venv_pip(python)?;
+    run_python_command(
+        python,
+        &["-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd,
+    )
+    .context("reinstalling pip into the Headroom-managed virtualenv")
+}
+
+/// Clears pip out of the venv `python` belongs to, so ensurepip writes a whole
+/// one. ensurepip alone leaves a torn pip torn: it installs with `--upgrade`,
+/// which reads a surviving dist-info as "already satisfied". The package goes
+/// too: ensurepip writes only its own pip's files, and a newer pip's leftovers
+/// shadow them (the lock's pip 26 `build_env/` package wins over ensurepip's
+/// 25.0.1 `build_env.py`, and `pip --version` dies).
+fn remove_venv_pip(python: &Path) -> Result<()> {
     let lib = python
         .parent()
         .and_then(Path::parent)
@@ -15032,23 +15078,24 @@ fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
     // lib/site-packages on Windows (case-insensitive `Lib`),
     // lib/python3.X/site-packages elsewhere.
     let site_dirs = std::iter::once(lib.clone())
-        .chain(std::fs::read_dir(&lib)?.flatten().map(|entry| entry.path()))
+        .chain(
+            std::fs::read_dir(&lib)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        )
         .map(|dir| dir.join("site-packages"));
     for site in site_dirs {
         for entry in std::fs::read_dir(&site).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("pip-") && name.ends_with(".dist-info") {
+            if name == "pip" || (name.starts_with("pip-") && name.ends_with(".dist-info")) {
                 std::fs::remove_dir_all(entry.path())
                     .with_context(|| format!("removing {}", entry.path().display()))?;
             }
         }
     }
-    run_python_command(
-        python,
-        &["-m", "ensurepip", "--upgrade", "--default-pip"],
-        cwd,
-    )
-    .context("reinstalling pip into the Headroom-managed virtualenv")
+    Ok(())
 }
 
 /// Cause class for a direct-wheel download that fell back to the pip index.
@@ -15076,6 +15123,7 @@ fn wheel_download_failure_category(detail: &str) -> &'static str {
         match code {
             403 => "http-403",
             404 => "http-404",
+            500..=599 => "http-5xx",
             _ => "http-other",
         }
     } else if lower.contains("dns error")
@@ -15166,10 +15214,11 @@ fn plugin_install_failure_reported(category: &str) -> bool {
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
 /// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
-/// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
+/// installed fine; RUST-NN: a connect timeout), and a 5xx is the CDN's own
+/// (RUST-RW: one 502 from files.pythonhosted.org). The pip fallback uses the
 /// same CDN, so if it fails too, pip's own failure report carries it.
 fn wheel_download_failure_reported(category: &str) -> bool {
-    !matches!(category, "dns" | "connect-timeout")
+    !matches!(category, "dns" | "connect-timeout" | "http-5xx")
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -15224,6 +15273,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     } else if lower.contains("permission denied")
         || lower.contains("access is denied")
         || lower.contains("errno 13")
+        // ERROR_ACCESS_DENIED, whose prose Windows localizes (RUST-RA:
+        // Portuguese "Acesso negado. (os error 5)" from Codex `plugin add`
+        // fell to "other"). On Unix 5 is EIO.
+        || (cfg!(windows) && lower.contains("(os error 5)"))
     {
         "permission"
     } else if lower.contains("was not registered") {
@@ -15854,6 +15907,19 @@ impl std::fmt::Display for CommandFailure {
 
 impl std::error::Error for CommandFailure {}
 
+/// The last non-empty stderr line of the `CommandFailure` in `err`'s chain: a
+/// Python traceback's exception, which the traceback's head pushed past
+/// Sentry's 400-char message cap (RUST-RS).
+fn command_failure_last_line(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<CommandFailure>())?
+        .stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// True when a failure is an older Codex CLI that predates `codex plugin add`
 /// (`error: unrecognized subcommand 'add'`). Not retryable -- the user must
 /// update Codex -- so install treats it as a soft skip + nudge, not an error.
@@ -16225,6 +16291,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::codex_list_line_installed;
+    use super::command_failure_last_line;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
@@ -19024,6 +19091,24 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
     }
 
     #[test]
+    fn command_failure_last_line_is_the_traceback_exception() {
+        let err = cmd_failure_with_stderr(
+            "Traceback (most recent call last):\r\n  \
+             File \"<frozen runpy>\", line 198, in _run_module_as_main\r\n\
+             ImportError: DLL load failed\r\n\r\n",
+        )
+        .context("running markitdown smoke test");
+        assert_eq!(
+            command_failure_last_line(&err).as_deref(),
+            Some("ImportError: DLL load failed")
+        );
+        assert_eq!(
+            command_failure_last_line(&anyhow::anyhow!("no command")),
+            None
+        );
+    }
+
+    #[test]
     fn looks_like_corrupt_venv_error_matches_module_not_found() {
         let err = cmd_failure_with_stderr(
             "Traceback (most recent call last):\n\
@@ -19305,6 +19390,14 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
                 "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (404 Not Found) for url (https://files.pythonhosted.org/a.whl)",
                 "http-404",
             ),
+            (
+                "downloading https://files.pythonhosted.org/a.whl: HTTP status server error (502 Gateway Error) for url (https://files.pythonhosted.org/a.whl)",
+                "http-5xx",
+            ),
+            (
+                "downloading https://x/a.whl: HTTP status client error (407 Proxy Authentication Required) for url (https://x/a.whl)",
+                "http-other",
+            ),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
@@ -19321,7 +19414,9 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         // RUST-MJ: a DNS failure stays local; the rest still report.
         assert!(!wheel_download_failure_reported("dns"));
         assert!(!wheel_download_failure_reported("connect-timeout"));
+        assert!(!wheel_download_failure_reported("http-5xx"));
         assert!(wheel_download_failure_reported("timeout"));
+        assert!(wheel_download_failure_reported("http-other"));
         assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
@@ -22393,27 +22488,32 @@ Always run the linter first.
 
     /// RUST-29/RUST-JF: pip's files gone from under an intact dist-info. Every
     /// retry, rollback and repair died on the same import, and ensurepip skips
-    /// a pip whose dist-info survives, so the dist-info has to go first.
+    /// a pip whose dist-info survives, so the dist-info has to go first. A
+    /// newer pip's leftover package (pip 26's `build_env/`) shadows the module
+    /// ensurepip writes, so the package goes as well.
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn pip_runner_replaces_a_pip_that_cannot_import_itself() {
         let (root, runtime, _manager) = seed_test_runtime("torn-pip");
-        let dist_info = runtime
-            .venv_dir
-            .join("lib/python3.12/site-packages/pip-24.0.dist-info");
+        let site = runtime.venv_dir.join("lib/python3.12/site-packages");
+        let dist_info = site.join("pip-26.2.2.dist-info");
         fs::create_dir_all(&dist_info).expect("dist-info");
+        let leftover = site.join("pip/_internal/build_env");
+        fs::create_dir_all(&leftover).expect("leftover package");
+        fs::write(leftover.join("__init__.py"), b"").expect("leftover module");
         let repaired = root.join("repaired");
         write_executable(
             &runtime.managed_python(),
             &format!(
                 "#!/bin/sh\n\
                  if [ \"$2\" = ensurepip ]; then [ -d {dist} ] && exit 1; touch {repaired}; exit 0; fi\n\
-                 [ -f {repaired} ] && exit 0\n\
+                 [ -f {repaired} ] && [ ! -d {leftover} ] && exit 0\n\
                  echo \"ImportError: cannot import name 'CacheControlAdapter' from \
                  'pip._vendor.cachecontrol' (unknown location)\" >&2\n\
                  exit 1\n",
                 dist = dist_info.display(),
                 repaired = repaired.display(),
+                leftover = leftover.display(),
             ),
         );
 
@@ -22590,6 +22690,11 @@ Always run the linter first.
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn create_managed_venv_runs_ensurepip_as_its_own_step() {
         let (root, runtime, manager) = seed_test_runtime("venv-ensurepip-split");
+        // A torn pip 26 left by an earlier attempt: `venv` does not clear it.
+        let leftover = runtime
+            .venv_dir
+            .join("lib/python3.12/site-packages/pip/_internal/build_env");
+        fs::create_dir_all(&leftover).expect("leftover package");
         let log = root.join("argv.log");
         let script = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
         write_executable(&runtime.standalone_python(), &script);
@@ -22617,6 +22722,7 @@ Always run the linter first.
             Some("-m pip --version"),
             "pip is still verified afterwards: {calls}"
         );
+        assert!(!leftover.exists(), "ensurepip gets a clean slot");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -24600,6 +24706,60 @@ Always run the linter first.
             receipt["artifact"]["requirementsLockSha256"],
             requirements_lock_sha(super::bootstrap_requirements_lock())
         );
+        assert_eq!(receipt["mcp"]["configured"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// RUST-RX: a 0.39.0 venv lost `headroom/providers/opencode`, so `headroom
+    /// mcp install` died on import and the self-heal re-synced the lock, which
+    /// never reinstalls our own wheel: the import error outlived the repair.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn mcp_install_missing_headroom_module_reinstalls_the_wheel() {
+        let (root, runtime, manager) = seed_test_runtime("mcp-torn-wheel");
+        let _home = HomeGuard::new(&root);
+        let log = root.join("argv.log");
+        let repaired = root.join("repaired");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *--force-reinstall*) touch {repaired} ;; esac\nexit 0\n",
+                log = log.display(),
+                repaired = repaired.display()
+            ),
+        );
+        write_executable(
+            &manager.headroom_entrypoint(),
+            &format!(
+                "#!/bin/sh\n[ -f {repaired} ] && exit 0\n\
+                 echo \"ModuleNotFoundError: No module named 'headroom.providers.opencode'\" >&2\n\
+                 exit 1\n",
+                repaired = repaired.display()
+            ),
+        );
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0","artifact":{"requirementsLockSha256":"x"},"mcp":{}}"#,
+        )
+        .expect("seed receipt");
+
+        manager
+            .ensure_mcp_configured()
+            .expect("the wheel reinstall lets the MCP install through");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.contains("--force-reinstall") && l.contains("headroom-ai==0.39.0")),
+            "{calls}"
+        );
+        assert!(!calls.contains("--upgrade"), "{calls}");
+        let receipt = fs::read(runtime.tools_dir.join("headroom.json")).expect("receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt).expect("receipt json");
         assert_eq!(receipt["mcp"]["configured"], true);
 
         let _ = fs::remove_dir_all(root);
@@ -26809,6 +26969,13 @@ exit 0
             ),
             ("Codex: something we have not seen", "other"),
         ];
+        // RUST-RA, real: Windows localizes ERROR_ACCESS_DENIED's prose.
+        let localized = "Codex: command failed (exit 1): ~\\AppData\\Roaming\\npm\\codex.cmd plugin \
+                         add caveman@caveman\nstdout:\n\nstderr:\nError: Acesso negado. (os error 5)";
+        assert_eq!(
+            plugin_install_failure_category(localized),
+            if cfg!(windows) { "permission" } else { "other" }
+        );
         let mut seen = std::collections::BTreeSet::new();
         for (detail, expected) in cases {
             assert_eq!(

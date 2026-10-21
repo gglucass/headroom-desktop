@@ -26,6 +26,9 @@
 # top-up as the macOS lock (see its lineage).
 # 2026-10-06: fsspec 2026.4.0 -> 2026.6.0 and multidict 6.7.1 -> 6.9.1, the
 # same CVE top-up as the macOS lock (see its lineage).
+# 2026-10-21: certifi 2026.6.17 -> 2026.10.19, the same CVE top-up as the
+# macOS lock (see its lineage).
+# 2026-10-21: pip 26.2.2 added for the same incident (see the macOS lock).
 #
 # Below: `sys_platform == "win32"` conditional deps excluded from this lock's
 # macOS-side resolution. `pip install --no-deps` skips dependency resolution
@@ -66,8 +69,8 @@ attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
 babel==2.18.0 \
     --hash=sha256:e2b422b277c2b9a9630c1d7903c2a00d0830c409c59ac8cae9081c92f1aeba35
-certifi==2026.6.17 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.10.19 \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
 cffi==2.0.0 \
     --hash=sha256:da68248800ad6320861f129cd9c1bf96ca849a2771a59e0344e88681905916f5
 charset-normalizer==3.4.7 \
@@ -210,6 +213,8 @@ pandas==3.0.3 \
     --hash=sha256:c7be265b62cef88e253a941e4698604973736dcfe242fdb5198f0f7bc473cdcc
 pillow==12.3.0 \
     --hash=sha256:a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09
+pip==26.2.2 \
+    --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70
 propcache==0.5.2 \
     --hash=sha256:be1ddfcbb376e3de5d2e2db1d58d6d67463e6b4f9f040c000de8e300295465fe \
     --hash=sha256:d9ee8826a7d47863a08ac44e1a5f611a462eefc3a194b492da242128bec75b42

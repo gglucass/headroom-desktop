@@ -39,6 +39,17 @@
 #     pure-Python with no deps and 2026.6.0 is exactly datasets 5.0.1's
 #     ceiling; multidict is a native wheel swap (cp312 wheels for every
 #     platform), inside aiohttp's <7.0, no new deps on cp312.
+#   - 2026-10-21 (no wheel change): certifi 2026.6.17 -> 2026.10.19
+#     (PYSEC-2026-4320, the distrusted emSign intermediates; the same incident
+#     as the desktop's RUSTSEC-2026-0381 webpki-roots bump). Pure-Python CA
+#     bundle, no deps, so a wheel swap with no resolution change.
+#   - 2026-10-21 (no wheel change): pip 26.2.2 added, same emSign incident.
+#     Older pip trusts its own vendored certifi on top of the OS store, and
+#     ensurepip seeds every venv with python-build-standalone's 25.0.1
+#     (certifi 2024.08.30). Hashed installs survive a forged certificate; the
+#     unhashed `markitdown[all]` install does not. Pinned here, the lock
+#     install upgrades pip in every new venv and the lock-sha re-sync does it
+#     in existing ones. Pure-Python, no deps.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
@@ -132,8 +143,8 @@ attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
 babel==2.18.0 \
     --hash=sha256:e2b422b277c2b9a9630c1d7903c2a00d0830c409c59ac8cae9081c92f1aeba35
-certifi==2026.6.17 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.10.19 \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
 cffi==2.0.0 \
     --hash=sha256:6d02d6655b0e54f54c4ef0b94eb6be0607b70853c45ce98bd278dc7de718be5d \
     --hash=sha256:8eca2a813c1cb7ad4fb74d368c2ffbbb4789d377ee5bb8df98373c2cc0dee76c
@@ -319,6 +330,8 @@ pandas==3.0.3 \
 pillow==12.3.0 \
     --hash=sha256:ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965 \
     --hash=sha256:ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7
+pip==26.2.2 \
+    --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70
 propcache==0.5.2 \
     --hash=sha256:806719138ecd720339a12410fb9614ac9b2b2d3a5fdf8235d56981c36f4039ba \
     --hash=sha256:be1ddfcbb376e3de5d2e2db1d58d6d67463e6b4f9f040c000de8e300295465fe \

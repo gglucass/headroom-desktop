@@ -1185,7 +1185,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             if silent_failures.is_empty() {
                 return false;
             }
-            if !repair_pages(&silent_failures) {
+            if cc_switch_dropped_the_hooks(guard_shape) || !repair_pages(&silent_failures) {
                 return true;
             }
             // WHICH check failed, in the fingerprint and in full as an
@@ -4373,21 +4373,112 @@ fn configure_claude_settings_env_impl(
 /// Bare `bash` remains the last resort -- a hook that needs the user to fix
 /// their PATH still beats no hook at all.
 fn windows_bash_command() -> String {
-    let git_bash = ["ProgramFiles", "ProgramFiles(x86)"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(|root| PathBuf::from(root).join("Git"))
-        .chain(
-            std::env::var_os("LOCALAPPDATA")
-                .map(|root| PathBuf::from(root).join("Programs").join("Git")),
+    let path_entries = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    // Claude Code reads its Git Bash override from settings.json's env too.
+    let settings_git_bash = || -> Option<std::ffi::OsString> {
+        let raw = std::fs::read_to_string(claude_settings_path()).ok()?;
+        let settings = serde_json::from_str::<Value>(&raw).ok()?;
+        Some(
+            settings
+                .get("env")?
+                .get("CLAUDE_CODE_GIT_BASH_PATH")?
+                .as_str()?
+                .into(),
         )
-        .map(|root| root.join("bin").join("bash.exe"))
-        .find(|candidate| candidate.exists());
-
-    git_bash
-        .or_else(|| find_on_path(&["bash"]))
+    };
+    let var = |name: &str| match name {
+        "CLAUDE_CODE_GIT_BASH_PATH" => std::env::var_os(name).or_else(settings_git_bash),
+        _ => std::env::var_os(name),
+    };
+    pick_windows_bash(var, git_for_windows_install_path, path_entries)
         .map(|path| format!("\"{}\"", path.display()))
         .unwrap_or_else(|| "bash".to_string())
+}
+
+/// The folder Git for Windows' installer recorded, a custom one included.
+fn git_for_windows_install_path() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    ["HKLM", "HKCU"].into_iter().find_map(|hive| {
+        let output = crate::proc::command("reg")
+            .args([
+                "query",
+                &format!(r"{hive}\SOFTWARE\GitForWindows"),
+                "/v",
+                "InstallPath",
+            ])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        crate::tool_manager::parse_reg_value(
+            &String::from_utf8_lossy(&output.stdout),
+            "InstallPath",
+        )
+        .map(PathBuf::from)
+    })
+}
+
+/// Git Bash for [`windows_bash_command`], found the way Claude Code finds it:
+/// `CLAUDE_CODE_GIT_BASH_PATH`, the install folders (the installer's recorded
+/// one included), then the Git root of a `git.exe` on PATH. A
+/// plain `bash` on PATH is the last resort and never one under `%SystemRoot%`
+/// or `WindowsApps`: those are the WSL launcher, which exits 127 on the
+/// hook's Windows script path, so RTK silently rewrote nothing.
+fn pick_windows_bash(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    registry_git_root: impl FnOnce() -> Option<PathBuf>,
+    path_entries: Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let lowercase = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+    var("CLAUDE_CODE_GIT_BASH_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["ProgramFiles", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(&var)
+                .map(|root| PathBuf::from(root).join("Git"))
+                .chain(
+                    var("LOCALAPPDATA")
+                        .map(|root| PathBuf::from(root).join("Programs").join("Git")),
+                )
+                .map(|root| root.join("bin").join("bash.exe"))
+                .find(|candidate| candidate.exists())
+        })
+        .or_else(|| {
+            registry_git_root()
+                .map(|root| root.join("bin").join("bash.exe"))
+                .filter(|candidate| candidate.is_file())
+        })
+        .or_else(|| {
+            // `<root>\cmd`, `<root>\bin` or `<root>\mingw64\bin` holds git.exe.
+            path_entries
+                .iter()
+                .filter(|entry| entry.join("git.exe").is_file())
+                .flat_map(|entry| entry.ancestors().skip(1).take(2))
+                .map(|root| root.join("bin").join("bash.exe"))
+                .find(|candidate| candidate.is_file())
+        })
+        .or_else(|| {
+            let wsl_dirs: Vec<PathBuf> = ["SystemRoot", "WINDIR"]
+                .into_iter()
+                .filter_map(&var)
+                .map(PathBuf::from)
+                .chain(
+                    var("LOCALAPPDATA")
+                        .map(|root| PathBuf::from(root).join("Microsoft").join("WindowsApps")),
+                )
+                .map(|dir| lowercase(&dir))
+                .collect();
+            let entries = path_entries.into_iter().filter(|entry| {
+                let entry = lowercase(entry);
+                !wsl_dirs.iter().any(|dir| entry.starts_with(dir))
+            });
+            find_on_path_entries(entries, &["bash.exe"])
+        })
 }
 
 /// The command Claude Code runs for a Headroom PreToolUse hook. The hooks are
@@ -5743,13 +5834,13 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
     if !existing.contains('\0') {
         return existing.to_string();
     }
-    let restored = headroom_backups_newest_first(path)
-        .into_iter()
-        .find_map(|backup| {
-            let text = std::fs::read_to_string(&backup).ok()?;
-            let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
-            clean.then_some((backup, text))
-        });
+    let backups = headroom_backups_newest_first(path);
+    let backup_count = backups.len();
+    let restored = backups.into_iter().find_map(|backup| {
+        let text = std::fs::read_to_string(&backup).ok()?;
+        let clean = !text.contains('\0') && text.parse::<toml::Value>().is_ok();
+        clean.then_some((backup, text))
+    });
     match restored {
         // Info: our own writes fsync before the rename, so the zeros are another
         // writer's lost to a crash, and the restore has fixed it (RUST-QS).
@@ -5762,9 +5853,11 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
             );
             text
         }
+        // A nonzero count means every backup was zeroed too: Headroom backed
+        // up the zeros again (RUST-QS) rather than finding no backups at all.
         None => {
             log::warn!(
-                "{} held NUL bytes (zero-filled) and no clean backup exists; dropping them",
+                "{} held NUL bytes (zero-filled) and none of its {backup_count} backups is clean; dropping them",
                 path.display()
             );
             existing.replace('\0', "")
@@ -7992,6 +8085,21 @@ fn claude_guard_registered_any_interpreter() -> Result<bool> {
         &claude_settings_path(),
         &claude_guard_hook_path().display().to_string(),
     )
+}
+
+/// cc-switch overwrites the whole settings.json on every provider switch and
+/// the reconciler puts back only ANTHROPIC_BASE_URL, so the hooks table goes
+/// and the re-apply is the fix: not a page (RUST-GS on 0.9.43, "no hooks
+/// table" twice in a day). The reconciler saves its capture on that switch,
+/// and a changed settings.json is re-verified within a 5-minute tick.
+fn cc_switch_dropped_the_hooks(guard_shape: Option<&str>) -> bool {
+    guard_shape == Some("no hooks table")
+        && std::fs::metadata(crate::tool_manager::cc_switch_capture_path())
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| {
+                at.elapsed()
+                    .is_ok_and(|age| age < Duration::from_secs(15 * 60))
+            })
 }
 
 /// Where the guard was, in fixed words for Sentry: whether a writer dropped
@@ -16080,6 +16188,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn a_cc_switch_provider_switch_dropping_the_hooks_does_not_page() {
+        let _home = TestHome::new();
+        let gone = Some("no hooks table");
+        assert!(
+            !super::cc_switch_dropped_the_hooks(gone),
+            "no capture, another writer"
+        );
+        write_cc_switch_capture("https://api.deepseek.com/anthropic");
+        assert!(super::cc_switch_dropped_the_hooks(gone));
+        assert!(!super::cc_switch_dropped_the_hooks(Some(
+            "no SessionStart hooks"
+        )));
+        fs::File::options()
+            .write(true)
+            .open(crate::tool_manager::cc_switch_capture_path())
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            !super::cc_switch_dropped_the_hooks(gone),
+            "an old switch is not this loss"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn a_lone_opencode_block_loss_pages_only_when_it_repeats_within_a_day() {
         // RUST-K2: an edit that drops the managed block, undone by one
         // re-apply. One pages nothing; another within a day pages.
@@ -17399,6 +17533,103 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         } else {
             assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
         }
+    }
+
+    fn touch(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+        path.to_path_buf()
+    }
+
+    fn bash_env(vars: Vec<(&'static str, PathBuf)>) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone().into_os_string())
+        }
+    }
+
+    /// Regression (Shijor, WSL 2 for Podman, Git outside the install folders):
+    /// System32\bash.exe came first on PATH, so every RTK hook ran under WSL
+    /// and exited 127.
+    #[test]
+    fn windows_bash_skips_the_wsl_launcher_for_the_git_beside_git_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system32 = tmp.path().join("Windows").join("System32");
+        touch(&system32.join("bash.exe"));
+        let git = tmp.path().join("tools").join("Git");
+        touch(&git.join("cmd").join("git.exe"));
+        let git_bash = touch(&git.join("bin").join("bash.exe"));
+        // SystemRoot's case differs from PATH's, as on real machines.
+        let vars = vec![("SystemRoot", tmp.path().join("WINDOWS"))];
+
+        let picked =
+            super::pick_windows_bash(bash_env(vars), || None, vec![system32, git.join("cmd")]);
+
+        assert_eq!(picked, Some(git_bash));
+    }
+
+    #[test]
+    fn windows_bash_prefers_claude_codes_git_bash_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = touch(&tmp.path().join("custom").join("bash.exe"));
+        touch(
+            &tmp.path()
+                .join("pf")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe"),
+        );
+        let vars = vec![
+            ("CLAUDE_CODE_GIT_BASH_PATH", custom.clone()),
+            ("ProgramFiles", tmp.path().join("pf")),
+        ];
+
+        assert_eq!(
+            super::pick_windows_bash(bash_env(vars), || None, Vec::new()),
+            Some(custom)
+        );
+    }
+
+    #[test]
+    fn windows_bash_never_falls_back_to_a_wsl_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system32 = tmp.path().join("Windows").join("System32");
+        touch(&system32.join("bash.exe"));
+        let local = tmp.path().join("Local");
+        let apps = local.join("Microsoft").join("WindowsApps");
+        touch(&apps.join("bash.exe"));
+        let msys = tmp.path().join("msys64").join("usr").join("bin");
+        let msys_bash = touch(&msys.join("bash.exe"));
+        let vars = vec![
+            ("SystemRoot", tmp.path().join("Windows")),
+            ("LOCALAPPDATA", local),
+        ];
+
+        let only_wsl = vec![system32.clone(), apps.clone()];
+        assert_eq!(
+            super::pick_windows_bash(bash_env(vars.clone()), || None, only_wsl),
+            None
+        );
+        assert_eq!(
+            super::pick_windows_bash(bash_env(vars), || None, vec![system32, apps, msys]),
+            Some(msys_bash)
+        );
+    }
+
+    /// Shijor's case: Git in a custom folder, on no PATH, and no override.
+    #[test]
+    fn windows_bash_uses_the_git_folder_the_installer_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system32 = tmp.path().join("Windows").join("System32");
+        touch(&system32.join("bash.exe"));
+        let git = tmp.path().join("D").join("Git");
+        let git_bash = touch(&git.join("bin").join("bash.exe"));
+        let vars = vec![("SystemRoot", tmp.path().join("Windows"))];
+
+        let picked = super::pick_windows_bash(bash_env(vars), || Some(git), vec![system32]);
+
+        assert_eq!(picked, Some(git_bash));
     }
 
     /// Regression: Codex runs SessionStart hooks through PowerShell on Windows.
