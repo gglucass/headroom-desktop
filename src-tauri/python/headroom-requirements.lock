@@ -43,6 +43,13 @@
 #     (PYSEC-2026-4320, the distrusted emSign intermediates; the same incident
 #     as the desktop's RUSTSEC-2026-0381 webpki-roots bump). Pure-Python CA
 #     bundle, no deps, so a wheel swap with no resolution change.
+#   - 2026-10-21 (no wheel change): pip 26.2.2 added, same emSign incident.
+#     Older pip trusts its own vendored certifi on top of the OS store, and
+#     ensurepip seeds every venv with python-build-standalone's 25.0.1
+#     (certifi 2024.08.30). Hashed installs survive a forged certificate; the
+#     unhashed `markitdown[all]` install does not. Pinned here, the lock
+#     install upgrades pip in every new venv and the lock-sha re-sync does it
+#     in existing ones. Pure-Python, no deps.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
@@ -323,6 +330,8 @@ pandas==3.0.3 \
 pillow==12.3.0 \
     --hash=sha256:ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965 \
     --hash=sha256:ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7
+pip==26.2.2 \
+    --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70
 propcache==0.5.2 \
     --hash=sha256:806719138ecd720339a12410fb9614ac9b2b2d3a5fdf8235d56981c36f4039ba \
     --hash=sha256:be1ddfcbb376e3de5d2e2db1d58d6d67463e6b4f9f040c000de8e300295465fe \
