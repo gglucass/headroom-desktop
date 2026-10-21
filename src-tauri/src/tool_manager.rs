@@ -15101,6 +15101,7 @@ fn wheel_download_failure_category(detail: &str) -> &'static str {
         match code {
             403 => "http-403",
             404 => "http-404",
+            500..=599 => "http-5xx",
             _ => "http-other",
         }
     } else if lower.contains("dns error")
@@ -15191,10 +15192,11 @@ fn plugin_install_failure_reported(category: &str) -> bool {
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
 /// network's problem (RUST-MJ: one Windows DNS blip, the pip fallback
-/// installed fine; RUST-NN: a connect timeout). The pip fallback uses the
+/// installed fine; RUST-NN: a connect timeout), and a 5xx is the CDN's own
+/// (RUST-RW: one 502 from files.pythonhosted.org). The pip fallback uses the
 /// same CDN, so if it fails too, pip's own failure report carries it.
 fn wheel_download_failure_reported(category: &str) -> bool {
-    !matches!(category, "dns" | "connect-timeout")
+    !matches!(category, "dns" | "connect-timeout" | "http-5xx")
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -19366,6 +19368,14 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
                 "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (404 Not Found) for url (https://files.pythonhosted.org/a.whl)",
                 "http-404",
             ),
+            (
+                "downloading https://files.pythonhosted.org/a.whl: HTTP status server error (502 Gateway Error) for url (https://files.pythonhosted.org/a.whl)",
+                "http-5xx",
+            ),
+            (
+                "downloading https://x/a.whl: HTTP status client error (407 Proxy Authentication Required) for url (https://x/a.whl)",
+                "http-other",
+            ),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
@@ -19382,7 +19392,9 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         // RUST-MJ: a DNS failure stays local; the rest still report.
         assert!(!wheel_download_failure_reported("dns"));
         assert!(!wheel_download_failure_reported("connect-timeout"));
+        assert!(!wheel_download_failure_reported("http-5xx"));
         assert!(wheel_download_failure_reported("timeout"));
+        assert!(wheel_download_failure_reported("http-other"));
         assert!(wheel_download_failure_reported("http-403"));
         // Two different pins of the same platform wheel must land on one
         // category -- that is the whole point.
