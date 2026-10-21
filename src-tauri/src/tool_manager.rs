@@ -6297,6 +6297,13 @@ impl ToolManager {
         )
         .context("creating Headroom-managed virtualenv")?;
 
+        // `venv` keeps an existing site-packages, so a pip torn by an earlier
+        // attempt (killed mid self-upgrade) would survive ensurepip. If the
+        // removal fails, the `pip --version` check below still decides.
+        if let Err(err) = remove_venv_pip(&self.runtime.managed_python()) {
+            log::info!("[tool_manager] could not clear the venv's old pip: {err:#}");
+        }
+
         run_python_command(
             &self.runtime.managed_python(),
             &["-m", "ensurepip", "--upgrade", "--default-pip"],
@@ -15044,11 +15051,25 @@ fn retire_venv(venv: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
-/// a torn pip torn: it installs with `--upgrade`, which reads the surviving
-/// dist-info as "already satisfied". Without the dist-info it writes every
-/// file again (and it runs pip from its bundled wheel, not the broken one).
+/// Puts a fresh pip into the venv `python` belongs to (and it runs pip from
+/// ensurepip's bundled wheel, not the broken one).
 fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
+    remove_venv_pip(python)?;
+    run_python_command(
+        python,
+        &["-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd,
+    )
+    .context("reinstalling pip into the Headroom-managed virtualenv")
+}
+
+/// Clears pip out of the venv `python` belongs to, so ensurepip writes a whole
+/// one. ensurepip alone leaves a torn pip torn: it installs with `--upgrade`,
+/// which reads a surviving dist-info as "already satisfied". The package goes
+/// too: ensurepip writes only its own pip's files, and a newer pip's leftovers
+/// shadow them (the lock's pip 26 `build_env/` package wins over ensurepip's
+/// 25.0.1 `build_env.py`, and `pip --version` dies).
+fn remove_venv_pip(python: &Path) -> Result<()> {
     let lib = python
         .parent()
         .and_then(Path::parent)
@@ -15057,23 +15078,24 @@ fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
     // lib/site-packages on Windows (case-insensitive `Lib`),
     // lib/python3.X/site-packages elsewhere.
     let site_dirs = std::iter::once(lib.clone())
-        .chain(std::fs::read_dir(&lib)?.flatten().map(|entry| entry.path()))
+        .chain(
+            std::fs::read_dir(&lib)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        )
         .map(|dir| dir.join("site-packages"));
     for site in site_dirs {
         for entry in std::fs::read_dir(&site).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("pip-") && name.ends_with(".dist-info") {
+            if name == "pip" || (name.starts_with("pip-") && name.ends_with(".dist-info")) {
                 std::fs::remove_dir_all(entry.path())
                     .with_context(|| format!("removing {}", entry.path().display()))?;
             }
         }
     }
-    run_python_command(
-        python,
-        &["-m", "ensurepip", "--upgrade", "--default-pip"],
-        cwd,
-    )
-    .context("reinstalling pip into the Headroom-managed virtualenv")
+    Ok(())
 }
 
 /// Cause class for a direct-wheel download that fell back to the pip index.
@@ -22466,27 +22488,32 @@ Always run the linter first.
 
     /// RUST-29/RUST-JF: pip's files gone from under an intact dist-info. Every
     /// retry, rollback and repair died on the same import, and ensurepip skips
-    /// a pip whose dist-info survives, so the dist-info has to go first.
+    /// a pip whose dist-info survives, so the dist-info has to go first. A
+    /// newer pip's leftover package (pip 26's `build_env/`) shadows the module
+    /// ensurepip writes, so the package goes as well.
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn pip_runner_replaces_a_pip_that_cannot_import_itself() {
         let (root, runtime, _manager) = seed_test_runtime("torn-pip");
-        let dist_info = runtime
-            .venv_dir
-            .join("lib/python3.12/site-packages/pip-24.0.dist-info");
+        let site = runtime.venv_dir.join("lib/python3.12/site-packages");
+        let dist_info = site.join("pip-26.2.2.dist-info");
         fs::create_dir_all(&dist_info).expect("dist-info");
+        let leftover = site.join("pip/_internal/build_env");
+        fs::create_dir_all(&leftover).expect("leftover package");
+        fs::write(leftover.join("__init__.py"), b"").expect("leftover module");
         let repaired = root.join("repaired");
         write_executable(
             &runtime.managed_python(),
             &format!(
                 "#!/bin/sh\n\
                  if [ \"$2\" = ensurepip ]; then [ -d {dist} ] && exit 1; touch {repaired}; exit 0; fi\n\
-                 [ -f {repaired} ] && exit 0\n\
+                 [ -f {repaired} ] && [ ! -d {leftover} ] && exit 0\n\
                  echo \"ImportError: cannot import name 'CacheControlAdapter' from \
                  'pip._vendor.cachecontrol' (unknown location)\" >&2\n\
                  exit 1\n",
                 dist = dist_info.display(),
                 repaired = repaired.display(),
+                leftover = leftover.display(),
             ),
         );
 
@@ -22663,6 +22690,11 @@ Always run the linter first.
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn create_managed_venv_runs_ensurepip_as_its_own_step() {
         let (root, runtime, manager) = seed_test_runtime("venv-ensurepip-split");
+        // A torn pip 26 left by an earlier attempt: `venv` does not clear it.
+        let leftover = runtime
+            .venv_dir
+            .join("lib/python3.12/site-packages/pip/_internal/build_env");
+        fs::create_dir_all(&leftover).expect("leftover package");
         let log = root.join("argv.log");
         let script = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
         write_executable(&runtime.standalone_python(), &script);
@@ -22690,6 +22722,7 @@ Always run the linter first.
             Some("-m pip --version"),
             "pip is still verified afterwards: {calls}"
         );
+        assert!(!leftover.exists(), "ensurepip gets a clean slot");
         let _ = fs::remove_dir_all(root);
     }
 
