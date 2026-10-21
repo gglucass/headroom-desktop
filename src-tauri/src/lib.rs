@@ -8478,6 +8478,8 @@ pub fn run() {
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
+    // A second launch has exited by now, so only the primary counts as one.
+    app.state::<AppState>().record_launch();
     app.run(|app, event| {
         // macOS never spawns a second process when the user opens an
         // already-running app from Finder or a pinned Dock icon, so the
