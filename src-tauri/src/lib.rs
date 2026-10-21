@@ -206,7 +206,16 @@ impl InstallableAppUpdate for TauriPendingUpdate {
                     },
                 )
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(|err| match &err {
+                    // tar's unpack error displays only "failed to unpack `X`
+                    // into `Y`"; the io error that stopped it (a full disk,
+                    // RUST-S4) is its source.
+                    tauri_plugin_updater::Error::Io(io) => match std::error::Error::source(io) {
+                        Some(cause) => format!("{err}: {cause}"),
+                        None => err.to_string(),
+                    },
+                    _ => err.to_string(),
+                })
         })
     }
 }

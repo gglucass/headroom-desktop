@@ -92,8 +92,13 @@ pub fn snapshot_state_on_version_change(base_dir: &Path, current_version: &str) 
     }
     let snapshot_dir = base_dir.join("config").join("pre-update");
     if let Err(err) = std::fs::create_dir_all(&snapshot_dir) {
+        // On a folder that exists but cannot be stat'ed (an ACL or privacy
+        // block) `create_dir_all` returns mkdir's AlreadyExists, which hid
+        // the block from env_fault and filed it twice (RUST-RP beside RN).
+        let err = std::fs::metadata(&snapshot_dir).err().unwrap_or(err);
+        let note = crate::env_fault::failed(&snapshot_dir, crate::env_fault::Op::Write, &err);
         log::warn!(
-            "pre-update snapshot: cannot create {}: {err}",
+            "pre-update snapshot: cannot create {}: {err}{note}",
             snapshot_dir.display()
         );
         return;

@@ -469,6 +469,22 @@ describe("app update helpers", () => {
     expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    'No space left on device (os error 28) at path "/var/folders/x/T/tauri_current_appMtFARI"', // RUST-S2/S3
+    "failed to unpack `Headroom.app/Contents/MacOS/headroom-desktop` into `/var/folders/x/T/tauri_updated_appnfvk9P/Contents/MacOS/headroom-desktop`: No space left on device (os error 28)", // RUST-S4
+  ])("tells the user the disk is full without reporting it: %s", async (failure) => {
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      quiet: true,
+      invokeFn: vi.fn().mockRejectedValueOnce(failure),
+    });
+
+    expect(result.statusCopy).toMatch(/disk is full/);
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
   it("reports a declined admin prompt only when a quiet install hit it (RUST-JD)", async () => {
     const declined = "Failed to move the new app into place";
     vi.mocked(Sentry.captureException).mockClear();

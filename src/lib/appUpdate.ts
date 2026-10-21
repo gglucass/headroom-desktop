@@ -48,6 +48,13 @@ const ADMIN_PROMPT_COPY =
 // the prompt" would send the user round the same loop. Only reached after a
 // click: `silent_install_supported` never stages a .deb quietly.
 const PACKAGE_INSTALL_FAILED = /Failed to install package/;
+
+// The machine's disk is full (ENOSPC, Windows ERROR_DISK_FULL), so the swap
+// cannot stage the new app. A quiet install retries on every hourly check, and
+// each attempt's random temp folder name made it a new issue (RUST-S2/S3/S4).
+const DISK_FULL = /No space left on device|\(os error (28|112)\)/;
+const DISK_FULL_COPY =
+  "Could not install the update: the disk is full. Free up some space, then try again.";
 const PACKAGE_INSTALL_COPY =
   "Headroom needs administrator rights to install this update, and the password prompt " +
   "was cancelled or could not be shown. Download the newest .deb from " +
@@ -395,9 +402,14 @@ export async function runAppUpdateInstall({
     const transport = TRANSPORT_FAILURE.test(detail);
     const adminPrompt = ADMIN_PROMPT_FAILED.test(detail);
     const packagePrompt = PACKAGE_INSTALL_FAILED.test(detail);
+    const diskFull = DISK_FULL.test(detail);
     // A quiet install reaching the admin prompt means the writability gate
     // missed a case, so that one still reports.
-    if (!READ_ONLY_BUNDLE.test(detail) && !((adminPrompt || packagePrompt) && !quiet)) {
+    if (
+      !READ_ONLY_BUNDLE.test(detail) &&
+      !diskFull &&
+      !((adminPrompt || packagePrompt) && !quiet)
+    ) {
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",
         tags: { flow: "app_update_install" },
@@ -410,7 +422,9 @@ export async function runAppUpdateInstall({
           ? ADMIN_PROMPT_COPY
           : packagePrompt
             ? PACKAGE_INSTALL_COPY
-            : describeInvokeError(error, "Could not install the update."),
+            : diskFull
+              ? DISK_FULL_COPY
+              : describeInvokeError(error, "Could not install the update."),
     };
   } finally {
     unlisten?.();
