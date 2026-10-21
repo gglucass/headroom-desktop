@@ -7959,9 +7959,9 @@ impl ToolManager {
     /// in stderr, the venv is missing one or more pinned dependencies despite
     /// the receipt's `requirementsLockSha256` saying otherwise (seen on
     /// upgrades from very-old desktop versions where a partial install left
-    /// the receipt stamped but the venv incomplete). Self-heal by running the
-    /// requirements repair, which re-installs the full lock file and retries
-    /// MCP install internally.
+    /// the receipt stamped but the venv incomplete). Self-heal with the repair
+    /// the missing module needs (our wheel, the module's lock pins, or the full
+    /// lock re-sync), then retry the MCP install.
     pub fn ensure_mcp_configured(&self) -> Result<()> {
         if self.headroom_mcp_configured() == Some(true)
             && matches!(
@@ -7985,18 +7985,41 @@ impl ToolManager {
         let method = match self.install_headroom_mcp() {
             Ok(method) => method,
             Err(err) if looks_like_corrupt_venv_error(&err) => {
-                log::warn!(
-                    "MCP install hit a Python import error; running requirements repair: {err:#}"
-                );
-                sentry::capture_message(
-                    "MCP install hit corrupt-venv signal; auto-running requirements repair",
-                    sentry::Level::Info,
-                );
-                self.repair_stale_requirements_with_progress(|_| {})
+                // Info: install_headroom_mcp already reported this failure with
+                // its stderr; a second and third event were the same incident
+                // (RUST-RX/RY/RZ).
+                log::info!("MCP install hit a Python import error; repairing the venv: {err:#}");
+                let stderr = err
+                    .downcast_ref::<CommandFailure>()
+                    .map_or("", |failure| failure.stderr.as_str());
+                if crate::is_missing_headroom_module_signal(stderr) {
+                    // Our own wheel is not in the lock, so the lock re-sync below
+                    // never put back a torn `headroom` package (RUST-RX lost
+                    // `headroom/providers/opencode`); the proxy start path's
+                    // RUST-CY repair, run here before the proxy starts.
+                    let version = self
+                        .installed_headroom_version()
+                        .unwrap_or_else(|| HEADROOM_PINNED_VERSION.to_string());
+                    self.pip_force_reinstall_headroom_version(&version)
+                        .context("auto-repairing venv after MCP install import error")?;
+                    self.install_headroom_mcp()?
+                } else {
+                    // A dist-info that outlived its files reads as installed to
+                    // the plain re-sync, so missing modules get their pins forced.
+                    let missing: Vec<String> = crate::missing_dependency_modules(stderr)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    if missing.is_empty() {
+                        self.repair_stale_requirements_with_progress(|_| {})
+                    } else {
+                        self.repair_missing_dependencies(&missing)
+                    }
                     .context("auto-repairing venv after MCP install import error")?;
-                // repair_stale_requirements_with_progress runs install_headroom_mcp
-                // and writes the mcp section of the receipt itself, so we're done.
-                return Ok(());
+                    // Both end in repair_stale_requirements_with_progress, which runs
+                    // install_headroom_mcp and writes the receipt's mcp section itself.
+                    return Ok(());
+                }
             }
             Err(err) => return Err(err),
         };
@@ -24638,6 +24661,60 @@ Always run the linter first.
             receipt["artifact"]["requirementsLockSha256"],
             requirements_lock_sha(super::bootstrap_requirements_lock())
         );
+        assert_eq!(receipt["mcp"]["configured"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// RUST-RX: a 0.39.0 venv lost `headroom/providers/opencode`, so `headroom
+    /// mcp install` died on import and the self-heal re-synced the lock, which
+    /// never reinstalls our own wheel: the import error outlived the repair.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn mcp_install_missing_headroom_module_reinstalls_the_wheel() {
+        let (root, runtime, manager) = seed_test_runtime("mcp-torn-wheel");
+        let _home = HomeGuard::new(&root);
+        let log = root.join("argv.log");
+        let repaired = root.join("repaired");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *--force-reinstall*) touch {repaired} ;; esac\nexit 0\n",
+                log = log.display(),
+                repaired = repaired.display()
+            ),
+        );
+        write_executable(
+            &manager.headroom_entrypoint(),
+            &format!(
+                "#!/bin/sh\n[ -f {repaired} ] && exit 0\n\
+                 echo \"ModuleNotFoundError: No module named 'headroom.providers.opencode'\" >&2\n\
+                 exit 1\n",
+                repaired = repaired.display()
+            ),
+        );
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0","artifact":{"requirementsLockSha256":"x"},"mcp":{}}"#,
+        )
+        .expect("seed receipt");
+
+        manager
+            .ensure_mcp_configured()
+            .expect("the wheel reinstall lets the MCP install through");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.contains("--force-reinstall") && l.contains("headroom-ai==0.39.0")),
+            "{calls}"
+        );
+        assert!(!calls.contains("--upgrade"), "{calls}");
+        let receipt = fs::read(runtime.tools_dir.join("headroom.json")).expect("receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt).expect("receipt json");
         assert_eq!(receipt["mcp"]["configured"], true);
 
         let _ = fs::remove_dir_all(root);
