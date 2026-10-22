@@ -15451,13 +15451,24 @@ fn pip_failure_is_sharing_violation(text: &str) -> bool {
 /// The file a `[WinError 32]` names: pip ends that line with the path's
 /// Python repr, quoted and with every backslash doubled.
 fn sharing_violation_path(text: &str) -> Option<String> {
+    // `(text before the quoted path, the path)` for the path that ends `line`.
+    fn last_quoted(line: &str) -> Option<(&str, &str)> {
+        let quote = line.chars().last().filter(|c| matches!(c, '\'' | '"'))?;
+        let inner = &line[..line.len() - 1];
+        let open = inner.rfind(quote)?;
+        Some((&inner[..open], &inner[open + 1..]))
+    }
     let line = text
         .lines()
         .find(|line| line.to_ascii_lowercase().contains("winerror 32]"))?
         .trim_end();
-    let quote = line.chars().last().filter(|c| matches!(c, '\'' | '"'))?;
-    let inner = &line[..line.len() - 1];
-    Some(inner[inner.rfind(quote)? + 1..].replace("\\\\", "\\"))
+    let (head, mut path) = last_quoted(line)?;
+    // A failed rename names both ends, `'src' -> 'src.deleteme'`: the held
+    // file is the source; the target never came to exist.
+    if let Some((_, source)) = head.strip_suffix(" -> ").and_then(last_quoted) {
+        path = source;
+    }
+    Some(path.replace("\\\\", "\\"))
 }
 
 /// Who holds the file a final sharing violation names (Windows). Six sweeps
@@ -26587,6 +26598,15 @@ exit 0
             super::sharing_violation_path(r#"[WinError 32] in use: "c:\\users\\o'brien\\x.dll""#)
                 .as_deref(),
             Some(r"c:\users\o'brien\x.dll")
+        );
+        // A failed rename names both ends; the held file is the source, not
+        // the `.deleteme` pip never got to create (RUST-29 on 0.9.2x).
+        assert_eq!(
+            super::sharing_violation_path(
+                r"ERROR: Could not install packages due to an OSError: [WinError 32] in use: 'c:\\v\\scripts\\headroom.exe' -> 'c:\\v\\scripts\\headroom.exe.deleteme'"
+            )
+            .as_deref(),
+            Some(r"c:\v\scripts\headroom.exe")
         );
         assert_eq!(
             super::sharing_violation_path("[WinError 5] Access is denied"),
