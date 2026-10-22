@@ -19549,6 +19549,38 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         }
     }
 
+    /// Leaving ast-grep-cli out is safe only while the backend never runs the
+    /// tool-result interceptors that shell out to it. A wheel that defaults the
+    /// flag on, or enables the feature on the app's beta channel, fails here:
+    /// re-add the pin to the locks and drop it from check-python-locks.py.
+    #[test]
+    fn tool_result_interceptors_stay_off_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        // The channel is the one the backend spawn sets.
+        let probe = r#"
+from headroom.cli.proxy import proxy
+from headroom.rollout import resolve_rollout
+flag = next(p for p in proxy.params if p.name == "intercept_tool_results")
+snapshot = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
+print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .output()
+            .expect("run interceptor probe");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "False False",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn bundled_locks_carry_a_hash_for_every_requirement() {
         // One --hash anywhere puts pip in hash-checking mode, which then
