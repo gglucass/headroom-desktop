@@ -136,9 +136,10 @@ anthropic==0.113.0 \
     --hash=sha256:9a52ed7a4982e916fa878d1ed3eaec2dcdf98699a39d8fc45b54b3c50f1e7426
 anyio==4.14.2 \
     --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494
-ast-grep-cli==0.44.0 \
-    --hash=sha256:719c0716c3d14bf905e078ee6862216f2c3cfcdeb3202a12ade26deda99e1555 \
-    --hash=sha256:c42b41c06759c5cf2254343c89a97c63ac0480d0d8f021b5092d43958d27851d
+# ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
+# only two binaries, used only by the opt-in --intercept-tool-results the app never
+# passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
+# (RUST-6S on 0.9.46). scripts/check-python-locks.py excuses it.
 attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
 babel==2.18.0 \

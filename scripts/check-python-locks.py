@@ -36,6 +36,12 @@ PYTHON_FULL_VERSION = "3.12.12"
 # Extras the desktop app actually installs. `proxy-prod` is server-side only.
 EXTRAS = {"", "proxy"}
 
+# Hard deps left out on purpose. ast-grep-cli is two binaries and no module, so its
+# absence is no ImportError; only the opt-in --intercept-tool-results uses it, and
+# the app never passes that (a web filter blocking its .exe wheel blocked a
+# Windows bootstrap: RUST-6S on 0.9.46).
+NOT_INSTALLED = {"ast-grep-cli"}
+
 
 def pinned_version() -> str:
     src = (REPO / "src-tauri/src/tool_manager.rs").read_text()
@@ -84,7 +90,8 @@ def main() -> int:
     failed = False
     for filename, sys_platform in LOCKS:
         lock = REPO / "src-tauri/python" / filename
-        missing = sorted(required_names(version, sys_platform) - pinned_names(lock))
+        required = required_names(version, sys_platform) - NOT_INSTALLED
+        missing = sorted(required - pinned_names(lock))
         if missing:
             failed = True
             print(f"FAIL {filename}: missing {', '.join(missing)}")

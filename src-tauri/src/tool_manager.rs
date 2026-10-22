@@ -19539,6 +19539,16 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         );
     }
 
+    /// A fresh resolution of headroom-ai re-adds ast-grep-cli, and its Windows
+    /// wheel is an .exe a web filter 403'd mid-bootstrap (RUST-6S on 0.9.46).
+    /// Nothing the app runs uses it; see the note in each lock.
+    #[test]
+    fn bundled_locks_leave_out_ast_grep() {
+        for os in ["macos", "linux", "windows"] {
+            assert!(!bootstrap_requirements_lock_for_target(os).contains("\nast-grep-cli=="));
+        }
+    }
+
     #[test]
     fn bundled_locks_carry_a_hash_for_every_requirement() {
         // One --hash anywhere puts pip in hash-checking mode, which then
@@ -22001,7 +22011,6 @@ time.sleep(30)
     fn linux_bootstrap_requirements_skip_optional_memory_and_ml_packages() {
         let linux_requirements = bootstrap_requirements_lock_for_target("linux");
 
-        assert!(linux_requirements.contains("ast-grep-cli=="));
         assert!(!linux_requirements.contains("hnswlib=="));
         assert!(linux_requirements.contains("opentelemetry-api=="));
         assert!(!linux_requirements.contains("torch=="));
