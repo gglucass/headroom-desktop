@@ -24,9 +24,10 @@
 # pip 26.2.2 added (2026-10-21) for the same incident (see the macOS lock).
 # 0.41.0's core requires_dist adds truststore>=0.10.0, so truststore 0.10.4
 # (the macOS and Windows locks' pin, a pure-Python wheel) is added here.
-ast-grep-cli==0.42.2 \
-    --hash=sha256:26adbb32aed0093a37128cc7fa0230b13dc5f1b806e3b526479f55bef65946d2 \
-    --hash=sha256:a2f4728d6cc75a67265afa0801dade15649eb9a5188333d1b0c51b4833f975d3
+# ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
+# only two binaries, used only by the opt-in --intercept-tool-results the app never
+# passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
+# (RUST-6S on 0.9.46). scripts/check-python-locks.py excuses it.
 click==8.4.0 \
     --hash=sha256:40c50b7c6c6adac2823d411041ec84f3f103f1b280d5e9ce0d7f998995832f81
 fastapi==0.136.1 \

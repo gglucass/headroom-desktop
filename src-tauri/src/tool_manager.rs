@@ -14737,12 +14737,18 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     // `ERROR: Exception:` names no reason: it is pip's own crash banner, and
     // the reason is the traceback's LAST line (RUST-6S on 0.9.31 read
     // "ERROR: Exception: Traceback ... File" and nothing else).
-    let from_pip_error = if trimmed.starts_with("ERROR: ") {
-        Some(trimmed)
-    } else {
-        trimmed.find("\nERROR: ").map(|i| &trimmed[i + 1..])
-    }
-    .filter(|head| !head.starts_with("ERROR: Exception:"));
+    // pip indents an `ERROR:` it logs under a "Collecting" line, and that can be
+    // the only one naming the cause (RUST-6S on 0.9.46: "  ERROR: HTTP error 403
+    // while getting <url>"; the unindented line after it spent the budget on
+    // the same URL three times).
+    let from_pip_error = trimmed
+        .match_indices("ERROR: ")
+        .find(|&(i, _)| {
+            let indent = trimmed[..i].trim_end_matches(' ');
+            indent.is_empty() || indent.ends_with('\n')
+        })
+        .map(|(i, _)| &trimmed[i..])
+        .filter(|head| !head.starts_with("ERROR: Exception:"));
     let tail = match from_pip_error {
         // Byte offsets, so walk to a char boundary before slicing: pip on a
         // non-English Windows locale emits multi-byte stderr and slicing
@@ -14936,6 +14942,10 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // succeeded, so the link failed mid-transfer. A certificate pip cannot
         // verify fails the handshake instead and reaches `could not fetch url`.
         || (lower.contains("sslerror") && evidence_lower.contains("in _error_catcher"))
+        // The index or CDN answered 4xx/5xx for a file the index itself listed
+        // (RUST-6S on 0.9.46: a 403 on one wheel, every other one cached), so
+        // something between the machine and PyPI refused it.
+        || lower.contains("http error")
     {
         "network"
     } else {
@@ -15448,6 +15458,52 @@ fn pip_failure_is_sharing_violation(text: &str) -> bool {
         || (lower.contains("winerror 183]") && lower.contains("\\~"))
 }
 
+/// The file a `[WinError 32]` names: pip ends that line with the path's
+/// Python repr, quoted and with every backslash doubled.
+fn sharing_violation_path(text: &str) -> Option<String> {
+    // `(text before the quoted path, the path)` for the path that ends `line`.
+    fn last_quoted(line: &str) -> Option<(&str, &str)> {
+        let quote = line.chars().last().filter(|c| matches!(c, '\'' | '"'))?;
+        let inner = &line[..line.len() - 1];
+        let open = inner.rfind(quote)?;
+        Some((&inner[..open], &inner[open + 1..]))
+    }
+    let line = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("winerror 32]"))?
+        .trim_end();
+    let (head, mut path) = last_quoted(line)?;
+    // A failed rename names both ends, `'src' -> 'src.deleteme'`: the held
+    // file is the source; the target never came to exist.
+    if let Some((_, source)) = head.strip_suffix(" -> ").and_then(last_quoted) {
+        path = source;
+    }
+    Some(path.replace("\\\\", "\\"))
+}
+
+/// Who holds the file a final sharing violation names (Windows). Six sweeps
+/// of the venv's processes did not free Scripts\headroom.exe on 0.9.46
+/// (RUST-29), and nothing said whether the holder was one the sweep cannot
+/// kill (elevated, another account) or no venv process at all (antivirus).
+fn sharing_violation_holders(evidence: &str) -> Option<String> {
+    let path = sharing_violation_path(evidence)?;
+    #[cfg(target_os = "windows")]
+    {
+        crate::winproc::file_holders(Path::new(&path)).map(|holders| {
+            if holders.is_empty() {
+                "none listed".to_string()
+            } else {
+                holders.join("; ")
+            }
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
 /// silent unpack phase. `None` (wait forever) stays `None`.
 fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
@@ -15553,6 +15609,7 @@ where
             }
             continue;
         }
+        let holders = sharing_violation_holders(&evidence);
         if crate::is_disk_full_signal(&compact) || crate::is_disk_full_signal(&format!("{err:#}")) {
             // ENOSPC is environmental and already surfaced + Sentry-
             // suppressed by the caller's runtime_upgrade_failed /
@@ -15568,6 +15625,9 @@ where
             sentry::with_scope(
                 |scope| {
                     scope.set_fingerprint(Some(&["pip-install-failed", category]));
+                    if let Some(holders) = &holders {
+                        scope.set_extra("file_holders", holders.as_str().into());
+                    }
                 },
                 || {
                     sentry::capture_message(
@@ -15580,7 +15640,12 @@ where
             );
             log::warn!("pip install attempt {attempt} failed (final): {compact}");
         }
-        return Err(err);
+        // In the error too, so the caller's own Sentry event (the upgrade's
+        // error_chain) names the holder.
+        return Err(match holders {
+            Some(holders) => err.context(format!("file held by: {holders}")),
+            None => err,
+        });
     }
 }
 
@@ -19474,6 +19539,48 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         );
     }
 
+    /// A fresh resolution of headroom-ai re-adds ast-grep-cli, and its Windows
+    /// wheel is an .exe a web filter 403'd mid-bootstrap (RUST-6S on 0.9.46).
+    /// Nothing the app runs uses it; see the note in each lock.
+    #[test]
+    fn bundled_locks_leave_out_ast_grep() {
+        for os in ["macos", "linux", "windows"] {
+            assert!(!bootstrap_requirements_lock_for_target(os).contains("\nast-grep-cli=="));
+        }
+    }
+
+    /// Leaving ast-grep-cli out is safe only while the backend never runs the
+    /// tool-result interceptors that shell out to it. A wheel that defaults the
+    /// flag on, or enables the feature on the app's beta channel, fails here:
+    /// re-add the pin to the locks and drop it from check-python-locks.py.
+    #[test]
+    fn tool_result_interceptors_stay_off_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        // The channel is the one the backend spawn sets.
+        let probe = r#"
+from headroom.cli.proxy import proxy
+from headroom.rollout import resolve_rollout
+flag = next(p for p in proxy.params if p.name == "intercept_tool_results")
+snapshot = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
+print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .output()
+            .expect("run interceptor probe");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "False False",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn bundled_locks_carry_a_hash_for_every_requirement() {
         // One --hash anywhere puts pip in hash-checking mode, which then
@@ -21936,7 +22043,6 @@ time.sleep(30)
     fn linux_bootstrap_requirements_skip_optional_memory_and_ml_packages() {
         let linux_requirements = bootstrap_requirements_lock_for_target("linux");
 
-        assert!(linux_requirements.contains("ast-grep-cli=="));
         assert!(!linux_requirements.contains("hnswlib=="));
         assert!(linux_requirements.contains("opentelemetry-api=="));
         assert!(!linux_requirements.contains("torch=="));
@@ -26505,6 +26611,25 @@ exit 0
         );
     }
 
+    /// RUST-6S on 0.9.46, from the real stderr: the status lives only on pip's
+    /// indented line, and the message read "... (from -r ...headroom-requirement".
+    #[test]
+    fn compact_pip_failure_keeps_an_indented_http_error() {
+        let url = "https://files.pythonhosted.org/packages/2f/85/51e98cd5d510a27208275a7c0fb36e0e0d1da0b0deeb9992ddd7f48387b6/ast_grep_cli-0.44.0-py3-none-win_amd64.whl";
+        let stderr = format!(
+            "  ERROR: HTTP error 403 while getting {url} (from https://pypi.org/simple/ast-grep-cli/)\n\
+             ERROR: Could not install requirement ast-grep-cli==0.44.0 from {url} (from -r \
+             ~\\AppData\\Local\\Headroom\\headroom\\downloads\\headroom-requirements.lock (line 66)) \
+             because of HTTP error 403 Client Error: Forbidden for url: {url} for URL {url}\n"
+        );
+        let compact = compact_pip_failure(&pip_failure(&stderr));
+        assert!(
+            compact.contains("ERROR: HTTP error 403 while getting"),
+            "{compact}"
+        );
+        assert_eq!(pip_failure_category(&compact), "network");
+    }
+
     /// The tail is still right when pip prints no `ERROR:` line at all, so the
     /// RUST-82 fix must not cost us the ordinary case.
     #[test]
@@ -26526,6 +26651,37 @@ exit 0
         let compact = compact_pip_failure(&pip_failure(&stderr));
         assert!(compact.starts_with("exit=1; stderr tail: "));
         assert!(compact.contains("エラー"));
+    }
+
+    #[test]
+    fn sharing_violation_path_reads_the_file_pip_names() {
+        let stderr = "WARNING: Ignoring invalid distribution ~eadroom-ai\n\
+            ERROR: Could not install packages due to an OSError: [WinError 32] O processo \
+            não pode acessar o arquivo: 'c:\\\\users\\\\o\\\\venv\\\\scripts\\\\headroom.exe'\n\
+            Check the permissions.\n";
+        assert_eq!(
+            super::sharing_violation_path(stderr).as_deref(),
+            Some(r"c:\users\o\venv\scripts\headroom.exe")
+        );
+        // An apostrophe in the path makes Python quote it with double quotes.
+        assert_eq!(
+            super::sharing_violation_path(r#"[WinError 32] in use: "c:\\users\\o'brien\\x.dll""#)
+                .as_deref(),
+            Some(r"c:\users\o'brien\x.dll")
+        );
+        // A failed rename names both ends; the held file is the source, not
+        // the `.deleteme` pip never got to create (RUST-29 on 0.9.2x).
+        assert_eq!(
+            super::sharing_violation_path(
+                r"ERROR: Could not install packages due to an OSError: [WinError 32] in use: 'c:\\v\\scripts\\headroom.exe' -> 'c:\\v\\scripts\\headroom.exe.deleteme'"
+            )
+            .as_deref(),
+            Some(r"c:\v\scripts\headroom.exe")
+        );
+        assert_eq!(
+            super::sharing_violation_path("[WinError 5] Access is denied"),
+            None
+        );
     }
 
     /// A sharing violation is antivirus holding a freshly written wheel; the

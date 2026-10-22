@@ -2024,6 +2024,14 @@ impl AppState {
         self.launch_profile.lock().launch_count
     }
 
+    /// Saves the profile `AppState::new` loaded, launch_count bumped. Only the
+    /// primary calls it, once a second launch would have been handed off.
+    pub fn record_launch(&self) {
+        self.launch_profile
+            .lock()
+            .persist_loaded(self.launch_profile_path.as_deref());
+    }
+
     pub fn launch_experience_label(&self) -> &'static str {
         if !self.setup_wizard_satisfied() {
             return "first_run";
@@ -5365,16 +5373,22 @@ impl LaunchProfile {
             current.launch_experience = LaunchExperience::Resume;
         }
 
-        // Best-effort persist: a failed write here (e.g. EPERM from locked-down
-        // Application Support perms, RUST-1P) must not crash startup. The profile
-        // is telemetry; degrade to the in-memory copy and continue.
-        if let (Some(path), Ok(bytes)) = (&persist_path, serde_json::to_vec_pretty(&current)) {
+        // Not saved here: AppState::new runs before the single-instance
+        // hand-off, so every second launch (a shortcut clicked while Headroom
+        // runs) saved its bumped launch_count and then exited. The primary
+        // saves it with `AppState::record_launch`.
+        Ok((current, persist_path))
+    }
+
+    /// Best-effort persist: a failed write here (e.g. EPERM from locked-down
+    /// Application Support perms, RUST-1P) must not crash startup. The profile
+    /// is telemetry; degrade to the in-memory copy and continue.
+    fn persist_loaded(&self, path: Option<&std::path::Path>) {
+        if let (Some(path), Ok(bytes)) = (path, serde_json::to_vec_pretty(self)) {
             if let Err(e) = crate::client_adapters::atomic_write(path, &bytes) {
                 log::warn!("could not persist {}: {e:#}", path.display());
             }
         }
-
-        Ok((current, persist_path))
     }
 }
 
@@ -18082,7 +18096,7 @@ mod tests {
         let path = crate::storage::config_file(&base_dir, "launch-profile.json");
         std::fs::write(&path, "").expect("write empty profile"); // RUST-1P: 0-byte file
 
-        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir)
+        let (profile, persist_path) = super::LaunchProfile::load_or_create(&base_dir)
             .expect("must not fail on corrupt profile");
         assert_eq!(profile.launch_count, 1);
         assert!(matches!(
@@ -18090,6 +18104,7 @@ mod tests {
             crate::models::LaunchExperience::FirstRun
         ));
         // The rewritten file parses again on the next launch.
+        profile.persist_loaded(persist_path.as_deref());
         let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
         assert_eq!(profile.launch_count, 2);
         let _ = std::fs::remove_dir_all(&base_dir);
@@ -18112,7 +18127,8 @@ mod tests {
         )
         .expect("write profile");
 
-        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("salvaged");
+        let (profile, persist_path) =
+            super::LaunchProfile::load_or_create(&base_dir).expect("salvaged");
         assert_eq!(profile.launch_count, 8);
         assert_eq!(profile.lifetime_requests, 3);
         assert_eq!(profile.accepted_terms_version, 2);
@@ -18121,7 +18137,15 @@ mod tests {
             super::UpstreamOverride::default()
         );
         assert!(path.with_extension("json.salvaged").exists());
+        // Loading alone writes nothing: a second launch loads the profile
+        // before its single-instance hand-off exits it.
+        let (unsaved, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
+        assert_eq!(
+            unsaved.launch_count, 8,
+            "a load must not save its bumped count"
+        );
         // The rewritten file parses cleanly on the next launch.
+        profile.persist_loaded(persist_path.as_deref());
         let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
         assert_eq!(profile.launch_count, 9);
         let _ = std::fs::remove_dir_all(&base_dir);

@@ -206,7 +206,16 @@ impl InstallableAppUpdate for TauriPendingUpdate {
                     },
                 )
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(|err| match &err {
+                    // tar's unpack error displays only "failed to unpack `X`
+                    // into `Y`"; the io error that stopped it (a full disk,
+                    // RUST-S4) is its source.
+                    tauri_plugin_updater::Error::Io(io) => match std::error::Error::source(io) {
+                        Some(cause) => format!("{err}: {cause}"),
+                        None => err.to_string(),
+                    },
+                    _ => err.to_string(),
+                })
         })
     }
 }
@@ -2785,6 +2794,7 @@ fn is_network_download_signal(text: &str) -> bool {
         "service unavailable",
         "error sending request",
         "could not fetch url",  // pip: an index/find-links fetch died
+        "http error",           // pip: a 4xx/5xx on a listed file (RUST-6S: a proxy's 403)
         "max retries exceeded", // urllib3 inside pip
         "operation timed out",
         "connection timed out",
@@ -8478,6 +8488,8 @@ pub fn run() {
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
+    // A second launch has exited by now, so only the primary counts as one.
+    app.state::<AppState>().record_launch();
     app.run(|app, event| {
         // macOS never spawns a second process when the user opens an
         // already-running app from Finder or a pinned Dock icon, so the
@@ -17332,6 +17344,7 @@ Some unrelated content.
             "tcp connect error: Connection refused (os error 61)",
             "dns error: failed to lookup address information",
             "operation timed out",
+            "  ERROR: HTTP error 403 while getting https://files.pythonhosted.org/x.whl",
         ] {
             assert!(is_network_download_signal(sample), "should match: {sample}");
         }
