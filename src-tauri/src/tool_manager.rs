@@ -14737,12 +14737,18 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     // `ERROR: Exception:` names no reason: it is pip's own crash banner, and
     // the reason is the traceback's LAST line (RUST-6S on 0.9.31 read
     // "ERROR: Exception: Traceback ... File" and nothing else).
-    let from_pip_error = if trimmed.starts_with("ERROR: ") {
-        Some(trimmed)
-    } else {
-        trimmed.find("\nERROR: ").map(|i| &trimmed[i + 1..])
-    }
-    .filter(|head| !head.starts_with("ERROR: Exception:"));
+    // pip indents an `ERROR:` it logs under a "Collecting" line, and that can be
+    // the only one naming the cause (RUST-6S on 0.9.46: "  ERROR: HTTP error 403
+    // while getting <url>"; the unindented line after it spent the budget on
+    // the same URL three times).
+    let from_pip_error = trimmed
+        .match_indices("ERROR: ")
+        .find(|&(i, _)| {
+            let indent = trimmed[..i].trim_end_matches(' ');
+            indent.is_empty() || indent.ends_with('\n')
+        })
+        .map(|(i, _)| &trimmed[i..])
+        .filter(|head| !head.starts_with("ERROR: Exception:"));
     let tail = match from_pip_error {
         // Byte offsets, so walk to a char boundary before slicing: pip on a
         // non-English Windows locale emits multi-byte stderr and slicing
@@ -14936,6 +14942,10 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         // succeeded, so the link failed mid-transfer. A certificate pip cannot
         // verify fails the handshake instead and reaches `could not fetch url`.
         || (lower.contains("sslerror") && evidence_lower.contains("in _error_catcher"))
+        // The index or CDN answered 4xx/5xx for a file the index itself listed
+        // (RUST-6S on 0.9.46: a 403 on one wheel, every other one cached), so
+        // something between the machine and PyPI refused it.
+        || lower.contains("http error")
     {
         "network"
     } else {
@@ -26558,6 +26568,25 @@ exit 0
             super::pip_failure_category_with_evidence(&compact, &evidence),
             "download-removed"
         );
+    }
+
+    /// RUST-6S on 0.9.46, from the real stderr: the status lives only on pip's
+    /// indented line, and the message read "... (from -r ...headroom-requirement".
+    #[test]
+    fn compact_pip_failure_keeps_an_indented_http_error() {
+        let url = "https://files.pythonhosted.org/packages/2f/85/51e98cd5d510a27208275a7c0fb36e0e0d1da0b0deeb9992ddd7f48387b6/ast_grep_cli-0.44.0-py3-none-win_amd64.whl";
+        let stderr = format!(
+            "  ERROR: HTTP error 403 while getting {url} (from https://pypi.org/simple/ast-grep-cli/)\n\
+             ERROR: Could not install requirement ast-grep-cli==0.44.0 from {url} (from -r \
+             ~\\AppData\\Local\\Headroom\\headroom\\downloads\\headroom-requirements.lock (line 66)) \
+             because of HTTP error 403 Client Error: Forbidden for url: {url} for URL {url}\n"
+        );
+        let compact = compact_pip_failure(&pip_failure(&stderr));
+        assert!(
+            compact.contains("ERROR: HTTP error 403 while getting"),
+            "{compact}"
+        );
+        assert_eq!(pip_failure_category(&compact), "network");
     }
 
     /// The tail is still right when pip prints no `ERROR:` line at all, so the

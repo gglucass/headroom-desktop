@@ -2794,6 +2794,7 @@ fn is_network_download_signal(text: &str) -> bool {
         "service unavailable",
         "error sending request",
         "could not fetch url",  // pip: an index/find-links fetch died
+        "http error",           // pip: a 4xx/5xx on a listed file (RUST-6S: a proxy's 403)
         "max retries exceeded", // urllib3 inside pip
         "operation timed out",
         "connection timed out",
@@ -17343,6 +17344,7 @@ Some unrelated content.
             "tcp connect error: Connection refused (os error 61)",
             "dns error: failed to lookup address information",
             "operation timed out",
+            "  ERROR: HTTP error 403 while getting https://files.pythonhosted.org/x.whl",
         ] {
             assert!(is_network_download_signal(sample), "should match: {sample}");
         }
