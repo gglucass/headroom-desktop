@@ -2361,10 +2361,10 @@ async fn handle(
         // in the backend's `handle_openai_responses_ws` (covers OSS-direct users
         // too). Remove this line once the bundled package includes that fix.
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
-        // A thread created on Codex's built-in `openai` provider (before setup,
-        // or resumed from before it) reaches us through the root
-        // `openai_base_url`, and that provider speaks WebSocket: the transport
-        // our own `headroom` provider turns off (`supports_websockets = false`).
+        // Codex's built-in `openai` provider, which Headroom routes through the
+        // root `openai_base_url` since 0.9.48, speaks WebSocket: the transport
+        // the pre-0.9.48 `headroom` provider turned off (`supports_websockets =
+        // false`). The disable is per session, so each session pays one 426.
         // Its failures were invisible: the 101 is no error, and a socket closed
         // mid-turn left Codex retrying into a bare "System error" (user 3277,
         // 2026-09-29). 426 is Codex's own signal to move the session to HTTPS
