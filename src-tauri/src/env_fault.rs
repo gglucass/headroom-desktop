@@ -580,6 +580,34 @@ mod tests {
         assert!(!state_unreadable());
     }
 
+    /// The pre-update snapshot looks past mkdir's AlreadyExists to the stat
+    /// error behind it (RUST-RP); a folder it may not create keeps mkdir's own
+    /// error, not the stat's NotFound for the folder that was never made.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_snapshot_folder_counts_as_a_write_fault() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("Headroom");
+        let config = base.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::create_dir(config.join("probe")).is_ok() {
+            eprintln!("skipped: file modes do not apply to this user");
+            return;
+        }
+        *TEST_ROOT.lock() = Some(base.clone());
+        let _guard = ReadFaultGuard; // resets FAULTS and TEST_ROOT on drop
+        *FAULTS.lock() = Faults::default();
+
+        crate::storage::snapshot_state_on_version_change(&base, "0.9.47");
+
+        let kind = FAULTS.lock().write.as_ref().map(|fault| fault.kind);
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(kind, Some(FaultKind::Permissions));
+    }
+
     #[test]
     fn issue_text_splits_into_a_lead_and_a_remedy() {
         // The dashboard's splitIssue cuts at the first ". " before a capital.
