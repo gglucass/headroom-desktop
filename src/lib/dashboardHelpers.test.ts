@@ -475,8 +475,12 @@ describe("dashboard helpers", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: false })
     ).toEqual({ label: "Verifying", tone: "pending" });
+    // Config in place but nothing reached Headroom: not "Active".
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true })
+    ).toEqual({ label: "Connected, no requests yet", tone: "pending" });
+    expect(
+      connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true, requestsSinceYesterday: 3 })
     ).toEqual({ label: "Active", tone: "active" });
     // Red is reserved for enabled-but-broken: proxy down while a connector is on.
     expect(

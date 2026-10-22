@@ -1605,6 +1605,10 @@ pub fn list_client_connectors(
                 verified,
                 last_configured_at: configured_timestamp(&setup_state, spec.id),
                 verification,
+                // Counter keys are the spec ids with dashes ("claude-code", "grok-build").
+                requests_since_yesterday: crate::usage_counters::requests_since_yesterday(
+                    &spec.id.replace('_', "-"),
+                ),
             }
         })
         .collect();
@@ -16743,6 +16747,27 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         assert!(!super::is_gate_exempt_client("claude_code"));
         assert!(!super::is_gate_exempt_client("vscode"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_client_connectors_counts_requests_under_the_intercepts_client_key() {
+        // The Home badge says "Active" only off this count, so a key mismatch
+        // would show a working agent as idle forever.
+        let _home = TestHome::new();
+        let count = |id: &str| {
+            super::list_client_connectors(&[])
+                .expect("listing succeeds")
+                .into_iter()
+                .find(|connector| connector.client_id == id)
+                .expect("connector listed")
+                .requests_since_yesterday
+        };
+        for (id, key) in [("claude_code", "claude-code"), ("grok_build", "grok-build")] {
+            let before = count(id);
+            crate::usage_counters::record_request(key);
+            assert!(count(id) > before, "{id} reads {key}");
+        }
     }
 
     #[test]
