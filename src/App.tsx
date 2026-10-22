@@ -3398,8 +3398,9 @@ export default function App() {
       return;
     }
     void Promise.all([refreshConnectors(), refreshRuntimeStatus()]);
+  // Focus too: the connector badges carry a request count, which goes stale while the window is hidden.
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
-  }, [activeView, startupReady]);
+  }, [activeView, startupReady, trayWindowFocused]);
 
   useEffect(() => {
     if (claudeProjects.length === 0) {

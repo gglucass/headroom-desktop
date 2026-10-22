@@ -493,6 +493,11 @@ pub struct ClientConnectorStatus {
     pub last_configured_at: Option<String>,
     #[serde(default)]
     pub verification: Option<ClientSetupVerification>,
+    /// Requests that actually reached Headroom from this client, today and
+    /// yesterday. `verified` only says our config is in place; a client that
+    /// ignores it (the Claude desktop app) verifies fine and sends nothing.
+    #[serde(default)]
+    pub requests_since_yesterday: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -924,6 +924,11 @@ export function connectorDashboardStatus(
       ? { label: "Verifying", tone: "pending" }
       : { label: "Restart needed", tone: "pending" };
   }
+  // Verified only means our config is in place. A client that ignores it (the
+  // Claude desktop app) showed "Active" for weeks while saving nothing (2026-10-22).
+  if (!connector.requestsSinceYesterday) {
+    return { label: "Connected, no requests yet", tone: "pending" };
+  }
   return { label: "Active", tone: "active" };
 }
 
