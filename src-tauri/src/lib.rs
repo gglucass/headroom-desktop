@@ -737,7 +737,10 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
 /// setup. The post-install screen and the nudge tell that user to restart,
 /// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
 /// first proxied request landed three minutes after the nudge. A `headroom`
-/// thread, an unrouted config or a CODEX_HOME override still reports.
+/// thread, an unrouted config or a CODEX_HOME override still reports. Since
+/// 0.9.48 a routed thread is `openai` too, so a Codex that read the config and
+/// still leaked reads as this straggler; only a pre-0.9.48 `headroom` thread
+/// proves the config was read (55 of RUST-KC's 76 events were stragglers).
 ///
 /// Nor is a thread on a provider of the user's own (`--oss`, a custom
 /// `model_providers` entry): Headroom routes only `openai` and `headroom`,
@@ -8324,15 +8327,14 @@ pub fn run() {
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
                 client_adapters::restore_client_setups();
-                // restore_client_setups only retags Codex threads back to the
-                // headroom provider for clients in `remembered_clients`, which a
-                // plain Cmd-Q / dock quit / app-update restart never populates
-                // (only pause and the Settings "Quit" do). Those exit paths still
-                // run the quit-time headroom->openai retag, so without this the
-                // Codex history menu stays empty after an update restart. Mirror
-                // the quit retag whenever Codex is still configured.
+                // restore_client_setups only retags Codex threads for clients in
+                // `remembered_clients`, which a plain Cmd-Q / dock quit /
+                // app-update restart never populates (only pause and the
+                // Settings "Quit" do). The update restart into 0.9.48 is the one
+                // that must move pre-0.9.48 `headroom` threads to `openai`, or
+                // they drop out of the Codex history menu.
                 if client_adapters::is_codex_enabled() {
-                    client_adapters::retag_codex_threads_to_headroom();
+                    client_adapters::retag_codex_threads_to_native();
                 }
             });
 
