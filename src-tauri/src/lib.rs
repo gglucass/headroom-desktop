@@ -4380,6 +4380,9 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
         "getaddrinfo failed",
         "newconnectionerror",
         "failed to establish a new connection",
+        // A 4xx/5xx on a listed file, pip's wording only (a web filter's 403,
+        // RUST-29 on 0.9.47-rc.7; bootstrap's `is_network_download_signal`).
+        "http error",
     ]
     .iter()
     .any(|marker| chain.contains(marker))
@@ -18009,6 +18012,21 @@ Some unrelated content.
                 "{errno}: expected network hint, got: {hint}"
             );
         }
+
+        // RUST-29 on 0.9.47-rc.7, verbatim: a web filter refused one wheel.
+        let forbidden = anyhow::Error::new(crate::tool_manager::CommandFailure {
+            program: "python".into(),
+            args: vec!["-m".into(), "pip".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "  ERROR: HTTP error 403 while getting https://files.pythonhosted.org/\
+                     packages/fb/e2/click-8.4.2-py3-none-any.whl\n"
+                .into(),
+            exit_code: Some(1),
+            signal: None,
+        })
+        .context("repairing stale headroom requirements");
+        let hint = classify_upgrade_error(&forbidden).expect("must classify");
+        assert!(hint.contains("PyPI"), "got: {hint}");
 
         // A genuine resolver conflict keeps its own hint.
         let conflict =
