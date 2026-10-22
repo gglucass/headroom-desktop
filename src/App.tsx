@@ -80,7 +80,10 @@ import {
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
   type SetupStallKind,
+  connectorBadgeTip,
   maybeFireUnroutedAlert,
+  mergeUnroutedBadges,
+  pruneUnroutedBadges,
   unroutedAfterReconnect,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
@@ -1814,6 +1817,7 @@ export default function App() {
   // whenever the user next opens the tray, rather than stealing focus.
   const [setupStall, setSetupStall] = useState<SetupStallAlert | null>(null);
   const [unroutedClients, setUnroutedClients] = useState<UnroutedClient[] | null>(null);
+  const [unroutedBadges, setUnroutedBadges] = useState<UnroutedClient[]>([]);
   // Same signals as the modal above, but for the always-on Home banner, whose
   // default copy tells a user with zero savings to check back later.
   const [stallBannerLine, setStallBannerLine] = useState<string | null>(null);
@@ -2949,11 +2953,12 @@ export default function App() {
           appStartedAtMs: appStartedAtMsRef.current,
         }).catch(() => [] as UnroutedClient[]);
         if (active && unrouted.length > 0) {
+          setUnroutedBadges((current) => mergeUnroutedBadges(current, unrouted));
           const alert = await maybeFireUnroutedAlert(unrouted);
           if (active && alert) {
             setUnroutedClients(alert);
-            void refreshConnectors();
           }
+          void refreshConnectors();
         }
       }
       const latest = await loadDashboard().catch(() => null);
@@ -3401,6 +3406,11 @@ export default function App() {
   // Focus too: the connector badges carry a request count, which goes stale while the window is hidden.
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView, startupReady, trayWindowFocused]);
+
+  // An unrouted finding stays on its Home badge until that agent's requests reach Headroom.
+  useEffect(() => {
+    setUnroutedBadges((current) => pruneUnroutedBadges(current, connectors));
+  }, [connectors]);
 
   useEffect(() => {
     if (claudeProjects.length === 0) {
@@ -7261,14 +7271,19 @@ export default function App() {
                 return (
                   <div className="callout-banner__connectors">
                     {homeConnectors.map((connector) => {
+                      const unrouted = unroutedBadges.find(
+                        (client) => client.clientId === connector.clientId
+                      );
                       const status = connectorDashboardStatus(connector, {
-                        proxyReachable: runtimeStatus?.proxyReachable
+                        proxyReachable: runtimeStatus?.proxyReachable,
+                        ranUnrouted: Boolean(unrouted)
                       });
+                      const tip = connectorBadgeTip(connector, status.label, unrouted);
                       return (
                         <span
                           className={`callout-banner__badge callout-banner__badge--${status.tone}`}
                           key={connector.clientId}
-                          data-tip={`${connector.name}: ${status.label}`}
+                          data-tip={tip}
                         >
                           {hasConnectorIcon(connector.clientId) ? (
                             <ConnectorIcon clientId={connector.clientId} />
@@ -7277,7 +7292,7 @@ export default function App() {
                               {connectorMonograms[connector.clientId] ?? connector.name.slice(0, 2)}
                             </span>
                           )}
-                          <span className="visually-hidden">{`${connector.name}: ${status.label}`}</span>
+                          <span className="visually-hidden">{tip}</span>
                         </span>
                       );
                     })}

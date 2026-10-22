@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { needsTermsAcceptance } from "./launcherHelpers";
-import { formatDayKey } from "./dashboardHelpers";
+import { formatDayKey, RAN_WITHOUT_HEADROOM } from "./dashboardHelpers";
 import type { ClientConnectorStatus, DashboardState, UnroutedClient } from "./types";
 
 // Nothing at all has come through. This is the weaker of the two signals:
@@ -409,6 +409,51 @@ export function unroutedBody(client: UnroutedClient): string {
   return client.enabled
     ? `${client.name} ran in the last day without going through Headroom, usually because it was already open when Headroom started. Always open Headroom first, then ${client.name}. To fix it now, quit and reopen ${client.name} (or reload your editor). Nothing to change in settings.`
     : `${client.name}'s connector is off, so nothing was optimized. Reconnect it to resume saving.`;
+}
+
+/// The unrouted findings the Home badges keep after a scan. The modal is once
+/// a day and gone on close, so a customer who closed it saw a green badge for
+/// weeks (2026-10-22). Switched-off agents are left to their "Off" badge.
+export function mergeUnroutedBadges(
+  current: UnroutedClient[],
+  found: UnroutedClient[]
+): UnroutedClient[] {
+  const fresh = found.filter((client) => client.enabled);
+  return [
+    ...current.filter((client) => !fresh.some((next) => next.clientId === client.clientId)),
+    ...fresh,
+  ];
+}
+
+/// Drops a finding once that agent's requests reach Headroom. Returns
+/// `current` itself when nothing changed, so a state setter skips the render.
+export function pruneUnroutedBadges(
+  current: UnroutedClient[],
+  connectors: ClientConnectorStatus[]
+): UnroutedClient[] {
+  const next = current.filter(
+    (client) =>
+      !connectors.some(
+        (connector) =>
+          connector.clientId === client.clientId && (connector.requestsSinceYesterday ?? 0) > 0
+      )
+  );
+  return next.length === current.length ? current : next;
+}
+
+/// Hover text for a Home connector badge: the evidence behind the verdict.
+export function connectorBadgeTip(
+  connector: ClientConnectorStatus,
+  label: string,
+  unrouted?: UnroutedClient
+): string {
+  if (label === RAN_WITHOUT_HEADROOM && unrouted) {
+    return unroutedBody(unrouted);
+  }
+  const requests = connector.requestsSinceYesterday ?? 0;
+  return requests > 0
+    ? `${connector.name}: ${label}, ${requests.toLocaleString("en-US")} ${requests === 1 ? "request" : "requests"} since yesterday`
+    : `${connector.name}: ${label}`;
 }
 
 /// What the reconnect modal still shows after one agent is reconnected, or
