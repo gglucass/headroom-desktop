@@ -23,6 +23,15 @@ on:
       - package.json
       - src-tauri/tauri.conf.json
   workflow_dispatch:
+    inputs:
+      rolling:
+        # An rc from a branch while staging's train verifies another: rc installs
+        # (Garm's Mac, the train guest) must not be moved onto it, and a newer
+        # staging-rolling would refuse that train's next rc. Test only runs on
+        # staging pushes, so its gate is skipped too; install from the rc release.
+        description: 'false publishes the rc release but leaves staging-rolling alone and skips the Test gate'
+        type: boolean
+        default: true
 
 concurrency:
   group: macos-release-staging-${{ github.ref }}
@@ -457,6 +466,7 @@ jobs:
       - name: Wait for the Test workflow on this commit
         # The release builds compile no test code, so they pass where the
         # Windows test build no longer compiles: rc8 and rc10 shipped that way.
+        if: github.event_name != 'workflow_dispatch' || inputs.rolling
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -510,6 +520,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RC_TAG: v${{ needs.guard.outputs.package_version }}
+          ROLLING: ${{ github.event_name != 'workflow_dispatch' || inputs.rolling }}
         run: |
           set -euo pipefail
           # The macOS job created the rc release; complete it first, so the
@@ -553,6 +564,10 @@ jobs:
             "$workdir/latest.json" > "$workdir/latest.merged.json"
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
           gh release upload "$RC_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+          if [ "$ROLLING" != true ]; then
+            echo "::notice::rolling=false: ${RC_TAG} is complete on its own release; staging-rolling untouched."
+            exit 0
+          fi
 
           # The stable publish (release-macos.yml, another concurrency group,
           # same check) also writes staging-rolling, and this rc can finish after
