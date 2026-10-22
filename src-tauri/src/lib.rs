@@ -7822,6 +7822,60 @@ fn finish_single_instance_hand_off(app: &tauri::App) {
     std::process::exit(0);
 }
 
+/// A Windows update relaunch can start this build while the old instance's
+/// WebView2 browser is still shutting down in the same user data folder; the
+/// windows then fail to create with 0x800700AA "The requested resource is in
+/// use" (RUST-JB: three hosts, each on its first launch of a release out that
+/// day), and the app runs without one while the RUST-K7 probe tells the user
+/// to reinstall WebView2. That browser holds `EBWebView\lockfile` until it
+/// exits, and a second launch has handed off by now, so a held lockfile is a
+/// previous instance's: wait for it before `run()` creates the windows.
+#[cfg(target_os = "windows")]
+fn wait_for_webview_data_folder(app: &tauri::App) {
+    use std::time::{Duration, Instant};
+    // Tauri's default data_directory on Windows (tauri manager/webview.rs).
+    let Ok(dir) = app.path().resolve(
+        &app.config().identifier,
+        tauri::path::BaseDirectory::LocalData,
+    ) else {
+        return;
+    };
+    let lockfile = dir.join("EBWebView").join("lockfile");
+    if !webview_lockfile_held(&lockfile) {
+        return;
+    }
+    let start = Instant::now();
+    let outcome = loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if !webview_lockfile_held(&lockfile) {
+            break format!(
+                "held at launch, freed after {}ms",
+                start.elapsed().as_millis()
+            );
+        }
+        if start.elapsed() >= Duration::from_secs(15) {
+            let holders = crate::winproc::file_holders(&lockfile)
+                .map_or_else(|| "unknown".to_string(), |holders| holders.join(", "));
+            break format!("still held after 15s by {holders}");
+        }
+    };
+    log::info!("webview data folder: {outcome}");
+    // Rides on the RUST-JB event if the windows fail anyway.
+    sentry::configure_scope(|scope| scope.set_extra("webview_data_folder", outcome.into()));
+}
+
+/// An exclusive open fails with a sharing violation while any process holds
+/// the file; a missing lockfile is a free folder.
+#[cfg(target_os = "windows")]
+fn webview_lockfile_held(lockfile: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(lockfile)
+        .is_err_and(|err| err.raw_os_error() == Some(32))
+}
+
 pub fn run() {
     // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary),
     // tauri's current_exe() refuses the path on macOS, so every update check
@@ -8493,6 +8547,8 @@ pub fn run() {
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
+    #[cfg(target_os = "windows")]
+    wait_for_webview_data_folder(&app);
     // A second launch has exited by now, so only the primary counts as one.
     app.state::<AppState>().record_launch();
     app.run(|app, event| {
@@ -18219,6 +18275,28 @@ Some unrelated content.
             .message
             .as_deref()
             .is_some_and(|m| m.contains("wait check failed")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn webview_lockfile_reads_held_only_while_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("hr-ebwebview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let lockfile = dir.join("lockfile");
+        assert!(!super::webview_lockfile_held(&lockfile), "missing is free");
+        // How Chromium holds it: write, share read, delete on close.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .custom_flags(0x0400_0000) // FILE_FLAG_DELETE_ON_CLOSE
+            .open(&lockfile)
+            .expect("hold lockfile");
+        assert!(super::webview_lockfile_held(&lockfile));
+        drop(held);
+        assert!(!super::webview_lockfile_held(&lockfile));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

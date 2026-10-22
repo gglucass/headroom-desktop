@@ -1020,12 +1020,20 @@ pub fn repair_client_setups() -> Vec<String> {
         }
         *last = Some(Instant::now());
     }
+    scan_client_setups()
+}
 
-    let client_ids: Vec<String> = load_setup_state()
-        .configured_clients
-        .keys()
-        .cloned()
-        .collect();
+/// The hourly pass of [`repair_client_setups`], unthrottled.
+fn scan_client_setups() -> Vec<String> {
+    let state = load_setup_state();
+    // Codex can rebuild a thread's row from its rollout, whose session_meta
+    // still says `headroom` for pre-0.9.48 threads, which drops that thread
+    // out of the `openai` history menu mid-run; the launch and quit retags
+    // alone left it hidden until the next restart.
+    if is_configured(&state, "codex_cli") {
+        retag_codex_threads_to_native();
+    }
+    let client_ids: Vec<String> = state.configured_clients.keys().cloned().collect();
     client_ids
         .into_iter()
         .filter(|client_id| repair_client_setup_now(client_id))
@@ -18672,6 +18680,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(repaired, vec!["codex_cli".to_string()]);
         let healed = super::verify_client_setup("codex").expect("verify runs");
         assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hourly_scan_retags_a_thread_codex_restamped_headroom() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        // Config still verifies, so nothing is re-applied; Codex rebuilt one
+        // pre-0.9.48 thread's row from its rollout and stamped it `headroom`.
+        let db = home.path().join(".codex").join("state_5.sqlite");
+        seed_codex_threads_db(&db, &[("a", "headroom"), ("b", "openai")]);
+
+        assert!(super::scan_client_setups().is_empty());
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 2);
     }
 
     // The configure time drives the frontend's "Quit and reopen" hint. A
