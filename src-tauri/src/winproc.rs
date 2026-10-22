@@ -13,6 +13,8 @@
 //! - The process table (pid, parent pid) from one kernel snapshot, plus each
 //!   process's command line and a TerminateProcess, so the process sweep runs
 //!   without starting PowerShell, and a tree kill runs without `taskkill`.
+//! - Who holds a file open, from the Restart Manager, for a pip run that gives
+//!   up on a sharing violation.
 //!
 //! Only proxy spawns join the job. The updater's installer, the relaunch
 //! helper and anything else that has to outlive the app never do.
@@ -24,7 +26,8 @@ use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+    CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -34,6 +37,10 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+use windows_sys::Win32::System::RestartManager::{
+    RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
+    RM_PROCESS_INFO,
 };
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
@@ -135,6 +142,79 @@ pub(crate) fn proxy_job_cpu_time_secs() -> Option<u64> {
 /// is a single syscall instead of a PowerShell cold start.
 pub(crate) fn process_image_path(pid: u32) -> Option<String> {
     ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.image_path()
+}
+
+/// Every process holding `path` open, as `<image> (pid N)`, marked `cannot
+/// terminate` when this app may not kill it (elevated, another account): the
+/// Restart Manager's answer, the one Explorer's "file in use" prompt gives,
+/// whether or not the holder runs from the venv. `None` when the query fails.
+pub(crate) fn file_holders(path: &std::path::Path) -> Option<Vec<String>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut session = 0u32;
+    let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    // SAFETY: `key` holds CCH_RM_SESSION_KEY + 1 units, as the API requires.
+    if unsafe { RmStartSession(&mut session, 0, key.as_mut_ptr()) } != ERROR_SUCCESS {
+        return None;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let files = [wide.as_ptr()];
+    let mut infos: Vec<RM_PROCESS_INFO> = Vec::new();
+    // SAFETY: one NUL-terminated path, no applications or services.
+    let mut status = unsafe {
+        RmRegisterResources(
+            session,
+            1,
+            files.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    // The list can grow between the size probe and the read.
+    for _ in 0..3 {
+        if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
+            break;
+        }
+        let (mut needed, mut count, mut reasons) = (0u32, infos.len() as u32, 0u32);
+        // SAFETY: `infos` holds `count` writable entries (none on the first
+        // call, which only asks for the size).
+        status = unsafe {
+            RmGetList(
+                session,
+                &mut needed,
+                &mut count,
+                infos.as_mut_ptr(),
+                &mut reasons,
+            )
+        };
+        if status == ERROR_MORE_DATA {
+            infos.resize(needed as usize, RM_PROCESS_INFO::default());
+            continue;
+        }
+        infos.truncate(count as usize);
+        break;
+    }
+    // SAFETY: `session` came from RmStartSession and is ended once.
+    unsafe { RmEndSession(session) };
+    (status == ERROR_SUCCESS).then(|| {
+        infos
+            .iter()
+            .map(|info| {
+                let pid = info.Process.dwProcessId;
+                let name = process_image_path(pid).unwrap_or_else(|| {
+                    let app = &info.strAppName;
+                    let len = app.iter().position(|&c| c == 0).unwrap_or(app.len());
+                    String::from_utf16_lossy(&app[..len])
+                });
+                let killable = ProcessHandle::open_to_terminate(pid).is_some();
+                format!(
+                    "{name} (pid {pid}{})",
+                    if killable { "" } else { ", cannot terminate" }
+                )
+            })
+            .collect()
+    })
 }
 
 /// An open process handle, closed on drop. While it is open the pid cannot be

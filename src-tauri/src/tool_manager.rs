@@ -15448,6 +15448,41 @@ fn pip_failure_is_sharing_violation(text: &str) -> bool {
         || (lower.contains("winerror 183]") && lower.contains("\\~"))
 }
 
+/// The file a `[WinError 32]` names: pip ends that line with the path's
+/// Python repr, quoted and with every backslash doubled.
+fn sharing_violation_path(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("winerror 32]"))?
+        .trim_end();
+    let quote = line.chars().last().filter(|c| matches!(c, '\'' | '"'))?;
+    let inner = &line[..line.len() - 1];
+    Some(inner[inner.rfind(quote)? + 1..].replace("\\\\", "\\"))
+}
+
+/// Who holds the file a final sharing violation names (Windows). Six sweeps
+/// of the venv's processes did not free Scripts\headroom.exe on 0.9.46
+/// (RUST-29), and nothing said whether the holder was one the sweep cannot
+/// kill (elevated, another account) or no venv process at all (antivirus).
+fn sharing_violation_holders(evidence: &str) -> Option<String> {
+    let path = sharing_violation_path(evidence)?;
+    #[cfg(target_os = "windows")]
+    {
+        crate::winproc::file_holders(Path::new(&path)).map(|holders| {
+            if holders.is_empty() {
+                "none listed".to_string()
+            } else {
+                holders.join("; ")
+            }
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
 /// silent unpack phase. `None` (wait forever) stays `None`.
 fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
@@ -15553,6 +15588,7 @@ where
             }
             continue;
         }
+        let holders = sharing_violation_holders(&evidence);
         if crate::is_disk_full_signal(&compact) || crate::is_disk_full_signal(&format!("{err:#}")) {
             // ENOSPC is environmental and already surfaced + Sentry-
             // suppressed by the caller's runtime_upgrade_failed /
@@ -15568,6 +15604,9 @@ where
             sentry::with_scope(
                 |scope| {
                     scope.set_fingerprint(Some(&["pip-install-failed", category]));
+                    if let Some(holders) = &holders {
+                        scope.set_extra("file_holders", holders.as_str().into());
+                    }
                 },
                 || {
                     sentry::capture_message(
@@ -15580,7 +15619,12 @@ where
             );
             log::warn!("pip install attempt {attempt} failed (final): {compact}");
         }
-        return Err(err);
+        // In the error too, so the caller's own Sentry event (the upgrade's
+        // error_chain) names the holder.
+        return Err(match holders {
+            Some(holders) => err.context(format!("file held by: {holders}")),
+            None => err,
+        });
     }
 }
 
@@ -26526,6 +26570,28 @@ exit 0
         let compact = compact_pip_failure(&pip_failure(&stderr));
         assert!(compact.starts_with("exit=1; stderr tail: "));
         assert!(compact.contains("エラー"));
+    }
+
+    #[test]
+    fn sharing_violation_path_reads_the_file_pip_names() {
+        let stderr = "WARNING: Ignoring invalid distribution ~eadroom-ai\n\
+            ERROR: Could not install packages due to an OSError: [WinError 32] O processo \
+            não pode acessar o arquivo: 'c:\\\\users\\\\o\\\\venv\\\\scripts\\\\headroom.exe'\n\
+            Check the permissions.\n";
+        assert_eq!(
+            super::sharing_violation_path(stderr).as_deref(),
+            Some(r"c:\users\o\venv\scripts\headroom.exe")
+        );
+        // An apostrophe in the path makes Python quote it with double quotes.
+        assert_eq!(
+            super::sharing_violation_path(r#"[WinError 32] in use: "c:\\users\\o'brien\\x.dll""#)
+                .as_deref(),
+            Some(r"c:\users\o'brien\x.dll")
+        );
+        assert_eq!(
+            super::sharing_violation_path("[WinError 5] Access is denied"),
+            None
+        );
     }
 
     /// A sharing violation is antivirus holding a freshly written wheel; the
