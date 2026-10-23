@@ -2590,6 +2590,10 @@ fn is_app_control_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
+        // The same verdict as an NTSTATUS exit code: python.exe exits
+        // STATUS_SYSTEM_INTEGRITY_POLICY_VIOLATION when the policy refuses a
+        // DLL it loads at startup, before printing anything (RUST-SE).
+        || lower.contains("0xc0e90002")
         // Windows localizes the verdict and only `CreateProcess` failures
         // carry the numeric code. When the policy blocks a DLL that Python is
         // importing, CPython reports it as an ImportError with the OS prose
@@ -12738,8 +12742,8 @@ mod tests {
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_agent_cli_outdated_hint, learn_agent_limit_hint,
-        learn_agent_unparseable_output_hint, learn_analysis_agent,
+        is_windows_app_control_block, learn_agent_auth_hint, learn_agent_cli_outdated_hint,
+        learn_agent_limit_hint, learn_agent_unparseable_output_hint, learn_analysis_agent,
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
@@ -17987,6 +17991,17 @@ Some unrelated content.
         assert!(!is_endpoint_protection_signal(
             "exited with status exit code: 0xc0000135 before opening port 6768"
         ));
+    }
+
+    #[test]
+    fn an_integrity_policy_exit_code_is_an_app_control_block() {
+        // RUST-SE, verbatim reason from the event.
+        let raw = "headroom.exe: exited with status exit code: 0xc0e90002 before opening port 6768";
+        assert!(is_windows_app_control_block(raw));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(raw)),
+            Some("startup_endpoint_protection")
+        );
     }
 
     #[test]

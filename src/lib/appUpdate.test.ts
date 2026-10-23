@@ -554,6 +554,24 @@ describe("app update helpers", () => {
     expect(result).toEqual({ statusCopy: staleError });
   });
 
+  it("reports the re-check's network failure, not the stale slot (RUST-HP)", async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce(
+        "The downloaded update is no longer staged. Check for updates again, then retry."
+      )
+      .mockRejectedValueOnce("error sending request for url (https://github.com/...)");
+
+    const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
+
+    expect(result.statusCopy).toMatch(/connection dropped/);
+    expect(Sentry.captureException).toHaveBeenCalledWith(
+      "error sending request for url (https://github.com/...)",
+      expect.objectContaining({ level: "warning" })
+    );
+  });
+
   it("returns an empty patch when install is requested without an update", async () => {
     const invokeFn = vi.fn();
 
