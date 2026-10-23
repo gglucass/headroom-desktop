@@ -367,8 +367,9 @@ jobs:
     # rather than looking like a test regression. All three audits (Rust, npm,
     # the Python runtime) read committed lockfiles, so this needs no build.
     # Known tradeoff: an advisory published upstream can red an unrelated PR.
-    # If that gets noisy, ignore the specific ID here rather than dropping the
-    # job -- `cargo audit --ignore RUSTSEC-YYYY-NNNN`, `pip-audit --ignore-vuln`.
+    # If that gets noisy, ignore the specific ID in scripts/advisories.sh (the
+    # release train's local gates run the same script) rather than dropping
+    # the job; every ignore there carries its reason.
     # Every audit runs even when an earlier one fails, so one red run lists all
     # of them (rc4's cargo-audit failure hid pip-audit's for a day).
     runs-on: ubuntu-latest
@@ -383,17 +384,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: Rust dependency advisories
-        # The two ignores are quick-xml DoS advisories reachable only through
-        # tauri's own tree (plist 1.8 pins ^0.38, tauri-winrt-notification 0.7
-        # pins ^0.37; both reject 0.41, so there is no upgrade from here).
-        # Neither parse path takes attacker-controlled XML -- plist reads our
-        # own bundle Info.plist, and the notification crate serializes toast XML
-        # we generate. Drop these the moment a tauri bump moves the pins;
-        # `cargo audit` prints them as unnecessary ignores when that happens.
-        run: >
-          cargo audit --file src-tauri/Cargo.lock
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
+        run: scripts/advisories.sh rust
       - name: Set up Node.js
         if: ${{ !cancelled() }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -402,9 +393,7 @@ jobs:
           cache: npm
       - name: Frontend dependency advisories
         if: ${{ !cancelled() }}
-        # --omit=dev: a devDependency advisory is not in the shipped bundle and
-        # would block releases on something users never run.
-        run: npm audit --audit-level=high --omit=dev
+        run: scripts/advisories.sh npm
       - name: Set up Python (runtime advisories)
         if: ${{ !cancelled() }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -412,83 +401,8 @@ jobs:
           python-version: '3.12'
       - name: Python runtime advisories
         if: ${{ !cancelled() }}
-        # Audits the pins each platform installs, not the lock files as-is:
-        # pip-audit evaluates environment markers against the runner, so a
-        # direct audit silently skips the Intel-Mac-only pins. --export
-        # resolves markers per target first (offline). The ignores:
-        # - PYSEC-2025-194 (torch.jit.script memory corruption): exploiting it
-        #   means running attacker-written TorchScript locally, and nothing in
-        #   headroom calls torch.jit. The fix is torch 2.13, a native bump with
-        #   its own macOS-arch review; drop the ignore with that bump.
-        # - PYSEC-2026-3447 (setuptools MANIFEST.in excludes vs NFD names):
-        #   only reachable when building an sdist, which the runtime never does
-        #   (--only-binary=:all:). Drop when setuptools moves to >=83.
-        # - PYSEC-2026-3552/3553/3554: cryptography 48.0.1 on Intel Macs only,
-        #   GHSA-g6cj-pr64-35w5 / GHSA-jwv3-5hgf-82ww / GHSA-m2h6-j472-rp4c,
-        #   verified unreachable 2026-08-17 (see headroom-requirements.lock).
-        #   Drop with that pin.
-        # - CVE-2026-112395/112397/112400/112404/112895/112896/112897/112899:
-        #   pillow 12.3.0 in the macOS and Windows locks (Linux pins none). The
-        #   fix is pillow 13.0.0, and fastembed caps pillow<13.0 in both 0.8.0
-        #   (our pin) and 0.9.0 (latest as of 2026-10-21), so no lock resolves.
-        #   headroom-ai decodes agent-traffic images with a bare Image.open, so
-        #   the three TIFF decode bugs (112395, 112404, 112897) are reachable: a
-        #   crafted image can crash the proxy or put proxy heap bytes into its
-        #   pixels. Out-of-bounds reads only, no code execution. The other five
-        #   need calls headroom never makes: a TIFF re-encode (112896; it saves
-        #   JPEG), ImageMorph (112397), PDF append (112895), GIF reuse after a
-        #   caught DecompressionBombError (112400), EPS load(scale) (112899).
-        #   Drop all eight with the pillow 13 bump once a fastembed release
-        #   allows it.
-        # - Sixteen more pillow 12.3.0 CVEs published 2026-10-22, same fix
-        #   (13.0.0), same fastembed cap. headroom-ai only calls Image.open on
-        #   a BytesIO (any format), convert("RGB"), resize and a JPEG save, so
-        #   five are reachable through a crafted agent-traffic image: IPTC
-        #   merge NULL read, a crash (112405); quadratic GIF comments (112401)
-        #   and the XBM header ReDoS (112901), CPU stalls; APNG canvas before
-        #   the bomb check (112399) and MSP RLE (112892), memory exhaustion.
-        #   No code execution. The other eleven need calls headroom never
-        #   makes: Image.transform (112402), ImageFont (112893), rank filters
-        #   (112392), GIF save (112891), PDF save (112391/112894/112406), TIFF
-        #   save (112393/112396), MIC n_frames with olefile, which no lock pins
-        #   (112390), and an EPS file name, which a BytesIO lacks (112900).
-        #   Drop all sixteen with the same pillow 13 bump.
+        # pip-audit's own install brings `packaging`, which the --export needs.
         shell: bash
         run: |
           python -m pip install --quiet pip-audit==2.10.1
-          python scripts/hash-python-locks.py --export "$RUNNER_TEMP/python-targets"
-          status=0
-          for target in "$RUNNER_TEMP"/python-targets/*.txt; do
-            echo "== $(basename "$target" .txt)"
-            pip-audit -r "$target" --disable-pip --progress-spinner off \
-              --ignore-vuln PYSEC-2025-194 \
-              --ignore-vuln PYSEC-2026-3447 \
-              --ignore-vuln PYSEC-2026-3552 \
-              --ignore-vuln PYSEC-2026-3553 \
-              --ignore-vuln PYSEC-2026-3554 \
-              --ignore-vuln CVE-2026-112390 \
-              --ignore-vuln CVE-2026-112391 \
-              --ignore-vuln CVE-2026-112392 \
-              --ignore-vuln CVE-2026-112393 \
-              --ignore-vuln CVE-2026-112395 \
-              --ignore-vuln CVE-2026-112396 \
-              --ignore-vuln CVE-2026-112397 \
-              --ignore-vuln CVE-2026-112399 \
-              --ignore-vuln CVE-2026-112400 \
-              --ignore-vuln CVE-2026-112401 \
-              --ignore-vuln CVE-2026-112402 \
-              --ignore-vuln CVE-2026-112404 \
-              --ignore-vuln CVE-2026-112405 \
-              --ignore-vuln CVE-2026-112406 \
-              --ignore-vuln CVE-2026-112891 \
-              --ignore-vuln CVE-2026-112892 \
-              --ignore-vuln CVE-2026-112893 \
-              --ignore-vuln CVE-2026-112894 \
-              --ignore-vuln CVE-2026-112895 \
-              --ignore-vuln CVE-2026-112896 \
-              --ignore-vuln CVE-2026-112897 \
-              --ignore-vuln CVE-2026-112899 \
-              --ignore-vuln CVE-2026-112900 \
-              --ignore-vuln CVE-2026-112901 || status=1
-          done
-          exit "$status"
+          scripts/advisories.sh python
