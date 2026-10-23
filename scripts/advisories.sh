@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Dependency advisory audits, shared by CI's advisories job (test.yml) and the
-# release train's local gates, so an advisory published overnight reds the
-# train before it pushes an rc rather than after. Every accepted advisory is an
+# release train, which puts anything red at the top of its release PR. An
+# advisories-only red still publishes a staging rc, so an advisory published
+# overnight does not cost the night's verify; no stable ships until this passes
+# (release-macos.yml waits for a green Test). Every accepted advisory is an
 # ignore below with its reason; drop each with the pin that carries it.
 # Usage: scripts/advisories.sh [rust|npm|python]... (no argument runs all three).
 # Every audit runs even when an earlier one fails, so one run lists all of them.

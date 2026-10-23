@@ -499,9 +499,19 @@ jobs:
           set -euo pipefail
           runs="repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1"
           for _ in $(seq 180); do
-            read -r status conclusion url < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url)"') || true
+            read -r status conclusion url id < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url) \(.id)"') || true
             if [ "$status" = completed ]; then
               [ "$conclusion" = success ] && exit 0
+              # An advisory published overnight must not stop the release
+              # train's night verify, so an advisories-only red still publishes
+              # the rc. Stables stay hard-gated: release-macos.yml waits for a
+              # fully green Test, and the train flags the advisory on the PR.
+              failed=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+                --jq '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name] | join(",")')
+              if [ "$failed" = advisories ]; then
+                echo "::warning::Test failed only its advisories job for $GITHUB_SHA ($url): publishing this rc; no stable ships until advisories pass."
+                exit 0
+              fi
               echo "::error::Test finished $conclusion for $GITHUB_SHA: $url. Fix it (or re-run it), then re-run this job."
               exit 1
             fi

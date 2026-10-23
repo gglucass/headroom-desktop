@@ -393,8 +393,9 @@ jobs:
     # the Python runtime) read committed lockfiles, so this needs no build.
     # Known tradeoff: an advisory published upstream can red an unrelated PR.
     # If that gets noisy, ignore the specific ID in scripts/advisories.sh (the
-    # release train's local gates run the same script) rather than dropping
-    # the job; every ignore there carries its reason.
+    # release train runs the same script) rather than dropping the job; every
+    # ignore there carries its reason. A staging rc publishes through an
+    # advisories-only red; a stable does not (release-macos.yml).
     # Every audit runs even when an earlier one fails, so one red run lists all
     # of them (rc4's cargo-audit failure hid pip-audit's for a day).
     runs-on: ubuntu-latest
