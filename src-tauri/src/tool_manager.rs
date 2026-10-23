@@ -5928,7 +5928,6 @@ impl ToolManager {
         // A repair that recreated a pip-less venv dropped markitdown with it.
         self.restore_markitdown_after_rebuild();
 
-        self.clear_bootstrap_attempt();
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
         self.prune_headroom_wheels();
@@ -5939,6 +5938,11 @@ impl ToolManager {
             eta_seconds: 0,
             percent: 100,
         });
+        // After the last milestone: `progress` notes each one, so clearing
+        // first left an "Install complete" marker behind every success, filed
+        // as abandoned by whichever later launch found the runtime gone
+        // (RUST-SB).
+        self.clear_bootstrap_attempt();
         Ok(self.runtime.clone())
     }
 
@@ -19847,6 +19851,25 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// Every milestone re-writes the marker, so the success path must clear
+    /// it after the final "Install complete" one, not before (RUST-SB).
+    #[test]
+    fn bootstrap_success_clears_the_marker_after_its_last_milestone() {
+        let source = include_str!("tool_manager.rs");
+        let start = source
+            .find("pub fn bootstrap_all_with_progress")
+            .expect("bootstrap exists");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("bootstrap ends")];
+        let last_milestone = body
+            .rfind("step: \"Install complete\"")
+            .expect("final milestone");
+        let clear = body
+            .rfind("self.clear_bootstrap_attempt();")
+            .expect("success clears the marker");
+        assert!(last_milestone < clear);
     }
 
     /// One machine relaunching into the same wall must not re-file the same
