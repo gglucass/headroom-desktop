@@ -332,6 +332,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // And the in-place rollback's: that upgrade's tagged capture carries
+    // `rollback_restored`, and the rollback's own pip failure has its
+    // fingerprinted capture, while this copy groups on a head cut at 400
+    // chars before the cause (RUST-S5, RUST-SA: an App Control block already
+    // filed as RUST-MR and RUST-NR seconds apart).
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("in-place upgrade rollback failed")
+    {
+        return true;
+    }
     // Two more warns from the same incident: the new venv's spawn error and
     // the not-started short-circuit that follows it. Both already ride in the
     // tagged capture (`ensure_headroom_running_error`, outcome=not_started).
@@ -1706,6 +1716,13 @@ mod tests {
             "headroom_desktop_lib::state",
             "run_upgrade_with_ui: install failed after 804ms (restored=false): failed to move \
              ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv aside: 拒绝访问。 (os error 5)"
+        ));
+        // RUST-SA, path scrubbed.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "in-place upgrade rollback failed (restoring Headroom dependencies from \
+             ~\\AppData\\Local\\Headroom\\headroom\\downloads\\headroom-requirements.lock.backup: \
+             command failed (exit 1)); keeping upgrade marker for recovery on next launch"
         ));
     }
 

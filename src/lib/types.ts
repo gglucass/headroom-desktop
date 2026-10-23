@@ -300,6 +300,8 @@ export interface ClientConnectorStatus {
   verified: boolean;
   lastConfiguredAt?: string | null;
   verification?: ClientSetupVerification | null;
+  /** Requests that reached Headroom from this client today and yesterday. */
+  requestsSinceYesterday?: number;
 }
 
 /// An agent that ran on this machine while Headroom saw nothing from it

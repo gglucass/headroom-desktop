@@ -2361,10 +2361,10 @@ async fn handle(
         // in the backend's `handle_openai_responses_ws` (covers OSS-direct users
         // too). Remove this line once the bundled package includes that fix.
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
-        // A thread created on Codex's built-in `openai` provider (before setup,
-        // or resumed from before it) reaches us through the root
-        // `openai_base_url`, and that provider speaks WebSocket: the transport
-        // our own `headroom` provider turns off (`supports_websockets = false`).
+        // Codex's built-in `openai` provider, which Headroom routes through the
+        // root `openai_base_url` since 0.9.48, speaks WebSocket: the transport
+        // the pre-0.9.48 `headroom` provider turned off (`supports_websockets =
+        // false`). The disable is per session, so each session pays one 426.
         // Its failures were invisible: the 101 is no error, and a socket closed
         // mid-turn left Codex retrying into a bare "System error" (user 3277,
         // 2026-09-29). 426 is Codex's own signal to move the session to HTTPS
@@ -5238,15 +5238,18 @@ fn is_client_probe_path(path: &str) -> bool {
 }
 
 /// Client traffic for the per-day `client_requests` / `failed_requests`
-/// counters, which headroom-web's stuck-host alert divides. Not our own polls
-/// (local proxy paths), not a HEAD (no prompt: the hourly `codex doctor` from
-/// Codex verify probes `HEAD /v1/responses` unauthenticated, a 401 by design,
-/// and was every Codex failure on a light Codex day), and not the backend's
-/// CCR retrieve route (the headroom MCP's own call, whose 404 is a CCR TTL
-/// miss, filed under `claude-code` even for a Codex user).
+/// counters, which headroom-web's stuck-host alert divides, and for
+/// `requests_since_yesterday` (the Home badge's "Active", the unrouted
+/// detector). A prompt is a POST: the hourly `codex doctor` from Codex verify
+/// probes `HEAD /v1/responses`, `GET /v1/models` and, since 0.9.48's `openai`
+/// provider, a WebSocket handshake we refuse with 426, so counting GETs kept
+/// every Codex badge "Active" with no Codex traffic at all. Not our own polls
+/// (local proxy paths), and not the backend's CCR retrieve route (the headroom
+/// MCP's own call, whose 404 is a CCR TTL miss, filed under `claude-code` even
+/// for a Codex user).
 fn is_counted_request(head: &ParsedRequestHead) -> bool {
     !is_local_proxy_path(&head.path)
-        && !head.method.eq_ignore_ascii_case("HEAD")
+        && head.method.eq_ignore_ascii_case("POST")
         && !is_ccr_retrieve_path(&head.path)
 }
 
@@ -7791,12 +7794,17 @@ mod tests {
     #[test]
     fn codex_doctor_probes_and_ccr_retrieves_are_not_counted_client_requests() {
         let counted = |head: &[u8]| is_counted_request(&parse_request_head(head).unwrap());
-        // `codex doctor`'s unauthenticated probe pair: the HEAD 401s by design.
+        // `codex doctor`'s probes, as codex 0.160 sends them through 6767
+        // (2026-10-23): counted, they kept the Codex badge "Active" alone.
         assert!(!counted(
             b"HEAD /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
         ));
-        assert!(counted(
+        assert!(!counted(
             b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:6767\r\n\r\n"
+        ));
+        assert!(!counted(
+            b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUpgrade: websocket\r\n\
+              Authorization: Bearer x\r\n\r\n"
         ));
         // The headroom MCP's retrieve, a 404 on a CCR TTL miss.
         assert!(!counted(

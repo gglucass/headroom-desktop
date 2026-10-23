@@ -649,9 +649,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             state
                 .managed_shell_files
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
-            // Pull existing native threads into the headroom-provider menu so the
-            // Codex history list stays whole once it routes through Headroom.
-            retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
+            // Pull threads a pre-0.9.48 build stamped `headroom` back into the
+            // `openai` menu Codex now runs under.
+            retag_codex_threads_to_native();
         }
         "grok_build" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
@@ -1020,12 +1020,20 @@ pub fn repair_client_setups() -> Vec<String> {
         }
         *last = Some(Instant::now());
     }
+    scan_client_setups()
+}
 
-    let client_ids: Vec<String> = load_setup_state()
-        .configured_clients
-        .keys()
-        .cloned()
-        .collect();
+/// The hourly pass of [`repair_client_setups`], unthrottled.
+fn scan_client_setups() -> Vec<String> {
+    let state = load_setup_state();
+    // Codex can rebuild a thread's row from its rollout, whose session_meta
+    // still says `headroom` for pre-0.9.48 threads, which drops that thread
+    // out of the `openai` history menu mid-run; the launch and quit retags
+    // alone left it hidden until the next restart.
+    if is_configured(&state, "codex_cli") {
+        retag_codex_threads_to_native();
+    }
+    let client_ids: Vec<String> = state.configured_clients.keys().cloned().collect();
     client_ids
         .into_iter()
         .filter(|client_id| repair_client_setup_now(client_id))
@@ -1421,7 +1429,9 @@ fn parse_codex_session_meta(first_line: &str) -> Option<CodexSessionMeta> {
 /// report said only that it happened (RUST-DW), which cannot tell the two
 /// fixes apart: a session CREATED with `model_provider = "headroom"` read our
 /// config and its traffic still never arrived, while one created with
-/// "openai" after Headroom started never read the config at all. `resumed`
+/// "openai" after Headroom started never read the config at all. Since 0.9.48
+/// a routed session records "openai" too, so read it with `codex_config_routed`
+/// and `rollout_fresh`; "headroom" now means a pre-0.9.48 config. `resumed`
 /// marks a thread older than `app_started_at`, whose provider predates us.
 /// `rollout_fresh` says whether that rollout was written this run at all:
 /// activity is the newest rollout's mtime since 0.9.28, so "false" on a
@@ -1605,6 +1615,10 @@ pub fn list_client_connectors(
                 verified,
                 last_configured_at: configured_timestamp(&setup_state, spec.id),
                 verification,
+                // Counter keys are the spec ids with dashes ("claude-code", "grok-build").
+                requests_since_yesterday: crate::usage_counters::requests_since_yesterday(
+                    &spec.id.replace('_', "-"),
+                ),
             }
         })
         .collect();
@@ -5181,11 +5195,11 @@ const CODEX_ROOT_BLOCK_ID: &str = "codex_cli";
 const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 
 // Codex permanently stamps every thread with the `model_provider` it ran under,
-// and its history/projects menu filters threads by the *active* provider set. So
-// threads created through Headroom (provider `headroom`) disappear from the menu
-// when Codex runs natively (provider `openai`) and vice-versa. To keep the menu
-// whole we retag threads to match whichever provider is currently active:
-// `openai -> headroom` on connect, `headroom -> openai` on disconnect/quit.
+// and its history/projects menu filters threads by the *active* provider set.
+// Headroom routes Codex through the built-in `openai` provider (root
+// `openai_base_url`), so its threads are `openai` whether or not Headroom runs.
+// Builds before 0.9.48 selected our own `headroom` provider, and their threads
+// would vanish from the menu: connect, launch and quit retag them to `openai`.
 const CODEX_HEADROOM_PROVIDER: &str = "headroom";
 const CODEX_NATIVE_PROVIDER: &str = "openai";
 
@@ -5415,27 +5429,22 @@ fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Opt
     .map(Some)
 }
 
-/// Retag Codex threads back to the native provider. Exposed for the app-quit
-/// hook in `lib.rs`, which covers exit paths (Cmd-Q, dock quit, signals) that
-/// bypass `clear_client_setups` and therefore the disconnect retag.
+/// Retag pre-0.9.48 `headroom` threads to the native provider. Exposed for the
+/// app-launch and app-quit hooks in `lib.rs`: an update restart and a Codex
+/// still running on the old config both leave `headroom` threads behind.
 pub fn retag_codex_threads_to_native() {
     retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
-}
-
-/// Pull Codex threads into the headroom provider menu. Exposed for the
-/// app-launch hook in `lib.rs`, which must undo the quit-time native retag on
-/// the exit paths (Cmd-Q, dock quit, app-update restart) that never populate
-/// `remembered_clients` and are therefore skipped by `restore_client_setups`.
-pub fn retag_codex_threads_to_headroom() {
-    retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
 }
 
 /// The root keys the managed `codex_cli` block owns, Headroom's value for each,
 /// and the `preserved_base_urls` entry that holds a user's own value until
 /// disable restores it. `model_provider` keeps the bare `codex_cli` entry older
-/// builds persisted.
+/// builds persisted. It is the built-in `openai` because the ChatGPT desktop
+/// app hides Dots, dictation, voice, image generation and read-aloud for any
+/// other `model_provider` string (openai/codex#55783); `openai_base_url` alone
+/// routes that provider through Headroom.
 const CODEX_ROOT_KEYS: [(&str, &str, &str); 2] = [
-    ("model_provider", "headroom", "codex_cli"),
+    ("model_provider", CODEX_NATIVE_PROVIDER, "codex_cli"),
     (
         "openai_base_url",
         HEADROOM_OPENAI_BASE_URL,
@@ -5451,7 +5460,7 @@ fn is_codex_root_key_line(code: &str) -> bool {
 
 fn codex_root_keys_body() -> String {
     format!(
-        "model_provider = \"headroom\"\n\
+        "model_provider = \"openai\"\n\
          openai_base_url = \"{base}\"",
         base = HEADROOM_OPENAI_BASE_URL,
     )
@@ -5705,7 +5714,9 @@ fn codex_foreign_root_value(content: &str, key: &str, ours: &str) -> Option<Stri
             let line = toml::from_str::<toml::Table>(raw).ok()?;
             line.get(key)?.as_str().map(str::to_owned)
         })
-        .find(|value| !value.is_empty() && value != ours)
+        // `headroom` is our pre-0.9.48 provider, never the user's: restoring it
+        // on disable would select the table disable just removed.
+        .find(|value| !value.is_empty() && value != ours && value != CODEX_HEADROOM_PROVIDER)
 }
 
 /// Drop every root-scope assignment of a [`CODEX_ROOT_KEYS`] key, whatever its
@@ -6203,13 +6214,23 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
         String::new()
     };
 
+    // Grok cannot read a file that does not parse either, and a block added
+    // to it still failed verify as "not found" (RUST-S9/SC): tell the user.
+    if let Err(err) = existing.parse::<toml::Table>() {
+        return Err(anyhow!(
+            "parsing {} failed ({}: {}); {UNPARSEABLE_SETTINGS}",
+            path.display(),
+            err.to_string().lines().next().unwrap_or_default(),
+            err.message()
+        ));
+    }
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
     }
     // A table header the text scan misses (quoted key, odd spacing) would get
     // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
-    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+    if updated.parse::<toml::Table>().is_err() {
         return Err(anyhow!(
             "rendered {} is not valid TOML; refusing to overwrite",
             path.display()
@@ -7133,11 +7154,9 @@ pub(crate) fn codex_provider_block_matches() -> Result<bool> {
     }
     let base_url = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let openai_base = format!("openai_base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
-    let root_ok = marker_block_contains(
-        &content,
-        CODEX_ROOT_BLOCK_ID,
-        "model_provider = \"headroom\"",
-    ) && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
+    let root_ok =
+        marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, "model_provider = \"openai\"")
+            && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
     let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url)
         && marker_block_contains(
             &content,
@@ -7475,14 +7494,11 @@ def main():
     if config is None:
         issues.append("~/.codex/config.toml is missing or unreadable")
     else:
-        provider_name = config.get("model_provider")
-        if provider_name != "headroom":
-            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); Codex is not being optimized by Headroom')
-        else:
-            provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
-            base = provider.get("base_url")
-            if base != BASE_URL:
-                issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
+        provider_name = config.get("model_provider", "openai")
+        if provider_name != "openai":
+            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "openai"); Codex is not being optimized by Headroom')
+        elif config.get("openai_base_url") != BASE_URL:
+            issues.append("Codex openai_base_url is " + str(config.get("openai_base_url")) + " (expected " + BASE_URL + ")")
     if not reachable():
         issues.append("Headroom Desktop isn't running; open it to optimize Codex")
 
@@ -11953,7 +11969,7 @@ mod tests {
         is_permission_denied, msys_path, normalize_setup_state, normalized_setup_id,
         nvm_binary_candidates, oss_remnant_warnings, parse_json_object, pin_codex_mcp_command,
         remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
-        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
+        retag_codex_thread_providers, retag_codex_threads_to_native, retag_one_codex_db,
         serialize_paths, shell_block_contains_in_files, shell_block_contains_text_in_files,
         shell_double_quote, strip_headroom_hook_from_settings, upsert_managed_block,
         vscode_settings_failure_level, windows_remote_control_confirm, write_file_if_changed,
@@ -16747,6 +16763,27 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn list_client_connectors_counts_requests_under_the_intercepts_client_key() {
+        // The Home badge says "Active" only off this count, so a key mismatch
+        // would show a working agent as idle forever.
+        let _home = TestHome::new();
+        let count = |id: &str| {
+            super::list_client_connectors(&[])
+                .expect("listing succeeds")
+                .into_iter()
+                .find(|connector| connector.client_id == id)
+                .expect("connector listed")
+                .requests_since_yesterday
+        };
+        for (id, key) in [("claude_code", "claude-code"), ("grok_build", "grok-build")] {
+            let before = count(id);
+            crate::usage_counters::record_request(key);
+            assert!(count(id) > before, "{id} reads {key}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn list_client_connectors_carries_verification_only_for_enabled_clients() {
         // The connector panel keys its status line off these two fields: an
         // enabled client must arrive with its checks attached (the panel has
@@ -16816,7 +16853,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "managed marker present, got:\n{toml}"
         );
         assert!(
-            toml.contains("model_provider = \"headroom\""),
+            toml.contains("model_provider = \"openai\""),
             "model_provider set, got:\n{toml}"
         );
         assert!(
@@ -17328,6 +17365,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(&config, quoted).unwrap();
         assert!(super::apply_client_setup("grok_build").is_err());
         assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
+
+        // A file that is already invalid is the user's to fix: say where,
+        // keep it, and stay out of Sentry like every other parse refusal.
+        let broken = "[model.grok-build]\nbase_url \"https://gw.example/v1\"\n";
+        fs::write(&config, broken).unwrap();
+        let err = super::apply_client_setup("grok_build").unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("line 2, column 10"), "{shown}");
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), broken);
     }
 
     #[test]
@@ -18018,7 +18065,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("openai"),
             "model_provider must resolve at root scope, got:\n{raw}"
         );
         assert!(
@@ -18242,7 +18289,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!toml.contains('\0'), "NULs survived:\n{toml:?}");
         let parsed: toml::Value = toml.parse().expect("recovered config parses");
         assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
-        assert_eq!(parsed["model_provider"].as_str(), Some("headroom"));
+        assert_eq!(parsed["model_provider"].as_str(), Some("openai"));
         assert!(super::codex_provider_block_matches().unwrap());
     }
 
@@ -18347,7 +18394,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn render_codex_config_does_not_duplicate_a_foreign_root_model_provider() {
         // Regression: a pre-existing root model_provider used to survive into the
-        // rendered body, colliding with the managed `model_provider = "headroom"`
+        // rendered body, colliding with the managed `model_provider = "openai"`
         // as a duplicate root key -> invalid TOML, Codex refuses to load config.
         let existing = "model_provider = \"gateway\"\n\
                         [model_providers.gateway]\n\
@@ -18358,7 +18405,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .unwrap_or_else(|e| panic!("rendered config is valid toml: {e}\n{rendered}"));
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("openai"),
             "managed provider wins at root, got:\n{rendered}"
         );
         assert_eq!(
@@ -18655,6 +18702,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn hourly_scan_retags_a_thread_codex_restamped_headroom() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        // Config still verifies, so nothing is re-applied; Codex rebuilt one
+        // pre-0.9.48 thread's row from its rollout and stamped it `headroom`.
+        let db = home.path().join(".codex").join("state_5.sqlite");
+        seed_codex_threads_db(&db, &[("a", "headroom"), ("b", "openai")]);
+
+        assert!(super::scan_client_setups().is_empty());
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 2);
+    }
+
     // The configure time drives the frontend's "Quit and reopen" hint. A
     // quit + relaunch restore must not reset it, or the hint shows for a day
     // after every launch.
@@ -18767,7 +18830,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .unwrap_or_else(|e| panic!("valid toml after apply: {e}\n{after_apply}"));
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom"),
+            Some("openai"),
             "Headroom takes over routing while enabled, got:\n{after_apply}"
         );
 
@@ -18789,6 +18852,50 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .is_some(),
             "user provider table survives the round trip, got:\n{after_disable}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn upgrade_from_the_headroom_provider_block_never_restores_it() {
+        // A pre-0.9.48 block selects our own `headroom` provider, which hides
+        // Dots and dictation in the ChatGPT app. Verify must fail on it so
+        // repair rewrites it, and the old value must not be captured as the
+        // user's: disable would restore it after removing its table.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            format!(
+                "{}\nmodel = \"gpt-5\"\n\n{}",
+                super::codex_marker_block(
+                    super::CODEX_ROOT_BLOCK_ID,
+                    "model_provider = \"headroom\"\nopenai_base_url = \"http://127.0.0.1:6767/v1\"",
+                ),
+                super::codex_marker_block(
+                    super::CODEX_TABLE_BLOCK_ID,
+                    &super::codex_provider_table_body()
+                ),
+            ),
+        )
+        .unwrap();
+        assert!(!super::codex_provider_block_matches().unwrap());
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let parsed: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
+        assert_eq!(parsed["model_provider"].as_str(), Some("openai"));
+        assert!(parsed["model_providers"].get("headroom").is_some());
+        assert!(super::codex_provider_block_matches().unwrap());
+
+        super::disable_client_setup("codex").expect("disable succeeds");
+
+        let after = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after.parse().unwrap();
+        assert_eq!(parsed.get("model_provider"), None, "got:\n{after}");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5"));
     }
 
     #[test]
@@ -18971,7 +19078,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let after: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
         assert_eq!(
             after.get("model_provider").and_then(|v| v.as_str()),
-            Some("headroom")
+            Some("openai")
         );
         assert!(after
             .get("features")
@@ -21507,18 +21614,21 @@ sys.exit(3)
 
     #[test]
     #[serial_test::serial]
-    fn retag_codex_threads_to_headroom_pulls_native_threads_back() {
-        // Reproduces the app-update restart path: the quit handler left threads
-        // tagged `openai`; launch must retag them back to `headroom`.
+    fn retag_codex_threads_to_native_moves_pre_0948_threads() {
+        // The update restart into 0.9.48: threads an older build stamped
+        // `headroom` must join the `openai` menu Codex now runs under.
         let home = TestHome::new();
         let db = home.path().join(".codex").join("state_5.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+        seed_codex_threads_db(
+            &db,
+            &[("a", "headroom"), ("b", "openai"), ("c", "anthropic")],
+        );
 
-        retag_codex_threads_to_headroom();
+        retag_codex_threads_to_native();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
-        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 2);
         // Third-party threads are untouched.
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
@@ -21531,8 +21641,8 @@ sys.exit(3)
         let home = TestHome::new();
         let db = home.path().join(".codex").join("state_5.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        seed_codex_threads_db(&db, &[("a", "openai")]);
-        retag_codex_threads_to_headroom();
+        seed_codex_threads_db(&db, &[("a", "headroom")]);
+        retag_codex_threads_to_native();
         let wal = db.with_extension("sqlite-wal");
         std::fs::write(&wal, b"idle app-server").unwrap();
         std::fs::File::options()
@@ -22278,12 +22388,15 @@ sys.exit(3)
         let home = TestHome::new();
         let db = home.path().join(".codex").join("state_99.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+        seed_codex_threads_db(
+            &db,
+            &[("a", "headroom"), ("b", "headroom"), ("c", "anthropic")],
+        );
 
-        retag_codex_threads_to_headroom();
+        retag_codex_threads_to_native();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
-        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 2);
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
 
@@ -22300,12 +22413,15 @@ sys.exit(3)
             .join("sqlite")
             .join("threads.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+        seed_codex_threads_db(
+            &db,
+            &[("a", "headroom"), ("b", "headroom"), ("c", "anthropic")],
+        );
 
-        retag_codex_threads_to_headroom();
+        retag_codex_threads_to_native();
 
-        assert_eq!(provider_count(&db, "headroom"), 2);
-        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "headroom"), 0);
+        assert_eq!(provider_count(&db, "openai"), 2);
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
 
@@ -22339,7 +22455,7 @@ sys.exit(3)
         assert!(!script.contains("urllib"));
         assert!(script.contains("socket.create_connection(ADDR, timeout=2).close()"));
         // Messages include the actual found value, not just "is not headroom".
-        assert!(script.contains("(expected \"headroom\")"));
+        assert!(script.contains("(expected \"openai\")"));
         assert!(script.contains("(expected \" + BASE_URL + \")"));
         assert!(script.contains("DEBOUNCE_PATH.touch()"));
         assert!(script.contains("time.sleep(2)\n    return probe()"));

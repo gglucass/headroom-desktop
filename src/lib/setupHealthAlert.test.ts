@@ -4,9 +4,12 @@ import { mockDashboard } from "./mockData";
 import type { ClientConnectorStatus, DailySavingsPoint, DashboardState } from "./types";
 import {
   __resetSetupStallThrottle,
+  connectorBadgeTip,
   evaluateSetupStall,
   maybeFireSetupStallAlert,
   setupStallBannerLine,
+  mergeUnroutedBadges,
+  pruneUnroutedBadges,
   setupStallNoTrafficMinutes,
   shouldShowStallBannerLine,
   unroutedAfterReconnect,
@@ -643,5 +646,64 @@ describe("unroutedAfterReconnect", () => {
       unroutedAfterReconnect([client("claude_code", false), client("codex", true)], "claude_code")
     ).toBeNull();
     expect(unroutedAfterReconnect([client("codex", false)], "codex")).toBeNull();
+  });
+});
+
+describe("unrouted badges", () => {
+  const finding = (clientId: string, enabled = true, diagnosis: string | null = null) => ({
+    clientId,
+    name: clientId === "codex" ? "Codex" : "Claude Code",
+    activeAt: "2026-10-22T04:00:00Z",
+    enabled,
+    reapplied: enabled,
+    diagnosis,
+  });
+  const connector = (clientId: string, requestsSinceYesterday: number): ClientConnectorStatus => ({
+    clientId,
+    name: clientId === "codex" ? "Codex" : "Claude Code",
+    installed: true,
+    enabled: true,
+    verified: true,
+    requestsSinceYesterday,
+  });
+
+  it("keeps earlier findings, replaces one per agent, and skips switched-off agents", () => {
+    const first = finding("claude_code");
+    const merged = mergeUnroutedBadges([first], [finding("codex"), finding("claude_code", false)]);
+    expect(merged.map((client) => client.clientId)).toEqual(["claude_code", "codex"]);
+    expect(merged[0]).toBe(first);
+    const again = finding("claude_code");
+    expect(mergeUnroutedBadges(merged, [again])[1]).toBe(again);
+  });
+
+  it("drops a finding once that agent's requests reach Headroom", () => {
+    const current = [finding("claude_code"), finding("codex")];
+    expect(
+      pruneUnroutedBadges(current, [connector("claude_code", 4), connector("codex", 0)]).map(
+        (client) => client.clientId
+      )
+    ).toEqual(["codex"]);
+    // Unchanged: the same array, so the state setter does not re-render.
+    expect(pruneUnroutedBadges(current, [connector("codex", 0)])).toBe(current);
+  });
+
+  it("shows the request count behind Active and the diagnosis behind an unrouted badge", () => {
+    expect(connectorBadgeTip(connector("claude_code", 1420), "Active")).toBe(
+      "Claude Code: Active, 1,420 requests since yesterday"
+    );
+    expect(connectorBadgeTip(connector("codex", 1), "Active")).toBe(
+      "Codex: Active, 1 request since yesterday"
+    );
+    expect(connectorBadgeTip(connector("codex", 0), "Connected, no requests yet")).toBe(
+      "Codex: Connected, no requests yet"
+    );
+    const desktop = finding("claude_code", true, "Sessions in the Claude desktop app go straight to Anthropic.");
+    expect(connectorBadgeTip(connector("claude_code", 0), "Ran without Headroom", desktop)).toBe(
+      "Claude Code: Sessions in the Claude desktop app go straight to Anthropic."
+    );
+    // A finding never overrides another verdict's text.
+    expect(connectorBadgeTip(connector("claude_code", 0), "Proxy unreachable", desktop)).toBe(
+      "Claude Code: Proxy unreachable"
+    );
   });
 });

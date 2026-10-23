@@ -2296,6 +2296,25 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.ar
     except Exception:
         pass
 
+# --- Forget half-imported packages (RUST-S8) -----------------------------------
+# Every vendor above swallows its own failure. When the import it triggers dies
+# partway (Application Control blocking `_overlapped.pyd` inside asyncio),
+# Python drops the package but keeps the submodules that loaded, so the proxy's
+# own `import asyncio` then dies on "NameError: name 'base_events' is not
+# defined": a corrupt-stdlib signature to the desktop, which discarded and
+# re-downloaded a sound interpreter. Dropping every module whose parent is gone
+# makes that import raise the real error. A no-op on a healthy boot.
+try:
+    _hd_orphans = True
+    while _hd_orphans:
+        _hd_orphans = [
+            k for k in _hd_sys.modules if "." in k and k.rpartition(".")[0] not in _hd_sys.modules
+        ]
+        for _hd_k in _hd_orphans:
+            del _hd_sys.modules[_hd_k]
+except Exception:
+    pass
+
 # --- One INFO line: which vendors bound (observability) -----------------------
 # Without it nobody can tell on a user machine whether a vendor (say
 # HEADROOM_TOOL_REF_HINT) is active. Names only, no user data. Written to
@@ -5909,7 +5928,6 @@ impl ToolManager {
         // A repair that recreated a pip-less venv dropped markitdown with it.
         self.restore_markitdown_after_rebuild();
 
-        self.clear_bootstrap_attempt();
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
         self.prune_headroom_wheels();
@@ -5920,6 +5938,11 @@ impl ToolManager {
             eta_seconds: 0,
             percent: 100,
         });
+        // After the last milestone: `progress` notes each one, so clearing
+        // first left an "Install complete" marker behind every success, filed
+        // as abandoned by whichever later launch found the runtime gone
+        // (RUST-SB).
+        self.clear_bootstrap_attempt();
         Ok(self.runtime.clone())
     }
 
@@ -14897,6 +14920,13 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
         "disk-full"
+    } else if pip_failure_is_sharing_violation(&lower) {
+        // A live process holds a file pip must replace, named by the
+        // `file_holders` extra. Ahead of `permission`: the 300-byte tail keeps
+        // pip's closing "Check the permissions." only when the path is short,
+        // so one cause filed `permission` or `other` by path length (RUST-6S,
+        // 0.9.47-rc.7).
+        "file-in-use"
     } else if lower.contains("permission denied")
         || lower.contains("check the permissions")
         || lower.contains("access is denied")
@@ -17191,6 +17221,62 @@ asyncio.run(main())
             "1"
         )
         .is_empty());
+    }
+
+    /// RUST-S8: the vendors swallowed an import that died inside asyncio, and
+    /// the submodules it left behind turned the proxy's own `import asyncio`
+    /// into a NameError the desktop read as a corrupt base stdlib.
+    #[test]
+    fn blocked_asyncio_raises_its_own_error_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hd_site.py"), super::SITECUSTOMIZE_PY).unwrap();
+        // Application Control's block is in place before any vendor runs.
+        std::fs::write(
+            dir.path().join("sitecustomize.py"),
+            r#"import os, sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name in ("asyncio.unix_events", "asyncio.windows_events"):
+            raise ImportError("DLL load failed while importing _overlapped: blocked")
+sys.meta_path.insert(0, _Block())
+_p = os.path.join(os.path.dirname(__file__), "hd_site.py")
+with open(_p, encoding="utf-8") as _f:
+    exec(compile(_f.read(), _p, "exec"))
+"#,
+        )
+        .unwrap();
+        let probe = dir.path().join("probe.py");
+        std::fs::write(
+            &probe,
+            "try:\n    import asyncio\nexcept Exception as e:\n    print(type(e).__name__, e)\n",
+        )
+        .unwrap();
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run probe");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The vendors did hit the block, or this proves nothing.
+        assert!(
+            stderr
+                .split_once(" skipped=")
+                .is_some_and(|(_, skipped)| skipped.contains("message_window")),
+            "{stderr}"
+        );
+        assert!(
+            stdout.contains("ImportError DLL load failed while importing _overlapped"),
+            "{stdout}\n{stderr}"
+        );
     }
 
     #[test]
@@ -19765,6 +19851,25 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// Every milestone re-writes the marker, so the success path must clear
+    /// it after the final "Install complete" one, not before (RUST-SB).
+    #[test]
+    fn bootstrap_success_clears_the_marker_after_its_last_milestone() {
+        let source = include_str!("tool_manager.rs");
+        let start = source
+            .find("pub fn bootstrap_all_with_progress")
+            .expect("bootstrap exists");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("bootstrap ends")];
+        let last_milestone = body
+            .rfind("step: \"Install complete\"")
+            .expect("final milestone");
+        let clear = body
+            .rfind("self.clear_bootstrap_attempt();")
+            .expect("success clears the marker");
+        assert!(last_milestone < clear);
     }
 
     /// One machine relaunching into the same wall must not re-file the same
@@ -26759,6 +26864,15 @@ exit 0
                 "disk-full",
             ),
             ("exit=1; stderr tail: Check the permissions.", "permission"),
+            // RUST-6S on 0.9.47-rc.7, verbatim: the long path pushed "Check
+            // the permissions." past the tail, and the event filed `other`.
+            (
+                "exit=1; stderr tail: ERROR: Could not install packages due to an OSError: \
+                 [WinError 32] The process cannot access the file because it is being used by \
+                 another process: '~\\\\AppData\\\\Local\\\\Headroom\\\\headroom\\\\runtime\\\\venv\
+                 \\\\Scripts\\\\headroom.exe' -> '~\\\\AppData\\\\Local\\\\Headroom\\\\headroom\\\\runt",
+                "file-in-use",
+            ),
             (
                 "exit=1; stderr tail: ERROR: Could not find a version that satisfies the \
                  requirement onnxruntime==1.27.0 (from versions: 1.23.2)\nERROR: No matching \

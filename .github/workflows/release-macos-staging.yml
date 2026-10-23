@@ -23,6 +23,15 @@ on:
       - package.json
       - src-tauri/tauri.conf.json
   workflow_dispatch:
+    inputs:
+      rolling:
+        # An rc from a branch while staging's train verifies another: rc installs
+        # (Garm's Mac, the train guest) must not be moved onto it, and a newer
+        # staging-rolling would refuse that train's next rc. Test only runs on
+        # staging pushes, so its gate is skipped too; install from the rc release.
+        description: 'false publishes the rc release but leaves staging-rolling alone and skips the Test gate'
+        type: boolean
+        default: true
 
 concurrency:
   group: macos-release-staging-${{ github.ref }}
@@ -345,10 +354,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Key the apt package cache
+        id: apt-cache-key
+        # Weekly and per Ubuntu release: a week's package updates download
+        # once, then every Linux job on the branch installs from the cache.
+        run: |
+          prefix="apt-$(. /etc/os-release && echo "$VERSION_ID")-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the apt packages
+        # The azure apt mirror sent these ~65 MB at 25-128 kB/s on 2026-10-22
+        # and 10-23 (8 to 35 minutes; the 35 came within 10 of the timeout),
+        # while the index update took a second. Only the .debs come from the
+        # cache, and apt checks each against the signed index's hash.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-cache-key.outputs.key }}
+          restore-keys: ${{ steps.apt-cache-key.outputs.prefix }}
+
       - name: Install Linux system dependencies
         run: |
+          sudo mkdir -p ~/apt-archives/partial
           sudo apt-get update
           sudo apt-get install -y \
+            -o Dir::Cache::Archives="$HOME/apt-archives" \
+            -o APT::Keep-Downloaded-Packages=true \
             build-essential \
             curl \
             file \
@@ -359,6 +391,8 @@ jobs:
             libxdo-dev \
             pkg-config \
             wget
+          # apt leaves root-owned files (its lock is 0640) the cache save cannot read.
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -457,6 +491,7 @@ jobs:
       - name: Wait for the Test workflow on this commit
         # The release builds compile no test code, so they pass where the
         # Windows test build no longer compiles: rc8 and rc10 shipped that way.
+        if: github.event_name != 'workflow_dispatch' || inputs.rolling
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -464,9 +499,19 @@ jobs:
           set -euo pipefail
           runs="repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1"
           for _ in $(seq 180); do
-            read -r status conclusion url < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url)"') || true
+            read -r status conclusion url id < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url) \(.id)"') || true
             if [ "$status" = completed ]; then
               [ "$conclusion" = success ] && exit 0
+              # An advisory published overnight must not stop the release
+              # train's night verify, so an advisories-only red still publishes
+              # the rc. Stables stay hard-gated: release-macos.yml waits for a
+              # fully green Test, and the train flags the advisory on the PR.
+              failed=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+                --jq '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name] | join(",")')
+              if [ "$failed" = advisories ]; then
+                echo "::warning::Test failed only its advisories job for $GITHUB_SHA ($url): publishing this rc; no stable ships until advisories pass."
+                exit 0
+              fi
               echo "::error::Test finished $conclusion for $GITHUB_SHA: $url. Fix it (or re-run it), then re-run this job."
               exit 1
             fi
@@ -510,6 +555,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RC_TAG: v${{ needs.guard.outputs.package_version }}
+          ROLLING: ${{ github.event_name != 'workflow_dispatch' || inputs.rolling }}
         run: |
           set -euo pipefail
           # The macOS job created the rc release; complete it first, so the
@@ -553,6 +599,10 @@ jobs:
             "$workdir/latest.json" > "$workdir/latest.merged.json"
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
           gh release upload "$RC_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+          if [ "$ROLLING" != true ]; then
+            echo "::notice::rolling=false: ${RC_TAG} is complete on its own release; staging-rolling untouched."
+            exit 0
+          fi
 
           # The stable publish (release-macos.yml, another concurrency group,
           # same check) also writes staging-rolling, and this rc can finish after

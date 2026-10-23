@@ -475,8 +475,26 @@ describe("dashboard helpers", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: false })
     ).toEqual({ label: "Verifying", tone: "pending" });
+    // Config in place but nothing reached Headroom: not "Active".
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true })
+    ).toEqual({ label: "Connected, no requests yet", tone: "pending" });
+    expect(
+      connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true, requestsSinceYesterday: 3 })
+    ).toEqual({ label: "Active", tone: "active" });
+    // The unrouted scan saw it work locally with nothing reaching Headroom.
+    expect(
+      connectorDashboardStatus(
+        { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true },
+        { ranUnrouted: true }
+      )
+    ).toEqual({ label: "Ran without Headroom", tone: "idle" });
+    // Requests arriving outrank an older finding.
+    expect(
+      connectorDashboardStatus(
+        { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true, requestsSinceYesterday: 1 },
+        { ranUnrouted: true }
+      )
     ).toEqual({ label: "Active", tone: "active" });
     // Red is reserved for enabled-but-broken: proxy down while a connector is on.
     expect(

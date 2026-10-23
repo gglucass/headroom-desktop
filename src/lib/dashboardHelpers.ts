@@ -902,9 +902,11 @@ export function hasEnabledConnector(connectors: ClientConnectorStatus[]) {
 
 export type ConnectorDashboardTone = "active" | "pending" | "idle" | "off";
 
+export const RAN_WITHOUT_HEADROOM = "Ran without Headroom";
+
 export function connectorDashboardStatus(
   connector: ClientConnectorStatus,
-  opts?: { proxyReachable?: boolean }
+  opts?: { proxyReachable?: boolean; ranUnrouted?: boolean }
 ): {
   label: string;
   tone: ConnectorDashboardTone;
@@ -923,6 +925,15 @@ export function connectorDashboardStatus(
     return connector.installed
       ? { label: "Verifying", tone: "pending" }
       : { label: "Restart needed", tone: "pending" };
+  }
+  // Verified only means our config is in place. A client that ignores it (the
+  // Claude desktop app) showed "Active" for weeks while saving nothing (2026-10-22).
+  if (!connector.requestsSinceYesterday) {
+    // The unrouted scan saw this agent work locally while nothing reached us:
+    // broken, not merely unused.
+    return opts?.ranUnrouted
+      ? { label: RAN_WITHOUT_HEADROOM, tone: "idle" }
+      : { label: "Connected, no requests yet", tone: "pending" };
   }
   return { label: "Active", tone: "active" };
 }

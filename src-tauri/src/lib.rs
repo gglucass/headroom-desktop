@@ -737,7 +737,10 @@ fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc
 /// setup. The post-install screen and the nudge tell that user to restart,
 /// and the funnel beacon counts them. RUST-KC on 0.9.30 was exactly this: the
 /// first proxied request landed three minutes after the nudge. A `headroom`
-/// thread, an unrouted config or a CODEX_HOME override still reports.
+/// thread, an unrouted config or a CODEX_HOME override still reports. Since
+/// 0.9.48 a routed thread is `openai` too, so a Codex that read the config and
+/// still leaked reads as this straggler; only a pre-0.9.48 `headroom` thread
+/// proves the config was read (55 of RUST-KC's 76 events were stragglers).
 ///
 /// Nor is a thread on a provider of the user's own (`--oss`, a custom
 /// `model_providers` entry): Headroom routes only `openai` and `headroom`,
@@ -752,7 +755,14 @@ fn codex_unrouted_is_expected(tags: &[(&'static str, String)]) -> bool {
     let predates_setup = tag("codex_session_provider") == Some("openai")
         && tag("codex_config_routed") == Some("true")
         && tag("codex_home_env") == Some("false");
-    predates_setup || tag("codex_session_provider") == Some("other")
+    predates_setup || codex_ran_on_own_provider(tags)
+}
+
+/// The newest Codex session ran on a provider of the user's own (`--oss`, a
+/// custom `model_providers` entry), which Headroom never routes.
+fn codex_ran_on_own_provider(tags: &[(&'static str, String)]) -> bool {
+    tags.iter()
+        .any(|(key, value)| *key == "codex_session_provider" && value == "other")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -3742,6 +3752,18 @@ fn capture_watchdog_give_up(
         report.log_tail.as_deref(),
     );
     let startup_is_environmental = is_environmental_startup_key(startup_key);
+    // When that capture already fired this session, the give-up is its twin a
+    // minute later: every RUST-G1 event (15 hosts in 14d) followed a RUST-G0
+    // from the same host, so it only spent quota re-filing one App Control
+    // block. A give-up with no earlier capture still reports.
+    if environmental_capture_flag(startup_key).is_some_and(|f| f.load(Ordering::Acquire)) {
+        log::info!(
+            "{} ({}), already reported at start this session",
+            report.message,
+            startup_key.unwrap_or_default()
+        );
+        return;
+    }
     let level = if (report.last_startup_error.is_some() && !startup_is_environmental)
         || cpu_deadlock_signal
     {
@@ -4237,6 +4259,16 @@ pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
     )
 }
 
+/// The once-per-session flag `capture_headroom_start_failure` sets when it
+/// reports an environmental startup key, so later reports of it can tell.
+fn environmental_capture_flag(key: Option<&str>) -> Option<&'static AtomicBool> {
+    match key {
+        Some("startup_endpoint_protection") => Some(&ENDPOINT_PROTECTION_CAPTURED),
+        Some("startup_loopback_socket_denied") => Some(&LOOPBACK_SOCKET_DENIED_CAPTURED),
+        _ => None,
+    }
+}
+
 /// Names both causes of WinError 10013 and how to tell them apart, without
 /// asserting either (same discipline as `state::intercept_bind_hint`).
 const LOOPBACK_SOCKET_DENIED_HINT: &str =
@@ -4377,6 +4409,9 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
         "getaddrinfo failed",
         "newconnectionerror",
         "failed to establish a new connection",
+        // A 4xx/5xx on a listed file, pip's wording only (a web filter's 403,
+        // RUST-29 on 0.9.47-rc.7; bootstrap's `is_network_download_signal`).
+        "http error",
     ]
     .iter()
     .any(|marker| chain.contains(marker))
@@ -6420,6 +6455,20 @@ async fn detect_unrouted_clients(
             if !client_adapters::client_ran_unrouted(activity, requests, routed_since, now) {
                 continue;
             }
+            // Before the re-apply: it rewrites the config these tags describe.
+            let codex_diagnostics = if client_id == "codex" {
+                client_adapters::codex_unrouted_diagnostics(routed_since)
+            } else {
+                Vec::new()
+            };
+            // A session on the user's own provider went where they sent it, the
+            // same skip as the first-run report. Before the daily throttle, so
+            // it never spends the day's one report of a real bypass. Reachable
+            // since 0.9.48-rc.9: `codex doctor`'s probes counted as requests
+            // and kept this check from ever firing for Codex.
+            if codex_ran_on_own_provider(&codex_diagnostics) {
+                continue;
+            }
             // One report per client per DAY. The condition is defined over a
             // 24h window (`requests_since_yesterday`), so once it holds it
             // holds for that whole window and every rescan inside it can only
@@ -6450,12 +6499,6 @@ async fn detect_unrouted_clients(
             let enabled = match client_id {
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
-            };
-            // Before the re-apply: it rewrites the config these tags describe.
-            let codex_diagnostics = if client_id == "codex" {
-                client_adapters::codex_unrouted_diagnostics(routed_since)
-            } else {
-                Vec::new()
             };
             // Every session in the window ran in the Claude desktop app, which
             // routes nothing through us by design. The guard calls those
@@ -7816,6 +7859,60 @@ fn finish_single_instance_hand_off(app: &tauri::App) {
     std::process::exit(0);
 }
 
+/// A Windows update relaunch can start this build while the old instance's
+/// WebView2 browser is still shutting down in the same user data folder; the
+/// windows then fail to create with 0x800700AA "The requested resource is in
+/// use" (RUST-JB: three hosts, each on its first launch of a release out that
+/// day), and the app runs without one while the RUST-K7 probe tells the user
+/// to reinstall WebView2. That browser holds `EBWebView\lockfile` until it
+/// exits, and a second launch has handed off by now, so a held lockfile is a
+/// previous instance's: wait for it before `run()` creates the windows.
+#[cfg(target_os = "windows")]
+fn wait_for_webview_data_folder(app: &tauri::App) {
+    use std::time::{Duration, Instant};
+    // Tauri's default data_directory on Windows (tauri manager/webview.rs).
+    let Ok(dir) = app.path().resolve(
+        &app.config().identifier,
+        tauri::path::BaseDirectory::LocalData,
+    ) else {
+        return;
+    };
+    let lockfile = dir.join("EBWebView").join("lockfile");
+    if !webview_lockfile_held(&lockfile) {
+        return;
+    }
+    let start = Instant::now();
+    let outcome = loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if !webview_lockfile_held(&lockfile) {
+            break format!(
+                "held at launch, freed after {}ms",
+                start.elapsed().as_millis()
+            );
+        }
+        if start.elapsed() >= Duration::from_secs(15) {
+            let holders = crate::winproc::file_holders(&lockfile)
+                .map_or_else(|| "unknown".to_string(), |holders| holders.join(", "));
+            break format!("still held after 15s by {holders}");
+        }
+    };
+    log::info!("webview data folder: {outcome}");
+    // Rides on the RUST-JB event if the windows fail anyway.
+    sentry::configure_scope(|scope| scope.set_extra("webview_data_folder", outcome.into()));
+}
+
+/// An exclusive open fails with a sharing violation while any process holds
+/// the file; a missing lockfile is a free folder.
+#[cfg(target_os = "windows")]
+fn webview_lockfile_held(lockfile: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(lockfile)
+        .is_err_and(|err| err.raw_os_error() == Some(32))
+}
+
 pub fn run() {
     // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary),
     // tauri's current_exe() refuses the path on macOS, so every update check
@@ -8324,15 +8421,14 @@ pub fn run() {
             // Restore previously connected client integrations in the background.
             std::thread::spawn(|| {
                 client_adapters::restore_client_setups();
-                // restore_client_setups only retags Codex threads back to the
-                // headroom provider for clients in `remembered_clients`, which a
-                // plain Cmd-Q / dock quit / app-update restart never populates
-                // (only pause and the Settings "Quit" do). Those exit paths still
-                // run the quit-time headroom->openai retag, so without this the
-                // Codex history menu stays empty after an update restart. Mirror
-                // the quit retag whenever Codex is still configured.
+                // restore_client_setups only retags Codex threads for clients in
+                // `remembered_clients`, which a plain Cmd-Q / dock quit /
+                // app-update restart never populates (only pause and the
+                // Settings "Quit" do). The update restart into 0.9.48 is the one
+                // that must move pre-0.9.48 `headroom` threads to `openai`, or
+                // they drop out of the Codex history menu.
                 if client_adapters::is_codex_enabled() {
-                    client_adapters::retag_codex_threads_to_headroom();
+                    client_adapters::retag_codex_threads_to_native();
                 }
             });
 
@@ -8488,6 +8584,8 @@ pub fn run() {
         .unwrap_or_else(|err| fatal_build_error(err));
     #[cfg(target_os = "windows")]
     finish_single_instance_hand_off(&app);
+    #[cfg(target_os = "windows")]
+    wait_for_webview_data_folder(&app);
     // A second launch has exited by now, so only the primary counts as one.
     app.state::<AppState>().record_launch();
     app.run(|app, event| {
@@ -12666,6 +12764,9 @@ mod tests {
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
     use super::{dir_is_read_only, is_read_only_filesystem, on_other_volumes, symlink_free_exe};
+    use super::{
+        environmental_capture_flag, ENDPOINT_PROTECTION_CAPTURED, LOOPBACK_SOCKET_DENIED_CAPTURED,
+    };
     use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -17555,6 +17656,18 @@ Some unrelated content.
         )));
         assert!(!is_environmental_startup_key(Some("startup_port_conflict")));
         assert!(!is_environmental_startup_key(None));
+        // The give-up skips its twin report through these flags, so each
+        // environmental key needs the one its start-time capture sets.
+        assert!(std::ptr::eq(
+            environmental_capture_flag(Some("startup_endpoint_protection")).unwrap(),
+            &ENDPOINT_PROTECTION_CAPTURED
+        ));
+        assert!(std::ptr::eq(
+            environmental_capture_flag(Some("startup_loopback_socket_denied")).unwrap(),
+            &LOOPBACK_SOCKET_DENIED_CAPTURED
+        ));
+        assert!(environmental_capture_flag(Some("startup_port_conflict")).is_none());
+        assert!(environmental_capture_flag(None).is_none());
 
         // Neighbouring Winsock codes are other conditions with other hints.
         for other in [
@@ -18008,6 +18121,21 @@ Some unrelated content.
             );
         }
 
+        // RUST-29 on 0.9.47-rc.7, verbatim: a web filter refused one wheel.
+        let forbidden = anyhow::Error::new(crate::tool_manager::CommandFailure {
+            program: "python".into(),
+            args: vec!["-m".into(), "pip".into(), "install".into()],
+            stdout: String::new(),
+            stderr: "  ERROR: HTTP error 403 while getting https://files.pythonhosted.org/\
+                     packages/fb/e2/click-8.4.2-py3-none-any.whl\n"
+                .into(),
+            exit_code: Some(1),
+            signal: None,
+        })
+        .context("repairing stale headroom requirements");
+        let hint = classify_upgrade_error(&forbidden).expect("must classify");
+        assert!(hint.contains("PyPI"), "got: {hint}");
+
         // A genuine resolver conflict keeps its own hint.
         let conflict =
             anyhow::anyhow!("ERROR: ResolutionImpossible: for help visit https://pip.pypa.io");
@@ -18157,6 +18285,26 @@ Some unrelated content.
     }
 
     #[test]
+    fn hourly_codex_check_skips_only_the_users_own_provider() {
+        // The hourly badge check skips just this; an `openai` thread that
+        // predates setup still needs a restart, which is what it tells the user.
+        let own = |provider: &str| {
+            super::codex_ran_on_own_provider(&[
+                ("codex_config_routed", "true".to_string()),
+                ("codex_session_provider", provider.to_string()),
+            ])
+        };
+        assert!(own("other"));
+        for routed in ["openai", "headroom", "unknown"] {
+            assert!(!own(routed), "{routed}");
+        }
+        assert!(
+            !super::codex_ran_on_own_provider(&[]),
+            "Claude Code has no tags"
+        );
+    }
+
+    #[test]
     fn a_start_the_apps_own_exit_cut_short_is_not_reported() {
         use std::sync::{Arc, Mutex};
         #[derive(Default)]
@@ -18199,6 +18347,28 @@ Some unrelated content.
             .message
             .as_deref()
             .is_some_and(|m| m.contains("wait check failed")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn webview_lockfile_reads_held_only_while_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("hr-ebwebview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let lockfile = dir.join("lockfile");
+        assert!(!super::webview_lockfile_held(&lockfile), "missing is free");
+        // How Chromium holds it: write, share read, delete on close.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .custom_flags(0x0400_0000) // FILE_FLAG_DELETE_ON_CLOSE
+            .open(&lockfile)
+            .expect("hold lockfile");
+        assert!(super::webview_lockfile_held(&lockfile));
+        drop(held);
+        assert!(!super::webview_lockfile_held(&lockfile));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

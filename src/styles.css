@@ -3881,7 +3881,11 @@ details[open] .optimize-minimal__details summary::after {
   font-size: 11px;
   font-weight: 500;
   letter-spacing: normal;
-  white-space: nowrap;
+  /* One line for "Codex: Active, 12 requests", wrapped for an unrouted
+     diagnosis, which runs to a few sentences. */
+  width: max-content;
+  max-width: 300px;
+  white-space: normal;
   opacity: 0;
   pointer-events: none;
   z-index: 30;
