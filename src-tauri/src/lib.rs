@@ -755,7 +755,14 @@ fn codex_unrouted_is_expected(tags: &[(&'static str, String)]) -> bool {
     let predates_setup = tag("codex_session_provider") == Some("openai")
         && tag("codex_config_routed") == Some("true")
         && tag("codex_home_env") == Some("false");
-    predates_setup || tag("codex_session_provider") == Some("other")
+    predates_setup || codex_ran_on_own_provider(tags)
+}
+
+/// The newest Codex session ran on a provider of the user's own (`--oss`, a
+/// custom `model_providers` entry), which Headroom never routes.
+fn codex_ran_on_own_provider(tags: &[(&'static str, String)]) -> bool {
+    tags.iter()
+        .any(|(key, value)| *key == "codex_session_provider" && value == "other")
 }
 
 /// Names the agent whose sessions grew: telling a Codex user to restart
@@ -6448,6 +6455,20 @@ async fn detect_unrouted_clients(
             if !client_adapters::client_ran_unrouted(activity, requests, routed_since, now) {
                 continue;
             }
+            // Before the re-apply: it rewrites the config these tags describe.
+            let codex_diagnostics = if client_id == "codex" {
+                client_adapters::codex_unrouted_diagnostics(routed_since)
+            } else {
+                Vec::new()
+            };
+            // A session on the user's own provider went where they sent it, the
+            // same skip as the first-run report. Before the daily throttle, so
+            // it never spends the day's one report of a real bypass. Reachable
+            // since 0.9.48-rc.9: `codex doctor`'s probes counted as requests
+            // and kept this check from ever firing for Codex.
+            if codex_ran_on_own_provider(&codex_diagnostics) {
+                continue;
+            }
             // One report per client per DAY. The condition is defined over a
             // 24h window (`requests_since_yesterday`), so once it holds it
             // holds for that whole window and every rescan inside it can only
@@ -6478,12 +6499,6 @@ async fn detect_unrouted_clients(
             let enabled = match client_id {
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
-            };
-            // Before the re-apply: it rewrites the config these tags describe.
-            let codex_diagnostics = if client_id == "codex" {
-                client_adapters::codex_unrouted_diagnostics(routed_since)
-            } else {
-                Vec::new()
             };
             // Every session in the window ran in the Claude desktop app, which
             // routes nothing through us by design. The guard calls those
@@ -18267,6 +18282,26 @@ Some unrelated content.
         assert!(!skips("unknown", "true", "false"));
         assert!(!skips("openai", "false", "false"));
         assert!(!skips("openai", "true", "true"));
+    }
+
+    #[test]
+    fn hourly_codex_check_skips_only_the_users_own_provider() {
+        // The hourly badge check skips just this; an `openai` thread that
+        // predates setup still needs a restart, which is what it tells the user.
+        let own = |provider: &str| {
+            super::codex_ran_on_own_provider(&[
+                ("codex_config_routed", "true".to_string()),
+                ("codex_session_provider", provider.to_string()),
+            ])
+        };
+        assert!(own("other"));
+        for routed in ["openai", "headroom", "unknown"] {
+            assert!(!own(routed), "{routed}");
+        }
+        assert!(
+            !super::codex_ran_on_own_provider(&[]),
+            "Claude Code has no tags"
+        );
     }
 
     #[test]
