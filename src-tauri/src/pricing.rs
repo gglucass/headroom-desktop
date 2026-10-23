@@ -3018,13 +3018,15 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
         | CodexPlanTier::EnterpriseCbpUsageBased
         | CodexPlanTier::Edu
         | CodexPlanTier::Education => Some(plan.as_header_str().to_string()),
-        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::ProLite | CodexPlanTier::Pro => {
-            Some(if has_org {
-                plan.as_header_str().to_string()
-            } else {
-                "subscription".to_string()
-            })
-        }
+        CodexPlanTier::Go
+        | CodexPlanTier::Plus
+        | CodexPlanTier::ProLite
+        | CodexPlanTier::Pro
+        | CodexPlanTier::ProMax => Some(if has_org {
+            plan.as_header_str().to_string()
+        } else {
+            "subscription".to_string()
+        }),
     }
 }
 

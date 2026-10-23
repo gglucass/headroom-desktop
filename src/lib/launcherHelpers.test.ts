@@ -296,8 +296,10 @@ describe("launcher helpers", () => {
       // Standard Business/Team seats carry a Plus-level Codex allowance.
       expect(recommendedHeadroomTier(null, "team")).toBe("pro");
       expect(recommendedHeadroomTier(null, "business")).toBe("pro");
-      // ChatGPT Pro Lite is ~$100/mo, the Claude Max x5 price point.
+      // ChatGPT Pro $100 (claim prolite), the Claude Max x5 price point.
       expect(recommendedHeadroomTier(null, "prolite")).toBe("max5x");
+      // ChatGPT Pro $500 (claim promax), priced like Pro $200.
+      expect(recommendedHeadroomTier(null, "promax")).toBe("max20x");
       expect(recommendedHeadroomTier(null, "self_serve_business_usage_based")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "self_serve_business_prolite")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "edu")).toBe("max5x");
