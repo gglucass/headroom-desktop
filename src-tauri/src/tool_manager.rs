@@ -3706,10 +3706,11 @@ impl ToolManager {
     }
 
     /// Chip text for the Addons tab. markitdown and serena are measured
-    /// (shim counter / serena's logs plus its live dashboard stats); ponytail,
-    /// caveman and chisle are the plugins' published benchmark figures — their skills
-    /// forbid inventing per-repo figures, so the labels say "benchmark". rtk's
-    /// figure comes from `rtk gain` via RuntimeStatus, not from here.
+    /// (shim counter / serena's logs plus its live dashboard stats), and so is
+    /// chisle's tool-output trimming (its own ledger); ponytail, caveman and
+    /// chisle's reply rules are the plugins' published benchmark figures — their
+    /// skills forbid inventing per-repo figures, so the labels say "benchmark".
+    /// rtk's figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
         match tool_id {
             "markitdown" => self.markitdown_conversion_count().map(|count| {
@@ -3727,8 +3728,7 @@ impl ToolManager {
             }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
             "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
-            // Its 2026-10-01 rerun: 83% of a bare model's billed output.
-            "chisle" => Some("~17% fewer output tokens (benchmark)".to_string()),
+            "chisle" => Some(chisle_savings_label(chisle_trimmed_chars())),
             _ => None,
         }
     }
@@ -10216,6 +10216,33 @@ fn serena_savings_label(
         None
     } else {
         Some(parts.join(", "))
+    }
+}
+
+/// Characters Chisle's PostToolUse hook has cut from tool output, from its own
+/// ledger `~/.claude/.chisle-compress-stats.json` (`{savedChars, events}`). The
+/// hook bumps it only once Claude Code accepts the trimmed output, so it counts
+/// what the model actually stopped reading. Cumulative, no dates. None until
+/// the first trim.
+fn chisle_trimmed_chars() -> Option<u64> {
+    let path = crate::client_adapters::home_dir()
+        .join(".claude")
+        .join(".chisle-compress-stats.json");
+    let ledger: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let chars = ledger.get("savedChars")?.as_f64()?;
+    (chars >= 1.0).then_some(chars as u64)
+}
+
+fn chisle_savings_label(trimmed_chars: Option<u64>) -> String {
+    // Its 2026-10-01 rerun: 83% of a bare model's billed output.
+    const REPLY_BENCHMARK: &str = "~17% fewer output tokens (benchmark)";
+    match trimmed_chars {
+        // chars/4: the same estimate Chisle's own `--stats` and statusline show.
+        Some(chars) => format!(
+            "~{} tool-output tokens trimmed, {REPLY_BENCHMARK}",
+            compact_token_count(chars / 4)
+        ),
+        None => REPLY_BENCHMARK.to_string(),
     }
 }
 
@@ -23721,6 +23748,37 @@ Always run the linter first.
             Some("231 tool calls today, ~48k tokens returned in 2h 14m")
         );
         assert_eq!(super::compact_token_count(1_234_000), "1.2M");
+    }
+
+    #[test]
+    fn chisle_label_reads_its_trim_ledger_and_falls_back_to_the_benchmark() {
+        let root = unique_temp_dir("chisle-ledger");
+        let home = root.join("home");
+        let _home = HomeGuard::new(&home);
+        let ledger = home.join(".claude").join(".chisle-compress-stats.json");
+        let benchmark = "~17% fewer output tokens (benchmark)";
+
+        assert_eq!(super::chisle_trimmed_chars(), None);
+        assert_eq!(super::chisle_savings_label(None), benchmark);
+
+        fs::create_dir_all(ledger.parent().unwrap()).expect("claude dir");
+        fs::write(&ledger, br#"{"savedChars":88967,"events":18}"#).expect("ledger");
+        assert_eq!(super::chisle_trimmed_chars(), Some(88_967));
+        // Chisle's README shows this ledger as "~22,241 tokens".
+        assert_eq!(
+            super::chisle_savings_label(super::chisle_trimmed_chars()),
+            "~22k tool-output tokens trimmed, ~17% fewer output tokens (benchmark)"
+        );
+
+        for junk in [
+            &br#"{"savedChars":0,"events":0}"#[..],
+            b"not json",
+            br#"{"events":3}"#,
+        ] {
+            fs::write(&ledger, junk).expect("ledger");
+            assert_eq!(super::chisle_trimmed_chars(), None);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
