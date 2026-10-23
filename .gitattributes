@@ -3,3 +3,5 @@
 
 # Embedded as include_str! and asserted byte-wise; never CRLF-mangle on Windows checkout.
 src-tauri/python/*.lock text eol=lf
+# Source-scan tests include_str! their own file and match "\n"; Windows CI checks out CRLF.
+*.rs text eol=lf
