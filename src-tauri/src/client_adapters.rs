@@ -6214,13 +6214,23 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
         String::new()
     };
 
+    // Grok cannot read a file that does not parse either, and a block added
+    // to it still failed verify as "not found" (RUST-S9/SC): tell the user.
+    if let Err(err) = existing.parse::<toml::Table>() {
+        return Err(anyhow!(
+            "parsing {} failed ({}: {}); {UNPARSEABLE_SETTINGS}",
+            path.display(),
+            err.to_string().lines().next().unwrap_or_default(),
+            err.message()
+        ));
+    }
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
     }
     // A table header the text scan misses (quoted key, odd spacing) would get
     // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
-    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+    if updated.parse::<toml::Table>().is_err() {
         return Err(anyhow!(
             "rendered {} is not valid TOML; refusing to overwrite",
             path.display()
@@ -17355,6 +17365,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::write(&config, quoted).unwrap();
         assert!(super::apply_client_setup("grok_build").is_err());
         assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
+
+        // A file that is already invalid is the user's to fix: say where,
+        // keep it, and stay out of Sentry like every other parse refusal.
+        let broken = "[model.grok-build]\nbase_url \"https://gw.example/v1\"\n";
+        fs::write(&config, broken).unwrap();
+        let err = super::apply_client_setup("grok_build").unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("line 2, column 10"), "{shown}");
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), broken);
     }
 
     #[test]
