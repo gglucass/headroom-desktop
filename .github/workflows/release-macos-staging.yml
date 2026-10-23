@@ -354,10 +354,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Key the apt package cache
+        id: apt-cache-key
+        # Weekly and per Ubuntu release: a week's package updates download
+        # once, then every Linux job on the branch installs from the cache.
+        run: |
+          prefix="apt-$(. /etc/os-release && echo "$VERSION_ID")-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the apt packages
+        # The azure apt mirror sent these ~65 MB at 25-128 kB/s on 2026-10-22
+        # and 10-23 (8 to 35 minutes; the 35 came within 10 of the timeout),
+        # while the index update took a second. Only the .debs come from the
+        # cache, and apt checks each against the signed index's hash.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-cache-key.outputs.key }}
+          restore-keys: ${{ steps.apt-cache-key.outputs.prefix }}
+
       - name: Install Linux system dependencies
         run: |
+          sudo mkdir -p ~/apt-archives/partial
           sudo apt-get update
           sudo apt-get install -y \
+            -o Dir::Cache::Archives="$HOME/apt-archives" \
+            -o APT::Keep-Downloaded-Packages=true \
             build-essential \
             curl \
             file \
@@ -368,6 +391,8 @@ jobs:
             libxdo-dev \
             pkg-config \
             wget
+          # apt leaves root-owned files (its lock is 0640) the cache save cannot read.
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
