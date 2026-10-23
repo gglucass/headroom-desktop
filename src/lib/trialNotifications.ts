@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { HeadroomPricingStatus } from "./types";
+import { trialSavingsLabel } from "./appHelpers";
+import type { DailySavingsPoint, HeadroomPricingStatus } from "./types";
 import { localDayKey, shouldNotifyInBackground } from "./urgentNotifications";
 
 // Remaining-time thresholds at which to fire grace period notifications.
@@ -14,7 +15,8 @@ const GRACE_THRESHOLD_KEY = "headroom_grace_notif_threshold";
 const TRIAL_EXPIRY_DATE_KEY = "headroom_trial_expiry_notif_date";
 
 export async function maybeFireTrialNotifications(
-  status: HeadroomPricingStatus
+  status: HeadroomPricingStatus,
+  dailySavings: DailySavingsPoint[] = []
 ): Promise<void> {
   if (!(await shouldNotifyInBackground())) return;
 
@@ -24,9 +26,20 @@ export async function maybeFireTrialNotifications(
 
   const account = status.account;
   if (account?.trialActive && !account.subscriptionActive) {
+    // Lead with what the trial has saved so far, as the Upgrade page does.
+    const saved = account.trialStartedAt
+      ? trialSavingsLabel(
+          dailySavings,
+          account.trialStartedAt,
+          account.trialEndsAt ?? new Date().toISOString(),
+          null,
+          true
+        )
+      : null;
     await maybeFireTrialExpiryNotification(
       account.trialEndsAt ?? null,
-      account.trialUsageDaysLeft ?? null
+      account.trialUsageDaysLeft ?? null,
+      saved
     );
   }
 }
@@ -62,7 +75,8 @@ async function maybeFireGraceNotification(
 
 async function maybeFireTrialExpiryNotification(
   trialEndsAt: string | null,
-  usageDaysLeft: number | null
+  usageDaysLeft: number | null,
+  savedLabel: string | null
 ): Promise<void> {
   const now = new Date();
   let daysLeft: number;
@@ -83,7 +97,7 @@ async function maybeFireTrialExpiryNotification(
   const today = localDayKey(now);
   if (localStorage.getItem(TRIAL_EXPIRY_DATE_KEY) === today) return;
 
-  const body =
+  const ending =
     usageDaysLeft != null
       ? `Your Headroom trial ends after ${daysLeft} more day${daysLeft === 1 ? "" : "s"} of use. Upgrade to keep optimization enabled.`
       : daysLeft === 0
@@ -94,6 +108,7 @@ async function maybeFireTrialExpiryNotification(
 
   // Claimed before awaiting, as in the grace path above.
   localStorage.setItem(TRIAL_EXPIRY_DATE_KEY, today);
+  const body = savedLabel ? `${savedLabel} ${ending}` : ending;
   await sendNotification("Headroom Trial Ending Soon", body, "billing");
 }
 

@@ -364,6 +364,32 @@ describe("maybeFireTrialNotifications", () => {
       });
     });
 
+    it("leads with what the trial has saved so far", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+      const account = makeTrialAccount(daysFromNow(2));
+      const status = makeStatus({ localGraceActive: false, authenticated: true, account });
+      const today = localDayKey(new Date());
+
+      await maybeFireTrialNotifications(status, [
+        {
+          date: today,
+          estimatedSavingsUsd: 34,
+          estimatedTokensSaved: 12_300_000,
+          actualCostUsd: 0,
+          totalTokensSent: 0,
+        },
+      ]);
+
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: "Headroom Trial Ending Soon",
+        body:
+          "So far in your trial, Headroom has saved you 12.3M tokens, about $34 at API prices. " +
+          "Your Headroom trial ends in 2 days. Upgrade to keep optimization enabled.",
+        action: "billing",
+      });
+    });
+
     it("uses tomorrow copy when exactly 1 day remains", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();

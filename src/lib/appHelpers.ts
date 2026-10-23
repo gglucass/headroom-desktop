@@ -312,12 +312,15 @@ export function forgoneSavingsLabel(
 /// (TrialEndingMailer#paused): tokens only from 1M, dollars only from $1,
 /// months only when the trial covered at least one, at the monthly list
 /// price. Local history only, so another machine's trial days are missing:
-/// it can understate, never overstate.
+/// it can understate, never overstate. `ongoing` words it for a trial still
+/// running: 71% of unpaid Upgrade viewers (28d to 2026-10-23) were mid-trial
+/// and saw no savings figure, while pay rate climbed 5% -> 18% with $ saved.
 export function trialSavingsLabel(
   daily: DailySavingsPoint[],
   trialStartedAt: string,
   trialEndsAt: string,
-  planId: HeadroomSubscriptionTier | null
+  planId: HeadroomSubscriptionTier | null,
+  ongoing = false
 ): string | null {
   const from = formatDayKey(new Date(trialStartedAt));
   const to = formatDayKey(new Date(trialEndsAt));
@@ -325,12 +328,18 @@ export function trialSavingsLabel(
   const tokens = trial.reduce((sum, p) => sum + p.estimatedTokensSaved, 0);
   const usd = trial.reduce((sum, p) => sum + p.estimatedSavingsUsd + (p.outputSavingsUsd ?? 0), 0);
   if (tokens <= 0 || (usd < 1 && tokens < 1_000_000)) return null;
-  const saved = `Over your trial, Headroom saved you ${compactNumber(tokens)} tokens${usd >= 1 ? `, about ${currency(usd)} at API prices` : ""}.`;
+  const amount = `${compactNumber(tokens)} tokens${usd >= 1 ? `, about ${currency(usd)} at API prices` : ""}.`;
+  const saved = ongoing
+    ? `So far in your trial, Headroom has saved you ${amount}`
+    : `Over your trial, Headroom saved you ${amount}`;
   if (!planId) return saved;
   const price = planPrice(planId, "monthly");
   const months = price.fullCents > 0 ? Math.floor((usd * 100) / price.fullCents) : 0;
   if (months < 1) return saved;
-  return `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so the trial alone covered ${months === 1 ? "a month" : `about ${months} months`} of it.`;
+  const covered = months === 1 ? "a month" : `about ${months} months`;
+  return ongoing
+    ? `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so your trial has already covered ${covered} of it.`
+    : `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so the trial alone covered ${covered} of it.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
@@ -386,6 +395,47 @@ export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
     default:
       return null;
   }
+}
+
+/// ChatGPT-side names for a Codex-only user's not-yet-bought plans. Headroom's
+/// names mirror Claude's, so a ChatGPT Plus user met "Pro", which is ChatGPT's
+/// $100+ plan: Codex-only Plus checkout starters picked a Max plan 9 of 26
+/// times (Claude Pro: 8 of 38) and paid 5 of 26 (16 of 38), 28d to 2026-10-23.
+/// OpenAI names its Pro tiers only by price. Polar and receipts keep the
+/// Headroom name, so the tagline carries it.
+const CODEX_PLAN_NAMES: Partial<Record<UpgradePlanId, [name: string, chatgpt: string]>> = {
+  pro: ["Plus", "ChatGPT Go or Plus"],
+  max5x: ["Pro 5x", "ChatGPT Pro $100"],
+  max20x: ["Pro 20x", "ChatGPT Pro $200 or $500"]
+};
+
+export function withCodexPlanNames(
+  plans: UpgradePlan[],
+  claudePlanTier: ClaudePlanTier | null | undefined,
+  codexPlanTier: CodexPlanTier | null | undefined
+): UpgradePlan[] {
+  const claudeSubscriber =
+    claudePlanTier === "pro" || claudePlanTier === "max5x" || claudePlanTier === "max20x";
+  const consumerCodex =
+    codexPlanTier === "go" ||
+    codexPlanTier === "plus" ||
+    codexPlanTier === "prolite" ||
+    codexPlanTier === "pro" ||
+    codexPlanTier === "promax";
+  if (claudeSubscriber || !consumerCodex) return plans;
+  return plans.map((plan) => {
+    const names = CODEX_PLAN_NAMES[plan.id];
+    // Only a card still offering a first purchase: Active, switch, downgrade
+    // and AppSumo cards talk about the plan already owned, by its own name.
+    if (!names || plan.ctaLabel !== `Get ${upgradePlanIntentLabel(plan.id)}`) return plan;
+    const [name, chatgpt] = names;
+    return {
+      ...plan,
+      name,
+      tagline: `Headroom ${upgradePlanIntentLabel(plan.id)}, for ${chatgpt} accounts`,
+      ctaLabel: `Get ${name}`
+    };
+  });
 }
 
 export interface ScheduledPlanChange {
@@ -745,8 +795,8 @@ export function getUpgradePlans(
         "Use on all your devices with one account",
         "Email-based support"
       ], "Get Pro"),
-      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro Lite accounts", "Includes:", [
-        "Unlimited use with Claude Max x5 or ChatGPT Pro Lite",
+      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro $100 accounts", "Includes:", [
+        "Unlimited use with Claude Max x5 or ChatGPT Pro $100",
         "Use on all your devices with one account",
         "Email-based support"
       ], "Get Max x5"),

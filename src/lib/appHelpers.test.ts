@@ -11,6 +11,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  withCodexPlanNames,
   higherSubscriptionTier,
   replyAddonOverlapNotice,
   annualFirstYearSavingCents,
@@ -114,6 +115,13 @@ describe("app helpers", () => {
     // A trickle (under 1M tokens and under $1) argues against upgrading -> null.
     expect(trialSavingsLabel([on("2026-09-02", 0.5, 200_000)], start, end, "max20x")).toBeNull();
     expect(trialSavingsLabel([], start, end, "max20x")).toBeNull();
+    // A trial still running says "so far", never "the trial alone covered".
+    expect(trialSavingsLabel(trial, start, end, "max20x", true)).toBe(
+      "So far in your trial, Headroom has saved you 41M tokens, about $430 at API prices. Max x20 is $40/month, so your trial has already covered about 10 months of it."
+    );
+    expect(trialSavingsLabel([on("2026-09-02", 30, 2_000_000)], start, end, null, true)).toBe(
+      "So far in your trial, Headroom has saved you 2M tokens, about $30 at API prices."
+    );
   });
 
   it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {
@@ -168,6 +176,33 @@ describe("app helpers", () => {
       "pro",
       "max5x",
     ]);
+  });
+
+  it("names plans the ChatGPT way for a Codex-only buyer, keeping the Headroom name in the tagline", () => {
+    const plans = getUpgradePlans("individual", undefined, "pro").plans;
+    const byId = (list: typeof plans, id: string) => list.find((plan) => plan.id === id)!;
+
+    const codex = withCodexPlanNames(plans, null, "plus");
+    expect(byId(codex, "pro")).toMatchObject({
+      name: "Plus",
+      tagline: "Headroom Pro, for ChatGPT Go or Plus accounts",
+      ctaLabel: "Get Plus"
+    });
+    expect(byId(codex, "max5x")).toMatchObject({ name: "Pro 5x", ctaLabel: "Get Pro 5x" });
+    expect(byId(codex, "max20x").tagline).toBe("Headroom Max x20, for ChatGPT Pro $200 or $500 accounts");
+    expect(byId(withCodexPlanNames(plans, null, "promax"), "max20x").name).toBe("Pro 20x");
+    expect(byId(withCodexPlanNames(plans, null, "prolite"), "max5x").name).toBe("Pro 5x");
+    // Price and features are untouched.
+    expect(byId(codex, "pro").price).toBe(byId(plans, "pro").price);
+
+    // A Claude subscriber keeps Claude's names; so do Business seats and no Codex.
+    expect(withCodexPlanNames(plans, "pro", "plus")).toBe(plans);
+    expect(withCodexPlanNames(plans, null, "business")).toBe(plans);
+    expect(withCodexPlanNames(plans, "free", null)).toBe(plans);
+
+    // An owned plan's card keeps its own name.
+    const owned = getUpgradePlans("individual", undefined, "pro", "pro", true).plans;
+    expect(byId(withCodexPlanNames(owned, null, "plus"), "pro").name).toBe("Pro");
   });
 
   it("uses recommended subscription order when no active plan exists", () => {
