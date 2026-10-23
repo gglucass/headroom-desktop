@@ -3745,6 +3745,18 @@ fn capture_watchdog_give_up(
         report.log_tail.as_deref(),
     );
     let startup_is_environmental = is_environmental_startup_key(startup_key);
+    // When that capture already fired this session, the give-up is its twin a
+    // minute later: every RUST-G1 event (15 hosts in 14d) followed a RUST-G0
+    // from the same host, so it only spent quota re-filing one App Control
+    // block. A give-up with no earlier capture still reports.
+    if environmental_capture_flag(startup_key).is_some_and(|f| f.load(Ordering::Acquire)) {
+        log::info!(
+            "{} ({}), already reported at start this session",
+            report.message,
+            startup_key.unwrap_or_default()
+        );
+        return;
+    }
     let level = if (report.last_startup_error.is_some() && !startup_is_environmental)
         || cpu_deadlock_signal
     {
@@ -4238,6 +4250,16 @@ pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
         key,
         Some("startup_endpoint_protection") | Some("startup_loopback_socket_denied")
     )
+}
+
+/// The once-per-session flag `capture_headroom_start_failure` sets when it
+/// reports an environmental startup key, so later reports of it can tell.
+fn environmental_capture_flag(key: Option<&str>) -> Option<&'static AtomicBool> {
+    match key {
+        Some("startup_endpoint_protection") => Some(&ENDPOINT_PROTECTION_CAPTURED),
+        Some("startup_loopback_socket_denied") => Some(&LOOPBACK_SOCKET_DENIED_CAPTURED),
+        _ => None,
+    }
 }
 
 /// Names both causes of WinError 10013 and how to tell them apart, without
@@ -12727,6 +12749,9 @@ mod tests {
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
     use super::{dir_is_read_only, is_read_only_filesystem, on_other_volumes, symlink_free_exe};
+    use super::{
+        environmental_capture_flag, ENDPOINT_PROTECTION_CAPTURED, LOOPBACK_SOCKET_DENIED_CAPTURED,
+    };
     use super::{take_fresh_notification_action, NOTIFICATION_ACTION_TTL};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -17616,6 +17641,18 @@ Some unrelated content.
         )));
         assert!(!is_environmental_startup_key(Some("startup_port_conflict")));
         assert!(!is_environmental_startup_key(None));
+        // The give-up skips its twin report through these flags, so each
+        // environmental key needs the one its start-time capture sets.
+        assert!(std::ptr::eq(
+            environmental_capture_flag(Some("startup_endpoint_protection")).unwrap(),
+            &ENDPOINT_PROTECTION_CAPTURED
+        ));
+        assert!(std::ptr::eq(
+            environmental_capture_flag(Some("startup_loopback_socket_denied")).unwrap(),
+            &LOOPBACK_SOCKET_DENIED_CAPTURED
+        ));
+        assert!(environmental_capture_flag(Some("startup_port_conflict")).is_none());
+        assert!(environmental_capture_flag(None).is_none());
 
         // Neighbouring Winsock codes are other conditions with other hints.
         for other in [
