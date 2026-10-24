@@ -2225,7 +2225,15 @@ async fn handle(
         "opencode"
     } else if is_grok {
         "grok-build"
-    } else if is_codex {
+    } else if is_codex
+        // Counters only: OpenAI image calls (user 3966's /v1/images/edits, an
+        // OpenAI moderation 400) filled the claude-code bucket on a host with
+        // no Claude login and paged it as stuck. Routing keeps treating them
+        // as non-Codex, which the backend already sends to OpenAI.
+        || parsed_head
+            .as_ref()
+            .is_some_and(|head| head.path.starts_with("/v1/images/"))
+    {
         "codex"
     } else {
         "claude-code"
@@ -6977,6 +6985,28 @@ mod tests {
         assert_eq!(
             counts_after_codex["claude-code"], counts_after_api["claude-code"],
             "claude-code counter should not move for Codex request"
+        );
+
+        // Codex's image calls count as Codex, never Claude Code.
+        let mut images_client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("images connect");
+        images_client
+            .write_all(
+                b"POST /v1/images/edits HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write images request");
+        read_response(images_client).await;
+        let counts_after_images = intercept_request_counts();
+        assert_eq!(
+            counts_after_images["codex"] - counts_after_codex["codex"],
+            1,
+            "an OpenAI image call should count as codex"
+        );
+        assert_eq!(
+            counts_after_images["claude-code"], counts_after_codex["claude-code"],
+            "an OpenAI image call must not count as claude-code"
         );
 
         // Local proxy paths (health probes, stats) must NOT leak upstream on
