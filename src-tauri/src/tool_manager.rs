@@ -8739,7 +8739,7 @@ impl ToolManager {
 
     pub fn install_markitdown(&self) -> Result<()> {
         let before = venv_dist_infos(&self.runtime.managed_python());
-        run_pip_install_with_retries_streaming(
+        let installed = run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -8753,7 +8753,10 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| log_pip_line("markitdown pip", line),
-        )?;
+        );
+        // Even after a failure: pip keeps the packages it installed before it.
+        self.remove_olefile();
+        installed?;
         // markitdown's own pins move lock packages below their hashed pins:
         // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
         // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
@@ -8832,6 +8835,31 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Pillow opens FlashPix and MIC images only when olefile imports, and its
+    /// FlashPix decoder has a heap write (CVE-2026-112398) that a crafted
+    /// agent-traffic image reaches through headroom-ai's bare Image.open.
+    /// markitdown[all]'s outlook extra is the only thing that installs olefile,
+    /// and markitdown without it loses .msg conversion only. A dist-info scan
+    /// when olefile is absent, so the launch path can call it every time.
+    pub fn remove_olefile(&self) {
+        let python = self.runtime.managed_python();
+        if !venv_dist_infos(&python)
+            .iter()
+            .any(|d| d.starts_with("olefile-"))
+        {
+            return;
+        }
+        if let Err(err) = run_command_streaming(
+            &python,
+            &["-m", "pip", "uninstall", "-y", "olefile"],
+            &self.runtime.root_dir,
+            Some(PIP_OUTPUT_SILENCE_TIMEOUT),
+            &mut |line: &str| log_pip_line("olefile pip uninstall", line),
+        ) {
+            log::warn!("removing olefile from the runtime venv failed: {err:#}");
+        }
     }
 
     /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
@@ -16038,8 +16066,10 @@ fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
 /// True when every registrar an MCP helper's exit line names (`codex: <why>;
 /// claude: <why>`) failed on a config file the user broke, which the client
 /// that owns it cannot read either (RUST-R6: `~/.codex/config.toml is not valid
-/// TOML`, retried and reported on every launch). One real failure beside it
-/// still reports.
+/// TOML`, retried and reported on every launch). Wheel 0.41.0's marker-span
+/// rewrite refuses a parseable file it cannot rewrite safely as `does not
+/// parse, or the Headroom block holds entries...`, same class. One real
+/// failure beside it still reports.
 fn mcp_helper_failed_on_user_config(stderr: &str) -> bool {
     let Some(line) = stderr.lines().rev().find(|line| !line.trim().is_empty()) else {
         return false;
@@ -16050,8 +16080,14 @@ fn mcp_helper_failed_on_user_config(stderr: &str) -> bool {
             usize::from(line.starts_with(name)) + line.matches(&format!("; {name}")).count()
         })
         .sum();
-    let unparseable =
-        line.matches(" is not valid TOML").count() + line.matches(" is not valid JSON").count();
+    let unparseable = [
+        " is not valid TOML",
+        " is not valid JSON",
+        " does not parse, or the Headroom block holds",
+    ]
+    .iter()
+    .map(|reason| line.matches(reason).count())
+    .sum::<usize>();
     failures > 0 && failures == unparseable
 }
 
@@ -19757,6 +19793,10 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         assert!(user_config(&format!("Traceback noise\n{toml}\n")));
         let json = "opencode: /Users/u/.config/opencode/opencode.json exists but is not valid JSON (Expecting ',' delimiter: line 3 column 5 (char 40)); fix it by hand";
         assert!(user_config(&format!("{toml}; {json}")));
+        // RUST-R6 on wheel 0.41.0: a parseable file the span rewrite refuses.
+        let span = "codex: /Users/u/.codex/config.toml does not parse, or the Headroom block holds entries Headroom could not move out safely; refusing to rewrite it.";
+        assert!(user_config(span));
+        assert!(!user_config(&format!("{span}; claude: removal failed")));
         assert!(!user_config(&format!("{toml}; claude: removal failed")));
         assert!(!user_config("codex: removal failed"));
         assert!(!user_config(""));
@@ -25913,6 +25953,7 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .join("site-packages");
         fs::create_dir_all(site.join("magika-1.0.3.dist-info")).expect("magika");
         fs::create_dir_all(site.join("onnxruntime-1.27.0.dist-info")).expect("onnxruntime");
+        fs::create_dir_all(site.join("olefile-0.47.dist-info")).expect("olefile");
         write_executable(
             &runtime.managed_python(),
             &format!(
@@ -25940,6 +25981,12 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .expect("magika re-pinned");
         assert!(repin > markitdown, "{calls}");
         assert!(argvs[repin].contains("--no-deps"), "{calls}");
+        // olefile makes pillow's FlashPix decoder reachable (CVE-2026-112398).
+        let olefile = argvs
+            .iter()
+            .position(|a| a.contains("uninstall -y olefile"))
+            .expect("olefile removed");
+        assert!(olefile > markitdown, "{calls}");
         for name in ["magika", "onnxruntime"] {
             let entries = super::lock_entries_named(super::bootstrap_requirements_lock(), name);
             assert!(!entries.is_empty(), "lock pins {name}");
@@ -25948,6 +25995,34 @@ assert OpencodeRegistrar().register_server(own).ok"#,
                 assert!(calls.contains(&entry), "{name}: {calls}");
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// pip keeps what it installed before a failing package, so a failed
+    /// markitdown[all] run can still leave olefile (CVE-2026-112398).
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn install_markitdown_removes_olefile_after_a_failed_install() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-olefile");
+        let log = root.join("argv.log");
+        let site = runtime
+            .venv_dir
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site).expect("site");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *markitdown*) mkdir -p '{site}/olefile-0.47.dist-info'; exit 1;; esac\n",
+                log = log.display(),
+                site = site.display(),
+            ),
+        );
+        manager.install_markitdown().expect_err("pip failed");
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("uninstall -y olefile"), "{calls}");
         let _ = fs::remove_dir_all(root);
     }
 

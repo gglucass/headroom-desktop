@@ -1143,12 +1143,18 @@ pub enum CodexPlanTier {
     Free,
     Go,
     Plus,
-    /// ChatGPT Pro Lite, the ~$100/mo mid-tier between Plus and Pro. Seen in
-    /// the fleet from 2026-08 (caught by the `plan_raw` passthrough) before
-    /// OpenAI announced it; any other spelling still falls through to
-    /// `Unknown` and rides out as a raw claim.
+    /// ChatGPT Pro $100 (claim `prolite`), the mid-tier between Plus and Pro.
+    /// Seen in the fleet from 2026-08 (caught by the `plan_raw` passthrough)
+    /// before OpenAI announced it. Renamed on the wire: snake_case made it
+    /// `pro_lite`, which the frontend and the server never matched (6 devices
+    /// stored as `pro_lite` by 2026-10-23); `pro_lite` still reads back.
+    #[serde(rename = "prolite", alias = "pro_lite")]
     ProLite,
     Pro,
+    /// ChatGPT Pro $500 (claim `promax`), first seen 2026-09-29 when OpenAI
+    /// reopened Pro at $100/$200/$500. Priced like Pro: Max x20.
+    #[serde(rename = "promax")]
+    ProMax,
     Team,
     Business,
     SelfServeBusinessUsageBased,
@@ -1172,8 +1178,9 @@ impl CodexPlanTier {
             "free" => CodexPlanTier::Free,
             "go" => CodexPlanTier::Go,
             "plus" => CodexPlanTier::Plus,
-            "prolite" => CodexPlanTier::ProLite,
+            "prolite" | "pro_lite" => CodexPlanTier::ProLite,
             "pro" => CodexPlanTier::Pro,
+            "promax" => CodexPlanTier::ProMax,
             "team" => CodexPlanTier::Team,
             "business" => CodexPlanTier::Business,
             "self_serve_business_usage_based" => CodexPlanTier::SelfServeBusinessUsageBased,
@@ -1196,6 +1203,7 @@ impl CodexPlanTier {
             CodexPlanTier::Plus => "plus",
             CodexPlanTier::ProLite => "prolite",
             CodexPlanTier::Pro => "pro",
+            CodexPlanTier::ProMax => "promax",
             CodexPlanTier::Team => "team",
             CodexPlanTier::Business => "business",
             CodexPlanTier::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
@@ -1222,7 +1230,8 @@ impl CodexPlanTier {
 ///   map that claim to Max x5/x20 -- do not re-bump Standard seats.
 /// - Self-serve usage-based -> Max x5: credit-billed Codex seats with no fixed
 ///   seat price; spend is open-ended, so pitch the middle tier.
-/// - Pro ($100/$200) -> Max x20: individual already paying top dollar.
+/// - Pro ($200) / Pro $500 (`promax`) -> Max x20: individual already paying
+///   top dollar. Pro $100 is `ProLite` (above).
 /// - Enterprise / enterprise CBP usage-based -> Max x20: $60+/seat at a 150-seat
 ///   minimum, the genuine high-budget tier.
 /// - Edu / Education -> Max x5: institutional but discounted. OpenAI mints
@@ -1244,6 +1253,7 @@ pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubs
         | CodexPlanTier::Edu
         | CodexPlanTier::Education => Some(HeadroomSubscriptionTier::Max5x),
         CodexPlanTier::Pro
+        | CodexPlanTier::ProMax
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
         | CodexPlanTier::Unknown => Some(HeadroomSubscriptionTier::Max20x),
@@ -1680,6 +1690,9 @@ mod tests {
         for (tier, wire) in [
             (CodexPlanTier::Free, "free"),
             (CodexPlanTier::Plus, "plus"),
+            // The header spelling, which the frontend and the server match on.
+            (CodexPlanTier::ProLite, "prolite"),
+            (CodexPlanTier::ProMax, "promax"),
             (CodexPlanTier::Enterprise, "enterprise"),
             (CodexPlanTier::Education, "education"),
             (
@@ -1701,6 +1714,16 @@ mod tests {
         // ChatGPT Pro Lite: the claim OpenAI mints for the ~$100/mo mid-tier.
         assert_eq!(CodexPlanTier::from_claim("prolite"), CodexPlanTier::ProLite);
         assert_eq!(CodexPlanTier::ProLite.as_header_str(), "prolite");
+        assert_eq!(
+            CodexPlanTier::from_claim("pro_lite"),
+            CodexPlanTier::ProLite
+        );
+        // ChatGPT Pro $500.
+        assert_eq!(CodexPlanTier::from_claim("promax"), CodexPlanTier::ProMax);
+        assert_eq!(CodexPlanTier::ProMax.as_header_str(), "promax");
+        // The old snake_case wire value still deserializes.
+        let old: CodexPlanTier = serde_json::from_value(json!("pro_lite")).unwrap();
+        assert_eq!(old, CodexPlanTier::ProLite);
         // Both spellings of ChatGPT Edu, and the Business/Pro Lite composite.
         assert_eq!(
             CodexPlanTier::from_claim("education"),
@@ -1737,6 +1760,7 @@ mod tests {
         }
         for plan in [
             CodexPlanTier::Pro,
+            CodexPlanTier::ProMax,
             CodexPlanTier::Enterprise,
             CodexPlanTier::EnterpriseCbpUsageBased,
         ] {

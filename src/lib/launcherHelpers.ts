@@ -123,6 +123,7 @@ export function recommendedHeadroomTier(
         codexTier === "education"
       ? "max5x"
     : codexTier === "pro" ||
+        codexTier === "promax" ||
         codexTier === "enterprise" ||
         codexTier === "enterprise_cbp_usage_based"
       ? "max20x"

@@ -2590,6 +2590,10 @@ fn is_app_control_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
+        // The same verdict as an NTSTATUS exit code: python.exe exits
+        // STATUS_SYSTEM_INTEGRITY_POLICY_VIOLATION when the policy refuses a
+        // DLL it loads at startup, before printing anything (RUST-SE).
+        || lower.contains("0xc0e90002")
         // Windows localizes the verdict and only `CreateProcess` failures
         // carry the numeric code. When the policy blocks a DLL that Python is
         // importing, CPython reports it as an ImportError with the OS prose
@@ -3878,6 +3882,21 @@ pub(crate) struct UpgradeBootDiagnostics {
     pub pip_output_tail: String,
 }
 
+/// The upgrade died on a pip run the pip runner files under `network`: the
+/// machine's network refused PyPI (a web filter's 403, an offline host).
+fn upgrade_pip_network_refused(err: &anyhow::Error) -> bool {
+    let is_pip = err
+        .chain()
+        .filter_map(|c| c.downcast_ref::<tool_manager::CommandFailure>())
+        .any(|f| f.args.iter().any(|a| a == "pip"));
+    if !is_pip {
+        return false;
+    }
+    let compact = tool_manager::compact_pip_failure(err);
+    let evidence = tool_manager::pip_failure_evidence(err, &compact);
+    tool_manager::pip_failure_category_with_evidence(&compact, &evidence) == "network"
+}
+
 /// Report a runtime upgrade failure to Sentry. `phase` is "install" for
 /// pip/smoke-test failures, "boot_validation" for "installed but didn't boot".
 /// `outcome` is the BootValidationOutcome label when phase is boot_validation.
@@ -3946,7 +3965,10 @@ pub(crate) fn capture_upgrade_failure(
     // diagnostics but at Warning, as the watchdog give-up already does, and
     // groups apart: sharing the defect's fingerprint, an App Control host
     // reopened RUST-29 after its WinError 32 fix had shipped.
-    let level = if endpoint_protection_suspected || loopback_socket_denied {
+    // The network refusing PyPI is the same kind of verdict: a 403 from the
+    // release-train guest's network-deny run reopened RUST-29 on 0.9.47-rc.7.
+    let network_refused = upgrade_pip_network_refused(err);
+    let level = if endpoint_protection_suspected || loopback_socket_denied || network_refused {
         sentry::protocol::Level::Warning
     } else {
         sentry::protocol::Level::Error
@@ -3955,6 +3977,8 @@ pub(crate) fn capture_upgrade_failure(
         "endpoint_protection"
     } else if loopback_socket_denied {
         "loopback_socket_denied"
+    } else if network_refused {
+        "network"
     } else {
         outcome.unwrap_or("none")
     };
@@ -12738,8 +12762,8 @@ mod tests {
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_agent_cli_outdated_hint, learn_agent_limit_hint,
-        learn_agent_unparseable_output_hint, learn_analysis_agent,
+        is_windows_app_control_block, learn_agent_auth_hint, learn_agent_cli_outdated_hint,
+        learn_agent_limit_hint, learn_agent_unparseable_output_hint, learn_analysis_agent,
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
@@ -12754,12 +12778,13 @@ mod tests {
         readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
         resolve_release_updater_config, savings_report, select_updater_endpoints,
         snap_to_work_area_edges, startup_error_fingerprint_key, store_checked_update,
-        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link,
+        upgrade_pip_network_refused, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -17990,6 +18015,17 @@ Some unrelated content.
     }
 
     #[test]
+    fn an_integrity_policy_exit_code_is_an_app_control_block() {
+        // RUST-SE, verbatim reason from the event.
+        let raw = "headroom.exe: exited with status exit code: 0xc0e90002 before opening port 6768";
+        assert!(is_windows_app_control_block(raw));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(raw)),
+            Some("startup_endpoint_protection")
+        );
+    }
+
+    #[test]
     fn is_endpoint_protection_signal_matches_dll_init_failed_exit() {
         let raw = "python.exe: exited with status exit code: 0xc0000142 before opening port 6768";
         assert!(is_endpoint_protection_signal(raw));
@@ -18085,6 +18121,46 @@ Some unrelated content.
         let offline = pip_failure("OSError: [Errno 51] Network is unreachable");
         let hint = classify_upgrade_error(&offline).expect("must classify");
         assert!(hint.contains("PyPI"), "expected network hint, got: {hint}");
+    }
+
+    #[test]
+    fn an_upgrade_the_network_refused_groups_apart_from_the_defects() {
+        let failure = |args: &[&str], stderr: &str| {
+            anyhow::Error::new(crate::tool_manager::CommandFailure {
+                program: "python3".into(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+                stdout: String::new(),
+                stderr: stderr.into(),
+                exit_code: Some(1),
+                signal: None,
+            })
+            .context("repairing stale headroom requirements")
+        };
+        let pip = ["-m", "pip", "install"];
+        // RUST-29 on 0.9.47-rc.7: the release-train guest's network-deny run.
+        let url = "https://files.pythonhosted.org/packages/fb/e2/79c688af8b210d232694e31e59da9f6ec747bae31c3f5946e4e9b98860d5/click-8.4.2-py3-none-any.whl";
+        let forbidden = failure(
+            &pip,
+            &format!(
+                "  ERROR: HTTP error 403 while getting {url} (from https://pypi.org/simple/click/)\n\
+                 ERROR: Could not install requirement click==8.4.2 from {url} because of \
+                 HTTP error 403 Client Error: Forbidden for url: {url}\n"
+            ),
+        );
+        assert!(upgrade_pip_network_refused(&forbidden));
+
+        // The open WinError 32 question must keep reopening RUST-29.
+        let file_lock = failure(
+            &pip,
+            "ERROR: Could not install packages due to an OSError: [WinError 32] The process \
+             cannot access the file because it is being used by another process: \
+             'C:\\v\\Scripts\\headroom.exe'",
+        );
+        assert!(!upgrade_pip_network_refused(&file_lock));
+
+        // Only pip's network words count: a smoke test's stderr is not pip.
+        let smoke = failure(&["-c", "import headroom"], "TimeoutError: timed out");
+        assert!(!upgrade_pip_network_refused(&smoke));
     }
 
     #[test]

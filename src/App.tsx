@@ -101,6 +101,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  withCodexPlanNames,
   higherSubscriptionTier,
   type UpgradePlan,
   introSaleBadgeLabel,
@@ -2080,7 +2081,7 @@ export default function App() {
   // reads a price this render. Idempotent and derived purely from state, so a
   // repeated render (StrictMode) is a no-op.
   setServerPlanPrices(pricingStatus?.planPrices);
-  const upgradePlansState = getUpgradePlans(
+  const rawUpgradePlans = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
     higherSubscriptionTier(
@@ -2106,6 +2107,14 @@ export default function App() {
     pricingStatus?.account?.upgradeAction,
     pricingStatus?.account?.appsumoLifetimeTier
   );
+  const upgradePlansState = {
+    ...rawUpgradePlans,
+    plans: withCodexPlanNames(
+      rawUpgradePlans.plans,
+      pricingStatus?.claude.planTier ?? cachedPricing.planTier,
+      pricingStatus?.codexPlanTier
+    )
+  };
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
   const showInstallProgress =
@@ -4307,7 +4316,7 @@ export default function App() {
         setGatedBypassBytes(bytes);
         unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboardRef.current.dailySavings);
       }
-      void maybeFireTrialNotifications(status);
+      void maybeFireTrialNotifications(status, dashboardRef.current.dailySavings);
       void maybeFireUrgentPricingNotifications(status, unsavedLabel);
       setPricingError(null);
     } catch (error) {
@@ -6159,7 +6168,7 @@ export default function App() {
       .filter((plan): plan is UpgradePlan => plan !== undefined);
     const paywallPlanFit: Record<string, string> = {
       pro: "For Claude Pro or ChatGPT Plus",
-      max5x: "Claude Max x5 & ChatGPT Pro Lite",
+      max5x: "Claude Max x5 & ChatGPT Pro $100",
       max20x: "Claude Max x20 & ChatGPT Pro"
     };
     const signedIn = pricingStatus?.authenticated === true;
@@ -6692,18 +6701,20 @@ export default function App() {
     inUpgradeMoment && paybackPlanId
       ? paybackLabel(recentDailySavings * 30, paybackPlanId, billingPeriod)
       : null;
-  // Item 3 - what the ended trial saved; still there once items 1-2 decay.
+  // Item 3 - what the trial saved (so far, while it runs); still there once
+  // items 1-2 decay.
   const trialSavedLabel =
     pricingStatus?.account &&
-    !pricingStatus.account.trialActive &&
     !pricingStatus.account.subscriptionActive &&
     pricingStatus.account.trialStartedAt &&
-    pricingStatus.account.trialEndsAt
+    (pricingStatus.account.trialEndsAt || pricingStatus.account.trialActive)
       ? trialSavingsLabel(
           dashboard.dailySavings,
           pricingStatus.account.trialStartedAt,
-          pricingStatus.account.trialEndsAt,
-          paybackPlanId
+          pricingStatus.account.trialEndsAt ?? new Date().toISOString(),
+          paybackPlanId,
+          pricingStatus.account.trialActive,
+          upgradePlansState.plans.find((plan) => plan.id === paybackPlanId)?.name
         )
       : null;
   // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
@@ -6893,9 +6904,10 @@ export default function App() {
       return {
         tone: "warning" as const,
         message:
-          usageDaysLeft != null
+          (trialSavedLabel ? `${trialSavedLabel} ` : "") +
+          (usageDaysLeft != null
             ? `${usageDaysLeft} more day${usageDaysLeft === 1 ? "" : "s"} of use left in your trial. Upgrade to continue using Headroom without limits.`
-            : `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`,
+            : `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`),
         actionLabel: "Upgrade",
         onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
       };
@@ -8114,7 +8126,12 @@ export default function App() {
               // The active plan's mismatch already has the metering banner.
               const tierWarning = isActivePlan
                 ? null
-                : underTierWarning(plan.id, pricingStatus?.claude.planTier, pricingStatus?.codexPlanTier);
+                : underTierWarning(
+                    plan.id,
+                    pricingStatus?.claude.planTier,
+                    pricingStatus?.codexPlanTier,
+                    upgradePlansState.plans
+                  );
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}

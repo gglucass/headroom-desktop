@@ -620,6 +620,7 @@ export type CodexPlanTier =
   | "go"
   | "plus"
   | "prolite"
+  | "promax"
   | "pro"
   | "team"
   | "business"

@@ -379,9 +379,9 @@ export async function runAppUpdateInstall({
       if (!STALE_STAGED_UPDATE.test(detail) && !TRANSPORT_FAILURE.test(detail)) {
         throw error;
       }
-      const rechecked = await invokeFn<AvailableAppUpdate | null>("check_for_app_update").catch(
-        () => null
-      );
+      // A failed re-check is the real cause (RUST-HP: a dropped network failed
+      // both the install and the check), so its error is the one reported.
+      const rechecked = await invokeFn<AvailableAppUpdate | null>("check_for_app_update");
       if (rechecked?.version !== availableUpdate.version) {
         throw error;
       }
