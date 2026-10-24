@@ -11508,17 +11508,32 @@ fn kill_pid(pid: u32, force: bool) {
 }
 
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
+    // The bracket names which check refused: the four bails read identically
+    // in Sentry, so RUST-6J could never say which one the field hits.
+    let held = |why: &str| anyhow!("{} [reclaim: {why}]", format_already_running_bail(port));
+    // The orphan can exit between the pre-flight and here: the watchdog's
+    // hung-kill stop waits only on the tracked child, not on the sweep's or
+    // tree kill's other victims, and the readyz probe below takes up to 5s.
+    // A port it let go of needs no reclaim (RUST-6J).
+    let released =
+        || TcpListener::bind(("127.0.0.1", port)).is_ok() && listener_process(port).is_none();
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
-        bail!("{}", format_already_running_bail(port));
+        return Err(held("backend answers /readyz"));
     }
     let Some((_, pid)) = listener_process(port) else {
-        bail!("{}", format_already_running_bail(port));
+        if released() {
+            return Ok(());
+        }
+        return Err(held("no listener pid"));
     };
     // Belt-and-braces identity gate (diagnose_proxy_port already filters, but
     // the upgrade flow reaches here with force set): never kill a pid that
     // doesn't look like our own backend.
     if !pid_is_headroom_backend(pid) {
-        bail!("{}", format_already_running_bail(port));
+        if released() {
+            return Ok(());
+        }
+        return Err(held("listener is not our backend"));
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
@@ -11540,7 +11555,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
             kill_pid(pid, true);
         }
         if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
-            bail!("{}", format_already_running_bail(port));
+            return Err(held("still held 5s after kill"));
         }
     }
 
@@ -21493,6 +21508,19 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// RUST-6J: the watchdog's hung-kill stop does not wait for the orphan to
+    /// die, so it can let go of the port before the reclaim looks. A port
+    /// nobody holds any more is reclaimed, not reported as still running.
+    #[test]
+    fn reclaim_orphan_proxy_accepts_a_port_the_orphan_already_freed() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let result = reclaim_orphan_proxy(port, false);
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
