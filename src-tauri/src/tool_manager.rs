@@ -8739,7 +8739,7 @@ impl ToolManager {
 
     pub fn install_markitdown(&self) -> Result<()> {
         let before = venv_dist_infos(&self.runtime.managed_python());
-        run_pip_install_with_retries_streaming(
+        let installed = run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -8753,7 +8753,10 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| log_pip_line("markitdown pip", line),
-        )?;
+        );
+        // Even after a failure: pip keeps the packages it installed before it.
+        self.remove_olefile();
+        installed?;
         // markitdown's own pins move lock packages below their hashed pins:
         // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
         // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
@@ -8774,7 +8777,6 @@ impl ToolManager {
                 log::warn!("restoring the lock's pins after markitdown failed: {err:#}");
             }
         }
-        self.remove_olefile();
         if !self.markitdown_entrypoint().exists() {
             bail!(
                 "markitdown install completed but {} was not found",
@@ -25993,6 +25995,34 @@ assert OpencodeRegistrar().register_server(own).ok"#,
                 assert!(calls.contains(&entry), "{name}: {calls}");
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// pip keeps what it installed before a failing package, so a failed
+    /// markitdown[all] run can still leave olefile (CVE-2026-112398).
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn install_markitdown_removes_olefile_after_a_failed_install() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-olefile");
+        let log = root.join("argv.log");
+        let site = runtime
+            .venv_dir
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site).expect("site");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *markitdown*) mkdir -p '{site}/olefile-0.47.dist-info'; exit 1;; esac\n",
+                log = log.display(),
+                site = site.display(),
+            ),
+        );
+        manager.install_markitdown().expect_err("pip failed");
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("uninstall -y olefile"), "{calls}");
         let _ = fs::remove_dir_all(root);
     }
 
