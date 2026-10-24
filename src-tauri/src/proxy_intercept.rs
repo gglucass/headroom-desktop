@@ -2225,15 +2225,7 @@ async fn handle(
         "opencode"
     } else if is_grok {
         "grok-build"
-    } else if is_codex
-        // Counters only: OpenAI image calls (user 3966's /v1/images/edits, an
-        // OpenAI moderation 400) filled the claude-code bucket on a host with
-        // no Claude login and paged it as stuck. Routing keeps treating them
-        // as non-Codex, which the backend already sends to OpenAI.
-        || parsed_head
-            .as_ref()
-            .is_some_and(|head| head.path.starts_with("/v1/images/"))
-    {
+    } else if is_codex {
         "codex"
     } else {
         "claude-code"
@@ -3745,8 +3737,8 @@ fn response_content_type(head: &[u8]) -> Option<String> {
 /// `error.type` / `error.code` / `error.param`, never free-text (the
 /// `message` field and raw bodies can quote request content).
 fn codex_error_summary(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(json) => {
+    match error_body_json(body) {
+        Some(json) => {
             let err = json.get("error").unwrap_or(&json);
             let field = |key: &str| err.get(key).and_then(|v| v.as_str());
             let (kind, code, param) = (field("type"), field("code"), field("param"));
@@ -3787,7 +3779,7 @@ fn codex_error_summary(body: &[u8]) -> String {
             )
         }
         // Truncated (peek is bounded) or non-JSON body — report size only.
-        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+        None => format!("unparseable error body ({} bytes)", body.len()),
     }
 }
 
@@ -3848,9 +3840,11 @@ fn plain_server_text(text: &str) -> bool {
 /// has no `error` object), `-` when absent or not identifier-shaped. They key
 /// the `codex-prompts-failing` issue, so a Headroom-caused `internal_error`
 /// run is not resolved together with a provider's `server_error` outage, as
-/// both were inside RUST-NY.
+/// both were inside RUST-NY. The backend's streaming `event: error` frame too:
+/// read as bare JSON, every one keyed `-/-` (RUST-R7 held a TLS-intercepted
+/// `upstream_tls_error` run with a plain-text 500).
 fn codex_error_class(body: &[u8]) -> [String; 2] {
-    let json = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let json = error_body_json(body).unwrap_or_default();
     let err = json.get("error").filter(|e| e.is_object()).unwrap_or(&json);
     ["type", "code"].map(|key| {
         err.get(key)
@@ -5308,6 +5302,11 @@ fn is_openai_path(path: &str) -> bool {
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",
+        // Codex's image tool (the backend's images/generations + edits). Off
+        // this list they went direct to api.anthropic.com with the ChatGPT
+        // token whenever the backend was down, and counted as Claude Code
+        // (user 3966 paged stuck on its OpenAI moderation 400s, 2026-10-23).
+        "/v1/images",
     ];
     OPENAI_PREFIXES.iter().any(|prefix| {
         path.strip_prefix(prefix)
@@ -5849,6 +5848,8 @@ mod tests {
         assert!(is_openai_path("/v1/chat/completions"));
         assert!(is_openai_path("/v1/completions"));
         assert!(is_openai_path("/v1/embeddings"));
+        assert!(is_openai_path("/v1/images/edits"));
+        assert!(is_openai_path("/v1/images/generations"));
         // Anthropic paths must NOT be misrouted to OpenAI.
         assert!(!is_openai_path("/v1/messages"));
         assert!(!is_openai_path("/v1/complete"));
@@ -6987,17 +6988,27 @@ mod tests {
             "claude-code counter should not move for Codex request"
         );
 
-        // Codex's image calls count as Codex, never Claude Code.
+        // Codex's image calls are Codex: forwarded to chatgpt.com, counted
+        // as codex, never sent to Anthropic or counted as Claude Code.
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
         let mut images_client = TcpStream::connect(intercept_addr)
             .await
             .expect("images connect");
         images_client
             .write_all(
-                b"POST /v1/images/edits HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+                b"POST /v1/images/edits HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Length: 0\r\n\r\n",
             )
             .await
             .expect("write images request");
-        read_response(images_client).await;
+        let response = read_response(images_client).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+        assert!(
+            std::str::from_utf8(&response)
+                .unwrap_or("")
+                .starts_with("HTTP/1.1 200"),
+            "expected the image call to forward direct to ChatGPT"
+        );
         let counts_after_images = intercept_request_counts();
         assert_eq!(
             counts_after_images["codex"] - counts_after_codex["codex"],
@@ -9691,6 +9702,16 @@ mod tests {
         );
         assert_eq!(codex_error_class(b""), ["-", "-"]);
         assert_eq!(codex_error_class(b"event: error\ndata: {"), ["-", "-"]);
+        // RUST-R7: the backend's streaming 502 keys on its code, not `-/-`.
+        let tls = b"event: error\ndata: {\"error\":{\"message\":\"m\",\"type\":\"connection_error\",\"code\":\"upstream_tls_error\"}}\n\n";
+        assert_eq!(
+            codex_error_class(tls),
+            ["connection_error", "upstream_tls_error"]
+        );
+        assert_eq!(
+            codex_error_summary(tls),
+            "type=connection_error code=upstream_tls_error param=-"
+        );
         // A value shaped like content never becomes a fingerprint key.
         assert_eq!(
             codex_error_class(br#"{"error":{"type":"my secret prompt"}}"#),

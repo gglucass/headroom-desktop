@@ -1174,6 +1174,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     }
     // Before the re-apply puts the guard back.
     let guard_shape = (silent_failures == [CLAUDE_GUARD_NOT_FOUND]).then(claude_guard_shape);
+    let opencode_shape = (silent_failures == [OPENCODE_BLOCK_NOT_FOUND]).then(opencode_block_shape);
     if let Err(err) = apply_client_setup(client_id) {
         log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
         return false;
@@ -1214,6 +1215,9 @@ fn repair_client_setup_now(client_id: &str) -> bool {
                     scope.set_extra("failures", broken.clone().into());
                     if let Some(shape) = guard_shape {
                         scope.set_extra("guard_shape", shape.into());
+                    }
+                    if let Some(shape) = &opencode_shape {
+                        scope.set_extra("block_shape", shape.clone().into());
                     }
                     scope.set_fingerprint(Some(&[
                         "repair_client_setups",
@@ -3585,7 +3589,7 @@ pub(crate) fn retry_transient_denied<T>(
 /// Retries after the first attempt (see `retry_transient_denied`).
 const TRANSIENT_DENIED_RETRIES: u32 = if cfg!(windows) { 5 } else { 3 };
 
-fn is_transient_denied(err: &std::io::Error) -> bool {
+pub(crate) fn is_transient_denied(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
         || (cfg!(windows) && err.raw_os_error() == Some(32))
 }
@@ -6684,6 +6688,44 @@ fn configure_opencode_provider_block(
         backup_files.push(backup_path.display().to_string());
     }
     Ok((vec![path.display().to_string()], backup_files))
+}
+
+/// What was left of OpenCode's block, in fixed words for Sentry: which file,
+/// whether each provider's base URL is gone or now points at another proxy,
+/// and whether the plugin entry went too (RUST-K2: a Linux host on 0.9.49
+/// lost it twice in a day, with nothing on the event to name the writer).
+fn opencode_block_shape() -> String {
+    let path = opencode_config_path();
+    let file = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    if !path.exists() {
+        return format!("{file} missing");
+    }
+    let Ok(config) = read_opencode_config(&path) else {
+        return format!("{file} unparseable");
+    };
+    let mut parts: Vec<String> = OPENCODE_MANAGED_PROVIDERS
+        .iter()
+        .map(|provider| {
+            let url = match opencode_provider_base_url(&config, provider).as_deref() {
+                Some(HEADROOM_OPENCODE_BASE_URL) => "ours",
+                None => "absent",
+                Some(url) if url.contains("127.0.0.1") || url.contains("localhost") => {
+                    "another local URL"
+                }
+                Some(_) => "a remote URL",
+            };
+            format!("{provider} {url}")
+        })
+        .collect();
+    let plugin = opencode_plugin_install_path().display().to_string();
+    parts.push(if opencode_plugin_array_contains(&config, &plugin) {
+        "plugin entry kept".into()
+    } else {
+        "plugin entry gone".into()
+    });
+    format!("{file}: {}", parts.join(", "))
 }
 
 fn opencode_provider_block_matches() -> Result<bool> {
@@ -16278,6 +16320,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .expect("verify runs")
             .failures;
         assert_eq!(lost, vec![super::OPENCODE_BLOCK_NOT_FOUND.to_string()]);
+        assert_eq!(
+            super::opencode_block_shape(),
+            "opencode.json: anthropic absent, openai absent, plugin entry gone"
+        );
         assert!(!super::repair_pages(&lost), "a first loss does not page");
         assert!(super::repair_pages(&lost), "a repeat within a day pages");
         let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];

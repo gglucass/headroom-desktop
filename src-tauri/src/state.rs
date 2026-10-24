@@ -2520,10 +2520,10 @@ impl AppState {
     }
 
     pub fn dashboard(&self) -> DashboardState {
-        // Callers that take this read-only path (tray updater, bootstrap
-        // finalize, account activation) must NOT drain pending milestones —
-        // doing so silently consumes crossings before `get_dashboard_state`
-        // can fire the aptabase event and the in-app notification.
+        // Callers that take this read-only path (bootstrap finalize, account
+        // activation) must NOT drain pending milestones — doing so silently
+        // consumes crossings before `report_pending_milestones` (lib.rs) can
+        // fire the aptabase event and post them.
         self.build_dashboard(false).0
     }
 
