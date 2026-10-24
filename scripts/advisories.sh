@@ -68,8 +68,8 @@ python() {
   #   No code execution. The other eleven need calls headroom never
   #   makes: Image.transform (112402), ImageFont (112893), rank filters
   #   (112392), GIF save (112891), PDF save (112391/112894/112406), TIFF
-  #   save (112393/112396), MIC n_frames with olefile, which no lock pins
-  #   (112390), and an EPS file name, which a BytesIO lacks (112900).
+  #   save (112393/112396), MIC n_frames, which needs olefile (112390; see
+  #   112398 below), and an EPS file name, which a BytesIO lacks (112900).
   #   Drop all sixteen with the same pillow 13 bump.
   # - Eleven more pillow 12.3.0 advisories published by 2026-10-23, same
   #   fix, same cap (fastembed 0.9.0 still pins <13.0; fastembed PR #830
@@ -88,6 +88,14 @@ python() {
   #   passed an icc_profile (96778; JpegImagePlugin reads it from the
   #   save call's arguments only). Drop all eleven with the same pillow
   #   13 bump.
+  # - CVE-2026-112398 (pillow 12.3.0 FlashPix JPEG-tile heap write, possible
+  #   code execution; same fix, same fastembed cap): pillow registers the
+  #   FPX (and MIC) decoders only when olefile imports. No lock pins it; the
+  #   MarkItDown addon's markitdown[all] (outlook extra) was the only thing
+  #   that installed it, so the app now uninstalls olefile right after a
+  #   MarkItDown install and at launch before the proxy starts
+  #   (ToolManager::remove_olefile). Unreachable from 0.9.49 on. Drop with
+  #   the pillow 13 bump.
   # - CVE-2026-114603 (opentelemetry-api <1.45.1, quadratic regex in
   #   TraceState.from_header): reached only by extracting an inbound W3C
   #   tracestate header. headroom uses OpenTelemetry to export its own
@@ -132,6 +140,7 @@ python() {
       --ignore-vuln CVE-2026-112395 \
       --ignore-vuln CVE-2026-112396 \
       --ignore-vuln CVE-2026-112397 \
+      --ignore-vuln CVE-2026-112398 \
       --ignore-vuln CVE-2026-112399 \
       --ignore-vuln CVE-2026-112400 \
       --ignore-vuln CVE-2026-112401 \

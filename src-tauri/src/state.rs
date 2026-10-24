@@ -868,6 +868,10 @@ impl AppState {
             log::warn!("RTK integrations failed during warm_runtime_on_launch: {err:#}");
         }
 
+        // Before the proxy starts: venvs that got markitdown[all] before
+        // 0.9.49 (or kept olefile after uninstalling it) still hold olefile.
+        self.tool_manager.remove_olefile();
+
         // Pre-wrapper installs still have a bare symlink shim; refresh it so
         // the conversion counter starts recording without a reinstall.
         if self.tool_manager.markitdown_installed() {

@@ -8774,6 +8774,7 @@ impl ToolManager {
                 log::warn!("restoring the lock's pins after markitdown failed: {err:#}");
             }
         }
+        self.remove_olefile();
         if !self.markitdown_entrypoint().exists() {
             bail!(
                 "markitdown install completed but {} was not found",
@@ -8832,6 +8833,31 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Pillow opens FlashPix and MIC images only when olefile imports, and its
+    /// FlashPix decoder has a heap write (CVE-2026-112398) that a crafted
+    /// agent-traffic image reaches through headroom-ai's bare Image.open.
+    /// markitdown[all]'s outlook extra is the only thing that installs olefile,
+    /// and markitdown without it loses .msg conversion only. A dist-info scan
+    /// when olefile is absent, so the launch path can call it every time.
+    pub fn remove_olefile(&self) {
+        let python = self.runtime.managed_python();
+        if !venv_dist_infos(&python)
+            .iter()
+            .any(|d| d.starts_with("olefile-"))
+        {
+            return;
+        }
+        if let Err(err) = run_command_streaming(
+            &python,
+            &["-m", "pip", "uninstall", "-y", "olefile"],
+            &self.runtime.root_dir,
+            Some(PIP_OUTPUT_SILENCE_TIMEOUT),
+            &mut |line: &str| log_pip_line("olefile pip uninstall", line),
+        ) {
+            log::warn!("removing olefile from the runtime venv failed: {err:#}");
+        }
     }
 
     /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
@@ -25925,6 +25951,7 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .join("site-packages");
         fs::create_dir_all(site.join("magika-1.0.3.dist-info")).expect("magika");
         fs::create_dir_all(site.join("onnxruntime-1.27.0.dist-info")).expect("onnxruntime");
+        fs::create_dir_all(site.join("olefile-0.47.dist-info")).expect("olefile");
         write_executable(
             &runtime.managed_python(),
             &format!(
@@ -25952,6 +25979,12 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .expect("magika re-pinned");
         assert!(repin > markitdown, "{calls}");
         assert!(argvs[repin].contains("--no-deps"), "{calls}");
+        // olefile makes pillow's FlashPix decoder reachable (CVE-2026-112398).
+        let olefile = argvs
+            .iter()
+            .position(|a| a.contains("uninstall -y olefile"))
+            .expect("olefile removed");
+        assert!(olefile > markitdown, "{calls}");
         for name in ["magika", "onnxruntime"] {
             let entries = super::lock_entries_named(super::bootstrap_requirements_lock(), name);
             assert!(!entries.is_empty(), "lock pins {name}");
