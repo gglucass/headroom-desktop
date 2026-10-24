@@ -1737,10 +1737,6 @@ select {
   font-size: var(--text-base);
   line-height: 1.3;
   color: var(--text-primary);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 
 .upgrade-trial-callout__button {

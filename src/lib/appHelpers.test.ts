@@ -28,6 +28,7 @@ import {
   unsavedWhileBlockedLabel,
   upgradePlanIntentLabel,
   underTierWarning,
+  type UpgradePlan,
 } from "./appHelpers";
 import type { ClientConnectorStatus, HeadroomAccountProfile, RuntimeStatus } from "./types";
 import type { DailySavingsPoint, IntroOffer } from "./types";
@@ -121,6 +122,10 @@ describe("app helpers", () => {
     );
     expect(trialSavingsLabel([on("2026-09-02", 30, 2_000_000)], start, end, null, true)).toBe(
       "So far in your trial, Headroom has saved you 2M tokens, about $30 at API prices."
+    );
+    // A Codex-only user's card is "Pro 20x"; the line names the card they see.
+    expect(trialSavingsLabel(trial, start, end, "max20x", true, "Pro 20x")).toContain(
+      "Pro 20x is $40/month"
     );
   });
 
@@ -1078,6 +1083,16 @@ describe("underTierWarning", () => {
   it("names ChatGPT when the Codex plan is the bigger one", () => {
     expect(underTierWarning("pro", "pro", "prolite")).toBe(
       "Your ChatGPT plan needs Headroom Max x5. On Pro, weekly limits apply once the grace period ends."
+    );
+  });
+
+  it("uses the card names a Codex-only user sees", () => {
+    const shown = [
+      { id: "pro", name: "Plus" },
+      { id: "max5x", name: "Pro 5x" }
+    ] as UpgradePlan[];
+    expect(underTierWarning("pro", null, "prolite", shown)).toBe(
+      "Your ChatGPT plan needs Headroom Pro 5x. On Plus, weekly limits apply once the grace period ends."
     );
   });
 

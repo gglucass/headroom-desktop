@@ -315,12 +315,14 @@ export function forgoneSavingsLabel(
 /// it can understate, never overstate. `ongoing` words it for a trial still
 /// running: 71% of unpaid Upgrade viewers (28d to 2026-10-23) were mid-trial
 /// and saw no savings figure, while pay rate climbed 5% -> 18% with $ saved.
+/// `planName` is the plan card's shown name (withCodexPlanNames renames it).
 export function trialSavingsLabel(
   daily: DailySavingsPoint[],
   trialStartedAt: string,
   trialEndsAt: string,
   planId: HeadroomSubscriptionTier | null,
-  ongoing = false
+  ongoing = false,
+  planName = upgradePlanIntentLabel(planId)
 ): string | null {
   const from = formatDayKey(new Date(trialStartedAt));
   const to = formatDayKey(new Date(trialEndsAt));
@@ -338,8 +340,8 @@ export function trialSavingsLabel(
   if (months < 1) return saved;
   const covered = months === 1 ? "a month" : `about ${months} months`;
   return ongoing
-    ? `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so your trial has already covered ${covered} of it.`
-    : `${saved} ${upgradePlanIntentLabel(planId)} is ${price.full}/month, so the trial alone covered ${covered} of it.`;
+    ? `${saved} ${planName} is ${price.full}/month, so your trial has already covered ${covered} of it.`
+    : `${saved} ${planName} is ${price.full}/month, so the trial alone covered ${covered} of it.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
@@ -475,19 +477,23 @@ export function scheduledPlanChange(
 // calls for: a subscriber that far under is metered once the tier-mismatch
 // grace runs out (TIER_MISMATCH_GRACE_DAYS in pricing.rs). No day count: a
 // clock already running or clamped is not reset by a change that stays under.
-// Null when no plan is detected or the card covers it.
+// Null when no plan is detected or the card covers it. `plans` are the cards as
+// shown, so a Codex-only user reads the names withCodexPlanNames gave them.
 export function underTierWarning(
   cardTier: UpgradePlanId,
   claudePlanTier: ClaudePlanTier | null | undefined,
-  codexPlanTier: CodexPlanTier | null | undefined
+  codexPlanTier: CodexPlanTier | null | undefined,
+  plans: UpgradePlan[] = []
 ): string | null {
   if (cardTier !== "pro" && cardTier !== "max5x" && cardTier !== "max20x") return null;
   const fromClaude = recommendedHeadroomTier(claudePlanTier, null, null);
   const needed = higherSubscriptionTier(fromClaude, recommendedHeadroomTier(null, codexPlanTier, null));
   if (!needed || TIER_RANK[cardTier] >= TIER_RANK[needed]) return null;
+  const name = (id: UpgradePlanId) =>
+    plans.find((plan) => plan.id === id)?.name ?? upgradePlanIntentLabel(id);
   return (
-    `Your ${needed === fromClaude ? "Claude" : "ChatGPT"} plan needs Headroom ${upgradePlanIntentLabel(needed)}. ` +
-    `On ${upgradePlanIntentLabel(cardTier)}, weekly limits apply once the grace period ends.`
+    `Your ${needed === fromClaude ? "Claude" : "ChatGPT"} plan needs Headroom ${name(needed)}. ` +
+    `On ${name(cardTier)}, weekly limits apply once the grace period ends.`
   );
 }
 

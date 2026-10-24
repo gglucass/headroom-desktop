@@ -6713,7 +6713,8 @@ export default function App() {
           pricingStatus.account.trialStartedAt,
           pricingStatus.account.trialEndsAt ?? new Date().toISOString(),
           paybackPlanId,
-          pricingStatus.account.trialActive
+          pricingStatus.account.trialActive,
+          upgradePlansState.plans.find((plan) => plan.id === paybackPlanId)?.name
         )
       : null;
   // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
@@ -8125,7 +8126,12 @@ export default function App() {
               // The active plan's mismatch already has the metering banner.
               const tierWarning = isActivePlan
                 ? null
-                : underTierWarning(plan.id, pricingStatus?.claude.planTier, pricingStatus?.codexPlanTier);
+                : underTierWarning(
+                    plan.id,
+                    pricingStatus?.claude.planTier,
+                    pricingStatus?.codexPlanTier,
+                    upgradePlansState.plans
+                  );
               return (
                 <article
                   className={`upgrade-plan-card${isFeatured ? " upgrade-plan-card--featured" : ""}${isActivePlan ? " upgrade-plan-card--active" : ""}`}
