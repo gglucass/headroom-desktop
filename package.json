@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.9.49-rc.4",
+  "version": "0.9.49",
   "private": true,
   "type": "module",
   "scripts": {
