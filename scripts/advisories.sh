@@ -96,6 +96,21 @@ python() {
   #   which headroom does not register. The 1.45.1 family adds two packages
   #   to the closure and every lock change re-syncs each install's runtime,
   #   so the bump rides the next lock refresh; drop the ignore with it.
+  # - CVE-2026-114501 (pillow 12.3.0, macOS and Windows locks: heap bytes
+  #   leak through Image.__arrow_c_array__/__arrow_c_schema__ when
+  #   PILLOW_ALIGNMENT > 1): fix 13.0.0, same fastembed <13.0 cap as above.
+  #   Nothing in the runtime hands a PIL image to Arrow (no caller of either
+  #   dunder outside PIL, no pyarrow use in headroom) and nothing sets
+  #   PILLOW_ALIGNMENT or core.set_alignment. Read-only, no code execution.
+  #   Drop with the pillow 13 bump.
+  # - GHSA-xmj3-9gf7-h52w (setuptools 81.0.0, macOS and Windows locks:
+  #   Wheel.install_as_egg writes an __init__.py stub at a path a wheel's
+  #   namespace_packages.txt picks, Windows only): fix 84.1.0, but torch
+  #   2.12.1 requires setuptools<82, so no lock resolves. Reached only by a
+  #   legacy setup_requires egg fetch; nothing outside setuptools and pip
+  #   calls install_as_egg, setuptools.wheel or fetch_build_egg, and the
+  #   runtime installs --only-binary. Drop with the torch 2.13 bump (which
+  #   lifts the cap to >=77.0.3), with PYSEC-2026-3447.
   local py pa targets target status=0
   # The submodule: the repo's own packaging/ dir imports as an empty namespace package.
   if python3 -c 'import packaging.requirements' 2>/dev/null; then py=(python3); else py=(uvx --with packaging python); fi
@@ -145,7 +160,9 @@ python() {
       --ignore-vuln CVE-2026-96643 \
       --ignore-vuln CVE-2026-96644 \
       --ignore-vuln CVE-2026-96778 \
-      --ignore-vuln CVE-2026-114603 || status=1
+      --ignore-vuln CVE-2026-114603 \
+      --ignore-vuln CVE-2026-114501 \
+      --ignore-vuln GHSA-xmj3-9gf7-h52w || status=1
   done
   rm -rf "$targets"
   return "$status"
