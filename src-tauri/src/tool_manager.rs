@@ -8858,7 +8858,13 @@ impl ToolManager {
             Some(PIP_OUTPUT_SILENCE_TIMEOUT),
             &mut |line: &str| log_pip_line("olefile pip uninstall", line),
         ) {
-            log::warn!("removing olefile from the runtime venv failed: {err:#}");
+            // A base that lost a stdlib file fails every pip run, and the start
+            // path discards it for bootstrap to re-fetch (RUST-ST).
+            if is_corrupt_base_stdlib_signal(&format!("{err:#}")) {
+                log::info!("removing olefile skipped, base interpreter is corrupt: {err:#}");
+            } else {
+                log::warn!("removing olefile from the runtime venv failed: {err:#}");
+            }
         }
     }
 
@@ -15021,6 +15027,11 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         || lower.contains("http error")
     {
         "network"
+    } else if is_corrupt_base_stdlib_signal(evidence) {
+        // pip died importing the base stdlib, before it ran (RUST-6S on
+        // 0.9.48: `logging` -> `traceback` -> a quarantined `linecache.py`).
+        // Last, so a traceback can never take a cause the needles above name.
+        "base-stdlib-broken"
     } else {
         "other"
     }
@@ -16336,9 +16347,10 @@ pub(crate) fn onnx_probe_crashed(verdict: &str) -> bool {
 /// That is exactly CPython's layout, where the raising frame is the last
 /// `File "..."` line before the exception.
 pub(crate) fn is_corrupt_base_stdlib_signal(text: &str) -> bool {
-    // Failures of reading, parsing or executing bytes. Import errors are left
-    // out on purpose: a missing or blocked module is Application Control's
-    // signature, and `is_blocked_runtime_dll_signal` owns that class.
+    // Failures of reading, parsing or executing bytes. `ImportError` is left
+    // out on purpose: a blocked stdlib extension (`DLL load failed`) is
+    // Application Control's signature, and `is_blocked_runtime_dll_signal`
+    // owns that class. A `ModuleNotFoundError` is handled below.
     const DAMAGE: &[&str] = &[
         "syntaxerror",
         "indentationerror",
@@ -16355,12 +16367,27 @@ pub(crate) fn is_corrupt_base_stdlib_signal(text: &str) -> bool {
     // Reset by every new frame, so a base frame deeper in the stack cannot
     // lend its verdict to a site-packages frame that raised.
     let mut raised_in_base_stdlib = false;
+    // Whether that frame's source line is a static `import`. The stdlib only
+    // imports the stdlib that way, so a ModuleNotFoundError there means one
+    // of its files is gone, not blocked (RUST-SM: `traceback.py` -> `import
+    // linecache`, and pip and `python -m venv` die on it too). A dynamic
+    // import (importlib, `__import__`) names whatever its caller asked for.
+    // shortcut: a stdlib module imported straight from site-packages raises
+    // in a site-packages frame and is missed; walk the import chain if one
+    // turns up.
+    let mut static_import = false;
     for line in text.lines() {
-        if let Some(frame) = line.trim_start().strip_prefix("file \"") {
+        let line = line.trim_start();
+        if let Some(frame) = line.strip_prefix("file \"") {
             raised_in_base_stdlib = frame.contains("/runtime/python/lib/");
+            static_import = false;
             continue;
         }
-        if raised_in_base_stdlib && DAMAGE.iter().any(|d| line.contains(d)) {
+        static_import |= line.starts_with("import ") || line.starts_with("from ");
+        if raised_in_base_stdlib
+            && (DAMAGE.iter().any(|d| line.contains(d))
+                || static_import && line.starts_with("modulenotfounderror"))
+        {
             return true;
         }
     }
@@ -18945,6 +18972,47 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
              __all__ = (base_events.__all__ +\n\
              NameError: name 'base_events' is not defined";
         assert!(super::is_corrupt_base_stdlib_signal(base_frame_raised));
+    }
+
+    /// RUST-SM/SN/SP verbatim (Windows, 0.9.46): the base stdlib lost
+    /// `linecache.py`, so the proxy, pip and `python -m venv` all died on it,
+    /// and the pip re-sync and the watchdog rebuild could never take.
+    #[test]
+    fn a_stdlib_file_gone_from_the_base_is_a_corrupt_interpreter() {
+        let rust_sm = "Traceback (most recent call last):\n  \
+             File \"<frozen runpy>\", line 112, in _get_module_details\n  \
+             File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages\\\
+             headroom\\_ort.py\", line 40, in <module>\n    import logging\n  \
+             File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\logging\\\
+             __init__.py\", line 26, in <module>\n    \
+             import sys, os, time, io, re, traceback, warnings, weakref, collections.abc\n  \
+             File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\traceback.py\", \
+             line 5, in <module>\n    import linecache\n\
+             ModuleNotFoundError: No module named 'linecache'";
+        assert!(super::is_corrupt_base_stdlib_signal(rust_sm));
+        assert_eq!(
+            crate::startup_error_fingerprint_key(Some(rust_sm)),
+            Some("startup_runtime_missing_stdlib")
+        );
+
+        // A dynamic import from the base stdlib names a package the caller
+        // asked for: a pip problem, not a lost stdlib file.
+        let import_module = "  File \"/h/runtime/python/lib/python3.12/importlib/__init__.py\", \
+             line 90, in import_module\n    \
+             return _bootstrap._gcd_import(name[level:], package, level)\n\
+             ModuleNotFoundError: No module named 'httpcore'";
+        assert!(!super::is_corrupt_base_stdlib_signal(import_module));
+        // CPython 3.12 verbatim: logging.config resolving a handler class.
+        assert!(!super::is_corrupt_base_stdlib_signal(
+            "  File \"/h/runtime/python/lib/python3.12/logging/config.py\", line 101, in \
+             _resolve\n    found = __import__(used)\n            ^^^^^^^^^^^^^^^^\n\
+             ModuleNotFoundError: No module named 'nosuchpkg'"
+        ));
+        // Nor a third-party import that raised in site-packages.
+        assert!(!super::is_corrupt_base_stdlib_signal(
+            "  File \"/h/runtime/venv/lib/python3.12/site-packages/httpx/_transports.py\", \
+             line 3\n    import httpcore\nModuleNotFoundError: No module named 'httpcore'"
+        ));
     }
 
     #[test]
@@ -27062,6 +27130,14 @@ exit 0
                  python.exe -m ensurepip --upgrade --default-pip\nstderr:\n\
                  ImportError: cannot import name 'HTTPSHandler' from 'urllib.request'",
                 "ssl-missing",
+            ),
+            // RUST-6S on 0.9.48, verbatim: the base lost `linecache.py`.
+            (
+                "exit=1; stderr tail:     import sys, os, time, io, re, traceback, warnings, \
+                 weakref, collections.abc\n  File \"~\\AppData\\Local\\Headroom\\headroom\\\
+                 runtime\\python\\Lib\\traceback.py\", line 5, in <module>\n    \
+                 import linecache\nModuleNotFoundError: No module named 'linecache'",
+                "base-stdlib-broken",
             ),
             // The macOS network errnos must not read as a denial: the
             // closing paren in the needle is what keeps 51 out of "permission".

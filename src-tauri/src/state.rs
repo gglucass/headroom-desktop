@@ -9675,6 +9675,21 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
                 .into(),
         );
     }
+    // One stdlib file gone from the base (RUST-SM: `linecache.py`). The start
+    // path already discarded the base, so Retry re-downloads it; if the file
+    // keeps vanishing, the user's antivirus is the likely cause.
+    if crate::tool_manager::is_corrupt_base_stdlib_signal(raw) {
+        let folder = if cfg!(windows) {
+            "%LOCALAPPDATA%\\Headroom"
+        } else {
+            "Headroom's data folder"
+        };
+        return Some(format!(
+            "One of the Python files Headroom's runtime needs went missing, usually because \
+             antivirus moved it to quarantine. Click Retry and Headroom downloads a fresh copy. \
+             If it happens again, add {folder} as an exclusion in your antivirus."
+        ));
+    }
     // `encodings` is the first stdlib module CPython imports; its absence is
     // the base runtime's `Lib` tree being gone while `python.exe` survived
     // (RUST-C8). Same remedy as a missing headroom.* module, and the
@@ -12459,6 +12474,25 @@ mod tests {
         assert!(hint.contains("Reinstall"));
         // Must win over the generic crash branch (which also matches this raw).
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
+    }
+
+    #[test]
+    fn classify_startup_error_names_antivirus_for_a_lost_stdlib_file() {
+        // RUST-SM verbatim shape: the base lost `linecache.py`. Without its own
+        // branch it read as a pip package and got the generic reinstall hint.
+        let raw = "unable to keep headroom running in background: \
+            C:\\U\\venv\\Scripts\\python.exe -m headroom.proxy.server --port 6768 exited with \
+            status exit code: 1 before opening port 6768\n--- log tail ---\n  \
+            File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\traceback.py\", \
+            line 5, in <module>\n    import linecache\n\
+            ModuleNotFoundError: No module named 'linecache'\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("lost stdlib file should classify");
+        assert!(hint.contains("antivirus"), "got: {hint}");
+        assert!(hint.contains("Retry"), "got: {hint}");
+        assert!(
+            !hint.contains("missing some of its own files"),
+            "got: {hint}"
+        );
     }
 
     #[test]

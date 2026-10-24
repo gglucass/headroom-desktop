@@ -3432,9 +3432,14 @@ pub(crate) fn startup_error_fingerprint_key(
         Some("startup_loopback_socket_denied")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
-    } else if err.contains("No module named 'encodings'") || err.contains("init_fs_encoding") {
+    } else if err.contains("No module named 'encodings'")
+        || err.contains("init_fs_encoding")
+        || crate::tool_manager::is_corrupt_base_stdlib_signal(err)
+    {
         // The base interpreter kept python.exe but lost its stdlib (RUST-C8,
-        // third shape). `headroom_installed` already routes the next launch
+        // third shape), or one file of it (RUST-SM: `linecache`, which
+        // `missing_dependency_modules` would file as a pip package).
+        // `headroom_installed` already routes the next launch
         // back to bootstrap's re-download, so this is a distinct cause with a
         // distinct remedy and does not belong in the exit-1 bucket.
         Some("startup_runtime_missing_stdlib")
@@ -3968,7 +3973,16 @@ pub(crate) fn capture_upgrade_failure(
     // The network refusing PyPI is the same kind of verdict: a 403 from the
     // release-train guest's network-deny run reopened RUST-29 on 0.9.47-rc.7.
     let network_refused = upgrade_pip_network_refused(err);
-    let level = if endpoint_protection_suspected || loopback_socket_denied || network_refused {
+    // A base interpreter that lost a stdlib file fails every pip run through
+    // it; the start path discards it for bootstrap to re-fetch and files
+    // `startup_runtime_missing_stdlib`. One AV-hit host reopened RUST-29 on
+    // 0.9.48 three times in seven minutes.
+    let corrupt_base = tool_manager::is_corrupt_base_stdlib_signal(&technical_err);
+    let level = if endpoint_protection_suspected
+        || loopback_socket_denied
+        || network_refused
+        || corrupt_base
+    {
         sentry::protocol::Level::Warning
     } else {
         sentry::protocol::Level::Error
@@ -3979,6 +3993,8 @@ pub(crate) fn capture_upgrade_failure(
         "loopback_socket_denied"
     } else if network_refused {
         "network"
+    } else if corrupt_base {
+        "corrupt_base_stdlib"
     } else {
         outcome.unwrap_or("none")
     };
@@ -18157,6 +18173,17 @@ Some unrelated content.
              'C:\\v\\Scripts\\headroom.exe'",
         );
         assert!(!upgrade_pip_network_refused(&file_lock));
+        let corrupt = |e: &anyhow::Error| {
+            crate::tool_manager::is_corrupt_base_stdlib_signal(&format!("{e:#}"))
+        };
+        assert!(!corrupt(&file_lock));
+        // RUST-29 on 0.9.48: pip died on a base that lost `linecache.py`.
+        assert!(corrupt(&failure(
+            &pip,
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\traceback.py\", \
+             line 5, in <module>\n    import linecache\n\
+             ModuleNotFoundError: No module named 'linecache'\n",
+        )));
 
         // Only pip's network words count: a smoke test's stderr is not pip.
         let smoke = failure(&["-c", "import headroom"], "TimeoutError: timed out");
