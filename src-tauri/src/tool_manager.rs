@@ -16038,8 +16038,10 @@ fn is_outdated_claude_manifest(err: &anyhow::Error) -> bool {
 /// True when every registrar an MCP helper's exit line names (`codex: <why>;
 /// claude: <why>`) failed on a config file the user broke, which the client
 /// that owns it cannot read either (RUST-R6: `~/.codex/config.toml is not valid
-/// TOML`, retried and reported on every launch). One real failure beside it
-/// still reports.
+/// TOML`, retried and reported on every launch). Wheel 0.41.0's marker-span
+/// rewrite refuses a parseable file it cannot rewrite safely as `does not
+/// parse, or the Headroom block holds entries...`, same class. One real
+/// failure beside it still reports.
 fn mcp_helper_failed_on_user_config(stderr: &str) -> bool {
     let Some(line) = stderr.lines().rev().find(|line| !line.trim().is_empty()) else {
         return false;
@@ -16050,8 +16052,14 @@ fn mcp_helper_failed_on_user_config(stderr: &str) -> bool {
             usize::from(line.starts_with(name)) + line.matches(&format!("; {name}")).count()
         })
         .sum();
-    let unparseable =
-        line.matches(" is not valid TOML").count() + line.matches(" is not valid JSON").count();
+    let unparseable = [
+        " is not valid TOML",
+        " is not valid JSON",
+        " does not parse, or the Headroom block holds",
+    ]
+    .iter()
+    .map(|reason| line.matches(reason).count())
+    .sum::<usize>();
     failures > 0 && failures == unparseable
 }
 
@@ -19757,6 +19765,10 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         assert!(user_config(&format!("Traceback noise\n{toml}\n")));
         let json = "opencode: /Users/u/.config/opencode/opencode.json exists but is not valid JSON (Expecting ',' delimiter: line 3 column 5 (char 40)); fix it by hand";
         assert!(user_config(&format!("{toml}; {json}")));
+        // RUST-R6 on wheel 0.41.0: a parseable file the span rewrite refuses.
+        let span = "codex: /Users/u/.codex/config.toml does not parse, or the Headroom block holds entries Headroom could not move out safely; refusing to rewrite it.";
+        assert!(user_config(span));
+        assert!(!user_config(&format!("{span}; claude: removal failed")));
         assert!(!user_config(&format!("{toml}; claude: removal failed")));
         assert!(!user_config("codex: removal failed"));
         assert!(!user_config(""));
