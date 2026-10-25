@@ -4427,14 +4427,18 @@ fn claude_direct_base(default: &str, header_buf: &[u8]) -> Option<String> {
 /// put in `x-headroom-base-url` (the intercept stamps Grok's the same way), and
 /// the provider's own path in `x-headroom-original-path` when the plugin
 /// normalized it to /v1/chat/completions or /v1/responses. Takes both headers,
-/// and our X-Client stamp, out of `buf`: they are for the backend, and the
-/// provider gets what the client would have sent it without Headroom.
+/// the 0.41.0 plugin's project and session-token headers, and our X-Client
+/// stamp out of `buf`: they are for the backend (which strips every
+/// `x-headroom-*` upstream), and the provider gets what the client would have
+/// sent it without Headroom.
 fn take_plugin_route(buf: &mut Vec<u8>) -> Option<(String, Option<String>)> {
     let origin = extract_header_value(buf, "x-headroom-base-url")?;
     let original_path = extract_header_value(buf, "x-headroom-original-path");
     for name in [
         "x-headroom-base-url",
         "x-headroom-original-path",
+        "x-headroom-project",
+        "x-headroom-session-token",
         "x-client",
     ] {
         strip_request_header(buf, name);
@@ -8972,8 +8976,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn plugin_routed_requests_go_direct_to_their_own_upstream() {
-        // The provider's own URL, without Headroom's headers.
-        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        // The provider's own URL, without Headroom's headers (the 0.41.0
+        // plugin adds the project and, when set, a session token).
+        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nx-headroom-project: /Users/u/secret-repo\r\nx-headroom-session-token: hst_1\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
         let (origin, original) = take_plugin_route(&mut buf).expect("plugin-routed");
         assert_eq!(
             plugin_direct_url(&origin, original.as_deref(), "/v1/chat/completions?alt=sse")
@@ -8985,6 +8990,8 @@ mod tests {
         for name in [
             "x-headroom-base-url",
             "x-headroom-original-path",
+            "x-headroom-project",
+            "x-headroom-session-token",
             "x-client",
         ] {
             assert!(
