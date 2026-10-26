@@ -4,57 +4,6 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// src/retrieve.ts
-var _proxyUrlCache = null;
-function getDefaultProxyUrl() {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
-}
-function createHeadroomRetrieveTool(config2) {
-  const origin = config2.proxyBaseUrl.replace(/\/+$/, "");
-  return {
-    name: "headroom_retrieve",
-    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
-    parameters: {
-      type: "object",
-      properties: {
-        hash: {
-          type: "string",
-          description: "The 24-character hex hash from the compression marker"
-        }
-      },
-      required: ["hash"]
-    },
-    execute: async (args) => {
-      const { hash: hash2 } = args;
-      if (!/^[a-f0-9]{24}$/i.test(hash2)) {
-        return JSON.stringify({
-          error: "Invalid hash format. Expected 24 hex characters."
-        });
-      }
-      try {
-        const url2 = `${origin}/v1/retrieve/${hash2}`;
-        const resp = await fetch(url2, {
-          signal: AbortSignal.timeout(1e4)
-        });
-        if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
-          return JSON.stringify({
-            error: `Retrieval failed: HTTP ${resp.status}`,
-            details: body
-          });
-        }
-        const data = await resp.json();
-        return typeof data === "string" ? data : JSON.stringify(data);
-      } catch (error45) {
-        return JSON.stringify({
-          error: `Retrieval failed: ${error45}`,
-          hint: "The compressed content may have expired (default TTL: 30 minutes)"
-        });
-      }
-    }
-  };
-}
-
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
@@ -12477,6 +12426,62 @@ function tool(input) {
 }
 tool.schema = external_exports;
 
+// src/retrieve.ts
+var _proxyUrlCache = null;
+function getDefaultProxyUrl() {
+  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+}
+function trimTrailingSlashes(value) {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+function createHeadroomRetrieveTool(config2) {
+  const origin = trimTrailingSlashes(config2.proxyBaseUrl);
+  return {
+    name: "headroom_retrieve",
+    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
+    parameters: {
+      type: "object",
+      properties: {
+        hash: {
+          type: "string",
+          description: "The 24-character hex hash from the compression marker"
+        }
+      },
+      required: ["hash"]
+    },
+    execute: async (args) => {
+      const { hash: hash2 } = args;
+      if (!/^[a-f0-9]{24}$/i.test(hash2)) {
+        return JSON.stringify({
+          error: "Invalid hash format. Expected 24 hex characters."
+        });
+      }
+      try {
+        const url2 = `${origin}/v1/retrieve/${hash2}`;
+        const resp = await fetch(url2, {
+          signal: AbortSignal.timeout(1e4)
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          return JSON.stringify({
+            error: `Retrieval failed: HTTP ${resp.status}`,
+            details: body
+          });
+        }
+        const data = await resp.json();
+        return typeof data === "string" ? data : JSON.stringify(data);
+      } catch (error45) {
+        return JSON.stringify({
+          error: `Retrieval failed: ${error45}`,
+          hint: "The compressed content may have expired (default TTL: 30 minutes)"
+        });
+      }
+    }
+  };
+}
+
 // src/transport.ts
 import { createRequire, syncBuiltinESMExports } from "module";
 var nodeRequire = createRequire(import.meta.url);
@@ -12484,9 +12489,13 @@ var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
 var http2 = nodeRequire("node:http2");
 var childProcess = nodeRequire("node:child_process");
+var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+var PROJECT_HEADER = "x-headroom-project";
+var SESSION_TOKEN_HEADER = "x-headroom-session-token";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
+var EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
   return globalThis[STATE_KEY];
@@ -12495,7 +12504,8 @@ function setState(state) {
   globalThis[STATE_KEY] = state;
 }
 function shimImportSpecifier() {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : void 0;
 }
 function withNodeImportOption(existing, shim) {
   const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
@@ -12507,24 +12517,42 @@ function withNodeImportOption(existing, shim) {
   }
   return parts.join(" ");
 }
-function withShimEnv(env, proxyUrl) {
+function withExcludeHostsEnv(env, excludeHosts) {
+  if (excludeHosts.length > 0) {
+    env[EXCLUDE_HOSTS_ENV] = excludeHosts.join(",");
+  } else {
+    delete env[EXCLUDE_HOSTS_ENV];
+  }
+}
+function withShimEnv(env, proxyUrl, excludeHosts) {
   const nextEnv = { ...env ?? process.env };
   nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
+  withExcludeHostsEnv(nextEnv, excludeHosts);
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
-function installProcessEnv(proxyUrl) {
+function installProcessEnv(proxyUrl, excludeHosts) {
   process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
+  withExcludeHostsEnv(process.env, excludeHosts);
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
 }
-function injectOptionsEnv(args, optionIndex, proxyUrl) {
+function injectOptionsEnv(args, optionIndex, state) {
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, proxyUrl);
+  existing.env = withShimEnv(existing.env, state.proxyUrl, state.excludeHosts);
+  if (process.platform === "win32" && existing.windowsHide === void 0) {
+    existing.windowsHide = true;
+  }
   if (isOptions(nextArgs[optionIndex])) {
     nextArgs[optionIndex] = existing;
   } else {
@@ -12542,7 +12570,7 @@ function wrapSpawn(originalSpawn) {
       return Reflect.apply(originalSpawn, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapExec(originalExec) {
@@ -12551,7 +12579,7 @@ function wrapExec(originalExec) {
     if (!state) {
       return Reflect.apply(originalExec, this, args);
     }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
+    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
   };
 }
 function wrapExecFile(originalExecFile) {
@@ -12561,7 +12589,7 @@ function wrapExecFile(originalExecFile) {
       return Reflect.apply(originalExecFile, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function wrapFork(originalFork) {
@@ -12571,7 +12599,7 @@ function wrapFork(originalFork) {
       return Reflect.apply(originalFork, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   };
 }
 function normalizeProxyUrl(proxyUrl) {
@@ -12581,7 +12609,24 @@ function isLoopback(hostname3) {
   const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
-function shouldRoute(url2, proxy) {
+function normalizeExcludeHosts(entries) {
+  const hosts = /* @__PURE__ */ new Set();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    if (host) {
+      hosts.add(host);
+    }
+  }
+  return [...hosts];
+}
+function isExcludedHost(hostname3, excludeHosts) {
+  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
+  return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
+}
+function isLlmEndpointPath(pathname) {
+  return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
+}
+function isRoutableUpstream(url2, proxy, excludeHosts) {
   if (url2.protocol !== "http:" && url2.protocol !== "https:") {
     return false;
   }
@@ -12591,7 +12636,20 @@ function shouldRoute(url2, proxy) {
   if (url2.origin === proxy.origin) {
     return false;
   }
+  if (isExcludedHost(url2.hostname, excludeHosts)) {
+    return false;
+  }
   return true;
+}
+function shouldRoute(url2, proxy, excludeHosts) {
+  return isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
+}
+function modelBaseRoutesThroughProxy(baseUrl, proxyUrl, excludeHosts = []) {
+  try {
+    return isRoutableUpstream(new URL(baseUrl), normalizeProxyUrl(proxyUrl), excludeHosts);
+  } catch {
+    return false;
+  }
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -12627,7 +12685,7 @@ function requestUrl(input) {
   }
   return new URL(String(input));
 }
-function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
+function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project = void 0, sessionToken = void 0) {
   const headers = new Headers(input instanceof Request ? input.headers : void 0);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -12639,17 +12697,23 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
+  }
   return headers;
 }
-function withRoutedFetchInput(input, init, proxy) {
+function withRoutedFetchInput(input, init, proxy, project, excludeHosts, sessionToken) {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy)) {
+  if (!shouldRoute(upstream, proxy, excludeHosts)) {
     return [input, init];
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath)
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project, sessionToken)
   };
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
@@ -12695,11 +12759,17 @@ function urlFromRequestOptions(options) {
     return void 0;
   }
 }
-function headersForNodeRequest(options, upstream, originalPath) {
+function headersForNodeRequest(options, upstream, originalPath, project, sessionToken) {
   const headers = new Headers(options.headers);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
+  if (sessionToken) {
+    headers.set(SESSION_TOKEN_HEADER, sessionToken);
   }
   headers.delete("host");
   const result = {};
@@ -12708,8 +12778,8 @@ function headersForNodeRequest(options, upstream, originalPath) {
   });
   return result;
 }
-function routedNodeOptions(parts, proxy) {
-  if (!parts.url || !shouldRoute(parts.url, proxy)) {
+function routedNodeOptions(parts, proxy, project, excludeHosts, sessionToken) {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return void 0;
   }
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
@@ -12739,7 +12809,7 @@ function routedNodeOptions(parts, proxy) {
     hostname: nextUrl.hostname,
     port: nextUrl.port || void 0,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath)
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project, sessionToken)
   };
 }
 function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
@@ -12750,7 +12820,7 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     }
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts, state.sessionToken);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -12767,33 +12837,30 @@ function wrapGet(request) {
   };
 }
 function wrapHttp2Connect(originalConnect) {
-  return function headroomHttp2Connect(authority, ...args) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. Use fetch, http, or https so traffic can be routed through Headroom.`
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  return function headroomHttp2Connect(...args) {
+    return Reflect.apply(originalConnect, this, args);
   };
 }
 function installHeadroomTransport(options) {
+  const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
   const existing = getState();
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
+    existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
-    installProcessEnv(options.proxyUrl);
+    existing.sessionToken = options.sessionToken;
+    installProcessEnv(options.proxyUrl, excludeHosts);
     return () => uninstallHeadroomTransport();
   }
   const state = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
+    excludeHosts,
     debug: Boolean(options.debug),
+    sessionToken: options.sessionToken,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -12806,14 +12873,14 @@ function installHeadroomTransport(options) {
     originalChildFork: childProcess.fork
   };
   setState(state);
-  installProcessEnv(options.proxyUrl);
+  installProcessEnv(options.proxyUrl, excludeHosts);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts, current.sessionToken);
     return state.originalFetch(nextInput, nextInit);
   };
   http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
@@ -12852,21 +12919,70 @@ function uninstallHeadroomTransport() {
 }
 
 // src/plugin.ts
+var HEADROOM_PLUGIN_ID = "headroom";
 function normalizeProxyUrl2(url2) {
-  return url2.replace(/\/+$/, "");
+  return trimTrailingSlashes(url2);
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
     options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
   );
 }
+function resolveSessionToken(options) {
+  return options?.sessionToken ?? process.env.HEADROOM_OPENCODE_SESSION_TOKEN;
+}
+function resolveExcludeHosts(options) {
+  return normalizeExcludeHosts(options?.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+}
+function headroomShellEnv(proxyUrl, project, options) {
+  return {
+    HEADROOM_ACTIVE: "1",
+    HEADROOM_PROXY_URL: proxyUrl,
+    HEADROOM_PROJECT: project,
+    ...options.backend ? { HEADROOM_BACKEND: options.backend } : {}
+  };
+}
+function openAiWireSuffix(pkg) {
+  if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
+  if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
+    return "/chat/completions";
+  }
+  if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
+  return void 0;
+}
+function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken) {
+  for (const model of models.list()) {
+    const providerID = String(model.providerID);
+    const modelID = String(model.id);
+    const provider = models.provider.get(providerID)?.provider;
+    const suffix = openAiWireSuffix(model.package ?? provider?.package);
+    const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
+    if (!suffix || typeof baseURL !== "string") continue;
+    if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
+    const upstream = new URL(baseURL);
+    models.update(providerID, modelID, (draft) => {
+      draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
+      draft.headers = {
+        ...draft.headers,
+        [BASE_URL_HEADER]: upstream.origin,
+        [ORIGINAL_PATH_HEADER]: `${trimTrailingSlashes(upstream.pathname)}${suffix}`,
+        [PROJECT_HEADER]: project,
+        ...sessionToken ? { [SESSION_TOKEN_HEADER]: sessionToken } : {}
+      };
+    });
+  }
+}
 var HeadroomPlugin = async (input, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project = pluginOptions.project ?? input.project?.id ?? input.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
-    debug: pluginOptions.debug
+    project,
+    excludeHosts: pluginOptions.excludeHosts,
+    debug: pluginOptions.debug,
+    sessionToken: resolveSessionToken(pluginOptions)
   });
   return {
     dispose: async () => {
@@ -12884,27 +13000,58 @@ var HeadroomPlugin = async (input, options = {}) => {
       })
     },
     "shell.env": async (_input, output) => {
-      output.env.HEADROOM_ACTIVE = "1";
-      output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT = pluginOptions.project ?? input.project.id ?? input.directory;
-      if (pluginOptions.backend) {
-        output.env.HEADROOM_BACKEND = pluginOptions.backend;
-      }
+      Object.assign(output.env, headroomShellEnv(proxyUrl, project, pluginOptions));
     }
   };
 };
-var plugin_default = HeadroomPlugin;
-
-// src/entry.desktop.ts
-var DESKTOP_PROXY_URL = "http://127.0.0.1:6767";
-var HeadroomDesktopPlugin = async (input, options = {}) => {
-  const desktopOptions = {
-    proxyUrl: process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? DESKTOP_PROXY_URL,
-    ...options
+var headroomSetup = async (ctx) => {
+  const pluginOptions = ctx.options;
+  const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project = pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
+  const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
+  const excludeHosts = resolveExcludeHosts(pluginOptions);
+  const sessionToken = resolveSessionToken(pluginOptions);
+  const uninstallTransport = installHeadroomTransport({
+    proxyUrl,
+    project,
+    excludeHosts,
+    debug: pluginOptions.debug,
+    sessionToken
+  });
+  try {
+    await ctx.model.transform((models) => {
+      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts, sessionToken);
+    });
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: retrieveTool.name,
+        description: retrieveTool.description,
+        input: retrieveTool.parameters,
+        // Offer the tool directly, like OpenCode's built-ins, rather than only
+        // through the code-mode `execute` tool.
+        options: { codemode: false },
+        async execute(args) {
+          return { content: await retrieveTool.execute(args) };
+        }
+      });
+    });
+    await ctx.shell.hook("create.before", (shell) => {
+      Object.assign(shell.env, headroomShellEnv(proxyUrl, project, pluginOptions));
+    });
+  } catch (error45) {
+    uninstallTransport();
+    throw error45;
+  }
+  return () => {
+    uninstallTransport();
   };
-  return plugin_default(input, desktopOptions);
 };
-var entry_desktop_default = HeadroomDesktopPlugin;
+var HeadroomOpenCodePlugin = {
+  id: HEADROOM_PLUGIN_ID,
+  server: HeadroomPlugin,
+  setup: headroomSetup
+};
+var plugin_default = HeadroomOpenCodePlugin;
 export {
-  entry_desktop_default as default
+  plugin_default as default
 };

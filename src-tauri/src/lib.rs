@@ -997,38 +997,48 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
         .sum();
 }
 
+/// Posts the milestones `build_dashboard` found due, with the savings snapshot
+/// whose per-day rows carry the stuck-host alert's request and failure counts.
+fn report_pending_milestones(
+    app: &AppHandle,
+    state: &AppState,
+    dashboard: &DashboardState,
+    pending_milestones: &state::PendingMilestones,
+) {
+    let report = (!pending_milestones.token.is_empty()
+        || pending_milestones.cumulative_report.is_some())
+    .then(|| savings_report(dashboard))
+    .flatten();
+
+    for milestone_tokens_saved in &pending_milestones.token {
+        analytics::track_event(
+            app,
+            "lifetime_tokens_saved_milestone_reached",
+            Some(json!({
+                "milestone_tokens_saved": *milestone_tokens_saved,
+                "milestone_millions": milestone_tokens_saved / 1_000_000,
+                "milestone_kind": lifetime_token_milestone_kind(*milestone_tokens_saved),
+                "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
+                "lifetime_requests": dashboard.lifetime_requests,
+                "launch_count": state.launch_count(),
+                "launch_experience": state.launch_experience_label()
+            })),
+        );
+        pricing::report_milestone(*milestone_tokens_saved, report.as_ref());
+    }
+
+    if let Some(total) = pending_milestones.cumulative_report {
+        pricing::report_milestone(total, report.as_ref());
+    }
+}
+
 #[tauri::command]
 async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
         let (mut dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
-
-        // Built from the REAL dashboard, before the demo-data injector below.
-        let report = (!pending_milestones.token.is_empty()
-            || pending_milestones.cumulative_report.is_some())
-        .then(|| savings_report(&dashboard))
-        .flatten();
-
-        for milestone_tokens_saved in &pending_milestones.token {
-            analytics::track_event(
-                &app,
-                "lifetime_tokens_saved_milestone_reached",
-                Some(json!({
-                    "milestone_tokens_saved": *milestone_tokens_saved,
-                    "milestone_millions": milestone_tokens_saved / 1_000_000,
-                    "milestone_kind": lifetime_token_milestone_kind(*milestone_tokens_saved),
-                    "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
-                    "lifetime_requests": dashboard.lifetime_requests,
-                    "launch_count": state.launch_count(),
-                    "launch_experience": state.launch_experience_label()
-                })),
-            );
-            pricing::report_milestone(*milestone_tokens_saved, report.as_ref());
-        }
-
-        if let Some(total) = pending_milestones.cumulative_report {
-            pricing::report_milestone(total, report.as_ref());
-        }
+        // From the REAL dashboard, before the demo-data injector below.
+        report_pending_milestones(&app, &state, &dashboard, &pending_milestones);
 
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
@@ -3432,9 +3442,14 @@ pub(crate) fn startup_error_fingerprint_key(
         Some("startup_loopback_socket_denied")
     } else if is_port_conflict_failure(err) {
         Some("startup_port_conflict")
-    } else if err.contains("No module named 'encodings'") || err.contains("init_fs_encoding") {
+    } else if err.contains("No module named 'encodings'")
+        || err.contains("init_fs_encoding")
+        || crate::tool_manager::is_corrupt_base_stdlib_signal(err)
+    {
         // The base interpreter kept python.exe but lost its stdlib (RUST-C8,
-        // third shape). `headroom_installed` already routes the next launch
+        // third shape), or one file of it (RUST-SM: `linecache`, which
+        // `missing_dependency_modules` would file as a pip package).
+        // `headroom_installed` already routes the next launch
         // back to bootstrap's re-download, so this is a distinct cause with a
         // distinct remedy and does not belong in the exit-1 bucket.
         Some("startup_runtime_missing_stdlib")
@@ -3968,7 +3983,16 @@ pub(crate) fn capture_upgrade_failure(
     // The network refusing PyPI is the same kind of verdict: a 403 from the
     // release-train guest's network-deny run reopened RUST-29 on 0.9.47-rc.7.
     let network_refused = upgrade_pip_network_refused(err);
-    let level = if endpoint_protection_suspected || loopback_socket_denied || network_refused {
+    // A base interpreter that lost a stdlib file fails every pip run through
+    // it; the start path discards it for bootstrap to re-fetch and files
+    // `startup_runtime_missing_stdlib`. One AV-hit host reopened RUST-29 on
+    // 0.9.48 three times in seven minutes.
+    let corrupt_base = tool_manager::is_corrupt_base_stdlib_signal(&technical_err);
+    let level = if endpoint_protection_suspected
+        || loopback_socket_denied
+        || network_refused
+        || corrupt_base
+    {
         sentry::protocol::Level::Warning
     } else {
         sentry::protocol::Level::Error
@@ -3979,6 +4003,8 @@ pub(crate) fn capture_upgrade_failure(
         "loopback_socket_denied"
     } else if network_refused {
         "network"
+    } else if corrupt_base {
+        "corrupt_base_stdlib"
     } else {
         outcome.unwrap_or("none")
     };
@@ -7489,11 +7515,54 @@ fn spawn_crash_guard() {
     // RUST-M9: Windows denied this spawn (os error 5) on the first launch of a
     // freshly installed build, the scanner hold persisted writes retry through.
     match client_adapters::retry_transient_denied(|| spawn_crash_guard_process(&exe)) {
+        // 0.9.49's first launches showed the hold can outlast those ~1.5s:
+        // keep trying off the launch path rather than run unguarded.
+        Err(err) if client_adapters::is_transient_denied(&err) => {
+            std::thread::spawn(move || {
+                keep_crash_guard(retry_denied_after(&CRASH_GUARD_LATE_RETRIES, err, || {
+                    spawn_crash_guard_process(&exe)
+                }))
+            });
+        }
+        other => keep_crash_guard(other),
+    }
+}
+
+/// About two minutes of late retries for the crash guard's spawn.
+const CRASH_GUARD_LATE_RETRIES: [std::time::Duration; 6] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+];
+
+fn keep_crash_guard<P>(pipe: std::io::Result<P>) {
+    match pipe {
         // Never written to and never closed: the OS closes it when we die,
         // and that is the guard's signal.
         Ok(pipe) => std::mem::forget(pipe),
         Err(err) => log::warn!("crash guard: failed to start: {err}"),
     }
+}
+
+/// Retries `op` after each delay while it keeps failing with a transient
+/// denial (`client_adapters::is_transient_denied`), starting from `err`.
+fn retry_denied_after<T>(
+    delays: &[std::time::Duration],
+    err: std::io::Error,
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut result = Err(err);
+    for delay in delays {
+        match &result {
+            Err(err) if client_adapters::is_transient_denied(err) => std::thread::sleep(*delay),
+            _ => break,
+        }
+        result = op();
+    }
+    result
 }
 
 /// Detached like the relauncher (`spawn_detached`), which a quitting macOS app
@@ -9480,12 +9549,17 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 /// So is a model the user's Codex config selects that their ChatGPT plan
 /// does not include (RUST-NM: `ERROR: {"detail":"The 'gpt-5.6-sol' model is
 /// not supported when using Codex with a ChatGPT account."}`).
+///
+/// And Codex's own RUST-DE: a CLI older than the model its config selects
+/// (RUST-SV: `ERROR: {"detail":"The 'gpt-6-astra' model requires a newer
+/// version of Codex. Please upgrade to the latest app or CLI and try again."}`).
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     lowered.contains("unrecognized_model")
         || lowered.contains("does not support this model")
         || lowered.contains("issue with the selected model")
         || lowered.contains("model is not supported when using codex")
+        || lowered.contains("requires a newer version of codex")
 }
 
 /// True when a `headroom learn` failure was the agent CLI exhausting its own
@@ -11825,7 +11899,12 @@ fn spawn_tray_savings_updater(app: AppHandle) {
     // first 20s after launch.
     std::thread::spawn(move || loop {
         let state: tauri::State<'_, AppState> = app.state();
-        let dashboard = state.dashboard();
+        // Drains the heartbeat too: the Home poll runs only while a window is
+        // visible, so a menu-bar user uploaded their day's rows once per launch.
+        // User 2157's 0.9.42 sent none for three days of 86% failed Codex
+        // requests, and the stuck-host alert never saw them (2026-10-24).
+        let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
+        report_pending_milestones(&app, &state, &dashboard, &pending_milestones);
         let today_key = Local::now().format("%Y-%m-%d").to_string();
         // Both Headroom layers, matching the home chart's headline total.
         let savings = dashboard
@@ -17002,6 +17081,10 @@ Some unrelated content.
         assert!(learn_failure_is_agent_model_rejected(
             "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\nERROR: {\"detail\":\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\"}"
         ));
+        // RUST-SV verbatim: a Codex CLI older than the model its config picks.
+        assert!(learn_failure_is_agent_model_rejected(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nERROR: {\"detail\":\"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\"}"
+        ));
         // These must keep reporting: they are ours to fix (or transient).
         for stderr in [
             "LLM analysis failed: `claude -p` did not respond within 120s.",
@@ -18157,6 +18240,17 @@ Some unrelated content.
              'C:\\v\\Scripts\\headroom.exe'",
         );
         assert!(!upgrade_pip_network_refused(&file_lock));
+        let corrupt = |e: &anyhow::Error| {
+            crate::tool_manager::is_corrupt_base_stdlib_signal(&format!("{e:#}"))
+        };
+        assert!(!corrupt(&file_lock));
+        // RUST-29 on 0.9.48: pip died on a base that lost `linecache.py`.
+        assert!(corrupt(&failure(
+            &pip,
+            "  File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\traceback.py\", \
+             line 5, in <module>\n    import linecache\n\
+             ModuleNotFoundError: No module named 'linecache'\n",
+        )));
 
         // Only pip's network words count: a smoke test's stderr is not pip.
         let smoke = failure(&["-c", "import headroom"], "TimeoutError: timed out");
@@ -18613,6 +18707,40 @@ Some unrelated content.
         }
         let arg = std::fs::read_to_string(&eof).expect("the guard never saw the pipe close");
         assert_eq!(arg.trim(), super::CRASH_GUARD_ARG);
+    }
+
+    /// RUST-M9: a denial that outlasts the launch-path retries is retried
+    /// late, and anything else ends the wait at once.
+    #[test]
+    fn crash_guard_late_retry_waits_out_a_denial_only() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let delays = [std::time::Duration::ZERO; 3];
+        let mut calls = 0;
+        let started = super::retry_denied_after(&delays, denied(), || {
+            calls += 1;
+            if calls < 2 {
+                Err(denied())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(started.unwrap(), 2);
+
+        let mut calls = 0;
+        let gone = super::retry_denied_after(&delays, denied(), || -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(gone.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(calls, 1, "a non-denial stops the retries");
+
+        let mut calls = 0;
+        let held = super::retry_denied_after(&delays, denied(), || -> std::io::Result<()> {
+            calls += 1;
+            Err(denied())
+        });
+        assert!(held.is_err());
+        assert_eq!(calls, delays.len(), "one try per delay, then give up");
     }
 
     /// RUST-KV: the guard's report names the quit step the app died in, and

@@ -19,12 +19,12 @@ The checks drive OpenCode with one-shot commands (`opencode run`), so they work 
 CFG=~/.config/opencode/opencode.json; [ -f ~/.config/opencode/opencode.jsonc ] && CFG=~/.config/opencode/opencode.jsonc
 jq -e '.provider.anthropic.options.baseURL == "http://127.0.0.1:6767/v1"
    and .provider.openai.options.baseURL == "http://127.0.0.1:6767/v1"
-   and (.plugin | map(test("Headroom/opencode/entry\\.opencode\\.js$")) | any)' "$CFG" \
-  && test -f ~/Library/Application\ Support/Headroom/opencode/entry.opencode.js \
+   and (.plugin | map(test("Headroom/opencode/plugin$")) | any)' "$CFG" \
+  && test -f ~/Library/Application\ Support/Headroom/opencode/plugin/index.js \
   && echo PASS || echo FAIL
 ```
 
-Expect: `PASS`. A missing `plugin` entry means `configure_opencode_provider_block` ran an older build; a missing file means `ensure_opencode_plugin_file` failed (both in `client_adapters.rs`).
+Expect: `PASS`. A missing `plugin` entry means `configure_opencode_provider_block` ran an older build; a missing file means `ensure_opencode_plugin_dir` failed. An `entry.opencode.js` entry is an older build's file plugin, which OpenCode 2.x rejects ("configured plugin path must be a directory") (both in `client_adapters.rs`).
 
 ### O2. Anthropic traffic is classified and optimized
 
@@ -79,11 +79,11 @@ Toggle the OpenCode connector off in Settings, then:
 
 ```bash
 jq -e '(.provider.anthropic.options.baseURL // "gone") != "http://127.0.0.1:6767/v1" and ((.plugin // []) | map(test("Headroom")) | any | not)' "$CFG" \
-  && test ! -f ~/Library/Application\ Support/Headroom/opencode/entry.opencode.js \
+  && test ! -e ~/Library/Application\ Support/Headroom/opencode/plugin \
   && echo PASS || echo FAIL
 ```
 
-Expect: `PASS` - proxied baseURLs removed (or restored to the pre-Headroom value if you had one), plugin entry and plugin file gone. Re-enable afterwards and re-run O1.
+Expect: `PASS` - proxied baseURLs removed (or restored to the pre-Headroom value if you had one), plugin entry and plugin directory gone. Re-enable afterwards and re-run O1.
 
 ## Cross-cutting
 
@@ -94,5 +94,5 @@ Expect: `PASS` - proxied baseURLs removed (or restored to the pre-Headroom value
 ## When something fails
 
 - `client=` missing or wrong in PERF lines: the intercept classification or X-Client stamp regressed (`proxy_intercept.rs`, `is_opencode`).
-- Errors mentioning port 8787: vendored plugin default regressed (`entry.desktop.ts` wrapper, `src-tauri/resources/opencode/entry.opencode.js`).
+- Errors mentioning port 8787: vendored plugin default regressed (the `index.js` wrapper in `src-tauri/resources/opencode/`).
 - Config writes missing after enable: `configure_opencode_provider_block` in `client_adapters.rs`; it refuses configs managed by `headroom wrap opencode` - the connector error message says so explicitly.

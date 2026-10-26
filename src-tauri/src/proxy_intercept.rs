@@ -2731,8 +2731,10 @@ fn report_inflight_cap_reached(client: &'static str) {
 }
 
 /// Upper bound on a `/v1/models` response body we're willing to buffer for the
-/// lite-flag rewrite. Real model catalogs are a few KB.
-const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
+/// lite-flag rewrite. Catalogs carry per-model instructions and keep growing:
+/// 396 KB in RUST-7S, 2.17 MB on a Linux host in RUST-SY, which the old 2 MiB
+/// cap forwarded with the lite flags still on.
+const MAX_MODELS_BODY: usize = 16 * 1024 * 1024;
 /// Idle bound between body reads, not a total. The backend streams the
 /// catalog as the provider sends it, and a 10s idle gap cut a 396 KB catalog
 /// 27 times on one host (RUST-7S); a truncated read forwards the body
@@ -3737,8 +3739,8 @@ fn response_content_type(head: &[u8]) -> Option<String> {
 /// `error.type` / `error.code` / `error.param`, never free-text (the
 /// `message` field and raw bodies can quote request content).
 fn codex_error_summary(body: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(json) => {
+    match error_body_json(body) {
+        Some(json) => {
             let err = json.get("error").unwrap_or(&json);
             let field = |key: &str| err.get(key).and_then(|v| v.as_str());
             let (kind, code, param) = (field("type"), field("code"), field("param"));
@@ -3779,7 +3781,7 @@ fn codex_error_summary(body: &[u8]) -> String {
             )
         }
         // Truncated (peek is bounded) or non-JSON body — report size only.
-        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+        None => format!("unparseable error body ({} bytes)", body.len()),
     }
 }
 
@@ -3840,9 +3842,11 @@ fn plain_server_text(text: &str) -> bool {
 /// has no `error` object), `-` when absent or not identifier-shaped. They key
 /// the `codex-prompts-failing` issue, so a Headroom-caused `internal_error`
 /// run is not resolved together with a provider's `server_error` outage, as
-/// both were inside RUST-NY.
+/// both were inside RUST-NY. The backend's streaming `event: error` frame too:
+/// read as bare JSON, every one keyed `-/-` (RUST-R7 held a TLS-intercepted
+/// `upstream_tls_error` run with a plain-text 500).
 fn codex_error_class(body: &[u8]) -> [String; 2] {
-    let json = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let json = error_body_json(body).unwrap_or_default();
     let err = json.get("error").filter(|e| e.is_object()).unwrap_or(&json);
     ["type", "code"].map(|key| {
         err.get(key)
@@ -4425,14 +4429,18 @@ fn claude_direct_base(default: &str, header_buf: &[u8]) -> Option<String> {
 /// put in `x-headroom-base-url` (the intercept stamps Grok's the same way), and
 /// the provider's own path in `x-headroom-original-path` when the plugin
 /// normalized it to /v1/chat/completions or /v1/responses. Takes both headers,
-/// and our X-Client stamp, out of `buf`: they are for the backend, and the
-/// provider gets what the client would have sent it without Headroom.
+/// the 0.41.0 plugin's project and session-token headers, and our X-Client
+/// stamp out of `buf`: they are for the backend (which strips every
+/// `x-headroom-*` upstream), and the provider gets what the client would have
+/// sent it without Headroom.
 fn take_plugin_route(buf: &mut Vec<u8>) -> Option<(String, Option<String>)> {
     let origin = extract_header_value(buf, "x-headroom-base-url")?;
     let original_path = extract_header_value(buf, "x-headroom-original-path");
     for name in [
         "x-headroom-base-url",
         "x-headroom-original-path",
+        "x-headroom-project",
+        "x-headroom-session-token",
         "x-client",
     ] {
         strip_request_header(buf, name);
@@ -5300,6 +5308,11 @@ fn is_openai_path(path: &str) -> bool {
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",
+        // Codex's image tool (the backend's images/generations + edits). Off
+        // this list they went direct to api.anthropic.com with the ChatGPT
+        // token whenever the backend was down, and counted as Claude Code
+        // (user 3966 paged stuck on its OpenAI moderation 400s, 2026-10-23).
+        "/v1/images",
     ];
     OPENAI_PREFIXES.iter().any(|prefix| {
         path.strip_prefix(prefix)
@@ -5841,6 +5854,8 @@ mod tests {
         assert!(is_openai_path("/v1/chat/completions"));
         assert!(is_openai_path("/v1/completions"));
         assert!(is_openai_path("/v1/embeddings"));
+        assert!(is_openai_path("/v1/images/edits"));
+        assert!(is_openai_path("/v1/images/generations"));
         // Anthropic paths must NOT be misrouted to OpenAI.
         assert!(!is_openai_path("/v1/messages"));
         assert!(!is_openai_path("/v1/complete"));
@@ -6977,6 +6992,38 @@ mod tests {
         assert_eq!(
             counts_after_codex["claude-code"], counts_after_api["claude-code"],
             "claude-code counter should not move for Codex request"
+        );
+
+        // Codex's image calls are Codex: forwarded to chatgpt.com, counted
+        // as codex, never sent to Anthropic or counted as Claude Code.
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let mut images_client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("images connect");
+        images_client
+            .write_all(
+                b"POST /v1/images/edits HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write images request");
+        let response = read_response(images_client).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+        assert!(
+            std::str::from_utf8(&response)
+                .unwrap_or("")
+                .starts_with("HTTP/1.1 200"),
+            "expected the image call to forward direct to ChatGPT"
+        );
+        let counts_after_images = intercept_request_counts();
+        assert_eq!(
+            counts_after_images["codex"] - counts_after_codex["codex"],
+            1,
+            "an OpenAI image call should count as codex"
+        );
+        assert_eq!(
+            counts_after_images["claude-code"], counts_after_codex["claude-code"],
+            "an OpenAI image call must not count as claude-code"
         );
 
         // Local proxy paths (health probes, stats) must NOT leak upstream on
@@ -8931,8 +8978,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn plugin_routed_requests_go_direct_to_their_own_upstream() {
-        // The provider's own URL, without Headroom's headers.
-        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        // The provider's own URL, without Headroom's headers (the 0.41.0
+        // plugin adds the project and, when set, a session token).
+        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nx-headroom-project: /Users/u/secret-repo\r\nx-headroom-session-token: hst_1\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
         let (origin, original) = take_plugin_route(&mut buf).expect("plugin-routed");
         assert_eq!(
             plugin_direct_url(&origin, original.as_deref(), "/v1/chat/completions?alt=sse")
@@ -8944,6 +8992,8 @@ mod tests {
         for name in [
             "x-headroom-base-url",
             "x-headroom-original-path",
+            "x-headroom-project",
+            "x-headroom-session-token",
             "x-client",
         ] {
             assert!(
@@ -9398,7 +9448,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn intercept_rewrites_use_responses_lite_in_models_response() {
-        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        // RUST-SY's 2,170,581-byte catalog, past the old 2 MiB cap.
+        let instructions = "x".repeat(2_170_581 - 80);
+        let models_json = format!(
+            r#"{{"models":[{{"slug":"gpt-5.5","use_responses_lite":true,"base_instructions":"{instructions}"}}]}}"#
+        )
+        .into_bytes();
+        assert_eq!(models_json.len(), 2_170_581);
         let (backend_listener, backend_addr) = bind_ephemeral().await;
         let backend_task = tokio::spawn(async move {
             let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
@@ -9499,7 +9555,7 @@ mod tests {
         assert_eq!(
             body["models"][0]["use_responses_lite"],
             serde_json::Value::Bool(false),
-            "lite flag rewritten to false: {body}"
+            "lite flag rewritten to false"
         );
         assert_eq!(body["models"][0]["slug"], "gpt-5.5");
 
@@ -9661,6 +9717,16 @@ mod tests {
         );
         assert_eq!(codex_error_class(b""), ["-", "-"]);
         assert_eq!(codex_error_class(b"event: error\ndata: {"), ["-", "-"]);
+        // RUST-R7: the backend's streaming 502 keys on its code, not `-/-`.
+        let tls = b"event: error\ndata: {\"error\":{\"message\":\"m\",\"type\":\"connection_error\",\"code\":\"upstream_tls_error\"}}\n\n";
+        assert_eq!(
+            codex_error_class(tls),
+            ["connection_error", "upstream_tls_error"]
+        );
+        assert_eq!(
+            codex_error_summary(tls),
+            "type=connection_error code=upstream_tls_error param=-"
+        );
         // A value shaped like content never becomes a fingerprint key.
         assert_eq!(
             codex_error_class(br#"{"error":{"type":"my secret prompt"}}"#),

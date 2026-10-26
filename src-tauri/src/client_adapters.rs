@@ -1174,6 +1174,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
     }
     // Before the re-apply puts the guard back.
     let guard_shape = (silent_failures == [CLAUDE_GUARD_NOT_FOUND]).then(claude_guard_shape);
+    let opencode_shape = (silent_failures == [OPENCODE_BLOCK_NOT_FOUND]).then(opencode_block_shape);
     if let Err(err) = apply_client_setup(client_id) {
         log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
         return false;
@@ -1214,6 +1215,9 @@ fn repair_client_setup_now(client_id: &str) -> bool {
                     scope.set_extra("failures", broken.clone().into());
                     if let Some(shape) = guard_shape {
                         scope.set_extra("guard_shape", shape.into());
+                    }
+                    if let Some(shape) = &opencode_shape {
+                        scope.set_extra("block_shape", shape.clone().into());
                     }
                     scope.set_fingerprint(Some(&[
                         "repair_client_setups",
@@ -3585,7 +3589,7 @@ pub(crate) fn retry_transient_denied<T>(
 /// Retries after the first attempt (see `retry_transient_denied`).
 const TRANSIENT_DENIED_RETRIES: u32 = if cfg!(windows) { 5 } else { 3 };
 
-fn is_transient_denied(err: &std::io::Error) -> bool {
+pub(crate) fn is_transient_denied(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
         || (cfg!(windows) && err.raw_os_error() == Some(32))
 }
@@ -6532,30 +6536,50 @@ fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> 
 }
 
 /// Self-contained OpenCode transport plugin (all-provider routing via
-/// `x-headroom-base-url`), vendored from headroom-ai's `plugins/opencode`
-/// built with the desktop wrapper entry (proxy default 127.0.0.1:6767).
-/// Regenerate: `npx tsup --config tsup.desktop.config.ts` in the plugin dir,
-/// copy `dist-desktop/entry.opencode.js` here. Replace with the wheel-shipped
-/// bundle once upstream PR headroomlabs-ai/headroom#2601 lands in a release.
-const OPENCODE_PLUGIN_BYTES: &[u8] = include_bytes!("../resources/opencode/entry.opencode.js");
+/// `x-headroom-base-url`): `headroom-plugin.js` is the pinned wheel's
+/// `headroom/providers/opencode/_dist/index.js` (refresh it on a wheel bump),
+/// whose default export carries both OpenCode 1.x's `server` and 2.x's `setup`.
+/// `index.js` re-exports it with the proxy defaulting to 127.0.0.1:6767.
+/// Installed as a directory: OpenCode 2.x drops a plugin file path with
+/// "configured plugin path must be a directory" and loads `<dir>/index.*`,
+/// which 1.x resolves for a package-less directory too (checked on 1.18.5).
+const OPENCODE_PLUGIN_FILES: [(&str, &[u8]); 2] = [
+    ("index.js", include_bytes!("../resources/opencode/index.js")),
+    (
+        "headroom-plugin.js",
+        include_bytes!("../resources/opencode/headroom-plugin.js"),
+    ),
+];
 
 fn opencode_plugin_install_path() -> PathBuf {
+    crate::storage::app_data_dir()
+        .join("opencode")
+        .join("plugin")
+}
+
+/// The single-file 1.x-only plugin older builds registered; OpenCode 2.x rejects it.
+fn legacy_opencode_plugin_path() -> PathBuf {
     crate::storage::app_data_dir()
         .join("opencode")
         .join("entry.opencode.js")
 }
 
-/// Write (or refresh after an app update) the vendored plugin bundle.
-fn ensure_opencode_plugin_file() -> Result<PathBuf> {
-    let path = opencode_plugin_install_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+/// Write (or refresh after an app update) the vendored plugin directory.
+fn ensure_opencode_plugin_dir() -> Result<PathBuf> {
+    let dir = opencode_plugin_install_path();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    for (name, bytes) in OPENCODE_PLUGIN_FILES {
+        let path = dir.join(name);
+        if std::fs::read(&path).ok().as_deref() != Some(bytes) {
+            atomic_write(&path, bytes)?;
+        }
     }
-    if std::fs::read(&path).ok().as_deref() != Some(OPENCODE_PLUGIN_BYTES) {
-        atomic_write(&path, OPENCODE_PLUGIN_BYTES)?;
-    }
-    Ok(path)
+    Ok(dir)
+}
+
+fn remove_opencode_plugin_files() {
+    let _ = std::fs::remove_dir_all(opencode_plugin_install_path());
+    let _ = std::fs::remove_file(legacy_opencode_plugin_path());
 }
 
 fn opencode_plugin_array_contains(config: &serde_json::Value, entry: &str) -> bool {
@@ -6639,7 +6663,13 @@ fn configure_opencode_provider_block(
     // Transport plugin: routes every other provider (Google, custom
     // gateways, ...) through the proxy via x-headroom-base-url. The bundle
     // defaults to 6767, so no env vars are needed.
-    let plugin_path = ensure_opencode_plugin_file()?;
+    let legacy_entry = legacy_opencode_plugin_path().display().to_string();
+    if opencode_plugin_array_contains(&config, &legacy_entry) {
+        remove_opencode_plugin_entry(&mut config, &legacy_entry);
+        changed = true;
+    }
+    let _ = std::fs::remove_file(legacy_opencode_plugin_path());
+    let plugin_path = ensure_opencode_plugin_dir()?;
     let plugin_entry = plugin_path.display().to_string();
     if !opencode_plugin_array_contains(&config, &plugin_entry) {
         add_opencode_plugin_entry(&mut config, &plugin_entry);
@@ -6660,6 +6690,44 @@ fn configure_opencode_provider_block(
     Ok((vec![path.display().to_string()], backup_files))
 }
 
+/// What was left of OpenCode's block, in fixed words for Sentry: which file,
+/// whether each provider's base URL is gone or now points at another proxy,
+/// and whether the plugin entry went too (RUST-K2: a Linux host on 0.9.49
+/// lost it twice in a day, with nothing on the event to name the writer).
+fn opencode_block_shape() -> String {
+    let path = opencode_config_path();
+    let file = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    if !path.exists() {
+        return format!("{file} missing");
+    }
+    let Ok(config) = read_opencode_config(&path) else {
+        return format!("{file} unparseable");
+    };
+    let mut parts: Vec<String> = OPENCODE_MANAGED_PROVIDERS
+        .iter()
+        .map(|provider| {
+            let url = match opencode_provider_base_url(&config, provider).as_deref() {
+                Some(HEADROOM_OPENCODE_BASE_URL) => "ours",
+                None => "absent",
+                Some(url) if url.contains("127.0.0.1") || url.contains("localhost") => {
+                    "another local URL"
+                }
+                Some(_) => "a remote URL",
+            };
+            format!("{provider} {url}")
+        })
+        .collect();
+    let plugin = opencode_plugin_install_path().display().to_string();
+    parts.push(if opencode_plugin_array_contains(&config, &plugin) {
+        "plugin entry kept".into()
+    } else {
+        "plugin entry gone".into()
+    });
+    format!("{file}: {}", parts.join(", "))
+}
+
 fn opencode_provider_block_matches() -> Result<bool> {
     let path = opencode_config_path();
     if !path.exists() {
@@ -6670,8 +6738,13 @@ fn opencode_provider_block_matches() -> Result<bool> {
         opencode_provider_base_url(&config, provider).as_deref() == Some(HEADROOM_OPENCODE_BASE_URL)
     });
     let plugin_path = opencode_plugin_install_path();
-    let plugin_ok = plugin_path.is_file()
-        && opencode_plugin_array_contains(&config, &plugin_path.display().to_string());
+    let legacy_path = legacy_opencode_plugin_path();
+    // An older build's file entry still verifies: the version restamp after the
+    // update re-applies and swaps it, so it must not count as a silent repair.
+    let plugin_ok = (plugin_path.join("index.js").is_file()
+        && opencode_plugin_array_contains(&config, &plugin_path.display().to_string()))
+        || (legacy_path.is_file()
+            && opencode_plugin_array_contains(&config, &legacy_path.display().to_string()));
     Ok(base_urls_ok && plugin_ok)
 }
 
@@ -6698,16 +6771,21 @@ fn disable_opencode(state: &ClientSetupState) -> Result<()> {
         }
         changed = true;
     }
-    let plugin_entry = opencode_plugin_install_path().display().to_string();
-    if opencode_plugin_array_contains(&config, &plugin_entry) {
-        remove_opencode_plugin_entry(&mut config, &plugin_entry);
-        changed = true;
+    for plugin_path in [
+        opencode_plugin_install_path(),
+        legacy_opencode_plugin_path(),
+    ] {
+        let plugin_entry = plugin_path.display().to_string();
+        if opencode_plugin_array_contains(&config, &plugin_entry) {
+            remove_opencode_plugin_entry(&mut config, &plugin_entry);
+            changed = true;
+        }
     }
     if changed {
         let _ = backup_if_exists(&path)?;
         write_opencode_config(&path, &config)?;
     }
-    let _ = std::fs::remove_file(opencode_plugin_install_path());
+    remove_opencode_plugin_files();
     Ok(())
 }
 
@@ -16242,6 +16320,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .expect("verify runs")
             .failures;
         assert_eq!(lost, vec![super::OPENCODE_BLOCK_NOT_FOUND.to_string()]);
+        assert_eq!(
+            super::opencode_block_shape(),
+            "opencode.json: anthropic absent, openai absent, plugin entry gone"
+        );
         assert!(!super::repair_pages(&lost), "a first loss does not page");
         assert!(super::repair_pages(&lost), "a repeat within a day pages");
         let claude = vec![super::CLAUDE_GUARD_NOT_FOUND.to_string()];
@@ -17121,7 +17203,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::apply_client_setup("opencode").expect("apply succeeds");
 
         let plugin_path = super::opencode_plugin_install_path();
-        assert!(plugin_path.is_file(), "vendored plugin written to app data");
+        assert!(
+            plugin_path.join("index.js").is_file()
+                && plugin_path.join("headroom-plugin.js").is_file(),
+            "vendored plugin directory written to app data"
+        );
         let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -17140,7 +17226,61 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             after.get("plugin").is_none(),
             "plugin entry removed on disable, got:\n{after:#}"
         );
-        assert!(!plugin_path.exists(), "plugin file removed on disable");
+        assert!(!plugin_path.exists(), "plugin directory removed on disable");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_apply_replaces_the_legacy_plugin_file_entry() {
+        // OpenCode 2.x rejects the single-file plugin older builds registered
+        // ("configured plugin path must be a directory").
+        let _home = TestHome::new(); // env guard
+        let legacy = super::legacy_opencode_plugin_path();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "old bundle").unwrap();
+        let legacy_entry = legacy.display().to_string();
+        let config_path = super::opencode_config_path();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let base_url =
+            serde_json::json!({ "options": { "baseURL": super::HEADROOM_OPENCODE_BASE_URL } });
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "plugin": ["user-plugin", legacy_entry],
+                "provider": { "anthropic": base_url, "openai": base_url },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            super::opencode_provider_block_matches().unwrap(),
+            "an older build's setup verifies, so the update restamp migrates it unreported"
+        );
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let dir_entry = super::opencode_plugin_install_path().display().to_string();
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["user-plugin", dir_entry]),
+            "legacy file entry swapped for the directory, user plugin kept"
+        );
+        assert!(!legacy.exists(), "legacy plugin file removed");
+        assert!(super::opencode_provider_block_matches().unwrap());
+
+        // A disable after a downgrade-and-upgrade dance still clears both forms.
+        let mut config = config;
+        config["plugin"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(legacy_entry));
+        fs::write(&config_path, config.to_string()).unwrap();
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(after["plugin"], serde_json::json!(["user-plugin"]));
     }
 
     #[test]
