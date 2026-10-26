@@ -3843,6 +3843,14 @@ impl ToolManager {
         self.missing_runtime_marker().is_none()
     }
 
+    /// A finished install whose base interpreter is gone or lost part of its
+    /// stdlib, which `redownload_lost_base_interpreter` re-fetches without a
+    /// click. READY, not `missing_runtime_marker`: on macOS and Linux the venv
+    /// python is a symlink into the base, so it reads as missing first.
+    pub fn base_interpreter_lost(&self) -> bool {
+        self.runtime.ready_flag().exists() && !self.runtime.standalone_runtime_intact()
+    }
+
     /// The first runtime file `python_runtime_installed` finds missing, named
     /// for diagnostics. RUST-MA: a 6-minute requirements repair on Windows
     /// ended with the runtime gone (AV killed `headroom mcp install` with exit
@@ -4856,10 +4864,10 @@ impl ToolManager {
             // cannot run, and their failures would bury the real cause.
             // Nothing here can mend bytes on disk either - what unblocks the
             // user is dropping the base so `standalone_runtime_intact()` stops
-            // claiming this machine is installed, which routes the next launch
-            // (or the retry button already on screen) back through bootstrap's
-            // re-download. Same remedy RUST-C8 got for the missing-stdlib
-            // shape, reached by a different gate.
+            // claiming this machine is installed; the caller then starts
+            // bootstrap's re-download (`redownload_lost_base_interpreter`).
+            // Same remedy RUST-C8 got for the missing-stdlib shape, reached by
+            // a different gate.
             if let Some(failure) = failures
                 .iter()
                 .find(|f| is_corrupt_base_stdlib_signal(&f.log_tail))
@@ -22782,6 +22790,7 @@ Always run the linter first.
             !manager.python_runtime_installed(),
             "a venv whose standalone base is gone must not read as installed"
         );
+        assert!(manager.base_interpreter_lost());
 
         let base = runtime.standalone_python();
         fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
@@ -22814,6 +22823,36 @@ Always run the linter first.
         assert_eq!(manager.missing_runtime_marker(), Some("venv READY flag"));
         fs::remove_file(&landmark).expect("remove landmark");
         assert!(!runtime.standalone_runtime_intact());
+    }
+
+    /// The venv python is a symlink into the base on macOS and Linux, so a
+    /// discarded base dangles it: the guest's re-download never fired when the
+    /// check went by `missing_runtime_marker`, which named "venv python".
+    #[cfg(unix)]
+    #[test]
+    fn a_discarded_base_reads_as_lost_through_the_venv_symlink() {
+        let (_root, runtime, manager) = seed_test_runtime("lost-base-symlink");
+        let base = runtime.standalone_python();
+        fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
+        fs::write(&base, b"").expect("base");
+        seed_stdlib_landmark(&runtime);
+        let venv_python = runtime.managed_python();
+        fs::create_dir_all(venv_python.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&base, &venv_python).expect("symlink");
+        fs::write(runtime.ready_flag(), b"").expect("READY");
+        fs::write(runtime.venv_dir.join("pyvenv.cfg"), b"").expect("pyvenv.cfg");
+        assert!(manager.python_runtime_installed());
+        assert!(!manager.base_interpreter_lost());
+
+        runtime.discard_base_interpreter().expect("discard");
+        assert_eq!(manager.missing_runtime_marker(), Some("venv python"));
+        assert!(manager.base_interpreter_lost());
+
+        fs::remove_file(runtime.ready_flag()).expect("remove READY");
+        assert!(
+            !manager.base_interpreter_lost(),
+            "a first run waits for the wizard"
+        );
     }
 
     /// Creates the `os.py` landmark CPython's getpath looks for next to the

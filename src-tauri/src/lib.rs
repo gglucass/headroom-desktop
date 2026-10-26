@@ -3312,6 +3312,17 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
         return;
     }
 
+    // A base interpreter that lost a stdlib file (antivirus quarantine,
+    // RUST-SM) is the machine's fault, and the next launch re-downloads the
+    // base: Warning, as the upgrade path files the same cause (RUST-K0).
+    let level = if startup_error_fingerprint_key(Some(technical_err.as_str()))
+        == Some("startup_runtime_missing_stdlib")
+    {
+        sentry::Level::Warning
+    } else {
+        sentry::Level::Error
+    };
+
     if let Some(failure) = startup_failure {
         let category = headroom_start_failure_category(&failure.reason);
         sentry::with_scope(
@@ -3338,11 +3349,11 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
             || {
-                sentry::capture_message(&truncated, sentry::Level::Error);
+                sentry::capture_message(&truncated, level);
             },
         );
     } else {
-        sentry::capture_message(&truncated, sentry::Level::Error);
+        sentry::capture_message(&truncated, level);
     }
 }
 
@@ -11690,6 +11701,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                             if !port_conflict::note_proxy_failed(&app, &err, false) {
                                 capture_headroom_start_failure("watchdog hung-kill restart", &err);
                             }
+                            state.redownload_lost_base_interpreter(&app);
                         }
                     }
                     continue;
@@ -11882,6 +11894,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     log::info!("watchdog: ensure_headroom_running failed: {err:#}");
                     // In-session retry: don't bump the launch counter.
                     port_conflict::note_proxy_failed(&app, &err, false);
+                    state.redownload_lost_base_interpreter(&app);
                 }
             }
         }
@@ -18510,13 +18523,29 @@ Some unrelated content.
                 "headroom auto-start failed during launch",
                 &anyhow::anyhow!("wait check failed: interrupted"),
             );
+            // RUST-K0 on 0.9.50-rc.6: the base lost linecache.py.
+            let lost_stdlib = crate::tool_manager::HeadroomStartupFailure {
+                program: "python3".into(),
+                args: Vec::new(),
+                log_path: String::new(),
+                log_tail: "Fatal Python error: init_fs_encoding: failed to get the Python \
+                           codec of the filesystem encoding"
+                    .into(),
+                reason: "exited with status exit status: 1 before opening port 6768".into(),
+            };
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &anyhow::Error::new(lost_stdlib),
+            );
         });
         let events = recorder.0.lock().unwrap();
-        assert_eq!(events.len(), 1, "only the real failure reports");
+        assert_eq!(events.len(), 2, "only the real failures report");
         assert!(events[0]
             .message
             .as_deref()
             .is_some_and(|m| m.contains("wait check failed")));
+        assert_eq!(events[0].level, sentry::Level::Error);
+        assert_eq!(events[1].level, sentry::Level::Warning, "machine fault");
     }
 
     #[cfg(target_os = "windows")]
