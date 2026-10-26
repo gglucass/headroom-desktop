@@ -1291,46 +1291,108 @@ pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desk
      straight to Anthropic whatever you open first, so Headroom can't optimize them. Run \
      Claude Code in your terminal or IDE to keep saving.";
 
-/// True when the transcript was written by Claude Code inside the Claude
-/// desktop app, which stamps `"entrypoint":"claude-desktop"` (or
-/// `claude-desktop-3p`) on its lines; the CLI says `cli`, the IDE extension
-/// `claude-vscode`. The newest stamp decides: a resumed session appends to the
+/// The surface that last wrote a Claude Code transcript, from the
+/// `"entrypoint"` stamp on its lines: `cli`, `claude-vscode` for the IDE
+/// extension, `claude-desktop` (or `claude-desktop-3p`) inside the Claude
+/// desktop app. The newest stamp decides: a resumed session appends to the
 /// same file even from another surface (an app session continued with
 /// `claude -c` in a terminal is a CLI session now).
-fn claude_transcript_is_desktop(path: &Path) -> bool {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
+fn claude_transcript_entrypoint(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 1 << 20;
     let stamp = |line: &str| {
         serde_json::from_str::<Value>(line)
             .ok()?
             .get("entrypoint")?
             .as_str()
-            .map(|entrypoint| entrypoint.starts_with("claude-desktop"))
+            .map(str::to_owned)
     };
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+    let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut tail = Vec::new();
     if file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_ok()
         && file.by_ref().take(TAIL).read_to_end(&mut tail).is_ok()
     {
         // The first tail line may be cut mid-way; it just fails to parse.
-        if let Some(desktop) = String::from_utf8_lossy(&tail).lines().rev().find_map(stamp) {
-            return desktop;
+        if let Some(entrypoint) = String::from_utf8_lossy(&tail).lines().rev().find_map(stamp) {
+            return Some(entrypoint);
         }
     }
     // Lines can carry whole tool results or pasted images, so the tail may
     // hold no whole stamped line; the first one sits within the first few.
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return false;
-    }
-    std::io::BufReader::new(file.take(4 << 20))
+    claude_transcript_head(file).find_map(|line| stamp(&line))
+}
+
+/// The first lines of a transcript, where the first stamped ones sit.
+fn claude_transcript_head(mut file: std::fs::File) -> impl Iterator<Item = String> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    let rewound = file.seek(SeekFrom::Start(0)).is_ok();
+    std::io::BufReader::new(file.take(if rewound { 4 << 20 } else { 0 }))
         .lines()
         .take(32)
         .map_while(Result::ok)
-        .find_map(|line| stamp(&line))
-        .unwrap_or(false)
+}
+
+fn claude_transcript_is_desktop(path: &Path) -> bool {
+    claude_transcript_entrypoint(path)
+        .is_some_and(|entrypoint| entrypoint.starts_with("claude-desktop"))
+}
+
+/// When a Claude Code session began: the first `"timestamp"` in its transcript.
+fn claude_transcript_started_at(path: &Path) -> Option<SystemTime> {
+    let file = std::fs::File::open(path).ok()?;
+    claude_transcript_head(file).find_map(|line| {
+        let at = serde_json::from_str::<Value>(&line)
+            .ok()?
+            .get("timestamp")?
+            .as_str()?
+            .to_owned();
+        chrono::DateTime::parse_from_rfc3339(&at)
+            .ok()
+            .map(SystemTime::from)
+    })
+}
+
+/// Sentry tags for "Claude Code ran, nothing reached the proxy", the Claude
+/// twin of `codex_unrouted_diagnostics`. 141 machines filed RUST-DN from the
+/// terminal or IDE in 30 days (to 2026-10-26) and almost none carried a guard
+/// verdict, so the reports could not say why. `claude_session_predates_route`
+/// tests the leading guess: quitting or pausing Headroom clears the route, so a
+/// session started while it was off (or before a login launch caught up with
+/// the terminal restoring its tabs) goes straight to Anthropic for its whole
+/// life. Read from the newest active session, the one still being written.
+pub(crate) fn claude_unrouted_diagnostics(
+    active_since: SystemTime,
+    routed_since: SystemTime,
+) -> Vec<(&'static str, String)> {
+    let mut active: Vec<(PathBuf, SystemTime)> =
+        claude_transcripts(&home_dir().join(".claude").join("projects"))
+            .filter(|(_, at)| *at > active_since)
+            .collect();
+    active.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    let mut entrypoints: Vec<String> = active
+        .iter()
+        .map(|(path, _)| claude_transcript_entrypoint(path).unwrap_or_else(|| "unknown".into()))
+        .collect();
+    entrypoints.sort();
+    entrypoints.dedup();
+    let predates = match active
+        .first()
+        .and_then(|(path, _)| claude_transcript_started_at(path))
+    {
+        Some(started) => (started < routed_since).to_string(),
+        None => "unknown".into(),
+    };
+    let guard = match read_guard_verdict("claude_code") {
+        None => "none_or_stale",
+        Some(issues) if issues.is_empty() => "clean",
+        Some(_) => "issues",
+    };
+    vec![
+        ("claude_entrypoints", entrypoints.join(",")),
+        ("claude_session_predates_route", predates),
+        ("claude_guard_verdict", guard.into()),
+    ]
 }
 
 /// True when Claude Code ran after `since` and every such session was inside
@@ -18657,6 +18719,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let big = format!("{desktop}{{\"t\":\"{}\"}}\n", "x".repeat(1 << 21));
         fs::write(project.join("a.jsonl"), big).unwrap();
         assert!(super::claude_ran_only_in_desktop_app(tmp.path(), before));
+    }
+
+    #[test]
+    fn claude_transcript_names_its_surface_and_start_for_unrouted_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        // Real head shape: an unstamped snapshot line, then the first turn.
+        fs::write(
+            &path,
+            "{\"type\":\"file-history-snapshot\"}\n\
+             {\"type\":\"user\",\"entrypoint\":\"cli\",\"timestamp\":\"2026-10-26T08:00:00.000Z\"}\n\
+             {\"type\":\"user\",\"entrypoint\":\"claude-vscode\",\"timestamp\":\"2026-10-26T09:00:00.000Z\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::claude_transcript_entrypoint(&path).as_deref(),
+            Some("claude-vscode")
+        );
+        assert!(!super::claude_transcript_is_desktop(&path));
+        let started = super::claude_transcript_started_at(&path).unwrap();
+        let expected: SystemTime = chrono::DateTime::parse_from_rfc3339("2026-10-26T08:00:00Z")
+            .unwrap()
+            .into();
+        assert_eq!(started, expected);
+
+        fs::write(&path, "not json\n").unwrap();
+        assert_eq!(super::claude_transcript_entrypoint(&path), None);
+        assert_eq!(super::claude_transcript_started_at(&path), None);
+        assert_eq!(
+            super::claude_transcript_entrypoint(&tmp.path().join("missing.jsonl")),
+            None
+        );
     }
 
     #[test]
