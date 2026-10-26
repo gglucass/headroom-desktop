@@ -102,7 +102,7 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   withCodexPlanNames,
-  higherSubscriptionTier,
+  upgradeRecommendedTier,
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -202,6 +202,7 @@ import {
   createPricingStatusOrder,
   formatRemainingDays,
   readCachedPricing,
+  resolvedCodexPlanTier,
   subscriptionTierLabel,
   writeCachedPricing
 } from "./lib/pricing";
@@ -2081,12 +2082,14 @@ export default function App() {
   // reads a price this render. Idempotent and derived purely from state, so a
   // repeated render (StrictMode) is a no-op.
   setServerPlanPrices(pricingStatus?.planPrices);
+  const codexPlanTier = resolvedCodexPlanTier(pricingStatus, cachedPricing);
   const rawUpgradePlans = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-    higherSubscriptionTier(
+    upgradeRecommendedTier(
       pricingStatus?.recommendedSubscriptionTier,
-      pricingStatus?.codex?.recommendedSubscriptionTier
+      pricingStatus?.codex?.recommendedSubscriptionTier,
+      codexPlanTier
     ) ?? cachedPricing.recommendedSubscriptionTier,
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false,
@@ -2112,7 +2115,7 @@ export default function App() {
     plans: withCodexPlanNames(
       rawUpgradePlans.plans,
       pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-      pricingStatus?.codexPlanTier
+      codexPlanTier
     )
   };
   const contactEmailValid = isValidEmailAddress(contactEmail);
@@ -2267,7 +2270,7 @@ export default function App() {
 
   useEffect(() => {
     if (!pricingStatus) return;
-    writeCachedPricing(cachePricingStatus(pricingStatus));
+    writeCachedPricing(cachePricingStatus(pricingStatus, readCachedPricing()));
   }, [pricingStatus]);
 
   useEffect(() => {
@@ -6669,9 +6672,10 @@ export default function App() {
   })();
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
-      ? (higherSubscriptionTier(
+      ? (upgradeRecommendedTier(
           pricingStatus?.recommendedSubscriptionTier,
-          pricingStatus?.codex?.recommendedSubscriptionTier
+          pricingStatus?.codex?.recommendedSubscriptionTier,
+          codexPlanTier
         ) ??
           cachedPricing.recommendedSubscriptionTier ??
           upgradePlansState.featuredPlanId)
@@ -8129,7 +8133,7 @@ export default function App() {
                 : underTierWarning(
                     plan.id,
                     pricingStatus?.claude.planTier,
-                    pricingStatus?.codexPlanTier,
+                    codexPlanTier,
                     upgradePlansState.plans
                   );
               return (

@@ -12,6 +12,7 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   withCodexPlanNames,
+  upgradeRecommendedTier,
   higherSubscriptionTier,
   replyAddonOverlapNotice,
   annualFirstYearSavingCents,
@@ -30,7 +31,7 @@ import {
   underTierWarning,
   type UpgradePlan,
 } from "./appHelpers";
-import type { ClientConnectorStatus, HeadroomAccountProfile, RuntimeStatus } from "./types";
+import type { ClientConnectorStatus, CodexPlanTier, HeadroomAccountProfile, RuntimeStatus } from "./types";
 import type { DailySavingsPoint, IntroOffer } from "./types";
 
 const daily = (usd: number): DailySavingsPoint => ({
@@ -181,6 +182,30 @@ describe("app helpers", () => {
       "pro",
       "max5x",
     ]);
+  });
+
+  it("pitches a Codex-only user by their ChatGPT plan before Codex has sent a request", () => {
+    // What the Upgrade view renders: recommendation -> plan order -> Codex names.
+    const pitch = (claude: "pro" | "max20x" | null, live: "max20x" | null, codex: CodexPlanTier | null) => {
+      const result = getUpgradePlans("individual", claude ?? undefined, upgradeRecommendedTier(claude, live, codex));
+      return {
+        featured: result.featuredPlanId,
+        first: withCodexPlanNames(result.plans, claude, codex)[0].name
+      };
+    };
+    // No snapshot yet: Plus used to get the Max x5 fallback.
+    expect(pitch(null, null, "plus")).toEqual({ featured: "pro", first: "Plus" });
+    expect(pitch(null, null, "prolite")).toEqual({ featured: "max5x", first: "Pro 5x" });
+    expect(pitch(null, null, "pro")).toEqual({ featured: "max20x", first: "Pro 20x" });
+    // A known plan without a mapped tier is at least Pro, as the snapshot path says.
+    expect(pitch(null, null, "free").featured).toBe("pro");
+    // No plan evidence keeps the fallback.
+    expect(pitch(null, null, "unknown").featured).toBe("max5x");
+    expect(pitch(null, null, null).featured).toBe("max5x");
+    // The live snapshot wins over the plan, and the bigger account wins overall.
+    expect(upgradeRecommendedTier(null, "max20x", "plus")).toBe("max20x");
+    expect(pitch("max20x", null, "plus").featured).toBe("max20x");
+    expect(upgradeRecommendedTier("pro", null, "prolite")).toBe("max5x");
   });
 
   it("names plans the ChatGPT way for a Codex-only buyer, keeping the Headroom name in the tagline", () => {
