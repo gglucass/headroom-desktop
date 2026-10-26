@@ -2731,8 +2731,10 @@ fn report_inflight_cap_reached(client: &'static str) {
 }
 
 /// Upper bound on a `/v1/models` response body we're willing to buffer for the
-/// lite-flag rewrite. Real model catalogs are a few KB.
-const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
+/// lite-flag rewrite. Catalogs carry per-model instructions and keep growing:
+/// 396 KB in RUST-7S, 2.17 MB on a Linux host in RUST-SY, which the old 2 MiB
+/// cap forwarded with the lite flags still on.
+const MAX_MODELS_BODY: usize = 16 * 1024 * 1024;
 /// Idle bound between body reads, not a total. The backend streams the
 /// catalog as the provider sends it, and a 10s idle gap cut a 396 KB catalog
 /// 27 times on one host (RUST-7S); a truncated read forwards the body
@@ -9446,7 +9448,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn intercept_rewrites_use_responses_lite_in_models_response() {
-        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        // RUST-SY's 2,170,581-byte catalog, past the old 2 MiB cap.
+        let instructions = "x".repeat(2_170_581 - 80);
+        let models_json = format!(
+            r#"{{"models":[{{"slug":"gpt-5.5","use_responses_lite":true,"base_instructions":"{instructions}"}}]}}"#
+        )
+        .into_bytes();
+        assert_eq!(models_json.len(), 2_170_581);
         let (backend_listener, backend_addr) = bind_ephemeral().await;
         let backend_task = tokio::spawn(async move {
             let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
@@ -9547,7 +9555,7 @@ mod tests {
         assert_eq!(
             body["models"][0]["use_responses_lite"],
             serde_json::Value::Bool(false),
-            "lite flag rewritten to false: {body}"
+            "lite flag rewritten to false"
         );
         assert_eq!(body["models"][0]["slug"], "gpt-5.5");
 
