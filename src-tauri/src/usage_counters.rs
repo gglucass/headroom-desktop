@@ -33,7 +33,7 @@ const FILE_NAME: &str = "usage-counters.json";
 pub struct DayCounters {
     /// Provider-bound requests per client bucket, same keys as
     /// `intercept_request_counts` (`claude-code`, `codex`, `opencode`,
-    /// `grok-build`).
+    /// `grok-build`, `github-copilot`).
     pub client_requests: BTreeMap<String, u64>,
     /// Upstream HTTP 429 responses per client bucket.
     pub rate_limit_429s: BTreeMap<String, u64>,

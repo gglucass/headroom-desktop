@@ -158,6 +158,9 @@ static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_OPENCODE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_GROK_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static INTERCEPT_COPILOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Set once the loopback guard below has refused a Copilot request.
+static COPILOT_REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Request bytes forwarded unoptimized while the pricing gate was on, this
 /// process. Feeds the "unsaved since Headroom paused" counter in the gate
@@ -573,6 +576,10 @@ pub fn intercept_request_counts() -> std::collections::HashMap<String, u64> {
         (
             "grok-build".to_string(),
             INTERCEPT_GROK_REQUESTS.load(Ordering::Acquire),
+        ),
+        (
+            "github-copilot".to_string(),
+            INTERCEPT_COPILOT_REQUESTS.load(Ordering::Acquire),
         ),
     ])
 }
@@ -2191,6 +2198,18 @@ async fn handle(
     // a user's browser; CLI clients never set Origin and always send a
     // loopback Host.
     if !request_is_loopback_safe(&buf) {
+        // Copilot Chat's fetcher is not verified against this guard. If it
+        // sends an Origin, every Copilot request dies here silently; one line
+        // says so.
+        if find_header_end(&buf)
+            .and_then(|end| parse_request_head(&buf[..end + 4]))
+            .is_some_and(|head| copilot_api_path(&head.path).is_some())
+            && !COPILOT_REFUSAL_LOGGED.swap(true, Ordering::Relaxed)
+        {
+            log::warn!(
+                "[proxy_intercept] refused a GitHub Copilot request carrying an Origin header or a non-loopback Host"
+            );
+        }
         let _ = client
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -2199,7 +2218,13 @@ async fn handle(
 
     // Whether this is a Codex request. Parsed once here and reused for the
     // Codex plan capture, Codex-only bypass, counters, and response handling.
-    let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
+    let mut parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
+    // GitHub Copilot in VS Code is pointed at `/copilot` (its API host
+    // override), so the prefix alone identifies it. Classified before the
+    // prefix is stripped below, so none of its paths read as Codex.
+    let is_copilot = parsed_head
+        .as_ref()
+        .is_some_and(|head| copilot_api_path(&head.path).is_some());
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
     let is_local_backend_path = parsed_head
         .as_ref()
@@ -2221,7 +2246,9 @@ async fn handle(
     // One classification for the process counters, the per-day usage
     // counters, and the 429 sniffers below. Same keys as
     // `intercept_request_counts`.
-    let client_key: &'static str = if is_opencode {
+    let client_key: &'static str = if is_copilot {
+        "github-copilot"
+    } else if is_opencode {
         "opencode"
     } else if is_grok {
         "grok-build"
@@ -2240,6 +2267,7 @@ async fn handle(
             match client_key {
                 "opencode" => INTERCEPT_OPENCODE_REQUESTS.fetch_add(1, Ordering::AcqRel),
                 "grok-build" => INTERCEPT_GROK_REQUESTS.fetch_add(1, Ordering::AcqRel),
+                "github-copilot" => INTERCEPT_COPILOT_REQUESTS.fetch_add(1, Ordering::AcqRel),
                 "codex" => INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel),
                 _ => INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel),
             };
@@ -2289,6 +2317,30 @@ async fn handle(
         if !parsed_head
             .as_ref()
             .is_some_and(|head| is_grok_inference_path(&head.path))
+        {
+            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+            return;
+        }
+    }
+
+    // Copilot goes on to GitHub's Copilot API (the backend passes VS Code's
+    // own Copilot token through), at the path it would have called there.
+    // Only inference needs the backend. The rest (model list, agents,
+    // embeddings) and the WebSocket transport, which the backend would send
+    // to its OpenAI target, go where Copilot sends them without Headroom.
+    if is_copilot {
+        strip_copilot_path_prefix(&mut buf);
+        parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
+        stamp_request_header(
+            &mut buf,
+            "x-headroom-base-url",
+            b"x-headroom-base-url: https://api.githubcopilot.com\r\n",
+        );
+        stamp_client_header(&mut buf, b"X-Client: copilot\r\n");
+        if request_has_header(&buf, "upgrade")
+            || !parsed_head
+                .as_ref()
+                .is_some_and(|head| is_copilot_inference_path(&head.path))
         {
             forward_direct_to_anthropic(client, buf, &upstream_base).await;
             return;
@@ -2406,7 +2458,8 @@ async fn handle(
     // only Claude (non-Codex) traffic direct; Codex falls through to the backend
     // below. This keeps a Claude overage from pausing Codex optimization.
     // OpenCode is exempt: it runs on the user's own API keys, so a Claude
-    // plan gate has nothing to do with its billing — keep it optimized.
+    // plan gate has nothing to do with its billing — keep it optimized. So is
+    // Copilot, billed by GitHub.
     // !is_grok: a grok request on a non-OpenAI path must not be direct-
     // forwarded to api.anthropic.com with its xAI bearer; the backend stays
     // alive whenever grok is enabled, so falling through is always routable.
@@ -2417,6 +2470,7 @@ async fn handle(
     if !is_codex
         && !is_opencode
         && !is_grok
+        && !is_copilot
         && !is_local_backend_path
         && claude_only_bypass.load(Ordering::Acquire)
     {
@@ -2439,10 +2493,10 @@ async fn handle(
         stamp_headroom_bypass_header(&mut buf);
     }
 
-    // OpenCode / Grok honor the account wall the same way: Python stays up
-    // (it owns their upstream routing) but is told to pass the request
-    // through untouched.
-    if (is_opencode || is_grok) && account_gate() {
+    // OpenCode / Grok / Copilot honor the account wall the same way: Python
+    // stays up (it owns their upstream routing) but is told to pass the
+    // request through untouched.
+    if (is_opencode || is_grok || is_copilot) && account_gate() {
         record_gated_bypass(&buf);
         stamp_headroom_bypass_header(&mut buf);
     }
@@ -5176,6 +5230,54 @@ fn is_grok_inference_path(path: &str) -> bool {
     )
 }
 
+/// Copilot's API path behind the `/copilot` prefix Headroom sets as its API
+/// host (`github.copilot.advanced.debug.overrideCapiUrl`).
+fn copilot_api_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/copilot")?;
+    (rest.is_empty() || rest.starts_with(['/', '?'])).then_some(rest)
+}
+
+/// Rewrite the request target to the path Copilot would have called on
+/// GitHub, so the backend's routes and the direct forwarder both see it.
+fn strip_copilot_path_prefix(buf: &mut Vec<u8>) {
+    let Some(line_end) = buf.windows(2).position(|w| w == b"\r\n") else {
+        return;
+    };
+    let Ok(line) = std::str::from_utf8(&buf[..line_end]) else {
+        return;
+    };
+    let mut parts = line.splitn(3, ' ');
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return;
+    };
+    let Some(rest) = copilot_api_path(target) else {
+        return;
+    };
+    let rest = if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    };
+    let rewritten = format!("{method} {rest} {version}");
+    buf.splice(..line_end, rewritten.into_bytes());
+}
+
+/// The Copilot endpoints the backend compresses, after the prefix is gone:
+/// OpenAI chat and responses (Copilot serves both without `/v1`) and
+/// Anthropic messages for Claude models. Exact paths: sub-resources go direct.
+fn is_copilot_inference_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    matches!(
+        path,
+        "/chat/completions"
+            | "/responses"
+            | "/v1/chat/completions"
+            | "/v1/responses"
+            | "/v1/messages"
+    )
+}
+
 /// The upstream a Grok Build request belongs to, keyed on its credential.
 /// `grok login` stores an auth.x.ai OIDC session token (a JWT) and the CLI's
 /// own default base for that mode is `cli-chat-proxy.grok.com/v1`; api.x.ai
@@ -5540,24 +5642,24 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_class,
         codex_error_shape_tag, codex_error_summary, codex_failure_kind, codex_inband_message,
         codex_prompt_failed, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        grok_upstream_header, held_by_our_other_window, intercept_request_counts,
+        copilot_api_path, decode_codex_plan_tier, extract_bearer, extract_header_value,
+        find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
         is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
-        is_codex_sse_response, is_compression_refused_error, is_counted_request,
-        is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
-        is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_codex_sse_response, is_compression_refused_error, is_copilot_inference_path,
+        is_counted_request, is_failed_request_status, is_geo_blocked_codex_error,
+        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
-        stamp_request_header, strip_request_header, take_plugin_route, verdict_permits_reuse,
-        verdict_unwires_clients, BypassFlag, CodexTerminalReader, HeldPortVerdict, ModelsRewrite,
-        ParsedRequestHead, PortProbe, ResponseSniffer, SharedToken,
-        FIRST_OPTIMIZED_REQUEST_REPORTED,
+        stamp_request_header, strip_copilot_path_prefix, strip_request_header, take_plugin_route,
+        verdict_permits_reuse, verdict_unwires_clients, BypassFlag, CodexTerminalReader,
+        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, PortProbe, ResponseSniffer, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED, INTERCEPT_COPILOT_REQUESTS,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -7133,6 +7235,135 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn copilot_inference_reaches_the_backend_without_its_prefix() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend_listener.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let head = read_until_header_end(&mut sock).await;
+                    let _ = seen_tx.send(String::from_utf8_lossy(&head).to_string());
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        backend_port::set(backend_addr.port());
+
+        let send = |request: &'static [u8]| async move {
+            let (intercept_listener, intercept_addr) = bind_ephemeral().await;
+            let mut client = TcpStream::connect(intercept_addr)
+                .await
+                .expect("client connect");
+            let (accepted, _) = intercept_listener.accept().await.expect("accept");
+            let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+            tokio::spawn(super::handle(
+                accepted,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("https://api.anthropic.com".to_string()),
+            ));
+            client.write_all(request).await.expect("write request");
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(5), client.read_to_end(&mut response)).await;
+            response
+        };
+
+        let before = INTERCEPT_COPILOT_REQUESTS.load(std::sync::atomic::Ordering::Acquire);
+        // Real Copilot Chat 0.69 shapes. The loopback base URL makes the
+        // direct forwarder refuse (503), so the direct path is observable
+        // without touching the network.
+        let chat = send(b"POST /copilot/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: GitHubCopilotChat/0.69.0\r\nAuthorization: Bearer tid_abc\r\nContent-Length: 0\r\n\r\n").await;
+        let messages = send(b"POST /copilot/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: GitHubCopilotChat/0.69.0\r\nContent-Length: 0\r\n\r\n").await;
+        let models = send(b"GET /copilot/models HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: GitHubCopilotChat/0.69.0\r\nx-headroom-base-url: http://127.0.0.1:9\r\n\r\n").await;
+        let websocket = send(b"GET /copilot/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nx-headroom-base-url: http://127.0.0.1:9\r\n\r\n").await;
+        backend_port::reset_for_tests();
+
+        assert!(
+            chat.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&chat)
+        );
+        assert!(
+            messages.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&messages)
+        );
+        assert!(
+            models.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&models)
+        );
+        assert!(
+            websocket.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&websocket)
+        );
+        assert_eq!(
+            INTERCEPT_COPILOT_REQUESTS.load(std::sync::atomic::Ordering::Acquire) - before,
+            4
+        );
+        let mut seen = Vec::new();
+        while let Ok(head) = seen_rx.try_recv() {
+            seen.push(head);
+        }
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (head, line) in seen.iter().zip([
+            "POST /chat/completions HTTP/1.1",
+            "POST /v1/messages HTTP/1.1",
+        ]) {
+            assert_eq!(head.lines().next(), Some(line));
+            assert!(
+                head.contains("x-headroom-base-url: https://api.githubcopilot.com\r\n"),
+                "{head}"
+            );
+            assert!(head.contains("X-Client: copilot\r\n"), "{head}");
+        }
+    }
+
+    #[test]
+    fn copilot_prefix_is_matched_whole_and_stripped_from_the_request_line() {
+        assert_eq!(
+            copilot_api_path("/copilot/chat/completions"),
+            Some("/chat/completions")
+        );
+        assert_eq!(copilot_api_path("/copilot"), Some(""));
+        assert_eq!(copilot_api_path("/copilot?x=1"), Some("?x=1"));
+        assert_eq!(copilot_api_path("/copilotx/models"), None);
+        assert_eq!(copilot_api_path("/v1/copilot/models"), None);
+
+        let mut buf =
+            b"POST /copilot/responses?stream=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"a\":1}"
+                .to_vec();
+        strip_copilot_path_prefix(&mut buf);
+        assert_eq!(
+            buf,
+            b"POST /responses?stream=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"a\":1}".to_vec()
+        );
+        let mut root = b"GET /copilot HTTP/1.1\r\n\r\n".to_vec();
+        strip_copilot_path_prefix(&mut root);
+        assert_eq!(root, b"GET / HTTP/1.1\r\n\r\n".to_vec());
+        let mut other = b"POST /v1/messages HTTP/1.1\r\n\r\n".to_vec();
+        strip_copilot_path_prefix(&mut other);
+        assert_eq!(other, b"POST /v1/messages HTTP/1.1\r\n\r\n".to_vec());
+
+        assert!(is_copilot_inference_path("/chat/completions"));
+        assert!(is_copilot_inference_path("/v1/messages"));
+        assert!(!is_copilot_inference_path("/models"));
+        assert!(!is_copilot_inference_path("/v1/messages/count_tokens"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn intercept_goes_direct_until_the_backend_port_is_selected() {
         // Something already listens where the backend port points (Orca's
         // mobile server, a dev server on 6768) before tool_manager has probed
@@ -7332,7 +7563,13 @@ mod tests {
     #[test]
     fn intercept_request_counts_exposes_all_agent_keys() {
         let counts = intercept_request_counts();
-        for key in ["claude-code", "codex", "opencode", "grok-build"] {
+        for key in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "grok-build",
+            "github-copilot",
+        ] {
             assert!(counts.contains_key(key), "missing agent key {key}");
         }
     }
