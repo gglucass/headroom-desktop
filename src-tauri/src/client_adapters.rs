@@ -5406,10 +5406,13 @@ fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     reasons.iter().find_map(|reason| {
         let lower = reason.to_ascii_lowercase();
         // SQLITE_FULL is the user's full disk (RUST-PH), as environmental as
-        // a corrupted one.
+        // a corrupted one. So is SQLITE_CANTOPEN: the file is in our listing
+        // but this account cannot read it (another owner, e.g. a `sudo codex`
+        // run, or mode 000; RUST-PH regressed on a Mac where all 6 refused).
         if lower.contains("malformed")
             || lower.contains("disk i/o error")
             || lower.contains("database or disk is full")
+            || lower.contains("unable to open database file")
         {
             None
         } else if lower.contains("is locked") {
@@ -12063,6 +12066,10 @@ mod tests {
         assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
         assert_eq!(
             codex_retag_skip_class(&["database or disk is full".into()]),
+            None
+        );
+        assert_eq!(
+            codex_retag_skip_class(&["unable to open database file".into()]),
             None
         );
         // A lock outliving busy_timeout is: one class for the whole pass,
