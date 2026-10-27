@@ -11325,6 +11325,19 @@ fn auto_resume_backoff(failed_attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Wait before the watchdog re-downloads a lost base interpreter again: 1m,
+/// 5m, 15m, then hourly. Each try may fetch the ~30 MB base, and antivirus
+/// that quarantines it again would otherwise loop that download.
+fn lost_base_retry_backoff(retries: u32) -> std::time::Duration {
+    let mins = match retries {
+        0 => 1,
+        1 => 5,
+        2 => 15,
+        _ => 60,
+    };
+    std::time::Duration::from_secs(mins * 60)
+}
+
 /// Give-ups in a row whose start died before opening its port before the
 /// watchdog rebuilds the runtime: the first plus the 30s, 1m and 2m retries,
 /// so about four minutes of the same death.
@@ -11410,6 +11423,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // counts failed attempts to grow the backoff (see `auto_resume_backoff`).
         let mut auto_pause_next_retry: Option<std::time::Instant> = None;
         let mut auto_pause_failed: u32 = 0;
+        // Re-download retries for a base interpreter lost after launch.
+        let mut lost_base_next_retry: Option<std::time::Instant> = None;
+        let mut lost_base_retries: u32 = 0;
         // Consecutive give-ups whose last start died before opening its port.
         let mut rebuild_strikes: u32 = 0;
         // Set after a forced kill+restart of a hung process. Prevents the
@@ -11537,6 +11553,27 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 bypass_active,
             );
             if !should_be_up {
+                // The failed start (or the launch) that found the base gone
+                // started one re-download; if that one failed (offline, a
+                // login launch before the network is up) nothing retried
+                // until the next launch. A base deleted under a running
+                // backend has had no first try at all.
+                if !runtime.installed
+                    && !state.bootstrap_progress().running
+                    && state.tool_manager.base_interpreter_lost()
+                {
+                    let now = std::time::Instant::now();
+                    match lost_base_next_retry {
+                        None => lost_base_next_retry = Some(now + lost_base_retry_backoff(0)),
+                        Some(at) if now >= at => {
+                            state.redownload_lost_base_interpreter(&app);
+                            lost_base_retries += 1;
+                            lost_base_next_retry =
+                                Some(now + lost_base_retry_backoff(lost_base_retries));
+                        }
+                        Some(_) => {}
+                    }
+                }
                 if consecutive_failures > 0 {
                     log::debug!(
                         "watchdog: skip restart (installed={}, paused={}, starting={}, upgrading={}, bypass={}); resetting failure counter",
@@ -11562,6 +11599,8 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 auto_pause_failed = 0;
                 rebuild_strikes = 0;
                 auto_pause_next_retry = None;
+                lost_base_next_retry = None;
+                lost_base_retries = 0;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
                 WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
@@ -12897,7 +12936,7 @@ mod tests {
         learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
         learn_failure_is_agent_unparseable_output, learn_failure_signature,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        missing_dependency_modules, noop_app_update_progress_emitter,
+        lost_base_retry_backoff, missing_dependency_modules, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
         parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
         persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
@@ -16246,6 +16285,16 @@ Some unrelated content.
         assert_eq!(auto_resume_backoff(2), Duration::from_secs(120));
         assert_eq!(auto_resume_backoff(3), Duration::from_secs(300));
         assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn lost_base_retry_backoff_escalates_to_hourly() {
+        use std::time::Duration;
+        assert_eq!(lost_base_retry_backoff(0), Duration::from_secs(60));
+        assert_eq!(lost_base_retry_backoff(1), Duration::from_secs(300));
+        assert_eq!(lost_base_retry_backoff(2), Duration::from_secs(900));
+        assert_eq!(lost_base_retry_backoff(3), Duration::from_secs(3600));
+        assert_eq!(lost_base_retry_backoff(40), Duration::from_secs(3600));
     }
 
     /// Every reqwest client must decide, explicitly, whether it honors the
