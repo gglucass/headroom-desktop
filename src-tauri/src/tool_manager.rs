@@ -1140,6 +1140,34 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
         # Memory only: the wheel's 100-entry window stands.
         pass
 
+# --- Embedding relevance: 16 texts per ONNX run, not 256 (vendor, upstream owed) -
+# The content router's relevance split embeds every record of a tool output in
+# one fastembed embed() at its default batch of 256, padded to the longest text.
+# fastembed's ONNX session keeps ORT's CPU arena on and the arena never shrinks,
+# so it grows to the biggest batch the proxy ever scored: 2.5 GB pinned on a
+# 4-day macOS proxy (2026-10-27), out of the periodic trim's reach. 16 retained
+# ~10x less and ran faster, with the same keep/drop decisions. Python only: the
+# Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
+# `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
+# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_EMBED_BATCH_CAP=0.
+_hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
+if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_ebc_meta
+
+        if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
+            from headroom.relevance import embedding as _hd_ebc_mod
+
+            def _hd_ebc_encode(self, texts):
+                model = self._get_model()
+                return _hd_ebc_mod._get_numpy().array(list(model.embed(texts, batch_size=16)))
+
+            _hd_ebc_mod.EmbeddingScorer._encode = _hd_ebc_encode
+            _hd_bound.add("embed_batch_cap")
+    except Exception:
+        # Memory only: on any binding failure the wheel's batch of 256 stands.
+        pass
+
 # Proxied guarded upstreams (desktop posture; upstream #3804 shipped as an
 # allowlist): since 0.39.0 the wheel pins caller-supplied upstreams
 # (x-headroom-base-url) to the address the SSRF guard judged, and refuses them
@@ -2409,6 +2437,7 @@ _HD_VENDORS = (
     "cc_switch_reset",
     "tool_ref_hint",
     "message_window",
+    "embed_batch_cap",
     "proxied_guarded_upstreams",
     "output_warmup",
     "learn_rule_coerce",
@@ -17634,6 +17663,44 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(on, "20 20");
         // Off keeps the wheel's window, which also proves the probe sees it.
         assert_eq!(run("0"), "100 22");
+    }
+
+    #[test]
+    fn embed_batch_cap_behaves_against_the_installed_wheel() {
+        // The relevance scorer's fastembed calls run 16 texts per ONNX batch, not
+        // fastembed's 256 that grew ORT's arena to 2.5 GB. A fake model records
+        // the batch_size the installed EmbeddingScorer._encode passes.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.relevance.embedding import EmbeddingScorer
+seen = []
+class Model:
+    def embed(self, texts, **kwargs):
+        seen.append(kwargs.get("batch_size"))
+        return [[1.0, 0.0] for _ in texts]
+scorer = EmbeddingScorer()
+scorer._get_model = lambda: Model()
+print(len(scorer._encode(["record"] * 40)), seen)
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_EMBED_BATCH_CAP", flag)
+                .output()
+                .expect("run embed batch cap probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("1"), "40 [16]");
+        // Off keeps fastembed's default, which also proves the probe sees it.
+        assert_eq!(run("0"), "40 [None]");
     }
 
     #[test]
