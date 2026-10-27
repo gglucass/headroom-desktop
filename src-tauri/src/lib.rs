@@ -3312,6 +3312,17 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
         return;
     }
 
+    // A base interpreter that lost a stdlib file (antivirus quarantine,
+    // RUST-SM) is the machine's fault, and the next launch re-downloads the
+    // base: Warning, as the upgrade path files the same cause (RUST-K0).
+    let level = if startup_error_fingerprint_key(Some(technical_err.as_str()))
+        == Some("startup_runtime_missing_stdlib")
+    {
+        sentry::Level::Warning
+    } else {
+        sentry::Level::Error
+    };
+
     if let Some(failure) = startup_failure {
         let category = headroom_start_failure_category(&failure.reason);
         sentry::with_scope(
@@ -3338,11 +3349,11 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
             || {
-                sentry::capture_message(&truncated, sentry::Level::Error);
+                sentry::capture_message(&truncated, level);
             },
         );
     } else {
-        sentry::capture_message(&truncated, sentry::Level::Error);
+        sentry::capture_message(&truncated, level);
     }
 }
 
@@ -6511,6 +6522,14 @@ async fn detect_unrouted_clients(
             } else {
                 Vec::new()
             };
+            let claude_diagnostics = if client_id == "claude_code" {
+                client_adapters::claude_unrouted_diagnostics(
+                    routed_since.max(now - client_adapters::UNROUTED_ACTIVITY_WINDOW),
+                    routed_since,
+                )
+            } else {
+                Vec::new()
+            };
             // A session on the user's own provider went where they sent it, the
             // same skip as the first-run report. Before the daily throttle, so
             // it never spends the day's one report of a real bypass. Reachable
@@ -6586,7 +6605,7 @@ async fn detect_unrouted_clients(
                     scope.set_tag("client", client_id);
                     scope.set_tag("enabled", enabled);
                     scope.set_tag("reapplied", reapplied);
-                    for (key, value) in codex_diagnostics {
+                    for (key, value) in codex_diagnostics.into_iter().chain(claude_diagnostics) {
                         scope.set_tag(key, value);
                     }
                     scope.set_extra("active_at", active_at.to_rfc3339().into());
@@ -7303,6 +7322,11 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     // Prevent the launch-time OSS-plugin worker from mutating Claude's hook
     // cache after cleanup has restored it.
     SHUTTING_DOWN.store(true, Ordering::Release);
+    // Before the cleanup, which removes the device identity it is keyed by.
+    pricing::report_funnel_step_before_exit(
+        "app_uninstall_requested",
+        std::time::Duration::from_secs(2),
+    );
     {
         let state: tauri::State<'_, AppState> = app.state();
         stop_headroom_for_exit(&state);
@@ -7666,6 +7690,13 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         app,
         "app_quit_requested",
         Some(app_quit_requested_properties(source, runtime_paused)),
+    );
+    // Aptabase alone could not answer whether a trial user who stopped had
+    // quit: half of those who stop after a day or two leave no app check-in
+    // after it (2026-10-26). The funnel row keys this install for that join.
+    pricing::report_funnel_step_before_exit(
+        "app_quit_requested",
+        std::time::Duration::from_secs(2),
     );
     analytics::shutdown(app);
     if let Some(client) = sentry::Hub::current().client() {
@@ -8349,6 +8380,12 @@ pub fn run() {
                     "autostart_launch": launched_from_autostart
                 })),
             );
+            // Per install, so the trial users whose app stops checking in can
+            // be split into "never relaunched at login" and "quit" (paired
+            // with `app_quit_requested`).
+            if launched_from_autostart {
+                pricing::report_funnel_step(&app_handle, "launched_at_login");
+            }
 
             // Absorb the open-source `headroom` Claude Code plugin. Its hooks
             // run a bare `headroom init hook ensure`, which exits 127 here
@@ -11690,6 +11727,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                             if !port_conflict::note_proxy_failed(&app, &err, false) {
                                 capture_headroom_start_failure("watchdog hung-kill restart", &err);
                             }
+                            state.redownload_lost_base_interpreter(&app);
                         }
                     }
                     continue;
@@ -11882,6 +11920,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     log::info!("watchdog: ensure_headroom_running failed: {err:#}");
                     // In-session retry: don't bump the launch counter.
                     port_conflict::note_proxy_failed(&app, &err, false);
+                    state.redownload_lost_base_interpreter(&app);
                 }
             }
         }
@@ -18510,13 +18549,29 @@ Some unrelated content.
                 "headroom auto-start failed during launch",
                 &anyhow::anyhow!("wait check failed: interrupted"),
             );
+            // RUST-K0 on 0.9.50-rc.6: the base lost linecache.py.
+            let lost_stdlib = crate::tool_manager::HeadroomStartupFailure {
+                program: "python3".into(),
+                args: Vec::new(),
+                log_path: String::new(),
+                log_tail: "Fatal Python error: init_fs_encoding: failed to get the Python \
+                           codec of the filesystem encoding"
+                    .into(),
+                reason: "exited with status exit status: 1 before opening port 6768".into(),
+            };
+            super::capture_headroom_start_failure(
+                "headroom auto-start failed during launch",
+                &anyhow::Error::new(lost_stdlib),
+            );
         });
         let events = recorder.0.lock().unwrap();
-        assert_eq!(events.len(), 1, "only the real failure reports");
+        assert_eq!(events.len(), 2, "only the real failures report");
         assert!(events[0]
             .message
             .as_deref()
             .is_some_and(|m| m.contains("wait check failed")));
+        assert_eq!(events[0].level, sentry::Level::Error);
+        assert_eq!(events[1].level, sentry::Level::Warning, "machine fault");
     }
 
     #[cfg(target_os = "windows")]

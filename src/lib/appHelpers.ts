@@ -88,6 +88,24 @@ export function higherSubscriptionTier(
   return TIER_RANK[b] > TIER_RANK[a] ? b : a;
 }
 
+/// The tier the Upgrade view pitches: the higher of Claude's and Codex's
+/// recommendation. Codex's own waits for a Codex request since launch (the
+/// rate-limit snapshot), so until then its plan names the tier, any known plan
+/// at least Pro as in that snapshot path. Without it a Codex-only user got the
+/// Max x5 fallback: Plus users who opened Max x5 paid 1 of 15, Pro 5 of 10
+/// (in-app checkouts Sep 8 - Oct 18, 2026).
+export function upgradeRecommendedTier(
+  claudeRecommended: HeadroomSubscriptionTier | null | undefined,
+  codexRecommended: HeadroomSubscriptionTier | null | undefined,
+  codexPlanTier: CodexPlanTier | null | undefined
+): HeadroomSubscriptionTier | null {
+  const fromCodexPlan =
+    codexPlanTier && codexPlanTier !== "unknown"
+      ? recommendedHeadroomTier(null, codexPlanTier, "pro")
+      : null;
+  return higherSubscriptionTier(claudeRecommended, codexRecommended ?? fromCodexPlan);
+}
+
 /// Whether the billing-period tab being viewed is the one the subscriber
 /// actually bought. An unknown/absent server value means "can't tell" - treat
 /// it as a match so the active-plan chrome never vanishes on older servers.

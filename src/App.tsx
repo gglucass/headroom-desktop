@@ -102,7 +102,7 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   withCodexPlanNames,
-  higherSubscriptionTier,
+  upgradeRecommendedTier,
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -202,6 +202,7 @@ import {
   createPricingStatusOrder,
   formatRemainingDays,
   readCachedPricing,
+  resolvedCodexPlanTier,
   subscriptionTierLabel,
   writeCachedPricing
 } from "./lib/pricing";
@@ -1781,17 +1782,16 @@ export default function App() {
   const [startupReady, setStartupReady] = useState(false);
   const [activeView, setActiveView] = useState<TrayView>("home");
   const [pricingAudience, setPricingAudience] = useState<PricingAudience>("individual");
-  // Annual first: it is the cheaper per-month number and the tab the "Save 25%"
-  // badge points at. A subscriber's own period overrides this once it loads.
-  // Monthly by default: since the 2026-08-13 intro launch, annual-first
-  // checkouts converted 13 of 74 and monthly-first 25 of 44, and 20 of the 24
-  // lost annual starters never opened a monthly checkout. Subscribers still
-  // open on the period they bought (effect below).
-  // Annual, deliberately. This default is the single biggest lever on billing
-  // mix: it was flipped to "monthly" on 2026-09-06 (shipped in v0.9.10) and the
-  // annual share of new subscriptions fell from 36% to 12%, with Max x20 annual
-  // going to zero. Do not flip it without a measured reason.
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // Monthly while the in-app intro runs (2026-10-26). This default is the
+  // biggest lever on billing mix (annual 36% of new subscriptions under an
+  // annual default, 12% under monthly, Sep 2026), but with the intro on, buyers
+  // switched to monthly anyway: in-app starters Oct 5-18 opened annual 56% of
+  // the time, bought 3 annual plans (all Pro) and made $16.66 first-year
+  // revenue each, against $29.56 under the Sep 8-20 monthly default and $36.11
+  // on annual with the intro off. Re-measure before flipping it back, and
+  // revisit when the intro ends. Subscribers open on the period they bought
+  // (effect below).
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
   // `lastAttemptAt` of the upgrade failure the user chose to continue past in
   // the launcher. The record stays persisted (the dashboard banner still offers
   // Retry and Dismiss); a newer failed attempt shows the screen again.
@@ -2081,12 +2081,14 @@ export default function App() {
   // reads a price this render. Idempotent and derived purely from state, so a
   // repeated render (StrictMode) is a no-op.
   setServerPlanPrices(pricingStatus?.planPrices);
+  const codexPlanTier = resolvedCodexPlanTier(pricingStatus, cachedPricing);
   const rawUpgradePlans = getUpgradePlans(
     pricingAudience,
     pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-    higherSubscriptionTier(
+    upgradeRecommendedTier(
       pricingStatus?.recommendedSubscriptionTier,
-      pricingStatus?.codex?.recommendedSubscriptionTier
+      pricingStatus?.codex?.recommendedSubscriptionTier,
+      codexPlanTier
     ) ?? cachedPricing.recommendedSubscriptionTier,
     pricingStatus?.account?.subscriptionTier ?? cachedPricing.subscriptionTier,
     pricingStatus?.account?.subscriptionActive ?? false,
@@ -2112,7 +2114,7 @@ export default function App() {
     plans: withCodexPlanNames(
       rawUpgradePlans.plans,
       pricingStatus?.claude.planTier ?? cachedPricing.planTier,
-      pricingStatus?.codexPlanTier
+      codexPlanTier
     )
   };
   const contactEmailValid = isValidEmailAddress(contactEmail);
@@ -2267,7 +2269,7 @@ export default function App() {
 
   useEffect(() => {
     if (!pricingStatus) return;
-    writeCachedPricing(cachePricingStatus(pricingStatus));
+    writeCachedPricing(cachePricingStatus(pricingStatus, readCachedPricing()));
   }, [pricingStatus]);
 
   useEffect(() => {
@@ -6669,9 +6671,10 @@ export default function App() {
   })();
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
-      ? (higherSubscriptionTier(
+      ? (upgradeRecommendedTier(
           pricingStatus?.recommendedSubscriptionTier,
-          pricingStatus?.codex?.recommendedSubscriptionTier
+          pricingStatus?.codex?.recommendedSubscriptionTier,
+          codexPlanTier
         ) ??
           cachedPricing.recommendedSubscriptionTier ??
           upgradePlansState.featuredPlanId)
@@ -8129,7 +8132,7 @@ export default function App() {
                 : underTierWarning(
                     plan.id,
                     pricingStatus?.claude.planTier,
-                    pricingStatus?.codexPlanTier,
+                    codexPlanTier,
                     upgradePlansState.plans
                   );
               return (

@@ -637,6 +637,21 @@ pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
     );
 }
 
+/// `report_funnel_step` for a step the process exits right after (quit,
+/// uninstall): a detached retry thread dies with the process, so this sends
+/// one POST and waits up to `wait` for it. Device identity only, because the
+/// full one can fetch from Anthropic first.
+pub fn report_funnel_step_before_exit(step: &str, wait: std::time::Duration) {
+    if !crate::analytics::sharing_enabled() {
+        return;
+    }
+    let sent = spawn_funnel_step(IdentityPayload::device_only, step, api_base_url(), &[]);
+    let deadline = std::time::Instant::now() + wait;
+    while !sent.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {

@@ -9,6 +9,7 @@ import {
   PRICING_CACHE_KEY,
   pricingTone,
   readCachedPricing,
+  resolvedCodexPlanTier,
   subscriptionTierLabel,
   writeCachedPricing,
 } from "./pricing";
@@ -149,6 +150,20 @@ describe("pricing cache snapshot", () => {
       recommendedSubscriptionTier: "max5x",
       subscriptionTier: "pro",
     });
+  });
+
+  it("remembers the last known Codex plan across a status that does not know it", () => {
+    const known = cachePricingStatus(makePricingStatus({ codexPlanTier: "plus" }));
+    expect(known.codexPlanTier).toBe("plus");
+    // After a restart, before auth.json or a Codex request names the plan.
+    const restarted = makePricingStatus({ codexPlanTier: "unknown" });
+    expect(cachePricingStatus(restarted, known).codexPlanTier).toBe("plus");
+    expect(resolvedCodexPlanTier(restarted, known)).toBe("plus");
+    // A newly named plan replaces the remembered one.
+    expect(
+      resolvedCodexPlanTier(makePricingStatus({ codexPlanTier: "prolite" }), known)
+    ).toBe("prolite");
+    expect(resolvedCodexPlanTier(null, {})).toBeUndefined();
   });
 });
 

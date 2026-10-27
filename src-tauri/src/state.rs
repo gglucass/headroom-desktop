@@ -811,7 +811,9 @@ impl AppState {
         self.recover_interrupted_upgrade();
 
         if !self.tool_manager.python_runtime_installed() {
-            // First-run; start_bootstrap (wizard) handles install.
+            // First run waits for the wizard's start_bootstrap; a lost base
+            // (discarded by an earlier session's restart) does not.
+            self.redownload_lost_base_interpreter(app);
             return;
         }
 
@@ -949,6 +951,8 @@ impl AppState {
                         &err,
                     );
                 }
+                // The start path discards a base that lost a stdlib file.
+                self.redownload_lost_base_interpreter(app);
             }
         }
 
@@ -977,6 +981,21 @@ impl AppState {
         }
 
         self.set_runtime_starting(false);
+    }
+
+    /// A finished install that lost only its base interpreter (the start path
+    /// discards one missing a stdlib file, RUST-SM; disk cleanup, RUST-8E):
+    /// re-download it now. A login launch has no window, so waiting for an
+    /// Install click left the machine unoptimized until the user noticed.
+    /// info!, not warn!: the log bridge files every warn! in Sentry.
+    pub(crate) fn redownload_lost_base_interpreter(&self, app: &tauri::AppHandle) {
+        if !self.tool_manager.base_interpreter_lost() {
+            return;
+        }
+        log::info!("base interpreter missing on an installed runtime; re-downloading it");
+        if let Err(err) = crate::start_bootstrap(app.clone()) {
+            log::info!("re-downloading the base interpreter did not start: {err}");
+        }
     }
 
     fn runtime_maintenance_plan_for_app_version(
@@ -9676,8 +9695,9 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
         );
     }
     // One stdlib file gone from the base (RUST-SM: `linecache.py`). The start
-    // path already discarded the base, so Retry re-downloads it; if the file
-    // keeps vanishing, the user's antivirus is the likely cause.
+    // path already discarded the base and re-downloads it on its own;
+    // if the file keeps vanishing, the user's antivirus is the likely cause.
+    // No screen shows a Retry button for a start error, so do not name one.
     if crate::tool_manager::is_corrupt_base_stdlib_signal(raw) {
         let folder = if cfg!(windows) {
             "%LOCALAPPDATA%\\Headroom"
@@ -9686,7 +9706,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
         };
         return Some(format!(
             "One of the Python files Headroom's runtime needs went missing, usually because \
-             antivirus moved it to quarantine. Click Retry and Headroom downloads a fresh copy. \
+             antivirus moved it to quarantine. Headroom downloads a fresh copy on its own. \
              If it happens again, add {folder} as an exclusion in your antivirus."
         ));
     }
@@ -12488,7 +12508,7 @@ mod tests {
             ModuleNotFoundError: No module named 'linecache'\n--- end log ---";
         let hint = classify_startup_error(raw).expect("lost stdlib file should classify");
         assert!(hint.contains("antivirus"), "got: {hint}");
-        assert!(hint.contains("Retry"), "got: {hint}");
+        assert!(hint.contains("fresh copy on its own"), "got: {hint}");
         assert!(
             !hint.contains("missing some of its own files"),
             "got: {hint}"

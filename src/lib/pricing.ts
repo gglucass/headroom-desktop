@@ -1,6 +1,7 @@
 import type {
   ClaudeAuthMethod,
   ClaudePlanTier,
+  CodexPlanTier,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
 } from "./types";
@@ -9,6 +10,19 @@ export interface CachedPricing {
   planTier?: ClaudePlanTier;
   recommendedSubscriptionTier?: HeadroomSubscriptionTier;
   subscriptionTier?: HeadroomSubscriptionTier;
+  codexPlanTier?: CodexPlanTier;
+}
+
+/// The ChatGPT plan this status names, else the last one remembered. The
+/// status only knows it from Codex's auth.json or a live Codex request, so a
+/// keychain-stored Codex login reads "unknown" after every restart until Codex
+/// sends one; "unknown" is no evidence and never replaces a known plan.
+export function resolvedCodexPlanTier(
+  status: HeadroomPricingStatus | null | undefined,
+  cached: CachedPricing
+): CodexPlanTier | undefined {
+  const live = status?.codexPlanTier;
+  return live && live !== "unknown" ? live : cached.codexPlanTier;
 }
 
 export function claudePlanLabel(plan: ClaudePlanTier) {
@@ -88,11 +102,15 @@ export function pricingTone(status: HeadroomPricingStatus | null) {
   return "healthy";
 }
 
-export function cachePricingStatus(status: HeadroomPricingStatus): CachedPricing {
+export function cachePricingStatus(
+  status: HeadroomPricingStatus,
+  previous: CachedPricing = {}
+): CachedPricing {
   return {
     planTier: status.claude.planTier,
     recommendedSubscriptionTier: status.recommendedSubscriptionTier ?? undefined,
     subscriptionTier: status.account?.subscriptionTier ?? undefined,
+    codexPlanTier: resolvedCodexPlanTier(status, previous),
   };
 }
 
