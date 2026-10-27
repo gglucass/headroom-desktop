@@ -7441,11 +7441,20 @@ fn handle_crash_guard_flag() {
     let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
     let started = std::time::Instant::now();
     let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
-    let unwired = client_adapters::unwire_clients_after_crash(|| {
+    let intercept_answers = || {
         let intercept =
             std::net::SocketAddr::from(([127, 0, 0, 1], proxy_intercept::INTERCEPT_PORT));
         std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
-    });
+    };
+    let unwired = client_adapters::unwire_clients_after_crash(intercept_answers);
+    // After a quit stop_headroom already swept, so this finds nothing; the
+    // orphan rule spares a relaunched instance's backend.
+    #[cfg(unix)]
+    if !intercept_answers() {
+        state::reap_orphaned_backend(&tool_manager::ManagedRuntime::bootstrap_root(
+            &storage::app_data_dir(),
+        ));
+    }
     if !unwired.is_empty() {
         // RUST-KV carried nothing else, so a crash, a kill mid-quit (the
         // relauncher's force-kill, a logout deadline) and a force quit all

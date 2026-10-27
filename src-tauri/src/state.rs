@@ -4129,17 +4129,7 @@ impl AppState {
         // to identify our proxies regardless of port.
         let managed_python = self.tool_manager.managed_python();
         let headroom_entrypoint = self.tool_manager.headroom_entrypoint();
-        let command_patterns = [
-            (managed_python.as_path(), "-m headroom.proxy.server"),
-            (headroom_entrypoint.as_path(), "proxy --port"),
-            // On macOS the entrypoint re-execs itself as `python -m
-            // headroom.cli proxy ...` for malloc tuning (upstream
-            // cli/proxy.py `_reexec_with_malloc_tuning`), so that is what a
-            // live or orphaned backend's argv actually reads there; neither
-            // pattern above matches it.
-            (managed_python.as_path(), "-m headroom.cli proxy"),
-        ];
-        for (exe, args_pattern) in command_patterns {
+        for (exe, args_pattern) in backend_command_patterns(&managed_python, &headroom_entrypoint) {
             log::info!(
                 "stop_headroom: pkill -f {:?}",
                 format!("{} {args_pattern}", exe.display())
@@ -10437,6 +10427,49 @@ fn leads_own_process_group(pid: u32) -> bool {
         == Some(pid)
 }
 
+/// What a backend proxy's command line reads, as (executable, args) for
+/// `kill_processes_by_command_pattern`. The port is left out: the proxy may
+/// have fallen back to 6769..=6790 if 6768 was foreign-held.
+fn backend_command_patterns<'a>(
+    managed_python: &'a std::path::Path,
+    headroom_entrypoint: &'a std::path::Path,
+) -> [(&'a std::path::Path, &'static str); 3] {
+    [
+        (managed_python, "-m headroom.proxy.server"),
+        (headroom_entrypoint, "proxy --port"),
+        // On macOS the entrypoint re-execs itself as `python -m
+        // headroom.cli proxy ...` for malloc tuning (upstream
+        // cli/proxy.py `_reexec_with_malloc_tuning`), so that is what a
+        // live or orphaned backend's argv actually reads there; neither
+        // pattern above matches it.
+        (managed_python, "-m headroom.cli proxy"),
+    ]
+}
+
+/// The crash guard's half of `stop_headroom`'s sweep (`handle_crash_guard_flag`
+/// in lib.rs). A crash or force quit leaves the backend running, reparented
+/// to launchd/init, until the next launch reclaims it; for an app the user
+/// then deleted that was until reboot (a "Headroom left connections behind"
+/// report, 2026-10-27). Windows needs none of this: the backend dies with
+/// the app's kill-on-close job.
+#[cfg(unix)]
+pub(crate) fn reap_orphaned_backend(runtime: &crate::tool_manager::ManagedRuntime) {
+    let python = runtime.managed_python();
+    let entrypoint = runtime.headroom_entrypoint();
+    for (exe, args_pattern) in backend_command_patterns(&python, &entrypoint) {
+        if let Err(err) = kill_processes_by_command_pattern(
+            exe,
+            args_pattern,
+            SweepParents::Orphans {
+                own_children: false,
+            },
+        ) {
+            log::warn!("reaping the orphaned backend failed: {err:#}");
+        }
+    }
+    reap_orphaned_multiprocessing_helpers(&python);
+}
+
 /// Reaps multiprocessing helpers (image-isolation pool workers, the resource
 /// tracker) of a managed-runtime python that is gone. They outlive their
 /// parent: before the sweep signalled a stray proxy's group, every proxy it
@@ -14070,6 +14103,27 @@ mod tests {
             pid_exits_within(helper, std::time::Duration::from_secs(5)),
             "sweep left the backend's group member {helper} running"
         );
+    }
+
+    /// The crash guard's sweep: a backend whose parent is not a Headroom
+    /// desktop (the app died, it went to launchd) is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn crash_guard_reaps_a_backend_the_dead_app_left_running() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(base.path());
+        let (python, pid_file) = fake_venv_python(&runtime.venv_dir);
+        let mut parent = crate::proc::command("/bin/sh")
+            .args(["-c", "\"$P\" -m headroom.cli proxy --port 6768; true"])
+            .env("P", &python)
+            .spawn()
+            .expect("spawn parent");
+        let backend = wait_for_pid_file(&pid_file);
+        super::reap_orphaned_backend(&runtime);
+        let reaped = pid_exits_within(backend, std::time::Duration::from_secs(5));
+        let _ = parent.kill();
+        let _ = parent.wait();
+        assert!(reaped, "the crash guard left backend {backend} running");
     }
 
     /// A helper whose parent is a live process of the same runtime is that

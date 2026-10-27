@@ -3178,6 +3178,15 @@ impl ManagedRuntime {
         self.venv_dir.join(bin_subdir()).join(python_exe_name())
     }
 
+    pub fn headroom_entrypoint(&self) -> PathBuf {
+        let name = if cfg!(target_os = "windows") {
+            "headroom.exe"
+        } else {
+            "headroom"
+        };
+        self.venv_dir.join(bin_subdir()).join(name)
+    }
+
     pub fn managed_pip(&self) -> PathBuf {
         self.venv_dir.join(bin_subdir()).join(pip_exe_name())
     }
@@ -3892,12 +3901,7 @@ impl ToolManager {
     }
 
     pub fn headroom_entrypoint(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") {
-            "headroom.exe"
-        } else {
-            "headroom"
-        };
-        self.runtime.venv_dir.join(bin_subdir()).join(name)
+        self.runtime.headroom_entrypoint()
     }
 
     /// Holds only the SITECUSTOMIZE_PY the backend spawn writes; put it on
