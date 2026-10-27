@@ -9787,6 +9787,12 @@ fn learn_failure_signature_source(text: &str) -> String {
         .iter()
         .position(|line| learn_marker_expects_reason_line(line))
     else {
+        // An uncaught exception opens with the same header every time, which
+        // put every distinct crash on one issue (RUST-HJ). Python prints the
+        // exception itself last.
+        if lines.contains(&"Traceback (most recent call last):") {
+            return learn_quoted_paths_elided(lines[lines.len() - 1]);
+        }
         return first.to_string();
     };
     match lines.get(marker + 1) {
@@ -9823,6 +9829,23 @@ fn learn_failure_signature_source(text: &str) -> String {
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
     }
+}
+
+/// `line` with every single-quoted path cut to `...`. An OSError names its file
+/// as `'<path>'`, and a home directory in a fingerprint splits one cause per
+/// user and puts their username in the title.
+fn learn_quoted_paths_elided(line: &str) -> String {
+    line.split('\'')
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 && (part.contains('/') || part.contains('\\')) {
+                "..."
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("'")
 }
 
 /// A stderr line with any Python log-record prefix removed: the message of a
@@ -10513,10 +10536,14 @@ fn execute_headroom_learn_run(
             }
         }
         Err(err) => {
-            sentry::capture_message(
-                &format!("headroom learn spawn failed: {err}"),
-                sentry::Level::Error,
-            );
+            // App Control refusing the venv's exe is machine policy, already
+            // counted once per session by the start path (RUST-G0); RUST-T1.
+            if !is_windows_app_control_block(&err.to_string()) {
+                sentry::capture_message(
+                    &format!("headroom learn spawn failed: {err}"),
+                    sentry::Level::Error,
+                );
+            }
             (
                 format!("headroom learn failed for {project_name}."),
                 false,
@@ -17343,6 +17370,25 @@ Some unrelated content.
             "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
         )
         .ends_with("Reading prompt from stdin..."));
+    }
+
+    #[test]
+    fn learn_failure_signature_source_names_a_tracebacks_exception() {
+        // RUST-HJ: every uncaught exception was titled by the header.
+        let opencode = "Traceback (most recent call last):\n  File \"~/x/headroom/learn/plugins/opencode.py\", line 115, in discover_projects\n    cursor.execute(\nsqlite3.OperationalError: no such table: session\n";
+        assert_eq!(
+            learn_failure_signature_source(opencode),
+            "sqlite3.OperationalError: no such table: session"
+        );
+        let denied = "Traceback (most recent call last):\n  File \"learn.py\", line 9, in learn\nPermissionError: [Errno 13] Permission denied: '/Users/ann/.claude/projects/-/memory'\n";
+        assert_eq!(
+            learn_failure_signature_source(denied),
+            "PermissionError: [Errno 13] Permission denied: '...'"
+        );
+        assert_eq!(
+            super::learn_quoted_paths_elided("ModuleNotFoundError: No module named 'headroom'"),
+            "ModuleNotFoundError: No module named 'headroom'"
+        );
     }
 
     #[test]

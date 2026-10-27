@@ -1611,6 +1611,85 @@ if _hd_llb_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: OpenCode's v2 session tables (vendor, upstream owed) --------------
+# OpenCode moved sessions from session/message/part to session_v2 and
+# session_message (tool calls inside each row's data.content), and a database a
+# current OpenCode created has no `session` table at all. The wheel's plugin
+# (0.41.0) reads only v1, so every learn scan there died on "no such table:
+# session" (RUST-HJ, 6 hosts). On a v2 database the plugin's connection gets
+# TEMP views with the v1 names and shape, so its own queries and parsing run
+# unchanged; TEMP objects never touch the user's file, and a v1 database gets
+# none. The part view inverts OpenCode's own v1 -> v2 migration (migrateTool:
+# callID -> id, tool -> name, output -> content text, error -> error.message).
+# On Windows v2 stores C:/x while the plugin matches str(Path(worktree)), C:\x.
+# Exact-pin gated to wheel 0.41.0; self-neutralizes once the plugin names
+# session_v2. Kill switch: HEADROOM_LEARN_OPENCODE_V2=0.
+_hd_oc2_flag = _hd_os.environ.get("HEADROOM_LEARN_OPENCODE_V2", "1")
+if _hd_oc2_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_oc2_meta
+
+        if _hd_oc2_meta.version("headroom-ai") == "0.41.0":
+            import inspect as _hd_oc2_inspect
+            import sqlite3 as _hd_oc2_sqlite
+            import types as _hd_oc2_types
+
+            from headroom.learn.plugins import opencode as _hd_oc2_mod
+
+            if "session_v2" not in _hd_oc2_inspect.getsource(_hd_oc2_mod):
+                _hd_oc2_worktree = (
+                    "replace(worktree, '/', '\\')" if _hd_os.name == "nt" else "worktree"
+                )
+                _HD_OC2_VIEWS = (
+                    "CREATE TEMP VIEW project AS SELECT id, name, "
+                    + _hd_oc2_worktree
+                    + " AS worktree FROM main.project",
+                    "CREATE TEMP VIEW session AS"
+                    " SELECT id, project_id, time_created FROM main.session_v2",
+                    "CREATE TEMP VIEW message AS SELECT id, session_id FROM main.session_message",
+                    "CREATE TEMP VIEW part AS"
+                    " SELECT m.id AS message_id,"
+                    "  json_object('type', 'tool', 'tool', t.value ->> '$.name',"
+                    "   'callID', t.value ->> '$.id',"
+                    "   'state', json_object('status', t.value ->> '$.state.status',"
+                    "    'input', t.value -> '$.state.input',"
+                    "    'output', coalesce(t.value ->> '$.state.error.message',"
+                    "     (SELECT group_concat(c.value ->> '$.text', char(10))"
+                    "      FROM json_each(t.value, '$.state.content') c"
+                    "      WHERE c.value ->> '$.type' = 'text'), ''))) AS data,"
+                    "  coalesce(t.value ->> '$.time.created', m.time_created) AS time_created"
+                    " FROM main.session_message m, json_each(m.data, '$.content') t"
+                    " WHERE t.value ->> '$.type' = 'tool'",
+                )
+
+                def _hd_oc2_connect(*args, **kwargs):
+                    conn = _hd_oc2_sqlite.connect(*args, **kwargs)
+                    try:
+                        tables = {
+                            r[0]
+                            for r in conn.execute(
+                                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                            )
+                        }
+                        if "session" not in tables and {
+                            "project",
+                            "session_v2",
+                            "session_message",
+                        } <= tables:
+                            for stmt in _HD_OC2_VIEWS:
+                                conn.execute(stmt)
+                    except _hd_oc2_sqlite.Error:
+                        pass
+                    return conn
+
+                _hd_oc2_shim = _hd_oc2_types.ModuleType("sqlite3")
+                _hd_oc2_shim.__dict__.update(_hd_oc2_sqlite.__dict__)
+                _hd_oc2_shim.connect = _hd_oc2_connect
+                _hd_oc2_mod.sqlite3 = _hd_oc2_shim
+                _hd_bound.add("learn_opencode_v2")
+    except Exception:
+        pass
+
 # --- web_search_call history on a request without a web_search tool ----------
 # Codex compacts locally for a custom provider such as Headroom's: it resends
 # the whole history with `tools: []` and asks for a summary. When that history
@@ -2340,6 +2419,7 @@ _HD_VENDORS = (
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
     "learn_loop_budget",
+    "learn_opencode_v2",
     "web_search_history",
     "buffered_upstream_stream",
     "deferred_tool_affinity",
@@ -17772,6 +17852,73 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
         assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_opencode_v2_behaves_against_the_installed_wheel() {
+        // RUST-HJ: a current OpenCode's database has session_v2 and no
+        // `session`, and every learn scan died on "no such table: session".
+        // Rows follow OpenCode's own v1 -> v2 migration (migrateTool). The kill
+        // switch brings the crash back; the user's file never gets a view.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-oc2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"import json, sqlite3, tempfile
+from pathlib import Path
+t = Path(tempfile.mkdtemp())
+db = t / 'opencode.db'
+c = sqlite3.connect(db)
+c.executescript('CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT);'
+    'CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL, time_created INTEGER);'
+    'CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER, data TEXT NOT NULL);')
+w = (t / 'app').as_posix()
+c.execute("INSERT INTO project VALUES ('p1', ?, 'app')", (w,))
+c.execute("INSERT INTO session_v2 VALUES ('s1', 'p1', ?, 1761000000000)", (w,))
+data = {'type': 'assistant', 'content': [{'type': 'text', 'text': 'hi'},
+    {'type': 'tool', 'id': 'call_1', 'name': 'bash', 'state': {'status': 'completed', 'input': {'command': 'ls'}, 'content': [{'type': 'text', 'text': 'a.txt'}]}, 'time': {'created': 1761000000001}},
+    {'type': 'tool', 'id': 'call_2', 'name': 'read', 'state': {'status': 'error', 'input': {'filePath': '/x'}, 'error': {'type': 'tool.execution', 'message': 'File not found: /x'}}, 'time': {'created': 1761000000002}}]}
+c.execute("INSERT INTO session_message VALUES ('m1', 's1', 'assistant', 0, 1761000000000, ?)", (json.dumps(data),))
+c.commit()
+c.close()
+from headroom.learn.plugins.opencode import OpenCodePlugin
+p = OpenCodePlugin(db_path=db)
+try:
+    projects = p.discover_projects()
+except sqlite3.OperationalError as e:
+    print(e)
+    raise SystemExit
+calls = [(tc.name, tc.tool_call_id, tc.input_data, tc.output, tc.is_error) for s in p.scan_project(projects[0]) for tc in s.tool_calls]
+views = sqlite3.connect(db).execute("SELECT count(*) FROM sqlite_master WHERE type = 'view'").fetchone()[0]
+print(len(projects), calls, views)"#;
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_OPENCODE_V2", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on,
+            "1 [('Bash', 'call_1', {'command': 'ls'}, 'a.txt', False), \
+             ('Read', 'call_2', {'filePath': '/x'}, 'File not found: /x', True)] 0",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(off, "no such table: session", "stderr:\n{off_err}");
     }
 
     #[test]
