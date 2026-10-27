@@ -159,6 +159,8 @@ static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_OPENCODE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_GROK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_COPILOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Set once the loopback guard below has refused a Copilot request.
+static COPILOT_REFUSAL_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Request bytes forwarded unoptimized while the pricing gate was on, this
 /// process. Feeds the "unsaved since Headroom paused" counter in the gate
@@ -2196,6 +2198,18 @@ async fn handle(
     // a user's browser; CLI clients never set Origin and always send a
     // loopback Host.
     if !request_is_loopback_safe(&buf) {
+        // Copilot Chat's fetcher is not verified against this guard. If it
+        // sends an Origin, every Copilot request dies here silently; one line
+        // says so.
+        if find_header_end(&buf)
+            .and_then(|end| parse_request_head(&buf[..end + 4]))
+            .is_some_and(|head| copilot_api_path(&head.path).is_some())
+            && !COPILOT_REFUSAL_LOGGED.swap(true, Ordering::Relaxed)
+        {
+            log::warn!(
+                "[proxy_intercept] refused a GitHub Copilot request carrying an Origin header or a non-loopback Host"
+            );
+        }
         let _ = client
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;

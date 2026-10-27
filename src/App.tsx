@@ -379,7 +379,7 @@ const connectorSetupDetails: Record<string, string> = {
   opencode:
     "Points the anthropic and openai providers in OpenCode's global config (usually ~/.config/opencode/opencode.json) at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this.",
   github_copilot:
-    "Points GitHub Copilot's chat and agent requests in VS Code at Headroom, in VS Code's user settings.json. Inline completions are unlimited on every plan, so they stay direct. VS Code profiles other than Default aren't covered yet."
+    "Points GitHub Copilot's chat and agent requests at Headroom in VS Code's user settings.json, for every profile. Inline completions are unlimited on every plan, so they stay direct. Not yet in remote windows: in Remote-SSH, WSL and dev containers, Copilot runs on the remote machine and can't reach Headroom."
 };
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
