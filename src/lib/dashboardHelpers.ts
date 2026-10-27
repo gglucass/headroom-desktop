@@ -528,6 +528,16 @@ export function mergeProviderSavingsForDisplay(
       totalTokensSent: 0,
       cacheSavingsUsd: 0,
       compressibleCostUsd: 0 as number | null
+    },
+    copilot: {
+      label: "GitHub Copilot",
+      count: 0,
+      estimatedSavingsUsd: 0,
+      estimatedTokensSaved: 0,
+      actualCostUsd: 0,
+      totalTokensSent: 0,
+      cacheSavingsUsd: 0,
+      compressibleCostUsd: 0 as number | null
     }
   };
   for (const point of byProvider) {
@@ -537,7 +547,9 @@ export function mergeProviderSavingsForDisplay(
         ? groups.codex
         : provider === "xai"
           ? groups.grok
-          : groups.claude;
+          : provider === "copilot"
+            ? groups.copilot
+            : groups.claude;
     group.count += 1;
     group.estimatedSavingsUsd += point.estimatedSavingsUsd;
     group.estimatedTokensSaved += point.estimatedTokensSaved;
@@ -552,7 +564,7 @@ export function mergeProviderSavingsForDisplay(
         : group.compressibleCostUsd +
           Math.max(0, point.actualCostUsd - Math.max(0, point.cacheReadCostUsd));
   }
-  return [groups.claude, groups.codex, groups.grok]
+  return [groups.claude, groups.codex, groups.grok, groups.copilot]
     .filter((group) => group.count > 0)
     .map(({ count: _count, cacheSavingsUsd, ...display }) => {
       const cost = display.compressibleCostUsd;
@@ -753,7 +765,8 @@ const SUPPORTED_CONNECTOR_IDS = new Set([
   "claude_code",
   "codex",
   "grok_build",
-  "opencode"
+  "opencode",
+  "github_copilot"
 ]);
 
 export function baseUrlTakeoverNotice(replaced: string): string {
@@ -782,9 +795,15 @@ const RESTART_HINT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // Connectors the Claude pricing gate does not cover while the user is
 // authenticated: Codex has its own proxy-side gate (codex_bypass); OpenCode and
-// Grok bill against the user's own provider keys, so the Claude gate has
-// nothing to meter. Plan-usage metering only, see `connectorGateMessage`.
-const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
+// Grok bill against the user's own provider keys and Copilot against the
+// user's GitHub plan, so the Claude gate has nothing to meter. Plan-usage
+// metering only, see `connectorGateMessage`.
+const GATE_EXEMPT_CONNECTOR_IDS = new Set([
+  "codex",
+  "opencode",
+  "grok_build",
+  "github_copilot"
+]);
 
 function claudeGateCovers(
   connector: ClientConnectorStatus,

@@ -377,7 +377,9 @@ const connectorSetupDetails: Record<string, string> = {
   grok_build:
     "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:
-    "Points the anthropic and openai providers in OpenCode's global config (usually ~/.config/opencode/opencode.json) at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this."
+    "Points the anthropic and openai providers in OpenCode's global config (usually ~/.config/opencode/opencode.json) at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this.",
+  github_copilot:
+    "Points GitHub Copilot's chat and agent requests in VS Code at Headroom, in VS Code's user settings.json. Inline completions are unlimited on every plan, so they stay direct. VS Code profiles other than Default aren't covered yet."
 };
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
@@ -402,7 +404,8 @@ const connectorMonograms: Record<string, string> = {
   claude_code: "CC",
   codex: "CX",
   grok_build: "GK",
-  opencode: "OC"
+  opencode: "OC",
+  github_copilot: "GC"
 };
 
 const connectorUnavailableReasons: Record<string, string> = {
@@ -416,7 +419,9 @@ const connectorUnavailableReasons: Record<string, string> = {
   grok_build:
     "Grok Build not found. Install it and restart Headroom.",
   opencode:
-    "OpenCode not found. Install it and restart Headroom."
+    "OpenCode not found. Install it and restart Headroom.",
+  github_copilot:
+    "VS Code not found. Install it, open it once and restart Headroom."
 };
 
 // Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
@@ -427,11 +432,16 @@ const GROK_CONNECTOR_ENABLED = true;
 // flag so it can ship dark in a stable if the RC pass surfaces problems.
 const OPENCODE_CONNECTOR_ENABLED = true;
 
+// GitHub Copilot (VS Code chat) is visible in RC builds for end-to-end
+// verification; same dark-ship switch as OpenCode.
+const COPILOT_CONNECTOR_ENABLED = true;
+
 function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
   return list.filter(
     (connector) =>
       (GROK_CONNECTOR_ENABLED || connector.clientId !== "grok_build") &&
-      (OPENCODE_CONNECTOR_ENABLED || connector.clientId !== "opencode")
+      (OPENCODE_CONNECTOR_ENABLED || connector.clientId !== "opencode") &&
+      (COPILOT_CONNECTOR_ENABLED || connector.clientId !== "github_copilot")
   );
 }
 
@@ -461,6 +471,13 @@ const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnecto
   {
     clientId: "opencode",
     name: "OpenCode",
+    installed: false,
+    enabled: false,
+    verified: false
+  },
+  {
+    clientId: "github_copilot",
+    name: "GitHub Copilot",
     installed: false,
     enabled: false,
     verified: false

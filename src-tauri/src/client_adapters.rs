@@ -60,7 +60,7 @@ struct ManagedClientSpec {
     name: &'static str,
 }
 
-const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
+const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 5] = [
     ManagedClientSpec {
         id: "claude_code",
         name: "Claude Code",
@@ -76,6 +76,10 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     ManagedClientSpec {
         id: "opencode",
         name: "OpenCode",
+    },
+    ManagedClientSpec {
+        id: "github_copilot",
+        name: "GitHub Copilot",
     },
 ];
 
@@ -94,6 +98,7 @@ pub fn detect_clients() -> Vec<ClientStatus> {
         detect_codex_client(is_configured(&setup_state, "codex")),
         detect_grok_build_client(is_configured(&setup_state, "grok_build")),
         detect_opencode_client(is_configured(&setup_state, "opencode")),
+        detect_github_copilot_client(is_configured(&setup_state, "github_copilot")),
     ]
 }
 
@@ -685,6 +690,11 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
         }
+        "github_copilot" => {
+            let updates = configure_copilot_capi_url()?;
+            changed_files.extend(updates.0);
+            backup_files.extend(updates.1);
+        }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
@@ -952,6 +962,18 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             } else {
                 failures.push(OPENCODE_BLOCK_NOT_FOUND.into());
+            }
+        }
+        "github_copilot" => {
+            if vscode_settings_key_matches(COPILOT_CAPI_URL_KEY, HEADROOM_COPILOT_CAPI_URL)? {
+                checks.push(
+                    "Found GitHub Copilot's API URL pointing to Headroom in VS Code's settings."
+                        .into(),
+                );
+            } else {
+                failures.push(
+                    "VS Code's settings no longer send GitHub Copilot through Headroom.".into(),
+                );
             }
         }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
@@ -1619,7 +1641,7 @@ pub fn any_gate_exempt_client_enabled() -> bool {
         .any(|id| is_configured(&state, id) || state.remembered_clients.contains_key(*id))
 }
 
-const GATE_EXEMPT_CLIENTS: [&str; 3] = ["codex_cli", "opencode", "grok_build"];
+const GATE_EXEMPT_CLIENTS: [&str; 4] = ["codex_cli", "opencode", "grok_build", "github_copilot"];
 
 /// Whether the user has the Claude Code connector on, which keeps Headroom's
 /// `headroom` MCP server in Claude Code's config. The remembered snapshot
@@ -1784,6 +1806,9 @@ fn disable_client_setup_with(client_id: &str, forget: bool) -> Result<()> {
         }
         "grok_build" => disable_grok_build()?,
         "opencode" => disable_opencode(&state)?,
+        "github_copilot" => {
+            remove_vscode_settings_key(COPILOT_CAPI_URL_KEY, HEADROOM_COPILOT_CAPI_URL)?
+        }
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -8951,7 +8976,13 @@ fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
         return Ok((Vec::new(), Vec::new()));
     }
     let wrapper = claude_remote_control_wrapper_path().display().to_string();
-    let Some(edited) = edit_vscode_wrapper_key(&raw, &wrapper, true, &settings_path) else {
+    let Some(edited) = edit_vscode_settings_key(
+        &raw,
+        VSCODE_PROCESS_WRAPPER_KEY,
+        &wrapper,
+        true,
+        &settings_path,
+    ) else {
         log::warn!(
             "not setting {VSCODE_PROCESS_WRAPPER_KEY}: {} did not take a clean text edit",
             settings_path.display()
@@ -8970,6 +9001,12 @@ fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
 }
 
 fn remove_vscode_process_wrapper() -> Result<()> {
+    let wrapper = claude_remote_control_wrapper_path().display().to_string();
+    remove_vscode_settings_key(VSCODE_PROCESS_WRAPPER_KEY, &wrapper)
+}
+
+/// Drop `key` from VS Code's user settings when it still holds `value`.
+fn remove_vscode_settings_key(key: &str, value: &str) -> Result<()> {
     let settings_path = vscode_user_settings_path();
     if !settings_path.exists() {
         return Ok(());
@@ -8977,22 +9014,136 @@ fn remove_vscode_process_wrapper() -> Result<()> {
     let raw = std::fs::read_to_string(&settings_path)
         .with_context(|| format!("reading {}", settings_path.display()))?;
     let mut obj = parse_json_object(&raw, &settings_path)?;
-    let wrapper = claude_remote_control_wrapper_path().display().to_string();
     // A text edit keeps the user's comments and key order; a full rewrite is
-    // the fallback, since a setting left pointing at a deleted wrapper would
-    // stop the panel from starting at all.
-    let edited = match edit_vscode_wrapper_key(&raw, &wrapper, false, &settings_path) {
+    // the fallback, since a setting left pointing at a deleted wrapper (or a
+    // stopped Headroom) stops the panel or Copilot Chat from working at all.
+    let edited = match edit_vscode_settings_key(&raw, key, value, false, &settings_path) {
         Some(edited) => edited.into_bytes(),
         None => {
-            if !remove_json_key_if_matches(&mut obj, VSCODE_PROCESS_WRAPPER_KEY, &wrapper) {
+            if !remove_json_key_if_matches(&mut obj, key, value) {
                 return Ok(());
             }
             serde_json::to_vec_pretty(&Value::Object(obj))
-                .context("serializing VS Code settings after removing the process wrapper")?
+                .with_context(|| format!("serializing VS Code settings after removing {key}"))?
         }
     };
     backup_if_exists(&settings_path)?;
     atomic_write(&settings_path, &edited)
+}
+
+/// Whether VS Code's user settings hold `key` set to `value`.
+fn vscode_settings_key_matches(key: &str, value: &str) -> Result<bool> {
+    let settings_path = vscode_user_settings_path();
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", settings_path.display()))
+        }
+    };
+    Ok(parse_json_object(&raw, &settings_path)?
+        .get(key)
+        .and_then(Value::as_str)
+        == Some(value))
+}
+
+/// Copilot Chat's API host (user scope only). Headroom points it at the
+/// intercept's `/copilot` prefix, which the intercept strips on the way to
+/// GitHub. Inline completions have their own setting (`overrideProxyUrl`),
+/// left alone: they are unlimited on every Copilot plan, so routing them
+/// would add latency to every keystroke for no savings.
+const COPILOT_CAPI_URL_KEY: &str = "github.copilot.advanced.debug.overrideCapiUrl";
+const HEADROOM_COPILOT_CAPI_URL: &str = "http://127.0.0.1:6767/copilot";
+
+fn configure_copilot_capi_url() -> Result<(Vec<String>, Vec<String>)> {
+    let settings_path = vscode_user_settings_path();
+    // VS Code creates settings.json on the first change made in its Settings
+    // UI; the user asked for this connector, so a missing file starts empty.
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", settings_path.display()))
+        }
+    };
+    let obj = parse_json_object(&raw, &settings_path)?;
+    if let Some(existing) = obj.get(COPILOT_CAPI_URL_KEY) {
+        if existing.as_str() == Some(HEADROOM_COPILOT_CAPI_URL) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        // A company gateway or test endpoint: replacing it would move the
+        // user's Copilot traffic somewhere they did not choose.
+        return Err(anyhow!(
+            "VS Code already sends GitHub Copilot to {existing} ({COPILOT_CAPI_URL_KEY} in {}). Remove that setting to route Copilot through Headroom.",
+            settings_path.display()
+        ));
+    }
+    let edited = edit_vscode_settings_key(
+        &raw,
+        COPILOT_CAPI_URL_KEY,
+        HEADROOM_COPILOT_CAPI_URL,
+        true,
+        &settings_path,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "Could not add {COPILOT_CAPI_URL_KEY} to {} without changing your other settings.",
+            settings_path.display()
+        )
+    })?;
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let backup = backup_if_exists(&settings_path)?;
+    atomic_write(&settings_path, edited.as_bytes())?;
+    Ok((
+        vec![settings_path.display().to_string()],
+        backup
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+    ))
+}
+
+/// VS Code counts as installed once it has a user folder: that is where its
+/// settings.json, the only thing this connector edits, lives. Copilot Chat
+/// ships inside VS Code, so there is no extension to look for.
+fn detect_github_copilot_client(configured: bool) -> ClientStatus {
+    let user_dir = vscode_user_settings_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    if !user_dir.is_dir() {
+        return ClientStatus {
+            id: "github_copilot".into(),
+            name: "GitHub Copilot".into(),
+            installed: false,
+            configured: false,
+            health: ClientHealth::NotDetected,
+            notes: vec!["VS Code not detected on this machine yet.".into()],
+        };
+    }
+    let detected = format!("Detected VS Code settings in {}.", user_dir.display());
+    ClientStatus {
+        id: "github_copilot".into(),
+        name: "GitHub Copilot".into(),
+        installed: true,
+        configured,
+        health: if configured {
+            ClientHealth::Healthy
+        } else {
+            ClientHealth::Attention
+        },
+        notes: if configured {
+            vec![detected, "Configured by Headroom.".into()]
+        } else {
+            vec![
+                detected,
+                "Route GitHub Copilot in VS Code through Headroom so its prompts use fewer credits."
+                    .into(),
+            ]
+        },
+    }
 }
 
 /// Delete the wrapper script once VS Code's settings no longer name it. An
@@ -9019,17 +9170,23 @@ fn remove_vscode_wrapper_file_if_unreferenced() {
     }
 }
 
-/// Add (or remove) our wrapper key in VS Code's settings.json as a text edit.
+/// Add (or remove) one of our keys in VS Code's settings.json as a text edit.
 /// The file is hand-maintained JSONC: a serde round trip would sort every key
 /// and strip every comment. The result is re-parsed and must equal the parsed
 /// original plus (minus) exactly that key, or None is returned.
-fn edit_vscode_wrapper_key(raw: &str, wrapper: &str, add: bool, path: &Path) -> Option<String> {
+fn edit_vscode_settings_key(
+    raw: &str,
+    name: &str,
+    value: &str,
+    add: bool,
+    path: &Path,
+) -> Option<String> {
     let mut expected = parse_json_object(raw, path).ok()?;
-    let value = Value::String(wrapper.to_string());
-    let key = format!("\"{VSCODE_PROCESS_WRAPPER_KEY}\"");
+    let value = Value::String(value.to_string());
+    let key = Value::String(name.to_string()).to_string();
     let edited = if add {
         let comma = if expected.is_empty() { "\n" } else { "," };
-        expected.insert(VSCODE_PROCESS_WRAPPER_KEY.to_string(), value.clone());
+        expected.insert(name.to_string(), value.clone());
         // A whitespace-only file parses as `{}` but has no brace to insert after.
         let raw = if raw.trim().is_empty() { "{}" } else { raw };
         // The first `{` can sit in a leading comment (RUST-RE): try each in
@@ -9043,7 +9200,7 @@ fn edit_vscode_wrapper_key(raw: &str, wrapper: &str, add: bool, path: &Path) -> 
             (parse_json_object(&edited, path).ok()? == expected).then_some(edited)
         });
     } else {
-        if expected.remove(VSCODE_PROCESS_WRAPPER_KEY)? != value {
+        if expected.remove(name)? != value {
             return None;
         }
         let at = raw.find(&key)?;
@@ -12112,7 +12269,7 @@ mod tests {
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
-        edit_vscode_wrapper_key, entry_contains_hook, find_on_path_entries, is_no_space,
+        edit_vscode_settings_key, entry_contains_hook, find_on_path_entries, is_no_space,
         is_permission_denied, msys_path, normalize_setup_state, normalized_setup_id,
         nvm_binary_candidates, oss_remnant_warnings, parse_json_object, pin_codex_mcp_command,
         remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
@@ -17643,6 +17800,57 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn github_copilot_round_trip_keeps_user_settings_and_refuses_their_own_endpoint() {
+        let _home = TestHome::new();
+        assert!(!super::detect_github_copilot_client(false).installed);
+        let settings = super::vscode_user_settings_path();
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        assert!(super::detect_github_copilot_client(false).installed);
+
+        // No settings.json yet: VS Code writes it on the first settings change.
+        super::apply_client_setup("github_copilot").expect("apply without settings.json");
+        let obj = parse_json_object(&fs::read_to_string(&settings).unwrap(), &settings).unwrap();
+        assert_eq!(
+            obj[super::COPILOT_CAPI_URL_KEY],
+            super::HEADROOM_COPILOT_CAPI_URL
+        );
+        super::disable_client_setup("github_copilot").expect("disable");
+        let obj = parse_json_object(&fs::read_to_string(&settings).unwrap(), &settings).unwrap();
+        assert!(obj.is_empty(), "{obj:?}");
+
+        let user = "{\n    // my theme\n    \"workbench.colorTheme\": \"Default Dark Modern\"\n}\n";
+        fs::write(&settings, user).unwrap();
+        super::apply_client_setup("github_copilot").expect("apply");
+        let edited = fs::read_to_string(&settings).unwrap();
+        assert!(edited.contains("// my theme"), "{edited}");
+        let verification = super::verify_client_setup("github_copilot").expect("verify");
+        assert!(
+            verification.failures.is_empty(),
+            "{:?}",
+            verification.failures
+        );
+        // Re-applying (launch restore, hourly repair) changes nothing.
+        super::apply_client_setup("github_copilot").expect("re-apply");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), edited);
+        super::disable_client_setup("github_copilot").expect("disable");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), user);
+        let verification = super::verify_client_setup("github_copilot").expect("verify after");
+        assert!(!verification.failures.is_empty());
+
+        // A gateway the user set stays, and nothing is written.
+        let theirs = format!(
+            "{{\"{}\": \"https://copilot.corp.example\"}}",
+            super::COPILOT_CAPI_URL_KEY
+        );
+        fs::write(&settings, &theirs).unwrap();
+        let err = super::apply_client_setup("github_copilot").expect_err("refuses");
+        assert!(err.to_string().contains("copilot.corp.example"), "{err}");
+        super::disable_client_setup("github_copilot").expect("disable leaves it");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), theirs);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn grok_config_redirects_user_endpoints_table_and_migrates_old_block() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -20989,40 +21197,55 @@ for line in sys.stdin:
         let w = "/Users/me/.headroom/claude-wrapper";
         let user = "{\n  // font for the panel\n  \"editor.fontSize\": 13,\n  \"files.autoSave\": \"off\"\n}\n";
 
-        let added = edit_vscode_wrapper_key(user, w, true, path).expect("add");
+        let added =
+            edit_vscode_settings_key(user, VSCODE_PROCESS_WRAPPER_KEY, w, true, path).expect("add");
         assert!(added.contains("// font for the panel"));
         let obj = parse_json_object(&added, path).unwrap();
         assert_eq!(obj[VSCODE_PROCESS_WRAPPER_KEY], w);
         assert_eq!(obj["editor.fontSize"], 13);
         assert_eq!(
-            edit_vscode_wrapper_key(&added, w, false, path).as_deref(),
+            edit_vscode_settings_key(&added, VSCODE_PROCESS_WRAPPER_KEY, w, false, path).as_deref(),
             Some(user)
         );
 
         // Empty object, and the key as the last entry (no trailing comma left).
-        let added = edit_vscode_wrapper_key("{}", w, true, path).expect("add to empty");
-        let removed = edit_vscode_wrapper_key(&added, w, false, path).expect("remove");
+        let added = edit_vscode_settings_key("{}", VSCODE_PROCESS_WRAPPER_KEY, w, true, path)
+            .expect("add to empty");
+        let removed = edit_vscode_settings_key(&added, VSCODE_PROCESS_WRAPPER_KEY, w, false, path)
+            .expect("remove");
         assert!(parse_json_object(&removed, path).unwrap().is_empty());
         let last = format!("{{\"a\": 1, \"{VSCODE_PROCESS_WRAPPER_KEY}\": \"{w}\"}}");
-        let removed = edit_vscode_wrapper_key(&last, w, false, path).expect("remove last");
+        let removed = edit_vscode_settings_key(&last, VSCODE_PROCESS_WRAPPER_KEY, w, false, path)
+            .expect("remove last");
         assert_eq!(removed, "{\"a\": 1}");
 
         // A wrapper the user set themselves, or no key at all, is not ours.
         let theirs = format!("{{\"{VSCODE_PROCESS_WRAPPER_KEY}\": \"/opt/their-wrapper\"}}");
-        assert_eq!(edit_vscode_wrapper_key(&theirs, w, false, path), None);
-        assert_eq!(edit_vscode_wrapper_key(user, w, false, path), None);
+        assert_eq!(
+            edit_vscode_settings_key(&theirs, VSCODE_PROCESS_WRAPPER_KEY, w, false, path),
+            None
+        );
+        assert_eq!(
+            edit_vscode_settings_key(user, VSCODE_PROCESS_WRAPPER_KEY, w, false, path),
+            None
+        );
         // Unparseable settings are never touched.
-        assert_eq!(edit_vscode_wrapper_key("{\"a\": ", w, true, path), None);
+        assert_eq!(
+            edit_vscode_settings_key("{\"a\": ", VSCODE_PROCESS_WRAPPER_KEY, w, true, path),
+            None
+        );
 
         // A whitespace-only file, and a `{` in a leading comment (RUST-RE).
-        let added = edit_vscode_wrapper_key("\n", w, true, path).expect("add to blank");
+        let added = edit_vscode_settings_key("\n", VSCODE_PROCESS_WRAPPER_KEY, w, true, path)
+            .expect("add to blank");
         assert_eq!(
             parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],
             w
         );
         for header in ["// { my settings }\n", "/* { */\n"] {
             let raw = format!("{header}{user}");
-            let added = edit_vscode_wrapper_key(&raw, w, true, path).expect("add past comment");
+            let added = edit_vscode_settings_key(&raw, VSCODE_PROCESS_WRAPPER_KEY, w, true, path)
+                .expect("add past comment");
             assert!(added.starts_with(header));
             assert_eq!(
                 parse_json_object(&added, path).unwrap()[VSCODE_PROCESS_WRAPPER_KEY],

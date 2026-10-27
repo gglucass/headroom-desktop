@@ -416,7 +416,7 @@ describe("dashboard helpers", () => {
     expect(connectorGateBlocksEnable(row("codex", false), weekly)).toBe(false);
     // W5: behind the trial wall the intercept bypasses Codex, OpenCode and Grok
     // too, on or off, so their rows say so. They can still be enabled.
-    for (const id of ["claude_code", "codex", "opencode", "grok_build"]) {
+    for (const id of ["claude_code", "codex", "opencode", "grok_build", "github_copilot"]) {
       expect(connectorGateMessage(row(id), wall)).toBe("Trial ended.");
       expect(connectorGateMessage(row(id, false), wall)).toBe("Trial ended.");
     }
@@ -435,9 +435,10 @@ describe("dashboard helpers", () => {
     expect(connectorGateBlocksEnable(row("opencode", false), signedOut)).toBe(true);
   });
 
-  it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {
+  it("keeps codex, grok_build, opencode and github_copilot alongside claude_code as supported connectors", () => {
     const connectors: ClientConnectorStatus[] = [
       { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false },
+      { clientId: "github_copilot", name: "GitHub Copilot", installed: true, enabled: false, verified: false },
       { clientId: "grok_build", name: "Grok Build", installed: true, enabled: false, verified: false },
       { clientId: "opencode", name: "OpenCode", installed: true, enabled: true, verified: false },
       { clientId: "claude_code", name: "Claude Code", installed: true, enabled: true, verified: true },
@@ -446,7 +447,7 @@ describe("dashboard helpers", () => {
 
     expect(
       aggregateClientConnectors(connectors).map((connector) => connector.clientId).sort()
-    ).toEqual(["claude_code", "codex", "grok_build", "opencode"]);
+    ).toEqual(["claude_code", "codex", "github_copilot", "grok_build", "opencode"]);
   });
 
   it("reports enabled supported connectors regardless of which tool", () => {
@@ -554,7 +555,7 @@ describe("historyOverlayCaption", () => {
 });
 
 describe("mergeProviderSavingsForDisplay", () => {
-  it("folds anthropic and unknown into Claude Code, openai into Codex, and xai into Grok Build", () => {
+  it("folds anthropic and unknown into Claude Code, openai into Codex, xai into Grok Build and copilot into GitHub Copilot", () => {
     const merged = mergeProviderSavingsForDisplay([
       {
         provider: "openai",
@@ -583,6 +584,13 @@ describe("mergeProviderSavingsForDisplay", () => {
         estimatedTokensSaved: 25,
         actualCostUsd: 0.08,
         totalTokensSent: 50
+      },
+      {
+        provider: "copilot",
+        estimatedSavingsUsd: 0.03,
+        estimatedTokensSaved: 30,
+        actualCostUsd: 0.09,
+        totalTokensSent: 60
       }
     ]);
 
@@ -612,6 +620,15 @@ describe("mergeProviderSavingsForDisplay", () => {
         estimatedTokensSaved: 25,
         actualCostUsd: 0.08,
         totalTokensSent: 50,
+        compressibleCostUsd: null,
+        compressibleTokensSent: null
+      },
+      {
+        label: "GitHub Copilot",
+        estimatedSavingsUsd: 0.03,
+        estimatedTokensSaved: 30,
+        actualCostUsd: 0.09,
+        totalTokensSent: 60,
         compressibleCostUsd: null,
         compressibleTokensSent: null
       }
