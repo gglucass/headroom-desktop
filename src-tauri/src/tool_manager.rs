@@ -17915,7 +17915,7 @@ print(len(projects), calls, views)"#;
         assert_eq!(
             on,
             "1 [('Bash', 'call_1', {'command': 'ls'}, 'a.txt', False), \
-             ('Read', 'call_2', {'filePath': '/x'}, 'File not found: /x', True)] 0",
+             ('read', 'call_2', {'filePath': '/x'}, 'File not found: /x', True)] 0",
             "stderr:\n{on_err}"
         );
         assert_eq!(off, "no such table: session", "stderr:\n{off_err}");
