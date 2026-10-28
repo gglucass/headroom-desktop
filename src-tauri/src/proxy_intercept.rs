@@ -3300,7 +3300,8 @@ fn backend_error_code(body: &[u8]) -> Option<&'static str> {
 /// The `type`/`code` of every 5xx error object the backend writes on the
 /// Responses and passthrough paths (wheel `handlers/openai.py`; since 0.40.0's
 /// #3851 the codes come from `public_errors`, whose `internal_error` replaced
-/// `backend_error`).
+/// `backend_error`), plus the `shutdown` 503 a retry backoff gets when the
+/// backend stops (`_shutdown_retry_response`), which read as `503:provider`.
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
@@ -3310,6 +3311,7 @@ const HEADROOM_ERROR_IDS: &[&str] = &[
     "upstream_timeout",
     "upstream_tls_error",
     "internal_error",
+    "shutdown",
 ];
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
@@ -8269,6 +8271,8 @@ mod tests {
         assert_eq!(super::failure_kind(502, cut), "502:upstream_protocol_error");
         let frame = b"9a\r\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"connection_error\",\"message\":\"Upstream API did not respond in time.\",\"code\":\"upstream_timeout\"}}\n\n\r\n";
         assert_eq!(super::failure_kind(502, frame), "502:upstream_timeout");
+        let stopping = br#"{"error":{"type":"shutdown","message":"Proxy is shutting down; retry backoff cancelled."}}"#;
+        assert_eq!(super::failure_kind(503, stopping), "503:shutdown");
         let anthropic = br#"{"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_1"}"#;
         assert_eq!(super::failure_kind(502, anthropic), "502:provider");
         assert_eq!(
