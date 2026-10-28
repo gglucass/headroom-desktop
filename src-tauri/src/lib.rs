@@ -3501,6 +3501,23 @@ pub(crate) fn give_up_startup_key(
     })
 }
 
+/// True when the backend's formatted exit status (Windows' `exit code: N`,
+/// hex for NTSTATUS errors) says the session's teardown terminated it.
+/// STATUS_DLL_INIT_FAILED alone is left out: a child that never started can
+/// also be an App Control block, which reports under its own startup key.
+fn child_exit_is_session_teardown(status: &str) -> bool {
+    let Some(code) = status.strip_prefix("exit code: ") else {
+        return false;
+    };
+    let code = match code.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => code.parse::<u32>().ok(),
+    };
+    code.map(|c| c as i32).is_some_and(|c| {
+        c != crate::state::STATUS_DLL_INIT_FAILED && crate::state::is_session_teardown_exit(c)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -3762,6 +3779,16 @@ fn capture_watchdog_give_up(
         log_silent_secs,
         backend_readyz_outcome,
     );
+    // Windows ending the session reaped the backend, and every restart then
+    // failed to start in the dying session (RUST-T5: 0xC0000142 on each).
+    if child_exit_is_session_teardown(&report.tracked_child_exit_status) {
+        log::info!(
+            "{} after the backend exited with {}, Windows ending the session; not reported",
+            report.message,
+            report.tracked_child_exit_status
+        );
+        return;
+    }
 
     // Default to Warning: give-up is the documented recovery path, not a
     // bug. Escalate to Error only when there's a real signal something is
@@ -16546,6 +16573,27 @@ Some unrelated content.
             "wait-check-failed"
         );
         assert_eq!(cat("something upstream changed"), "other");
+    }
+
+    #[test]
+    fn a_backend_the_session_teardown_ended_is_not_a_give_up() {
+        // RUST-T5 verbatim: DBG_TERMINATE_PROCESS, as std formats it.
+        assert!(crate::child_exit_is_session_teardown(
+            "exit code: 1073807364"
+        ));
+        assert!(crate::child_exit_is_session_teardown(
+            "exit code: 0xc000013a"
+        ));
+        // A child that could not start may be App Control, not a logoff.
+        assert!(!crate::child_exit_is_session_teardown(
+            "exit code: 0xc0000142"
+        ));
+        assert!(!crate::child_exit_is_session_teardown("exit code: 0"));
+        assert!(!crate::child_exit_is_session_teardown("exit code: 1"));
+        assert!(!crate::child_exit_is_session_teardown("exit status: 1"));
+        assert!(!crate::child_exit_is_session_teardown(
+            "still_alive_or_untracked"
+        ));
     }
 
     #[test]
