@@ -16836,9 +16836,12 @@ Some unrelated content.
         // to Sentry at Error on every Connect click.
         let refused = anyhow::anyhow!(crate::client_adapters::PORT_HOLDER_REFUSAL);
         assert!(!client_setup_failure_is_reportable(&refused));
-        let enospc =
-            anyhow::Error::new(std::io::Error::from_raw_os_error(28)).context("creating backup");
-        assert!(!client_setup_failure_is_reportable(&enospc));
+        // The platform's own disk-full code: ENOSPC (28) on unix,
+        // ERROR_DISK_FULL (112) on Windows, where 28 is ERROR_OUT_OF_PAPER.
+        let disk_full_code = if cfg!(windows) { 112 } else { 28 };
+        let disk_full = anyhow::Error::new(std::io::Error::from_raw_os_error(disk_full_code))
+            .context("creating backup");
+        assert!(!client_setup_failure_is_reportable(&disk_full));
         // A real code failure still is.
         let exists = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
             .context("renaming codex config");
