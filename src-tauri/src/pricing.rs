@@ -51,6 +51,14 @@ struct LocalPricingState {
     /// Reported so the server need not re-derive the per-account grace.
     #[serde(default)]
     mismatch_clamped_at: Option<DateTime<Utc>>,
+    /// When the open mismatch last read as resolved. The clock is held, not
+    /// wiped, so a mismatch back within a grace period resumes it and its clamp.
+    #[serde(default)]
+    mismatch_resolved_at: Option<DateTime<Utc>>,
+    /// The paid tier the clock runs against: an upgrade that still falls short
+    /// starts a fresh grace instead of resuming the old clamp.
+    #[serde(default)]
+    mismatch_paid_tier: Option<HeadroomSubscriptionTier>,
     /// Server-bucketed paywall-first experiment flag. `None` = never fetched.
     /// Refreshed only by the launch-time config fetch so a mid-onboarding
     /// server flip can't strand a user halfway through the gated flow.
@@ -455,8 +463,16 @@ impl IdentityPayload {
             .map(codex_usage_windows_summary);
         payload.claude_usage_windows = state.claude_usage_windows.lock().clone();
         if let Ok(local) = load_or_initialize_local_state() {
-            payload.tier_mismatch_since = local.mismatch_since.map(|at| at.to_rfc3339());
-            payload.tier_mismatch_clamped_at = local.mismatch_clamped_at.map(|at| at.to_rfc3339());
+            // A held clock is no open mismatch to report.
+            let open = local.mismatch_resolved_at.is_none();
+            payload.tier_mismatch_since = local
+                .mismatch_since
+                .filter(|_| open)
+                .map(|at| at.to_rfc3339());
+            payload.tier_mismatch_clamped_at = local
+                .mismatch_clamped_at
+                .filter(|_| open)
+                .map(|at| at.to_rfc3339());
         }
         payload.without_analytics_unless_shared()
     }
@@ -2706,11 +2722,13 @@ fn resolve_tier_mismatch(
                             detect_tier_mismatch(a, &known, codex_plan).is_none()
                         })
                 });
+                // Even an affirmative reading only holds the clock: one poll on a
+                // lower plan or a Polar sync blip used to wipe it, and u734 and
+                // u668 went from metered to a fresh 14 days (Oct 2026).
                 if affirmative {
                     if let Ok(mut local) = load_or_initialize_local_state() {
-                        if local.mismatch_since.is_some() || local.mismatch_clamped_at.is_some() {
-                            local.mismatch_since = None;
-                            local.mismatch_clamped_at = None;
+                        if local.mismatch_since.is_some() && local.mismatch_resolved_at.is_none() {
+                            local.mismatch_resolved_at = Some(Utc::now());
                             let _ = write_local_state(&local);
                         }
                     }
@@ -2720,15 +2738,36 @@ fn resolve_tier_mismatch(
         };
 
     let mut local = load_or_initialize_local_state().ok()?;
-    let since = match local.mismatch_since {
-        Some(since) => since,
-        None => {
-            let now = Utc::now();
-            local.mismatch_since = Some(now);
-            let _ = write_local_state(&local);
-            now
-        }
-    };
+    let now = Utc::now();
+    // A held clock resumes, clamp included. An upgrade that still falls short,
+    // or a resolution that held a full grace, starts a fresh one.
+    let upgraded = local
+        .mismatch_paid_tier
+        .is_some_and(|old| paid_tier.rank() > old.rank());
+    let lapsed = local
+        .mismatch_resolved_at
+        .is_some_and(|at| now - at >= Duration::days(TIER_MISMATCH_GRACE_DAYS));
+    let before = (
+        local.mismatch_since,
+        local.mismatch_resolved_at,
+        local.mismatch_paid_tier,
+    );
+    if upgraded || lapsed {
+        local.mismatch_since = None;
+        local.mismatch_clamped_at = None;
+    }
+    let since = *local.mismatch_since.get_or_insert(now);
+    local.mismatch_resolved_at = None;
+    local.mismatch_paid_tier = Some(paid_tier);
+    if before
+        != (
+            local.mismatch_since,
+            local.mismatch_resolved_at,
+            local.mismatch_paid_tier,
+        )
+    {
+        let _ = write_local_state(&local);
+    }
 
     let appsumo = account.is_some_and(appsumo_free_year);
     let computed = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
@@ -4090,6 +4129,8 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         reconcile_with_server: true,
         mismatch_since: None,
         mismatch_clamped_at: None,
+        mismatch_resolved_at: None,
+        mismatch_paid_tier: None,
         paywall_first: None,
         paywall_first_fetch_failed: false,
         last_server_contact_at: None,
@@ -4557,6 +4598,8 @@ mod tests {
             reconcile_with_server: false,
             mismatch_since: None,
             mismatch_clamped_at: None,
+            mismatch_resolved_at: None,
+            mismatch_paid_tier: None,
             paywall_first: None,
             paywall_first_fetch_failed: false,
             last_server_contact_at: stale,
@@ -8289,14 +8332,67 @@ mod tests {
         .expect("mismatch");
         assert!(resumed.clamped);
         assert_eq!(persisted(), (Some(since), Some(clamped_at)));
+    }
 
-        // A classified plan the paid tier covers clears it for real.
-        let pro = empty_claude_profile(ClaudePlanTier::Pro);
-        assert!(
-            resolve_tier_mismatch(Some(&account), &pro, Some(&ClaudePlanTier::Pro), None, &[])
-                .is_none()
+    /// A classified plan the paid tier covers ends the mismatch but only holds
+    /// the clock: one such poll used to wipe it, and u734 and u668 went from
+    /// metered back to a fresh 14 days (Oct 2026).
+    #[test]
+    #[serial_test::serial]
+    fn tier_mismatch_clock_resumes_after_a_brief_resolution() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let hold_clamped_clock = || {
+            let since = Utc::now() - Duration::days(20);
+            let mut local = super::load_or_initialize_local_state().unwrap();
+            local.mismatch_since = Some(since);
+            local.mismatch_clamped_at = Some(since + Duration::days(TIER_MISMATCH_GRACE_DAYS));
+            super::write_local_state(&local).unwrap();
+        };
+        let resolve = |paid, plan| {
+            let claude = empty_claude_profile(plan);
+            resolve_tier_mismatch(
+                Some(&active_subscriber(paid)),
+                &claude,
+                Some(&claude.plan_tier),
+                None,
+                &[],
+            )
+        };
+        let (pro, max5x) = (
+            HeadroomSubscriptionTier::Pro,
+            HeadroomSubscriptionTier::Max5x,
         );
-        assert_eq!(persisted(), (None, None));
+
+        hold_clamped_clock();
+        assert!(resolve(pro, ClaudePlanTier::Pro).is_none());
+        assert!(super::load_or_initialize_local_state()
+            .unwrap()
+            .mismatch_resolved_at
+            .is_some());
+        assert!(
+            resolve(pro, ClaudePlanTier::Max20x)
+                .expect("mismatch")
+                .clamped
+        );
+
+        // A resolution that held a full grace is real: the next one starts over.
+        assert!(resolve(pro, ClaudePlanTier::Pro).is_none());
+        let mut local = super::load_or_initialize_local_state().unwrap();
+        local.mismatch_resolved_at = Some(Utc::now() - Duration::days(TIER_MISMATCH_GRACE_DAYS));
+        super::write_local_state(&local).unwrap();
+        assert!(
+            !resolve(pro, ClaudePlanTier::Max20x)
+                .expect("mismatch")
+                .clamped
+        );
+
+        // So does an upgrade that still falls short (u475: Pro -> Max x5 on Max x20).
+        hold_clamped_clock();
+        assert!(
+            !resolve(max5x, ClaudePlanTier::Max20x)
+                .expect("mismatch")
+                .clamped
+        );
     }
 
     /// Right after a relaunch only the remembered snapshot holds Claude Code
