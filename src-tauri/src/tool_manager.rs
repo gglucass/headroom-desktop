@@ -2651,7 +2651,29 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 }
 const RTK_VERSION: &str = "0.48.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
-const SERENA_PINNED_VERSION: &str = "1.7.0";
+const SERENA_PINNED_VERSION: &str =
+    serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
+
+/// serena-agent pins every dependency exactly, and 1.7.0 pins
+/// cryptography==50.0.0, whose macOS wheels are arm64-only (49.0.0 dropped
+/// universal2). On an Intel Mac pip fell back to the sdist, which needs a Rust
+/// toolchain, so every Serena install there failed with "Failed building wheel
+/// for cryptography" from the 1.6.1 -> 1.7.0 bump (2026-08-13) on (RUST-F6).
+/// 1.6.1 pins cryptography==48.0.1, the universal2 build the runtime lock also
+/// pins for Intel, and matches 1.7.0 on everything Headroom drives: the
+/// start-mcp-server flags, the claude-code/codex contexts,
+/// `web_dashboard_interface`, the dashboard port and `/get_tool_stats`, and the
+/// tool-call log line. Its closure resolves wheels-only on x86_64 macOS
+/// (proxy-tools, pure Python, builds from its sdist as on every platform).
+/// Drop the Intel branch once the pin's cryptography ships an x86_64 macOS
+/// wheel.
+const fn serena_pinned_version(intel_mac: bool) -> &'static str {
+    if intel_mac {
+        "1.6.1"
+    } else {
+        "1.7.0"
+    }
+}
 /// Serena runs its Python language servers (pyright, basedpyright, ty,
 /// pyrefly) through `uvx`, found via `$UVX` or PATH. Without uv every Python
 /// symbol query failed after a clean install, so uv lives in serena's venv and
@@ -23890,6 +23912,24 @@ Always run the linter first.
         );
         // Everything else keeps PYTHONPATH stripped (the proxy, smoke tests).
         assert_eq!(pythonpath(&["-c", "import headroom"]), None);
+    }
+
+    #[test]
+    fn serena_on_an_intel_mac_pins_the_release_whose_cryptography_installs_there() {
+        // RUST-F6: serena-agent 1.7.0 pins cryptography==50.0.0, which has no
+        // x86_64 macOS wheel, so every Intel Mac install tried a Rust build
+        // and failed. 1.6.1 pins 48.0.1, the last universal2 build.
+        assert_eq!(super::serena_pinned_version(true), "1.6.1");
+        // The runtime lock holds Intel Macs on 48.0.1 for the same reason. If
+        // that pin moves, cryptography may ship an Intel wheel again: check
+        // whether the Serena pin's cryptography does, and drop the Intel
+        // branch if so.
+        assert!(
+            HEADROOM_REQUIREMENTS_LOCK.contains(
+                "cryptography==48.0.1; platform_machine == \"x86_64\" and sys_platform == \"darwin\""
+            ),
+            "the lock's Intel Mac cryptography pin moved; re-check serena_pinned_version"
+        );
     }
 
     #[test]
