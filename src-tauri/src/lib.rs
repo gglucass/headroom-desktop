@@ -6281,6 +6281,23 @@ pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// Whether a failed client setup goes to Sentry. Each skipped cause is shown
+/// to the user and no code change fixes it: permission-denied (os error 13)
+/// and disk-full (ENOSPC, os error 28) are unwritable-file environment
+/// issues, an unparseable settings file is the user's to fix, and the
+/// port-holder refusal is the designed guard while another program holds
+/// 6767, whose holder the intercept already reports once per session.
+/// Reported at Error, that refusal filed 60 events in 3 minutes from one
+/// Windows host on 0.9.51 (RUST-5A).
+fn client_setup_failure_is_reportable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    !msg.starts_with("Automatic setup is not supported yet")
+        && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
+        && !msg.contains(client_adapters::PORT_HOLDER_REFUSAL)
+        && !client_adapters::is_permission_denied(err)
+        && !client_adapters::is_no_space(err)
+}
+
 fn resume_for_client_setup(state: &AppState) {
     if let Err(err) = state.resume_runtime() {
         // Local log keeps the full chain; the capture below is the Sentry
@@ -6407,14 +6424,7 @@ async fn apply_client_setup(
         }
         Err(err) => {
             let msg = err.to_string();
-            // Permission-denied (os error 13) and disk-full (ENOSPC, os error
-            // 28) writes are unwritable-file environment issues, not app bugs --
-            // surface to the user but keep them out of Sentry.
-            if !msg.starts_with("Automatic setup is not supported yet")
-                && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
-                && !client_adapters::is_permission_denied(&err)
-                && !client_adapters::is_no_space(&err)
-            {
+            if client_setup_failure_is_reportable(&err) {
                 // Split the grab-bag: a message-based fingerprint collapsed every
                 // client x every failure cause into one issue, so resolving one
                 // shape (e.g. the codex rename race) regressed the moment a
@@ -12971,6 +12981,7 @@ fn compute_tray_window_position(
 mod tests {
     #[cfg(unix)]
     use super::bundle_folder_accepts_writes;
+    use super::client_setup_failure_is_reportable;
     #[cfg(target_os = "macos")]
     use super::ensure_launch_agent_interactive;
     use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
@@ -16817,6 +16828,21 @@ Some unrelated content.
 
         // No io::Error in the chain -> "other".
         assert_eq!(client_setup_error_kind(&anyhow::anyhow!("boom")), "other");
+    }
+
+    #[test]
+    fn a_client_setup_refused_for_a_port_holder_is_not_reported() {
+        // RUST-5A: the designed refusal while another program holds 6767 went
+        // to Sentry at Error on every Connect click.
+        let refused = anyhow::anyhow!(crate::client_adapters::PORT_HOLDER_REFUSAL);
+        assert!(!client_setup_failure_is_reportable(&refused));
+        let enospc =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(28)).context("creating backup");
+        assert!(!client_setup_failure_is_reportable(&enospc));
+        // A real code failure still is.
+        let exists = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            .context("renaming codex config");
+        assert!(client_setup_failure_is_reportable(&exists));
     }
 
     #[test]
