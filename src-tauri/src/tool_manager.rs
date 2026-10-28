@@ -15417,13 +15417,14 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 }
 
 /// The user's machine lacks git (the UI says so), a host holds the plugin but
-/// no CLI for it can be found (RUST-MV), or the user's own settings.json does
+/// no CLI for it can be found (RUST-MV), the user's own settings.json does
 /// not parse (RUST-DQ; our own writers already keep that refusal out of
-/// Sentry): nothing we ship fixes any of them.
+/// Sentry), or its network cannot reach GitHub (the CLI's error says so):
+/// nothing we ship fixes any of them.
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
-        "git-missing" | "cli-missing" | "settings-unparseable"
+        "git-missing" | "cli-missing" | "settings-unparseable" | "github-unreachable"
     )
 }
 
@@ -15461,6 +15462,15 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // follows then fails "not found in marketplace", which names only the
         // consequence.
         "git-missing"
+    } else if lower.contains("git clone timed out")
+        || lower.contains("could not resolve host: github.com")
+        || lower.contains("failed to connect to github.com")
+    {
+        // The marketplace clone never reached GitHub from this machine's
+        // network (RUST-P0 on 0.9.51: Claude Code's "Git clone timed out after
+        // 120s"). Checked before the install's "not found in marketplace" for
+        // the same reason as git-missing.
+        "github-unreachable"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -27672,6 +27682,28 @@ exit 0
                  stderr:\n\u{d7} Failed to install plugin \"ponytail@ponytail\": Failed to update \
                  settings: Invalid JSON syntax in settings file at ~\\.claude\\settings.json",
                 "settings-unparseable",
+            ),
+            (
+                // RUST-P0 on 0.9.51, real (Windows).
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JuliusBrussee/caveman\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Fetching the marketplace from GitHub failed on both attempts. \
+                 HTTPS (https://github.com/JuliusBrussee/caveman.git): Failed to clone \
+                 marketplace repository: Git clone timed out after 120s. The repository may be \
+                 too large for the current timeout.\n: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin install caveman@caveman\nstdout:\n\
+                 Installing plugin \"caveman@caveman\"...\n\nstderr:\n\u{d7} Failed to install \
+                 plugin \"caveman@caveman\": Plugin \"caveman\" not found in marketplace \
+                 \"caveman\".",
+                "github-unreachable",
+            ),
+            (
+                "Codex: command failed (exit 1): codex plugin marketplace add \
+                 JuliusBrussee/caveman\nstderr:\nError: failed to run git clone: fatal: unable \
+                 to access 'https://github.com/JuliusBrussee/caveman.git/': Could not resolve \
+                 host: github.com",
+                "github-unreachable",
             ),
             ("Codex: something we have not seen", "other"),
         ];
