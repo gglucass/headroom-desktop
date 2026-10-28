@@ -1168,6 +1168,54 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # Memory only: on any binding failure the wheel's batch of 256 stands.
         pass
 
+# --- Read maturation: never inside the provider-cached prefix (vendor) --------
+# Maturation swaps a quiet Read for a marker only "while it is outside the
+# frozen prefix", but the Anthropic handler hands it the pipeline's freeze
+# count, min(provider floor, local compression-cache count), and runs it AFTER
+# finalize_turn replayed the provider floor. The local count stops at the first
+# tool_result the cache never stored (a Read, which the router excludes), so it
+# sits at 2 for a whole Claude Code session and every Read matures inside the
+# cached prefix 5 quiet turns later: forwarded bytes change 9 messages back from
+# the floor and the tail re-writes (Sentry RUST-DP, prefix_rewrite, 436 users).
+# finalize_turn's confirmed_frozen_count is that floor; maturation gets the
+# larger of the two, so a cached Read stays verbatim, as the module documents.
+# Turns that skip the replay (cold cache, restart) keep the wheel's count.
+# Exact-pin gated to wheel 0.41.0 (0.42.0 still passes the clamped count).
+# Kill switch: HEADROOM_MATURATION_FLOOR=0.
+_hd_mf_flag = _hd_os.environ.get("HEADROOM_MATURATION_FLOOR", "1")
+if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import contextvars as _hd_mf_cv
+        import importlib.metadata as _hd_mf_meta
+
+        if _hd_mf_meta.version("headroom-ai") == "0.41.0":
+            from headroom.proxy import session_engine as _hd_mf_se
+            from headroom.transforms import read_maturation as _hd_mf_rm
+
+            _hd_mf_floor = _hd_mf_cv.ContextVar("desktop_maturation_floor", default=0)
+            _hd_mf_finalize = _hd_mf_se.finalize_turn
+            _hd_mf_apply = _hd_mf_rm.ReadMaturationManager.apply
+
+            def _hd_mf_finalize_turn(*args, **kwargs):
+                _hd_mf_floor.set(max(int(kwargs.get("confirmed_frozen_count") or 0), 0))
+                return _hd_mf_finalize(*args, **kwargs)
+
+            def _hd_mf_apply_floored(self, messages, frozen_message_count=0):
+                floor = _hd_mf_floor.get()
+                # One replay floor per maturation pass: the request task owns it.
+                _hd_mf_floor.set(0)
+                return _hd_mf_apply(self, messages,
+                                    frozen_message_count=max(frozen_message_count, floor))
+
+            # The handler imports finalize_turn per request, so the module
+            # attribute is what it calls.
+            _hd_mf_se.finalize_turn = _hd_mf_finalize_turn
+            _hd_mf_rm.ReadMaturationManager.apply = _hd_mf_apply_floored
+            _hd_bound.add("maturation_floor")
+    except Exception:
+        # On any binding failure the wheel's maturation stands.
+        pass
+
 # Proxied guarded upstreams (desktop posture; upstream #3804 shipped as an
 # allowlist): since 0.39.0 the wheel pins caller-supplied upstreams
 # (x-headroom-base-url) to the address the SSRF guard judged, and refuses them
@@ -2438,6 +2486,7 @@ _HD_VENDORS = (
     "tool_ref_hint",
     "message_window",
     "embed_batch_cap",
+    "maturation_floor",
     "proxied_guarded_upstreams",
     "output_warmup",
     "learn_rule_coerce",
@@ -17711,6 +17760,62 @@ print(len(scorer._encode(["record"] * 40)), seen)
         assert_eq!(run("1"), "40 [16]");
         // Off keeps fastembed's default, which also proves the probe sees it.
         assert_eq!(run("0"), "40 [None]");
+    }
+
+    #[test]
+    fn maturation_floor_behaves_against_the_installed_wheel() {
+        // RUST-DP: a Read quiet for 5 turns sits inside the provider-cached prefix,
+        // and the handler's freeze count (here 1) is below the floor finalize_turn
+        // replayed. With a replay the Read must stay verbatim; without one (cold
+        // cache) it matures, so the floor never outlives its request's pass.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+import inspect
+from headroom.config import ReadMaturationConfig
+from headroom.proxy import session_engine
+from headroom.proxy.handlers import anthropic as handler
+from headroom.transforms.read_maturation import ReadMaturationManager
+src = inspect.getsource(handler)
+# The vendor relies on the handler importing finalize_turn per request and
+# maturing Reads after that replay.
+wired = ("            from headroom.proxy.session_engine import finalize_turn\n" in src
+         and src.index("_final = finalize_turn(") < src.index("maturation_mgr.apply("))
+msgs = [{"role": "user", "content": "fix the retry"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read",
+                                           "input": {"file_path": "/repo/net.rs"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "x" * 4096}]}]
+for k in range(5):
+    msgs += [{"role": "assistant", "content": [{"type": "tool_use", "id": f"b{k}", "name": "Bash",
+                                                "input": {"command": "cargo test"}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"b{k}", "content": "ok"}]}]
+def matured(replayed):
+    mgr = ReadMaturationManager(ReadMaturationConfig(enabled=True, quiesce_turns=5,
+                                                     max_hold_turns=25, min_size_bytes=2048))
+    if replayed:
+        prev = msgs[:-2]
+        session_engine.finalize_turn(msgs, msgs, prev, prev, confirmed_frozen_count=len(prev))
+    return mgr.apply(msgs, frozen_message_count=1).newly_matured
+print(wired, matured(True), matured(False))
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_MATURATION_FLOOR", flag)
+                .output()
+                .expect("run maturation floor probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("1"), "True 0 1");
+        // Off is the wheel's own behaviour: the cached Read matures.
+        assert_eq!(run("0"), "True 1 1");
     }
 
     #[test]
