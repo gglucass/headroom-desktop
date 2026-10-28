@@ -5520,6 +5520,13 @@ const CODEX_ROOT_KEYS: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// The `openai_base_url` Codex used before Headroom took it over, if any.
+pub(crate) fn preserved_codex_base_url() -> Option<String> {
+    load_setup_state()
+        .preserved_base_urls
+        .remove("codex_cli_openai_base_url")
+}
+
 /// Whether a comment-stripped TOML line assigns one of [`CODEX_ROOT_KEYS`].
 fn is_codex_root_key_line(code: &str) -> bool {
     code.split_once('=')

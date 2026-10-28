@@ -2384,6 +2384,15 @@ async fn handle(
         }
     }
 
+    // Ollama's placeholder key reached OpenAI once Headroom owned Codex's
+    // `openai_base_url`, so every turn of an `ollama launch chatgpt` setup
+    // 401'd (RUST-T6). Relay it to Ollama uncompressed: the backend refuses
+    // loopback upstreams.
+    if extract_bearer(&buf).as_deref() == Some(OLLAMA_CODEX_KEY) {
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        return;
+    }
+
     // When the pricing gate has bypassed Headroom, the Python proxy on
     // `backend_addr` is intentionally stopped. Forward direct to the provider
     // so already-running sessions stay alive while optimization is off. The
@@ -4566,6 +4575,13 @@ async fn forward_direct_to_anthropic(
         && request_uses_chatgpt_auth(&header_buf);
     let url = if let Some((origin, original_path)) = &plugin_route {
         plugin_direct_url(origin, original_path.as_deref(), &parsed.path)
+    } else if extract_bearer(&header_buf).as_deref() == Some(OLLAMA_CODEX_KEY) {
+        let preserved = crate::client_adapters::preserved_codex_base_url();
+        Some(format!(
+            "{}{}",
+            ollama_codex_direct_base(preserved.as_deref()),
+            parsed.path
+        ))
     } else if chatgpt_codex {
         Some(format!(
             "{}{}",
@@ -5193,6 +5209,22 @@ fn grok_upstream_header(bearer: Option<&str>) -> &'static [u8] {
     }
 }
 
+/// The placeholder key `ollama launch chatgpt` writes for a Codex with no login
+/// of its own. Only Ollama's Codex proxy accepts it; OpenAI answers 401.
+const OLLAMA_CODEX_KEY: &str = "ollama-local-codex";
+
+/// Where a request carrying [`OLLAMA_CODEX_KEY`] goes: the Ollama Codex proxy
+/// the launcher set as `openai_base_url` before Headroom took it over, else
+/// Ollama's default address. Without `/v1`, which the request path carries.
+fn ollama_codex_direct_base(preserved: Option<&str>) -> String {
+    preserved
+        .map(|url| url.trim_end_matches('/'))
+        .and_then(|url| url.strip_suffix("/v1"))
+        .filter(|base| base.ends_with("/api/codex"))
+        .unwrap_or("http://127.0.0.1:11434/api/codex")
+        .to_string()
+}
+
 /// Append `header_line` as the last request header unless a header named
 /// `guard_name` is already present. No-op if the terminator is missing.
 fn stamp_request_header(buf: &mut Vec<u8>, guard_name: &str, header_line: &'static [u8]) {
@@ -5549,7 +5581,7 @@ mod tests {
         is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
         is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
         is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_reportable_upstream_error, is_vscode_claude_ua, ollama_codex_direct_base, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -7393,6 +7425,22 @@ mod tests {
             grok_upstream_header(Some("xai-abc123")),
             b"x-headroom-base-url: https://api.x.ai\r\n"
         );
+    }
+
+    #[test]
+    fn ollama_codex_key_goes_to_the_launchers_proxy() {
+        // The launcher's URL on a custom OLLAMA_HOST is kept.
+        assert_eq!(
+            ollama_codex_direct_base(Some("http://10.0.0.5:11434/api/codex/v1/")),
+            "http://10.0.0.5:11434/api/codex"
+        );
+        // Nothing preserved, or a gateway that is not Ollama's: the default.
+        for preserved in [None, Some("https://gateway.example/v1")] {
+            assert_eq!(
+                ollama_codex_direct_base(preserved),
+                "http://127.0.0.1:11434/api/codex"
+            );
+        }
     }
 
     #[test]

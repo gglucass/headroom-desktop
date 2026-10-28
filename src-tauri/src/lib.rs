@@ -9458,6 +9458,9 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         // RUST-T2: `codex exec` with neither a login nor OPENAI_API_KEY:
         // `Missing OpenAI API key.`
         "missing openai api key",
+        // RUST-T6: OpenAI's verdict on a wrong key: `ERROR: unexpected status
+        // 401 Unauthorized: Incorrect API key provided: ...`.
+        "incorrect api key provided",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -17007,6 +17010,10 @@ Some unrelated content.
         // RUST-T2 verbatim: Codex with no login and no API key.
         assert!(learn_failure_is_agent_auth(
             "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nMissing OpenAI API key.\n\nSet the environment variable OPENAI_API_KEY and re-run this command."
+        ));
+        // RUST-T6 verbatim: Codex's verdict on a key OpenAI never issued.
+        assert!(learn_failure_is_agent_auth(
+            "ERROR: unexpected status 401 Unauthorized: Incorrect API key provided: ollama-l******odex. You can find your API key at https://platform.openai.com/account/api-keys."
         ));
     }
 

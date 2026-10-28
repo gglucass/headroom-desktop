@@ -753,8 +753,8 @@ function SavingsChartTooltip({
             <i
               aria-hidden="true"
               className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
-                chartMode === "usd" ? "saved-usd" : "saved-tokens"
-              } savings-chart__tooltip-dot--output`}
+                chartMode === "usd" ? "output-usd" : "output-tokens"
+              }`}
             />
             {chartMode === "usd"
               ? `Saved ${currencyExact(point.outputSavingsUsd)}`
@@ -1380,7 +1380,9 @@ function DailySavingsChart({
                 </linearGradient>
                 {/* Output shaping sits on top of compression in the same hue
                     family, one shade lighter, so it reads as a second layer of
-                    the same thing rather than a separate metric. */}
+                    the same thing rather than a separate metric. Keep the
+                    tooltip swatches (--output-usd/--output-tokens) and the
+                    chip-dot tokens (--chart-*-savings) in sync. */}
                 <linearGradient id="outputUsdGradient" x1="0" x2="0" y1="0" y2="1">
                   <stop offset="0%" stopColor="#63b3a4" />
                   <stop offset="100%" stopColor="#8CCCBE" />
