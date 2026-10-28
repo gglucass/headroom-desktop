@@ -9428,6 +9428,9 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         // RUST-RT: `codex exec` with a revoked refresh token: `ERROR: Your
         // access token could not be refreshed. Please log out and sign in again.`
         "access token could not be refreshed",
+        // RUST-T2: `codex exec` with neither a login nor OPENAI_API_KEY:
+        // `Missing OpenAI API key.`
+        "missing openai api key",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -16951,6 +16954,10 @@ Some unrelated content.
         // RUST-RT verbatim: Codex's verdict on a revoked refresh token.
         assert!(learn_failure_is_agent_auth(
             "ERROR: Your access token could not be refreshed. Please log out and sign in again."
+        ));
+        // RUST-T2 verbatim: Codex with no login and no API key.
+        assert!(learn_failure_is_agent_auth(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nMissing OpenAI API key.\n\nSet the environment variable OPENAI_API_KEY and re-run this command."
         ));
     }
 
