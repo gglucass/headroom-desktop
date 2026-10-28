@@ -61,6 +61,17 @@ python() {
   #   calls install_as_egg, setuptools.wheel or fetch_build_egg, and the
   #   runtime installs --only-binary. Drop with the torch 2.13 bump (which
   #   lifts the cap to >=77.0.3), with PYSEC-2026-3447.
+  # - GHSA-g5ff-637f-6q2m (litellm <1.95.0, every lock: an authenticated
+  #   LiteLLM PROXY SERVER user reads local files by sending
+  #   vertex_ai_credentials to /utils/transform_request). headroom uses
+  #   litellm only as a library (cost_per_token, get_model_info,
+  #   token_counter, acompletion); its one litellm.proxy reference is a
+  #   usage example in integrations/asgi.py's docstring, so that server
+  #   never runs. 1.95.0 has no macOS wheels, and 1.95.1 swaps the pure
+  #   Python wheel for a 17 MB Rust native (its macOS arm64 wheel names it
+  #   for cp310) plus price-map churn that feeds savings. Accepted by Garm
+  #   2026-10-28. Drop with the locks' move to >=1.95; revisit when litellm
+  #   ships a clean py3 wheel or headroom imports litellm.proxy.
   local py pa targets target status=0
   # The submodule: the repo's own packaging/ dir imports as an empty namespace package.
   if python3 -c 'import packaging.requirements' 2>/dev/null; then py=(python3); else py=(uvx --with packaging python); fi
@@ -76,7 +87,8 @@ python() {
       --ignore-vuln PYSEC-2026-3553 \
       --ignore-vuln PYSEC-2026-3554 \
       --ignore-vuln CVE-2026-114603 \
-      --ignore-vuln GHSA-xmj3-9gf7-h52w || status=1
+      --ignore-vuln GHSA-xmj3-9gf7-h52w \
+      --ignore-vuln GHSA-g5ff-637f-6q2m || status=1
   done
   rm -rf "$targets"
   return "$status"
