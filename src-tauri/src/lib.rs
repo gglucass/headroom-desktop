@@ -10857,7 +10857,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                         pause_headroom(app).await
                     };
                     if let Err(err) = result {
-                        log::warn!("tray pause toggle failed: {err}");
+                        // A quit during the resume cuts its start short (RUST-T4).
+                        log_headroom_start_failure("tray pause toggle failed", &err);
                     }
                 });
             }
