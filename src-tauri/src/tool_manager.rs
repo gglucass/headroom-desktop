@@ -4583,7 +4583,7 @@ impl ToolManager {
                     command.process_group(0);
                 }
                 strip_unsupported_proxy_env(&mut command);
-                override_unsupported_registry_proxy(&mut command);
+                override_unsupported_registry_proxy(&mut command, httpx_supports_proxy_url);
                 strip_unusable_sslkeylogfile(&mut command);
                 command
                     .env("PYTHONNOUSERSITE", "1")
@@ -14524,8 +14524,10 @@ fn strip_unsupported_proxy_env(command: &mut Command) {
 /// parse, override the child env: usable entries become explicit
 /// http_proxy/https_proxy vars (any env proxy var makes urllib skip the
 /// registry), and when nothing is usable NO_PROXY="*" sends the backend
-/// direct -- strictly better than a guaranteed boot crash.
-fn override_unsupported_registry_proxy(command: &mut Command) {
+/// direct -- strictly better than a guaranteed boot crash. pip children run
+/// it too with a socks-rejecting `supported` (no pysocks): their env strip
+/// cannot reach a v2rayN socks system proxy either (RUST-6S/RUST-29).
+fn override_unsupported_registry_proxy(command: &mut Command, supported: fn(&str) -> bool) {
     if !cfg!(windows) {
         return;
     }
@@ -14543,7 +14545,7 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
             return false;
         }
         let stripped_above = ["http_proxy", "https_proxy", "all_proxy"].contains(&lower.as_str())
-            && !httpx_supports_proxy_url(&value);
+            && !supported(&value);
         !stripped_above
     });
     if child_keeps_a_proxy_var {
@@ -14570,14 +14572,14 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
     let Some(server) = parse_reg_value(&text, "ProxyServer") else {
         return;
     };
-    let Some(overrides) = registry_proxy_env_overrides(&server) else {
+    let Some(overrides) = registry_proxy_env_overrides(&server, supported) else {
         return;
     };
     // info, not warn: warn is bridged to Sentry and would re-report on every
     // launch of an affected machine, forever. Values stay out of the log --
     // proxy URLs can embed credentials.
     log::info!(
-        "[tool_manager] WinINET registry proxy carries a scheme httpx cannot parse; overriding {} child proxy env var(s) so backend boot survives",
+        "[tool_manager] WinINET registry proxy carries a scheme the child cannot use; overriding {} child proxy env var(s)",
         overrides.len()
     );
     for (name, value) in overrides {
@@ -14622,9 +14624,12 @@ fn reg_dword_is_set(value: &str) -> bool {
 /// with `socks4://addr` ("the default SOCKS proxy type of Windows is SOCKS4",
 /// urllib/request.py getproxies_registry) -- the RUST-B3 crash was exactly
 /// that backfill reaching httpx via the https mount. Returns None when no
-/// override is needed (nothing mounted, or every mounted entry parses),
-/// otherwise the env vars to set on the child.
-fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, String)>> {
+/// override is needed (nothing mounted, or every mounted entry is
+/// `supported`), otherwise the env vars to set on the child.
+fn registry_proxy_env_overrides(
+    proxy_server: &str,
+    supported: fn(&str) -> bool,
+) -> Option<Vec<(String, String)>> {
     let server = proxy_server.trim();
     if server.is_empty() {
         return None;
@@ -14682,12 +14687,12 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
             }
         }
     }
-    if mounted.iter().all(|(_, url)| httpx_supports_proxy_url(url)) {
+    if mounted.iter().all(|(_, url)| supported(url)) {
         return None;
     }
     let usable: Vec<(String, String)> = mounted
         .into_iter()
-        .filter(|(_, url)| httpx_supports_proxy_url(url))
+        .filter(|(_, url)| supported(url))
         .map(|(proto, url)| (format!("{proto}_proxy"), url))
         .collect();
     if usable.is_empty() {
@@ -14849,6 +14854,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         if let Some(dir) = pip_net_hook_dir(binary) {
             command.env("PYTHONPATH", dir);
         }
+        override_unsupported_registry_proxy(&mut command, |v| !is_socks_proxy_value(v));
     }
     strip_unusable_sslkeylogfile(&mut command);
     strip_socks_proxy_env(&mut command);
@@ -23649,26 +23655,44 @@ Always run the linter first.
     #[test]
     fn registry_socks4_single_value_goes_direct() {
         assert_eq!(
-            super::registry_proxy_env_overrides("socks4://127.0.0.1:10808"),
+            super::registry_proxy_env_overrides(
+                "socks4://127.0.0.1:10808",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![("NO_PROXY".to_string(), "*".to_string())])
         );
     }
 
     #[test]
     fn registry_clean_proxies_need_no_override() {
-        assert_eq!(super::registry_proxy_env_overrides("1.2.3.4:8080"), None);
         assert_eq!(
-            super::registry_proxy_env_overrides("http=1.2.3.4:8080;https=1.2.3.4:8080"),
+            super::registry_proxy_env_overrides("1.2.3.4:8080", super::httpx_supports_proxy_url),
+            None
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;https=1.2.3.4:8080",
+                super::httpx_supports_proxy_url
+            ),
             None
         );
         // A keyed socks entry with an explicit httpx-supported scheme is kept
         // verbatim by urllib's backfill, so both mounts parse: no override.
         assert_eq!(
-            super::registry_proxy_env_overrides("socks=socks5://127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "socks=socks5://127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             None
         );
-        assert_eq!(super::registry_proxy_env_overrides(""), None);
-        assert_eq!(super::registry_proxy_env_overrides("   "), None);
+        assert_eq!(
+            super::registry_proxy_env_overrides("", super::httpx_supports_proxy_url),
+            None
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides("   ", super::httpx_supports_proxy_url),
+            None
+        );
     }
 
     /// RUST-B3: CPython backfills missing http/https keys from a keyed
@@ -23678,7 +23702,10 @@ Always run the linter first.
     #[test]
     fn registry_keyed_socks_backfills_and_overrides() {
         assert_eq!(
-            super::registry_proxy_env_overrides("http=1.2.3.4:8080;socks=127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "http_proxy".to_string(),
                 "http://1.2.3.4:8080".to_string()
@@ -23686,7 +23713,10 @@ Always run the linter first.
         );
         // socks alone backfills BOTH mounts with socks4: nothing usable.
         assert_eq!(
-            super::registry_proxy_env_overrides("socks=127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![("NO_PROXY".to_string(), "*".to_string())])
         );
         // Explicit http/https pairs win over the backfill (CPython uses
@@ -23694,7 +23724,8 @@ Always run the linter first.
         // stray socks entry keeps its usable halves.
         assert_eq!(
             super::registry_proxy_env_overrides(
-                "http=1.2.3.4:8080;https=1.2.3.4:8080;socks=127.0.0.1:1080"
+                "http=1.2.3.4:8080;https=1.2.3.4:8080;socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
             ),
             None
         );
@@ -23706,7 +23737,10 @@ Always run the linter first.
     #[test]
     fn registry_mixed_keeps_the_usable_entry() {
         assert_eq!(
-            super::registry_proxy_env_overrides("http=socks4://127.0.0.1:10808;https=1.2.3.4:8080"),
+            super::registry_proxy_env_overrides(
+                "http=socks4://127.0.0.1:10808;https=1.2.3.4:8080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "https_proxy".to_string(),
                 "http://1.2.3.4:8080".to_string()
@@ -23721,11 +23755,40 @@ Always run the linter first.
     #[test]
     fn registry_schemeless_https_entry_mirrors_as_http_like_cpython() {
         assert_eq!(
-            super::registry_proxy_env_overrides("https=proxy.corp:8080;socks=proxy.corp:1080"),
+            super::registry_proxy_env_overrides(
+                "https=proxy.corp:8080;socks=proxy.corp:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "https_proxy".to_string(),
                 "http://proxy.corp:8080".to_string()
             )])
+        );
+    }
+
+    /// RUST-6S/RUST-29: with no socks env var left, pip's urllib still mounts
+    /// a socks WinINET system proxy and dies without pysocks. For pip any
+    /// socks mount is unusable, even socks5 that httpx copes with.
+    #[test]
+    fn registry_socks_is_unusable_for_pip() {
+        let pip: fn(&str) -> bool = |v| !super::is_socks_proxy_value(v);
+        assert_eq!(
+            super::registry_proxy_env_overrides("socks5://127.0.0.1:10808", pip),
+            Some(vec![("NO_PROXY".to_string(), "*".to_string())])
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;socks=socks5://127.0.0.1:1080",
+                pip
+            ),
+            Some(vec![(
+                "http_proxy".to_string(),
+                "http://1.2.3.4:8080".to_string()
+            )])
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides("1.2.3.4:8080", pip),
+            None
         );
     }
 
