@@ -1149,7 +1149,13 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
 # ~10x less and ran faster, with the same keep/drop decisions. Python only: the
 # Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
 # `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
-# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_EMBED_BATCH_CAP=0.
+# Concurrent splits still stacked the arena to +2.5 GB, so each run also asks ORT
+# to hand its free arena regions back: +80 MB settled after 4 parallel 128-record
+# splits, same speed (M6, 2026-10-29). Only when the desktop started the proxy
+# with MallocLargeCache=0 (macOS): libmalloc otherwise keeps the freed blocks
+# dirty and shrinking re-grew the arena to +3.8 GB.
+# Exact-pin gated to wheel 0.41.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
+# HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only, read by the desktop).
 _hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
 if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
@@ -1158,8 +1164,25 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
             from headroom.relevance import embedding as _hd_ebc_mod
 
+            _hd_ebc_shrink = _hd_os.environ.get("MallocLargeCache") == "0"
+
+            def _hd_ebc_arm(model):
+                model._hd_ebc_armed = True
+                import onnxruntime as _hd_ebc_ort
+
+                session = model.model.model  # TextEmbedding -> OnnxTextEmbedding -> InferenceSession
+                opts = _hd_ebc_ort.RunOptions()
+                opts.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                run = session.run
+                session.run = lambda names, feed, run_options=None: run(names, feed, run_options or opts)
+
             def _hd_ebc_encode(self, texts):
                 model = self._get_model()
+                if _hd_ebc_shrink and not getattr(model, "_hd_ebc_armed", False):
+                    try:
+                        _hd_ebc_arm(model)
+                    except Exception:
+                        pass  # Memory only: the arena keeps its high-water mark.
                 return _hd_ebc_mod._get_numpy().array(list(model.embed(texts, batch_size=16)))
 
             _hd_ebc_mod.EmbeddingScorer._encode = _hd_ebc_encode
@@ -4940,6 +4963,14 @@ impl ToolManager {
                         .env_remove("REQUESTS_CA_BUNDLE");
                 }
                 command.envs(startup_stall_dump_env(&stall_path));
+                // libmalloc caches freed large blocks and keeps them dirty, so the
+                // arena memory the embed batch cap vendor's shrinkage frees never
+                // left the proxy (+2.5 GB after 4 parallel relevance splits, +80 MB
+                // with the cache off, M6 2026-10-29). Costs ~1 ms per 8 MB body.
+                #[cfg(target_os = "macos")]
+                if std::env::var("HEADROOM_EMBED_ARENA_SHRINK").as_deref() != Ok("0") {
+                    command.env("MallocLargeCache", "0");
+                }
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -17776,8 +17807,9 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     #[test]
     fn embed_batch_cap_behaves_against_the_installed_wheel() {
         // The relevance scorer's fastembed calls run 16 texts per ONNX batch, not
-        // fastembed's 256 that grew ORT's arena to 2.5 GB. A fake model records
-        // the batch_size the installed EmbeddingScorer._encode passes.
+        // fastembed's 256 that grew ORT's arena to 2.5 GB, and with the large
+        // cache off each ONNX run shrinks the arena. A fake model records the
+        // batch_size and run options the installed EmbeddingScorer._encode passes.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17790,25 +17822,42 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
 from headroom.relevance.embedding import EmbeddingScorer
 seen = []
 class Model:
+    def __init__(self):
+        self.model = Onnx()
     def embed(self, texts, **kwargs):
         seen.append(kwargs.get("batch_size"))
+        self.model.model.run(["out"], {})
         return [[1.0, 0.0] for _ in texts]
+class Onnx:
+    def __init__(self):
+        self.model = Session()
+class Session:
+    def run(self, names, feed, run_options=None):
+        shrink.append(run_options and run_options.get_run_config_entry("memory.enable_memory_arena_shrinkage"))
+shrink = []
+model = Model()
 scorer = EmbeddingScorer()
-scorer._get_model = lambda: Model()
-print(len(scorer._encode(["record"] * 40)), seen)
+scorer._get_model = lambda: model
+print(len(scorer._encode(["record"] * 40)), seen, shrink)
 "#;
-        let run = |flag: &str| {
-            let out = crate::proc::command(&python)
+        let run = |flag: &str, large_cache: Option<&str>| {
+            let mut command = crate::proc::command(&python);
+            command
                 .args(["-c", probe])
                 .env("PYTHONPATH", dir.path())
                 .env("HEADROOM_EMBED_BATCH_CAP", flag)
-                .output()
-                .expect("run embed batch cap probe");
+                .env_remove("MallocLargeCache");
+            if let Some(value) = large_cache {
+                command.env("MallocLargeCache", value);
+            }
+            let out = command.output().expect("run embed batch cap probe");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        assert_eq!(run("1"), "40 [16]");
+        assert_eq!(run("1", Some("0")), "40 [16] ['cpu:0']");
+        // Shrinking with libmalloc's large cache on re-grows the arena; stay out.
+        assert_eq!(run("1", None), "40 [16] [None]");
         // Off keeps fastembed's default, which also proves the probe sees it.
-        assert_eq!(run("0"), "40 [None]");
+        assert_eq!(run("0", Some("0")), "40 [None] [None]");
     }
 
     #[test]
