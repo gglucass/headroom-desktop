@@ -453,8 +453,11 @@ export function mergeUnroutedBadges(
   ];
 }
 
-/// Drops a finding once that agent's requests reach Headroom. Returns
-/// `current` itself when nothing changed, so a state setter skips the render.
+/// Drops a finding once that agent's requests reach Headroom, or once the
+/// user switches its connector off: the finding's `enabled` is from the scan,
+/// and the Home banner would keep asking for a restart that cannot route it.
+/// Returns `current` itself when nothing changed, so a state setter skips the
+/// render.
 export function pruneUnroutedBadges(
   current: UnroutedClient[],
   connectors: ClientConnectorStatus[]
@@ -463,7 +466,8 @@ export function pruneUnroutedBadges(
     (client) =>
       !connectors.some(
         (connector) =>
-          connector.clientId === client.clientId && (connector.requestsSinceYesterday ?? 0) > 0
+          connector.clientId === client.clientId &&
+          ((connector.requestsSinceYesterday ?? 0) > 0 || !connector.enabled)
       )
   );
   return next.length === current.length ? current : next;
