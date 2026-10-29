@@ -732,6 +732,15 @@ describe("unrouted badges", () => {
     expect(pruneUnroutedBadges(current, [connector("codex", 0)])).toBe(current);
   });
 
+  it("drops a finding once the user switches that agent's connector off", () => {
+    const current = [finding("claude_code"), finding("codex")];
+    const off = { ...connector("claude_code", 0), enabled: false };
+    const kept = pruneUnroutedBadges(current, [off, connector("codex", 0)]);
+    expect(kept.map((client) => client.clientId)).toEqual(["codex"]);
+    // The Home banner then names only the agent a restart can still route.
+    expect(unroutedCallout(kept)?.title).toBe("Codex ran without Headroom.");
+  });
+
   it("shows the request count behind Active and the diagnosis behind an unrouted badge", () => {
     expect(connectorBadgeTip(connector("claude_code", 1420), "Active")).toBe(
       "Claude Code: Active, 1,420 requests since yesterday"
