@@ -204,7 +204,7 @@ mod platform {
             if status == ERR_SEC_ITEM_NOT_FOUND {
                 return Ok(None);
             }
-            check_status(status, "read keychain secret")?;
+            check_status(status, "read keychain item")?;
 
             let data: CFDataRef = result;
             let len = CFDataGetLength(data) as usize;
@@ -214,7 +214,7 @@ mod platform {
 
             String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|err| format!("Keychain secret for {account} was not valid UTF-8: {err}"))
+                .map_err(|err| format!("Keychain item for {account} was not valid UTF-8: {err}"))
         }
     }
 
@@ -247,7 +247,7 @@ mod platform {
             CFRelease(query);
 
             if status != ERR_SEC_ITEM_NOT_FOUND {
-                return check_status(status, "update keychain secret");
+                return check_status(status, "update keychain item");
             }
 
             let svc = cf_string(service);
@@ -286,7 +286,7 @@ mod platform {
                         .to_string(),
                 );
             }
-            check_status(add_status, "write keychain secret")
+            check_status(add_status, "write keychain item")
         }
     }
 
@@ -298,10 +298,12 @@ mod platform {
             if status == ERR_SEC_ITEM_NOT_FOUND {
                 return Ok(());
             }
-            check_status(status, "delete keychain secret")
+            check_status(status, "delete keychain item")
         }
     }
 
+    // Actions say "item", never "secret": Sentry blanks any value containing
+    // "secret" whatever its key, which hid RUST-8Z's error chain.
     fn check_status(status: OSStatus, action: &str) -> Result<(), String> {
         if status == 0 {
             return Ok(());

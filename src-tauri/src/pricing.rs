@@ -3947,8 +3947,9 @@ fn report_silent(message: &str, hours: i64, err: &str) {
         |scope| {
             scope.set_fingerprint(Some(&[message]));
             scope.set_extra("hours_silent", hours.into());
-            // A safe field: Sentry scrubbed "error" whole whenever it held a word
-            // like "secret" ("read keychain secret failed", RUST-8Z on 0.9.46).
+            // Sentry blanks this whole when the value holds password|secret|auth|...
+            // (Relay's @password rule matches values, not only keys), so the
+            // error texts this carries avoid those words (keychain.rs, RUST-8Z).
             scope.set_extra("error_chain", err.to_string().into());
         },
         || sentry::capture_message(message, sentry::Level::Warning),
