@@ -1149,13 +1149,14 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
 # ~10x less and ran faster, with the same keep/drop decisions. Python only: the
 # Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
 # `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
-# Concurrent splits still stacked the arena to +2.5 GB, so each run also asks ORT
+# Concurrent splits still stacked the arena to +2.2 GB, so each run also asks ORT
 # to hand its free arena regions back: +80 MB settled after 4 parallel 128-record
-# splits, same speed (M6, 2026-10-29). Only when the desktop started the proxy
-# with MallocLargeCache=0 (macOS): libmalloc otherwise keeps the freed blocks
-# dirty and shrinking re-grew the arena to +3.8 GB.
+# splits, same speed (M6, 2026-10-29). Only under MallocLargeCache=0, which the
+# wheel's macOS CLI re-exec sets (#2879): without it libmalloc keeps the freed
+# blocks dirty and shrinking re-grew the arena to +3.8 GB. Windows and Linux are
+# unmeasured and never set it, so they keep the cap alone.
 # Exact-pin gated to wheel 0.41.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
-# HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only, read by the desktop).
+# HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only).
 _hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
 if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
@@ -1164,7 +1165,11 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
             from headroom.relevance import embedding as _hd_ebc_mod
 
-            _hd_ebc_shrink = _hd_os.environ.get("MallocLargeCache") == "0"
+            _hd_ebc_shrink = (
+                _hd_os.environ.get("MallocLargeCache") == "0"
+                and _hd_os.environ.get("HEADROOM_EMBED_ARENA_SHRINK", "1").strip().lower()
+                not in ("", "0", "false", "no", "off")
+            )
 
             def _hd_ebc_arm(model):
                 model._hd_ebc_armed = True
@@ -4963,14 +4968,6 @@ impl ToolManager {
                         .env_remove("REQUESTS_CA_BUNDLE");
                 }
                 command.envs(startup_stall_dump_env(&stall_path));
-                // libmalloc caches freed large blocks and keeps them dirty, so the
-                // arena memory the embed batch cap vendor's shrinkage frees never
-                // left the proxy (+2.5 GB after 4 parallel relevance splits, +80 MB
-                // with the cache off, M6 2026-10-29). Costs ~1 ms per 8 MB body.
-                #[cfg(target_os = "macos")]
-                if std::env::var("HEADROOM_EMBED_ARENA_SHRINK").as_deref() != Ok("0") {
-                    command.env("MallocLargeCache", "0");
-                }
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -17852,6 +17849,7 @@ print(len(scorer._encode(["record"] * 40)), seen, shrink)
                 .args(["-c", probe])
                 .env("PYTHONPATH", dir.path())
                 .env("HEADROOM_EMBED_BATCH_CAP", flag)
+                .env_remove("HEADROOM_EMBED_ARENA_SHRINK")
                 .env_remove("MallocLargeCache");
             if let Some(value) = large_cache {
                 command.env("MallocLargeCache", value);
@@ -17864,6 +17862,19 @@ print(len(scorer._encode(["record"] * 40)), seen, shrink)
         assert_eq!(run("1", None), "40 [16] [None]");
         // Off keeps fastembed's default, which also proves the probe sees it.
         assert_eq!(run("0", Some("0")), "40 [None] [None]");
+        // The shrink kill switch keeps the cap and drops only the run options.
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_EMBED_BATCH_CAP", "1")
+            .env("HEADROOM_EMBED_ARENA_SHRINK", "0")
+            .env("MallocLargeCache", "0")
+            .output()
+            .expect("run embed batch cap probe");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "40 [16] [None]"
+        );
     }
 
     #[test]
