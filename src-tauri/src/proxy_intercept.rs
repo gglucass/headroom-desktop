@@ -3647,20 +3647,7 @@ fn report_upstream_error(
         );
         return;
     }
-    // Group by client and status so each upstream failure class is its own
-    // Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
-    // message and collapses 401 noise, 403 challenges and real 502/503
-    // connection errors into one un-triageable bucket that regresses the moment
-    // any sibling status reappears (RUST-46). Codex keeps its historical
-    // fingerprint so existing issues and their triage state carry over.
-    let status_str = status.to_string();
-    let fingerprint: Vec<&str> = if tls_interception {
-        vec!["upstream-tls-interception", client]
-    } else if client == "codex" {
-        vec!["codex-upstream-error", status_str.as_str()]
-    } else {
-        vec!["upstream-error", client, status_str.as_str()]
-    };
+    let fingerprint = upstream_error_fingerprint(client, status, tls_interception, &body);
     // Tags, not extras: an extra can only be read one event at a time, so the
     // shape RUST-4V's 578 events shared was never visible from the issue view.
     // All values are bounded and content-free, so they stay aggregatable.
@@ -3701,6 +3688,7 @@ fn report_upstream_error(
                 scope.set_tag("upstream_response_content_type", content_type);
             }
             scope.set_extra("error_body", snippet.clone().into());
+            let fingerprint: Vec<&str> = fingerprint.iter().map(String::as_str).collect();
             scope.set_fingerprint(Some(&fingerprint));
         },
         || {
@@ -3710,6 +3698,34 @@ fn report_upstream_error(
             );
         },
     );
+}
+
+/// Group by client and status so each upstream failure class is its own
+/// Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
+/// message and collapses 401 noise, 403 challenges and real 502/503
+/// connection errors into one un-triageable bucket that regresses the moment
+/// any sibling status reappears (RUST-46). Codex keeps its historical
+/// fingerprint so existing issues and their triage state carry over.
+fn upstream_error_fingerprint(
+    client: &str,
+    status: u16,
+    tls_interception: bool,
+    body: &[u8],
+) -> Vec<String> {
+    if tls_interception {
+        return vec!["upstream-tls-interception".into(), client.into()];
+    }
+    if client == "codex" {
+        return vec!["codex-upstream-error".into(), status.to_string()];
+    }
+    let mut fingerprint = vec!["upstream-error".into(), client.into(), status.to_string()];
+    // A 403's body class says whose refusal it is (Zen's FreeTierError, a
+    // gateway's provider_permission_denied, GitHub's org policy); one bucket
+    // for all of them made RUST-G5 a grab-bag any new provider re-escalated.
+    if status == 403 {
+        fingerprint.extend(codex_error_class(body));
+    }
+    fingerprint
 }
 
 /// True when an upstream error body carries OpenAI's unsupported-region code.
@@ -9869,6 +9885,42 @@ mod tests {
         assert_eq!(
             codex_error_summary(br#"{"error":{"code":"invalid_prompt"}}"#),
             "type=- code=invalid_prompt param=-"
+        );
+    }
+
+    #[test]
+    fn upstream_403_fingerprint_splits_by_error_class() {
+        use super::upstream_error_fingerprint as fp;
+        // RUST-G5's two latest opencode 403s: Zen's free-tier gate and a gateway.
+        let zen = br#"{"type":"error","error":{"type":"FreeTierError","message":"m"}}"#;
+        let gateway =
+            br#"{"error":{"type":"invalid_request_error","code":"provider_permission_denied"}}"#;
+        assert_eq!(
+            fp("opencode", 403, false, zen),
+            ["upstream-error", "opencode", "403", "FreeTierError", "-"]
+        );
+        assert_eq!(
+            fp("opencode", 403, false, gateway),
+            [
+                "upstream-error",
+                "opencode",
+                "403",
+                "invalid_request_error",
+                "provider_permission_denied"
+            ]
+        );
+        // Every other status, and codex, keep the grouping their issues carry.
+        assert_eq!(
+            fp("opencode", 400, false, gateway),
+            ["upstream-error", "opencode", "400"]
+        );
+        assert_eq!(
+            fp("codex", 403, false, zen),
+            ["codex-upstream-error", "403"]
+        );
+        assert_eq!(
+            fp("opencode", 502, true, zen),
+            ["upstream-tls-interception", "opencode"]
         );
     }
 
