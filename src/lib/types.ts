@@ -316,6 +316,8 @@ export interface UnroutedClient {
    *  Present only when it names a cause the app cannot see from its own
    *  config files, such as a project-local override. */
   diagnosis?: string | null;
+  /** Every session ran in the Claude desktop app, which a restart cannot route. */
+  desktopOnly?: boolean;
 }
 
 export interface RuntimeStatus {

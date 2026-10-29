@@ -1287,9 +1287,9 @@ fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, Sy
 /// own API host and Claude Code drops provider env from every settings scope,
 /// so no config Headroom owns can route them.
 /// "Restart your terminal" is advice that cannot work there.
-pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Sessions in the Claude desktop app go \
-     straight to Anthropic whatever you open first, so Headroom can't optimize them. Run \
-     Claude Code in your terminal or IDE to keep saving.";
+pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Headroom does not work with the Claude \
+     Desktop app. Due to design decisions by Anthropic, we are unable to apply our token saving \
+     logic. Instead, please use Claude Code in VS Code.";
 
 /// The surface that last wrote a Claude Code transcript, from the
 /// `"entrypoint"` stamp on its lines: `cli`, `claude-vscode` for the IDE
@@ -5521,6 +5521,13 @@ const CODEX_ROOT_KEYS: [(&str, &str, &str); 2] = [
     ),
 ];
 
+/// The `openai_base_url` Codex used before Headroom took it over, if any.
+pub(crate) fn preserved_codex_base_url() -> Option<String> {
+    load_setup_state()
+        .preserved_base_urls
+        .remove("codex_cli_openai_base_url")
+}
+
 /// Whether a comment-stripped TOML line assigns one of [`CODEX_ROOT_KEYS`].
 fn is_codex_root_key_line(code: &str) -> bool {
     code.split_once('=')
@@ -6419,16 +6426,23 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Windows editors and PowerShell 5.1's `-Encoding UTF8` start the file
+    // with a BOM, which serde_json reads as a stray character at line 1
+    // column 1 (RUST-61).
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     if raw.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) => {
+            // The parser's line and column go in the message the user sees
+            // (setup returns only the top context), and the shared refusal
+            // phrase keeps a file OpenCode cannot read either out of Sentry.
             let value: serde_json::Value =
-                serde_json::from_str(&strip_jsonc(&raw)).with_context(|| {
-                    format!(
-                        "parsing {} failed (JSON/JSONC); refusing to overwrite potentially valid user config",
+                serde_json::from_str(&strip_jsonc(raw)).map_err(|err| {
+                    anyhow!(
+                        "parsing {} failed (JSON/JSONC: {err}); {UNPARSEABLE_SETTINGS}",
                         path.display()
                     )
                 })?;
@@ -6488,6 +6502,10 @@ fn strip_jsonc(text: &str) -> String {
             '/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    // Keep its line breaks: a parse error names the file's own line.
+                    if bytes[i] == b'\n' {
+                        out.push(b'\n');
+                    }
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
@@ -6759,15 +6777,31 @@ fn configure_opencode_provider_block(
 /// whether each provider's base URL is gone or now points at another proxy,
 /// and whether the plugin entry went too (RUST-K2: a Linux host on 0.9.49
 /// lost it twice in a day, with nothing on the event to name the writer).
+/// A Mac on 0.9.51 then showed only "opencode.jsonc: all absent", so it also
+/// names a symlink (dotfiles manager), the top-level keys left (OpenCode's
+/// schema words: a reset vs another tool's config) and, since OpenCode merges
+/// opencode.json under opencode.jsonc, the .json beside it.
 fn opencode_block_shape() -> String {
     let path = opencode_config_path();
-    let file = path
+    let json = opencode_config_dir().join("opencode.json");
+    let shape = opencode_file_shape(&path);
+    if path != json && json.exists() {
+        return format!("{shape}; {}", opencode_file_shape(&json));
+    }
+    shape
+}
+
+fn opencode_file_shape(path: &Path) -> String {
+    let mut file = path
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     if !path.exists() {
         return format!("{file} missing");
     }
-    let Ok(config) = read_opencode_config(&path) else {
+    if std::fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink()) {
+        file.push_str(" (a symlink)");
+    }
+    let Ok(config) = read_opencode_config(path) else {
         return format!("{file} unparseable");
     };
     let mut parts: Vec<String> = OPENCODE_MANAGED_PROVIDERS
@@ -6790,7 +6824,11 @@ fn opencode_block_shape() -> String {
     } else {
         "plugin entry gone".into()
     });
-    format!("{file}: {}", parts.join(", "))
+    let keys: Vec<&str> = config
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    format!("{file}: {}, keys [{}]", parts.join(", "), keys.join(" "))
 }
 
 fn opencode_provider_block_matches() -> Result<bool> {
@@ -6813,12 +6851,31 @@ fn opencode_provider_block_matches() -> Result<bool> {
     Ok(base_urls_ok && plugin_ok)
 }
 
-fn disable_opencode(state: &ClientSetupState) -> Result<()> {
-    let path = opencode_config_path();
-    if !path.exists() {
-        return Ok(());
+/// The active config plus the other global name when it exists: OpenCode
+/// merges opencode.json under opencode.jsonc, so a .jsonc made after the apply
+/// leaves our block live in the .json.
+fn opencode_config_files() -> Vec<PathBuf> {
+    let mut files = vec![opencode_config_path()];
+    for name in ["opencode.json", "opencode.jsonc"] {
+        let path = opencode_config_dir().join(name);
+        if !files.contains(&path) {
+            files.push(path);
+        }
     }
-    let mut config = read_opencode_config(&path)?;
+    files.retain(|path| path.exists());
+    files
+}
+
+fn disable_opencode(state: &ClientSetupState) -> Result<()> {
+    for path in opencode_config_files() {
+        disable_opencode_file(state, &path)?;
+    }
+    remove_opencode_plugin_files();
+    Ok(())
+}
+
+fn disable_opencode_file(state: &ClientSetupState, path: &Path) -> Result<()> {
+    let mut config = read_opencode_config(path)?;
     let mut changed = false;
     for provider in OPENCODE_MANAGED_PROVIDERS {
         if opencode_provider_base_url(&config, provider).as_deref()
@@ -6847,10 +6904,9 @@ fn disable_opencode(state: &ClientSetupState) -> Result<()> {
         }
     }
     if changed {
-        let _ = backup_if_exists(&path)?;
-        write_opencode_config(&path, &config)?;
+        let _ = backup_if_exists(path)?;
+        write_opencode_config(path, &config)?;
     }
-    remove_opencode_plugin_files();
     Ok(())
 }
 
@@ -16391,7 +16447,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(lost, vec![super::OPENCODE_BLOCK_NOT_FOUND.to_string()]);
         assert_eq!(
             super::opencode_block_shape(),
-            "opencode.json: anthropic absent, openai absent, plugin entry gone"
+            "opencode.json: anthropic absent, openai absent, plugin entry gone, keys []"
         );
         assert!(!super::repair_pages(&lost), "a first loss does not page");
         assert!(super::repair_pages(&lost), "a repeat within a day pages");
@@ -16404,6 +16460,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             super::opencode_provider_block_matches().unwrap(),
             "block back"
+        );
+        // A bare .jsonc beside it now hides the block from verify.
+        fs::write(
+            super::opencode_config_dir().join("opencode.jsonc"),
+            r#"{"$schema": "https://opencode.ai/config.json"}"#,
+        )
+        .unwrap();
+        let shape = super::opencode_block_shape();
+        assert!(
+            shape.starts_with(
+                "opencode.jsonc: anthropic absent, openai absent, plugin entry gone, keys [$schema]; \
+                 opencode.json: anthropic ours, openai ours, plugin entry kept, keys ["
+            ),
+            "{shape}"
         );
     }
 
@@ -17300,6 +17370,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn opencode_disable_cleans_the_json_a_later_jsonc_hides() {
+        // OpenCode merges opencode.json under opencode.jsonc: a .jsonc made
+        // after the apply must not leave our block live in the .json.
+        let _home = TestHome::new(); // env guard
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        let json = super::opencode_config_dir().join("opencode.json");
+        fs::write(super::opencode_config_dir().join("opencode.jsonc"), "{}").unwrap();
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        let after = fs::read_to_string(&json).unwrap();
+        assert!(
+            !after.contains(super::HEADROOM_OPENCODE_BASE_URL) && !after.contains("plugin"),
+            "block left in opencode.json:\n{after}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn opencode_apply_replaces_the_legacy_plugin_file_entry() {
         // OpenCode 2.x rejects the single-file plugin older builds registered
         // ("configured plugin path must be a directory").
@@ -17409,6 +17497,27 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 "provider {provider} routed"
             );
         }
+    }
+
+    #[test]
+    fn opencode_config_reads_a_bom_and_refuses_garbage_as_user_settings() {
+        // RUST-61: a BOM-prefixed opencode.json failed at line 1 column 1 and
+        // the refusal filed at Error because it missed the shared phrase.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        fs::write(&path, "\u{feff}{\"theme\": \"dark\"}").unwrap();
+        let config = super::read_opencode_config(&path).expect("a BOM is not a parse error");
+        assert_eq!(config["theme"], serde_json::json!("dark"));
+
+        fs::write(&path, "\0\0\0\0").unwrap();
+        let shown = super::read_opencode_config(&path).unwrap_err().to_string();
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
+        assert!(shown.contains("line 1 column 1"), "{shown}");
+
+        // The line shown is the file's own, past a multi-line block comment.
+        fs::write(&path, "{\n  /* a\n     b */\n  \"x\": 1\n  \"y\": 2\n}").unwrap();
+        let shown = super::read_opencode_config(&path).unwrap_err().to_string();
+        assert!(shown.contains("at line 5 column"), "{shown}");
     }
 
     #[test]

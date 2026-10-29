@@ -57,8 +57,10 @@
   --accent-strong:      #5fa688;
   --accent-tint:        rgba(79, 158, 145, 0.12);
   --accent-tint-strong: rgba(79, 158, 145, 0.28);
-  /* Output-savings bar segment (chart gradients are theme-invariant), so the
-     chip legend dots can key to the exact segment hue. */
+  /* Input- and output-savings bar segments (chart gradients are
+     theme-invariant), so the chip legend dots key to the exact segment hue.
+     Not --accent: dark mode lightens that past the output segment. */
+  --chart-input-savings:  #4F9E91;
   --chart-output-savings: #63b3a4;
   /* Tokens-mode segment golds (gradient midpoints in App.tsx), so the chip
      legend dots match the bars in tokens view too. */
@@ -116,6 +118,7 @@
     --accent-tint:        rgba(79, 158, 145, 0.2);
     --accent-tint-strong: rgba(79, 158, 145, 0.3);
     /* Same as light: the chart's segment gradients don't change in dark. */
+    --chart-input-savings:  #4F9E91;
     --chart-output-savings: #63b3a4;
     --chart-input-savings-tokens:  #837305;
     --chart-output-savings-tokens: #a08a10;
@@ -2206,7 +2209,7 @@ select {
 
 .output-chip__dot--input {
   /* Legend key: matches the compression-savings segment in the history bars. */
-  background: var(--accent);
+  background: var(--chart-input-savings);
 }
 
 /* Tokens view paints the saved segments gold, so the legend dots follow. */
@@ -2528,11 +2531,15 @@ select {
   background: linear-gradient(180deg, #746605, #8f7d0b);
 }
 
-/* Output shaping is the lighter shade of whichever savings colour is active,
-   matching the second stacked bar segment. Opacity instead of a new colour so
-   the two layers stay visibly the same metric. */
-.savings-chart__tooltip-dot--output {
-  opacity: 0.65;
+/* Output shaping: the lighter top segment, keyed like the chip dots. Not
+   opacity on the input swatch: on the dark tooltip that blends toward black
+   and reads darker than input, the reverse of the bars. */
+.savings-chart__tooltip-dot--output-usd {
+  background: var(--chart-output-savings);
+}
+
+.savings-chart__tooltip-dot--output-tokens {
+  background: var(--chart-output-savings-tokens);
 }
 
 .panel-card__header,

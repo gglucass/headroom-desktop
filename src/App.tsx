@@ -85,6 +85,7 @@ import {
   mergeUnroutedBadges,
   pruneUnroutedBadges,
   unroutedAfterReconnect,
+  unroutedCallout,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
@@ -595,6 +596,7 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 };
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
+const CLAUDE_CODE_VSCODE_DOCS_URL = "https://code.claude.com/docs/en/vs-code";
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -753,8 +755,8 @@ function SavingsChartTooltip({
             <i
               aria-hidden="true"
               className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
-                chartMode === "usd" ? "saved-usd" : "saved-tokens"
-              } savings-chart__tooltip-dot--output`}
+                chartMode === "usd" ? "output-usd" : "output-tokens"
+              }`}
             />
             {chartMode === "usd"
               ? `Saved ${currencyExact(point.outputSavingsUsd)}`
@@ -1380,7 +1382,9 @@ function DailySavingsChart({
                 </linearGradient>
                 {/* Output shaping sits on top of compression in the same hue
                     family, one shade lighter, so it reads as a second layer of
-                    the same thing rather than a separate metric. */}
+                    the same thing rather than a separate metric. Keep the
+                    tooltip swatches (--output-usd/--output-tokens) and the
+                    chip-dot tokens (--chart-*-savings) in sync. */}
                 <linearGradient id="outputUsdGradient" x1="0" x2="0" y1="0" y2="1">
                   <stop offset="0%" stopColor="#63b3a4" />
                   <stop offset="100%" stopColor="#8CCCBE" />
@@ -1828,6 +1832,8 @@ export default function App() {
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
+  const [claudeTerminalError, setClaudeTerminalError] = useState<string | null>(null);
+  const [vscodeNudgeNote, setVscodeNudgeNote] = useState<string | null>(null);
   // Claude Desktop on disk. It is not a client we can route (host-managed
   // provider env), so the no-clients and no-agent copy has to say so.
   const [claudeDesktopInstalled, setClaudeDesktopInstalled] = useState(false);
@@ -4392,6 +4398,26 @@ export default function App() {
     }
   }
 
+  // A fresh session reads the routing setup just wrote, so it is the first
+  // prompt's shortest path, above all for someone who just installed the CLI.
+  // `vscode` sends a Claude desktop app user to the extension we recommend;
+  // without VS Code, Anthropic's guide covers installing both.
+  async function openClaudeCode(vscode: boolean): Promise<string> {
+    let opened = "none";
+    try {
+      opened = await invoke<string>("open_claude_code", {
+        prompt: vscode ? null : STARTER_PROMPT,
+        vscode
+      });
+    } catch {
+      // Same as nowhere to open it: the caller shows the manual way.
+    }
+    if (vscode && opened === "none") {
+      openLinkFromClick(CLAUDE_CODE_VSCODE_DOCS_URL);
+    }
+    return opened;
+  }
+
   // Launcher twin of copyLearnInstallCommand: the launcher stages only render
   // connectorsNotice, not the learn panel's notice.
   async function copyAgentInstallCommand(command: string) {
@@ -5868,11 +5894,31 @@ export default function App() {
           <div className="post-install__lead">
             <h1>Install a coding agent first</h1>
             {claudeDesktopInstalled ? (
-              <p className="install-progress__notice">
-                <strong>You have the Claude Desktop app, but Headroom cannot work with it.</strong>{" "}
-                Due to design decisions by Anthropic, we are unable to apply our compression logic.
-                Instead, please use Claude Code in your terminal or in VS Code.
-              </p>
+              <>
+                <p className="install-progress__notice">
+                  <strong>Headroom does not work with the Claude Desktop app.</strong>{" "}
+                  Due to design decisions by Anthropic, we are unable to apply our token saving logic.
+                  Instead, please use Claude Code in VS Code.
+                </p>
+                <button
+                  className="primary-button"
+                  onClick={() => {
+                    void openClaudeCode(true).then((opened) =>
+                      setVscodeNudgeNote(
+                        opened === "editor"
+                          ? "Sign in to Claude Code in VS Code, then click Check again."
+                          : "Install VS Code and its Claude Code extension, then click Check again."
+                      )
+                    );
+                  }}
+                  type="button"
+                >
+                  Use Claude Code in VS Code
+                </button>
+                {vscodeNudgeNote ? (
+                  <p className="install-progress__notice">{vscodeNudgeNote}</p>
+                ) : null}
+              </>
             ) : (
               <p>
                 Headroom saves tokens by routing an AI coding tool you already use
@@ -5893,7 +5939,7 @@ export default function App() {
                 </div>
               </header>
               <button
-                className="primary-button"
+                className={claudeDesktopInstalled ? "secondary-button" : "primary-button"}
                 disabled={claudeInstallBusy || connectorsBusy}
                 onClick={() => void installClaudeCodeCli()}
                 type="button"
@@ -6381,6 +6427,9 @@ export default function App() {
       aggregateClientConnectors(connectors).some(
         (connector) => connector.enabled && connector.installed
       );
+    const claudeCodeConnected = aggregateClientConnectors(connectors).some(
+      (connector) => connector.clientId === "claude_code" && connector.enabled && connector.installed
+    );
     const restartRows =
       proxyVerificationRows.length > 0 ? (
         <div className="connector-list">
@@ -6433,9 +6482,18 @@ export default function App() {
                 Install Claude Code or Codex, then connect it from the Back button here or
                 later from the Headroom window.
                 {claudeDesktopInstalled
-                  ? " The Claude Desktop app does not count: Anthropic pins its built-in Claude Code to its own servers, so Headroom cannot route it."
+                  ? " Headroom does not work with the Claude Desktop app. Due to design decisions by Anthropic, we are unable to apply our token saving logic. Instead, please use Claude Code in VS Code."
                   : ""}
               </p>
+              {claudeDesktopInstalled ? (
+                <button
+                  className="secondary-button"
+                  onClick={() => void openClaudeCode(true)}
+                  type="button"
+                >
+                  Use Claude Code in VS Code
+                </button>
+              ) : null}
             </div>
           ) : awaitingFirstPrompt ? (
             <div className="post-install__checklist">
@@ -6444,6 +6502,29 @@ export default function App() {
                 Then ask them to "Say hi" or paste the prompt below to see savings appear.
               </p>
               {restartRows}
+              {claudeCodeConnected ? (
+                <div>
+                  <button
+                    className="secondary-button"
+                    onClick={() => {
+                      setClaudeTerminalError(null);
+                      void openClaudeCode(false).then((opened) => {
+                        if (opened === "none") {
+                          setClaudeTerminalError(
+                            "Couldn't open Claude Code from here. Open a new terminal and type claude, or start a new chat in VS Code."
+                          );
+                        }
+                      });
+                    }}
+                    type="button"
+                  >
+                    Open Claude Code
+                  </button>
+                  {claudeTerminalError ? (
+                    <p className="install-progress__error">{claudeTerminalError}</p>
+                  ) : null}
+                </div>
+              ) : null}
               <StarterPrompt />
               {proxyVerificationHint ? (
                 <p
@@ -6591,12 +6672,14 @@ export default function App() {
     runtimeIssues,
     runtimeHealthy,
     kompressWarming,
-    connectorPhase
+    connectorPhase,
+    unrouted: unroutedCallout(unroutedBadges)
   });
 
   // A never-routed install sits in connectorPhase "verifying" indefinitely, so
   // this cannot key off the healthy tone alone - see shouldShowStallBannerLine.
-  const showStallBannerLine = shouldShowStallBannerLine({
+  // The unrouted fix already says what the stall line would guess at.
+  const showStallBannerLine = !calloutBanner.detail && shouldShowStallBannerLine({
     stallBannerLine,
     tone: calloutBanner.tone,
     connectorPhase,
@@ -6763,6 +6846,16 @@ export default function App() {
     const { percentOff, durationMonths } = pricingStatus.introOffer;
     return `Intro offer: ${percentOff}% off your first ${durationMonths} months.`;
   })();
+  // The same offer during the trial, once it has saved something: before the
+  // wall a trial user only met the offer by opening Upgrade themselves.
+  const trialOfferLine =
+    !inUpgradeMoment &&
+    pricingStatus?.account?.trialActive &&
+    !pricingStatus.account.subscriptionActive &&
+    pricingStatus.introOffer?.active &&
+    trialSavedLabel
+      ? `Intro offer: ${pricingStatus.introOffer.percentOff}% off your first ${pricingStatus.introOffer.durationMonths} months.`
+      : null;
   // When the banner is carrying an upgrade nudge (and isn't showing the Resume
   // control), let clicking the card jump straight to the upgrade view.
   const calloutIsUpgradeNudge =
@@ -7251,10 +7344,38 @@ export default function App() {
                 {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
+                {calloutBanner.detail ? (
+                  <p className="callout-banner__subtitle">
+                    {calloutBanner.detail}
+                    {calloutBanner.offerVscode ? (
+                      <>
+                        {" "}
+                        <button
+                          className="link-button"
+                          onClick={() => void openClaudeCode(true)}
+                          type="button"
+                        >
+                          Open VS Code
+                        </button>
+                      </>
+                    ) : null}
+                  </p>
+                ) : null}
                 {showStallBannerLine ? (
                   // Nothing has ever been saved on this install, so the
                   // reassuring "check back later" below would be a lie.
                   <p className="callout-banner__subtitle">{stallBannerLine}</p>
+                ) : calloutBanner.tone === "healthy" && trialOfferLine ? (
+                  <p className="callout-banner__subtitle">
+                    {trialOfferLine}{" "}
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={() => setActiveView("upgrade")}
+                    >
+                      See plans
+                    </button>
+                  </p>
                 ) : calloutBanner.tone === "healthy" &&
                   dashboard.lifetimeEstimatedTokensSaved < 1_000_000 ? (
                   <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>

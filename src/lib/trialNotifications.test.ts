@@ -576,4 +576,74 @@ describe("maybeFireTrialNotifications", () => {
       expect(invokeMock).not.toHaveBeenCalled();
     });
   });
+
+  describe("intro offer notification", () => {
+    const introOffer = { active: true, percentOff: 25, annualPercentOff: 12.5, durationMonths: 3 };
+    const savedToday = () => [
+      {
+        date: localDayKey(new Date()),
+        estimatedSavingsUsd: 4.2,
+        estimatedTokensSaved: 2_100_000,
+        actualCostUsd: 0,
+        totalTokensSent: 0,
+      },
+    ];
+    const usageTrial = (usageDaysLeft: number) =>
+      makeStatus({
+        localGraceActive: false,
+        authenticated: true,
+        introOffer,
+        account: {
+          ...makeTrialAccount(daysFromNow(13)),
+          trialStartedAt: hoursAgo(5),
+          trialUsageDaysLeft: usageDaysLeft,
+        },
+      });
+
+    it("pitches the offer once, as soon as the trial has saved something", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+
+      await maybeFireTrialNotifications(usageTrial(6), savedToday());
+      await maybeFireTrialNotifications(usageTrial(5), savedToday());
+
+      expect(invokeMock).toHaveBeenCalledTimes(1);
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: "Intro offer: 25% off your first 3 months",
+        body:
+          "So far in your trial, Headroom has saved you 2.1M tokens, about $4 at API prices. " +
+          "Upgrade to keep it running after your trial.",
+        action: "billing",
+      });
+    });
+
+    it("waits until the trial has saved something worth naming", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+
+      await maybeFireTrialNotifications(usageTrial(6), []);
+
+      expect(invokeMock).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet without a live intro offer", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+      const status = usageTrial(6);
+
+      await maybeFireTrialNotifications({ ...status, introOffer: { ...introOffer, active: false } }, savedToday());
+
+      expect(invokeMock).not.toHaveBeenCalled();
+    });
+
+    it("leaves the last two days of use to the trial-ending notice", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+
+      await maybeFireTrialNotifications(usageTrial(2), savedToday());
+
+      expect(invokeMock).toHaveBeenCalledTimes(1);
+      expect(invokeMock.mock.calls[0][1].title).toBe("Headroom Trial Ending Soon");
+    });
+  });
 });

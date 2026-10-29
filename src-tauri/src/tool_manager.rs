@@ -1140,6 +1140,82 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
         # Memory only: the wheel's 100-entry window stands.
         pass
 
+# --- Embedding relevance: 16 texts per ONNX run, not 256 (vendor, upstream owed) -
+# The content router's relevance split embeds every record of a tool output in
+# one fastembed embed() at its default batch of 256, padded to the longest text.
+# fastembed's ONNX session keeps ORT's CPU arena on and the arena never shrinks,
+# so it grows to the biggest batch the proxy ever scored: 2.5 GB pinned on a
+# 4-day macOS proxy (2026-10-27), out of the periodic trim's reach. 16 retained
+# ~10x less and ran faster, with the same keep/drop decisions. Python only: the
+# Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
+# `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
+# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_EMBED_BATCH_CAP=0.
+_hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
+if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_ebc_meta
+
+        if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
+            from headroom.relevance import embedding as _hd_ebc_mod
+
+            def _hd_ebc_encode(self, texts):
+                model = self._get_model()
+                return _hd_ebc_mod._get_numpy().array(list(model.embed(texts, batch_size=16)))
+
+            _hd_ebc_mod.EmbeddingScorer._encode = _hd_ebc_encode
+            _hd_bound.add("embed_batch_cap")
+    except Exception:
+        # Memory only: on any binding failure the wheel's batch of 256 stands.
+        pass
+
+# --- Read maturation: never inside the provider-cached prefix (vendor) --------
+# Maturation swaps a quiet Read for a marker only "while it is outside the
+# frozen prefix", but the Anthropic handler hands it the pipeline's freeze
+# count, min(provider floor, local compression-cache count), and runs it AFTER
+# finalize_turn replayed the provider floor. The local count stops at the first
+# tool_result the cache never stored (a Read, which the router excludes), so it
+# sits at 2 for a whole Claude Code session and every Read matures inside the
+# cached prefix 5 quiet turns later: forwarded bytes change 9 messages back from
+# the floor and the tail re-writes (Sentry RUST-DP, prefix_rewrite, 436 users).
+# finalize_turn's confirmed_frozen_count is that floor; maturation gets the
+# larger of the two, so a cached Read stays verbatim, as the module documents.
+# Turns that skip the replay (cold cache, restart) keep the wheel's count.
+# Exact-pin gated to wheel 0.41.0 (0.42.0 still passes the clamped count).
+# Kill switch: HEADROOM_MATURATION_FLOOR=0.
+_hd_mf_flag = _hd_os.environ.get("HEADROOM_MATURATION_FLOOR", "1")
+if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import contextvars as _hd_mf_cv
+        import importlib.metadata as _hd_mf_meta
+
+        if _hd_mf_meta.version("headroom-ai") == "0.41.0":
+            from headroom.proxy import session_engine as _hd_mf_se
+            from headroom.transforms import read_maturation as _hd_mf_rm
+
+            _hd_mf_floor = _hd_mf_cv.ContextVar("desktop_maturation_floor", default=0)
+            _hd_mf_finalize = _hd_mf_se.finalize_turn
+            _hd_mf_apply = _hd_mf_rm.ReadMaturationManager.apply
+
+            def _hd_mf_finalize_turn(*args, **kwargs):
+                _hd_mf_floor.set(max(int(kwargs.get("confirmed_frozen_count") or 0), 0))
+                return _hd_mf_finalize(*args, **kwargs)
+
+            def _hd_mf_apply_floored(self, messages, frozen_message_count=0):
+                floor = _hd_mf_floor.get()
+                # One replay floor per maturation pass: the request task owns it.
+                _hd_mf_floor.set(0)
+                return _hd_mf_apply(self, messages,
+                                    frozen_message_count=max(frozen_message_count, floor))
+
+            # The handler imports finalize_turn per request, so the module
+            # attribute is what it calls.
+            _hd_mf_se.finalize_turn = _hd_mf_finalize_turn
+            _hd_mf_rm.ReadMaturationManager.apply = _hd_mf_apply_floored
+            _hd_bound.add("maturation_floor")
+    except Exception:
+        # On any binding failure the wheel's maturation stands.
+        pass
+
 # Proxied guarded upstreams (desktop posture; upstream #3804 shipped as an
 # allowlist): since 0.39.0 the wheel pins caller-supplied upstreams
 # (x-headroom-base-url) to the address the SSRF guard judged, and refuses them
@@ -1608,6 +1684,85 @@ if _hd_llb_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
             _hd_llb_mod._build_digest = _hd_llb_digest
             _hd_bound.add("learn_loop_budget")
+    except Exception:
+        pass
+
+# --- Learn: OpenCode's v2 session tables (vendor, upstream owed) --------------
+# OpenCode moved sessions from session/message/part to session_v2 and
+# session_message (tool calls inside each row's data.content), and a database a
+# current OpenCode created has no `session` table at all. The wheel's plugin
+# (0.41.0) reads only v1, so every learn scan there died on "no such table:
+# session" (RUST-HJ, 6 hosts). On a v2 database the plugin's connection gets
+# TEMP views with the v1 names and shape, so its own queries and parsing run
+# unchanged; TEMP objects never touch the user's file, and a v1 database gets
+# none. The part view inverts OpenCode's own v1 -> v2 migration (migrateTool:
+# callID -> id, tool -> name, output -> content text, error -> error.message).
+# On Windows v2 stores C:/x while the plugin matches str(Path(worktree)), C:\x.
+# Exact-pin gated to wheel 0.41.0; self-neutralizes once the plugin names
+# session_v2. Kill switch: HEADROOM_LEARN_OPENCODE_V2=0.
+_hd_oc2_flag = _hd_os.environ.get("HEADROOM_LEARN_OPENCODE_V2", "1")
+if _hd_oc2_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_oc2_meta
+
+        if _hd_oc2_meta.version("headroom-ai") == "0.41.0":
+            import inspect as _hd_oc2_inspect
+            import sqlite3 as _hd_oc2_sqlite
+            import types as _hd_oc2_types
+
+            from headroom.learn.plugins import opencode as _hd_oc2_mod
+
+            if "session_v2" not in _hd_oc2_inspect.getsource(_hd_oc2_mod):
+                _hd_oc2_worktree = (
+                    "replace(worktree, '/', '\\')" if _hd_os.name == "nt" else "worktree"
+                )
+                _HD_OC2_VIEWS = (
+                    "CREATE TEMP VIEW project AS SELECT id, name, "
+                    + _hd_oc2_worktree
+                    + " AS worktree FROM main.project",
+                    "CREATE TEMP VIEW session AS"
+                    " SELECT id, project_id, time_created FROM main.session_v2",
+                    "CREATE TEMP VIEW message AS SELECT id, session_id FROM main.session_message",
+                    "CREATE TEMP VIEW part AS"
+                    " SELECT m.id AS message_id,"
+                    "  json_object('type', 'tool', 'tool', t.value ->> '$.name',"
+                    "   'callID', t.value ->> '$.id',"
+                    "   'state', json_object('status', t.value ->> '$.state.status',"
+                    "    'input', t.value -> '$.state.input',"
+                    "    'output', coalesce(t.value ->> '$.state.error.message',"
+                    "     (SELECT group_concat(c.value ->> '$.text', char(10))"
+                    "      FROM json_each(t.value, '$.state.content') c"
+                    "      WHERE c.value ->> '$.type' = 'text'), ''))) AS data,"
+                    "  coalesce(t.value ->> '$.time.created', m.time_created) AS time_created"
+                    " FROM main.session_message m, json_each(m.data, '$.content') t"
+                    " WHERE t.value ->> '$.type' = 'tool'",
+                )
+
+                def _hd_oc2_connect(*args, **kwargs):
+                    conn = _hd_oc2_sqlite.connect(*args, **kwargs)
+                    try:
+                        tables = {
+                            r[0]
+                            for r in conn.execute(
+                                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                            )
+                        }
+                        if "session" not in tables and {
+                            "project",
+                            "session_v2",
+                            "session_message",
+                        } <= tables:
+                            for stmt in _HD_OC2_VIEWS:
+                                conn.execute(stmt)
+                    except _hd_oc2_sqlite.Error:
+                        pass
+                    return conn
+
+                _hd_oc2_shim = _hd_oc2_types.ModuleType("sqlite3")
+                _hd_oc2_shim.__dict__.update(_hd_oc2_sqlite.__dict__)
+                _hd_oc2_shim.connect = _hd_oc2_connect
+                _hd_oc2_mod.sqlite3 = _hd_oc2_shim
+                _hd_bound.add("learn_opencode_v2")
     except Exception:
         pass
 
@@ -2330,6 +2485,8 @@ _HD_VENDORS = (
     "cc_switch_reset",
     "tool_ref_hint",
     "message_window",
+    "embed_batch_cap",
+    "maturation_floor",
     "proxied_guarded_upstreams",
     "output_warmup",
     "learn_rule_coerce",
@@ -2340,6 +2497,7 @@ _HD_VENDORS = (
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
     "learn_loop_budget",
+    "learn_opencode_v2",
     "web_search_history",
     "buffered_upstream_stream",
     "deferred_tool_affinity",
@@ -2493,7 +2651,29 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
 }
 const RTK_VERSION: &str = "0.48.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
-const SERENA_PINNED_VERSION: &str = "1.7.0";
+const SERENA_PINNED_VERSION: &str =
+    serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
+
+/// serena-agent pins every dependency exactly, and 1.7.0 pins
+/// cryptography==50.0.0, whose macOS wheels are arm64-only (49.0.0 dropped
+/// universal2). On an Intel Mac pip fell back to the sdist, which needs a Rust
+/// toolchain, so every Serena install there failed with "Failed building wheel
+/// for cryptography" from the 1.6.1 -> 1.7.0 bump (2026-08-13) on (RUST-F6).
+/// 1.6.1 pins cryptography==48.0.1, the universal2 build the runtime lock also
+/// pins for Intel, and matches 1.7.0 on everything Headroom drives: the
+/// start-mcp-server flags, the claude-code/codex contexts,
+/// `web_dashboard_interface`, the dashboard port and `/get_tool_stats`, and the
+/// tool-call log line. Its closure resolves wheels-only on x86_64 macOS
+/// (proxy-tools, pure Python, builds from its sdist as on every platform).
+/// Drop the Intel branch once the pin's cryptography ships an x86_64 macOS
+/// wheel.
+const fn serena_pinned_version(intel_mac: bool) -> &'static str {
+    if intel_mac {
+        "1.6.1"
+    } else {
+        "1.7.0"
+    }
+}
 /// Serena runs its Python language servers (pyright, basedpyright, ty,
 /// pyrefly) through `uvx`, found via `$UVX` or PATH. Without uv every Python
 /// symbol query failed after a clean install, so uv lives in serena's venv and
@@ -3176,6 +3356,15 @@ impl ManagedRuntime {
 
     pub fn managed_python(&self) -> PathBuf {
         self.venv_dir.join(bin_subdir()).join(python_exe_name())
+    }
+
+    pub fn headroom_entrypoint(&self) -> PathBuf {
+        let name = if cfg!(target_os = "windows") {
+            "headroom.exe"
+        } else {
+            "headroom"
+        };
+        self.venv_dir.join(bin_subdir()).join(name)
     }
 
     pub fn managed_pip(&self) -> PathBuf {
@@ -3892,12 +4081,7 @@ impl ToolManager {
     }
 
     pub fn headroom_entrypoint(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") {
-            "headroom.exe"
-        } else {
-            "headroom"
-        };
-        self.runtime.venv_dir.join(bin_subdir()).join(name)
+        self.runtime.headroom_entrypoint()
     }
 
     /// Holds only the SITECUSTOMIZE_PY the backend spawn writes; put it on
@@ -15304,13 +15488,14 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 }
 
 /// The user's machine lacks git (the UI says so), a host holds the plugin but
-/// no CLI for it can be found (RUST-MV), or the user's own settings.json does
+/// no CLI for it can be found (RUST-MV), the user's own settings.json does
 /// not parse (RUST-DQ; our own writers already keep that refusal out of
-/// Sentry): nothing we ship fixes any of them.
+/// Sentry), or its network cannot reach GitHub (the CLI's error says so):
+/// nothing we ship fixes any of them.
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
-        "git-missing" | "cli-missing" | "settings-unparseable"
+        "git-missing" | "cli-missing" | "settings-unparseable" | "github-unreachable"
     )
 }
 
@@ -15348,6 +15533,15 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // follows then fails "not found in marketplace", which names only the
         // consequence.
         "git-missing"
+    } else if lower.contains("git clone timed out")
+        || lower.contains("could not resolve host: github.com")
+        || lower.contains("failed to connect to github.com")
+    {
+        // The marketplace clone never reached GitHub from this machine's
+        // network (RUST-P0 on 0.9.51: Claude Code's "Git clone timed out after
+        // 120s"). Checked before the install's "not found in marketplace" for
+        // the same reason as git-missing.
+        "github-unreachable"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -17553,6 +17747,100 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     }
 
     #[test]
+    fn embed_batch_cap_behaves_against_the_installed_wheel() {
+        // The relevance scorer's fastembed calls run 16 texts per ONNX batch, not
+        // fastembed's 256 that grew ORT's arena to 2.5 GB. A fake model records
+        // the batch_size the installed EmbeddingScorer._encode passes.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.relevance.embedding import EmbeddingScorer
+seen = []
+class Model:
+    def embed(self, texts, **kwargs):
+        seen.append(kwargs.get("batch_size"))
+        return [[1.0, 0.0] for _ in texts]
+scorer = EmbeddingScorer()
+scorer._get_model = lambda: Model()
+print(len(scorer._encode(["record"] * 40)), seen)
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_EMBED_BATCH_CAP", flag)
+                .output()
+                .expect("run embed batch cap probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("1"), "40 [16]");
+        // Off keeps fastembed's default, which also proves the probe sees it.
+        assert_eq!(run("0"), "40 [None]");
+    }
+
+    #[test]
+    fn maturation_floor_behaves_against_the_installed_wheel() {
+        // RUST-DP: a Read quiet for 5 turns sits inside the provider-cached prefix,
+        // and the handler's freeze count (here 1) is below the floor finalize_turn
+        // replayed. With a replay the Read must stay verbatim; without one (cold
+        // cache) it matures, so the floor never outlives its request's pass.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+import inspect
+from headroom.config import ReadMaturationConfig
+from headroom.proxy import session_engine
+from headroom.proxy.handlers import anthropic as handler
+from headroom.transforms.read_maturation import ReadMaturationManager
+src = inspect.getsource(handler)
+# The vendor relies on the handler importing finalize_turn per request and
+# maturing Reads after that replay.
+wired = ("            from headroom.proxy.session_engine import finalize_turn\n" in src
+         and src.index("_final = finalize_turn(") < src.index("maturation_mgr.apply("))
+msgs = [{"role": "user", "content": "fix the retry"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read",
+                                           "input": {"file_path": "/repo/net.rs"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "x" * 4096}]}]
+for k in range(5):
+    msgs += [{"role": "assistant", "content": [{"type": "tool_use", "id": f"b{k}", "name": "Bash",
+                                                "input": {"command": "cargo test"}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"b{k}", "content": "ok"}]}]
+def matured(replayed):
+    mgr = ReadMaturationManager(ReadMaturationConfig(enabled=True, quiesce_turns=5,
+                                                     max_hold_turns=25, min_size_bytes=2048))
+    if replayed:
+        prev = msgs[:-2]
+        session_engine.finalize_turn(msgs, msgs, prev, prev, confirmed_frozen_count=len(prev))
+    return mgr.apply(msgs, frozen_message_count=1).newly_matured
+print(wired, matured(True), matured(False))
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_MATURATION_FLOOR", flag)
+                .output()
+                .expect("run maturation floor probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("1"), "True 0 1");
+        // Off is the wheel's own behaviour: the cached Read matures.
+        assert_eq!(run("0"), "True 1 1");
+    }
+
+    #[test]
     fn proxied_guarded_upstream_vendor_behaves_against_the_installed_wheel() {
         // Grok/OpenCode behind a system proxy: the shipped sitecustomize must let
         // a guarded x-headroom-base-url upstream out through a proxy transport
@@ -17768,6 +18056,73 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
         assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_opencode_v2_behaves_against_the_installed_wheel() {
+        // RUST-HJ: a current OpenCode's database has session_v2 and no
+        // `session`, and every learn scan died on "no such table: session".
+        // Rows follow OpenCode's own v1 -> v2 migration (migrateTool). The kill
+        // switch brings the crash back; the user's file never gets a view.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-oc2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = r#"import json, sqlite3, tempfile
+from pathlib import Path
+t = Path(tempfile.mkdtemp())
+db = t / 'opencode.db'
+c = sqlite3.connect(db)
+c.executescript('CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT);'
+    'CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL, time_created INTEGER);'
+    'CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER, data TEXT NOT NULL);')
+w = (t / 'app').as_posix()
+c.execute("INSERT INTO project VALUES ('p1', ?, 'app')", (w,))
+c.execute("INSERT INTO session_v2 VALUES ('s1', 'p1', ?, 1761000000000)", (w,))
+data = {'type': 'assistant', 'content': [{'type': 'text', 'text': 'hi'},
+    {'type': 'tool', 'id': 'call_1', 'name': 'bash', 'state': {'status': 'completed', 'input': {'command': 'ls'}, 'content': [{'type': 'text', 'text': 'a.txt'}]}, 'time': {'created': 1761000000001}},
+    {'type': 'tool', 'id': 'call_2', 'name': 'read', 'state': {'status': 'error', 'input': {'filePath': '/x'}, 'error': {'type': 'tool.execution', 'message': 'File not found: /x'}}, 'time': {'created': 1761000000002}}]}
+c.execute("INSERT INTO session_message VALUES ('m1', 's1', 'assistant', 0, 1761000000000, ?)", (json.dumps(data),))
+c.commit()
+c.close()
+from headroom.learn.plugins.opencode import OpenCodePlugin
+p = OpenCodePlugin(db_path=db)
+try:
+    projects = p.discover_projects()
+except sqlite3.OperationalError as e:
+    print(e)
+    raise SystemExit
+calls = [(tc.name, tc.tool_call_id, tc.input_data, tc.output, tc.is_error) for s in p.scan_project(projects[0]) for tc in s.tool_calls]
+views = sqlite3.connect(db).execute("SELECT count(*) FROM sqlite_master WHERE type = 'view'").fetchone()[0]
+print(len(projects), calls, views)"#;
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_OPENCODE_V2", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on,
+            "1 [('Bash', 'call_1', {'command': 'ls'}, 'a.txt', False), \
+             ('read', 'call_2', {'filePath': '/x'}, 'File not found: /x', True)] 0",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(off, "no such table: session", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -23560,6 +23915,24 @@ Always run the linter first.
     }
 
     #[test]
+    fn serena_on_an_intel_mac_pins_the_release_whose_cryptography_installs_there() {
+        // RUST-F6: serena-agent 1.7.0 pins cryptography==50.0.0, which has no
+        // x86_64 macOS wheel, so every Intel Mac install tried a Rust build
+        // and failed. 1.6.1 pins 48.0.1, the last universal2 build.
+        assert_eq!(super::serena_pinned_version(true), "1.6.1");
+        // The runtime lock holds Intel Macs on 48.0.1 for the same reason. If
+        // that pin moves, cryptography may ship an Intel wheel again: check
+        // whether the Serena pin's cryptography does, and drop the Intel
+        // branch if so.
+        assert!(
+            HEADROOM_REQUIREMENTS_LOCK.contains(
+                "cryptography==48.0.1; platform_machine == \"x86_64\" and sys_platform == \"darwin\""
+            ),
+            "the lock's Intel Mac cryptography pin moved; re-check serena_pinned_version"
+        );
+    }
+
+    #[test]
     fn serena_without_bundled_uvx_offers_an_update_that_reinstalls_it() {
         let (_root, runtime, manager) = seed_test_runtime("serena-uvx");
         let entrypoint = manager.serena_entrypoint();
@@ -27454,6 +27827,28 @@ exit 0
                  stderr:\n\u{d7} Failed to install plugin \"ponytail@ponytail\": Failed to update \
                  settings: Invalid JSON syntax in settings file at ~\\.claude\\settings.json",
                 "settings-unparseable",
+            ),
+            (
+                // RUST-P0 on 0.9.51, real (Windows).
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JuliusBrussee/caveman\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Fetching the marketplace from GitHub failed on both attempts. \
+                 HTTPS (https://github.com/JuliusBrussee/caveman.git): Failed to clone \
+                 marketplace repository: Git clone timed out after 120s. The repository may be \
+                 too large for the current timeout.\n: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin install caveman@caveman\nstdout:\n\
+                 Installing plugin \"caveman@caveman\"...\n\nstderr:\n\u{d7} Failed to install \
+                 plugin \"caveman@caveman\": Plugin \"caveman\" not found in marketplace \
+                 \"caveman\".",
+                "github-unreachable",
+            ),
+            (
+                "Codex: command failed (exit 1): codex plugin marketplace add \
+                 JuliusBrussee/caveman\nstderr:\nError: failed to run git clone: fatal: unable \
+                 to access 'https://github.com/JuliusBrussee/caveman.git/': Could not resolve \
+                 host: github.com",
+                "github-unreachable",
             ),
             ("Codex: something we have not seen", "other"),
         ];

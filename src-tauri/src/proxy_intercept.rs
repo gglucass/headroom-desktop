@@ -2384,6 +2384,15 @@ async fn handle(
         }
     }
 
+    // Ollama's placeholder key reached OpenAI once Headroom owned Codex's
+    // `openai_base_url`, so every turn of an `ollama launch chatgpt` setup
+    // 401'd (RUST-T6). Relay it to Ollama uncompressed: the backend refuses
+    // loopback upstreams.
+    if extract_bearer(&buf).as_deref() == Some(OLLAMA_CODEX_KEY) {
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        return;
+    }
+
     // When the pricing gate has bypassed Headroom, the Python proxy on
     // `backend_addr` is intentionally stopped. Forward direct to the provider
     // so already-running sessions stay alive while optimization is off. The
@@ -3300,7 +3309,8 @@ fn backend_error_code(body: &[u8]) -> Option<&'static str> {
 /// The `type`/`code` of every 5xx error object the backend writes on the
 /// Responses and passthrough paths (wheel `handlers/openai.py`; since 0.40.0's
 /// #3851 the codes come from `public_errors`, whose `internal_error` replaced
-/// `backend_error`).
+/// `backend_error`), plus the `shutdown` 503 a retry backoff gets when the
+/// backend stops (`_shutdown_retry_response`), which read as `503:provider`.
 const HEADROOM_ERROR_IDS: &[&str] = &[
     "proxy_error",
     "backend_error",
@@ -3310,6 +3320,7 @@ const HEADROOM_ERROR_IDS: &[&str] = &[
     "upstream_timeout",
     "upstream_tls_error",
     "internal_error",
+    "shutdown",
 ];
 
 /// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
@@ -3636,20 +3647,7 @@ fn report_upstream_error(
         );
         return;
     }
-    // Group by client and status so each upstream failure class is its own
-    // Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
-    // message and collapses 401 noise, 403 challenges and real 502/503
-    // connection errors into one un-triageable bucket that regresses the moment
-    // any sibling status reappears (RUST-46). Codex keeps its historical
-    // fingerprint so existing issues and their triage state carry over.
-    let status_str = status.to_string();
-    let fingerprint: Vec<&str> = if tls_interception {
-        vec!["upstream-tls-interception", client]
-    } else if client == "codex" {
-        vec!["codex-upstream-error", status_str.as_str()]
-    } else {
-        vec!["upstream-error", client, status_str.as_str()]
-    };
+    let fingerprint = upstream_error_fingerprint(client, status, tls_interception, &body);
     // Tags, not extras: an extra can only be read one event at a time, so the
     // shape RUST-4V's 578 events shared was never visible from the issue view.
     // All values are bounded and content-free, so they stay aggregatable.
@@ -3690,6 +3688,7 @@ fn report_upstream_error(
                 scope.set_tag("upstream_response_content_type", content_type);
             }
             scope.set_extra("error_body", snippet.clone().into());
+            let fingerprint: Vec<&str> = fingerprint.iter().map(String::as_str).collect();
             scope.set_fingerprint(Some(&fingerprint));
         },
         || {
@@ -3699,6 +3698,34 @@ fn report_upstream_error(
             );
         },
     );
+}
+
+/// Group by client and status so each upstream failure class is its own
+/// Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
+/// message and collapses 401 noise, 403 challenges and real 502/503
+/// connection errors into one un-triageable bucket that regresses the moment
+/// any sibling status reappears (RUST-46). Codex keeps its historical
+/// fingerprint so existing issues and their triage state carry over.
+fn upstream_error_fingerprint(
+    client: &str,
+    status: u16,
+    tls_interception: bool,
+    body: &[u8],
+) -> Vec<String> {
+    if tls_interception {
+        return vec!["upstream-tls-interception".into(), client.into()];
+    }
+    if client == "codex" {
+        return vec!["codex-upstream-error".into(), status.to_string()];
+    }
+    let mut fingerprint = vec!["upstream-error".into(), client.into(), status.to_string()];
+    // A 403's body class says whose refusal it is (Zen's FreeTierError, a
+    // gateway's provider_permission_denied, GitHub's org policy); one bucket
+    // for all of them made RUST-G5 a grab-bag any new provider re-escalated.
+    if status == 403 {
+        fingerprint.extend(codex_error_class(body));
+    }
+    fingerprint
 }
 
 /// True when an upstream error body carries OpenAI's unsupported-region code.
@@ -4564,6 +4591,13 @@ async fn forward_direct_to_anthropic(
         && request_uses_chatgpt_auth(&header_buf);
     let url = if let Some((origin, original_path)) = &plugin_route {
         plugin_direct_url(origin, original_path.as_deref(), &parsed.path)
+    } else if extract_bearer(&header_buf).as_deref() == Some(OLLAMA_CODEX_KEY) {
+        let preserved = crate::client_adapters::preserved_codex_base_url();
+        Some(format!(
+            "{}{}",
+            ollama_codex_direct_base(preserved.as_deref()),
+            parsed.path
+        ))
     } else if chatgpt_codex {
         Some(format!(
             "{}{}",
@@ -5191,6 +5225,22 @@ fn grok_upstream_header(bearer: Option<&str>) -> &'static [u8] {
     }
 }
 
+/// The placeholder key `ollama launch chatgpt` writes for a Codex with no login
+/// of its own. Only Ollama's Codex proxy accepts it; OpenAI answers 401.
+const OLLAMA_CODEX_KEY: &str = "ollama-local-codex";
+
+/// Where a request carrying [`OLLAMA_CODEX_KEY`] goes: the Ollama Codex proxy
+/// the launcher set as `openai_base_url` before Headroom took it over, else
+/// Ollama's default address. Without `/v1`, which the request path carries.
+fn ollama_codex_direct_base(preserved: Option<&str>) -> String {
+    preserved
+        .map(|url| url.trim_end_matches('/'))
+        .and_then(|url| url.strip_suffix("/v1"))
+        .filter(|base| base.ends_with("/api/codex"))
+        .unwrap_or("http://127.0.0.1:11434/api/codex")
+        .to_string()
+}
+
 /// Append `header_line` as the last request header unless a header named
 /// `guard_name` is already present. No-op if the terminator is missing.
 fn stamp_request_header(buf: &mut Vec<u8>, guard_name: &str, header_line: &'static [u8]) {
@@ -5547,7 +5597,7 @@ mod tests {
         is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
         is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
         is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        is_reportable_upstream_error, is_vscode_claude_ua, ollama_codex_direct_base, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
         request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
@@ -7394,6 +7444,22 @@ mod tests {
     }
 
     #[test]
+    fn ollama_codex_key_goes_to_the_launchers_proxy() {
+        // The launcher's URL on a custom OLLAMA_HOST is kept.
+        assert_eq!(
+            ollama_codex_direct_base(Some("http://10.0.0.5:11434/api/codex/v1/")),
+            "http://10.0.0.5:11434/api/codex"
+        );
+        // Nothing preserved, or a gateway that is not Ollama's: the default.
+        for preserved in [None, Some("https://gateway.example/v1")] {
+            assert_eq!(
+                ollama_codex_direct_base(preserved),
+                "http://127.0.0.1:11434/api/codex"
+            );
+        }
+    }
+
+    #[test]
     fn stamp_request_header_grok_base_url_and_client() {
         let mut buf =
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n{}"
@@ -8269,6 +8335,8 @@ mod tests {
         assert_eq!(super::failure_kind(502, cut), "502:upstream_protocol_error");
         let frame = b"9a\r\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"connection_error\",\"message\":\"Upstream API did not respond in time.\",\"code\":\"upstream_timeout\"}}\n\n\r\n";
         assert_eq!(super::failure_kind(502, frame), "502:upstream_timeout");
+        let stopping = br#"{"error":{"type":"shutdown","message":"Proxy is shutting down; retry backoff cancelled."}}"#;
+        assert_eq!(super::failure_kind(503, stopping), "503:shutdown");
         let anthropic = br#"{"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_1"}"#;
         assert_eq!(super::failure_kind(502, anthropic), "502:provider");
         assert_eq!(
@@ -9817,6 +9885,42 @@ mod tests {
         assert_eq!(
             codex_error_summary(br#"{"error":{"code":"invalid_prompt"}}"#),
             "type=- code=invalid_prompt param=-"
+        );
+    }
+
+    #[test]
+    fn upstream_403_fingerprint_splits_by_error_class() {
+        use super::upstream_error_fingerprint as fp;
+        // RUST-G5's two latest opencode 403s: Zen's free-tier gate and a gateway.
+        let zen = br#"{"type":"error","error":{"type":"FreeTierError","message":"m"}}"#;
+        let gateway =
+            br#"{"error":{"type":"invalid_request_error","code":"provider_permission_denied"}}"#;
+        assert_eq!(
+            fp("opencode", 403, false, zen),
+            ["upstream-error", "opencode", "403", "FreeTierError", "-"]
+        );
+        assert_eq!(
+            fp("opencode", 403, false, gateway),
+            [
+                "upstream-error",
+                "opencode",
+                "403",
+                "invalid_request_error",
+                "provider_permission_denied"
+            ]
+        );
+        // Every other status, and codex, keep the grouping their issues carry.
+        assert_eq!(
+            fp("opencode", 400, false, gateway),
+            ["upstream-error", "opencode", "400"]
+        );
+        assert_eq!(
+            fp("codex", 403, false, zen),
+            ["codex-upstream-error", "403"]
+        );
+        assert_eq!(
+            fp("opencode", 502, true, zen),
+            ["upstream-tls-interception", "opencode"]
         );
     }
 

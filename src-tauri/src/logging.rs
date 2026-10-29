@@ -204,6 +204,13 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("rustls_platform_verifier") {
         return true;
     }
+    // tao's Linux theme listener (platform_impl::linux::portal) logs this once
+    // when the session bus drops (logout, a dbus restart) and stops following
+    // light/dark changes until the next launch. No release of ours changes
+    // that (RUST-MM: 6 Linux hosts, 0.9.31-0.9.51).
+    if target.starts_with("tao::") && msg.starts_with("D-Bus message processing error") {
+        return true;
+    }
     // proxy_intercept bypass forwarders (plain + websocket-upgrade variant):
     // when CC is bypassing the local Python proxy and we re-issue directly to
     // the upstream API, transient network failures aren't actionable — client
@@ -1521,6 +1528,19 @@ mod tests {
         assert!(skip_sentry(
             "rustls_platform_verifier::verification::apple",
             "failed to verify TLS certificate: invalid peer certificate: Other(OtherError(\"\u{201c}lightspeedsystems.com\u{201d} certificate is not trusted: -67843\"))"
+        ));
+    }
+
+    #[test]
+    fn skips_taos_dropped_session_bus() {
+        // RUST-MM verbatim.
+        assert!(skip_sentry(
+            "tao::platform_impl::platform::portal",
+            "D-Bus message processing error: Failed to read/write data, disconnected from D-Bus?"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::keychain",
+            "D-Bus message processing error: Failed to read/write data, disconnected from D-Bus?"
         ));
     }
 

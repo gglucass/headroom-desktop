@@ -667,9 +667,11 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         && routed("claude_code")
             .is_some_and(|at| client_adapters::claude_ran_only_in_desktop_app_since(at.into()));
     let (title, body) = if claude_desktop && !codex {
+        // The title says what the diagnosis opens with; a notification
+        // cut off at two lines must still show the way out.
         (
-            "Claude Code in the Claude app isn't optimized",
-            client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS,
+            "Headroom does not work with the Claude Desktop app",
+            "Instead, please use Claude Code in VS Code.",
         )
     } else {
         unrouted_usage_copy(claude && !claude_desktop, codex)
@@ -3501,6 +3503,23 @@ pub(crate) fn give_up_startup_key(
     })
 }
 
+/// True when the backend's formatted exit status (Windows' `exit code: N`,
+/// hex for NTSTATUS errors) says the session's teardown terminated it.
+/// STATUS_DLL_INIT_FAILED alone is left out: a child that never started can
+/// also be an App Control block, which reports under its own startup key.
+fn child_exit_is_session_teardown(status: &str) -> bool {
+    let Some(code) = status.strip_prefix("exit code: ") else {
+        return false;
+    };
+    let code = match code.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => code.parse::<u32>().ok(),
+    };
+    code.map(|c| c as i32).is_some_and(|c| {
+        c != crate::state::STATUS_DLL_INIT_FAILED && crate::state::is_session_teardown_exit(c)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -3762,6 +3781,16 @@ fn capture_watchdog_give_up(
         log_silent_secs,
         backend_readyz_outcome,
     );
+    // Windows ending the session reaped the backend, and every restart then
+    // failed to start in the dying session (RUST-T5: 0xC0000142 on each).
+    if child_exit_is_session_teardown(&report.tracked_child_exit_status) {
+        log::info!(
+            "{} after the backend exited with {}, Windows ending the session; not reported",
+            report.message,
+            report.tracked_child_exit_status
+        );
+        return;
+    }
 
     // Default to Warning: give-up is the documented recovery path, not a
     // bug. Escalate to Error only when there's a real signal something is
@@ -4773,6 +4802,68 @@ fn install_claude_code_cli_blocking() -> Result<(), String> {
     } else {
         detail
     })
+}
+
+/// Opens a new Claude Code session where the user runs it: a chat with
+/// `prompt` typed in, in the editor that has Anthropic's extension, else a
+/// terminal window. A session started now reads the routing setup already
+/// wrote, so it goes through Headroom; and someone who just ran the installer
+/// above has never opened a terminal for it. 123 of 168 no-agent installs
+/// connected Claude Code within minutes and 19 sent a prompt (2026-09-14..10-25).
+/// `vscode` is the Claude desktop app user's way out: VS Code, extension
+/// installed on the way, and never the terminal. Says where it opened:
+/// "editor", "terminal" or "none".
+#[tauri::command]
+async fn open_claude_code(prompt: Option<String>, vscode: bool) -> Result<&'static str, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let claude = claude_cli::detect_claude_cli().filter(|_| !vscode);
+        // Without a CLI the extension is the only Claude Code there can be.
+        if vscode_statusbar::open_claude_code_chat(prompt.as_deref(), vscode || claude.is_none())
+            .map_err(|err| format!("{err:#}"))?
+        {
+            return Ok("editor");
+        }
+        let Some(claude) = claude else {
+            return Ok("none");
+        };
+        claude_terminal_command(&claude)
+            .spawn()
+            .map_err(|err| format!("could not open a terminal: {err}"))?;
+        Ok("terminal")
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// macOS Terminal runs an executable it is asked to open in a new window,
+/// under the user's own login shell rather than our environment.
+#[cfg(target_os = "macos")]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    let mut command = crate::proc::command("/usr/bin/open");
+    command.args(["-a", "Terminal"]).arg(claude);
+    command
+}
+
+/// `start` gives the console app a window of its own; cmd itself stays hidden.
+#[cfg(windows)]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = crate::proc::command("cmd");
+    command.raw_arg(format!(
+        "/c start \"Claude Code\" /D \"{}\" \"{}\"",
+        client_adapters::home_dir().display(),
+        claude.display()
+    ));
+    command
+}
+
+// shortcut: Debian-style alternatives only; other desktops get the error and
+// the manual `claude` line on screen. Upgrade if Linux installs report it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    let mut command = crate::proc::command("x-terminal-emulator");
+    command.arg("-e").arg(claude);
+    command
 }
 
 /// The last `n` non-empty lines joined with spaces — installer output ends
@@ -6254,6 +6345,23 @@ pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// Whether a failed client setup goes to Sentry. Each skipped cause is shown
+/// to the user and no code change fixes it: permission-denied (os error 13)
+/// and disk-full (ENOSPC, os error 28) are unwritable-file environment
+/// issues, an unparseable settings file is the user's to fix, and the
+/// port-holder refusal is the designed guard while another program holds
+/// 6767, whose holder the intercept already reports once per session.
+/// Reported at Error, that refusal filed 60 events in 3 minutes from one
+/// Windows host on 0.9.51 (RUST-5A).
+fn client_setup_failure_is_reportable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    !msg.starts_with("Automatic setup is not supported yet")
+        && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
+        && !msg.contains(client_adapters::PORT_HOLDER_REFUSAL)
+        && !client_adapters::is_permission_denied(err)
+        && !client_adapters::is_no_space(err)
+}
+
 fn resume_for_client_setup(state: &AppState) {
     if let Err(err) = state.resume_runtime() {
         // Local log keeps the full chain; the capture below is the Sentry
@@ -6380,14 +6488,7 @@ async fn apply_client_setup(
         }
         Err(err) => {
             let msg = err.to_string();
-            // Permission-denied (os error 13) and disk-full (ENOSPC, os error
-            // 28) writes are unwritable-file environment issues, not app bugs --
-            // surface to the user but keep them out of Sentry.
-            if !msg.starts_with("Automatic setup is not supported yet")
-                && !msg.contains(client_adapters::UNPARSEABLE_SETTINGS)
-                && !client_adapters::is_permission_denied(&err)
-                && !client_adapters::is_no_space(&err)
-            {
+            if client_setup_failure_is_reportable(&err) {
                 // Split the grab-bag: a message-based fingerprint collapsed every
                 // client x every failure cause into one issue, so resolving one
                 // shape (e.g. the codex rename race) regressed the moment a
@@ -6464,6 +6565,9 @@ struct UnroutedClient {
     /// the guard has not run recently or found nothing - then the generic
     /// restart advice is still the best we have.
     diagnosis: Option<String>,
+    /// Every session ran in the Claude desktop app, which no restart can
+    /// route, so the Home banner leaves it to the badge.
+    desktop_only: bool,
 }
 
 /// Agents that ran on this machine while Headroom, up the whole time, saw
@@ -6642,6 +6746,7 @@ async fn detect_unrouted_clients(
                 reapplied,
                 active_at: active_at.to_rfc3339(),
                 diagnosis,
+                desktop_only,
             });
         }
         found
@@ -7441,11 +7546,20 @@ fn handle_crash_guard_flag() {
     let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
     let started = std::time::Instant::now();
     let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
-    let unwired = client_adapters::unwire_clients_after_crash(|| {
+    let intercept_answers = || {
         let intercept =
             std::net::SocketAddr::from(([127, 0, 0, 1], proxy_intercept::INTERCEPT_PORT));
         std::net::TcpStream::connect_timeout(&intercept, std::time::Duration::from_secs(1)).is_ok()
-    });
+    };
+    let unwired = client_adapters::unwire_clients_after_crash(intercept_answers);
+    // After a quit stop_headroom already swept, so this finds nothing; the
+    // orphan rule spares a relaunched instance's backend.
+    #[cfg(unix)]
+    if !intercept_answers() {
+        state::reap_orphaned_backend(&tool_manager::ManagedRuntime::bootstrap_root(
+            &storage::app_data_dir(),
+        ));
+    }
     if !unwired.is_empty() {
         // RUST-KV carried nothing else, so a crash, a kill mid-quit (the
         // relauncher's force-kill, a logout deadline) and a force quit all
@@ -8640,6 +8754,7 @@ pub fn run() {
             claude_desktop_installed,
             get_gated_bypass_bytes,
             install_claude_code_cli,
+            open_claude_code,
             get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
@@ -9419,6 +9534,12 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         // RUST-RT: `codex exec` with a revoked refresh token: `ERROR: Your
         // access token could not be refreshed. Please log out and sign in again.`
         "access token could not be refreshed",
+        // RUST-T2: `codex exec` with neither a login nor OPENAI_API_KEY:
+        // `Missing OpenAI API key.`
+        "missing openai api key",
+        // RUST-T6: OpenAI's verdict on a wrong key: `ERROR: unexpected status
+        // 401 Unauthorized: Incorrect API key provided: ...`.
+        "incorrect api key provided",
     ];
     NEEDLES.iter().any(|needle| lower.contains(needle))
 }
@@ -9778,6 +9899,12 @@ fn learn_failure_signature_source(text: &str) -> String {
         .iter()
         .position(|line| learn_marker_expects_reason_line(line))
     else {
+        // An uncaught exception opens with the same header every time, which
+        // put every distinct crash on one issue (RUST-HJ). Python prints the
+        // exception itself last.
+        if lines.contains(&"Traceback (most recent call last):") {
+            return learn_quoted_paths_elided(lines[lines.len() - 1]);
+        }
         return first.to_string();
     };
     match lines.get(marker + 1) {
@@ -9814,6 +9941,23 @@ fn learn_failure_signature_source(text: &str) -> String {
         Some(reason) => format!("{} {reason}", lines[marker]),
         None => lines[marker].to_string(),
     }
+}
+
+/// `line` with every single-quoted path cut to `...`. An OSError names its file
+/// as `'<path>'`, and a home directory in a fingerprint splits one cause per
+/// user and puts their username in the title.
+fn learn_quoted_paths_elided(line: &str) -> String {
+    line.split('\'')
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 && (part.contains('/') || part.contains('\\')) {
+                "..."
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("'")
 }
 
 /// A stderr line with any Python log-record prefix removed: the message of a
@@ -10504,10 +10648,14 @@ fn execute_headroom_learn_run(
             }
         }
         Err(err) => {
-            sentry::capture_message(
-                &format!("headroom learn spawn failed: {err}"),
-                sentry::Level::Error,
-            );
+            // App Control refusing the venv's exe is machine policy, already
+            // counted once per session by the start path (RUST-G0); RUST-T1.
+            if !is_windows_app_control_block(&err.to_string()) {
+                sentry::capture_message(
+                    &format!("headroom learn spawn failed: {err}"),
+                    sentry::Level::Error,
+                );
+            }
             (
                 format!("headroom learn failed for {project_name}."),
                 false,
@@ -10818,7 +10966,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                         pause_headroom(app).await
                     };
                     if let Err(err) = result {
-                        log::warn!("tray pause toggle failed: {err}");
+                        // A quit during the resume cuts its start short (RUST-T4).
+                        log_headroom_start_failure("tray pause toggle failed", &err);
                     }
                 });
             }
@@ -11316,6 +11465,19 @@ fn auto_resume_backoff(failed_attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Wait before the watchdog re-downloads a lost base interpreter again: 1m,
+/// 5m, 15m, then hourly. Each try may fetch the ~30 MB base, and antivirus
+/// that quarantines it again would otherwise loop that download.
+fn lost_base_retry_backoff(retries: u32) -> std::time::Duration {
+    let mins = match retries {
+        0 => 1,
+        1 => 5,
+        2 => 15,
+        _ => 60,
+    };
+    std::time::Duration::from_secs(mins * 60)
+}
+
 /// Give-ups in a row whose start died before opening its port before the
 /// watchdog rebuilds the runtime: the first plus the 30s, 1m and 2m retries,
 /// so about four minutes of the same death.
@@ -11401,6 +11563,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // counts failed attempts to grow the backoff (see `auto_resume_backoff`).
         let mut auto_pause_next_retry: Option<std::time::Instant> = None;
         let mut auto_pause_failed: u32 = 0;
+        // Re-download retries for a base interpreter lost after launch.
+        let mut lost_base_next_retry: Option<std::time::Instant> = None;
+        let mut lost_base_retries: u32 = 0;
         // Consecutive give-ups whose last start died before opening its port.
         let mut rebuild_strikes: u32 = 0;
         // Set after a forced kill+restart of a hung process. Prevents the
@@ -11528,6 +11693,27 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 bypass_active,
             );
             if !should_be_up {
+                // The failed start (or the launch) that found the base gone
+                // started one re-download; if that one failed (offline, a
+                // login launch before the network is up) nothing retried
+                // until the next launch. A base deleted under a running
+                // backend has had no first try at all.
+                if !runtime.installed
+                    && !state.bootstrap_progress().running
+                    && state.tool_manager.base_interpreter_lost()
+                {
+                    let now = std::time::Instant::now();
+                    match lost_base_next_retry {
+                        None => lost_base_next_retry = Some(now + lost_base_retry_backoff(0)),
+                        Some(at) if now >= at => {
+                            state.redownload_lost_base_interpreter(&app);
+                            lost_base_retries += 1;
+                            lost_base_next_retry =
+                                Some(now + lost_base_retry_backoff(lost_base_retries));
+                        }
+                        Some(_) => {}
+                    }
+                }
                 if consecutive_failures > 0 {
                     log::debug!(
                         "watchdog: skip restart (installed={}, paused={}, starting={}, upgrading={}, bypass={}); resetting failure counter",
@@ -11553,6 +11739,8 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 auto_pause_failed = 0;
                 rebuild_strikes = 0;
                 auto_pause_next_retry = None;
+                lost_base_next_retry = None;
+                lost_base_retries = 0;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
                 WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
@@ -12862,6 +13050,7 @@ fn compute_tray_window_position(
 mod tests {
     #[cfg(unix)]
     use super::bundle_folder_accepts_writes;
+    use super::client_setup_failure_is_reportable;
     #[cfg(target_os = "macos")]
     use super::ensure_launch_agent_interactive;
     use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
@@ -12888,7 +13077,7 @@ mod tests {
         learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
         learn_failure_is_agent_unparseable_output, learn_failure_signature,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        missing_dependency_modules, noop_app_update_progress_emitter,
+        lost_base_retry_backoff, missing_dependency_modules, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
         parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
         persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
@@ -16239,6 +16428,16 @@ Some unrelated content.
         assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
     }
 
+    #[test]
+    fn lost_base_retry_backoff_escalates_to_hourly() {
+        use std::time::Duration;
+        assert_eq!(lost_base_retry_backoff(0), Duration::from_secs(60));
+        assert_eq!(lost_base_retry_backoff(1), Duration::from_secs(300));
+        assert_eq!(lost_base_retry_backoff(2), Duration::from_secs(900));
+        assert_eq!(lost_base_retry_backoff(3), Duration::from_secs(3600));
+        assert_eq!(lost_base_retry_backoff(40), Duration::from_secs(3600));
+    }
+
     /// Every reqwest client must decide, explicitly, whether it honors the
     /// user's system proxy. reqwest 0.12 delegates proxy discovery to
     /// hyper-util, which has no loopback exemption anywhere:
@@ -16457,6 +16656,27 @@ Some unrelated content.
             "wait-check-failed"
         );
         assert_eq!(cat("something upstream changed"), "other");
+    }
+
+    #[test]
+    fn a_backend_the_session_teardown_ended_is_not_a_give_up() {
+        // RUST-T5 verbatim: DBG_TERMINATE_PROCESS, as std formats it.
+        assert!(crate::child_exit_is_session_teardown(
+            "exit code: 1073807364"
+        ));
+        assert!(crate::child_exit_is_session_teardown(
+            "exit code: 0xc000013a"
+        ));
+        // A child that could not start may be App Control, not a logoff.
+        assert!(!crate::child_exit_is_session_teardown(
+            "exit code: 0xc0000142"
+        ));
+        assert!(!crate::child_exit_is_session_teardown("exit code: 0"));
+        assert!(!crate::child_exit_is_session_teardown("exit code: 1"));
+        assert!(!crate::child_exit_is_session_teardown("exit status: 1"));
+        assert!(!crate::child_exit_is_session_teardown(
+            "still_alive_or_untracked"
+        ));
     }
 
     #[test]
@@ -16680,6 +16900,24 @@ Some unrelated content.
     }
 
     #[test]
+    fn a_client_setup_refused_for_a_port_holder_is_not_reported() {
+        // RUST-5A: the designed refusal while another program holds 6767 went
+        // to Sentry at Error on every Connect click.
+        let refused = anyhow::anyhow!(crate::client_adapters::PORT_HOLDER_REFUSAL);
+        assert!(!client_setup_failure_is_reportable(&refused));
+        // The platform's own disk-full code: ENOSPC (28) on unix,
+        // ERROR_DISK_FULL (112) on Windows, where 28 is ERROR_OUT_OF_PAPER.
+        let disk_full_code = if cfg!(windows) { 112 } else { 28 };
+        let disk_full = anyhow::Error::new(std::io::Error::from_raw_os_error(disk_full_code))
+            .context("creating backup");
+        assert!(!client_setup_failure_is_reportable(&disk_full));
+        // A real code failure still is.
+        let exists = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            .context("renaming codex config");
+        assert!(client_setup_failure_is_reportable(&exists));
+    }
+
+    #[test]
     fn readyz_fingerprint_key_buckets_shapes_and_drops_cardinality() {
         assert_eq!(readyz_outcome_fingerprint_key("ok"), "readyz_ok");
         assert_eq!(readyz_outcome_fingerprint_key("timeout"), "readyz_timeout");
@@ -16866,6 +17104,14 @@ Some unrelated content.
         // RUST-RT verbatim: Codex's verdict on a revoked refresh token.
         assert!(learn_failure_is_agent_auth(
             "ERROR: Your access token could not be refreshed. Please log out and sign in again."
+        ));
+        // RUST-T2 verbatim: Codex with no login and no API key.
+        assert!(learn_failure_is_agent_auth(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nMissing OpenAI API key.\n\nSet the environment variable OPENAI_API_KEY and re-run this command."
+        ));
+        // RUST-T6 verbatim: Codex's verdict on a key OpenAI never issued.
+        assert!(learn_failure_is_agent_auth(
+            "ERROR: unexpected status 401 Unauthorized: Incorrect API key provided: ollama-l******odex. You can find your API key at https://platform.openai.com/account/api-keys."
         ));
     }
 
@@ -17285,6 +17531,25 @@ Some unrelated content.
             "LLM analysis failed: `codex exec` failed (exit 1):\nReading prompt from stdin...\nOpenAI Codex\n"
         )
         .ends_with("Reading prompt from stdin..."));
+    }
+
+    #[test]
+    fn learn_failure_signature_source_names_a_tracebacks_exception() {
+        // RUST-HJ: every uncaught exception was titled by the header.
+        let opencode = "Traceback (most recent call last):\n  File \"~/x/headroom/learn/plugins/opencode.py\", line 115, in discover_projects\n    cursor.execute(\nsqlite3.OperationalError: no such table: session\n";
+        assert_eq!(
+            learn_failure_signature_source(opencode),
+            "sqlite3.OperationalError: no such table: session"
+        );
+        let denied = "Traceback (most recent call last):\n  File \"learn.py\", line 9, in learn\nPermissionError: [Errno 13] Permission denied: '/Users/ann/.claude/projects/-/memory'\n";
+        assert_eq!(
+            learn_failure_signature_source(denied),
+            "PermissionError: [Errno 13] Permission denied: '...'"
+        );
+        assert_eq!(
+            super::learn_quoted_paths_elided("ModuleNotFoundError: No module named 'headroom'"),
+            "ModuleNotFoundError: No module named 'headroom'"
+        );
     }
 
     #[test]
@@ -18436,6 +18701,18 @@ Some unrelated content.
             "progress 42% error: no network"
         );
         assert_eq!(super::last_nonempty_lines("\n \n", 3), "");
+    }
+
+    /// Terminal.app is asked to open the binary itself, so the session runs
+    /// under the user's login shell in a window of its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_terminal_command_opens_the_binary_in_terminal() {
+        let claude = std::path::Path::new("/Users/me/.local/bin/claude");
+        let command = super::claude_terminal_command(claude);
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-a", "Terminal", "/Users/me/.local/bin/claude"]);
     }
 
     /// The unrouted-usage nudge keys on session mtimes newer than app start;

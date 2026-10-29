@@ -14,6 +14,7 @@ import {
   shouldShowStallBannerLine,
   unroutedAfterReconnect,
   unroutedBody,
+  unroutedCallout,
   SETUP_STALL_NO_SAVINGS_AFTER_MS,
   SETUP_STALL_NO_SAVINGS_MIN_REQUESTS,
   SETUP_STALL_NO_TRAFFIC_AFTER_MS,
@@ -622,6 +623,50 @@ describe("unroutedBody", () => {
   });
 });
 
+describe("unroutedCallout", () => {
+  const client = (clientId: string, name: string, extra: Record<string, unknown> = {}) => ({
+    clientId,
+    name,
+    activeAt: "2026-10-29T08:00:00Z",
+    enabled: true,
+    reapplied: true,
+    ...extra,
+  });
+
+  it("names the agent and the restart that routes it", () => {
+    expect(unroutedCallout([client("claude_code", "Claude Code")])).toEqual({
+      title: "Claude Code ran without Headroom.",
+      detail:
+        "Quit and reopen Claude Code (or reload your editor) so it goes through Headroom.",
+    });
+  });
+
+  it("leads with the guard's cause when it found one, since a restart would not fix it", () => {
+    const diagnosis = "/repo/.claude/settings.json sets ANTHROPIC_BASE_URL to http://other, which overrides Headroom's route.";
+    expect(unroutedCallout([client("claude_code", "Claude Code", { diagnosis })])?.detail).toBe(diagnosis);
+  });
+
+  it("offers Claude Code in VS Code for Claude desktop app sessions, which no restart routes", () => {
+    expect(unroutedCallout([client("claude_code", "Claude Code", { desktopOnly: true })])).toEqual({
+      title: "Headroom does not work with the Claude Desktop app.",
+      detail:
+        "Due to design decisions by Anthropic, we are unable to apply our token saving logic. Instead, please use Claude Code in VS Code.",
+      offerVscode: true,
+    });
+  });
+
+  it("leaves switched-off agents to their badges and puts a restartable agent first", () => {
+    expect(unroutedCallout([])).toBeNull();
+    expect(unroutedCallout([client("codex", "ChatGPT Codex", { enabled: false })])).toBeNull();
+    expect(
+      unroutedCallout([
+        client("claude_code", "Claude Code", { desktopOnly: true }),
+        client("codex", "ChatGPT Codex"),
+      ])?.title
+    ).toBe("ChatGPT Codex ran without Headroom.");
+  });
+});
+
 describe("unroutedAfterReconnect", () => {
   const client = (clientId: string, enabled: boolean) => ({
     clientId,
@@ -685,6 +730,15 @@ describe("unrouted badges", () => {
     ).toEqual(["codex"]);
     // Unchanged: the same array, so the state setter does not re-render.
     expect(pruneUnroutedBadges(current, [connector("codex", 0)])).toBe(current);
+  });
+
+  it("drops a finding once the user switches that agent's connector off", () => {
+    const current = [finding("claude_code"), finding("codex")];
+    const off = { ...connector("claude_code", 0), enabled: false };
+    const kept = pruneUnroutedBadges(current, [off, connector("codex", 0)]);
+    expect(kept.map((client) => client.clientId)).toEqual(["codex"]);
+    // The Home banner then names only the agent a restart can still route.
+    expect(unroutedCallout(kept)?.title).toBe("Codex ran without Headroom.");
   });
 
   it("shows the request count behind Active and the diagnosis behind an unrouted badge", () => {

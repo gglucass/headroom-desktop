@@ -411,6 +411,34 @@ export function unroutedBody(client: UnroutedClient): string {
     : `${client.name}'s connector is off, so nothing was optimized. Reconnect it to resume saving.`;
 }
 
+/// Headline and fix for the Home banner while an agent the user can restart
+/// keeps bypassing Headroom. The badge's tooltip alone left never-routed
+/// installs reading "send a message to verify" for days (~13% of signups,
+/// 2026-10-29). No restart routes a Claude desktop app session, so that one
+/// gets the way out instead: Claude Code in VS Code, the same account.
+export function unroutedCallout(
+  badges: UnroutedClient[]
+): { title: string; detail: string; offerVscode?: boolean } | null {
+  const enabled = badges.filter((client) => client.enabled);
+  const clients = enabled.filter((client) => !client.desktopOnly);
+  if (clients.length === 0) {
+    return enabled.length > 0
+      ? {
+          title: "Headroom does not work with the Claude Desktop app.",
+          detail:
+            "Due to design decisions by Anthropic, we are unable to apply our token saving logic. Instead, please use Claude Code in VS Code.",
+          offerVscode: true,
+        }
+      : null;
+  }
+  const names = clients.map((client) => client.name).join(" and ");
+  const detail =
+    clients.length === 1 && clients[0].diagnosis
+      ? clients[0].diagnosis
+      : `Quit and reopen ${names} (or reload your editor) so it goes through Headroom.`;
+  return { title: `${unroutedTitle(clients)}.`, detail };
+}
+
 /// The unrouted findings the Home badges keep after a scan. The modal is once
 /// a day and gone on close, so a customer who closed it saw a green badge for
 /// weeks (2026-10-22). Switched-off agents are left to their "Off" badge.
@@ -425,8 +453,11 @@ export function mergeUnroutedBadges(
   ];
 }
 
-/// Drops a finding once that agent's requests reach Headroom. Returns
-/// `current` itself when nothing changed, so a state setter skips the render.
+/// Drops a finding once that agent's requests reach Headroom, or once the
+/// user switches its connector off: the finding's `enabled` is from the scan,
+/// and the Home banner would keep asking for a restart that cannot route it.
+/// Returns `current` itself when nothing changed, so a state setter skips the
+/// render.
 export function pruneUnroutedBadges(
   current: UnroutedClient[],
   connectors: ClientConnectorStatus[]
@@ -435,7 +466,8 @@ export function pruneUnroutedBadges(
     (client) =>
       !connectors.some(
         (connector) =>
-          connector.clientId === client.clientId && (connector.requestsSinceYesterday ?? 0) > 0
+          connector.clientId === client.clientId &&
+          ((connector.requestsSinceYesterday ?? 0) > 0 || !connector.enabled)
       )
   );
   return next.length === current.length ? current : next;

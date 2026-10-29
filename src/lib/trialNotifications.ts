@@ -13,6 +13,7 @@ const GRACE_HOURS_LEFT_THRESHOLDS = [
 
 const GRACE_THRESHOLD_KEY = "headroom_grace_notif_threshold";
 const TRIAL_EXPIRY_DATE_KEY = "headroom_trial_expiry_notif_date";
+const TRIAL_OFFER_SENT_KEY = "headroom_trial_offer_notif_sent";
 
 export async function maybeFireTrialNotifications(
   status: HeadroomPricingStatus,
@@ -36,6 +37,7 @@ export async function maybeFireTrialNotifications(
           true
         )
       : null;
+    if (await maybeFireTrialOfferNotification(status, saved)) return;
     await maybeFireTrialExpiryNotification(
       account.trialEndsAt ?? null,
       account.trialUsageDaysLeft ?? null,
@@ -71,6 +73,30 @@ async function maybeFireGraceNotification(
   // twice. sendNotification never throws, so the claim always stood anyway.
   localStorage.setItem(GRACE_THRESHOLD_KEY, String(nextIndex));
   await sendNotification("Start Your Headroom Trial", body, "signup");
+}
+
+// Once per install, as soon as the trial has saved something worth naming
+// (usually day one): buyers within a day of first use fell from about half
+// (Jul 2026) to a tenth (Oct) once nothing pitched the offer before the wall.
+async function maybeFireTrialOfferNotification(
+  status: HeadroomPricingStatus,
+  savedLabel: string | null
+): Promise<boolean> {
+  const offer = status.introOffer;
+  if (!offer?.active || !savedLabel) return false;
+  // The last two days of use belong to the trial-ending notice.
+  const usageDaysLeft = status.account?.trialUsageDaysLeft;
+  if (usageDaysLeft != null && usageDaysLeft <= 2) return false;
+  if (localStorage.getItem(TRIAL_OFFER_SENT_KEY)) return false;
+
+  // Claimed before awaiting, as in the grace path above.
+  localStorage.setItem(TRIAL_OFFER_SENT_KEY, new Date().toISOString());
+  await sendNotification(
+    `Intro offer: ${offer.percentOff}% off your first ${offer.durationMonths} months`,
+    `${savedLabel} Upgrade to keep it running after your trial.`,
+    "billing"
+  );
+  return true;
 }
 
 async function maybeFireTrialExpiryNotification(
