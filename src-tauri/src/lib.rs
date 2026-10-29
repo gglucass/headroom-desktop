@@ -4812,9 +4812,19 @@ fn install_claude_code_cli_blocking() -> Result<(), String> {
 /// connected Claude Code within minutes and 19 sent a prompt (2026-09-14..10-25).
 /// `vscode` is the Claude desktop app user's way out: VS Code, extension
 /// installed on the way, and never the terminal. Says where it opened:
-/// "editor", "terminal" or "none".
+/// "editor", "terminal", "terminal_untrusted" (Claude Code first asks whether
+/// to trust the folder) or "none".
 #[tauri::command]
-async fn open_claude_code(prompt: Option<String>, vscode: bool) -> Result<&'static str, String> {
+async fn open_claude_code(
+    state: State<'_, AppState>,
+    prompt: Option<String>,
+    vscode: bool,
+) -> Result<&'static str, String> {
+    let projects = if vscode {
+        Vec::new()
+    } else {
+        state.list_claude_code_projects().unwrap_or_default()
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let claude = claude_cli::detect_claude_cli().filter(|_| !vscode);
         // Without a CLI the extension is the only Claude Code there can be.
@@ -4826,44 +4836,97 @@ async fn open_claude_code(prompt: Option<String>, vscode: bool) -> Result<&'stat
         let Some(claude) = claude else {
             return Ok("none");
         };
-        claude_terminal_command(&claude)
-            .spawn()
-            .map_err(|err| format!("could not open a terminal: {err}"))?;
-        Ok("terminal")
+        let claude_json = std::fs::read_to_string(client_adapters::home_dir().join(".claude.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let project = latest_trusted_claude_project(&projects, &claude_json);
+        let dir = project.clone().unwrap_or_else(client_adapters::home_dir);
+        claude_terminal_command(&claude, &dir)
+            .and_then(|mut command| Ok(command.spawn()?))
+            .map_err(|err| format!("could not open a terminal: {err:#}"))?;
+        Ok(if project.is_some() {
+            "terminal"
+        } else {
+            "terminal_untrusted"
+        })
     })
     .await
     .map_err(|err| err.to_string())?
 }
 
-/// macOS Terminal runs an executable it is asked to open in a new window,
-/// under the user's own login shell rather than our environment.
+/// The project Claude Code last ran in that it already trusts (`projects`
+/// newest first). Its trust question selects "No, exit" in any other folder,
+/// home included, where a yes lasts one session, so a new user who pressed
+/// Enter there quit (guest, 2026-10-29).
+fn latest_trusted_claude_project(
+    projects: &[ClaudeCodeProject],
+    claude_json: &serde_json::Value,
+) -> Option<std::path::PathBuf> {
+    projects
+        .iter()
+        .find(|project| {
+            // Claude Code keys Windows projects with forward slashes.
+            let key = if cfg!(windows) {
+                project.project_path.replace('\\', "/")
+            } else {
+                project.project_path.clone()
+            };
+            claude_json["projects"][key.as_str()]["hasTrustDialogAccepted"] == true
+        })
+        .map(|project| std::path::PathBuf::from(&project.project_path))
+}
+
+/// macOS Terminal runs a `.command` script it is asked to open in a new
+/// window, under the user's own login shell rather than our environment.
 #[cfg(target_os = "macos")]
-fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+fn claude_terminal_command(
+    claude: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<std::process::Command> {
+    use std::os::unix::fs::PermissionsExt;
+    let script = std::env::temp_dir().join("headroom-open-claude.command");
+    client_adapters::atomic_write(
+        &script,
+        format!(
+            "#!/bin/sh\ncd {} && exec {}\n",
+            shell_quote_path(dir),
+            shell_quote_path(claude)
+        )
+        .as_bytes(),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
     let mut command = crate::proc::command("/usr/bin/open");
-    command.args(["-a", "Terminal"]).arg(claude);
-    command
+    command.args(["-a", "Terminal"]).arg(script);
+    Ok(command)
 }
 
 /// `start` gives the console app a window of its own; cmd itself stays hidden.
 #[cfg(windows)]
-fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+fn claude_terminal_command(
+    claude: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<std::process::Command> {
     use std::os::windows::process::CommandExt;
     let mut command = crate::proc::command("cmd");
     command.raw_arg(format!(
         "/c start \"Claude Code\" /D \"{}\" \"{}\"",
-        client_adapters::home_dir().display(),
+        dir.display(),
         claude.display()
     ));
-    command
+    Ok(command)
 }
 
 // shortcut: Debian-style alternatives only; other desktops get the error and
 // the manual `claude` line on screen. Upgrade if Linux installs report it.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+fn claude_terminal_command(
+    claude: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<std::process::Command> {
     let mut command = crate::proc::command("x-terminal-emulator");
-    command.arg("-e").arg(claude);
-    command
+    command.arg("-e").arg(claude).current_dir(dir);
+    Ok(command)
 }
 
 /// The last `n` non-empty lines joined with spaces — installer output ends
@@ -18703,16 +18766,63 @@ Some unrelated content.
         assert_eq!(super::last_nonempty_lines("\n \n", 3), "");
     }
 
-    /// Terminal.app is asked to open the binary itself, so the session runs
-    /// under the user's login shell in a window of its own.
+    /// Terminal.app is asked to open a script that starts the binary in the
+    /// chosen folder, so the session runs under the user's login shell in a
+    /// window of its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn claude_terminal_command_opens_the_binary_in_terminal() {
+        use std::os::unix::fs::PermissionsExt;
         let claude = std::path::Path::new("/Users/me/.local/bin/claude");
-        let command = super::claude_terminal_command(claude);
+        let dir = std::path::Path::new("/Users/me/it's mine");
+        let command = super::claude_terminal_command(claude, dir).expect("command");
         assert_eq!(command.get_program(), "/usr/bin/open");
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, ["-a", "Terminal", "/Users/me/.local/bin/claude"]);
+        assert_eq!(args[..2], ["-a", "Terminal"]);
+        let script = std::path::Path::new(args[2]);
+        assert_eq!(
+            std::fs::read_to_string(script).expect("script"),
+            "#!/bin/sh\ncd '/Users/me/it'\\''s mine' && exec '/Users/me/.local/bin/claude'\n"
+        );
+        let mode = std::fs::metadata(script)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// Claude Code asks whether to trust any folder it has not, with "No,
+    /// exit" selected, so the terminal starts in the newest trusted project.
+    #[test]
+    fn latest_trusted_claude_project_skips_folders_claude_code_would_ask_about() {
+        fn project(path: &str) -> crate::models::ClaudeCodeProject {
+            crate::models::ClaudeCodeProject {
+                id: path.into(),
+                project_path: path.into(),
+                display_name: path.into(),
+                last_worked_at: String::new(),
+                session_count: 1,
+                sessions_today: 0,
+                last_learn_ran_at: None,
+                has_persisted_learnings: false,
+                active_days_since_last_learn: 0,
+                last_learn_pattern_count: None,
+            }
+        }
+        let newest_first = [project("/u/me"), project("/u/me/new"), project("/u/me/old")];
+        let claude_json = serde_json::json!({ "projects": {
+            "/u/me": { "hasTrustDialogAccepted": false },
+            "/u/me/new": { "allowedTools": [] },
+            "/u/me/old": { "hasTrustDialogAccepted": true },
+        }});
+        assert_eq!(
+            super::latest_trusted_claude_project(&newest_first, &claude_json),
+            Some(std::path::PathBuf::from("/u/me/old"))
+        );
+        assert_eq!(
+            super::latest_trusted_claude_project(&newest_first, &serde_json::Value::Null),
+            None
+        );
     }
 
     /// The unrouted-usage nudge keys on session mtimes newer than app start;

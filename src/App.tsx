@@ -597,6 +597,29 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
 const CLAUDE_CODE_VSCODE_DOCS_URL = "https://code.claude.com/docs/en/vs-code";
+
+// What to do next where Claude Code opened: VS Code asks before an extension
+// opens a link and switches Claude Code off in a folder it does not trust, and
+// Claude Code's own trust question selects "No, exit".
+function claudeOpenNote(opened: string, vscode: boolean): { text: string; error?: boolean } | null {
+  if (opened === "editor") {
+    return {
+      text: `In ${vscode ? "VS Code" : "your editor"}, click Open if it asks. If it shows Restricted Mode, trust the folder first.`
+    };
+  }
+  if (opened === "terminal_untrusted") {
+    return {
+      text: 'In the Terminal, use the arrow keys to pick "Yes, I trust this folder", then press Enter.'
+    };
+  }
+  if (opened === "none" && !vscode) {
+    return {
+      text: "Couldn't open Claude Code from here. Open a new terminal and type claude, or start a new chat in VS Code.",
+      error: true
+    };
+  }
+  return null;
+}
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -1832,7 +1855,7 @@ export default function App() {
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
-  const [claudeTerminalError, setClaudeTerminalError] = useState<string | null>(null);
+  const [claudeOpenNoteState, setClaudeOpenNoteState] = useState<ReturnType<typeof claudeOpenNote>>(null);
   const [vscodeNudgeNote, setVscodeNudgeNote] = useState<string | null>(null);
   // Claude Desktop on disk. It is not a client we can route (host-managed
   // provider env), so the no-clients and no-agent copy has to say so.
@@ -4403,6 +4426,7 @@ export default function App() {
   // `vscode` sends a Claude desktop app user to the extension we recommend;
   // without VS Code, Anthropic's guide covers installing both.
   async function openClaudeCode(vscode: boolean): Promise<string> {
+    setClaudeOpenNoteState(null);
     let opened = "none";
     try {
       opened = await invoke<string>("open_claude_code", {
@@ -4415,6 +4439,7 @@ export default function App() {
     if (vscode && opened === "none") {
       openLinkFromClick(CLAUDE_CODE_VSCODE_DOCS_URL);
     }
+    setClaudeOpenNoteState(claudeOpenNote(opened, vscode));
     return opened;
   }
 
@@ -5906,7 +5931,7 @@ export default function App() {
                     void openClaudeCode(true).then((opened) =>
                       setVscodeNudgeNote(
                         opened === "editor"
-                          ? "Sign in to Claude Code in VS Code, then click Check again."
+                          ? "In VS Code, click Open if it asks, then sign in to Claude Code and click Check again."
                           : "Install VS Code and its Claude Code extension, then click Check again."
                       )
                     );
@@ -6494,6 +6519,11 @@ export default function App() {
                   Use Claude Code in VS Code
                 </button>
               ) : null}
+              {claudeOpenNoteState ? (
+                <p className={claudeOpenNoteState.error ? "install-progress__error" : "install-progress__notice"}>
+                  {claudeOpenNoteState.text}
+                </p>
+              ) : null}
             </div>
           ) : awaitingFirstPrompt ? (
             <div className="post-install__checklist">
@@ -6506,22 +6536,15 @@ export default function App() {
                 <div>
                   <button
                     className="secondary-button"
-                    onClick={() => {
-                      setClaudeTerminalError(null);
-                      void openClaudeCode(false).then((opened) => {
-                        if (opened === "none") {
-                          setClaudeTerminalError(
-                            "Couldn't open Claude Code from here. Open a new terminal and type claude, or start a new chat in VS Code."
-                          );
-                        }
-                      });
-                    }}
+                    onClick={() => void openClaudeCode(false)}
                     type="button"
                   >
                     Open Claude Code
                   </button>
-                  {claudeTerminalError ? (
-                    <p className="install-progress__error">{claudeTerminalError}</p>
+                  {claudeOpenNoteState ? (
+                    <p className={claudeOpenNoteState.error ? "install-progress__error" : "install-progress__notice"}>
+                      {claudeOpenNoteState.text}
+                    </p>
                   ) : null}
                 </div>
               ) : null}
@@ -7360,6 +7383,9 @@ export default function App() {
                       </>
                     ) : null}
                   </p>
+                ) : null}
+                {calloutBanner.offerVscode && claudeOpenNoteState ? (
+                  <p className="callout-banner__subtitle">{claudeOpenNoteState.text}</p>
                 ) : null}
                 {showStallBannerLine ? (
                   // Nothing has ever been saved on this install, so the
