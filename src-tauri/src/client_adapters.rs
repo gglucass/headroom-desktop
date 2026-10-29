@@ -6501,6 +6501,10 @@ fn strip_jsonc(text: &str) -> String {
             '/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    // Keep its line breaks: a parse error names the file's own line.
+                    if bytes[i] == b'\n' {
+                        out.push(b'\n');
+                    }
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
@@ -17508,6 +17512,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let shown = super::read_opencode_config(&path).unwrap_err().to_string();
         assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
         assert!(shown.contains("line 1 column 1"), "{shown}");
+
+        // The line shown is the file's own, past a multi-line block comment.
+        fs::write(&path, "{\n  /* a\n     b */\n  \"x\": 1\n  \"y\": 2\n}").unwrap();
+        let shown = super::read_opencode_config(&path).unwrap_err().to_string();
+        assert!(shown.contains("at line 5 column"), "{shown}");
     }
 
     #[test]
