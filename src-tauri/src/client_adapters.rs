@@ -6425,16 +6425,23 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Windows editors and PowerShell 5.1's `-Encoding UTF8` start the file
+    // with a BOM, which serde_json reads as a stray character at line 1
+    // column 1 (RUST-61).
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     if raw.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
+    let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) => {
+            // The parser's line and column go in the message the user sees
+            // (setup returns only the top context), and the shared refusal
+            // phrase keeps a file OpenCode cannot read either out of Sentry.
             let value: serde_json::Value =
-                serde_json::from_str(&strip_jsonc(&raw)).with_context(|| {
-                    format!(
-                        "parsing {} failed (JSON/JSONC); refusing to overwrite potentially valid user config",
+                serde_json::from_str(&strip_jsonc(raw)).map_err(|err| {
+                    anyhow!(
+                        "parsing {} failed (JSON/JSONC: {err}); {UNPARSEABLE_SETTINGS}",
                         path.display()
                     )
                 })?;
@@ -17485,6 +17492,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 "provider {provider} routed"
             );
         }
+    }
+
+    #[test]
+    fn opencode_config_reads_a_bom_and_refuses_garbage_as_user_settings() {
+        // RUST-61: a BOM-prefixed opencode.json failed at line 1 column 1 and
+        // the refusal filed at Error because it missed the shared phrase.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        fs::write(&path, "\u{feff}{\"theme\": \"dark\"}").unwrap();
+        let config = super::read_opencode_config(&path).expect("a BOM is not a parse error");
+        assert_eq!(config["theme"], serde_json::json!("dark"));
+
+        fs::write(&path, "\0\0\0\0").unwrap();
+        let shown = super::read_opencode_config(&path).unwrap_err().to_string();
+        assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
+        assert!(shown.contains("line 1 column 1"), "{shown}");
     }
 
     #[test]
