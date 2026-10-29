@@ -950,6 +950,10 @@ export type CalloutTone =
 export interface CalloutBanner {
   tone: CalloutTone;
   title: string;
+  /** A line under the title, when the state that owns it has a fix to name. */
+  detail?: string;
+  /** The fix is Claude Code in VS Code, which the banner opens. */
+  offerVscode?: boolean;
 }
 
 // A startup hint is prose: "what is wrong. What to do." The headline
@@ -975,7 +979,8 @@ export function calloutBannerFor({
   runtimeIssues,
   runtimeHealthy,
   kompressWarming,
-  connectorPhase
+  connectorPhase,
+  unrouted = null
 }: {
   runtimeStatus: RuntimeStatus | null;
   pricingStatus: HeadroomPricingStatus | null;
@@ -983,6 +988,8 @@ export function calloutBannerFor({
   runtimeHealthy: boolean;
   kompressWarming: boolean;
   connectorPhase: "disabled" | "verifying" | "healthy";
+  /** setupHealthAlert.unroutedCallout: an agent the user can restart ran around Headroom. */
+  unrouted?: { title: string; detail: string; offerVscode?: boolean } | null;
 }): CalloutBanner {
   const primaryIssue = runtimeIssues.length > 0 ? splitIssue(runtimeIssues[0]) : null;
   const issueSummary = primaryIssue?.detail ? primaryIssue.lead : runtimeIssues.join(", ");
@@ -1079,6 +1086,11 @@ export function calloutBannerFor({
         tone: "disabled",
         title: "No coding tools connected, so Headroom isn't saving anything."
       };
+    }
+    // Evidence beats the generic "verify" ask, and outranks a healthy
+    // headline that would hide a day of unoptimized sessions.
+    if (unrouted) {
+      return { tone: "degraded", ...unrouted };
     }
     if (connectorPhase === "verifying") {
       return {

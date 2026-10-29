@@ -1287,8 +1287,9 @@ fn claude_transcripts(projects_root: &Path) -> impl Iterator<Item = (PathBuf, Sy
 /// own API host and Claude Code drops provider env from every settings scope,
 /// so no config Headroom owns can route them.
 /// "Restart your terminal" is advice that cannot work there.
-pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Headroom can't optimize the Claude \
-     desktop app. To keep saving, use Claude Code in VS Code or Terminal instead.";
+pub const CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS: &str = "Headroom does not work with the Claude \
+     Desktop app. Due to design decisions by Anthropic, we are unable to apply our token saving \
+     logic. Instead, please use Claude Code in VS Code.";
 
 /// The surface that last wrote a Claude Code transcript, from the
 /// `"entrypoint"` stamp on its lines: `cli`, `claude-vscode` for the IDE

@@ -1008,4 +1008,23 @@ describe("calloutBannerFor", () => {
       expect(calloutBannerFor(input)).toEqual({ tone, title });
     }
   });
+
+  it("names an agent that ran around Headroom over the generic verify ask and the healthy headline", () => {
+    const unrouted = { title: "Claude Code ran without Headroom.", detail: "Quit and reopen Claude Code." };
+    for (const connectorPhase of ["verifying", "healthy"] as const) {
+      expect(calloutBannerFor({ ...healthy, runtimeStatus: runtime(), pricingStatus: pricing(), connectorPhase, unrouted })).toEqual({
+        tone: "degraded",
+        ...unrouted
+      });
+    }
+    // A gate sends agents direct on purpose; its message keeps the headline.
+    expect(
+      calloutBannerFor({
+        ...healthy,
+        runtimeStatus: runtime(),
+        pricingStatus: pricing({ optimizationAllowed: false, gateMessage: "Your Headroom trial ended." }),
+        unrouted
+      })
+    ).toEqual({ tone: "disabled", title: "Your Headroom trial ended." });
+  });
 });

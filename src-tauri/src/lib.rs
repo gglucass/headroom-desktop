@@ -667,9 +667,11 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         && routed("claude_code")
             .is_some_and(|at| client_adapters::claude_ran_only_in_desktop_app_since(at.into()));
     let (title, body) = if claude_desktop && !codex {
+        // The title says what the diagnosis opens with; a notification
+        // cut off at two lines must still show the way out.
         (
-            "Claude Code in the Claude app isn't optimized",
-            client_adapters::CLAUDE_DESKTOP_UNROUTED_DIAGNOSIS,
+            "Headroom does not work with the Claude Desktop app",
+            "Instead, please use Claude Code in VS Code.",
         )
     } else {
         unrouted_usage_copy(claude && !claude_desktop, codex)
@@ -4802,6 +4804,68 @@ fn install_claude_code_cli_blocking() -> Result<(), String> {
     })
 }
 
+/// Opens a new Claude Code session where the user runs it: a chat with
+/// `prompt` typed in, in the editor that has Anthropic's extension, else a
+/// terminal window. A session started now reads the routing setup already
+/// wrote, so it goes through Headroom; and someone who just ran the installer
+/// above has never opened a terminal for it. 123 of 168 no-agent installs
+/// connected Claude Code within minutes and 19 sent a prompt (2026-09-14..10-25).
+/// `vscode` is the Claude desktop app user's way out: VS Code, extension
+/// installed on the way, and never the terminal. Says where it opened:
+/// "editor", "terminal" or "none".
+#[tauri::command]
+async fn open_claude_code(prompt: Option<String>, vscode: bool) -> Result<&'static str, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let claude = claude_cli::detect_claude_cli().filter(|_| !vscode);
+        // Without a CLI the extension is the only Claude Code there can be.
+        if vscode_statusbar::open_claude_code_chat(prompt.as_deref(), vscode || claude.is_none())
+            .map_err(|err| format!("{err:#}"))?
+        {
+            return Ok("editor");
+        }
+        let Some(claude) = claude else {
+            return Ok("none");
+        };
+        claude_terminal_command(&claude)
+            .spawn()
+            .map_err(|err| format!("could not open a terminal: {err}"))?;
+        Ok("terminal")
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// macOS Terminal runs an executable it is asked to open in a new window,
+/// under the user's own login shell rather than our environment.
+#[cfg(target_os = "macos")]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    let mut command = crate::proc::command("/usr/bin/open");
+    command.args(["-a", "Terminal"]).arg(claude);
+    command
+}
+
+/// `start` gives the console app a window of its own; cmd itself stays hidden.
+#[cfg(windows)]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = crate::proc::command("cmd");
+    command.raw_arg(format!(
+        "/c start \"Claude Code\" /D \"{}\" \"{}\"",
+        client_adapters::home_dir().display(),
+        claude.display()
+    ));
+    command
+}
+
+// shortcut: Debian-style alternatives only; other desktops get the error and
+// the manual `claude` line on screen. Upgrade if Linux installs report it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn claude_terminal_command(claude: &std::path::Path) -> std::process::Command {
+    let mut command = crate::proc::command("x-terminal-emulator");
+    command.arg("-e").arg(claude);
+    command
+}
+
 /// The last `n` non-empty lines joined with spaces — installer output ends
 /// with the useful error, and a wall of curl progress is not a message.
 fn last_nonempty_lines(text: &str, n: usize) -> String {
@@ -6501,6 +6565,9 @@ struct UnroutedClient {
     /// the guard has not run recently or found nothing - then the generic
     /// restart advice is still the best we have.
     diagnosis: Option<String>,
+    /// Every session ran in the Claude desktop app, which no restart can
+    /// route, so the Home banner leaves it to the badge.
+    desktop_only: bool,
 }
 
 /// Agents that ran on this machine while Headroom, up the whole time, saw
@@ -6679,6 +6746,7 @@ async fn detect_unrouted_clients(
                 reapplied,
                 active_at: active_at.to_rfc3339(),
                 diagnosis,
+                desktop_only,
             });
         }
         found
@@ -8686,6 +8754,7 @@ pub fn run() {
             claude_desktop_installed,
             get_gated_bypass_bytes,
             install_claude_code_cli,
+            open_claude_code,
             get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
@@ -18632,6 +18701,18 @@ Some unrelated content.
             "progress 42% error: no network"
         );
         assert_eq!(super::last_nonempty_lines("\n \n", 3), "");
+    }
+
+    /// Terminal.app is asked to open the binary itself, so the session runs
+    /// under the user's login shell in a window of its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_terminal_command_opens_the_binary_in_terminal() {
+        let claude = std::path::Path::new("/Users/me/.local/bin/claude");
+        let command = super::claude_terminal_command(claude);
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-a", "Terminal", "/Users/me/.local/bin/claude"]);
     }
 
     /// The unrouted-usage nudge keys on session mtimes newer than app start;

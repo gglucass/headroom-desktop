@@ -132,10 +132,11 @@ fn extension_version() -> String {
 /// made re-enabling skip the install, so the item stayed gone. Folders are
 /// only the fallback for an editor without a registry.
 fn installed_versions(extensions_dir: &Path) -> Vec<String> {
-    registry_versions(extensions_dir).unwrap_or_else(|| folder_versions(extensions_dir))
+    registry_versions(extensions_dir, EXTENSION_ID)
+        .unwrap_or_else(|| folder_versions(extensions_dir))
 }
 
-fn registry_versions(extensions_dir: &Path) -> Option<Vec<String>> {
+fn registry_versions(extensions_dir: &Path, extension_id: &str) -> Option<Vec<String>> {
     let bytes = std::fs::read(extensions_dir.join("extensions.json")).ok()?;
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
     Some(
@@ -144,7 +145,7 @@ fn registry_versions(extensions_dir: &Path) -> Option<Vec<String>> {
             .filter(|e| {
                 e["identifier"]["id"]
                     .as_str()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(EXTENSION_ID))
+                    .is_some_and(|id| id.eq_ignore_ascii_case(extension_id))
             })
             .filter_map(|e| e["version"].as_str().map(str::to_owned))
             .collect(),
@@ -175,7 +176,7 @@ fn folder_versions(extensions_dir: &Path) -> Vec<String> {
 /// under 0.9.22, whose re-enable then skipped the install. A user's uninstall
 /// marks the folder obsolete or deletes it, so this never reads as theirs.
 fn orphaned_by_our_uninstall(extensions_dir: &Path) -> bool {
-    registry_versions(extensions_dir).is_some_and(|listed| listed.is_empty())
+    registry_versions(extensions_dir, EXTENSION_ID).is_some_and(|listed| listed.is_empty())
         && !folder_versions(extensions_dir).is_empty()
 }
 
@@ -505,9 +506,72 @@ fn uninstall_from(editors: &[Editor]) -> Result<()> {
     }
 }
 
+/// Anthropic's Claude Code extension: what we recommend to Claude desktop app
+/// users, whose app routes nothing through us whatever we configure.
+const CLAUDE_CODE_EXTENSION_ID: &str = "anthropic.claude-code";
+
+/// Opens a new Claude Code chat with `prompt` typed in, in the editor (and
+/// profile) that has Anthropic's extension, or in VS Code when `vscode`
+/// is set and no editor has it: VS Code then offers to install the extension
+/// itself, with its own progress, before it opens the chat. False when there
+/// is no such editor.
+pub fn open_claude_code_chat(prompt: Option<&str>, vscode: bool) -> Result<bool> {
+    let editors = editors();
+    let with_extension = editors.iter().find_map(|editor| {
+        profiles(editor)
+            .into_iter()
+            .find(|profile| {
+                registry_versions(&profile.registry_dir, CLAUDE_CODE_EXTENSION_ID)
+                    .is_some_and(|versions| !versions.is_empty())
+            })
+            .map(|profile| (editor, profile))
+    });
+    let Some((editor, profile)) = with_extension.or_else(|| {
+        let vscode = editors
+            .iter()
+            .find(|editor| vscode && editor.id == "vscode")?;
+        // The default profile comes first.
+        Some((vscode, profiles(vscode).swap_remove(0)))
+    }) else {
+        return Ok(false);
+    };
+    let url = claude_code_open_url(editor.id, prompt);
+    run_cli(editor, &profile, &["--open-url".as_ref(), url.as_ref()])?;
+    Ok(true)
+}
+
+/// The extension's own `/open` link (its URI handler takes `prompt` and
+/// `session`). Each editor id is also its URL scheme.
+fn claude_code_open_url(editor_id: &str, prompt: Option<&str>) -> String {
+    let mut url = format!("{editor_id}://{CLAUDE_CODE_EXTENSION_ID}/open");
+    if let Some(prompt) = prompt {
+        url.push_str("?prompt=");
+        for byte in prompt.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                url.push(byte as char);
+            } else {
+                url.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_code_open_url_encodes_the_prompt_for_the_editor_scheme() {
+        assert_eq!(
+            claude_code_open_url("vscode", None),
+            "vscode://anthropic.claude-code/open"
+        );
+        assert_eq!(
+            claude_code_open_url("cursor", Some("Say hi, it's 50% off & more")),
+            "cursor://anthropic.claude-code/open?prompt=Say%20hi%2C%20it%27s%2050%25%20off%20%26%20more"
+        );
+    }
 
     #[test]
     fn reports_a_failed_install_once_per_profile_and_version() {
