@@ -174,15 +174,18 @@ export async function runAppUpdateCheck({
   } catch (error) {
     if (background) {
       // A transport failure reaching github.com is the user's network
-      // (RUST-GM), and "Could not fetch a valid release JSON" is github.com
-      // answering with something other than latest.json (RUST-GW: two hosts
-      // on two OSes in the same minute), not a defect; keep both visible but
-      // below Error.
-      const transport = TRANSPORT_FAILURE.test(describeInvokeError(error, ""));
-      Sentry.captureException(error, {
-        level: transport ? "warning" : "error",
-        tags: { flow: "app_update_check" },
-      });
+      // (RUST-GM, ~350 events a week with nothing to act on), so it is not
+      // reported; the next background check retries. "Could not fetch a valid
+      // release JSON" (RUST-GW) still reports below Error: from many hosts at
+      // once it would mean our own latest.json is broken.
+      const detail = describeInvokeError(error, "");
+      const releaseJson = /valid release JSON/i.test(detail);
+      if (releaseJson || !TRANSPORT_FAILURE.test(detail)) {
+        Sentry.captureException(error, {
+          level: releaseJson ? "warning" : "error",
+          tags: { flow: "app_update_check" },
+        });
+      }
       return {};
     }
     return {
