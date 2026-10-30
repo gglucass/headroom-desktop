@@ -796,10 +796,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
             if !claude_settings_ok {
-                failures.push(
-                    "Claude Code ANTHROPIC_BASE_URL was not found in ~/.claude/settings.json."
-                        .into(),
-                );
+                failures.push(CLAUDE_BASE_URL_NOT_FOUND.into());
             }
             // RTK is a separate, opt-in integration (`set_rtk_enabled` tears it
             // down without touching ANTHROPIC_BASE_URL routing). Its wiring is
@@ -1118,8 +1115,14 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// And Codex's guard alone (RUST-KA): hooks.json is a file the user and
 /// Codex's own /hooks edit, separate from the config.toml block. 5 repairs on
 /// 4 hosts (2026-09-29..10-12); only one host lost it again, 1.7h later.
+///
+/// And Claude's ANTHROPIC_BASE_URL, alone or with the hooks (RUST-KH): a
+/// Claude Code session writing back settings it read before Headroom wired
+/// them. 72 repairs on 58 hosts (2026-09-30..10-30); 47 lost it once, six
+/// again within a day.
 fn repair_pages(silent_failures: &[String]) -> bool {
     let marker = match silent_failures {
+        [first, ..] if first == CLAUDE_BASE_URL_NOT_FOUND => "claude-base-url-lost",
         [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
         [only] if only == CODEX_GUARD_NOT_FOUND => "codex-guard-lost",
         [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
@@ -8347,6 +8350,8 @@ fn claude_guard_shape() -> &'static str {
     }
 }
 
+const CLAUDE_BASE_URL_NOT_FOUND: &str =
+    "Claude Code ANTHROPIC_BASE_URL was not found in ~/.claude/settings.json.";
 const CLAUDE_GUARD_NOT_FOUND: &str =
     "Headroom routing guard was not found in ~/.claude/settings.json.";
 const CLAUDE_GUARD_SCRIPT_MISSING: &str =
@@ -16429,6 +16434,42 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !super::cc_switch_dropped_the_hooks(gone),
             "an old switch is not this loss"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_claude_base_url_loss_pages_only_when_it_repeats_within_a_day() {
+        // RUST-KH: a stale Claude Code session's write-back drops the env,
+        // with or without the hooks. One pages nothing; another within a day
+        // pages.
+        let home = TestHome::new();
+        super::apply_client_setup("claude_code").expect("apply succeeds");
+        let settings = home.path().join(".claude").join("settings.json");
+        let mut stripped = read_settings_json(&settings);
+        stripped["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ANTHROPIC_BASE_URL");
+        fs::write(&settings, serde_json::to_string(&stripped).unwrap()).unwrap();
+
+        let lost = super::verify_client_setup("claude_code")
+            .expect("verify runs")
+            .failures;
+        assert_eq!(lost, vec![super::CLAUDE_BASE_URL_NOT_FOUND.to_string()]);
+        assert!(!super::repair_pages(&lost), "a first loss does not page");
+        let with_hooks = vec![
+            super::CLAUDE_BASE_URL_NOT_FOUND.to_string(),
+            super::CLAUDE_GUARD_NOT_FOUND.to_string(),
+        ];
+        assert!(
+            super::repair_pages(&with_hooks),
+            "a repeat within a day pages"
+        );
+        assert!(super::repair_client_setup_now("claude_code"), "repaired");
+        assert!(super::verify_client_setup("claude_code")
+            .unwrap()
+            .failures
+            .is_empty());
     }
 
     #[test]
