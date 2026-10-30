@@ -1120,7 +1120,9 @@ function tipView(event: TipEvent): TipView | null {
     case "codex_compact":
       return {
         title: "Compact long Codex sessions sooner",
-        body: `A Codex session reached ${size} tokens. Add this line to ~/.codex/config.toml to compact at 150k, though compaction summarizes earlier detail.`,
+        // "Above any [section]": appended at the end it lands in the last table, and a
+        // trailing [features] makes Codex refuse the whole file (RUST-TB).
+        body: `A Codex session reached ${size} tokens. Add this line at the top of ~/.codex/config.toml, above any [section] line, to compact at 150k, though compaction summarizes earlier detail.`,
         action: { type: "command", text: "model_auto_compact_token_limit = 150000" }
       };
     default:

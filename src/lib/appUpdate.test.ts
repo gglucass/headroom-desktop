@@ -272,6 +272,29 @@ describe("app update helpers", () => {
     expect(result).toEqual({});
   });
 
+  it("reports a background check failure only when it is not the user's network (RUST-GM)", async () => {
+    const reportedLevel = async (message: string) => {
+      vi.mocked(Sentry.captureException).mockClear();
+      await runAppUpdateCheck({
+        background: true,
+        invokeFn: vi.fn().mockRejectedValueOnce(message),
+      });
+      return vi.mocked(Sentry.captureException).mock.calls[0]?.[1];
+    };
+
+    expect(
+      await reportedLevel(
+        "error sending request for url (https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json)"
+      )
+    ).toBeUndefined();
+    expect(await reportedLevel("Could not fetch a valid release JSON from the remote")).toEqual(
+      expect.objectContaining({ level: "warning" })
+    );
+    expect(await reportedLevel("signature verification failed")).toEqual(
+      expect.objectContaining({ level: "error" })
+    );
+  });
+
   it("surfaces manual check errors with invoke-style fallback parsing", async () => {
     const invokeFn = vi.fn().mockRejectedValueOnce({ message: "timed out" });
 

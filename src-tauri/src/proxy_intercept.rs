@@ -869,7 +869,10 @@ impl<R> Drop for ResponseSniffer<R> {
         if self.capturing && self.count_failures && is_failed_request_status(status) {
             let body = find_header_end(&self.buf)
                 .map_or(&[][..], |end| &self.buf[(end + 4).min(self.buf.len())..]);
-            crate::usage_counters::record_failure(self.client_key, &failure_kind(status, body));
+            crate::usage_counters::record_failure(
+                self.client_key,
+                &with_unreachable_cause(failure_kind(status, body)),
+            );
         }
         let Some(path) = self.capture_path.as_deref() else {
             return;
@@ -3122,7 +3125,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
         if failed && counted && is_provider_api_path(req_path) {
             crate::usage_counters::record_failure(
                 "codex",
-                &codex_failure_kind(status, &error_body),
+                &with_unreachable_cause(codex_failure_kind(status, &error_body)),
             );
         }
         if prompt {
@@ -3437,6 +3440,73 @@ fn codex_failure_kind(status: Option<u16>, body: &[u8]) -> String {
         Some(status) => status.to_string(),
         None => "dropped".into(),
     }
+}
+
+/// `kind` plus the cause the backend logged when it is `upstream_unreachable`,
+/// a code the wheel gives httpx's PoolTimeout (its own connection pool ran
+/// dry: ours) and every connect failure (the user's network) alike. Only the
+/// wheel log tells them apart, so four stuck-host mails in a row (2026-10-26..29,
+/// users 895 and 2457) ended at "ask for proxy-6768.log".
+fn with_unreachable_cause(kind: String) -> String {
+    if !kind.ends_with(":upstream_unreachable") {
+        return kind;
+    }
+    let log = crate::client_adapters::home_dir()
+        .join(".headroom")
+        .join("logs")
+        .join(format!("proxy-{}.log", crate::backend_port::get()));
+    let from = std::fs::metadata(&log).map_or(0, |m| m.len().saturating_sub(64 * 1024));
+    let cause = crate::log_text_since(&log, from)
+        .as_deref()
+        .map_or("unlogged", unreachable_cause);
+    format!("{kind}:{cause}")
+}
+
+/// The cause on the newest connect-failure line of a wheel log tail: the
+/// streaming and passthrough handlers' and the buffered path's `Request
+/// failed`. httpx's timeouts carry no message: the sites that log a repr name
+/// the class, the passthrough and retry sites' `{e}` leaves the line ending at
+/// its colon, a pool or connect timeout this cannot tell apart ("timeout").
+/// shortcut: the newest line can be a concurrent request's; fine for a
+/// per-day tally, read the log itself before acting on a single failure.
+fn unreachable_cause(log_tail: &str) -> &'static str {
+    const LINES: &[&str] = &[
+        "Connection error to upstream API",
+        "failed before upstream response",
+        "Request failed",
+    ];
+    const CAUSES: &[(&str, &str)] = &[
+        ("PoolTimeout", "pool_timeout"),
+        ("ConnectTimeout", "connect_timeout"),
+        ("timed out", "connect_timeout"),
+        ("nodename nor servname", "dns"),
+        ("Name or service not known", "dns"),
+        ("name resolution", "dns"),
+        ("getaddrinfo failed", "dns"),
+        ("refused", "refused"),
+        ("reset", "reset"),
+        ("forcibly closed", "reset"),
+    ];
+    let Some(line) = log_tail
+        .lines()
+        .rev()
+        .find(|line| LINES.iter().any(|marker| line.contains(marker)))
+    else {
+        return "unlogged";
+    };
+    CAUSES
+        .iter()
+        .find(|(needle, _)| line.contains(needle))
+        .map_or_else(
+            || {
+                if line.trim_end().ends_with(':') {
+                    "timeout"
+                } else {
+                    "other"
+                }
+            },
+            |(_, cause)| cause,
+        )
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -5604,10 +5674,10 @@ mod tests {
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
-        stamp_request_header, strip_request_header, take_plugin_route, verdict_permits_reuse,
-        verdict_unwires_clients, BypassFlag, CodexTerminalReader, HeldPortVerdict, ModelsRewrite,
-        ParsedRequestHead, PortProbe, ResponseSniffer, SharedToken,
-        FIRST_OPTIMIZED_REQUEST_REPORTED,
+        stamp_request_header, strip_request_header, take_plugin_route, unreachable_cause,
+        verdict_permits_reuse, verdict_unwires_clients, with_unreachable_cause, BypassFlag,
+        CodexTerminalReader, HeldPortVerdict, ModelsRewrite, ParsedRequestHead, PortProbe,
+        ResponseSniffer, SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -7902,6 +7972,41 @@ mod tests {
         );
         assert_eq!(codex_failure_kind(Some(200), b""), "stream");
         assert_eq!(codex_failure_kind(None, b""), "dropped");
+    }
+
+    /// Line shapes from wheel 0.41.0's streaming, passthrough and buffered paths.
+    #[test]
+    fn unreachable_cause_names_what_the_backend_logged_last() {
+        let line = |text: &str| format!("2026-10-29 10:28:40,123 - headroom.proxy - {text}\n");
+        let pool = line("ERROR - [hr_1] Connection error to upstream API: PoolTimeout('')");
+        let retry = line("WARNING - [hr_1] Connection error to upstream API (attempt 1/3): ConnectTimeout(''); retrying in 900ms");
+        let dns = line("ERROR - [hr_2] Request failed: ConnectError: [Errno 8] nodename nor servname provided, or not known");
+        let refused = line("WARNING - Streaming passthrough failed before upstream response: POST /v1/responses -> https://chatgpt.com/backend-api/codex/responses: [Errno 61] Connection refused");
+        let noise =
+            line("INFO - event=proxy_inbound_response method=POST path=/v1/responses status=502");
+        let odd =
+            line("ERROR - [hr_3] Connection error to upstream API: All connection attempts failed");
+
+        assert_eq!(unreachable_cause(&pool), "pool_timeout");
+        assert_eq!(unreachable_cause(&retry), "connect_timeout");
+        assert_eq!(unreachable_cause(&dns), "dns");
+        assert_eq!(unreachable_cause(&refused), "refused");
+        assert_eq!(
+            unreachable_cause(&format!("{dns}{pool}{noise}")),
+            "pool_timeout"
+        );
+        assert_eq!(unreachable_cause(&odd), "other");
+        // `{e}` of an httpx PoolTimeout/ConnectTimeout is empty (httpcore wraps
+        // a bare TimeoutError): the passthrough and retry lines end at the colon.
+        let passthrough_timeout = line("WARNING - Streaming passthrough failed before upstream response: POST /v1/responses -> https://chatgpt.com/backend-api/codex/responses: ");
+        let retry_timeout = line("WARNING - Request failed (attempt 1), retrying in 900ms: ");
+        assert_eq!(unreachable_cause(&passthrough_timeout), "timeout");
+        assert_eq!(unreachable_cause(&retry_timeout), "timeout");
+        assert_eq!(unreachable_cause(&noise), "unlogged");
+        assert_eq!(
+            with_unreachable_cause("502:provider".into()),
+            "502:provider"
+        );
     }
 
     #[test]

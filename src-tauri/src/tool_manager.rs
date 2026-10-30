@@ -1149,7 +1149,14 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
 # ~10x less and ran faster, with the same keep/drop decisions. Python only: the
 # Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
 # `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
-# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_EMBED_BATCH_CAP=0.
+# Concurrent splits still stacked the arena to +2.2 GB, so each run also asks ORT
+# to hand its free arena regions back: +80 MB settled after 4 parallel 128-record
+# splits, same speed (M6, 2026-10-29). Only under MallocLargeCache=0, which the
+# wheel's macOS CLI re-exec sets (#2879): without it libmalloc keeps the freed
+# blocks dirty and shrinking re-grew the arena to +3.8 GB. Windows and Linux are
+# unmeasured and never set it, so they keep the cap alone.
+# Exact-pin gated to wheel 0.41.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
+# HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only).
 _hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
 if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
@@ -1158,8 +1165,29 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
             from headroom.relevance import embedding as _hd_ebc_mod
 
+            _hd_ebc_shrink = (
+                _hd_os.environ.get("MallocLargeCache") == "0"
+                and _hd_os.environ.get("HEADROOM_EMBED_ARENA_SHRINK", "1").strip().lower()
+                not in ("", "0", "false", "no", "off")
+            )
+
+            def _hd_ebc_arm(model):
+                model._hd_ebc_armed = True
+                import onnxruntime as _hd_ebc_ort
+
+                session = model.model.model  # TextEmbedding -> OnnxTextEmbedding -> InferenceSession
+                opts = _hd_ebc_ort.RunOptions()
+                opts.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                run = session.run
+                session.run = lambda names, feed, run_options=None: run(names, feed, run_options or opts)
+
             def _hd_ebc_encode(self, texts):
                 model = self._get_model()
+                if _hd_ebc_shrink and not getattr(model, "_hd_ebc_armed", False):
+                    try:
+                        _hd_ebc_arm(model)
+                    except Exception:
+                        pass  # Memory only: the arena keeps its high-water mark.
                 return _hd_ebc_mod._get_numpy().array(list(model.embed(texts, batch_size=16)))
 
             _hd_ebc_mod.EmbeddingScorer._encode = _hd_ebc_encode
@@ -3895,10 +3923,11 @@ impl ToolManager {
     }
 
     /// Chip text for the Addons tab. markitdown and serena are measured
-    /// (shim counter / serena's logs plus its live dashboard stats); ponytail,
-    /// caveman and chisle are the plugins' published benchmark figures — their skills
-    /// forbid inventing per-repo figures, so the labels say "benchmark". rtk's
-    /// figure comes from `rtk gain` via RuntimeStatus, not from here.
+    /// (shim counter / serena's logs plus its live dashboard stats), and so is
+    /// chisle's tool-output trimming (its own ledger); ponytail, caveman and
+    /// chisle's reply rules are the plugins' published benchmark figures — their
+    /// skills forbid inventing per-repo figures, so the labels say "benchmark".
+    /// rtk's figure comes from `rtk gain` via RuntimeStatus, not from here.
     fn tool_savings_label(&self, tool_id: &str) -> Option<String> {
         match tool_id {
             "markitdown" => self.markitdown_conversion_count().map(|count| {
@@ -3916,8 +3945,7 @@ impl ToolManager {
             }
             "ponytail" => Some("47-77% lower cost (benchmark)".to_string()),
             "caveman" => Some("~65% fewer output tokens (benchmark)".to_string()),
-            // Its 2026-10-01 rerun: 83% of a bare model's billed output.
-            "chisle" => Some("~17% fewer output tokens (benchmark)".to_string()),
+            "chisle" => Some(chisle_savings_label(chisle_trimmed_chars())),
             _ => None,
         }
     }
@@ -4560,7 +4588,7 @@ impl ToolManager {
                     command.process_group(0);
                 }
                 strip_unsupported_proxy_env(&mut command);
-                override_unsupported_registry_proxy(&mut command);
+                override_unsupported_registry_proxy(&mut command, httpx_supports_proxy_url);
                 strip_unusable_sslkeylogfile(&mut command);
                 command
                     .env("PYTHONNOUSERSITE", "1")
@@ -10445,6 +10473,33 @@ fn serena_savings_label(
     }
 }
 
+/// Characters Chisle's PostToolUse hook has cut from tool output, from its own
+/// ledger `~/.claude/.chisle-compress-stats.json` (`{savedChars, events}`). The
+/// hook bumps it only once Claude Code accepts the trimmed output, so it counts
+/// what the model actually stopped reading. Cumulative, no dates. None until
+/// the first trim.
+fn chisle_trimmed_chars() -> Option<u64> {
+    let path = crate::client_adapters::home_dir()
+        .join(".claude")
+        .join(".chisle-compress-stats.json");
+    let ledger: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let chars = ledger.get("savedChars")?.as_f64()?;
+    (chars >= 1.0).then_some(chars as u64)
+}
+
+fn chisle_savings_label(trimmed_chars: Option<u64>) -> String {
+    // Its 2026-10-01 rerun: 83% of a bare model's billed output.
+    const REPLY_BENCHMARK: &str = "~17% fewer output tokens (benchmark)";
+    match trimmed_chars {
+        // chars/4: the same estimate Chisle's own `--stats` and statusline show.
+        Some(chars) => format!(
+            "~{} tool-output tokens trimmed, {REPLY_BENCHMARK}",
+            compact_token_count(chars / 4)
+        ),
+        None => REPLY_BENCHMARK.to_string(),
+    }
+}
+
 /// Parse `ps` etime, `[[dd-]hh:]mm:ss`.
 fn parse_ps_etime(raw: &str) -> Option<Duration> {
     let raw = raw.trim();
@@ -14466,8 +14521,10 @@ fn strip_unsupported_proxy_env(command: &mut Command) {
 /// parse, override the child env: usable entries become explicit
 /// http_proxy/https_proxy vars (any env proxy var makes urllib skip the
 /// registry), and when nothing is usable NO_PROXY="*" sends the backend
-/// direct -- strictly better than a guaranteed boot crash.
-fn override_unsupported_registry_proxy(command: &mut Command) {
+/// direct -- strictly better than a guaranteed boot crash. pip children run
+/// it too with a socks-rejecting `supported` (no pysocks): their env strip
+/// cannot reach a v2rayN socks system proxy either (RUST-6S/RUST-29).
+fn override_unsupported_registry_proxy(command: &mut Command, supported: fn(&str) -> bool) {
     if !cfg!(windows) {
         return;
     }
@@ -14485,7 +14542,7 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
             return false;
         }
         let stripped_above = ["http_proxy", "https_proxy", "all_proxy"].contains(&lower.as_str())
-            && !httpx_supports_proxy_url(&value);
+            && !supported(&value);
         !stripped_above
     });
     if child_keeps_a_proxy_var {
@@ -14512,14 +14569,14 @@ fn override_unsupported_registry_proxy(command: &mut Command) {
     let Some(server) = parse_reg_value(&text, "ProxyServer") else {
         return;
     };
-    let Some(overrides) = registry_proxy_env_overrides(&server) else {
+    let Some(overrides) = registry_proxy_env_overrides(&server, supported) else {
         return;
     };
     // info, not warn: warn is bridged to Sentry and would re-report on every
     // launch of an affected machine, forever. Values stay out of the log --
     // proxy URLs can embed credentials.
     log::info!(
-        "[tool_manager] WinINET registry proxy carries a scheme httpx cannot parse; overriding {} child proxy env var(s) so backend boot survives",
+        "[tool_manager] WinINET registry proxy carries a scheme the child cannot use; overriding {} child proxy env var(s)",
         overrides.len()
     );
     for (name, value) in overrides {
@@ -14564,9 +14621,12 @@ fn reg_dword_is_set(value: &str) -> bool {
 /// with `socks4://addr` ("the default SOCKS proxy type of Windows is SOCKS4",
 /// urllib/request.py getproxies_registry) -- the RUST-B3 crash was exactly
 /// that backfill reaching httpx via the https mount. Returns None when no
-/// override is needed (nothing mounted, or every mounted entry parses),
-/// otherwise the env vars to set on the child.
-fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, String)>> {
+/// override is needed (nothing mounted, or every mounted entry is
+/// `supported`), otherwise the env vars to set on the child.
+fn registry_proxy_env_overrides(
+    proxy_server: &str,
+    supported: fn(&str) -> bool,
+) -> Option<Vec<(String, String)>> {
     let server = proxy_server.trim();
     if server.is_empty() {
         return None;
@@ -14624,12 +14684,12 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
             }
         }
     }
-    if mounted.iter().all(|(_, url)| httpx_supports_proxy_url(url)) {
+    if mounted.iter().all(|(_, url)| supported(url)) {
         return None;
     }
     let usable: Vec<(String, String)> = mounted
         .into_iter()
-        .filter(|(_, url)| httpx_supports_proxy_url(url))
+        .filter(|(_, url)| supported(url))
         .map(|(proto, url)| (format!("{proto}_proxy"), url))
         .collect();
     if usable.is_empty() {
@@ -14791,6 +14851,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         if let Some(dir) = pip_net_hook_dir(binary) {
             command.env("PYTHONPATH", dir);
         }
+        override_unsupported_registry_proxy(&mut command, |v| !is_socks_proxy_value(v));
     }
     strip_unusable_sslkeylogfile(&mut command);
     strip_socks_proxy_env(&mut command);
@@ -17749,8 +17810,9 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
     #[test]
     fn embed_batch_cap_behaves_against_the_installed_wheel() {
         // The relevance scorer's fastembed calls run 16 texts per ONNX batch, not
-        // fastembed's 256 that grew ORT's arena to 2.5 GB. A fake model records
-        // the batch_size the installed EmbeddingScorer._encode passes.
+        // fastembed's 256 that grew ORT's arena to 2.5 GB, and with the large
+        // cache off each ONNX run shrinks the arena. A fake model records the
+        // batch_size and run options the installed EmbeddingScorer._encode passes.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17763,25 +17825,56 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
 from headroom.relevance.embedding import EmbeddingScorer
 seen = []
 class Model:
+    def __init__(self):
+        self.model = Onnx()
     def embed(self, texts, **kwargs):
         seen.append(kwargs.get("batch_size"))
+        self.model.model.run(["out"], {})
         return [[1.0, 0.0] for _ in texts]
+class Onnx:
+    def __init__(self):
+        self.model = Session()
+class Session:
+    def run(self, names, feed, run_options=None):
+        shrink.append(run_options and run_options.get_run_config_entry("memory.enable_memory_arena_shrinkage"))
+shrink = []
+model = Model()
 scorer = EmbeddingScorer()
-scorer._get_model = lambda: Model()
-print(len(scorer._encode(["record"] * 40)), seen)
+scorer._get_model = lambda: model
+print(len(scorer._encode(["record"] * 40)), seen, shrink)
 "#;
-        let run = |flag: &str| {
-            let out = crate::proc::command(&python)
+        let run = |flag: &str, large_cache: Option<&str>| {
+            let mut command = crate::proc::command(&python);
+            command
                 .args(["-c", probe])
                 .env("PYTHONPATH", dir.path())
                 .env("HEADROOM_EMBED_BATCH_CAP", flag)
-                .output()
-                .expect("run embed batch cap probe");
+                .env_remove("HEADROOM_EMBED_ARENA_SHRINK")
+                .env_remove("MallocLargeCache");
+            if let Some(value) = large_cache {
+                command.env("MallocLargeCache", value);
+            }
+            let out = command.output().expect("run embed batch cap probe");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        assert_eq!(run("1"), "40 [16]");
+        assert_eq!(run("1", Some("0")), "40 [16] ['cpu:0']");
+        // Shrinking with libmalloc's large cache on re-grows the arena; stay out.
+        assert_eq!(run("1", None), "40 [16] [None]");
         // Off keeps fastembed's default, which also proves the probe sees it.
-        assert_eq!(run("0"), "40 [None]");
+        assert_eq!(run("0", Some("0")), "40 [None] [None]");
+        // The shrink kill switch keeps the cap and drops only the run options.
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_EMBED_BATCH_CAP", "1")
+            .env("HEADROOM_EMBED_ARENA_SHRINK", "0")
+            .env("MallocLargeCache", "0")
+            .output()
+            .expect("run embed batch cap probe");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "40 [16] [None]"
+        );
     }
 
     #[test]
@@ -23573,26 +23666,44 @@ Always run the linter first.
     #[test]
     fn registry_socks4_single_value_goes_direct() {
         assert_eq!(
-            super::registry_proxy_env_overrides("socks4://127.0.0.1:10808"),
+            super::registry_proxy_env_overrides(
+                "socks4://127.0.0.1:10808",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![("NO_PROXY".to_string(), "*".to_string())])
         );
     }
 
     #[test]
     fn registry_clean_proxies_need_no_override() {
-        assert_eq!(super::registry_proxy_env_overrides("1.2.3.4:8080"), None);
         assert_eq!(
-            super::registry_proxy_env_overrides("http=1.2.3.4:8080;https=1.2.3.4:8080"),
+            super::registry_proxy_env_overrides("1.2.3.4:8080", super::httpx_supports_proxy_url),
+            None
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;https=1.2.3.4:8080",
+                super::httpx_supports_proxy_url
+            ),
             None
         );
         // A keyed socks entry with an explicit httpx-supported scheme is kept
         // verbatim by urllib's backfill, so both mounts parse: no override.
         assert_eq!(
-            super::registry_proxy_env_overrides("socks=socks5://127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "socks=socks5://127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             None
         );
-        assert_eq!(super::registry_proxy_env_overrides(""), None);
-        assert_eq!(super::registry_proxy_env_overrides("   "), None);
+        assert_eq!(
+            super::registry_proxy_env_overrides("", super::httpx_supports_proxy_url),
+            None
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides("   ", super::httpx_supports_proxy_url),
+            None
+        );
     }
 
     /// RUST-B3: CPython backfills missing http/https keys from a keyed
@@ -23602,7 +23713,10 @@ Always run the linter first.
     #[test]
     fn registry_keyed_socks_backfills_and_overrides() {
         assert_eq!(
-            super::registry_proxy_env_overrides("http=1.2.3.4:8080;socks=127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "http_proxy".to_string(),
                 "http://1.2.3.4:8080".to_string()
@@ -23610,7 +23724,10 @@ Always run the linter first.
         );
         // socks alone backfills BOTH mounts with socks4: nothing usable.
         assert_eq!(
-            super::registry_proxy_env_overrides("socks=127.0.0.1:1080"),
+            super::registry_proxy_env_overrides(
+                "socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![("NO_PROXY".to_string(), "*".to_string())])
         );
         // Explicit http/https pairs win over the backfill (CPython uses
@@ -23618,7 +23735,8 @@ Always run the linter first.
         // stray socks entry keeps its usable halves.
         assert_eq!(
             super::registry_proxy_env_overrides(
-                "http=1.2.3.4:8080;https=1.2.3.4:8080;socks=127.0.0.1:1080"
+                "http=1.2.3.4:8080;https=1.2.3.4:8080;socks=127.0.0.1:1080",
+                super::httpx_supports_proxy_url
             ),
             None
         );
@@ -23630,7 +23748,10 @@ Always run the linter first.
     #[test]
     fn registry_mixed_keeps_the_usable_entry() {
         assert_eq!(
-            super::registry_proxy_env_overrides("http=socks4://127.0.0.1:10808;https=1.2.3.4:8080"),
+            super::registry_proxy_env_overrides(
+                "http=socks4://127.0.0.1:10808;https=1.2.3.4:8080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "https_proxy".to_string(),
                 "http://1.2.3.4:8080".to_string()
@@ -23645,11 +23766,40 @@ Always run the linter first.
     #[test]
     fn registry_schemeless_https_entry_mirrors_as_http_like_cpython() {
         assert_eq!(
-            super::registry_proxy_env_overrides("https=proxy.corp:8080;socks=proxy.corp:1080"),
+            super::registry_proxy_env_overrides(
+                "https=proxy.corp:8080;socks=proxy.corp:1080",
+                super::httpx_supports_proxy_url
+            ),
             Some(vec![(
                 "https_proxy".to_string(),
                 "http://proxy.corp:8080".to_string()
             )])
+        );
+    }
+
+    /// RUST-6S/RUST-29: with no socks env var left, pip's urllib still mounts
+    /// a socks WinINET system proxy and dies without pysocks. For pip any
+    /// socks mount is unusable, even socks5 that httpx copes with.
+    #[test]
+    fn registry_socks_is_unusable_for_pip() {
+        let pip: fn(&str) -> bool = |v| !super::is_socks_proxy_value(v);
+        assert_eq!(
+            super::registry_proxy_env_overrides("socks5://127.0.0.1:10808", pip),
+            Some(vec![("NO_PROXY".to_string(), "*".to_string())])
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;socks=socks5://127.0.0.1:1080",
+                pip
+            ),
+            Some(vec![(
+                "http_proxy".to_string(),
+                "http://1.2.3.4:8080".to_string()
+            )])
+        );
+        assert_eq!(
+            super::registry_proxy_env_overrides("1.2.3.4:8080", pip),
+            None
         );
     }
 
@@ -24269,6 +24419,37 @@ Always run the linter first.
             Some("231 tool calls today, ~48k tokens returned in 2h 14m")
         );
         assert_eq!(super::compact_token_count(1_234_000), "1.2M");
+    }
+
+    #[test]
+    fn chisle_label_reads_its_trim_ledger_and_falls_back_to_the_benchmark() {
+        let root = unique_temp_dir("chisle-ledger");
+        let home = root.join("home");
+        let _home = HomeGuard::new(&home);
+        let ledger = home.join(".claude").join(".chisle-compress-stats.json");
+        let benchmark = "~17% fewer output tokens (benchmark)";
+
+        assert_eq!(super::chisle_trimmed_chars(), None);
+        assert_eq!(super::chisle_savings_label(None), benchmark);
+
+        fs::create_dir_all(ledger.parent().unwrap()).expect("claude dir");
+        fs::write(&ledger, br#"{"savedChars":88967,"events":18}"#).expect("ledger");
+        assert_eq!(super::chisle_trimmed_chars(), Some(88_967));
+        // Chisle's README shows this ledger as "~22,241 tokens".
+        assert_eq!(
+            super::chisle_savings_label(super::chisle_trimmed_chars()),
+            "~22k tool-output tokens trimmed, ~17% fewer output tokens (benchmark)"
+        );
+
+        for junk in [
+            &br#"{"savedChars":0,"events":0}"#[..],
+            b"not json",
+            br#"{"events":3}"#,
+        ] {
+            fs::write(&ledger, junk).expect("ledger");
+            assert_eq!(super::chisle_trimmed_chars(), None);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

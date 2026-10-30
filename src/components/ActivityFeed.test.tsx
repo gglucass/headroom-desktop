@@ -157,6 +157,8 @@ describe("tips", () => {
     );
     const { unmount } = render(tip("codex_compact"));
     expect(screen.getByText("model_auto_compact_token_limit = 150000")).toBeTruthy();
+    // A root key: appended under a trailing [features] it breaks Codex (RUST-TB).
+    expect(screen.getByText(/at the top of ~\/\.codex\/config\.toml, above any \[section\] line/)).toBeTruthy();
     unmount();
     const second = render(tip("switch_to_codex", { usedPercent: 31.6 }));
     expect(screen.getByText("Claude Code is limited until it resets")).toBeTruthy();
