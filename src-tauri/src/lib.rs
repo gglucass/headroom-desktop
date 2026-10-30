@@ -9886,11 +9886,14 @@ fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
 
 /// Codex could not load the user's own config: a `model_catalog_json` file
 /// that does not parse (RUST-PA: Ollama's launcher wrote
-/// `~/.codex/ollama-launch-models.json` without a field Codex now requires).
+/// `~/.codex/ollama-launch-models.json` without a field Codex now requires),
+/// or a `~/.codex/config.toml` whose values Codex's schema rejects (RUST-TB:
+/// a root key appended under a trailing `[features]` table).
 /// Every `codex exec` on the machine fails the same way until the user fixes
 /// that file, and the failure tail shown in the app already names it.
 fn learn_failure_is_agent_config_broken(text: &str) -> bool {
     text.contains("failed to parse model_catalog_json")
+        || text.contains("Error loading config.toml")
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
@@ -17378,6 +17381,10 @@ Some unrelated content.
         // RUST-PA verbatim, minus the analyzer's log prefix.
         assert!(learn_failure_is_agent_config_broken(
             "LLM analysis failed: `codex exec --skip-git-repo-check` failed (exit 1):\nWARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)\nError: failed to parse model_catalog_json path `~/.codex/ollama-launch-models.json` as JSON: missing field `supports_reasoning_summaries` at line 422 column 5\n"
+        ));
+        // RUST-TB verbatim: our compact tip's line appended under `[features]`.
+        assert!(learn_failure_is_agent_config_broken(
+            "LLM analysis failed: `codex exec --skip-git-repo-check -c features.unbounded_connection_retries=false` failed (exit 1):\nError loading config.toml: invalid type: integer `150000`, expected a boolean\nin `features`\n"
         ));
         assert!(!learn_failure_is_agent_config_broken(
             "LLM analysis failed: `codex exec` failed (exit 1):\nError: stream disconnected\n"
