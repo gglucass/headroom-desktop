@@ -9944,6 +9944,9 @@ impl ToolManager {
                 log::warn!("chisle: scoping its tool-output compression failed: {err:#}");
             }
         }
+        if plugin.id == "ponytail" {
+            self.hide_ponytail_band_once();
+        }
         self.ensure_codex_skill_nudges();
         // At most one: with two hosts, the other one installed.
         Ok(outdated.pop())
@@ -10071,6 +10074,34 @@ impl ToolManager {
             if let Err(err) = crate::client_adapters::set_codex_skill_nudge(id, skill, on) {
                 log::warn!("{id}: Codex skill nudge failed: {err:#}");
             }
+        }
+    }
+
+    /// Ponytail 5.3 added a band above the Claude Code prompt (cost, Review,
+    /// Audit, Board). Hide it once per machine with the flag `/ponytail band
+    /// off` writes; the marker keeps a later `/ponytail band on` (which deletes
+    /// the flag) from being undone at the next launch.
+    pub fn hide_ponytail_band_once(&self) {
+        let marker = self.runtime.tools_dir.join("ponytail-band-hidden");
+        let Some(plugin) = plugin_addon("ponytail") else {
+            return;
+        };
+        if marker.exists()
+            || !self.plugin_receipt_exists(plugin)
+            || !PluginHost::ClaudeCode.plugin_present(plugin)
+        {
+            return;
+        }
+        let flag = crate::client_adapters::home_dir()
+            .join(".claude")
+            .join(".ponytail-band");
+        let hidden = if flag.exists() {
+            Ok(())
+        } else {
+            crate::client_adapters::atomic_write(&flag, b"off")
+        };
+        if let Err(err) = hidden.and_then(|()| crate::client_adapters::atomic_write(&marker, b"")) {
+            log::warn!("ponytail: hiding its band failed: {err:#}");
         }
     }
 
@@ -25882,6 +25913,38 @@ Always run the linter first.
             "{err:#}"
         );
         assert_eq!(enabled, Some(true), "receipt must not flip");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ponytail_band_is_hidden_once_and_a_later_band_on_sticks() {
+        let (root, runtime, manager) = seed_test_runtime("ponytail-band");
+        let _home = HomeGuard::new(&root);
+        let flag = root.join(".claude").join(".ponytail-band");
+        manager.hide_ponytail_band_once();
+        let without_plugin = flag.exists();
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":true}"#,
+        )
+        .expect("receipt");
+        manager.hide_ponytail_band_once();
+        let hidden = fs::read_to_string(&flag).ok();
+        // `/ponytail band on` deletes the flag.
+        fs::remove_file(&flag).expect("band on");
+        manager.hide_ponytail_band_once();
+        let rehidden = flag.exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(!without_plugin, "no ponytail, no flag");
+        assert_eq!(hidden.as_deref(), Some("off"));
+        assert!(!rehidden, "a later `/ponytail band on` must stick");
     }
 
     #[cfg(unix)]

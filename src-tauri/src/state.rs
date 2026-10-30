@@ -890,6 +890,7 @@ impl AppState {
             }
         }
         self.tool_manager.ensure_codex_skill_nudges();
+        self.tool_manager.hide_ponytail_band_once();
         // npm can take a minute, and this runs before the proxy starts.
         let tools = self.tool_manager.clone();
         std::thread::spawn(move || tools.ensure_context7_registration());
