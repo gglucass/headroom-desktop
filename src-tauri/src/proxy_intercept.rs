@@ -3464,7 +3464,9 @@ fn with_unreachable_cause(kind: String) -> String {
 
 /// The cause on the newest connect-failure line of a wheel log tail: the
 /// streaming and passthrough handlers' and the buffered path's `Request
-/// failed`. httpx's timeouts carry no message, so the wheel logs their repr.
+/// failed`. httpx's timeouts carry no message: the sites that log a repr name
+/// the class, the passthrough and retry sites' `{e}` leaves the line ending at
+/// its colon, a pool or connect timeout this cannot tell apart ("timeout").
 /// shortcut: the newest line can be a concurrent request's; fine for a
 /// per-day tally, read the log itself before acting on a single failure.
 fn unreachable_cause(log_tail: &str) -> &'static str {
@@ -3495,7 +3497,16 @@ fn unreachable_cause(log_tail: &str) -> &'static str {
     CAUSES
         .iter()
         .find(|(needle, _)| line.contains(needle))
-        .map_or("other", |(_, cause)| cause)
+        .map_or_else(
+            || {
+                if line.trim_end().ends_with(':') {
+                    "timeout"
+                } else {
+                    "other"
+                }
+            },
+            |(_, cause)| cause,
+        )
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -7985,6 +7996,12 @@ mod tests {
             "pool_timeout"
         );
         assert_eq!(unreachable_cause(&odd), "other");
+        // `{e}` of an httpx PoolTimeout/ConnectTimeout is empty (httpcore wraps
+        // a bare TimeoutError): the passthrough and retry lines end at the colon.
+        let passthrough_timeout = line("WARNING - Streaming passthrough failed before upstream response: POST /v1/responses -> https://chatgpt.com/backend-api/codex/responses: ");
+        let retry_timeout = line("WARNING - Request failed (attempt 1), retrying in 900ms: ");
+        assert_eq!(unreachable_cause(&passthrough_timeout), "timeout");
+        assert_eq!(unreachable_cause(&retry_timeout), "timeout");
         assert_eq!(unreachable_cause(&noise), "unlogged");
         assert_eq!(
             with_unreachable_cause("502:provider".into()),
