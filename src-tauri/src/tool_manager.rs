@@ -4657,6 +4657,10 @@ impl ToolManager {
                     // loopback. Env, not --host: the `-m headroom.proxy.server`
                     // fallback lets HEADROOM_HOST override its --host.
                     .env("HEADROOM_HOST", "127.0.0.1")
+                    // Same for the port: that fallback reads HEADROOM_PORT over
+                    // its --port, so a user's exported 8787 bound the backend
+                    // where the desktop never polls (RUST-CY, D3LLA).
+                    .env("HEADROOM_PORT", headroom_proxy_port())
                     // The `headroom` CLI applies ~/.headroom/settings.json with
                     // setdefault, and an OSS user's stored `uds` would bind the
                     // backend to a unix socket the desktop never probes. Empty
