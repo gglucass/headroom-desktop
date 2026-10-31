@@ -5376,7 +5376,10 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
                     "codex retag {from}->{to} skipped for {}: {e}",
                     path.display()
                 );
-                skip_reasons.push(e.to_string());
+                // The file name says whether the thread store itself was
+                // skipped (RUST-TE: one locked file, which one unknown).
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                skip_reasons.push(format!("{name}: {e}"));
             }
         }
     }
