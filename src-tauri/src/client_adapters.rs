@@ -1121,12 +1121,8 @@ const GUARD_LOSS_REPEAT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 /// them. 72 repairs on 58 hosts (2026-09-30..10-30); 47 lost it once, six
 /// again within a day.
 fn repair_pages(silent_failures: &[String]) -> bool {
-    let marker = match silent_failures {
-        [first, ..] if first == CLAUDE_BASE_URL_NOT_FOUND => "claude-base-url-lost",
-        [only] if only == CLAUDE_GUARD_NOT_FOUND => "claude-guard-lost",
-        [only] if only == CODEX_GUARD_NOT_FOUND => "codex-guard-lost",
-        [only] if only == OPENCODE_BLOCK_NOT_FOUND => "opencode-block-lost",
-        _ => return true,
+    let Some(marker) = repeat_gated_marker(silent_failures) else {
+        return true;
     };
     let marker = config_file(&app_data_dir(), marker);
     let repeat = std::fs::metadata(&marker)
@@ -1139,6 +1135,18 @@ fn repair_pages(silent_failures: &[String]) -> bool {
         log::info!("recording a lone config loss failed: {err:#}");
     }
     repeat
+}
+
+/// The marker of a cause `repair_pages` pages only on a repeat, or None for a
+/// cause that pages every time.
+fn repeat_gated_marker(silent_failures: &[String]) -> Option<&'static str> {
+    match silent_failures {
+        [first, ..] if first == CLAUDE_BASE_URL_NOT_FOUND => Some("claude-base-url-lost"),
+        [only] if only == CLAUDE_GUARD_NOT_FOUND => Some("claude-guard-lost"),
+        [only] if only == CODEX_GUARD_NOT_FOUND => Some("codex-guard-lost"),
+        [only] if only == OPENCODE_BLOCK_NOT_FOUND => Some("opencode-block-lost"),
+        _ => None,
+    }
 }
 
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
@@ -1212,6 +1220,14 @@ fn repair_client_setup_now(client_id: &str) -> bool {
                 .first()
                 .map(|f| f.chars().take(80).collect())
                 .unwrap_or_else(|| "unknown".to_string());
+            // A gated cause that paged is a repeat: its own issue, so one
+            // can stay resolved for builds that paged every loss while the
+            // other is archived by host count (RUST-KH could do neither).
+            let repeat = repeat_gated_marker(&silent_failures).is_some();
+            let mut fingerprint = vec!["repair_client_setups", client_id, cause.as_str()];
+            if repeat {
+                fingerprint.push("repeat");
+            }
             sentry::with_scope(
                 |scope| {
                     scope.set_tag("flow", "repair_client_setups");
@@ -1222,15 +1238,14 @@ fn repair_client_setup_now(client_id: &str) -> bool {
                     if let Some(shape) = &opencode_shape {
                         scope.set_extra("block_shape", shape.clone().into());
                     }
-                    scope.set_fingerprint(Some(&[
-                        "repair_client_setups",
-                        client_id,
-                        cause.as_str(),
-                    ]));
+                    scope.set_fingerprint(Some(fingerprint.as_slice()));
                 },
                 || {
                     sentry::capture_message(
-                        &format!("repair_client_setups: repaired {client_id}"),
+                        &format!(
+                            "repair_client_setups: repaired {client_id}{}",
+                            if repeat { " again within a day" } else { "" }
+                        ),
                         sentry::Level::Warning,
                     );
                 },
@@ -16464,6 +16479,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             super::repair_pages(&with_hooks),
             "a repeat within a day pages"
+        );
+        // ...under its own fingerprint; an every-time cause keeps the old one.
+        assert!(super::repeat_gated_marker(&with_hooks).is_some());
+        assert!(
+            super::repeat_gated_marker(&[super::CLAUDE_GUARD_SCRIPT_MISSING.to_string()]).is_none()
         );
         assert!(super::repair_client_setup_now("claude_code"), "repaired");
         assert!(super::verify_client_setup("claude_code")
