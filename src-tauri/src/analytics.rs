@@ -341,6 +341,7 @@ pub fn track_event(app: &AppHandle, name: &str, properties: Option<Value>) {
 }
 
 pub fn set_headroom_ai_version(app: &AppHandle, version: Option<String>) {
+    crate::logging::set_sentry_headroom_ai_version(version.clone());
     if let Some(client) = client(app, "headroom_ai_version") {
         client.set_headroom_ai_version(version);
     }
