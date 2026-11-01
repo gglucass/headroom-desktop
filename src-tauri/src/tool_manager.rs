@@ -16370,9 +16370,16 @@ fn command_failure_last_line(err: &anyhow::Error) -> Option<String> {
 /// True when a failure is an older Codex CLI that predates `codex plugin add`
 /// (`error: unrecognized subcommand 'add'`). Not retryable -- the user must
 /// update Codex -- so install treats it as a soft skip + nudge, not an error.
+/// The TypeScript Codex CLI before the Rust rewrite has no subcommands at all:
+/// it takes our args as a prompt and, with no key in the env, answers "Missing
+/// OpenAI API key. Set the environment variable OPENAI_API_KEY and re-run this
+/// command." (RUST-DQ on 0.9.54, /opt/homebrew/bin/codex).
 fn is_outdated_codex(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<CommandFailure>()
-        .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
+    err.downcast_ref::<CommandFailure>().is_some_and(|failure| {
+        failure.stderr.contains("unrecognized subcommand")
+            || (failure.stderr.contains("API key")
+                && failure.stderr.contains("re-run this command"))
+    })
 }
 
 /// True when Claude Code's manifest validator refuses a field it predates
@@ -26613,6 +26620,22 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             signal: None,
         });
         assert!(!is_outdated_codex(&other));
+
+        // RUST-DQ: the pre-Rust TypeScript CLI read `plugin add ...` as a
+        // prompt, reached here under install_plugin_into's context.
+        let typescript_cli = anyhow::Error::new(CommandFailure {
+            program: "/opt/homebrew/bin/codex".into(),
+            args: vec!["plugin".into(), "add".into(), "ponytail@ponytail".into()],
+            stdout: String::new(),
+            stderr: "\nMissing OpenAI API key.\n\nSet the environment variable OPENAI_API_KEY \
+                     and re-run this command.\nYou can create a key here: \
+                     https://platform.openai.com/account/api-keys\n\n"
+                .into(),
+            exit_code: Some(1),
+            signal: None,
+        })
+        .context("marketplace add failed first: command failed (exit 1)");
+        assert!(is_outdated_codex(&typescript_cli));
 
         // A non-CommandFailure error must not be misclassified.
         assert!(!is_outdated_codex(&anyhow::anyhow!(
