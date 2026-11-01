@@ -11766,17 +11766,23 @@ fn wait_for_port_free(port: u16, pid: u32, timeout: Duration) -> bool {
 fn kill_pid(pid: u32, force: bool) {
     #[cfg(windows)]
     {
-        // `/T` takes the subtree with it: the backend spawns helpers, and a
-        // survivor holds the port just as well as its parent did.
-        crate::state::note_app_kill(
-            "kill_pid",
-            format!("taskkill /T{} pid {pid}", if force { " /F" } else { "" }),
-        );
+        // The subtree goes with it: the backend spawns helpers, and a survivor
+        // holds the port just as well as its parent did.
+        if force {
+            // Native, as `state::terminate_process_tree` already is: a spawned
+            // `taskkill /T` walks the tree through WMI, so where WMI is wedged
+            // it can sit out its whole timeout without killing anything, and
+            // the reclaim then bails "still held 5s after kill" (RUST-6J).
+            crate::state::note_app_kill("kill_pid", format!("tree kill pid {pid}"));
+            crate::winproc::kill_tree(pid);
+            return;
+        }
+        // Graceful stays taskkill: without /F it closes a process that owns a
+        // window (the intercept reclaim's desktop twin), which TerminateProcess
+        // cannot do cleanly.
+        crate::state::note_app_kill("kill_pid", format!("taskkill /T pid {pid}"));
         let mut command = crate::proc::command("taskkill");
         command.args(["/PID", &pid.to_string(), "/T"]);
-        if force {
-            command.arg("/F");
-        }
         // Bounded: taskkill /T walks the tree through the same process
         // enumeration a wedged WMI stalls.
         let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
@@ -11837,13 +11843,22 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
         // Re-verify before forcing: the first kill can have worked (Windows
         // goes straight to /F) and left the port held only by sockets still
         // closing, while the pid went to an unrelated process in those 3s,
-        // and `taskkill /T /F` would take that process's whole tree. The wait
+        // and the forced tree kill would take that process's whole tree. The wait
         // still runs, so a draining port gets the same 5s it always had.
         if pid_is_headroom_backend(pid) {
             kill_pid(pid, true);
         }
         if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
-            return Err(held("still held 5s after kill"));
+            // Who outlived the kill decides the next step: the pid itself is a
+            // process the OS could not finish terminating, another pid is a
+            // holder the tree kill missed (RUST-6J on 0.9.54 named only this
+            // branch).
+            let holder = match listener_process(port) {
+                Some((_, holder)) if holder == pid => "the killed pid".to_string(),
+                Some((name, holder)) => format!("{name} pid {holder}"),
+                None => "no identifiable listener".to_string(),
+            };
+            return Err(held(&format!("still held 5s after kill, by {holder}")));
         }
     }
 
