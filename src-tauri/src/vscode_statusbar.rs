@@ -364,10 +364,12 @@ fn cli_stderr(stderr: &[u8]) -> String {
 
 /// The editor's own executable failed to load on Windows (`ExitStatus` prints
 /// the NTSTATUS): a DLL missing (RUST-PM), built for the wrong architecture, or
-/// refusing to initialize. The same executable runs the editor, so the install
-/// is broken for the user too; nothing on our side to fix.
+/// refusing to initialize. Or cmd.exe's 9009: the CLI shim points at an
+/// editor executable that is gone (RUST-TK, `Cursor.exe` missing beside its
+/// `resources`). The same executable runs the editor, so the install is broken
+/// for the user too; nothing on our side to fix.
 fn editor_failed_to_load(err: &str) -> bool {
-    ["0xc0000135", "0xc000007b", "0xc0000142"]
+    ["0xc0000135", "0xc000007b", "0xc0000142", "exit code: 9009"]
         .iter()
         .any(|status| err.contains(status))
 }
@@ -618,6 +620,9 @@ mod tests {
         ));
         assert!(editor_failed_to_load(
             "cursor exited exit code: 0xc000007b: "
+        ));
+        assert!(editor_failed_to_load(
+            "cursor exited exit code: 9009: '\"~\\AppData\\Local\\Programs\\cursor\\resources\\app\\bin\\..\\..\\..\\Cursor.exe\"' is not recognized as an internal or external command,"
         ));
         assert!(!editor_failed_to_load("vscode exited exit code: 1: boom"));
         assert!(!editor_failed_to_load("vscode timed out after 60s"));
