@@ -1663,6 +1663,7 @@ pub(crate) fn request_auth_code_with_base_url(
     let response = loop {
         let response = http_client()?
             .post(join_url(base_url, "desktop/auth/request_code"))
+            .timeout(AUTH_REQUEST_TIMEOUT)
             .json(&RequestCodePayload {
                 email: &trimmed,
                 identity: IdentityPayload::for_state(state),
@@ -1736,6 +1737,7 @@ pub(crate) fn verify_auth_code_with_base_url(
 
     let response = http_client()?
         .post(join_url(base_url, "desktop/auth/verify_code"))
+        .timeout(AUTH_REQUEST_TIMEOUT)
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
@@ -4432,6 +4434,14 @@ fn http_client() -> Result<Client, String> {
         .build()
         .map_err(|err| format!("Could not build HTTP client: {err}"))
 }
+
+/// Budget for the two sign-in calls, which a user waits on behind a spinner.
+/// The 8s client default cut off slow or lossy links far from our origin before
+/// the request ever reached it (RUST-CE/BG: 30 installs, mostly IN/AE/EG/BR/HK,
+/// none of the timed-out attempts in Railway's log while the server answers in
+/// under 0.5s), and Railway's edge holds a request up to 15s during a deploy
+/// switchover.
+const AUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn api_url(path: &str) -> String {
     join_url(&api_base_url(), path)
