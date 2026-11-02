@@ -60,6 +60,12 @@
 #     no caller in headroom, whose image path is open/convert/resize/JPEG save.
 #     fastembed 0.9 downloads built-in models from Hugging Face only; a model
 #     already in fastembed-cache still loads.
+#   - 0.42.0: requires_dist adds hf-xet>=1.6.0 to core (#4192: before 1.6.0
+#     its worker threads could segfault Python at exit), so hf-xet
+#     1.5.1 -> 1.6.0. Native abi3 wheel swap with no deps, already in the
+#     installed set through huggingface-hub (which accepts <2.0). The mcp
+#     floor moves to >=1.30.0 and filelock>=4.2.1 joins core; both are
+#     already met by the pins. No package is added or removed.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
@@ -223,9 +229,9 @@ h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 h2==4.4.1 \
     --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6
-hf-xet==1.5.1 \
-    --hash=sha256:6abd35c3221eff63836618ddfb954dcf84798603f71d8e33e3ed7b04acfdbe6e \
-    --hash=sha256:94e761bbd266bf4c03cee73753916062665ce8365aa40ed321f45afcb934b41e
+hf-xet==1.6.0 \
+    --hash=sha256:633dc0cd71d32da58ab8c03ad38e2fac452c15c2b0a2866ebf6ededfe0a5061d \
+    --hash=sha256:f0906082d9932ae0c0057fa194041c22b4e2cdb46b2592ef3b91f020d62a081a
 hnswlib==0.8.0 \
     --hash=sha256:eb4d43f298d57b18575ebbb1003a9652e968464e0c154fae7bfc6b89f51d5440
 hpack==4.2.0 \

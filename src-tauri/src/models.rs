@@ -714,11 +714,12 @@ impl TransformationFeedEvent {
     }
 
     /// Uncached plus cache-write input, or None when the feed has no split.
-    /// Only Anthropic (direct, Bedrock, Vertex) bills writes apart from
-    /// uncached input. Everything else here comes through the OpenAI handler,
-    /// which infers a write equal to the uncached input and, on /v1/responses
-    /// (Codex), reports that same input as uncached too (wheel 0.41.0): one
-    /// figure, counted once. `provider` is the feed's display label ("OpenAI",
+    /// Anthropic (direct, Bedrock, Vertex) bills writes apart from uncached
+    /// input. Everything else here comes through the OpenAI handler, which
+    /// infers a write equal to the uncached input when the provider reports
+    /// none: one figure, counted once. Since wheel 0.42.0 (#4237) a Responses
+    /// row can carry a reported write, disjoint from its uncached input, so
+    /// that one is summed. `provider` is the feed's display label ("OpenAI",
     /// "OpenRouter", ...), so it is matched loosely.
     fn new_input(&self) -> Option<u64> {
         let (uncached, cache_write) = (self.uncached_input_tokens?, self.cache_write_tokens?);
@@ -727,11 +728,17 @@ impl TransformationFeedEvent {
             .as_deref()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        Some(if provider.contains("anthropic") || provider == "bedrock" {
-            uncached.saturating_add(cache_write)
-        } else {
-            uncached.max(cache_write)
-        })
+        // shortcut: the feed carries no cache_inferred flag, so a reported write
+        // that equals the uncached input by chance counts once; use the flag
+        // when the feed grows one.
+        let inferred = uncached == cache_write;
+        Some(
+            if provider.contains("anthropic") || provider == "bedrock" || !inferred {
+                uncached.saturating_add(cache_write)
+            } else {
+                uncached
+            },
+        )
     }
 
     pub fn apply_new_input_basis(&mut self) {
