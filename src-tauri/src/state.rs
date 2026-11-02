@@ -664,6 +664,9 @@ pub struct AppState {
     /// (blocking HTTP) plus a handful of file stats. A short TTL dedupes
     /// the work across all those callers without any visible lag.
     cached_runtime_status: Mutex<Option<(RuntimeStatus, Instant)>>,
+    /// Held while `runtime_status()` refills the cache, so callers that miss
+    /// together share one `/readyz` instead of each sending their own.
+    runtime_status_refill: Mutex<()>,
     /// Set once we've kicked off (or skipped) the one-shot Kompress model
     /// prefetch for this app launch, so `maybe_prefetch_kompress` never fires
     /// the ~260MB download more than once per process.
@@ -796,6 +799,7 @@ impl AppState {
             claude_projects_cache_gen: std::sync::atomic::AtomicU64::new(0),
             cached_headroom_learn_prereq: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
+            runtime_status_refill: Mutex::new(()),
             kompress_prefetch_attempted: AtomicBool::new(false),
             savings_history_loaded: AtomicBool::new(false),
         };
@@ -3825,13 +3829,22 @@ impl AppState {
         // perceptible staleness — the longest-cadence caller is 5s, so 2s
         // TTL gives each poll a fresh read while deduping within bursts.
         const TTL: Duration = Duration::from_secs(2);
-        {
-            let cache = self.cached_runtime_status.lock();
-            if let Some((status, at)) = cache.as_ref() {
-                if at.elapsed() < TTL {
-                    return status.clone();
-                }
-            }
+        let fresh = || {
+            self.cached_runtime_status
+                .lock()
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < TTL)
+                .map(|(status, _)| status.clone())
+        };
+        if let Some(status) = fresh() {
+            return status;
+        }
+        // The tray and watchdog loops both tick every 5s and stay in step, so
+        // they missed together and each sent a /readyz: 9.8k of one user's
+        // 23k a day were same-millisecond pairs (proxy log, 2026-10-27).
+        let _refill = self.runtime_status_refill.lock();
+        if let Some(status) = fresh() {
+            return status;
         }
         let status = self.compute_runtime_status();
         *self.cached_runtime_status.lock() = Some((status.clone(), Instant::now()));
@@ -16312,6 +16325,54 @@ mod tests {
         assert_eq!(now.lifetime_requests, after_newer.lifetime_requests);
         assert_eq!(now.session_estimated_tokens_saved, 1_000);
         fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_status_callers_that_miss_together_share_one_readyz() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = probes.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /readyz") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    // Slow enough that the second caller arrives mid-probe.
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        TEST_PROXY_PORT.with(|cell| cell.set(Some(port)));
+        let state = Arc::new(AppState::new().expect("state"));
+        *state.cached_runtime_status.lock() = None;
+        let before = probes.load(Ordering::SeqCst);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let (state, barrier) = (state.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    TEST_PROXY_PORT.with(|cell| cell.set(Some(port)));
+                    barrier.wait();
+                    state.runtime_status().proxy_reachable
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert!(
+                caller.join().expect("caller"),
+                "both callers see the probe's answer"
+            );
+        }
+        assert_eq!(probes.load(Ordering::SeqCst) - before, 1);
     }
 
     #[test]
