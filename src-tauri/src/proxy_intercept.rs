@@ -819,6 +819,11 @@ impl<R> ResponseSniffer<R> {
             let header = |name: &str| extract_header_value(&self.buf, name);
             let usage_limit = self.status == Some(429)
                 && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected");
+            if usage_limit {
+                crate::usage_counters::record_429(
+                    crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY,
+                );
+            }
             crate::tip_signals::note_claude_response(
                 header("anthropic-ratelimit-unified-overage-in-use").as_deref() == Some("true"),
                 usage_limit.then(|| {
@@ -4817,11 +4822,20 @@ async fn forward_direct_to_anthropic(
     };
     // Plugin-routed 429s are OpenCode's or Grok's, not Codex's or Claude's.
     if resp.status().as_u16() == 429 && plugin_route.is_none() {
-        crate::usage_counters::record_429(if is_codex_request_head(&parsed) {
-            "codex"
+        if is_codex_request_head(&parsed) {
+            crate::usage_counters::record_429("codex");
         } else {
-            "claude-code"
-        });
+            crate::usage_counters::record_429("claude-code");
+            if resp
+                .headers()
+                .get("anthropic-ratelimit-unified-status")
+                .is_some_and(|v| v.as_bytes() == b"rejected")
+            {
+                crate::usage_counters::record_429(
+                    crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY,
+                );
+            }
+        }
     }
 
     let mut head = format!(
@@ -7872,6 +7886,20 @@ mod tests {
     /// A response with nothing to capture stops once the head is read.
     #[test]
     fn sniffer_reads_plan_usage_from_every_status_of_a_claude_conversation() {
+        let usage_limit_429s = || {
+            let today = crate::storage::user_day(chrono::Local::now())
+                .format("%Y-%m-%d")
+                .to_string();
+            crate::usage_counters::recent_days()
+                .get(&today)
+                .and_then(|d| {
+                    d.rate_limit_429s
+                        .get(crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY)
+                        .copied()
+                })
+                .unwrap_or(0)
+        };
+        let limit_429s_before = usage_limit_429s();
         let mut capped = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
             .with_savings_session(Some("sess-capped".into()));
         capped.observe(
@@ -7887,6 +7915,8 @@ mod tests {
         let signals = crate::tip_signals::observed();
         assert!(signals.usage_limit_hit && signals.extra_usage_in_use);
         assert_eq!(signals.usage_limit_resets_at, Some(4_102_444_800));
+        // ...and the synced counter that tells a plan limit from throttling.
+        assert_eq!(usage_limit_429s(), limit_429s_before + 1);
         let five = crate::claude_statusline::plan_usage()
             .and_then(|u| u.five_hour)
             .expect("5h window from the 429");
