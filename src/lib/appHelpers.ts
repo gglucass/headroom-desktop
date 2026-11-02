@@ -34,12 +34,13 @@ export type { BillingPeriod };
 /// that field, is unreachable, or omits a tier. Keep it in sync with
 /// Polar::ProductCatalog::LIST_CENTS on the server.
 const PLAN_PRICES: Record<
-  "pro" | "max5x" | "max20x",
+  HeadroomSubscriptionTier,
   Record<BillingPeriod, { full: string; fullCents: number }>
 > = {
   pro:   { annual: { full: "$3",  fullCents: 300  }, monthly: { full: "$4",  fullCents: 400  } },
   max5x: { annual: { full: "$15",   fullCents: 1500 }, monthly: { full: "$20", fullCents: 2000 } },
   max20x:{ annual: { full: "$30",   fullCents: 3000 }, monthly: { full: "$40", fullCents: 4000 } },
+  pro500:{ annual: { full: "$60",   fullCents: 6000 }, monthly: { full: "$80", fullCents: 8000 } },
 };
 
 /// The server's price table, mirrored here at render time by
@@ -59,7 +60,7 @@ export function setServerPlanPrices(prices: PlanPrices | null | undefined): void
 /// else the compiled-in fallback. Non-finite or negative server values are
 /// rejected rather than rendered as "$NaN".
 function planPrice(
-  tier: "pro" | "max5x" | "max20x",
+  tier: HeadroomSubscriptionTier,
   billingPeriod: BillingPeriod
 ): { full: string; fullCents: number } {
   const cents = serverPlanPrices?.[tier]?.[billingPeriod];
@@ -74,7 +75,7 @@ function planPrice(
 function discountedPriceLabel(fullCents: number, percentOff: number): string {
   return formatCents(Math.round((fullCents * (100 - percentOff)) / 100));
 }
-const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3 };
+const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3, pro500: 4 };
 
 /// The higher-ranked of two optional tiers: the known one when only one is
 /// present, null when neither is. Used to pitch a user routing both Claude and
@@ -362,11 +363,11 @@ export function trialSavingsLabel(
     : `${saved} ${planName} is ${price.full}/month, so the trial alone covered ${covered} of it.`;
 }
 
-export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
-type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
+export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "pro500" | "team" | "enterprise";
+type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "pro500";
 type PaidUpgradePlanId = HeadroomSubscriptionTier;
 
-const INDIVIDUAL_PLAN_ORDER: IndividualUpgradePlanId[] = ["free", "pro", "max5x", "max20x"];
+const INDIVIDUAL_PLAN_ORDER: IndividualUpgradePlanId[] = ["free", "pro", "max5x", "max20x", "pro500"];
 
 export interface UpgradePlanPurchaseInfo {
   renewsOn: string;
@@ -409,9 +410,11 @@ export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
     case "pro":
       return "Pro";
     case "max5x":
-      return "Max x5";
+      return "Max";
     case "max20x":
-      return "Max x20";
+      return "Ultra";
+    case "pro500":
+      return "Pro 500";
     default:
       return null;
   }
@@ -426,7 +429,8 @@ export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
 const CODEX_PLAN_NAMES: Partial<Record<UpgradePlanId, [name: string, chatgpt: string]>> = {
   pro: ["Plus", "ChatGPT Go or Plus"],
   max5x: ["Pro 5x", "ChatGPT Pro $100"],
-  max20x: ["Pro 20x", "ChatGPT Pro $200 or $500"]
+  max20x: ["Pro 20x", "ChatGPT Pro $200"],
+  pro500: ["Pro 500", "ChatGPT Pro $500"]
 };
 
 export function withCodexPlanNames(
@@ -503,7 +507,7 @@ export function underTierWarning(
   codexPlanTier: CodexPlanTier | null | undefined,
   plans: UpgradePlan[] = []
 ): string | null {
-  if (cardTier !== "pro" && cardTier !== "max5x" && cardTier !== "max20x") return null;
+  if (cardTier !== "pro" && cardTier !== "max5x" && cardTier !== "max20x" && cardTier !== "pro500") return null;
   const fromClaude = recommendedHeadroomTier(claudePlanTier, null, null);
   const needed = higherSubscriptionTier(fromClaude, recommendedHeadroomTier(null, codexPlanTier, null));
   if (!needed || TIER_RANK[cardTier] >= TIER_RANK[needed]) return null;
@@ -567,6 +571,8 @@ export function getNextLowerUpgradePlanId(
       return "pro";
     case "max20x":
       return "max5x";
+    case "pro500":
+      return "max20x";
     default:
       return null;
   }
@@ -724,7 +730,7 @@ export function getUpgradePlans(
     })();
 
     function paidPlan(
-      id: "pro" | "max5x" | "max20x",
+      id: HeadroomSubscriptionTier,
       name: string,
       tagline: string,
       featureIntro: string,
@@ -813,23 +819,35 @@ export function getUpgradePlans(
       };
     }
 
-    const paidPlans: Record<"pro" | "max5x" | "max20x", UpgradePlan> = {
+    const paidPlans: Record<HeadroomSubscriptionTier, UpgradePlan> = {
       pro: paidPlan("pro", "Pro", "Unlock unlimited savings", "Everything in Free, plus:", [
-        "Unlimited use with Claude Pro or ChatGPT Plus",
+        "Unlimited use with Claude Pro, a Claude Team standard seat or ChatGPT Plus",
         "Use on all your devices with one account",
         "Email-based support"
       ], "Get Pro"),
-      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro $100 accounts", "Includes:", [
-        "Unlimited use with Claude Max x5 or ChatGPT Pro $100",
+      max5x: paidPlan("max5x", "Max", "For Claude Max or ChatGPT Pro $100 accounts", "Includes:", [
+        "Unlimited use with Claude Max, a Claude Team premium seat or ChatGPT Pro $100",
         "Use on all your devices with one account",
         "Email-based support"
-      ], "Get Max x5"),
-      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 or ChatGPT Pro accounts", "Includes:", [
-        "Unlimited use with Claude Max x20 or ChatGPT Pro",
+      ], "Get Max"),
+      max20x: paidPlan("max20x", "Ultra", "For Claude Ultra or ChatGPT Pro $200 accounts", "Includes:", [
+        "Unlimited use with Claude Ultra or ChatGPT Pro $200",
         "Use on all your devices with one account",
         "Priority support"
-      ], "Get Max x20"),
+      ], "Get Ultra"),
+      pro500: paidPlan("pro500", "Pro 500", "For ChatGPT Pro $500 accounts", "Includes:", [
+        "Unlimited use with ChatGPT Pro $500",
+        "Use on all your devices with one account",
+        "Priority support"
+      ], "Get Pro 500"),
     };
+    // Pro 500 is listed only for those it fits (ChatGPT Pro $500) or who own it;
+    // AppSumo sells no Pro 500, so its accounts never see the card.
+    const listedTiers: HeadroomSubscriptionTier[] =
+      upgradeAction !== "appsumo" &&
+      (recommendedSubscriptionTier === "pro500" || headroomSubscriptionTier === "pro500")
+        ? ["pro", "max5x", "max20x", "pro500"]
+        : ["pro", "max5x", "max20x"];
 
     const withRelativeCta = (plan: UpgradePlan): UpgradePlan => {
       if (!activeHeadroomPlanId) {
@@ -879,7 +897,7 @@ export function getUpgradePlans(
     // one-time tier buy, so the Polar monthly/annual prices on the cards would
     // promise a price nobody pays. centeredPriceLabel replaces the whole price
     // block (sticker, billing lines, discounts) with the AppSumo figure.
-    const APPSUMO_LIFETIME_PRICES: Record<"pro" | "max5x" | "max20x", string> = {
+    const APPSUMO_LIFETIME_PRICES: Partial<Record<HeadroomSubscriptionTier, string>> = {
       pro: "$29",
       max5x: "$99",
       max20x: "$199"
@@ -906,8 +924,8 @@ export function getUpgradePlans(
         // Deal over: a higher tier is a Polar subscription, and the server
         // attaches a forever discount worth the lifetime tier they already own
         // (Appsumo::UpgradeCredit in headroom-web), so they pay the difference.
-        const owned = activeHeadroomPlanId as "pro" | "max5x" | "max20x" | null;
-        const target = planPrice(plan.id as "pro" | "max5x" | "max20x", billingPeriod).fullCents;
+        const owned = activeHeadroomPlanId;
+        const target = planPrice(plan.id as HeadroomSubscriptionTier, billingPeriod).fullCents;
         const ownedCents = owned ? planPrice(owned, billingPeriod).fullCents : 0;
         if (!owned || !(target > ownedCents) || !plan.ctaLabel.startsWith("Upgrade")) {
           return plan;
@@ -915,12 +933,13 @@ export function getUpgradePlans(
         return {
           ...plan,
           price: formatCents(target - ownedCents),
-          originalPrice: planPrice(plan.id as "pro" | "max5x" | "max20x", billingPeriod).full,
+          originalPrice: planPrice(plan.id as HeadroomSubscriptionTier, billingPeriod).full,
           saleBadge: `${Math.round((ownedCents / target) * 100)}% off forever`,
           reversionLine: `You own ${upgradePlanIntentLabel(owned)} for life, so you pay only the difference`
         };
       }
-      const oneTime = APPSUMO_LIFETIME_PRICES[plan.id as "pro" | "max5x" | "max20x"];
+      const oneTime = APPSUMO_LIFETIME_PRICES[plan.id as HeadroomSubscriptionTier];
+      if (!oneTime) return plan;
       return {
         ...plan,
         centeredPriceLabel: `${oneTime} one-time • on AppSumo`,
@@ -931,7 +950,7 @@ export function getUpgradePlans(
     if (activeHeadroomPlanId) {
       const orderedPaidPlans = [
         paidPlans[activeHeadroomPlanId],
-        ...(["pro", "max5x", "max20x"] as const)
+        ...listedTiers
           .filter((planId) => planId !== activeHeadroomPlanId)
           .map((planId) => paidPlans[planId])
       ].map(withRelativeCta).map(withAppsumoPricing);
@@ -968,7 +987,7 @@ export function getUpgradePlans(
     if (pitchedPlanId) {
       const orderedPaidPlans = [
         paidPlans[pitchedPlanId],
-        ...(["pro", "max5x", "max20x"] as const)
+        ...listedTiers
           .filter((planId) => planId !== pitchedPlanId)
           .map((planId) => paidPlans[planId])
       ];

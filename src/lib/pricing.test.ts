@@ -65,13 +65,13 @@ describe("pricing cache snapshot", () => {
   it("formats plan and auth labels for known and unknown states", () => {
     expect(claudePlanLabel("free")).toBe("Claude Free");
     expect(claudePlanLabel("pro")).toBe("Claude Pro");
-    expect(claudePlanLabel("max5x")).toBe("Claude Max x5");
-    expect(claudePlanLabel("max20x")).toBe("Claude Max x20");
+    expect(claudePlanLabel("max5x")).toBe("Claude Max");
+    expect(claudePlanLabel("max20x")).toBe("Claude Ultra");
     expect(claudePlanLabel("unknown")).toBe("Unknown Claude plan");
 
     expect(subscriptionTierLabel("pro")).toBe("Pro");
-    expect(subscriptionTierLabel("max5x")).toBe("Max x5");
-    expect(subscriptionTierLabel("max20x")).toBe("Max x20");
+    expect(subscriptionTierLabel("max5x")).toBe("Max");
+    expect(subscriptionTierLabel("max20x")).toBe("Ultra");
     expect(subscriptionTierLabel(null)).toBe("No paid Headroom plan");
 
     expect(authMethodLabel("claude_ai_oauth")).toBe("Claude AI OAuth");

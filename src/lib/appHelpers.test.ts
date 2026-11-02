@@ -45,8 +45,8 @@ const daily = (usd: number): DailySavingsPoint => ({
 describe("app helpers", () => {
   it("formats upgrade intent labels for paid plans only", () => {
     expect(upgradePlanIntentLabel("pro")).toBe("Pro");
-    expect(upgradePlanIntentLabel("max5x")).toBe("Max x5");
-    expect(upgradePlanIntentLabel("max20x")).toBe("Max x20");
+    expect(upgradePlanIntentLabel("max5x")).toBe("Max");
+    expect(upgradePlanIntentLabel("max20x")).toBe("Ultra");
     expect(upgradePlanIntentLabel("free")).toBeNull();
     expect(upgradePlanIntentLabel(null)).toBeNull();
   });
@@ -98,9 +98,9 @@ describe("app helpers", () => {
       { ...on("2026-09-05", 10, 1_000_000), outputSavingsUsd: 20 },
       on("2026-09-09", 900, 90_000_000) // after the wall: not counted
     ];
-    // $430 incl. output against Max x20's $40 list -> 10 months, floored.
+    // $430 incl. output against Ultra's $40 list -> 10 months, floored.
     expect(trialSavingsLabel(trial, start, end, "max20x")).toBe(
-      "Over your trial, Headroom saved you 41M tokens, about $430 at API prices. Max x20 is $40/month, so the trial alone covered about 10 months of it."
+      "Over your trial, Headroom saved you 41M tokens, about $430 at API prices. Ultra is $40/month, so the trial alone covered about 10 months of it."
     );
     // Covers exactly one month -> "a month".
     expect(trialSavingsLabel([on("2026-09-02", 4.5, 2_000_000)], start, end, "pro")).toContain(
@@ -119,7 +119,7 @@ describe("app helpers", () => {
     expect(trialSavingsLabel([], start, end, "max20x")).toBeNull();
     // A trial still running says "so far", never "the trial alone covered".
     expect(trialSavingsLabel(trial, start, end, "max20x", true)).toBe(
-      "So far in your trial, Headroom has saved you 41M tokens, about $430 at API prices. Max x20 is $40/month, so your trial has already covered about 10 months of it."
+      "So far in your trial, Headroom has saved you 41M tokens, about $430 at API prices. Ultra is $40/month, so your trial has already covered about 10 months of it."
     );
     expect(trialSavingsLabel([on("2026-09-02", 30, 2_000_000)], start, end, null, true)).toBe(
       "So far in your trial, Headroom has saved you 2M tokens, about $30 at API prices."
@@ -184,6 +184,15 @@ describe("app helpers", () => {
     ]);
   });
 
+  it("lists Pro 500 only for those it fits or who own it", () => {
+    const ids = (r: { plans: { id: string }[] }) => r.plans.map((plan) => plan.id);
+    expect(ids(getUpgradePlans("individual", "max20x"))).not.toContain("pro500");
+    const fits = getUpgradePlans("individual", undefined, "pro500");
+    expect(fits.featuredPlanId).toBe("pro500");
+    expect(ids(fits)).toEqual(["pro500", "pro", "max5x", "max20x"]);
+    expect(ids(getUpgradePlans("individual", undefined, "max20x", "pro500", true))).toContain("pro500");
+  });
+
   it("pitches a Codex-only user by their ChatGPT plan before Codex has sent a request", () => {
     // What the Upgrade view renders: recommendation -> plan order -> Codex names.
     const pitch = (claude: "pro" | "max20x" | null, live: "max20x" | null, codex: CodexPlanTier | null) => {
@@ -193,7 +202,7 @@ describe("app helpers", () => {
         first: withCodexPlanNames(result.plans, claude, codex)[0].name
       };
     };
-    // No snapshot yet: Plus used to get the Max x5 fallback.
+    // No snapshot yet: Plus used to get the Max fallback.
     expect(pitch(null, null, "plus")).toEqual({ featured: "pro", first: "Plus" });
     expect(pitch(null, null, "prolite")).toEqual({ featured: "max5x", first: "Pro 5x" });
     expect(pitch(null, null, "pro")).toEqual({ featured: "max20x", first: "Pro 20x" });
@@ -219,7 +228,7 @@ describe("app helpers", () => {
       ctaLabel: "Get Plus"
     });
     expect(byId(codex, "max5x")).toMatchObject({ name: "Pro 5x", ctaLabel: "Get Pro 5x" });
-    expect(byId(codex, "max20x").tagline).toBe("Headroom Max x20, for ChatGPT Pro $200 or $500 accounts");
+    expect(byId(codex, "max20x").tagline).toBe("Headroom Ultra, for ChatGPT Pro $200 accounts");
     expect(byId(withCodexPlanNames(plans, null, "promax"), "max20x").name).toBe("Pro 20x");
     expect(byId(withCodexPlanNames(plans, null, "prolite"), "max5x").name).toBe("Pro 5x");
     // Price and features are untouched.
@@ -247,9 +256,9 @@ describe("app helpers", () => {
   });
 
   it("pitches the higher of the Claude-implied tier and the recommendation", () => {
-    // Claude Max x5 routed next to ChatGPT Pro (Codex -> Max x20).
+    // Claude Max routed next to ChatGPT Pro (Codex -> Ultra).
     expect(getUpgradePlans("individual", "max5x", "max20x").featuredPlanId).toBe("max20x");
-    // Claude Max x20 routed next to ChatGPT Pro Lite (Codex -> Max x5).
+    // Claude Ultra routed next to ChatGPT Pro Lite (Codex -> Max).
     const result = getUpgradePlans("individual", "max20x", "max5x");
     expect(result.featuredPlanId).toBe("max20x");
     expect(result.plans.map((plan) => plan.id)).toEqual(["max20x", "pro", "max5x"]);
@@ -290,8 +299,8 @@ describe("app helpers", () => {
     expect(result.featuredPlanId).toBe("pro");
     expect(result.plans.map((plan) => [plan.id, plan.ctaLabel])).toEqual([
       ["pro", "Stay on Pro plan"],
-      ["max5x", "Upgrade to Max x5"],
-      ["max20x", "Upgrade to Max x20"],
+      ["max5x", "Upgrade to Max"],
+      ["max20x", "Upgrade to Ultra"],
     ]);
   });
 
@@ -337,9 +346,9 @@ describe("app helpers", () => {
     expect(lower.id).toBe("pro");
     expect(lower.saleBadge).toBeUndefined();
     expect([higher.id, higher.price, higher.originalPrice, higher.saleBadge, higher.ctaLabel]).toEqual([
-      "max20x", "$15", "$30", "50% off forever", "Upgrade to Max x20",
+      "max20x", "$15", "$30", "50% off forever", "Upgrade to Ultra",
     ]);
-    expect(higher.reversionLine).toBe("You own Max x5 for life, so you pay only the difference");
+    expect(higher.reversionLine).toBe("You own Max for life, so you pay only the difference");
   });
 
   it("shows tiers under an AppSumo lifetime license as already owned", () => {
@@ -350,9 +359,9 @@ describe("app helpers", () => {
     );
 
     expect(result.plans.map((p) => [p.id, p.centeredPriceLabel, p.ctaLabel])).toEqual([
-      ["max20x", undefined, "Stay on Max x20 plan"],
-      ["pro", "included in your AppSumo lifetime plan", "Switch back to lifetime Max x5"],
-      ["max5x", "included in your AppSumo lifetime plan", "Switch back to lifetime Max x5"],
+      ["max20x", undefined, "Stay on Ultra plan"],
+      ["pro", "included in your AppSumo lifetime plan", "Switch back to lifetime Max"],
+      ["max5x", "included in your AppSumo lifetime plan", "Switch back to lifetime Max"],
     ]);
   });
 
@@ -618,22 +627,22 @@ describe("app helpers", () => {
 
   describe("getPlanRenewalPriceLabel", () => {
     it("returns the standard per-month price when no current paid amount is given", () => {
-      // Max x5 annual is $15 / month (billed annually).
+      // Max annual is $15 / month (billed annually).
       expect(getPlanRenewalPriceLabel("max5x", "annual")).toBe("$15 / month");
       expect(getPlanRenewalPriceLabel("max5x", "monthly")).toBe("$20 / month");
     });
 
     it("carries the user's current discount ratio forward to the target plan", () => {
-      // 100% off Pro annual (paid $0 vs $36/year list) -> 100% off Max x20.
+      // 100% off Pro annual (paid $0 vs $36/year list) -> 100% off Ultra.
       expect(
         getPlanRenewalPriceLabel("max20x", "annual", { fromTier: "pro", currentPaidCents: 0 })
       ).toBe("$0 / month");
       // 50% off Pro annual (paid $18/year = 1800 cents per cycle vs $36 list)
-      // -> 50% off Max x5 annual: $15 / month list -> $7.50 / month.
+      // -> 50% off Max annual: $15 / month list -> $7.50 / month.
       expect(
         getPlanRenewalPriceLabel("max5x", "annual", { fromTier: "pro", currentPaidCents: 1800 })
       ).toBe("$7.50 / month");
-      // 50% off monthly cycle (paid $2 vs $4 list per month) -> 50% off Max x5
+      // 50% off monthly cycle (paid $2 vs $4 list per month) -> 50% off Max
       // monthly: $20 / month list -> $10 / month.
       expect(
         getPlanRenewalPriceLabel("max5x", "monthly", { fromTier: "pro", currentPaidCents: 200 })
@@ -1009,7 +1018,7 @@ describe("scheduledPlanChange", () => {
       })
     );
     expect(info?.tier).toBe("max5x");
-    expect(info?.note).toBe(`Switches to Max x5 (annual) on ${on("2026-09-01T12:00:00Z")}`);
+    expect(info?.note).toBe(`Switches to Max (annual) on ${on("2026-09-01T12:00:00Z")}`);
   });
 
   it("defaults an unknown billing period to annual", () => {
@@ -1098,16 +1107,16 @@ describe("replyAddonOverlapNotice", () => {
 describe("underTierWarning", () => {
   it("warns only on cards below the detected plan", () => {
     expect(underTierWarning("pro", "max20x", null)).toBe(
-      "Your Claude plan needs Headroom Max x20. On Pro, weekly limits apply once the grace period ends."
+      "Your Claude plan needs Headroom Ultra. On Pro, weekly limits apply once the grace period ends."
     );
-    expect(underTierWarning("max5x", "max20x", null)).toContain("On Max x5");
+    expect(underTierWarning("max5x", "max20x", null)).toContain("On Max");
     expect(underTierWarning("max20x", "max20x", null)).toBeNull();
     expect(underTierWarning("max20x", "pro", null)).toBeNull();
   });
 
   it("names ChatGPT when the Codex plan is the bigger one", () => {
     expect(underTierWarning("pro", "pro", "prolite")).toBe(
-      "Your ChatGPT plan needs Headroom Max x5. On Pro, weekly limits apply once the grace period ends."
+      "Your ChatGPT plan needs Headroom Max. On Pro, weekly limits apply once the grace period ends."
     );
   });
 

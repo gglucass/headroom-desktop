@@ -23,6 +23,9 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
+/// 2026-11-03T00:00:00Z: Max x20 subscriptions started before the Pro 500 tier
+/// existed cover a ChatGPT Pro $500 plan (see `detect_tier_mismatch`).
+const PRO500_LAUNCH_UNIX: i64 = 1_793_664_000;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
 /// AppSumo free-year accounts (the $0 tier 1 for Plus members) are pushed to
 /// upgrade faster: the clamp fires on their 4th active day (a local day with
@@ -1738,6 +1741,8 @@ pub(crate) fn verify_auth_code_with_base_url(
     let response = http_client()?
         .post(join_url(base_url, "desktop/auth/verify_code"))
         .timeout(AUTH_REQUEST_TIMEOUT)
+        // The server picks the tier names this build can parse from it.
+        .header("X-Headroom-App-Version", env!("CARGO_PKG_VERSION"))
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
@@ -2675,7 +2680,14 @@ fn detect_tier_mismatch(
         (None, Some(x)) => (x, TierRecommendationSource::Codex),
         (None, None) => return None,
     };
-    (recommended.rank() > paid.rank()).then_some((paid, recommended, source))
+    // Max x20 was sold for ChatGPT Pro $500 until Pro 500 existed, so those
+    // subscriptions keep covering it (headroom-web applies the same cutoff).
+    let grandfathered = paid == HeadroomSubscriptionTier::Max20x
+        && recommended == HeadroomSubscriptionTier::Pro500
+        && account
+            .subscription_started_at
+            .is_none_or(|started| started.timestamp() < PRO500_LAUNCH_UNIX);
+    (!grandfathered && recommended.rank() > paid.rank()).then_some((paid, recommended, source))
 }
 
 /// Detects the mismatch and manages the persisted grace clock. Sets
@@ -3569,13 +3581,18 @@ fn parse_oauth_profile_organization(
 /// observed in the wild (Claude Code parses the field as an opaque string, so
 /// this list grows via trial-identity telemetry): `team_standard` seats carry
 /// Pro-scale Claude limits, `team_tier_1` (premium) carries Max-5x-equivalent
-/// limits, `team_tier_2` is the higher premium level. Unknown values return
-/// `None` so callers fall through to the pre-seat-tier behavior.
+/// limits, `team_tier_2` is the higher premium level. Team variants name the
+/// seat by suffix (`team_labs_standard`, `team_labs_premium`,
+/// `team_bendep_nonprofit_premium`, seen 2026-10); a premium seat is 5x a
+/// standard one, the Max price point. Unknown values return `None` so callers
+/// fall through to the pre-seat-tier behavior.
 fn plan_tier_from_seat_tier(seat_tier: &str) -> Option<ClaudePlanTier> {
-    match seat_tier.trim().to_ascii_lowercase().as_str() {
-        "team_standard" => Some(ClaudePlanTier::Pro),
+    let seat = seat_tier.trim().to_ascii_lowercase();
+    match seat.as_str() {
         "team_tier_1" => Some(ClaudePlanTier::Max5x),
         "team_tier_2" => Some(ClaudePlanTier::Max20x),
+        s if s.starts_with("team_") && s.ends_with("_standard") => Some(ClaudePlanTier::Pro),
+        s if s.starts_with("team_") && s.ends_with("_premium") => Some(ClaudePlanTier::Max5x),
         _ => None,
     }
 }
@@ -4518,6 +4535,11 @@ fn policy_for_paid_tier(tier: HeadroomSubscriptionTier) -> PricingPolicy {
             nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
+        },
+        HeadroomSubscriptionTier::Pro500 => PricingPolicy {
+            nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
+            disable_threshold_percent: 25.0,
+            recommended_tier: HeadroomSubscriptionTier::Pro500,
         },
     }
 }
@@ -6067,6 +6089,32 @@ mod tests {
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max5x
         ));
+    }
+
+    #[test]
+    fn detect_plan_tier_team_variant_seats_classify_by_suffix() {
+        // Fleet shapes from 2026-10: default_raven + team_labs_standard was
+        // pitched Max x20 before the suffix match.
+        for (seat, rate) in [
+            ("team_labs_standard", "default_raven"),
+            ("team_labs_premium", "default_raven"),
+            ("team_bendep_nonprofit_premium", "default_raven"),
+        ] {
+            let p = with_seat_tier(
+                oauth_profile(Some(rate), Some("claude_team"), Some(Utc::now())),
+                seat,
+            );
+            let expected = if seat.ends_with("_standard") {
+                ClaudePlanTier::Pro
+            } else {
+                ClaudePlanTier::Max5x
+            };
+            assert_eq!(detect_plan_tier_from_profile(&p).0, expected, "{seat}");
+        }
+        assert_eq!(
+            crate::pricing::plan_tier_from_seat_tier("enterprise_usage_based"),
+            None
+        );
     }
 
     #[test]
@@ -8177,6 +8225,25 @@ mod tests {
                 HeadroomSubscriptionTier::Pro,
                 HeadroomSubscriptionTier::Max20x,
                 TierRecommendationSource::Claude
+            ))
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_grandfathers_max20x_bought_before_pro500() {
+        let claude = empty_claude_profile(ClaudePlanTier::Unknown);
+        let mut account = active_subscriber(HeadroomSubscriptionTier::Max20x);
+        account.subscription_started_at =
+            DateTime::from_timestamp(crate::pricing::PRO500_LAUNCH_UNIX - 1, 0);
+        assert!(detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::ProMax)).is_none());
+        account.subscription_started_at =
+            DateTime::from_timestamp(crate::pricing::PRO500_LAUNCH_UNIX, 0);
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::ProMax)),
+            Some((
+                HeadroomSubscriptionTier::Max20x,
+                HeadroomSubscriptionTier::Pro500,
+                TierRecommendationSource::Codex
             ))
         );
     }
