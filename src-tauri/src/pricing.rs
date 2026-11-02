@@ -23,9 +23,6 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
-/// 2026-11-03T00:00:00Z: Max x20 subscriptions started before the Pro 500 tier
-/// existed cover a ChatGPT Pro $500 plan (see `detect_tier_mismatch`).
-const PRO500_LAUNCH_UNIX: i64 = 1_793_664_000;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
 /// AppSumo free-year accounts (the $0 tier 1 for Plus members) are pushed to
 /// upgrade faster: the clamp fires on their 4th active day (a local day with
@@ -1009,6 +1006,8 @@ struct RemoteAccountResponse {
     #[serde(default)]
     grandfathered: bool,
     #[serde(default)]
+    pro500_grandfathered: bool,
+    #[serde(default)]
     payment_failed: bool,
     #[serde(default)]
     referral_code: Option<String>,
@@ -1226,7 +1225,8 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, account.as_ref()));
     let tier_mismatch = resolve_tier_mismatch(
         account.as_ref(),
         &claude,
@@ -1361,7 +1361,7 @@ fn fetch_codex_usage(
     if !crate::client_adapters::is_codex_enabled() {
         return None;
     }
-    let plan_tier = state.codex_plan_tier();
+    let plan_tier = codex_plan_for_pricing(state.codex_plan_tier(), account);
     // Identical activation ladder to the Claude branch: subscription (metered
     // only when clamped) > active trial > grandfathered (metered) > hard block.
     let (activation, invite_bonus) = match account {
@@ -1782,7 +1782,8 @@ pub(crate) fn verify_auth_code_with_base_url(
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, Some(&account)));
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
@@ -1972,7 +1973,8 @@ pub(crate) fn activate_account_with_retry_backoff(
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, Some(&account)));
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
@@ -2680,14 +2682,23 @@ fn detect_tier_mismatch(
         (None, Some(x)) => (x, TierRecommendationSource::Codex),
         (None, None) => return None,
     };
-    // Max x20 was sold for ChatGPT Pro $500 until Pro 500 existed, so those
-    // subscriptions keep covering it (headroom-web applies the same cutoff).
-    let grandfathered = paid == HeadroomSubscriptionTier::Max20x
-        && recommended == HeadroomSubscriptionTier::Pro500
-        && account
-            .subscription_started_at
-            .is_none_or(|started| started.timestamp() < PRO500_LAUNCH_UNIX);
-    (!grandfathered && recommended.rank() > paid.rank()).then_some((paid, recommended, source))
+    (recommended.rank() > paid.rank()).then_some((paid, recommended, source))
+}
+
+/// The Codex plan as pricing reads it. Accounts headroom-web grandfathered
+/// (`User#pro500_grandfathered?`: ChatGPT Pro $500 or Ultra before Pro 500
+/// existed, AppSumo bought through November) keep the old mapping, so their
+/// ChatGPT Pro $500 prices like Pro $200 (Ultra). Telemetry keeps the raw claim.
+fn codex_plan_for_pricing(
+    plan: CodexPlanTier,
+    account: Option<&HeadroomAccountProfile>,
+) -> CodexPlanTier {
+    match plan {
+        CodexPlanTier::ProMax if account.is_some_and(|a| a.pro500_grandfathered) => {
+            CodexPlanTier::Pro
+        }
+        plan => plan,
+    }
 }
 
 /// Detects the mismatch and manages the persisted grace clock. Sets
@@ -3836,6 +3847,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         appsumo_lifetime_tier: value.appsumo_lifetime_tier,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
+        pro500_grandfathered: value.pro500_grandfathered,
         payment_failed: value.payment_failed,
         referral_code: value.referral_code,
         referral_signups: value.referral_signups,
@@ -4833,6 +4845,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5493,6 +5506,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5531,6 +5545,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5548,6 +5563,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: true,
+            pro500_grandfathered: false,
             ..expired_account(0.0)
         }
     }
@@ -6349,6 +6365,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -6389,6 +6406,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -8230,21 +8248,23 @@ mod tests {
     }
 
     #[test]
-    fn detect_tier_mismatch_grandfathers_max20x_bought_before_pro500() {
+    fn grandfathered_account_prices_chatgpt_pro_500_like_pro_200() {
         let claude = empty_claude_profile(ClaudePlanTier::Unknown);
         let mut account = active_subscriber(HeadroomSubscriptionTier::Max20x);
-        account.subscription_started_at =
-            DateTime::from_timestamp(crate::pricing::PRO500_LAUNCH_UNIX - 1, 0);
-        assert!(detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::ProMax)).is_none());
-        account.subscription_started_at =
-            DateTime::from_timestamp(crate::pricing::PRO500_LAUNCH_UNIX, 0);
+        let mismatch = |account: &HeadroomAccountProfile| {
+            let plan = crate::pricing::codex_plan_for_pricing(CodexPlanTier::ProMax, Some(account));
+            detect_tier_mismatch(account, &claude, Some(plan))
+        };
         assert_eq!(
-            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::ProMax)),
-            Some((
-                HeadroomSubscriptionTier::Max20x,
-                HeadroomSubscriptionTier::Pro500,
-                TierRecommendationSource::Codex
-            ))
+            mismatch(&account).map(|(_, rec, _)| rec),
+            Some(HeadroomSubscriptionTier::Pro500)
+        );
+        account.pro500_grandfathered = true;
+        assert_eq!(mismatch(&account), None);
+        account.subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+        assert_eq!(
+            mismatch(&account).map(|(_, rec, _)| rec),
+            Some(HeadroomSubscriptionTier::Max20x)
         );
     }
 

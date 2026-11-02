@@ -1519,6 +1519,10 @@ pub struct HeadroomAccountProfile {
     // older cached payloads (no field) still deserialize.
     #[serde(default)]
     pub grandfathered: bool,
+    /// headroom-web keeps this account on the pre-Pro 500 mapping (ChatGPT
+    /// Pro $500 priced like Pro $200); see `pricing::codex_plan_for_pricing`.
+    #[serde(default)]
+    pub pro500_grandfathered: bool,
     /// A renewal charge failed and Polar is still retrying it. The server
     /// already dropped the account to free, so this is the only sign a
     /// subscription exists that a card update would bring back.
