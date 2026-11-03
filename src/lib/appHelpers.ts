@@ -580,14 +580,18 @@ export function getNextLowerUpgradePlanId(
 
 /// The tier above `planId`, or null at the top. The companion card next to an
 /// active plan: this is the upgrade view, so the nearest step up earns the slot.
+/// Pro 500 is above Ultra only where `plans` lists it (getUpgradePlans).
 export function getNextHigherUpgradePlanId(
-  planId?: PaidUpgradePlanId | null
+  planId: PaidUpgradePlanId | null | undefined,
+  plans: UpgradePlan[]
 ): IndividualUpgradePlanId | null {
   switch (planId) {
     case "pro":
       return "max5x";
     case "max5x":
       return "max20x";
+    case "max20x":
+      return plans.some((plan) => plan.id === "pro500") ? "pro500" : null;
     default:
       return null;
   }

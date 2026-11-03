@@ -8,6 +8,7 @@ import {
   buildSetupStallMailto,
   describeInvokeError,
   forgoneSavingsLabel,
+  getNextHigherUpgradePlanId,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
@@ -182,6 +183,16 @@ describe("app helpers", () => {
       "pro",
       "max5x",
     ]);
+  });
+
+  it("pairs an active Ultra plan with Pro 500 only where it is listed", () => {
+    // Ultra on ChatGPT Pro $500: the step up is Pro 500, not the Max below.
+    const fits = getUpgradePlans("individual", undefined, "pro500", "max20x", true).plans;
+    expect(getNextHigherUpgradePlanId("max20x", fits)).toBe("pro500");
+    const ultra = getUpgradePlans("individual", "max20x", undefined, "max20x", true).plans;
+    expect(getNextHigherUpgradePlanId("max20x", ultra)).toBeNull();
+    expect(getNextHigherUpgradePlanId("pro", [])).toBe("max5x");
+    expect(getNextHigherUpgradePlanId("pro500", fits)).toBeNull();
   });
 
   it("lists Pro 500 only for those it fits or who own it", () => {

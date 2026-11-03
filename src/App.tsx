@@ -6911,10 +6911,11 @@ export default function App() {
   // Without this the change leaves no trace anywhere in the app.
   const pendingPlanChangeInfo = scheduledPlanChange(pricingStatus?.account);
   // The card beside the active plan: the nearest step up, since that is what
-  // this view is for. Only the top tier has none, and there the tier below it
-  // is the sole remaining move.
+  // this view is for. Only the top listed tier has none, and there the tier
+  // below it is the sole remaining move.
   const companionPlanId =
-    getNextHigherUpgradePlanId(activeHeadroomPlanId) ?? getNextLowerUpgradePlanId(activeHeadroomPlanId);
+    getNextHigherUpgradePlanId(activeHeadroomPlanId, upgradePlansState.plans) ??
+    getNextLowerUpgradePlanId(activeHeadroomPlanId);
   const visibleUpgradePlans = (() => {
     if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
       return upgradePlansState.plans;
