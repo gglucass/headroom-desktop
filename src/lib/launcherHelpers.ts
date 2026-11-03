@@ -19,7 +19,6 @@ export type LauncherStage =
   | "install"
   | "client_setup"
   | "autostart"
-  | "paywall"
   | "post_install";
 
 // Canonical install-wizard funnel steps, in order. Single source of truth for
@@ -92,9 +91,8 @@ export function isValidEmailAddress(email: string) {
 }
 
 // Mirrors headroom_tier_for_claude_plan / headroom_tier_for_codex_plan in
-// models.rs, with one paywall-specific difference: undetected/free maps to
-// `fallback` ("pro" by default: the paywall always recommends something)
-// instead of None. Pass null to get None back.
+// models.rs, with one difference: undetected/free maps to `fallback` ("pro"
+// by default) instead of None. Pass null to get None back.
 export function recommendedHeadroomTier(
   claudeTier: ClaudePlanTier | null | undefined,
   codexTier: CodexPlanTier | null | undefined,

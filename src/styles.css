@@ -6191,20 +6191,8 @@ html.window-hiding {
   cursor: not-allowed;
 }
 
-/* Paywall-first onboarding stage (launcher) */
-.paywall {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  width: 100%;
-}
-
-.paywall__detection {
-  color: var(--text-secondary);
-  font-size: var(--text-sm);
-  margin: 0;
-}
-
+/* Email sign-in form (AuthCodeForm) in the launcher's sign-up gate;
+   ReferralCard reuses the input style */
 .paywall__auth {
   display: flex;
   flex-direction: column;
@@ -6260,128 +6248,6 @@ html.window-hiding {
   .paywall__auth-reveal {
     animation: none;
   }
-}
-
-.paywall__plans {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(3, 1fr);
-}
-
-.paywall-card {
-  align-items: flex-start;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 14px;
-  position: relative;
-}
-
-.paywall-card--recommended {
-  border: 1px solid var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-tint);
-}
-
-.paywall-card__badge {
-  background: var(--accent-tint);
-  border-radius: 999px;
-  color: var(--accent);
-  font-size: var(--text-xxs);
-  font-weight: 600;
-  padding: 2px 8px;
-}
-
-.paywall-card__name {
-  color: var(--text-primary);
-  font-size: var(--text-base);
-}
-
-.paywall-card__price {
-  color: var(--text-primary);
-  font-size: var(--text-lg);
-  font-weight: 700;
-}
-
-.paywall-card__billing {
-  color: var(--text-muted);
-  font-size: var(--text-xs);
-}
-
-.paywall-card button {
-  margin-top: auto;
-  width: 100%;
-}
-
-.paywall__footnote {
-  color: var(--text-muted);
-  font-size: var(--text-xs);
-  margin: 0;
-  text-align: center;
-}
-
-.paywall__sale-banner {
-  align-self: center;
-  background: var(--accent-tint);
-  border: 1px solid var(--accent-tint-strong);
-  border-radius: 999px;
-  color: var(--accent);
-  font-size: var(--text-sm);
-  font-weight: 600;
-  margin: 0;
-  padding: 4px 14px;
-}
-
-.paywall-card__sale-row {
-  align-items: center;
-  display: flex;
-  gap: 6px;
-}
-
-.paywall .upgrade-billing-toggle {
-  align-self: center;
-}
-
-/* Paywall stage must fit the fixed launcher window: tighter type/spacing than
-   the other intro stages, with scroll as the safety valve. */
-.intro-shell--paywall {
-  overflow-y: auto;
-}
-
-.paywall {
-  gap: 10px;
-}
-
-.paywall h1 {
-  font-size: var(--text-lg);
-  margin: 0;
-}
-
-.paywall-card {
-  gap: 4px;
-  padding: 12px;
-}
-
-.paywall-card__fit {
-  color: var(--text-secondary);
-  font-size: var(--text-xs);
-}
-
-/* Paywall header: mid-size centered title so it outranks body copy without
-   reclaiming the hero scale that overflowed the window, and the intro copy
-   centered to match the banner/toggle/cards below it. */
-.paywall h1 {
-  /* align-self overrides the max-width:28ch cap from .intro-shell__copy h1,
-     which otherwise pins the title to a narrow left-sitting box. */
-  align-self: center;
-  font-size: 1.55rem;
-  margin: 6px 0 0;
-  text-align: center;
-}
-
-.paywall__detection {
-  margin: 0 auto;
-  max-width: 560px;
-  text-align: center;
 }
 
 .paywall__account-row {
