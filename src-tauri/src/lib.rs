@@ -8928,6 +8928,7 @@ fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
         HeadroomSubscriptionTier::Pro => "pro",
         HeadroomSubscriptionTier::Max5x => "max5x",
         HeadroomSubscriptionTier::Max20x => "max20x",
+        HeadroomSubscriptionTier::Pro500 => "pro500",
     }
 }
 

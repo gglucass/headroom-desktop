@@ -719,6 +719,18 @@ pub(crate) fn set_sentry_tier(tier: Option<String>) {
     *SENTRY_TIER.write().unwrap_or_else(|e| e.into_inner()) = tier;
 }
 
+/// The headroom-ai wheel the runtime receipt names, stamped as the
+/// `headroom_ai_version` tag. The app release alone does not say it: a host
+/// whose wheel upgrade failed boot validation rolls back and keeps the old
+/// wheel under the new app (RUST-HD on 0.9.53 ran pre-0.40 quarantine rules).
+static SENTRY_HEADROOM_AI: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub(crate) fn set_sentry_headroom_ai_version(version: Option<String>) {
+    *SENTRY_HEADROOM_AI
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = version;
+}
+
 /// sha256 of the hardware UUID, the same value `trial_identities.machine_id_digest`
 /// stores, so a crash can be joined to an install even when nobody is signed in.
 /// Sentry's own identity fields were empty on every fatal before this: RUST-HF/HG
@@ -744,6 +756,16 @@ fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
         if user.id.is_none() {
             user.id = Some(install.clone());
         }
+    }
+    if let Some(version) = SENTRY_HEADROOM_AI
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        event
+            .tags
+            .entry("headroom_ai_version".into())
+            .or_insert_with(|| version.clone());
     }
     let guard = SENTRY_TIER.read().unwrap_or_else(|e| e.into_inner());
     let Some(tier) = guard.as_ref() else {
@@ -1925,6 +1947,17 @@ mod tests {
             sent.tags.get("headroom.tier").map(String::as_str),
             Some("Max5x")
         );
+
+        super::set_sentry_headroom_ai_version(Some("0.39.0".into()));
+        let sent = std::thread::spawn(|| super::sanitize_event(sentry::protocol::Event::new()))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sent.tags.get("headroom_ai_version").map(String::as_str),
+            Some("0.39.0")
+        );
+        super::set_sentry_headroom_ai_version(None);
 
         super::set_sentry_tier(None);
         let mut event = sentry::protocol::Event::new();

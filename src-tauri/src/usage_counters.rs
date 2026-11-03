@@ -35,7 +35,9 @@ pub struct DayCounters {
     /// `intercept_request_counts` (`claude-code`, `codex`, `opencode`,
     /// `grok-build`).
     pub client_requests: BTreeMap<String, u64>,
-    /// Upstream HTTP 429 responses per client bucket.
+    /// Upstream HTTP 429 responses per client bucket, plus
+    /// `CLAUDE_USAGE_LIMIT_429_KEY`: the subset of `claude-code`'s 429s that
+    /// are the plan's usage limit rather than short-term throttling.
     pub rate_limit_429s: BTreeMap<String, u64>,
     /// Requests the user saw fail, per client bucket: any non-429 4xx or 5xx,
     /// and for Codex a dropped response or a 200 stream failed in-band. No
@@ -193,6 +195,12 @@ pub fn record_request(client: &str) {
         store.dirty = true;
     });
 }
+
+/// A SUBSET of the `claude-code` 429s, never added to it (like
+/// `claude-code-vscode` in `client_requests`): Anthropic marked the 429
+/// `anthropic-ratelimit-unified-status: rejected`, the plan's usage limit.
+/// Without it a throttled retry and a user stopped for hours count the same.
+pub const CLAUDE_USAGE_LIMIT_429_KEY: &str = "claude-code:usage-limit";
 
 /// Count one upstream HTTP 429 for a client bucket (today, local day).
 pub fn record_429(client: &str) {

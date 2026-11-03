@@ -31,10 +31,12 @@ export function claudePlanLabel(plan: ClaudePlanTier) {
       return "Claude Free";
     case "pro":
       return "Claude Pro";
+    // Anthropic renamed Max 5x to Max and Max 20x to Ultra (claude.com/pricing,
+    // 2026-10); the profile still reports max_5x / max_20x, so only labels move.
     case "max5x":
-      return "Claude Max x5";
+      return "Claude Max";
     case "max20x":
-      return "Claude Max x20";
+      return "Claude Ultra";
     case "api":
       return "Claude API";
     default:
@@ -47,9 +49,11 @@ export function subscriptionTierLabel(tier?: HeadroomSubscriptionTier | null) {
     case "pro":
       return "Pro";
     case "max5x":
-      return "Max x5";
+      return "Max";
     case "max20x":
-      return "Max x20";
+      return "Ultra";
+    case "pro500":
+      return "Pro 500";
     default:
       return "No paid Headroom plan";
   }

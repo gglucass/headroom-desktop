@@ -298,8 +298,8 @@ describe("launcher helpers", () => {
       expect(recommendedHeadroomTier(null, "business")).toBe("pro");
       // ChatGPT Pro $100 (claim prolite), the Claude Max x5 price point.
       expect(recommendedHeadroomTier(null, "prolite")).toBe("max5x");
-      // ChatGPT Pro $500 (claim promax), priced like Pro $200.
-      expect(recommendedHeadroomTier(null, "promax")).toBe("max20x");
+      // ChatGPT Pro $500 (claim promax) has its own tier.
+      expect(recommendedHeadroomTier(null, "promax")).toBe("pro500");
       expect(recommendedHeadroomTier(null, "self_serve_business_usage_based")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "self_serve_business_prolite")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "edu")).toBe("max5x");

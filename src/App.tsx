@@ -2310,7 +2310,7 @@ export default function App() {
     // next confident poll — that's what nagged users overnight. Leave the key;
     // it's overwritten only when we climb to a higher tier below.
     if (!mismatch) return;
-    const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3 };
+    const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3, pro500: 4 };
     const previous = window.localStorage.getItem(STORAGE_KEY);
     // Notify on first detection and whenever the recommended tier climbs higher.
     if (previous !== null && (rank[mismatch.recommendedTier] ?? 0) <= (rank[previous] ?? 0)) {
@@ -4893,7 +4893,8 @@ export default function App() {
           };
         case "pro":
         case "max5x":
-        case "max20x": {
+        case "max20x":
+        case "pro500": {
           // Same tier on the other billing period is a real change (Polar swaps
           // the product), not the plan you are already on.
           if (
@@ -6235,14 +6236,20 @@ export default function App() {
       "max5x"
     );
     // Fixed cheapest-first order, independent of the upgrade view's
-    // recommended-first sorting; mirrors the website pricing page.
-    const paywallPlans = (["pro", "max5x", "max20x"] as const)
+    // recommended-first sorting; mirrors the website pricing page. The grid
+    // holds three, so a ChatGPT Pro $500 user swaps Pro for Pro 500.
+    const paywallPlans = (
+      recommendedTier === "pro500"
+        ? (["max5x", "max20x", "pro500"] as const)
+        : (["pro", "max5x", "max20x"] as const)
+    )
       .map((id) => upgradePlansState.plans.find((plan) => plan.id === id))
       .filter((plan): plan is UpgradePlan => plan !== undefined);
     const paywallPlanFit: Record<string, string> = {
-      pro: "For Claude Pro or ChatGPT Plus",
-      max5x: "Claude Max x5 & ChatGPT Pro $100",
-      max20x: "Claude Max x20 & ChatGPT Pro"
+      pro: "Claude Pro, Team standard & ChatGPT Plus",
+      max5x: "Claude Max, Team premium & ChatGPT Pro $100",
+      max20x: "Claude Ultra & ChatGPT Pro $200",
+      pro500: "For ChatGPT Pro $500"
     };
     const signedIn = pricingStatus?.authenticated === true;
     return (
@@ -6802,7 +6809,8 @@ export default function App() {
   const paybackPlanId =
     upgradeDefaultPlanId === "pro" ||
     upgradeDefaultPlanId === "max5x" ||
-    upgradeDefaultPlanId === "max20x"
+    upgradeDefaultPlanId === "max20x" ||
+    upgradeDefaultPlanId === "pro500"
       ? upgradeDefaultPlanId
       : null;
   // Item 1 - "pays for itself" anchor (recent monthly savings rate vs price).
@@ -6903,10 +6911,11 @@ export default function App() {
   // Without this the change leaves no trace anywhere in the app.
   const pendingPlanChangeInfo = scheduledPlanChange(pricingStatus?.account);
   // The card beside the active plan: the nearest step up, since that is what
-  // this view is for. Only the top tier has none, and there the tier below it
-  // is the sole remaining move.
+  // this view is for. Only the top listed tier has none, and there the tier
+  // below it is the sole remaining move.
   const companionPlanId =
-    getNextHigherUpgradePlanId(activeHeadroomPlanId) ?? getNextLowerUpgradePlanId(activeHeadroomPlanId);
+    getNextHigherUpgradePlanId(activeHeadroomPlanId, upgradePlansState.plans) ??
+    getNextLowerUpgradePlanId(activeHeadroomPlanId);
   const visibleUpgradePlans = (() => {
     if (showAllUpgradePlans || upgradePlansState.plans.length <= 2) {
       return upgradePlansState.plans;

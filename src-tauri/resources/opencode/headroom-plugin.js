@@ -12944,7 +12944,9 @@ function headroomShellEnv(proxyUrl, project, options) {
 }
 function openAiWireSuffix(pkg) {
   if (!pkg?.startsWith("@opencode/ai/providers/")) return void 0;
-  if (pkg === "@opencode/ai/providers/openai-compatible" || pkg.endsWith("/chat")) {
+  // Headroom Desktop patch, not in the wheel bundle: OpenCode 2.x serves OpenRouter
+  // chat models from their own package. Re-apply on each bundle copy (docs/wheel-bump.md).
+  if (pkg === "@opencode/ai/providers/openai-compatible" || pkg === "@opencode/ai/providers/openrouter" || pkg.endsWith("/chat")) {
     return "/chat/completions";
   }
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";

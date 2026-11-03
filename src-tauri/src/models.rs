@@ -1081,6 +1081,9 @@ pub enum HeadroomSubscriptionTier {
     Pro,
     Max5x,
     Max20x,
+    /// For ChatGPT Pro $500 (`promax`). headroom-web sends it only to builds
+    /// from 0.9.55-rc.4; older ones fail the whole account parse on it.
+    Pro500,
 }
 
 impl HeadroomSubscriptionTier {
@@ -1089,6 +1092,7 @@ impl HeadroomSubscriptionTier {
             HeadroomSubscriptionTier::Pro => 1,
             HeadroomSubscriptionTier::Max5x => 2,
             HeadroomSubscriptionTier::Max20x => 3,
+            HeadroomSubscriptionTier::Pro500 => 4,
         }
     }
 }
@@ -1152,7 +1156,7 @@ pub enum CodexPlanTier {
     ProLite,
     Pro,
     /// ChatGPT Pro $500 (claim `promax`), first seen 2026-09-29 when OpenAI
-    /// reopened Pro at $100/$200/$500. Priced like Pro: Max x20.
+    /// reopened Pro at $100/$200/$500. Has its own Headroom tier, Pro 500.
     #[serde(rename = "promax")]
     ProMax,
     Team,
@@ -1230,8 +1234,9 @@ impl CodexPlanTier {
 ///   map that claim to Max x5/x20 -- do not re-bump Standard seats.
 /// - Self-serve usage-based -> Max x5: credit-billed Codex seats with no fixed
 ///   seat price; spend is open-ended, so pitch the middle tier.
-/// - Pro ($200) / Pro $500 (`promax`) -> Max x20: individual already paying
-///   top dollar. Pro $100 is `ProLite` (above).
+/// - Pro ($200) -> Max x20: individual already paying top dollar. Pro $100 is
+///   `ProLite` (above).
+/// - Pro $500 (`promax`) -> Pro 500, the tier priced for it.
 /// - Enterprise / enterprise CBP usage-based -> Max x20: $60+/seat at a 150-seat
 ///   minimum, the genuine high-budget tier.
 /// - Edu / Education -> Max x5: institutional but discounted. OpenAI mints
@@ -1253,10 +1258,10 @@ pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubs
         | CodexPlanTier::Edu
         | CodexPlanTier::Education => Some(HeadroomSubscriptionTier::Max5x),
         CodexPlanTier::Pro
-        | CodexPlanTier::ProMax
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
         | CodexPlanTier::Unknown => Some(HeadroomSubscriptionTier::Max20x),
+        CodexPlanTier::ProMax => Some(HeadroomSubscriptionTier::Pro500),
         CodexPlanTier::Free => None,
     }
 }
@@ -1514,6 +1519,10 @@ pub struct HeadroomAccountProfile {
     // older cached payloads (no field) still deserialize.
     #[serde(default)]
     pub grandfathered: bool,
+    /// headroom-web keeps this account on the pre-Pro 500 mapping (ChatGPT
+    /// Pro $500 priced like Pro $200); see `pricing::codex_plan_for_pricing`.
+    #[serde(default)]
+    pub pro500_grandfathered: bool,
     /// A renewal charge failed and Polar is still retrying it. The server
     /// already dropped the account to free, so this is the only sign a
     /// subscription exists that a card update would bring back.
@@ -1758,9 +1767,16 @@ mod tests {
         ] {
             assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Pro));
         }
+        assert_eq!(
+            headroom_tier_for_codex_plan(&CodexPlanTier::ProMax),
+            Some(HeadroomSubscriptionTier::Pro500)
+        );
+        assert_eq!(
+            serde_json::to_value(HeadroomSubscriptionTier::Pro500).unwrap(),
+            json!("pro500")
+        );
         for plan in [
             CodexPlanTier::Pro,
-            CodexPlanTier::ProMax,
             CodexPlanTier::Enterprise,
             CodexPlanTier::EnterpriseCbpUsageBased,
         ] {

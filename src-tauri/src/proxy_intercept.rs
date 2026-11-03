@@ -819,6 +819,11 @@ impl<R> ResponseSniffer<R> {
             let header = |name: &str| extract_header_value(&self.buf, name);
             let usage_limit = self.status == Some(429)
                 && header("anthropic-ratelimit-unified-status").as_deref() == Some("rejected");
+            if usage_limit {
+                crate::usage_counters::record_429(
+                    crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY,
+                );
+            }
             crate::tip_signals::note_claude_response(
                 header("anthropic-ratelimit-unified-overage-in-use").as_deref() == Some("true"),
                 usage_limit.then(|| {
@@ -3645,9 +3650,11 @@ fn report_upstream_error(
     // 429 above, applied one level deeper because the status alone does not say
     // it -- a 403 can also be an org-verification challenge, which IS
     // actionable, so the body's `code` is what splits them. RUST-4H collected
-    // 139 of these from hosts in unsupported regions. The raw body still
-    // reaches the local log::warn! above.
-    if is_geo_blocked_codex_error(&body) {
+    // 139 of these from hosts in unsupported regions. Anthropic's edge does the
+    // same for claude-code. The raw body still reaches the local log::warn! above.
+    if is_geo_blocked_codex_error(&body)
+        || (client == "claude-code" && is_geo_blocked_anthropic_error(&body))
+    {
         return;
     }
     // 401 splits on the body, like the geo-block above: "Missing bearer" means
@@ -3806,6 +3813,15 @@ fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
     };
     let err = json.get("error").unwrap_or(&json);
     err.get("code").and_then(|v| v.as_str()) == Some("unsupported_country_region_territory")
+}
+
+/// True when Anthropic refused a request for the country it came from: its edge
+/// answers with `error.type` `forbidden` ("Request not allowed"), a type the API
+/// reference never lists. RUST-TN (Hong Kong) and RUST-C5's two `forbidden`
+/// events (Russia) were all this. Account refusals are `permission_error` and
+/// stay reported.
+fn is_geo_blocked_anthropic_error(body: &[u8]) -> bool {
+    error_body_json(body).is_some_and(|v| v["error"]["type"] == "forbidden")
 }
 
 /// True when a 413 is the backend refusing to forward after its own compression
@@ -4817,11 +4833,20 @@ async fn forward_direct_to_anthropic(
     };
     // Plugin-routed 429s are OpenCode's or Grok's, not Codex's or Claude's.
     if resp.status().as_u16() == 429 && plugin_route.is_none() {
-        crate::usage_counters::record_429(if is_codex_request_head(&parsed) {
-            "codex"
+        if is_codex_request_head(&parsed) {
+            crate::usage_counters::record_429("codex");
         } else {
-            "claude-code"
-        });
+            crate::usage_counters::record_429("claude-code");
+            if resp
+                .headers()
+                .get("anthropic-ratelimit-unified-status")
+                .is_some_and(|v| v.as_bytes() == b"rejected")
+            {
+                crate::usage_counters::record_429(
+                    crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY,
+                );
+            }
+        }
     }
 
     let mut head = format!(
@@ -5664,14 +5689,14 @@ mod tests {
         grok_upstream_header, held_by_our_other_window, intercept_request_counts,
         is_ccr_retrieve_path, is_claude_session_id, is_client_probe_path, is_codex_request_head,
         is_codex_sse_response, is_compression_refused_error, is_counted_request,
-        is_failed_request_status, is_geo_blocked_codex_error, is_grok_inference_path,
-        is_grok_request, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, ollama_codex_direct_base, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        plugin_direct_url, probe_port, read_http_headers, request_has_header,
-        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
-        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        is_failed_request_status, is_geo_blocked_anthropic_error, is_geo_blocked_codex_error,
+        is_grok_inference_path, is_grok_request, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua,
+        ollama_codex_direct_base, os_error_key, parse_codex_rate_limit_headers, parse_request_head,
+        parse_response_status, plugin_direct_url, probe_port, read_http_headers,
+        request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
+        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
         stamp_request_header, strip_request_header, take_plugin_route, unreachable_cause,
@@ -7872,6 +7897,20 @@ mod tests {
     /// A response with nothing to capture stops once the head is read.
     #[test]
     fn sniffer_reads_plan_usage_from_every_status_of_a_claude_conversation() {
+        let usage_limit_429s = || {
+            let today = crate::storage::user_day(chrono::Local::now())
+                .format("%Y-%m-%d")
+                .to_string();
+            crate::usage_counters::recent_days()
+                .get(&today)
+                .and_then(|d| {
+                    d.rate_limit_429s
+                        .get(crate::usage_counters::CLAUDE_USAGE_LIMIT_429_KEY)
+                        .copied()
+                })
+                .unwrap_or(0)
+        };
+        let limit_429s_before = usage_limit_429s();
         let mut capped = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
             .with_savings_session(Some("sess-capped".into()));
         capped.observe(
@@ -7887,6 +7926,8 @@ mod tests {
         let signals = crate::tip_signals::observed();
         assert!(signals.usage_limit_hit && signals.extra_usage_in_use);
         assert_eq!(signals.usage_limit_resets_at, Some(4_102_444_800));
+        // ...and the synced counter that tells a plan limit from throttling.
+        assert_eq!(usage_limit_429s(), limit_429s_before + 1);
         let five = crate::claude_statusline::plan_usage()
             .and_then(|u| u.five_hour)
             .expect("5h window from the 429");
@@ -10151,6 +10192,23 @@ mod tests {
         assert!(!is_geo_blocked_codex_error(b""));
         // A null code must not panic or match.
         assert!(!is_geo_blocked_codex_error(br#"{"error":{"code":null}}"#));
+    }
+
+    #[test]
+    fn geo_blocked_anthropic_error_is_the_forbidden_type_only() {
+        // RUST-TN's region block, as JSON and as the backend's SSE error frame.
+        let body =
+            br#"{"type":"error","error":{"type":"forbidden","message":"Request not allowed"}}"#;
+        assert!(is_geo_blocked_anthropic_error(body));
+        let mut sse = b"event: error\ndata: ".to_vec();
+        sse.extend_from_slice(body);
+        assert!(is_geo_blocked_anthropic_error(&sse));
+        // An account-level refusal (RUST-TH) must still reach Sentry.
+        assert!(!is_geo_blocked_anthropic_error(
+            br#"{"type":"error","error":{"type":"permission_error","message":"m"}}"#
+        ));
+        assert!(!is_geo_blocked_anthropic_error(b"<html>forbidden</html>"));
+        assert!(!is_geo_blocked_anthropic_error(b""));
     }
 
     #[test]

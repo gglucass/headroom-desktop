@@ -1006,6 +1006,8 @@ struct RemoteAccountResponse {
     #[serde(default)]
     grandfathered: bool,
     #[serde(default)]
+    pro500_grandfathered: bool,
+    #[serde(default)]
     payment_failed: bool,
     #[serde(default)]
     referral_code: Option<String>,
@@ -1223,7 +1225,8 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, account.as_ref()));
     let tier_mismatch = resolve_tier_mismatch(
         account.as_ref(),
         &claude,
@@ -1358,7 +1361,7 @@ fn fetch_codex_usage(
     if !crate::client_adapters::is_codex_enabled() {
         return None;
     }
-    let plan_tier = state.codex_plan_tier();
+    let plan_tier = codex_plan_for_pricing(state.codex_plan_tier(), account);
     // Identical activation ladder to the Claude branch: subscription (metered
     // only when clamped) > active trial > grandfathered (metered) > hard block.
     let (activation, invite_bonus) = match account {
@@ -1663,6 +1666,7 @@ pub(crate) fn request_auth_code_with_base_url(
     let response = loop {
         let response = http_client()?
             .post(join_url(base_url, "desktop/auth/request_code"))
+            .timeout(AUTH_REQUEST_TIMEOUT)
             .json(&RequestCodePayload {
                 email: &trimmed,
                 identity: IdentityPayload::for_state(state),
@@ -1736,6 +1740,9 @@ pub(crate) fn verify_auth_code_with_base_url(
 
     let response = http_client()?
         .post(join_url(base_url, "desktop/auth/verify_code"))
+        .timeout(AUTH_REQUEST_TIMEOUT)
+        // The server picks the tier names this build can parse from it.
+        .header("X-Headroom-App-Version", env!("CARGO_PKG_VERSION"))
         .json(&VerifyCodePayload {
             email: &trimmed_email,
             code: trimmed_code,
@@ -1775,7 +1782,8 @@ pub(crate) fn verify_auth_code_with_base_url(
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, Some(&account)));
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
@@ -1965,7 +1973,8 @@ pub(crate) fn activate_account_with_retry_backoff(
     // still maps conservatively to Max x20.
     let codex_plan = crate::client_adapters::codex_connector_wanted()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
-        .flatten();
+        .flatten()
+        .map(|plan| codex_plan_for_pricing(plan, Some(&account)));
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
@@ -2674,6 +2683,22 @@ fn detect_tier_mismatch(
         (None, None) => return None,
     };
     (recommended.rank() > paid.rank()).then_some((paid, recommended, source))
+}
+
+/// The Codex plan as pricing reads it. Accounts headroom-web grandfathered
+/// (`User#pro500_grandfathered?`: ChatGPT Pro $500 or Ultra before Pro 500
+/// existed, AppSumo bought through November) keep the old mapping, so their
+/// ChatGPT Pro $500 prices like Pro $200 (Ultra). Telemetry keeps the raw claim.
+fn codex_plan_for_pricing(
+    plan: CodexPlanTier,
+    account: Option<&HeadroomAccountProfile>,
+) -> CodexPlanTier {
+    match plan {
+        CodexPlanTier::ProMax if account.is_some_and(|a| a.pro500_grandfathered) => {
+            CodexPlanTier::Pro
+        }
+        plan => plan,
+    }
 }
 
 /// Detects the mismatch and manages the persisted grace clock. Sets
@@ -3567,13 +3592,18 @@ fn parse_oauth_profile_organization(
 /// observed in the wild (Claude Code parses the field as an opaque string, so
 /// this list grows via trial-identity telemetry): `team_standard` seats carry
 /// Pro-scale Claude limits, `team_tier_1` (premium) carries Max-5x-equivalent
-/// limits, `team_tier_2` is the higher premium level. Unknown values return
-/// `None` so callers fall through to the pre-seat-tier behavior.
+/// limits, `team_tier_2` is the higher premium level. Team variants name the
+/// seat by suffix (`team_labs_standard`, `team_labs_premium`,
+/// `team_bendep_nonprofit_premium`, seen 2026-10); a premium seat is 5x a
+/// standard one, the Max price point. Unknown values return `None` so callers
+/// fall through to the pre-seat-tier behavior.
 fn plan_tier_from_seat_tier(seat_tier: &str) -> Option<ClaudePlanTier> {
-    match seat_tier.trim().to_ascii_lowercase().as_str() {
-        "team_standard" => Some(ClaudePlanTier::Pro),
+    let seat = seat_tier.trim().to_ascii_lowercase();
+    match seat.as_str() {
         "team_tier_1" => Some(ClaudePlanTier::Max5x),
         "team_tier_2" => Some(ClaudePlanTier::Max20x),
+        s if s.starts_with("team_") && s.ends_with("_standard") => Some(ClaudePlanTier::Pro),
+        s if s.starts_with("team_") && s.ends_with("_premium") => Some(ClaudePlanTier::Max5x),
         _ => None,
     }
 }
@@ -3817,6 +3847,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         appsumo_lifetime_tier: value.appsumo_lifetime_tier,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
+        pro500_grandfathered: value.pro500_grandfathered,
         payment_failed: value.payment_failed,
         referral_code: value.referral_code,
         referral_signups: value.referral_signups,
@@ -4433,6 +4464,14 @@ fn http_client() -> Result<Client, String> {
         .map_err(|err| format!("Could not build HTTP client: {err}"))
 }
 
+/// Budget for the two sign-in calls, which a user waits on behind a spinner.
+/// The 8s client default cut off slow or lossy links far from our origin before
+/// the request ever reached it (RUST-CE/BG: 30 installs, mostly IN/AE/EG/BR/HK,
+/// none of the timed-out attempts in Railway's log while the server answers in
+/// under 0.5s), and Railway's edge holds a request up to 15s during a deploy
+/// switchover.
+const AUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn api_url(path: &str) -> String {
     join_url(&api_base_url(), path)
 }
@@ -4508,6 +4547,11 @@ fn policy_for_paid_tier(tier: HeadroomSubscriptionTier) -> PricingPolicy {
             nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
+        },
+        HeadroomSubscriptionTier::Pro500 => PricingPolicy {
+            nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
+            disable_threshold_percent: 25.0,
+            recommended_tier: HeadroomSubscriptionTier::Pro500,
         },
     }
 }
@@ -4801,6 +4845,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5461,6 +5506,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5499,6 +5545,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -5516,6 +5563,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: true,
+            pro500_grandfathered: false,
             ..expired_account(0.0)
         }
     }
@@ -6060,6 +6108,32 @@ mod tests {
     }
 
     #[test]
+    fn detect_plan_tier_team_variant_seats_classify_by_suffix() {
+        // Fleet shapes from 2026-10: default_raven + team_labs_standard was
+        // pitched Max x20 before the suffix match.
+        for (seat, rate) in [
+            ("team_labs_standard", "default_raven"),
+            ("team_labs_premium", "default_raven"),
+            ("team_bendep_nonprofit_premium", "default_raven"),
+        ] {
+            let p = with_seat_tier(
+                oauth_profile(Some(rate), Some("claude_team"), Some(Utc::now())),
+                seat,
+            );
+            let expected = if seat.ends_with("_standard") {
+                ClaudePlanTier::Pro
+            } else {
+                ClaudePlanTier::Max5x
+            };
+            assert_eq!(detect_plan_tier_from_profile(&p).0, expected, "{seat}");
+        }
+        assert_eq!(
+            crate::pricing::plan_tier_from_seat_tier("enterprise_usage_based"),
+            None
+        );
+    }
+
+    #[test]
     fn detect_plan_tier_team_tier_2_seat_is_max20x() {
         let p = with_seat_tier(
             oauth_profile(Some("raven"), Some("claude_team"), Some(Utc::now())),
@@ -6291,6 +6365,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -6331,6 +6406,7 @@ mod tests {
             appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
+            pro500_grandfathered: false,
             payment_failed: false,
             referral_code: None,
             referral_signups: 0,
@@ -8168,6 +8244,27 @@ mod tests {
                 HeadroomSubscriptionTier::Max20x,
                 TierRecommendationSource::Claude
             ))
+        );
+    }
+
+    #[test]
+    fn grandfathered_account_prices_chatgpt_pro_500_like_pro_200() {
+        let claude = empty_claude_profile(ClaudePlanTier::Unknown);
+        let mut account = active_subscriber(HeadroomSubscriptionTier::Max20x);
+        let mismatch = |account: &HeadroomAccountProfile| {
+            let plan = crate::pricing::codex_plan_for_pricing(CodexPlanTier::ProMax, Some(account));
+            detect_tier_mismatch(account, &claude, Some(plan))
+        };
+        assert_eq!(
+            mismatch(&account).map(|(_, rec, _)| rec),
+            Some(HeadroomSubscriptionTier::Pro500)
+        );
+        account.pro500_grandfathered = true;
+        assert_eq!(mismatch(&account), None);
+        account.subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+        assert_eq!(
+            mismatch(&account).map(|(_, rec, _)| rec),
+            Some(HeadroomSubscriptionTier::Max20x)
         );
     }
 

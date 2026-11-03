@@ -104,6 +104,7 @@ export function recommendedHeadroomTier(
     pro: 1,
     max5x: 2,
     max20x: 3,
+    pro500: 4,
   };
   const fromClaude: HeadroomSubscriptionTier | null =
     claudeTier === "pro" ? "pro"
@@ -123,10 +124,11 @@ export function recommendedHeadroomTier(
         codexTier === "education"
       ? "max5x"
     : codexTier === "pro" ||
-        codexTier === "promax" ||
         codexTier === "enterprise" ||
         codexTier === "enterprise_cbp_usage_based"
       ? "max20x"
+    : codexTier === "promax"
+      ? "pro500"
     : null;
   const candidates = [fromClaude, fromCodex].filter(
     (t): t is HeadroomSubscriptionTier => t !== null
