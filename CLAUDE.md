@@ -17,7 +17,7 @@ Every line here is re-sent with every request. A rule set needed for only one ki
 - If a test cannot be run in this environment, say so explicitly rather than skipping silently.
 
 ## Wheel Bump Rules
-- Read [docs/wheel-bump.md](docs/wheel-bump.md) before changing `HEADROOM_PINNED_VERSION`, a wheel URL/sha256, a vendor in `SITECUSTOMIZE_PY` or its `scripts/verify-*.py` probe, or a backend spawn env/flag (HEADROOM_HOST, HEADROOM_UDS, HEADROOM_HARD_WATCHDOG_SECS, HEADROOM_PROCESS_TRUST, HEADROOM_CA_BUNDLE, `--no-rate-limit`), and before debugging a proxy symptom or customer report that could be a known wheel bug. It holds the per-bump checklist, every vendored fix by symptom with its kill switch, and why each spawn setting exists. The pin is `0.41.0`.
+- Read [docs/wheel-bump.md](docs/wheel-bump.md) before changing `HEADROOM_PINNED_VERSION`, a wheel URL/sha256, a vendor in `SITECUSTOMIZE_PY` or its `scripts/verify-*.py` probe, or a backend spawn env/flag (HEADROOM_HOST, HEADROOM_UDS, HEADROOM_HARD_WATCHDOG_SECS, HEADROOM_PROCESS_TRUST, HEADROOM_CA_BUNDLE, `--no-rate-limit`), and before debugging a proxy symptom or customer report that could be a known wheel bug. It holds the per-bump checklist, every vendored fix by symptom with its kill switch, and why each spawn setting exists. The pin is `0.42.0`.
 
 ## Runtime Lock Rules
 - Every entry in `src-tauri/python/*.lock` carries `--hash` lines, so pip runs in hash-checking mode. After ANY pin change run `python3 scripts/hash-python-locks.py`; `bundled_locks_carry_a_hash_for_every_requirement` fails on an unhashed entry.

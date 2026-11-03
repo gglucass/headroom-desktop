@@ -24,6 +24,7 @@
 # pip 26.2.2 added (2026-10-21) for the same incident (see the macOS lock).
 # 0.41.0's core requires_dist adds truststore>=0.10.0, so truststore 0.10.4
 # (the macOS and Windows locks' pin, a pure-Python wheel) is added here.
+# 0.42.0: hf-xet 1.5.1 -> 1.6.0, its new core floor (see the macOS lock).
 # ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
 # only two binaries, used only by the opt-in --intercept-tool-results the app never
 # passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
@@ -153,9 +154,9 @@ h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 h2==4.4.1 \
     --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6
-hf-xet==1.5.1 \
-    --hash=sha256:892e3a3a3aecc12aded8b93cf4f9cd059282c7de0732f7d55026f3abdf474350 \
-    --hash=sha256:a93df2039190502835b1db8cd7e178b0b7b889fe9ab51299d5ced26e0dd879a4
+hf-xet==1.6.0 \
+    --hash=sha256:0e6e21fa3cdfcdcd76748564bf593870a5e013f47d97cf10aed63aa222cff5b7 \
+    --hash=sha256:d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f
 hpack==4.2.0 \
     --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
 httpcore==1.0.9 \
