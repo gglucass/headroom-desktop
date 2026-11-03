@@ -934,7 +934,7 @@ fn os_failure_fingerprint(msg: &str) -> Option<[String; 2]> {
         return None;
     }
     let before = msg[..at].trim_end();
-    let head = before.rfind(": ").map_or(before, |cut| &before[..cut]);
+    let head = cut_at_first_path(before.rfind(": ").map_or(before, |cut| &before[..cut]));
     // Digits out, as `warning_repeat` does for unfingerprinted text: the head
     // often names an atomic_write temp file (`.tmp.<pid>.<n>`), which made
     // every retry of one stuck write a new issue past the daily throttle.
@@ -944,6 +944,28 @@ fn os_failure_fingerprint(msg: &str) -> Option<[String; 2]> {
         .filter(|c| !c.is_ascii_digit())
         .collect();
     Some([head, format!("os error {code}")])
+}
+
+/// The call site before the first path in `head`. The file is the instance,
+/// not the bug: one machine's protected dotfiles filed one issue per file
+/// (RUST-TT/TV), as did one exhausted kernel pool (RUST-PR/PS/PT/PV). The path
+/// still rides along in the title. A head that starts with a path is kept whole.
+/// File paths are home-scrubbed (`~`) or Windows (`C:\`, `\\server`); a bare
+/// `/` is not one, since `headroom /stats fetch failed` would cut to `headroom`.
+fn cut_at_first_path(head: &str) -> &str {
+    let mut at = 0;
+    for word in head.split(' ') {
+        let w = word
+            .trim_start_matches(['\'', '"', '(', '[', '`'])
+            .as_bytes();
+        let rooted = matches!(w.first(), Some(b'~' | b'\\'));
+        let drive = w.len() > 2 && w[0].is_ascii_alphabetic() && matches!(&w[1..3], b":\\" | b":/");
+        if at > 0 && (rooted || drive) {
+            return head[..at].trim_end();
+        }
+        at += word.len() + 1;
+    }
+    head
 }
 
 impl Log for FileLogger {
@@ -1062,11 +1084,28 @@ mod tests {
         let ja = f("pre-update snapshot: cannot create ~/config/pre-update: \u{6307}\u{5b9a} (os error 161)").unwrap();
         let en = f("pre-update snapshot: cannot create ~/config/pre-update: The specified path is invalid. (os error 161)").unwrap();
         assert_eq!(ja, en);
-        assert_eq!(
-            ja[0],
-            "pre-update snapshot: cannot create ~/config/pre-update"
-        );
+        assert_eq!(ja[0], "pre-update snapshot: cannot create");
         assert_eq!(ja[1], "os error 161");
+
+        // RUST-TT/TV: one machine's protected dotfiles, one issue per file.
+        // The call site and code group them, on either OS.
+        let zprofile =
+            f("skipping shell profile ~/.zprofile: Operation not permitted (os error 1)").unwrap();
+        let zshrc =
+            f("skipping shell profile ~/.zshrc: Operation not permitted (os error 1)").unwrap();
+        let windows =
+            f(r"skipping shell profile ~\.bashrc: Access is denied. (os error 1)").unwrap();
+        assert_eq!(zprofile, zshrc);
+        assert_eq!(zprofile, windows);
+        assert_eq!(zprofile[0], "skipping shell profile");
+        let drive = f(r"failed to read C:\Tools\x.json: Access is denied. (os error 5)").unwrap();
+        assert_eq!(drive[0], "failed to read");
+        // A head that is only a path keeps it rather than grouping on nothing.
+        let bare = f("~/.zshrc: Operation not permitted (os error 1)").unwrap();
+        assert_eq!(bare[0], "~/.zshrc");
+        // A URL path is not a file: the call site keeps its own words.
+        let url = f("headroom /stats fetch failed: connection refused (os error 61)").unwrap();
+        assert_eq!(url[0], "headroom /stats fetch failed");
 
         // atomic_write's temp name carries the pid and a counter, so without
         // the digit strip every retry of one stuck write was a new issue and
