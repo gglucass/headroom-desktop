@@ -1,6 +1,5 @@
-// Email + one-time-code sign-in block. Controlled by App state/handlers so the
-// same form renders inside TermsGate (paywall-first onboarding) and the
-// launcher paywall stage without duplicating auth logic.
+// Email + one-time-code sign-in block, rendered inside TermsGate on a fresh
+// install (paywall-first onboarding). Controlled by App state/handlers.
 export interface AuthCodeFormProps {
   lead?: string;
   email: string;

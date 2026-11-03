@@ -104,7 +104,6 @@ import {
   getUpgradePlans,
   withCodexPlanNames,
   upgradeRecommendedTier,
-  type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
   ownedForLife,
@@ -190,7 +189,6 @@ import {
   needsTermsAcceptance,
   nextAutoConfigureStep,
   nextAutoConfigureStepAfterApply,
-  recommendedHeadroomTier,
   type LauncherStage,
   type MagicLinkState,
   type InstallWizardStep,
@@ -531,7 +529,7 @@ function reportFunnelStep(step: FunnelStep): void {
 }
 
 // Which funnel step each launcher stage's first paint represents. `install`
-// (the landing screen) and `paywall` have no beacon: for new users the
+// (the landing screen) has no beacon: for new users the
 // terms+email sign-up gate renders on top of the launcher, so the first real
 // screen is captured by `signup_gate_shown`, not a launcher stage.
 const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
@@ -2639,46 +2637,6 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, launcherStage]);
 
-  // Paywall stage: poll pricing status so the tier recommendation appears as
-  // soon as the first proxied request lands, and so a completed checkout
-  // (deep link or the 5-minute checkout poll) flips subscriptionActive here.
-  useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "paywall") {
-      return;
-    }
-    trackAnalyticsEvent("paywall_shown", {});
-    let active = true;
-    const poll = () => {
-      invoke<HeadroomPricingStatus>("get_headroom_pricing_status")
-        .then((status) => {
-          if (active) setPricingStatus(status);
-        })
-        .catch(() => {});
-    };
-    poll();
-    const interval = window.setInterval(poll, 3000);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [windowLabel, launcherStage]);
-
-  // Post-checkout resume: the subscription is live, so move to the install
-  // stage and start the (now gate-passing) bootstrap automatically.
-  useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "paywall") {
-      return;
-    }
-    if (pricingStatus?.account?.subscriptionActive) {
-      trackAnalyticsEvent("paywall_checkout_completed", {
-        plan_id: pricingStatus.account.subscriptionTier ?? undefined
-      });
-      setLauncherStage("install");
-      void handleBootstrap();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- fires when subscriptionActive flips; the tier only labels the analytics event
-  }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
-
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
@@ -4700,7 +4658,7 @@ export default function App() {
       reportFunnelStep("email_code_requested");
       setAuthCodeRequestedFor(result.email);
       // Main window only: localStorage is shared per origin, so a request
-      // made on the launcher paywall would otherwise resurface here on the
+      // made on the launcher's sign-up gate would otherwise resurface here on the
       // next mount. Best effort: the code is already sent, so a storage
       // failure must not turn into a "could not send" error.
       if (windowLabel === "main") {
@@ -4758,7 +4716,7 @@ export default function App() {
       reportFunnelStep("email_code_verified");
       setAuthFlowSuccess("Headroom account connected.");
       setPendingUpgradePlanId(null);
-      // The launcher paywall renders its own sign-in inline; switching the
+      // The launcher's sign-up gate renders its own sign-in inline; switching the
       // (hidden) main-window view would be meaningless there.
       if (windowLabel !== "launcher") {
         setActiveView("upgrade");
@@ -6221,158 +6179,6 @@ export default function App() {
           >
             Continue
           </button>
-        </div>
-      </LauncherShell>
-    );
-  }
-
-  if (windowLabel === "launcher" && launcherStage === "paywall") {
-    // Pre-install there is no proxied traffic, so detection normally yields
-    // nothing and the recommendation defaults to Max x5 — this is a self-select
-    // screen. Detected tiers still win if they happen to exist.
-    const recommendedTier = recommendedHeadroomTier(
-      pricingStatus?.claude?.planTier ?? null,
-      pricingStatus?.codexPlanTier ?? null,
-      "max5x"
-    );
-    // Fixed cheapest-first order, independent of the upgrade view's
-    // recommended-first sorting; mirrors the website pricing page. The grid
-    // holds three, so a ChatGPT Pro $500 user swaps Pro for Pro 500.
-    const paywallPlans = (
-      recommendedTier === "pro500"
-        ? (["max5x", "max20x", "pro500"] as const)
-        : (["pro", "max5x", "max20x"] as const)
-    )
-      .map((id) => upgradePlansState.plans.find((plan) => plan.id === id))
-      .filter((plan): plan is UpgradePlan => plan !== undefined);
-    const paywallPlanFit: Record<string, string> = {
-      pro: "Claude Pro, Team standard & ChatGPT Plus",
-      max5x: "Claude Max, Team premium & ChatGPT Pro $100",
-      max20x: "Claude Ultra & ChatGPT Pro $200",
-      pro500: "For ChatGPT Pro $500"
-    };
-    const signedIn = pricingStatus?.authenticated === true;
-    return (
-      <LauncherShell
-        shellClassName="intro-shell intro-shell--paywall"
-        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
-        copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleWindowDragMouseDown}
-        version={appSemver}
-      >
-        <div className="paywall">
-          <h1>Pick your Headroom plan</h1>
-          <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
-            {(["monthly", "annual"] as const).map((period) => (
-              <button
-                key={period}
-                className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
-                onClick={() => setBillingPeriod(period)}
-                type="button"
-              >
-                {period === "annual" ? (
-                  <>Annual <span className="upgrade-billing-toggle__save">Save 25%</span></>
-                ) : "Monthly"}
-              </button>
-            ))}
-          </div>
-          {pricingStatus?.introOffer?.active ? (
-            <p className="paywall__sale-banner">
-              🎉 Intro offer: {pricingStatus.introOffer.percentOff}% off your first{" "}
-              {pricingStatus.introOffer.durationMonths} months • on every plan
-            </p>
-          ) : null}
-          <p className="paywall__detection">
-            Pick the tier that matches your Claude or ChatGPT plan • <strong>free trial: 7 days of use</strong>.
-          </p>
-          {!signedIn ? (
-            <AuthCodeForm
-              lead="Sign in to subscribe. We'll email you a one-time code."
-              email={authEmail}
-              onEmailChange={setAuthEmail}
-              emailValid={authEmailValid}
-              code={authCode}
-              onCodeChange={setAuthCode}
-              codeRequested={authCodeRequestedFor !== null}
-              requestBusy={authRequestBusy}
-              verifyBusy={authVerifyBusy}
-              error={authFlowError}
-              success={authFlowSuccess}
-              onRequestCode={() => void handleRequestAuthCode()}
-              onVerify={() => void handleVerifyAuthCode()}
-            />
-          ) : null}
-          <div className="paywall__plans">
-            {paywallPlans.map((plan) => {
-              const isRecommended = plan.id === recommendedTier;
-              return (
-                <article
-                  className={`soft-card paywall-card${isRecommended ? " paywall-card--recommended" : ""}`}
-                  key={plan.id}
-                >
-                  <strong className="paywall-card__name">{plan.name}</strong>
-                  <span className="paywall-card__fit">
-                    {paywallPlanFit[plan.id] ?? plan.tagline}
-                  </span>
-                  {plan.originalPrice ? (
-                    <span className="paywall-card__sale-row">
-                      <s className="upgrade-plan-card__original-price">
-                        {plan.originalPrice}
-                      </s>
-                      <span className="upgrade-plan-card__sale-badge">
-                        {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
-                          `${(pricingStatus?.activePercentOff ?? 0) || 50}% off`}
-                      </span>
-                    </span>
-                  ) : null}
-                  <span className="paywall-card__price">{plan.price}</span>
-                  <span className="paywall-card__billing">
-                    {plan.billingLines.join(" ")}
-                  </span>
-                  <button
-                    className={isRecommended ? "primary-button" : "secondary-button"}
-                    disabled={!signedIn || upgradeActionBusy !== null}
-                    onClick={() => void handleUpgradeAction(plan.id)}
-                    type="button"
-                  >
-                    {upgradeActionBusy === plan.id
-                      ? "Opening checkout…"
-                      : `Start ${plan.name} trial`}
-                  </button>
-                </article>
-              );
-            })}
-          </div>
-          {upgradeActionError ? (
-            <p className="install-progress__error">{upgradeActionError}</p>
-          ) : null}
-          <p className="paywall__footnote">
-            <button
-              className="link-button"
-              onClick={() => openLinkFromClick("https://extraheadroom.com/features")}
-              type="button"
-            >
-              See all Headroom features
-            </button>
-            {" • "}
-            Headroom finalizes installing and starts optimizing right after checkout.
-          </p>
-          {signedIn ? (
-            <p className="paywall__footnote">
-              Signed in as {pricingStatus?.account?.email ?? authEmail}
-              {" • "}
-              <button
-                className="link-button"
-                onClick={() => void handleSignOutHeadroomAccount()}
-                type="button"
-              >
-                or use a different email
-              </button>
-            </p>
-          ) : null}
-          {signedIn && authFlowError ? (
-            <p className="install-progress__error">{authFlowError}</p>
-          ) : null}
         </div>
       </LauncherShell>
     );
