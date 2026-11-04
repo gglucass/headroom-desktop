@@ -2138,7 +2138,7 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
     }
 }
 const RTK_VERSION: &str = "1.1.0";
-const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
+const MARKITDOWN_PINNED_VERSION: &str = "0.1.9";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
 
@@ -8464,12 +8464,12 @@ impl ToolManager {
         // Even after a failure: pip keeps the packages it installed before it.
         self.remove_olefile();
         installed?;
-        // markitdown's own pins move lock packages below their hashed pins:
-        // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
-        // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
-        // back every lock package the install changed, found by diffing the
-        // venv's dist-info dirs, so a future pin moving another one is caught
-        // too. magika 1.0.3 and onnxruntime 1.27.0 both run markitdown 0.1.7.
+        // markitdown's own pins can move lock packages off their hashed pins:
+        // 0.1.7's magika~=0.6.1 did everywhere, and on Windows its onnxruntime
+        // too (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass).
+        // 0.1.9 accepts the lock's magika 1.0.3 and moves nothing. Put back
+        // every lock package an install changed, found by diffing the venv's
+        // dist-info dirs, so a future pin moving one is caught too.
         // Warn-only: failing here would take the addon down over a pin.
         let lock = bootstrap_requirements_lock();
         let moved: Vec<String> = moved_lock_packages(
