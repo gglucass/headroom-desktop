@@ -9897,6 +9897,16 @@ fn learn_failure_is_agent_config_broken(text: &str) -> bool {
         || text.contains("Error loading config.toml")
 }
 
+/// The agent's Windows launcher points at a program that is not there: npm's
+/// `claude.cmd` shim runs `node_modules\@anthropic-ai\claude-code\bin\claude.exe`
+/// and cmd.exe could not find it (RUST-TX). Detection smoke-tests the shim with
+/// `--version` just before the scan, so the exe went missing mid-run (a Claude
+/// Code update swapping it) or the install is broken; the tail names the path.
+/// English only: cmd.exe localizes this line, so other locales still report.
+fn learn_failure_is_agent_install_broken(text: &str) -> bool {
+    text.contains("is not recognized as an internal or external command")
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
 fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
     let (cli, update) = match agent {
@@ -10403,6 +10413,7 @@ fn execute_headroom_learn_run(
                         && !agent_unparseable
                         && !agent_cli_outdated
                         && !learn_failure_is_agent_config_broken(diagnosis)
+                        && !learn_failure_is_agent_install_broken(diagnosis)
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -10628,6 +10639,7 @@ fn execute_headroom_learn_run(
                     || session_teardown
                     || agent_cli_outdated
                     || learn_failure_is_agent_config_broken(diagnosis)
+                    || learn_failure_is_agent_install_broken(diagnosis)
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -13141,24 +13153,24 @@ mod tests {
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
-        learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
-        learn_failure_is_agent_unparseable_output, learn_failure_signature,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        lost_base_retry_backoff, missing_dependency_modules, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        snap_to_work_area_edges, startup_error_fingerprint_key, store_checked_update,
-        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link,
-        upgrade_pip_network_refused, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        learn_failure_is_agent_config_broken, learn_failure_is_agent_install_broken,
+        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
+        learn_failure_signature, learn_failure_signature_source, learn_step_label,
+        lifetime_token_milestone_kind, lost_base_retry_backoff, missing_dependency_modules,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, snap_to_work_area_edges,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, upgrade_pip_network_refused,
+        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -17389,6 +17401,17 @@ Some unrelated content.
         ));
         assert!(!learn_failure_is_agent_config_broken(
             "LLM analysis failed: `codex exec` failed (exit 1):\nError: stream disconnected\n"
+        ));
+    }
+
+    #[test]
+    fn learn_failure_is_agent_install_broken_matches_a_shim_without_its_exe() {
+        // RUST-TX verbatim: npm's claude.cmd pointing at a missing claude.exe.
+        assert!(learn_failure_is_agent_install_broken(
+            "LLM analysis failed: `~\\AppData\\Roaming\\npm\\claude.CMD -p --output-format stream-json` failed (exit 1):\r\n'\"~\\AppData\\Roaming\\npm\\\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n"
+        ));
+        assert!(!learn_failure_is_agent_install_broken(
+            "LLM analysis failed: `claude -p` failed (exit 1):\nAPI Error: 500\n"
         ));
     }
 
