@@ -34,7 +34,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.41.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.42.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Kill the RUST-9F onnxruntime import probe after this long: a native
@@ -451,6 +451,10 @@ HEADROOM_LOOP_STALL_DUMP is set to a positive number of seconds.
 Can also write every thread's stack to HEADROOM_STARTUP_STALL_DUMP when the
 proxy has not bound its port HEADROOM_STARTUP_STALL_DUMP_SECS after start
 (desktop diagnostic, RUST-P1). The desktop sets both on Windows only.
+
+Also gives Windows' WMI queries a timeout, so a wedged WMI service cannot
+hold the backend's imports forever (RUST-F2). Kill switch:
+HEADROOM_WMI_TIMEOUT_SECS=0.
 """
 import faulthandler
 import os as _hd_os
@@ -468,6 +472,53 @@ except Exception:
 # Names of the patches below that bound in this process; summarized once at
 # the end (see _HD_VENDORS).
 _hd_bound = set()
+
+# --- WMI queries time out (posture, RUST-F2) -----------------------------------
+# Python 3.12's platform module asks WMI first for the Windows version, and
+# `_wmi.exec_query` bounds the connect (~1s) but not the read, so a wedged WMI
+# service blocks it forever. aiohttp calls platform.system() at import, so such
+# a backend never bound its port (stall dumps at 486s on two hosts, both in
+# platform._wmi_query). Past the timeout the query raises OSError, which
+# platform answers from sys.getwindowsversion() and `ver`, and WMI is not asked
+# again in this process (3.13's platform does the same after a failed query).
+# Arms wherever `_wmi` exists (Windows). The stuck query keeps a daemon thread.
+# Kill switch: HEADROOM_WMI_TIMEOUT_SECS=0.
+try:
+    import platform as _hd_platform
+
+    _hd_wmi_secs = _hd_os.environ.get("HEADROOM_WMI_TIMEOUT_SECS", "5")
+    if getattr(_hd_platform, "_wmi", None) is not None and _hd_wmi_secs.isdigit() and int(_hd_wmi_secs) > 0:
+        import threading as _hd_threading
+
+        _hd_wmi_query = _hd_platform._wmi_query
+        _hd_wmi_dead = []
+
+        def _hd_wmi_timed_query(*args, **kwargs):
+            if _hd_wmi_dead:
+                raise OSError("WMI timed out earlier in this process")
+            box = []
+
+            def run():
+                try:
+                    box.append((_hd_wmi_query(*args, **kwargs), None))
+                except BaseException as exc:
+                    box.append((None, exc))
+
+            worker = _hd_threading.Thread(target=run, name="headroom-wmi-query", daemon=True)
+            worker.start()
+            worker.join(int(_hd_wmi_secs))
+            if not box:
+                _hd_wmi_dead.append(True)
+                raise OSError("WMI query timed out after %ss" % _hd_wmi_secs)
+            result, exc = box[0]
+            if exc is not None:
+                raise exc
+            return result
+
+        _hd_platform._wmi_query = _hd_wmi_timed_query
+        _hd_bound.add("wmi_timeout")
+except Exception:
+    pass
 
 # --- Pre-bind stall dump (desktop diagnostic, RUST-P1) ------------------------
 # A backend that never binds its port is killed at the desktop's startup
@@ -594,7 +645,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # four-argument signature raised TypeError on every Anthropic request.
     try:
         from importlib import metadata as _hd_ci_meta
-        if (_hd_ci_meta.version("headroom-ai") == "0.41.0" and
+        if (_hd_ci_meta.version("headroom-ai") == "0.42.0" and
             _hd_os.environ.get("HEADROOM_CACHE_INTEGRITY", "1").strip().lower()
                 not in ("0", "false", "no", "off")):
             import contextvars as _hd_ci_cv
@@ -1063,13 +1114,13 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 # insert inside the message (valid whether the body is JSON or an SSE error event),
 # guarded so it never touches a StreamingResponse, a non-400, or an already-hinted
 # body. Fail-open: any error returns the original response untouched.
-# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
+# Exact-pin gated to wheel 0.42.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
 _hd_hint_flag = _hd_os.environ.get("HEADROOM_TOOL_REF_HINT", "1")
 if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_hint_meta
 
-        if _hd_hint_meta.version("headroom-ai") == "0.41.0":
+        if _hd_hint_meta.version("headroom-ai") == "0.42.0":
             from headroom.proxy.handlers import streaming as _hd_hint_mod
 
             _hd_hint_sig = b"not found in available tools"
@@ -1155,14 +1206,14 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
 # wheel's macOS CLI re-exec sets (#2879): without it libmalloc keeps the freed
 # blocks dirty and shrinking re-grew the arena to +3.8 GB. Windows and Linux are
 # unmeasured and never set it, so they keep the cap alone.
-# Exact-pin gated to wheel 0.41.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
+# Exact-pin gated to wheel 0.42.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
 # HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only).
 _hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
 if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_ebc_meta
 
-        if _hd_ebc_meta.version("headroom-ai") == "0.41.0":
+        if _hd_ebc_meta.version("headroom-ai") == "0.42.0":
             from headroom.relevance import embedding as _hd_ebc_mod
 
             _hd_ebc_shrink = (
@@ -1208,7 +1259,7 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # finalize_turn's confirmed_frozen_count is that floor; maturation gets the
 # larger of the two, so a cached Read stays verbatim, as the module documents.
 # Turns that skip the replay (cold cache, restart) keep the wheel's count.
-# Exact-pin gated to wheel 0.41.0 (0.42.0 still passes the clamped count).
+# Exact-pin gated to wheel 0.42.0, which still passes the clamped count.
 # Kill switch: HEADROOM_MATURATION_FLOOR=0.
 _hd_mf_flag = _hd_os.environ.get("HEADROOM_MATURATION_FLOOR", "1")
 if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -1216,7 +1267,7 @@ if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         import contextvars as _hd_mf_cv
         import importlib.metadata as _hd_mf_meta
 
-        if _hd_mf_meta.version("headroom-ai") == "0.41.0":
+        if _hd_mf_meta.version("headroom-ai") == "0.42.0":
             from headroom.proxy import session_engine as _hd_mf_se
             from headroom.transforms import read_maturation as _hd_mf_rm
 
@@ -1259,13 +1310,13 @@ if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # forwards on the guard's name verdict, the 0.38.0 behaviour; direct routes stay
 # pinned and internal answers are still refused. No self-neutralization: the
 # wheel has no blanket allow to detect, so re-check on each bump whether it grew
-# one. Exact-pin gated to wheel 0.41.0.
+# one. Exact-pin gated to wheel 0.42.0.
 _hd_pgu_flag = _hd_os.environ.get("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "")
 if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
     try:
         import importlib.metadata as _hd_pgu_meta
 
-        if _hd_pgu_meta.version("headroom-ai") == "0.41.0":
+        if _hd_pgu_meta.version("headroom-ai") == "0.42.0":
             from headroom.proxy import upstream_pinning as _hd_pgu_mod
 
             _hd_pgu_cls = _hd_pgu_mod.GuardedUpstreamRefusingTransport
@@ -1307,7 +1358,7 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
 # so a backend restarted sooner lost its warm-up replies (the train guest sat at
 # 10 after 35 of them, 2026-10-17): each warm-up reply is written until the
 # baseline reaches the target. Not a wheel bug, so it never self-neutralizes.
-# Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+# Exact-pin gated to wheel 0.42.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
 _hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
 if _hd_os.environ.get(
     "HEADROOM_SDK"
@@ -1315,7 +1366,7 @@ if _hd_os.environ.get(
     try:
         import importlib.metadata as _hd_ow_meta
 
-        if _hd_ow_meta.version("headroom-ai") == "0.41.0":
+        if _hd_ow_meta.version("headroom-ai") == "0.42.0":
             import contextvars as _hd_ow_cv
 
             from headroom.proxy import output_savings as _hd_ow_os
@@ -1402,19 +1453,19 @@ if _hd_os.environ.get(
 # --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
 # The learn prompt asks for each rule's content as "1-3 bullet points", and a
 # model that returns them as a JSON array killed the whole analysis: the wheel's
-# _parse_llm_response (0.39.0 through 0.41.0) calls .strip() on section/content
+# _parse_llm_response (0.39.0 through 0.42.0) calls .strip() on section/content
 # unchecked ("'list' object has no attribute 'strip'", RUST-K5). Normalize first: a list of strings
 # becomes bullet lines (kept, where #2471 drops it), any other non-string
 # becomes "" so the parser skips that rule, and a null rules list reads as
 # empty. The desktop puts this file on the learn subprocess's PYTHONPATH too.
-# Exact-pin gated to wheel 0.41.0; self-neutralizes once the wheel carries
+# Exact-pin gated to wheel 0.42.0; self-neutralizes once the wheel carries
 # #2471's `_as_str`. Kill switch: HEADROOM_LEARN_RULE_COERCE=0.
 _hd_lrc_flag = _hd_os.environ.get("HEADROOM_LEARN_RULE_COERCE", "1")
 if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_lrc_meta
 
-        if _hd_lrc_meta.version("headroom-ai") == "0.41.0":
+        if _hd_lrc_meta.version("headroom-ai") == "0.42.0":
             from headroom.learn import analyzer as _hd_lrc_mod
 
             if not hasattr(_hd_lrc_mod, "_as_str"):
@@ -1463,14 +1514,14 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # block, and the prompt asks for a prior heading to be reused as written.
 # ClaudeCodeWriter ignores context_file, so only the analysis input changes.
 # The wheel merges worktrees itself (#3854), so merged projects are covered.
-# Exact-pin gated to wheel 0.41.0; self-neutralizes once the plugin or the
+# Exact-pin gated to wheel 0.42.0; self-neutralizes once the plugin or the
 # analyzer names CLAUDE.local.md. Kill switch: HEADROOM_LEARN_PRIOR_LOCAL=0.
 _hd_lpl_flag = _hd_os.environ.get("HEADROOM_LEARN_PRIOR_LOCAL", "1")
 if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_lpl_meta
 
-        if _hd_lpl_meta.version("headroom-ai") == "0.41.0":
+        if _hd_lpl_meta.version("headroom-ai") == "0.42.0":
             import inspect as _hd_lpl_inspect
             from pathlib import Path as _hd_lpl_Path
 
@@ -1678,62 +1729,25 @@ if _hd_lse_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
-# --- Learn: the digest's loop section fits its budget (vendor, upstream owed) --
-# _build_digest budgets the per-session event stream but renders every detected
-# loop ahead of it, each with every message index it repeated at. Codex learn is
-# one project holding every session the machine ever ran, so on a heavy user the
-# loops alone outgrew the digest and Codex refused every scan's 1.79M-char prompt
-# over its 1,048,576-char input cap (RUST-QV). Only the costliest
-# max_tokens // 400 loops are rendered (detect_loops sorts by waste), each with
-# its first 20 indices beside its count: under a quarter of the digest budget,
-# halving with it on the prompt-too-long retry. Loop weighting still sees every
-# loop. Exact-pin gated to wheel 0.41.0. Kill switch: HEADROOM_LEARN_LOOP_BUDGET=0.
-_hd_llb_flag = _hd_os.environ.get("HEADROOM_LEARN_LOOP_BUDGET", "1")
-if _hd_llb_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import dataclasses as _hd_llb_dc
-        import importlib.metadata as _hd_llb_meta
-
-        if _hd_llb_meta.version("headroom-ai") == "0.41.0":
-            from headroom.learn import analyzer as _hd_llb_mod
-
-            _hd_llb_orig = _hd_llb_mod._build_digest
-
-            def _hd_llb_digest(
-                project, sessions, loops=None, max_tokens=_hd_llb_mod._MAX_DIGEST_TOKENS
-            ):
-                if loops is None:
-                    loops = _hd_llb_mod.detect_loops(sessions)
-                loops = [
-                    _hd_llb_dc.replace(lp, msg_indices=lp.msg_indices[:20])
-                    for lp in loops[: max_tokens // 400]
-                ]
-                return _hd_llb_orig(project, sessions, loops=loops, max_tokens=max_tokens)
-
-            _hd_llb_mod._build_digest = _hd_llb_digest
-            _hd_bound.add("learn_loop_budget")
-    except Exception:
-        pass
-
 # --- Learn: OpenCode's v2 session tables (vendor, upstream owed) --------------
 # OpenCode moved sessions from session/message/part to session_v2 and
 # session_message (tool calls inside each row's data.content), and a database a
 # current OpenCode created has no `session` table at all. The wheel's plugin
-# (0.41.0) reads only v1, so every learn scan there died on "no such table:
+# (0.41.0, 0.42.0) reads only v1, so every learn scan there died on "no such table:
 # session" (RUST-HJ, 6 hosts). On a v2 database the plugin's connection gets
 # TEMP views with the v1 names and shape, so its own queries and parsing run
 # unchanged; TEMP objects never touch the user's file, and a v1 database gets
 # none. The part view inverts OpenCode's own v1 -> v2 migration (migrateTool:
 # callID -> id, tool -> name, output -> content text, error -> error.message).
 # On Windows v2 stores C:/x while the plugin matches str(Path(worktree)), C:\x.
-# Exact-pin gated to wheel 0.41.0; self-neutralizes once the plugin names
+# Exact-pin gated to wheel 0.42.0; self-neutralizes once the plugin names
 # session_v2. Kill switch: HEADROOM_LEARN_OPENCODE_V2=0.
 _hd_oc2_flag = _hd_os.environ.get("HEADROOM_LEARN_OPENCODE_V2", "1")
 if _hd_oc2_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_oc2_meta
 
-        if _hd_oc2_meta.version("headroom-ai") == "0.41.0":
+        if _hd_oc2_meta.version("headroom-ai") == "0.42.0":
             import inspect as _hd_oc2_inspect
             import sqlite3 as _hd_oc2_sqlite
             import types as _hd_oc2_types
@@ -1794,347 +1808,6 @@ if _hd_oc2_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
-# --- web_search_call history on a request without a web_search tool ----------
-# Codex compacts locally for a custom provider such as Headroom's: it resends
-# the whole history with `tools: []` and asks for a summary. When that history
-# holds a hosted `web_search_call` item, the ChatGPT backend answers 200 and
-# then the in-band error "response protection is unavailable". Codex ignores
-# in-band `error` events, sees the stream end ("stream closed before
-# response.completed"), retries the same body five times, and runs the same
-# compaction before every later prompt, so the session never answers again.
-# Measured 2026-10-08 straight against chatgpt.com, no Headroom in the path: a
-# captured compaction request failed as sent and completed with its 10
-# web_search_call items dropped; a normal turn on the same history (which
-# declares the tool) is unaffected. Codex on the built-in OpenAI provider uses
-# remote compaction instead, so only users of a custom provider hit it. The
-# vendor drops web_search_call items from a Responses `input` whose `tools`
-# declare no web_search tool, where every forwarder picks its outbound bytes,
-# and marks the body mutated so the edit is sent. Only the search action (query
-# or URL) leaves the history; its results were never in it. Exact-pin gated to
-# wheel 0.41.0; a no-op on any body without such items.
-# Kill switch: HEADROOM_WEB_SEARCH_HISTORY=0.
-_hd_wsh_flag = _hd_os.environ.get("HEADROOM_WEB_SEARCH_HISTORY", "1")
-if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
-    _hd_wsh_flag.strip().lower() not in ("", "0", "false", "no", "off")
-):
-    try:
-        import importlib.metadata as _hd_wsh_meta
-
-        if _hd_wsh_meta.version("headroom-ai") == "0.41.0":
-            import logging as _hd_wsh_logging
-
-            from headroom.proxy import body_forwarding as _hd_wsh_mod
-
-            _hd_wsh_orig = _hd_wsh_mod.select_outbound_body
-            _hd_wsh_log = _hd_wsh_logging.getLogger("headroom.proxy")
-
-            def _hd_wsh_strip(body):
-                items = body.get("input") if isinstance(body, dict) else None
-                if not isinstance(items, list):
-                    return 0
-                tools = body.get("tools")
-                if isinstance(tools, list) and any(
-                    isinstance(t, dict) and str(t.get("type") or "").startswith("web_search")
-                    for t in tools
-                ):
-                    return 0
-                kept = [
-                    i
-                    for i in items
-                    if not (isinstance(i, dict) and i.get("type") == "web_search_call")
-                ]
-                if len(kept) == len(items):
-                    return 0
-                body["input"] = kept
-                return len(items) - len(kept)
-
-            def _hd_wsh_select(*, body, original_body_bytes, body_mutated, **kwargs):
-                dropped = _hd_wsh_strip(body)
-                if dropped:
-                    body_mutated = True
-                    _hd_wsh_log.info(
-                        "event=web_search_history dropped=%d (no web_search tool declared)",
-                        dropped,
-                    )
-                return _hd_wsh_orig(
-                    body=body,
-                    original_body_bytes=original_body_bytes,
-                    body_mutated=body_mutated,
-                    **kwargs,
-                )
-
-            _hd_wsh_mod.select_outbound_body = _hd_wsh_select
-            _hd_bound.add("web_search_history")
-    except Exception:
-        # Fail-open to the wheel's forwarding (the pre-vendor behaviour).
-        pass
-
-# --- Buffered CCR turns stream from upstream ----------------------------------
-# A streaming Claude Code turn with headroom_retrieve resident is flipped to
-# stream:false so the proxy can serve a retrieval server-side. Anthropic then
-# sends nothing until the whole reply is generated, and a network middlebox that
-# drops HTTP connections idle for 60s (TLS-inspecting antivirus, VPN, corporate
-# proxy; TCP keepalive does not reset an L7 idle timer) closes it first: httpx
-# raises "Server disconnected without sending a response" at ~60s, the retry
-# loop tries three times and Claude Code gets a 502 after ~186s, then resends
-# the same body, forever (AppSumo customer 2026-10-08, 1.3-2.9MB opus turns and
-# 200KB subagent turns alike; without Headroom the client streams and works).
-# The vendor sends that one request as stream:true and folds the SSE reply back
-# into the Message JSON the buffered path expects, so bytes (deltas, pings)
-# flow the whole time and nothing downstream changes. It applies only to
-# api.anthropic.com /v1/messages bodies Headroom serializes itself: the
-# buffered flip, or a continuation built from scratch. A client's own
-# stream:false bytes stay byte-faithful. The CCR continuation that serves the
-# retrieval is a third stream:false call (its own http_client.post, not
-# _retry_request) and dropped the same way: 5 a day on one VPN machine at
-# 61-66s, 3 of them handing Claude Code a bare headroom_retrieve (rc.8,
-# 2026-10-12). Its outbound log line marks it, and the next post in that task
-# streams and folds the same way. Request content is unchanged apart from
-# the stream flag, so no compression or cache effect. A stream that ends
-# without message_stop raises like a dropped connection (the wheel's 502); an
-# in-band error event returns its status (529 overloaded, 429, else 500).
-# Exact-pin gated to wheel 0.41.0; stands down when the wheel stops flipping.
-# Kill switch: HEADROOM_BUFFERED_UPSTREAM_STREAM=0.
-_hd_bus_flag = _hd_os.environ.get("HEADROOM_BUFFERED_UPSTREAM_STREAM", "1")
-if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
-    _hd_bus_flag.strip().lower() not in ("", "0", "false", "no", "off")
-):
-    try:
-        import importlib.metadata as _hd_bus_meta
-
-        if _hd_bus_meta.version("headroom-ai") == "0.41.0":
-            import json as _hd_bus_json
-            import logging as _hd_bus_logging
-            from urllib.parse import urlsplit as _hd_bus_urlsplit
-
-            import httpx as _hd_bus_httpx
-            from headroom.proxy import server as _hd_bus_server
-            from headroom.proxy.handlers import anthropic as _hd_bus_anth
-
-            _hd_bus_log = _hd_bus_logging.getLogger("headroom.proxy")
-            _hd_bus_orig = _hd_bus_server.HeadroomProxy._retry_request
-            _hd_bus_flip = "ccr_streaming_retrieve_buffered_non_stream"
-            _hd_bus_status = {"overloaded_error": 529, "rate_limit_error": 429}
-            _hd_bus_block_members = {
-                "thinking": ("type", "thinking", "signature"),
-                "redacted_thinking": ("type", "data"),
-            }
-
-            def _hd_bus_applies(method, url, body, kwargs):
-                if method != "POST" or not isinstance(body, dict):
-                    return False
-                if body.get("stream") is not False:
-                    return False
-                parts = _hd_bus_urlsplit(url)
-                if parts.hostname != "api.anthropic.com" or not parts.path.endswith(
-                    "/v1/messages"
-                ):
-                    return False
-                if _hd_bus_flip in (kwargs.get("mutation_reasons") or []):
-                    return True
-                return kwargs.get("original_body_bytes") is None
-
-            def _hd_bus_events(text):
-                for chunk in text.replace("\r\n", "\n").split("\n\n"):
-                    data = [
-                        line[5:].lstrip() for line in chunk.split("\n") if line.startswith("data:")
-                    ]
-                    if data:
-                        yield _hd_bus_json.loads("\n".join(data))
-
-            # The fold mirrors the Anthropic SDK's stream accumulator, the one
-            # Claude Code builds a streamed reply with (MessageStream in its
-            # bundled @anthropic-ai/sdk): each delta type it knows, and
-            # message_delta usage only where non-null. A delta type it does not
-            # know raises, so the caller sends the wheel's stream:false request
-            # instead of guessing at what that delta means.
-            def _hd_bus_fold(text):
-                msg, blocks, partial, done = None, {}, {}, False
-                for ev in _hd_bus_events(text):
-                    kind = ev.get("type")
-                    if kind == "error":
-                        return None, ev
-                    if kind == "message_start":
-                        msg = dict(ev["message"])
-                        msg["usage"] = dict(msg.get("usage") or {})
-                    elif kind == "content_block_start":
-                        block = dict(ev["content_block"])
-                        blocks[ev["index"]] = block
-                        if block.get("type") == "fallback" and msg is not None:
-                            msg["model"] = block["to"]["model"]
-                    elif kind == "content_block_delta":
-                        index, delta = ev["index"], ev["delta"]
-                        block, dtype = blocks[index], delta["type"]
-                        if dtype == "text_delta":
-                            block["text"] = (block.get("text") or "") + delta["text"]
-                        elif dtype == "citations_delta":
-                            block["citations"] = (block.get("citations") or []) + [delta["citation"]]
-                        elif dtype == "input_json_delta":
-                            partial[index] = partial.get(index, "") + delta["partial_json"]
-                        elif dtype == "thinking_delta":
-                            # Not its estimated_tokens: a progress count the
-                            # Message schema lacks (rc.1 resent it: 400).
-                            block["thinking"] = (block.get("thinking") or "") + delta["thinking"]
-                        elif dtype == "signature_delta":
-                            block["signature"] = delta["signature"]
-                        elif dtype == "compaction_delta":
-                            block["content"] = delta.get("content")
-                            if "encrypted_content" in delta:
-                                block["encrypted_content"] = delta["encrypted_content"]
-                        else:
-                            raise ValueError("unknown delta type %r" % (dtype,))
-                    elif kind == "content_block_stop":
-                        raw = partial.pop(ev["index"], None)
-                        if raw is not None:
-                            blocks[ev["index"]]["input"] = (
-                                _hd_bus_json.loads(raw) if raw.strip() else {}
-                            )
-                    elif kind == "message_delta" and msg is not None:
-                        msg.update(ev.get("delta") or {})
-                        msg["usage"].update(
-                            (k, v) for k, v in (ev.get("usage") or {}).items() if v is not None
-                        )
-                        for key, value in ev.items():
-                            if key not in ("type", "delta", "usage") and value is not None:
-                                msg[key] = value
-                    elif kind == "message_stop":
-                        done = True
-                if msg is None or not done:
-                    return None, None
-                # The stream adds placeholders the Message schema lacks (a thinking
-                # block's estimated_tokens: null); the CCR continuation resends this
-                # content as is and Anthropic 400s "Extra inputs are not permitted"
-                # on any of them. A null member carries no content, so it leaves
-                # every block type; thinking blocks keep only their schema.
-                content = []
-                for i in sorted(blocks):
-                    block = {k: v for k, v in blocks[i].items() if v is not None}
-                    keep = _hd_bus_block_members.get(block.get("type"))
-                    if keep:
-                        block = {k: v for k, v in block.items() if k in keep}
-                    content.append(block)
-                msg["content"] = content
-                return msg, None
-
-            def _hd_bus_reply(resp, status, payload):
-                headers = [
-                    (k, v)
-                    for k, v in resp.headers.items()
-                    if k.lower()
-                    not in ("content-type", "content-length", "content-encoding", "transfer-encoding")
-                ]
-                headers.append(("content-type", "application/json"))
-                return _hd_bus_httpx.Response(
-                    status,
-                    headers=headers,
-                    content=_hd_bus_json.dumps(payload, ensure_ascii=False).encode(),
-                    request=resp.request,
-                )
-
-            def _hd_bus_sse_headers(headers):
-                sse_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "accept"}
-                sse_headers["accept"] = "text/event-stream"
-                return sse_headers
-
-            async def _hd_bus_retry_request(self, method, url, headers, body, stream=False, **kwargs):
-                if stream or not _hd_bus_applies(method, url, body, kwargs):
-                    return await _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
-                sse_kwargs = {
-                    **kwargs,
-                    "body_mutated": True,
-                    "mutation_reasons": list(kwargs.get("mutation_reasons") or [])
-                    + ["buffered_upstream_stream"],
-                }
-                resp = await _hd_bus_orig(
-                    self,
-                    method,
-                    url,
-                    _hd_bus_sse_headers(headers),
-                    {**body, "stream": True},
-                    False,
-                    **sse_kwargs,
-                )
-                return await _hd_bus_settle(
-                    resp, lambda: _hd_bus_orig(self, method, url, headers, body, stream, **kwargs)
-                )
-
-            async def _hd_bus_settle(resp, fallback):
-                if resp.status_code != 200 or "text/event-stream" not in resp.headers.get(
-                    "content-type", ""
-                ):
-                    # An HTTP error, or the client's own bytes went out (signed
-                    # thinking): either way the reply is already what the caller reads.
-                    return resp
-                try:
-                    msg, err = _hd_bus_fold(resp.text)
-                except Exception as exc:
-                    # A reply this fold cannot read would 502 the same way on every
-                    # resend; the wheel's own stream:false request answers it (one
-                    # more generation, the pre-vendor path).
-                    _hd_bus_log.warning(
-                        "event=buffered_upstream_stream fold_failed=%s", type(exc).__name__
-                    )
-                    return await fallback()
-                if err is not None:
-                    etype = (err.get("error") or {}).get("type")
-                    _hd_bus_log.warning("event=buffered_upstream_stream in_band_error=%s", etype)
-                    return _hd_bus_reply(resp, _hd_bus_status.get(etype, 500), err)
-                if msg is None:
-                    raise _hd_bus_httpx.RemoteProtocolError(
-                        "upstream stream ended before message_stop", request=resp.request
-                    )
-                return _hd_bus_reply(resp, 200, msg)
-
-            # The CCR continuation: its api_call_fn imports log_outbound_request
-            # at call time and posts right after it, in the same task, so the
-            # mark is read by exactly that post and cleared there.
-            import contextvars as _hd_bus_cv
-
-            from headroom.proxy import body_forwarding as _hd_bus_bf
-            from headroom.proxy import helpers as _hd_bus_helpers
-
-            _hd_bus_cont = _hd_bus_cv.ContextVar("_hd_bus_cont", default=False)
-            _hd_bus_log_orig = _hd_bus_helpers.log_outbound_request
-            _hd_bus_post_orig = _hd_bus_httpx.AsyncClient.post
-
-            def _hd_bus_log_outbound(**kwargs):
-                if kwargs.get("forwarder") == "anthropic_ccr_continuation":
-                    _hd_bus_cont.set(True)
-                return _hd_bus_log_orig(**kwargs)
-
-            async def _hd_bus_post(self, url, **kwargs):
-                if not _hd_bus_cont.get():
-                    return await _hd_bus_post_orig(self, url, **kwargs)
-                _hd_bus_cont.set(False)
-                try:
-                    body = _hd_bus_json.loads(kwargs.get("content") or b"")
-                except ValueError:
-                    body = None
-                if not _hd_bus_applies("POST", str(url), body, {}):
-                    return await _hd_bus_post_orig(self, url, **kwargs)
-                content, _ = _hd_bus_bf.prepare_outbound_body_bytes(
-                    body={**body, "stream": True}, original_body_bytes=None, body_mutated=True
-                )
-                _hd_bus_log.info("event=buffered_upstream_stream forwarder=anthropic_ccr_continuation")
-                resp = await _hd_bus_post_orig(
-                    self,
-                    url,
-                    **{**kwargs, "content": content, "headers": _hd_bus_sse_headers(kwargs.get("headers"))},
-                )
-                return await _hd_bus_settle(resp, lambda: _hd_bus_post_orig(self, url, **kwargs))
-
-            with open(_hd_bus_anth.__file__, encoding="utf-8") as _hd_bus_src:
-                _hd_bus_text = _hd_bus_src.read()
-            if _hd_bus_flip in _hd_bus_text:
-                _hd_bus_server.HeadroomProxy._retry_request = _hd_bus_retry_request
-                if 'forwarder="anthropic_ccr_continuation"' in _hd_bus_text:
-                    _hd_bus_helpers.log_outbound_request = _hd_bus_log_outbound
-                    _hd_bus_httpx.AsyncClient.post = _hd_bus_post
-                _hd_bound.add("buffered_upstream_stream")
-    except Exception:
-        # Fail-open to the wheel's buffered stream:false request.
-        pass
-
 # --- Prefix tracker: a deferred tool load is not a new conversation -----------
 # The tracker lineage is keyed on a fingerprint of the cache-key segments
 # before the messages, the whole `tools` array included. Claude Code appends
@@ -2151,7 +1824,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
 # to any tool the prompt renders still starts a new lineage. RAISES cache reads,
 # tokens saved unchanged in aggregate, so check cache_read per request with
 # savings:did after the stable ships.
-# Exact-pin gated to wheel 0.41.0; self-neutralizes when the wheel's
+# Exact-pin gated to wheel 0.42.0; self-neutralizes when the wheel's
 # fingerprint already ignores a deferred tool. Kill switch:
 # HEADROOM_DEFERRED_TOOL_AFFINITY=0.
 _hd_dta_flag = _hd_os.environ.get("HEADROOM_DEFERRED_TOOL_AFFINITY", "1")
@@ -2161,7 +1834,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
     try:
         import importlib.metadata as _hd_dta_meta
 
-        if _hd_dta_meta.version("headroom-ai") == "0.41.0":
+        if _hd_dta_meta.version("headroom-ai") == "0.42.0":
             from headroom.cache import prefix_tracker as _hd_dta_pt
 
             _hd_dta_orig = _hd_dta_pt.segment_fingerprint
@@ -2189,216 +1862,6 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
                 _hd_bound.add("deferred_tool_affinity")
     except Exception:
         # Fail-open to the wheel's fingerprint.
-        pass
-
-# --- Stream: a client that hangs up after the terminal event (#4286) ----------
-# The direct HTTP SSE loop yields each upstream chunk to the client BEFORE it
-# parses it. Codex closes the connection as soon as it reads
-# response.completed, so the generator is closed at that yield: the terminal
-# event and the usage in the same chunk are never parsed, completed_normally
-# stays False, and since #3747 (0.40.0) the turn finalizes as a 502.
-# emit_request_outcome drops a 502 whole (no /stats request, no savings, no
-# PERF line) and the finalizer skips the prefix tracker, so the next turn of
-# that conversation starts at frozen=0. 0.9.45-rc.12 recorded 0 of 8 Codex
-# requests in the train's guest where 0.39.0 recorded 3 of 3 (2026-10-20).
-# Upstream PR #4286 (open) parses each chunk before yielding it and records a
-# hang-up after the client was handed the terminal event as completed; a
-# hang-up before it stays a 502. Its _stream_response_inner hunks are applied
-# VERBATIM to the installed method's source and compiled in the module's own
-# globals; each must match its expected count or nothing binds. Its Bedrock
-# and LiteLLM-backend hunks are left out: the desktop runs neither. Bookkeeping
-# only, the bytes the client gets are unchanged; but Codex turns now update the
-# prefix tracker, so check BOTH tok_saved/tok_before and cache_read/forwarded
-# for Codex with savings:did after the stable ships.
-# Exact-pin gated to wheel 0.41.0; self-neutralizes when the method already
-# tracks client_left_after_terminal. Kill switch:
-# HEADROOM_STREAM_HANGUP_AFTER_TERMINAL=0.
-_HD_STH_HUNKS = (
-    (
-        '''        completed_normally = False
-        pending_messages: list[dict] = []
-''',
-        '''        completed_normally = False
-        # Set when the client hangs up after the terminal event; it marks
-        # the outcome only, so pending messages are not drained into a
-        # stream nobody reads.
-        client_left_after_terminal = False
-        # A terminal event the client was handed, not just one parsed from
-        # upstream: the memory filter holds message_stop until the end.
-        client_got_terminal = False
-        pending_messages: list[dict] = []
-''',
-        1,
-    ),
-    (
-        '''            else None
-        )
-
-        try:
-            async with contextlib.aclosing(upstream_response) as response:
-''',
-        '''            else None
-        )
-
-        def _client_frame(frame: bytes) -> bytes:
-            """``_guard_client_bytes``, noting when the terminal event goes out."""
-            nonlocal client_got_terminal
-            guarded = _guard_client_bytes(frame)
-            if guarded and not client_got_terminal:
-                if memory_filter is None:
-                    # Unfiltered, the client gets each whole chunk once it
-                    # is parsed, so every event the parser has seen.
-                    client_got_terminal = stream_state["stream_terminal"]
-                else:
-                    # Filtered frames are complete events the filter decoded.
-                    client_got_terminal = any(
-                        _sse_event_outcome(name, data, stream_state["sse_dialect"])[1]
-                        for name, data in parse_sse_events_from_byte_buffer(bytearray(frame))
-                    )
-            return guarded
-
-        try:
-            async with contextlib.aclosing(upstream_response) as response:
-''',
-        1,
-    ),
-    (
-        '''                    # Always stream immediately \u2014 buffering breaks
-                    # real-time clients (LangGraph, LangChain, etc.)
-                    # The context guard runs last, on exactly what the
-                    # client receives (after the memory filter), and may
-                    # hold back bytes only until the first complete event.
-                    client_frames = (
-                        [chunk] if memory_filter is None else memory_filter.feed(chunk)
-                    )
-                    for frame in client_frames:
-                        guarded_frame = _guard_client_bytes(frame)
-                        if guarded_frame:
-                            yield guarded_frame
-
-''',
-        "",
-        1,
-    ),
-    (
-        '''                    # Parse complete SSE events from buffer
-                    usage = self._parse_sse_usage_from_buffer(stream_state, provider)
-''',
-        '''                    # Parse complete SSE events from buffer. A failure (e.g.
-                    # invalid UTF-8) is raised once the chunk is forwarded:
-                    # malformed upstream content still reaches the client.
-                    parse_error: Exception | None = None
-                    try:
-                        usage = self._parse_sse_usage_from_buffer(stream_state, provider)
-                    except Exception as e:
-                        usage, parse_error = None, e
-''',
-        1,
-    ),
-    (
-        '''                                "cache_creation_ephemeral_1h_input_tokens"
-                            ]
-
-            # Memory tool handling after stream completes
-''',
-        '''                                "cache_creation_ephemeral_1h_input_tokens"
-                            ]
-
-                    # Always stream immediately \u2014 buffering breaks
-                    # real-time clients (LangGraph, LangChain, etc.)
-                    # The context guard runs last, on exactly what the
-                    # client receives (after the memory filter), and may
-                    # hold back bytes only until the first complete event.
-                    # Yielded only after the chunk is parsed: a client may
-                    # hang up on the terminal event (Codex does), closing
-                    # this generator at the yield.
-                    client_frames = (
-                        [chunk] if memory_filter is None else memory_filter.feed(chunk)
-                    )
-                    for frame in client_frames:
-                        guarded_frame = _client_frame(frame)
-                        if guarded_frame:
-                            yield guarded_frame
-                    if parse_error is not None:
-                        raise parse_error
-
-            # Memory tool handling after stream completes
-''',
-        1,
-    ),
-    # The memory filter's closing and continuation frames.
-    ("guarded_frame = _guard_client_bytes(frame)", "guarded_frame = _client_frame(frame)", 3),
-    (
-        '''        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-''',
-        '''        except (GeneratorExit, asyncio.CancelledError):
-            # Codex closes the connection as soon as it reads
-            # response.completed, before the upstream EOF ends the loop.
-            client_left_after_terminal = (
-                client_got_terminal and not stream_state["stream_failed"]
-            )
-            raise
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-''',
-        1,
-    ),
-    (
-        '''                    upstream_response.status_code, completed_normally
-                ),
-''',
-        '''                    upstream_response.status_code,
-                    completed_normally or client_left_after_terminal,
-                ),
-''',
-        1,
-    ),
-)
-_hd_sth_flag = _hd_os.environ.get("HEADROOM_STREAM_HANGUP_AFTER_TERMINAL", "1")
-if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
-    _hd_sth_flag.strip().lower() not in ("", "0", "false", "no", "off")
-):
-    try:
-        import importlib.metadata as _hd_sth_meta
-
-        if _hd_sth_meta.version("headroom-ai") == "0.41.0":
-            import __future__ as _hd_sth_future
-            import inspect as _hd_sth_inspect
-            import textwrap as _hd_sth_textwrap
-
-            from headroom.proxy import helpers as _hd_sth_helpers
-            from headroom.proxy.handlers import streaming as _hd_sth_mod
-
-            _hd_sth_src = _hd_sth_textwrap.dedent(
-                _hd_sth_inspect.getsource(_hd_sth_mod.StreamingMixin._stream_response_inner)
-            )
-            if "client_left_after_terminal" not in _hd_sth_src:
-                for _hd_sth_old, _hd_sth_new, _hd_sth_n in _HD_STH_HUNKS:
-                    if _hd_sth_src.count(_hd_sth_old) != _hd_sth_n:
-                        raise LookupError(_hd_sth_old.strip().splitlines()[0])
-                    _hd_sth_src = _hd_sth_src.replace(_hd_sth_old, _hd_sth_new)
-                _hd_sth_ns = {}
-                # streaming.py defers annotations; the recompiled method must too.
-                exec(
-                    compile(
-                        _hd_sth_src,
-                        "<headroom-desktop: upstream #4286 _stream_response_inner>",
-                        "exec",
-                        flags=_hd_sth_future.annotations.compiler_flag,
-                        dont_inherit=True,
-                    ),
-                    vars(_hd_sth_mod),
-                    _hd_sth_ns,
-                )
-                # The PR imports it at module level; the method reads it as a global.
-                _hd_sth_mod.parse_sse_events_from_byte_buffer = (
-                    _hd_sth_helpers.parse_sse_events_from_byte_buffer
-                )
-                _hd_sth_fn = _hd_sth_ns["_stream_response_inner"]
-                _hd_sth_fn.__qualname__ = "StreamingMixin._stream_response_inner"
-                _hd_sth_mod.StreamingMixin._stream_response_inner = _hd_sth_fn
-                _hd_bound.add("stream_hangup_after_terminal")
-    except Exception:
-        # Fail-open to the wheel's stream loop.
         pass
 
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
@@ -2524,14 +1987,11 @@ _HD_VENDORS = (
     "learn_codex_retries",
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
-    "learn_loop_budget",
     "learn_opencode_v2",
-    "web_search_history",
-    "buffered_upstream_stream",
     "deferred_tool_affinity",
-    "stream_hangup_after_terminal",
     "loop_stall_dump",
     "startup_stall_dump",
+    "wmi_timeout",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -2677,7 +2137,7 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.48.0";
+const RTK_VERSION: &str = "1.1.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
@@ -3155,15 +2615,15 @@ fn fetch_plugin_version(repo: &str) -> Option<String> {
     manifest.get("version")?.as_str().map(str::to_string)
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
+    "1623590dd8d65374f61589c599c764c08ba9ce993ebe6b601312a89a3c874558";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "a95f2c23e08572dcc84ddff5fbe432e41e7f94369622eb086cca49ae0b6f61e8";
+    "559156238dd3e148c84c88c3a62a7594b874f68793208994e1b02e77a9d9abf9";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "5ed65486a96077bd6bba7c87fdc9d0e4a1918d19619be3c87380888389a30c7c";
+    "57a4fac13d18da77f0577ea8b68def7934b934bf76d0a6e161f0bfd06b1e1078";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "e4e650fa1677c0de2f6839a6040d7b17f312d32f163c402b75af70e9e5af1a91";
+    "4dec94a64035e08189ae82fd5408fe4ae9ae27a665fc07e3e3ec3c4c2d8e8a3e";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "8c9ae56bacde865112777a9fe9791b449186d8b2a081c32c0772ef773f284f93";
+    "9b076379be9d86011ca3f3a0264d0be4851da5535453a47f67fa46b4e893fbb2";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -3569,6 +3029,27 @@ fn httpx_ca_bundle_bridge_from(
     }
 }
 
+/// The prefetch subprocess. The wheel's backend probes swallow their import
+/// error and raise a bare "Kompress requires onnxruntime or torch", so a torch
+/// `WinError 1114` that classified as `[missing native dep]` (RUST-7W) turned
+/// into an unexplained `[other]` once the wheel caught OSError (RUST-75, same
+/// hosts). Re-importing each backend puts the real error in the log tail.
+const KOMPRESS_PREFETCH_PY: &str = r#"import sys
+from headroom.transforms.kompress_compressor import KompressCompressor
+try:
+    KompressCompressor().preload(allow_download=True)
+except ImportError as exc:
+    if "requires onnxruntime or torch" not in str(exc):
+        raise
+    print(f"ImportError: {exc}")
+    for mod in ("onnxruntime", "transformers", "safetensors", "torch"):
+        try:
+            __import__(mod)
+        except Exception as err:
+            print(f"import {mod} failed: {type(err).__name__}: {err}")
+    sys.exit(1)
+"#;
+
 fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     let contents = std::fs::read_to_string(log_path).unwrap_or_default();
     let lines: Vec<&str> = contents.lines().collect();
@@ -3590,12 +3071,17 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     // cause that actually explains it scrolls past unreported. RUST-75 arrived
     // as a torch `c10.dll` load error with no hint that onnxruntime -- which
     // needs the same MSVC redistributable -- had already failed for the same
-    // reason. Carry the first cause too when the loader logged one.
+    // reason. Carry the first cause too when the loader (or the backend
+    // re-import in KOMPRESS_PREFETCH_PY) logged one.
     let onnx_cause: Option<String> = tail
         .lines()
         .map(str::trim)
         .rev()
-        .find(|line| line.contains("ONNX load failed"))
+        .find(|line| {
+            line.contains("ONNX load failed")
+                || (line.starts_with("import onnxruntime failed")
+                    && !line.starts_with(detail.as_str()))
+        })
         .map(|line| line.chars().take(160).collect());
 
     // The Sentry fingerprint is the bracketed category, so widening the detail
@@ -5631,10 +5117,7 @@ impl ToolManager {
 
         let mut child = crate::proc::command(python)
             .arg("-c")
-            .arg(
-                "from headroom.transforms.kompress_compressor import KompressCompressor; \
-                 KompressCompressor().preload(allow_download=True)",
-            )
+            .arg(KOMPRESS_PREFETCH_PY)
             .current_dir(&self.runtime.root_dir)
             .env("PYTHONNOUSERSITE", "1")
             .env("PYTHONUNBUFFERED", "1")
@@ -13191,24 +12674,24 @@ fn headroom_index_requirement(
 pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/d7/37/8e62a5ecb8c433230586c3dbcbbbcfb519adb72e8a91d69f4dad5e0b3184/headroom_ai-0.41.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "b842d36e161f9f0d1fc4d56de1d870e22a3e4d05c94d2272d9a306b38f406242",
+            "https://files.pythonhosted.org/packages/fe/d1/3449535c6776f106687ff58bfee0a626176069c0b884721ac839dc653ed7/headroom_ai-0.42.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "b175cccbfb8cbcabd0a9e9406379eee910d10fe14130f55b7beabec62194a48e",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/f2/d6/b40067368fd2c195b382d4734290e4ed2c9aed5b7af10521b77739975b29/headroom_ai-0.41.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "7e48d3896846558aeb1d84be82469be5be8bb7efbd65601ea0650524460b067f",
+            "https://files.pythonhosted.org/packages/35/90/ad2ddb1f4aee89cf0cab9b05c030ba7d9f553f2a0340f9cca9083e0751b1/headroom_ai-0.42.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "531f25f0a1bed35130301c3219fc94391a72f1b550c4ad456af6ed2345d1ef05",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/4f/c5/13888daac2d77561423ffd6135c91f1a7799c66aba4232ad191fd2c44eed/headroom_ai-0.41.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "04631aac0082605888594669bf0e983736321307c8c7f5306768e72d606a65ae",
+            "https://files.pythonhosted.org/packages/c1/cc/f54d9d36bfb8acbbca5f56ff800a27c83d2488c4c3f900ac1a2564ba61a9/headroom_ai-0.42.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "82972c52804f7d691dcf73b8f32acbd754b8c2262e56b2365d0741d99e517db8",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/e5/37/dfd7a44720ffb0d233384d1337efaf211e4e975dd5880fee57facb83c841/headroom_ai-0.41.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "f4db5e5119a73af3ed952b1c10caff2430831d899eb17d995a27574ae6e6b306",
+            "https://files.pythonhosted.org/packages/82/76/34c9b66a878b7ce69aa27761c41f341a8863945f2a681f8d2920c778c3d7/headroom_ai-0.42.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "fbb3ceb8f6c3f208edcc3aad43c0e03e0db45636d9d2061525ad0d0a166da146",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/24/81/2d221e74e7e5fd43936a7142d697c9754f6c593f4192f8780ac2f785d02a/headroom_ai-0.41.0-cp310-abi3-win_amd64.whl",
-            "18b43230c4dbbe9889fdb0863a7943059f4509fdf49ad20b19be394f2725db18",
+            "https://files.pythonhosted.org/packages/21/21/233710bc313c07cf652ed4234574f8906becdbe22b559413394e775fd8eb/headroom_ai-0.42.0-cp310-abi3-win_amd64.whl",
+            "df31ddff684f8a8f1001d3ab2b04c6b508dfc32e6d7ff3464cf669b7085deb63",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -13320,9 +12803,13 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
 
+    // rtk-oss: since 1.0.0 the plain `rtk` asset also links the BUSL-1.1
+    // rtk-engine, whose grant excludes paid products. The Apache-2.0 edition
+    // has the same rewrite and filters; it lacks only `rtk pipeline` and
+    // PostToolUse compression, which Headroom never runs.
     Ok(DownloadArtifact {
         url: format!(
-            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.{}",
+            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-oss-{}.{}",
             RTK_VERSION, target, extension
         ),
         sha256: Some(sha256),
@@ -17325,7 +16812,7 @@ print(round(t.snapshot()["lifetime"]["compression_savings_usd"], 6))
         // this pins the shape.
         let py = super::SITECUSTOMIZE_PY;
         assert!(py.contains("HEADROOM_TOOL_REF_HINT"));
-        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.41.0""#));
+        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.42.0""#));
         // Wraps the buffered-error seam and post-processes its Response.
         assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
         assert!(py.contains("def _hd_hint_apply(result):"));
@@ -17565,6 +17052,68 @@ asyncio.run(main())
         );
     }
 
+    /// RUST-F2: a WMI query that never returns must not hold the backend's
+    /// imports. macOS has no `_wmi`, so a fake one stands in: the OS query
+    /// answers, the CPU query hangs.
+    #[test]
+    fn wmi_timeout_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        std::fs::write(
+            dir.path().join("_wmi.py"),
+            "import time\n\
+             def exec_query(query):\n    \
+                 if 'Win32_Processor' in query:\n        \
+                     time.sleep(60)\n    \
+                 return 'Version=10.0.26200\\0ProductType=1'\n",
+        )
+        .unwrap();
+        let probe = r#"
+import platform, time
+print(platform._wmi_query.__name__)
+assert list(platform._wmi_query("OS", "Version", "ProductType")) == ["10.0.26200", "1"]
+for hung in (True, False):
+    start = time.monotonic()
+    try:
+        platform._wmi_query("CPU" if hung else "OS", "Version")
+        raise SystemExit("answered after the timeout")
+    except OSError:
+        took = time.monotonic() - start
+        assert (0.5 < took < 10) if hung else took < 0.5, (hung, took)
+"#;
+        let run = |secs: &str| {
+            crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_WMI_TIMEOUT_SECS", secs)
+                .output()
+                .expect("run probe")
+        };
+        let out = run("1");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).lines().next(),
+            Some("_hd_wmi_timed_query")
+        );
+        let off = crate::proc::command(&python)
+            .args(["-c", "import platform; print(platform._wmi_query.__name__)"])
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_WMI_TIMEOUT_SECS", "0")
+            .output()
+            .expect("run probe");
+        assert_eq!(String::from_utf8_lossy(&off.stdout).trim(), "_wmi_query");
+    }
+
     #[test]
     fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
         let python =
@@ -17693,7 +17242,7 @@ with open(_p, encoding="utf-8") as _f:
             "else {}",
             crate::output_savings::OUTPUT_WARMUP_REPLIES
         )));
-        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.41.0""#));
+        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.42.0""#));
         assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
         assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
         assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));
@@ -17759,7 +17308,9 @@ with open(_p, encoding="utf-8") as _f:
         // tool-search repair shipped in 0.39.0; the 24 vendors below shipped
         // in 0.40.0/0.41.0 (#2668, #2942, #3209, #3810, #3831, #3854, #3874,
         // #3878, #3881, #3885, #3892, #3907, #3926, #3928, #3930, #3932,
-        // #3934, #3938, #3940, #3941, #3946, #3977, #4023, #4034).
+        // #3934, #3938, #3940, #3941, #3946, #3977, #4023, #4034); the
+        // learn loop budget, web search history, buffered upstream stream
+        // and stream hang-up shipped in 0.42.0 (#4269, #4202, #4206, #4286).
         // Re-vendoring any of them would double-apply the fix; image_memo and
         // image_worker_reap raised a TypeError on every image call once
         // retargeted.
@@ -17811,6 +17362,10 @@ with open(_p, encoding="utf-8") as _f:
             "transient_system_lineage",
             "responses_shared_budget",
             "quarantine_spare_capacity",
+            "learn_loop_budget",
+            "web_search_history",
+            "buffered_upstream_stream",
+            "stream_hangup_after_terminal",
         ] {
             assert!(
                 !py.contains(&format!(r#"_hd_bound.add("{name}")"#)),
@@ -18167,48 +17722,6 @@ print(wired, matured(True), matured(False))
     }
 
     #[test]
-    fn learn_loop_budget_behaves_against_the_installed_wheel() {
-        // RUST-QV: thousands of loops with every message index outgrew Codex's
-        // 1,048,576-char input cap; the section now stays inside the digest
-        // budget and shrinks with it. The kill switch renders every loop again.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() {
-            eprintln!("skipping: no managed runtime at {}", python.display());
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-learn-lb-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        let probe = "from pathlib import Path\n\
-                     from headroom.learn import analyzer as a\n\
-                     from headroom.learn.loops import LoopPattern\n\
-                     from headroom.learn.models import ProjectInfo\n\
-                     p = ProjectInfo(name='x', project_path=Path('.'), data_path=Path('.'))\n\
-                     loops = [LoopPattern('Bash', 's', 'x' * 120, 300, False, 10**6 - i, list(range(300))) for i in range(2000)]\n\
-                     full, small = a._build_digest(p, [], loops=loops), a._build_digest(p, [], loops=loops, max_tokens=10000)\n\
-                     print(len(full) <= 80000, len(small) <= 10000, 'repeated 300x' in small, len(loops[0].msg_indices))";
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_LEARN_LOOP_BUDGET", kill)
-                .output()
-                .expect("run learn probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, "True True True 300", "stderr:\n{on_err}");
-        assert_eq!(off, "False False True 300", "stderr:\n{off_err}");
-    }
-
-    #[test]
     fn learn_opencode_v2_behaves_against_the_installed_wheel() {
         // RUST-HJ: a current OpenCode's database has session_v2 and no
         // `session`, and every learn scan died on "no such table: session".
@@ -18450,235 +17963,6 @@ print(len(projects), calls, views)"#;
     }
 
     #[test]
-    fn web_search_history_behaves_against_the_installed_wheel() {
-        // A Codex compaction request (`tools: []`) goes out without its
-        // web_search_call items, through both outbound pickers; a turn that
-        // declares web_search keeps them and its client bytes. The kill switch
-        // forwards the client's bytes throughout.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-web-search-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        let probe = "import json, sitecustomize\n\
-                     from headroom.proxy import body_forwarding as bf\n\
-                     WS = {'type': 'web_search_call', 'id': 'ws_1', 'status': 'completed',\n\
-                     \x20     'action': {'type': 'search', 'query': 'q'}}\n\
-                     MSG = {'type': 'message', 'role': 'user',\n\
-                     \x20      'content': [{'type': 'input_text', 'text': 'hi'}]}\n\
-                     def body(tools):\n\
-                     \x20   return {'model': 'gpt-6.1-sol', 'input': [MSG, WS, MSG], 'tools': tools}\n\
-                     def ws(raw):\n\
-                     \x20   return [i['type'] for i in json.loads(raw)['input']].count('web_search_call')\n\
-                     def pick(tools):\n\
-                     \x20   b = body(tools)\n\
-                     \x20   o = bf.select_outbound_body(body=b, original_body_bytes=json.dumps(b).encode(),\n\
-                     \x20       body_mutated=False)\n\
-                     \x20   return ws(o.content), o.source\n\
-                     b = body([])\n\
-                     raw, _ = bf.prepare_outbound_body_bytes(body=b,\n\
-                     \x20   original_body_bytes=json.dumps(b).encode(), body_mutated=False)\n\
-                     print(*pick([]), *pick([{'type': 'web_search'}]), ws(raw),\n\
-                     \x20     'web_search_history' in sitecustomize._hd_bound)";
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                .env("HEADROOM_WEB_SEARCH_HISTORY", kill)
-                .output()
-                .expect("run web search history probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        if on.ends_with("False") {
-            eprintln!("skipping: web search history vendor did not bind (wheel bumped?)");
-            return;
-        }
-        assert_eq!(on, "0 canonical 1 passthrough 0 True", "stderr:\n{on_err}");
-        assert_eq!(
-            off, "1 passthrough 1 passthrough 1 False",
-            "stderr:\n{off_err}"
-        );
-    }
-
-    #[test]
-    fn buffered_upstream_stream_behaves_against_the_installed_wheel() {
-        // The buffered CCR flip goes upstream as stream:true and its SSE reply
-        // folds back into the Message JSON; a client's own stream:false bytes,
-        // an in-band error and a truncated stream keep their wheel semantics.
-        // The kill switch sends the wheel's stream:false request.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-buffered-sse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        let probe = r#"
-import asyncio, json, httpx, sitecustomize
-from headroom.proxy import server
-URL = 'https://api.anthropic.com/v1/messages'
-FLIP = 'ccr_streaming_retrieve_buffered_non_stream'
-def ev(d):
-    return 'event: %s\ndata: %s\n\n' % (d['type'], json.dumps(d))
-START = ev({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message',
-    'role': 'assistant', 'model': 'm', 'content': [], 'stop_reason': None,
-    'stop_sequence': None, 'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5,
-    'output_tokens': 1}}})
-BODY = ''.join([START, ev({'type': 'ping'}),
-    ev({'type': 'content_block_start', 'index': 0,
-        'content_block': {'type': 'thinking', 'thinking': '', 'signature': '', 'estimated_tokens': None}}),
-    ev({'type': 'content_block_delta', 'index': 0,
-        'delta': {'type': 'thinking_delta', 'thinking': 'hm', 'estimated_tokens': 7}}),
-    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'sig'}}),
-    ev({'type': 'content_block_stop', 'index': 0}),
-    ev({'type': 'content_block_start', 'index': 1,
-        'content_block': {'type': 'redacted_thinking', 'data': 'enc', 'estimated_tokens': None}}),
-    ev({'type': 'content_block_stop', 'index': 1}),
-    ev({'type': 'content_block_start', 'index': 2,
-        'content_block': {'type': 'text', 'text': '', 'citations': None, 'estimated_tokens': None}}),
-    ev({'type': 'content_block_delta', 'index': 2,
-        'delta': {'type': 'text_delta', 'text': 'Hel', 'estimated_tokens': 3, 'phase': 'live'}}),
-    ev({'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'text_delta', 'text': 'lo'}}),
-    ev({'type': 'content_block_stop', 'index': 2}),
-    ev({'type': 'content_block_start', 'index': 3,
-        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
-    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
-    ev({'type': 'content_block_delta', 'index': 3, 'delta': {'type': 'input_json_delta', 'partial_json': ' "a.py"}'}}),
-    ev({'type': 'content_block_stop', 'index': 3}),
-    ev({'type': 'content_block_start', 'index': 4, 'content_block': {'type': 'compaction', 'content': None}}),
-    ev({'type': 'content_block_delta', 'index': 4,
-        'delta': {'type': 'compaction_delta', 'content': 'summary', 'encrypted_content': 'sealed'}}),
-    ev({'type': 'content_block_stop', 'index': 4}),
-    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use', 'stop_sequence': None},
-        'usage': {'output_tokens': 42, 'cache_read_input_tokens': None}}),
-    ev({'type': 'message_stop'})])
-EXPECT = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',
-    'content': [{'type': 'thinking', 'thinking': 'hm', 'signature': 'sig'},
-                {'type': 'redacted_thinking', 'data': 'enc'},
-                {'type': 'text', 'text': 'Hello'},
-                {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {'path': 'a.py'}},
-                {'type': 'compaction', 'content': 'summary', 'encrypted_content': 'sealed'}],
-    'stop_reason': 'tool_use', 'stop_sequence': None,
-    'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 42}}
-ERR = START + ev({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}})
-# A reply the fold cannot read (truncated tool input JSON) falls back to the
-# wheel's own stream:false request instead of a 502 the client resends forever.
-BAD = ''.join([START,
-    ev({'type': 'content_block_start', 'index': 0,
-        'content_block': {'type': 'tool_use', 'id': 'tu_1', 'name': 'Read', 'input': {}}}),
-    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":'}}),
-    ev({'type': 'content_block_stop', 'index': 0}),
-    ev({'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}, 'usage': {'output_tokens': 1}}),
-    ev({'type': 'message_stop'})])
-# A delta type the fold does not know is not guessed at: same fallback.
-ODD = ''.join([START,
-    ev({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}),
-    ev({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'mystery_delta', 'text': 'x'}}),
-    ev({'type': 'content_block_stop', 'index': 0}),
-    ev({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 1}}),
-    ev({'type': 'message_stop'})])
-class Cfg:
-    retry_max_attempts, retry_enabled, retry_base_delay_ms, retry_max_delay_ms = 1, False, 1, 1
-class Client:
-    def __init__(self, text):
-        self.text, self.sent = text, None
-    async def post(self, url, **kw):
-        self.sent = kw
-        return httpx.Response(200, headers={'content-type': 'text/event-stream',
-            'request-id': 'req_1'}, content=self.text.encode(), request=httpx.Request('POST', url))
-def run(text, **kw):
-    proxy = type('P', (), {})()
-    proxy.config, proxy.http_client = Cfg(), Client(text)
-    body = {'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}
-    try:
-        r = asyncio.run(server.HeadroomProxy._retry_request(proxy, 'POST', URL,
-            {'accept': 'application/json'}, body, original_body_bytes=json.dumps(body).encode(), **kw))
-    except httpx.RemoteProtocolError:
-        r = None
-    sent = proxy.http_client.sent
-    return r, json.loads(sent['content'])['stream'], sent['headers']['accept']
-r, s, a = run(BODY, body_mutated=True, mutation_reasons=[FLIP])
-fold = r.headers['content-type'] == 'application/json' and r.json() == EXPECT and r.headers['request-id'] == 'req_1'
-own, own_s, _ = run(BODY, body_mutated=False)
-err, _, _ = run(ERR, body_mutated=True, mutation_reasons=[FLIP])
-cut, _, _ = run(START, body_mutated=True, mutation_reasons=[FLIP])
-bad, bad_s, bad_a = run(BAD, body_mutated=True, mutation_reasons=[FLIP])
-odd, odd_s, _ = run(ODD, body_mutated=True, mutation_reasons=[FLIP])
-# The CCR continuation posts on its own right after its outbound log line: that
-# post streams and folds, the next one in the task goes out as sent.
-from headroom.proxy import helpers
-seen = []
-def upstream(request):
-    b = json.loads(request.content)
-    seen.append((b['stream'], request.headers['accept']))
-    if b['stream']:
-        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=BODY.encode())
-    return httpx.Response(200, json=EXPECT)
-async def continuation():
-    body = json.dumps({'model': 'm', 'stream': False, 'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
-    hdrs = {'accept': 'application/json', 'content-type': 'application/json'}
-    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as c:
-        helpers.log_outbound_request(forwarder='anthropic_ccr_continuation', method='POST', path=URL,
-            body_bytes_count=len(body), body_mutated=True, mutation_reasons=['ccr_continuation'],
-            request_id='r', source='canonical')
-        first = await c.post(URL, content=body, headers=hdrs, timeout=5)
-        second = await c.post(URL, content=body, headers=hdrs, timeout=5)
-    return first.json() == EXPECT and second.json() == EXPECT
-cont = asyncio.run(continuation())
-print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
-      bad is not None, bad_s, bad_a, odd is not None, odd_s,
-      cont, seen[0][0], seen[0][1], seen[1][0],
-      'buffered_upstream_stream' in sitecustomize._hd_bound)
-"#;
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                .env("HEADROOM_BUFFERED_UPSTREAM_STREAM", kill)
-                .output()
-                .expect("run buffered upstream stream probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        if on.ends_with("False") {
-            eprintln!("skipping: buffered upstream stream vendor did not bind (wheel bumped?)");
-            return;
-        }
-        assert_eq!(
-            on,
-            "True True text/event-stream False text/event-stream 529 None True False application/json True False \
-             True True text/event-stream False True",
-            "stderr:\n{on_err}"
-        );
-        assert!(
-            off.starts_with("False False application/json False")
-                && off.ends_with("True False application/json False False"),
-            "kill switch did not unbind:\n{off}\nstderr:\n{off_err}"
-        );
-    }
-
-    #[test]
     fn deferred_tool_affinity_behaves_against_the_installed_wheel() {
         // A tool ToolSearch loads joins `tools` with defer_loading and keeps
         // the conversation on its tracker; a rendered tool still splits it.
@@ -18732,87 +18016,6 @@ print(fold, s, a, own_s, own.headers['content-type'], err.status_code, cut,
         }
         assert_eq!(on, "True False True", "stderr:\n{on_err}");
         assert_eq!(off, "False False False", "stderr:\n{off_err}");
-    }
-
-    #[test]
-    fn stream_hangup_after_terminal_behaves_against_the_installed_wheel() {
-        // Codex hangs up on response.completed before the upstream EOF: that
-        // turn records 200 with its usage; a hang-up before the terminal event
-        // stays a 502. The kill switch restores the wheel's 502 with no usage.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-stream-hangup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        // Upstream PR #4286's test harness: a mocked upstream that sends the
-        // terminal event and never reaches EOF.
-        let probe = r#"import asyncio, json, sitecustomize
-from unittest.mock import AsyncMock, MagicMock
-import httpx
-from headroom.proxy.server import HeadroomProxy
-def ev(n, p): return f'event: {n}\ndata: {json.dumps(p)}\n\n'.encode()
-START = ev('response.created', {'type': 'response.created', 'response': {'id': 'r1'}})
-DONE = ev('response.completed', {'type': 'response.completed', 'response': {'id': 'r1', 'status': 'completed', 'usage': {'input_tokens': 1000, 'input_tokens_details': {'cached_tokens': 600}, 'output_tokens': 5}}})
-def proxy():
-    p = object.__new__(HeadroomProxy)
-    p.http_client = MagicMock(spec=httpx.AsyncClient)
-    p._config = MagicMock()
-    p._config.ccr_inject_tool = False
-    p._config.retry_max_attempts = 1
-    p.config = p._config
-    p._record_request_outcome = AsyncMock()
-    r = MagicMock()
-    r.headers = httpx.Headers({'content-type': 'text/event-stream'})
-    r.status_code = 200
-    async def chunks():
-        yield START
-        yield DONE
-        await asyncio.Event().wait()
-    r.aiter_bytes = chunks
-    r.aclose = AsyncMock()
-    p.http_client.build_request = MagicMock(return_value=MagicMock())
-    p.http_client.send = AsyncMock(return_value=r)
-    return p
-async def turn(stop):
-    p = proxy()
-    resp = await p._stream_response(url='https://chatgpt.com/backend-api/codex/responses', headers={'authorization': 'Bearer t'}, body={'model': 'gpt-5.4', 'stream': True, 'input': 'ok'}, provider='openai', model='gpt-5.4', request_id='t', original_tokens=10, optimized_tokens=10, tokens_saved=0, transforms_applied=[], tags={}, optimization_latency=0.0)
-    seen = b''
-    while stop not in seen:
-        seen += await resp.body_iterator.__anext__()
-    await resp.body_iterator.aclose()
-    o = p._record_request_outcome.await_args.args[0]
-    return f'{o.status_code}:{o.provider_input_tokens}'
-async def main():
-    print(await turn(b'response.completed'), await turn(b'response.created'), 'stream_hangup_after_terminal' in sitecustomize._hd_bound)
-asyncio.run(main())
-"#;
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                .env("HEADROOM_STREAM_HANGUP_AFTER_TERMINAL", kill)
-                .output()
-                .expect("run stream hangup probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        if on.ends_with("False") {
-            eprintln!("skipping: stream hangup vendor did not bind (wheel bumped?)");
-            return;
-        }
-        assert_eq!(on, "200:1000 502:0 True", "stderr:\n{on_err}");
-        assert_eq!(off, "502:0 502:0 False", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -19660,6 +18863,43 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         assert!(cause.contains("onnxruntime_pybind11_state"), "{cause}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// RUST-75: the wheel's probes swallow the backend import error, so the
+    /// log tail held only the generic ImportError and filed as `[other]`. The
+    /// re-import lines KOMPRESS_PREFETCH_PY prints restore the cause.
+    #[test]
+    fn summarize_kompress_prefetch_failure_reads_the_backend_reimport_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kompress-prefetch.log");
+        fs::write(
+            &log,
+            "ImportError: Kompress requires onnxruntime or torch. Install with: pip install headroom-ai[proxy]\n\
+             import onnxruntime failed: ImportError: DLL load failed while importing onnxruntime_pybind11_state: x\n\
+             import torch failed: OSError: [WinError 1114] y. Error loading \"C:\\venv\\torch\\lib\\c10.dll\"\n",
+        )
+        .unwrap();
+        let cause = summarize_kompress_prefetch_failure(&log);
+        assert!(
+            cause.starts_with("[missing native dep] import torch failed: OSError: [WinError 1114]"),
+            "{cause}"
+        );
+        assert!(
+            cause.contains("(after import onnxruntime failed: ImportError: DLL load failed"),
+            "{cause}"
+        );
+
+        // onnxruntime as the last line is the detail, not repeated as its cause.
+        fs::write(
+            &log,
+            "ImportError: Kompress requires onnxruntime or torch.\n\
+             import onnxruntime failed: ModuleNotFoundError: No module named 'onnxruntime'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            summarize_kompress_prefetch_failure(&log),
+            "[other] import onnxruntime failed: ModuleNotFoundError: No module named 'onnxruntime'"
+        );
     }
 
     /// An updater relaunch leaves :6768 held by nobody for a moment. Treating
@@ -20721,6 +19961,118 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
 
         assert_eq!(manager.latest_tool_log_path("headroom"), Some(proxy));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The rewrite hook auto-allows on rtk's exit code, and every other rtk
+    /// test drives a fake. This one installs the pinned release (URL, checksum,
+    /// archive layout) and runs the real hook on it, so a bump that changes
+    /// what rtk answers fails here. Needs the network, so CI opts in on Linux
+    /// and macOS with HEADROOM_TEST_PINNED_RTK=1.
+    #[test]
+    #[cfg(unix)]
+    fn pinned_rtk_keeps_the_hook_contract() {
+        use std::io::Write as _;
+        if std::env::var_os("HEADROOM_TEST_PINNED_RTK").is_none() {
+            eprintln!("skipping: set HEADROOM_TEST_PINNED_RTK=1 to install the pinned rtk");
+            return;
+        }
+        let (root, _runtime, manager) = seed_test_runtime("pinned-rtk");
+        manager.install_rtk().expect("install the pinned rtk");
+        let rtk = manager.rtk_entrypoint();
+        let (home, project) = (root.join("home"), root.join("project"));
+        fs::create_dir_all(home.join(".claude")).expect("home");
+        fs::create_dir_all(&project).expect("project");
+        // No rule names git, so `git status` takes the read-only path (exit 3).
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"permissions":{"allow":["Bash(git log:*)"],"ask":["Bash(cargo test:*)"],"deny":["Bash(cargo build:*)"]}}"#,
+        )
+        .expect("settings");
+        let hook = root.join("hook.sh");
+        fs::write(
+            &hook,
+            crate::client_adapters::build_headroom_rtk_hook(&rtk, Path::new("/usr/bin/python3")),
+        )
+        .expect("hook");
+        let rtk_in_home = |args: &[&str]| {
+            let mut cmd = crate::proc::command(&rtk);
+            cmd.args(args)
+                .env("HOME", &home)
+                .env("RTK_TELEMETRY_DISABLED", "1");
+            cmd
+        };
+
+        let version = rtk_in_home(&["--version"]).output().expect("rtk --version");
+        let version = String::from_utf8_lossy(&version.stdout).into_owned();
+        assert_eq!(
+            version.split_whitespace().nth(1),
+            Some(RTK_VERSION),
+            "{version}"
+        );
+
+        let run = |command: &str| {
+            let mut child = crate::proc::command("bash")
+                .arg(&hook)
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("RTK_TELEMETRY_DISABLED", "1")
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn hook");
+            let input = serde_json::json!({
+                "permission_mode": "default",
+                "cwd": project,
+                "tool_input": { "command": command },
+            });
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().expect("run hook");
+            assert!(
+                out.status.success(),
+                "{command}: hook exited {}",
+                out.status
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // An allow rule (rtk exits 0) and one plain read-only command (3).
+        for command in ["git log -5", "git status"] {
+            let out = run(command);
+            let decision: serde_json::Value = serde_json::from_str(&out).expect(&out);
+            let decision = &decision["hookSpecificOutput"];
+            assert_eq!(decision["permissionDecision"], "allow", "{command}: {out}");
+            let rewritten = decision["updatedInput"]["command"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                rewritten.ends_with(&format!("/rtk {command}")),
+                "{command}: {out}"
+            );
+        }
+        // Everything else reaches Claude Code untouched: a deny rule (2), an
+        // ask rule, a destructive tail, no rtk equivalent (1), and --check.
+        for command in [
+            "cargo build",
+            "cargo test",
+            "git status; rm -rf ~/x",
+            "echo hi",
+            "git diff --check",
+        ] {
+            assert_eq!(run(command), "", "{command}");
+        }
+
+        let gain = rtk_in_home(&["gain", "--daily", "--format", "json"])
+            .output()
+            .expect("rtk gain");
+        let gain: super::RtkDailyGainOutput =
+            serde_json::from_slice(&gain.stdout).expect("gain json");
+        assert!(gain.summary.is_some(), "the RTK tile reads summary");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -22734,6 +22086,111 @@ time.sleep(30)
              write({'ANTHROPIC_BASE_URL': 'http://localhost:6768'}); r.tick()\n\
              assert seen == [RELAY] and r.current_upstream == RELAY, (seen, r.current_upstream)\n\
              assert json.loads(capture.read_text()) == {'url': RELAY}",
+        );
+    }
+
+    /// Boots the backend through the app's own spawn against the runtime in
+    /// HEADROOM_DATA_DIR, waits for /readyz, and sends one request through it
+    /// to a fake upstream. CI's Linux job runs it: every other job only
+    /// dry-runs the Linux lock, so nothing ever started the runtime Linux users
+    /// get. Opt-in, because it takes port 6768 and reclaims a Headroom backend
+    /// it finds there: the release-train gates run on a machine with a live app.
+    #[test]
+    fn backend_boots_and_proxies_a_request_from_the_installed_runtime() {
+        use std::io::{Read, Write};
+        if std::env::var("HEADROOM_BACKEND_BOOT_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set HEADROOM_BACKEND_BOOT_TEST=1 (takes port 6768)");
+            return;
+        }
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        std::thread::spawn(move || {
+            for mut stream in upstream.incoming().flatten() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let head_end = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let body_len = head
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < head_end + body_len {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen.lock().unwrap().push(path);
+                let body = r#"{"id":"msg_boot","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":1}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        crate::upstream_override::publish(crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: upstream_url,
+            ..Default::default()
+        });
+
+        let runtime = ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir());
+        let logs = runtime.logs_dir();
+        let manager = ToolManager::new(runtime);
+        let mut child = manager
+            .start_headroom_background(false)
+            .expect("the backend did not start");
+        let port = backend_port::get();
+        let ready = (0..360).any(|_| {
+            probe_backend_readyz_ok(port) || {
+                std::thread::sleep(Duration::from_millis(500));
+                false
+            }
+        });
+        let reply = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", "sk-ant-boot-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with ok"}]}"#)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .map(|r| (r.status().as_u16(), r.text().unwrap_or_default()));
+        let _ = child.kill();
+        let _ = child.wait();
+        let proxy_log = log_tail(&logs.join(format!("proxy-{port}.log")), 6000);
+
+        assert!(ready, "/readyz never answered 2xx on {port}\n{proxy_log}");
+        let (status, body) =
+            reply.unwrap_or_else(|err| panic!("request failed: {err}\n{proxy_log}"));
+        assert_eq!(status, 200, "body: {body}\n{proxy_log}");
+        assert!(
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with("/v1/messages")),
+            "the fake upstream saw {:?}\n{proxy_log}",
+            paths.lock().unwrap()
         );
     }
 

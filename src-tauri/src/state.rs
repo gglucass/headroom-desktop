@@ -15577,12 +15577,12 @@ mod tests {
     #[test]
     fn codex_new_input_correction_is_pinned() {
         // TransformationFeedEvent::new_input (models.rs) counts an OpenAI row's
-        // write and uncached input once (their max): right on 0.41.0, where a
-        // write is either inferred (equal to uncached, or alone) or a reported
-        // 0. A wheel that reports real OpenAI writes beside uncached input
-        // (after #4237) needs the sum there; upstream #4285 also stops /stats
-        // totals counting inferred writes twice, so recheck both on the bump.
-        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.41.0");
+        // write once when it equals the uncached input (inferred) and sums a
+        // reported one, disjoint since #4237 (0.42.0). The feed carries no
+        // cache_inferred flag; /stats `prefix_cache.totals` drops inferred
+        // writes natively since #4285 (0.42.0), so it is summed raw. Recheck
+        // both on the bump.
+        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.42.0");
     }
 
     /// The /stats contract, in one place: every primary JSON path this app

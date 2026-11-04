@@ -346,15 +346,21 @@ mod tests {
             .spawn()
             .expect("spawn cmd");
         let cmd_pid = child.id();
-        let child_of_cmd = || {
+        // A ppid outlives its parent: on CI a leftover vctip.exe from the build
+        // named cmd's reused pid as its parent, and kill_tree rightly spared it.
+        let ping_of_cmd = || {
             crate::winproc::process_parents()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|&(_, ppid)| ppid == cmd_pid)
+                .find(|&(pid, ppid)| {
+                    ppid == cmd_pid
+                        && crate::winproc::process_image_path(pid)
+                            .is_some_and(|path| path.to_ascii_lowercase().ends_with("\\ping.exe"))
+                })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let ping = loop {
-            if let Some(found) = child_of_cmd() {
+            if let Some(found) = ping_of_cmd() {
                 break found;
             }
             assert!(

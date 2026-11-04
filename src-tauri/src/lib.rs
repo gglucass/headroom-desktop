@@ -133,6 +133,8 @@ type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>
 enum QuitSource {
     SettingsButton,
     TrayMenu,
+    /// "Quit anyway" in the dialog that warns about open agent sessions.
+    QuitConfirm,
 }
 
 impl QuitSource {
@@ -140,6 +142,7 @@ impl QuitSource {
         match self {
             Self::SettingsButton => "settings_button",
             Self::TrayMenu => "tray_menu",
+            Self::QuitConfirm => "quit_confirm",
         }
     }
 }
@@ -1110,6 +1113,17 @@ async fn check_for_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<Option<AvailableAppUpdate>, String> {
+    check_and_store_update(&app, &pending_update.0).await
+}
+
+/// When the last update check started, from the webview or the idle applier.
+static LAST_UPDATE_CHECK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+async fn check_and_store_update(
+    app: &AppHandle,
+    pending_update: &Mutex<Option<TauriPendingUpdate>>,
+) -> Result<Option<AvailableAppUpdate>, String> {
+    *LAST_UPDATE_CHECK.lock() = Some(std::time::Instant::now());
     let current_version = app.package_info().version.to_string();
     let config = release_updater_config(&current_version, beta_channel_enabled())?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
@@ -1149,7 +1163,13 @@ async fn check_for_app_update(
     let checked_update =
         classify_update_check(updater.check().await).map(|update| update.map(TauriPendingUpdate));
 
-    store_checked_update(checked_update, &pending_update.0)
+    store_checked_update(checked_update, pending_update)
+}
+
+/// Only a quiet release stages with no click: the loud marker keeps the
+/// frontend's interrupting flow (appUpdate.ts `isLoudAppUpdate`).
+fn quiet_install_allowed(notes: Option<&str>, silent_install_supported: bool) -> bool {
+    silent_install_supported && !notes.is_some_and(|notes| notes.contains("headroom:loud"))
 }
 
 /// A manifest with no entry for this platform means "nothing for you yet", not a
@@ -1335,6 +1355,42 @@ fn spawn_idle_update_applier(app: AppHandle) {
                             &storage::app_data_dir(),
                         ));
                         log::info!("update: idle install failed: {err}");
+                    }
+                });
+            }
+            // The hourly check runs in the webview, and macOS stops a hidden
+            // window's timers: the Mac mini, whose window nobody opens, made no
+            // check for 2.5 days and sat six builds behind (2026-11-04). So an
+            // idle hour with no check from anywhere checks from here, and a
+            // quiet release stages for the next tick's restart.
+            let checked_recently = LAST_UPDATE_CHECK
+                .lock()
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60 * 60));
+            if !checked_recently {
+                log::info!("update: idle for {idle_minutes} minutes with no check in the last hour; checking");
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let pending = app.state::<PendingAppUpdate>();
+                    match check_and_store_update(&app, &pending.0).await {
+                        Ok(Some(update))
+                            if quiet_install_allowed(
+                                update.notes.as_deref(),
+                                silent_install_supported(),
+                            ) =>
+                        {
+                            log::info!("update: staging {} while idle", update.version);
+                            match install_pending_update(
+                                &pending.0,
+                                Arc::new(|_: AppUpdateProgress| {}),
+                            )
+                            .await
+                            {
+                                Ok(()) => UPDATE_STAGED.store(true, Ordering::Release),
+                                Err(err) => log::info!("update: idle staging failed: {err}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => log::info!("update: idle check failed: {err}"),
                     }
                 });
             }
@@ -7582,8 +7638,45 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn quit_headroom(app: AppHandle) {
-    exit_headroom(&app, QuitSource::SettingsButton);
+async fn quit_headroom(app: AppHandle, confirmed: Option<bool>) {
+    let source = if confirmed.unwrap_or(false) {
+        QuitSource::QuitConfirm
+    } else {
+        QuitSource::SettingsButton
+    };
+    exit_headroom(&app, source);
+}
+
+/// How recently an agent must have sent a request for Quit to ask first. Long
+/// enough to catch a session idle between prompts; Codex's app-server also
+/// polls `/v1/models`, which counts.
+const QUIT_CONFIRM_TRAFFIC_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// True when quitting would strand open agent sessions. Quit stops 6767 and
+/// switches every client back to its provider, but a running Claude Code or
+/// Codex reads its base URL only at start, so it keeps calling the dead port
+/// until restarted. Pause keeps 6767 forwarding direct, so the Quit buttons
+/// offer it instead. A window spectating another one's 6767 strands nothing.
+fn quit_strands_sessions(state: &AppState) -> bool {
+    !state.runtime_is_paused()
+        && !proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire)
+        && proxy_intercept::client_traffic_within(QUIT_CONFIRM_TRAFFIC_WINDOW)
+}
+
+#[tauri::command]
+fn quit_needs_confirm(state: tauri::State<'_, AppState>) -> bool {
+    quit_strands_sessions(&state)
+}
+
+/// When the tray's Quit last handed the confirm to the dashboard.
+static TRAY_QUIT_HANDED_OFF_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Whether the tray's Quit may hand off to the dashboard's confirm again. Not
+/// within a minute of the last hand-off: a dashboard that cannot show the
+/// dialog (CrashFallback after a render crash, a dead webview) swallows it,
+/// and the tray is then the user's only way out, so their second Quit quits.
+fn tray_quit_may_hand_off(handed_off_at: Option<std::time::Instant>) -> bool {
+    handed_off_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60))
 }
 
 fn launched_from_autostart() -> bool {
@@ -8885,6 +8978,7 @@ pub fn run() {
             set_usage_data_enabled,
             uninstall_and_quit,
             quit_headroom,
+            quit_needs_confirm,
             #[cfg(debug_assertions)]
             debug_force_proxy_bypass
         ])
@@ -9897,6 +9991,16 @@ fn learn_failure_is_agent_config_broken(text: &str) -> bool {
         || text.contains("Error loading config.toml")
 }
 
+/// The agent's Windows launcher points at a program that is not there: npm's
+/// `claude.cmd` shim runs `node_modules\@anthropic-ai\claude-code\bin\claude.exe`
+/// and cmd.exe could not find it (RUST-TX). Detection smoke-tests the shim with
+/// `--version` just before the scan, so the exe went missing mid-run (a Claude
+/// Code update swapping it) or the install is broken; the tail names the path.
+/// English only: cmd.exe localizes this line, so other locales still report.
+fn learn_failure_is_agent_install_broken(text: &str) -> bool {
+    text.contains("is not recognized as an internal or external command")
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
 fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
     let (cli, update) = match agent {
@@ -10403,6 +10507,7 @@ fn execute_headroom_learn_run(
                         && !agent_unparseable
                         && !agent_cli_outdated
                         && !learn_failure_is_agent_config_broken(diagnosis)
+                        && !learn_failure_is_agent_install_broken(diagnosis)
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -10628,6 +10733,7 @@ fn execute_headroom_learn_run(
                     || session_teardown
                     || agent_cli_outdated
                     || learn_failure_is_agent_config_broken(diagnosis)
+                    || learn_failure_is_agent_install_broken(diagnosis)
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -11044,7 +11150,21 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "quit" => {
-                exit_headroom(app, QuitSource::TrayMenu);
+                // The dashboard asks first. Onboarding and the terms gate
+                // have no dialog; checking them first keeps the window from
+                // flashing up before the quit.
+                let state = app.state::<AppState>();
+                if tray_quit_may_hand_off(*TRAY_QUIT_HANDED_OFF_AT.lock())
+                    && quit_strands_sessions(&state)
+                    && onboarding_complete(app)
+                    && state.accepted_terms_version() >= state::REQUIRED_TERMS_VERSION
+                    && show_primary_window(app, false).unwrap_or(false)
+                {
+                    *TRAY_QUIT_HANDED_OFF_AT.lock() = Some(std::time::Instant::now());
+                    let _ = app.emit("open-view", "confirm-quit");
+                } else {
+                    exit_headroom(app, QuitSource::TrayMenu);
+                }
             }
             _ => {}
         });
@@ -13141,24 +13261,24 @@ mod tests {
         learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
         learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
-        learn_failure_is_agent_config_broken, learn_failure_is_agent_model_rejected,
-        learn_failure_is_agent_unparseable_output, learn_failure_signature,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        lost_base_retry_backoff, missing_dependency_modules, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        snap_to_work_area_edges, startup_error_fingerprint_key, store_checked_update,
-        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link,
-        upgrade_pip_network_refused, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        learn_failure_is_agent_config_broken, learn_failure_is_agent_install_broken,
+        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
+        learn_failure_signature, learn_failure_signature_source, learn_step_label,
+        lifetime_token_milestone_kind, lost_base_retry_backoff, missing_dependency_modules,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, snap_to_work_area_edges,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, upgrade_pip_network_refused,
+        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -13603,6 +13723,10 @@ mod tests {
                 "source": "tray_menu",
                 "runtime_paused": true,
             })
+        );
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::QuitConfirm, false)["source"],
+            "quit_confirm"
         );
     }
 
@@ -17393,6 +17517,17 @@ Some unrelated content.
     }
 
     #[test]
+    fn learn_failure_is_agent_install_broken_matches_a_shim_without_its_exe() {
+        // RUST-TX verbatim: npm's claude.cmd pointing at a missing claude.exe.
+        assert!(learn_failure_is_agent_install_broken(
+            "LLM analysis failed: `~\\AppData\\Roaming\\npm\\claude.CMD -p --output-format stream-json` failed (exit 1):\r\n'\"~\\AppData\\Roaming\\npm\\\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n"
+        ));
+        assert!(!learn_failure_is_agent_install_broken(
+            "LLM analysis failed: `claude -p` failed (exit 1):\nAPI Error: 500\n"
+        ));
+    }
+
+    #[test]
     fn learn_failure_is_agent_cli_outdated_matches_an_unknown_flag_only() {
         // RUST-K9 verbatim: a stale CLI that predates upstream's stream flag.
         assert!(learn_failure_is_agent_cli_outdated(
@@ -18286,6 +18421,32 @@ Some unrelated content.
         // owner of a laptop that just woke is about to use it.
         assert_eq!(super::idle_minutes_after(minutes, true, false), 0);
         assert_eq!(super::idle_minutes_after(minutes, false, true), 0);
+    }
+
+    #[test]
+    fn a_second_tray_quit_within_a_minute_quits_instead_of_asking_again() {
+        let now = std::time::Instant::now();
+        assert!(super::tray_quit_may_hand_off(None));
+        // A crashed or dead dashboard never shows the dialog; the retry quits.
+        assert!(!super::tray_quit_may_hand_off(Some(now)));
+        assert!(super::tray_quit_may_hand_off(
+            now.checked_sub(std::time::Duration::from_secs(61))
+        ));
+    }
+
+    #[test]
+    fn the_idle_check_stages_only_quiet_releases_where_a_silent_install_works() {
+        assert!(super::quiet_install_allowed(Some("Stability fixes"), true));
+        assert!(super::quiet_install_allowed(None, true));
+        assert!(!super::quiet_install_allowed(
+            Some("Must-take fix <!-- headroom:loud -->"),
+            true
+        ));
+        // A .deb, Windows or a read-only bundle stays behind the user's click.
+        assert!(!super::quiet_install_allowed(
+            Some("Stability fixes"),
+            false
+        ));
     }
 
     #[test]

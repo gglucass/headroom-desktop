@@ -31,6 +31,7 @@
 # 2026-10-21: pip 26.2.2 added for the same incident (see the macOS lock).
 # 2026-10-27: pillow 12.3.0 -> 13.0.0 and fastembed 0.8.0 -> 0.9.1, the same
 # advisory clearance as the macOS lock (see its lineage).
+# 0.42.0: hf-xet 1.5.1 -> 1.6.0, its new core floor (see the macOS lock).
 #
 # Below: `sys_platform == "win32"` conditional deps excluded from this lock's
 # macOS-side resolution. `pip install --no-deps` skips dependency resolution
@@ -120,8 +121,8 @@ h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 h2==4.4.1 \
     --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6
-hf-xet==1.5.1 \
-    --hash=sha256:f7b3002f95d1c13e24bcb4537baa8f0eb3838957067c91bb4959bc004a6435f5
+hf-xet==1.6.0 \
+    --hash=sha256:fb4fadde1b2b70bf4c0c14a6dccbe7194b1c28947fefd5bbe3fed9d940676c3b
 hpack==4.2.0 \
     --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
 htmldate==1.10.0 \

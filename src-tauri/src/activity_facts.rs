@@ -1689,6 +1689,20 @@ mod tests {
             ..sized("openai", "gpt-6-sol", 0)
         };
         assert_eq!(responses.context_tokens(), Some(152_000));
+        // A reported Responses write (wheel 0.42.0, #4237) is disjoint from
+        // the uncached input: summed.
+        let reported = TransformationFeedEvent {
+            uncached_input_tokens: Some(500),
+            cache_write_tokens: Some(1_500),
+            ..responses.clone()
+        };
+        assert_eq!(reported.context_tokens(), Some(152_000));
+        // Only one half of the split: the other is 0, not inferred.
+        let write_only = TransformationFeedEvent {
+            uncached_input_tokens: Some(0),
+            ..responses.clone()
+        };
+        assert_eq!(write_only.context_tokens(), Some(152_000));
         // Its savings rate uses the same single count: 1,000 saved of 2,000 new.
         let mut rated = TransformationFeedEvent {
             tokens_saved: Some(2_000),

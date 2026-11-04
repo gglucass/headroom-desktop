@@ -25,10 +25,6 @@ const ALLOWED_EVENTS: &[&str] = &[
     "app_started",
     "account_activated",
     "checkout_started",
-    // The launcher paywall: shown, and a checkout completed from it. Added in
-    // 0.6.1 but never listed here, so dropped until 0.9.45.
-    "paywall_shown",
-    "paywall_checkout_completed",
     "subscription_plan_changed",
     "subscription_reactivated",
     "invite_code_used",
