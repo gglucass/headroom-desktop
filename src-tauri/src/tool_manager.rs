@@ -2142,16 +2142,16 @@ const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
 
-/// serena-agent pins every dependency exactly, and 1.7.0 pins
+/// serena-agent pins every dependency exactly, and 1.7.0 through 2.1.0 pin
 /// cryptography==50.0.0, whose macOS wheels are arm64-only (49.0.0 dropped
 /// universal2). On an Intel Mac pip fell back to the sdist, which needs a Rust
 /// toolchain, so every Serena install there failed with "Failed building wheel
 /// for cryptography" from the 1.6.1 -> 1.7.0 bump (2026-08-13) on (RUST-F6).
 /// 1.6.1 pins cryptography==48.0.1, the universal2 build the runtime lock also
-/// pins for Intel, and matches 1.7.0 on everything Headroom drives: the
+/// pins for Intel, and matches 2.1.0 on everything Headroom drives: the
 /// start-mcp-server flags, the claude-code/codex contexts,
 /// `web_dashboard_interface`, the dashboard port and `/get_tool_stats`, and the
-/// tool-call log line. Its closure resolves wheels-only on x86_64 macOS
+/// tool-call log line's `SERENA_TOOL_CALL_LOG_MARKER`. Its closure resolves wheels-only on x86_64 macOS
 /// (proxy-tools, pure Python, builds from its sdist as on every platform).
 /// Drop the Intel branch once the pin's cryptography ships an x86_64 macOS
 /// wheel.
@@ -2159,7 +2159,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
     if intel_mac {
         "1.6.1"
     } else {
-        "1.7.0"
+        "2.1.0"
     }
 }
 /// Serena runs its Python language servers (pyright, basedpyright, ty,
@@ -3514,8 +3514,8 @@ impl ToolManager {
 
     /// Today's serena tool calls, counted from `~/.serena/logs/<local day>/`.
     /// Serena's usage stats are in-memory only (analytics.py), so its log
-    /// files are the only persisted trace: one line containing
-    /// "; session_id: " per tool application (tools_base.py, pinned v1.7.0).
+    /// files are the only persisted trace: one `SERENA_TOOL_CALL_LOG_MARKER`
+    /// line per tool application.
     /// Local day matches serena's own log-dir bucketing (datetime.now()).
     /// 60s cache: Result lines make these files large enough that scanning on
     /// every dashboard poll would be wasteful.
@@ -9908,9 +9908,11 @@ fn codex_list_line_installed(line: &str, plugin_ref: &str) -> bool {
     words.next() == Some(plugin_ref) && words.next().is_some_and(|w| w.starts_with("installed"))
 }
 
-/// One serena tool application logs exactly one line containing this marker
-/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.7.0).
-const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
+/// One serena tool application logs exactly one line, from
+/// `tools_base.py` `_log_tool_application`, and serena's log format
+/// (`%(name)s:%(funcName)s:%(lineno)d`) names that function on it, from 1.6.1
+/// through 2.1.0. 2.0 dropped the `; session_id: ` suffix this used to count.
+const SERENA_TOOL_CALL_LOG_MARKER: &str = ":_log_tool_application:";
 
 /// Serena's dashboard API binds the first free port scanning upward from here
 /// (`constants.py` 0x5EDA, `dashboard.py` `_find_first_free_port`).
@@ -23905,12 +23907,17 @@ Always run the linter first.
         fs::create_dir_all(&dir).expect("log dir");
         fs::write(
             dir.join("mcp_20260723_1.txt"),
-            "INFO find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
-             INFO Result: 42 lines\n\
-             INFO read_file: {\"path\": \"x.rs\"}; session_id: abc\n",
+            // A 1.x line (Intel Macs), a result, and a 2.x line.
+            "INFO  2026-07-23 10:00:00,000 [Thread-1] serena.tools.tools_base:_log_tool_application:279 - find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
+             INFO  2026-07-23 10:00:01,000 [Thread-1] serena.tools.tools_base:_log_tool_result:300 - Result: 42 lines\n\
+             INFO  2026-07-23 10:00:02,000 [Task-2:GetSymbolsOverviewTool] serena.tools.tools_base:_log_tool_application:256 - get_symbols_overview: relative_path='x.rs'\n",
         )
         .expect("log file");
-        fs::write(dir.join("ignored.log"), "x: {}; session_id: zzz\n").expect("non-txt");
+        fs::write(
+            dir.join("ignored.log"),
+            "serena.tools.tools_base:_log_tool_application:256 - x\n",
+        )
+        .expect("non-txt");
         assert_eq!(super::count_serena_tool_calls_in_dir(&dir), Some(2));
 
         fs::remove_dir_all(&dir).ok();
