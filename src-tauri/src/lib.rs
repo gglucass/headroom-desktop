@@ -1110,6 +1110,17 @@ async fn check_for_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<Option<AvailableAppUpdate>, String> {
+    check_and_store_update(&app, &pending_update.0).await
+}
+
+/// When the last update check started, from the webview or the idle applier.
+static LAST_UPDATE_CHECK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+async fn check_and_store_update(
+    app: &AppHandle,
+    pending_update: &Mutex<Option<TauriPendingUpdate>>,
+) -> Result<Option<AvailableAppUpdate>, String> {
+    *LAST_UPDATE_CHECK.lock() = Some(std::time::Instant::now());
     let current_version = app.package_info().version.to_string();
     let config = release_updater_config(&current_version, beta_channel_enabled())?
         .ok_or_else(|| "Update checks are not configured in this build.".to_string())?;
@@ -1149,7 +1160,13 @@ async fn check_for_app_update(
     let checked_update =
         classify_update_check(updater.check().await).map(|update| update.map(TauriPendingUpdate));
 
-    store_checked_update(checked_update, &pending_update.0)
+    store_checked_update(checked_update, pending_update)
+}
+
+/// Only a quiet release stages with no click: the loud marker keeps the
+/// frontend's interrupting flow (appUpdate.ts `isLoudAppUpdate`).
+fn quiet_install_allowed(notes: Option<&str>, silent_install_supported: bool) -> bool {
+    silent_install_supported && !notes.is_some_and(|notes| notes.contains("headroom:loud"))
 }
 
 /// A manifest with no entry for this platform means "nothing for you yet", not a
@@ -1335,6 +1352,42 @@ fn spawn_idle_update_applier(app: AppHandle) {
                             &storage::app_data_dir(),
                         ));
                         log::info!("update: idle install failed: {err}");
+                    }
+                });
+            }
+            // The hourly check runs in the webview, and macOS stops a hidden
+            // window's timers: the Mac mini, whose window nobody opens, made no
+            // check for 2.5 days and sat six builds behind (2026-11-04). So an
+            // idle hour with no check from anywhere checks from here, and a
+            // quiet release stages for the next tick's restart.
+            let checked_recently = LAST_UPDATE_CHECK
+                .lock()
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60 * 60));
+            if !checked_recently {
+                log::info!("update: idle for {idle_minutes} minutes with no check in the last hour; checking");
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let pending = app.state::<PendingAppUpdate>();
+                    match check_and_store_update(&app, &pending.0).await {
+                        Ok(Some(update))
+                            if quiet_install_allowed(
+                                update.notes.as_deref(),
+                                silent_install_supported(),
+                            ) =>
+                        {
+                            log::info!("update: staging {} while idle", update.version);
+                            match install_pending_update(
+                                &pending.0,
+                                Arc::new(|_: AppUpdateProgress| {}),
+                            )
+                            .await
+                            {
+                                Ok(()) => UPDATE_STAGED.store(true, Ordering::Release),
+                                Err(err) => log::info!("update: idle staging failed: {err}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => log::info!("update: idle check failed: {err}"),
                     }
                 });
             }
@@ -18309,6 +18362,21 @@ Some unrelated content.
         // owner of a laptop that just woke is about to use it.
         assert_eq!(super::idle_minutes_after(minutes, true, false), 0);
         assert_eq!(super::idle_minutes_after(minutes, false, true), 0);
+    }
+
+    #[test]
+    fn the_idle_check_stages_only_quiet_releases_where_a_silent_install_works() {
+        assert!(super::quiet_install_allowed(Some("Stability fixes"), true));
+        assert!(super::quiet_install_allowed(None, true));
+        assert!(!super::quiet_install_allowed(
+            Some("Must-take fix <!-- headroom:loud -->"),
+            true
+        ));
+        // A .deb, Windows or a read-only bundle stays behind the user's click.
+        assert!(!super::quiet_install_allowed(
+            Some("Stability fixes"),
+            false
+        ));
     }
 
     #[test]
