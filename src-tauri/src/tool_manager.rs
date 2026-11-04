@@ -2167,7 +2167,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
 /// symbol query failed after a clean install, so uv lives in serena's venv and
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
+const CONTEXT7_PINNED_VERSION: &str = "4.4.4";
 /// Context7's own hosted MCP server. The server ignores `via=headroom`; it is
 /// how uninstall tells this entry from one a user added by hand, which
 /// Context7's own docs tell them to do.
