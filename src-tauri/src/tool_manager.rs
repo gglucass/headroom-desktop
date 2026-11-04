@@ -3029,6 +3029,27 @@ fn httpx_ca_bundle_bridge_from(
     }
 }
 
+/// The prefetch subprocess. The wheel's backend probes swallow their import
+/// error and raise a bare "Kompress requires onnxruntime or torch", so a torch
+/// `WinError 1114` that classified as `[missing native dep]` (RUST-7W) turned
+/// into an unexplained `[other]` once the wheel caught OSError (RUST-75, same
+/// hosts). Re-importing each backend puts the real error in the log tail.
+const KOMPRESS_PREFETCH_PY: &str = r#"import sys
+from headroom.transforms.kompress_compressor import KompressCompressor
+try:
+    KompressCompressor().preload(allow_download=True)
+except ImportError as exc:
+    if "requires onnxruntime or torch" not in str(exc):
+        raise
+    print(f"ImportError: {exc}")
+    for mod in ("onnxruntime", "transformers", "safetensors", "torch"):
+        try:
+            __import__(mod)
+        except Exception as err:
+            print(f"import {mod} failed: {type(err).__name__}: {err}")
+    sys.exit(1)
+"#;
+
 fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     let contents = std::fs::read_to_string(log_path).unwrap_or_default();
     let lines: Vec<&str> = contents.lines().collect();
@@ -3050,12 +3071,17 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     // cause that actually explains it scrolls past unreported. RUST-75 arrived
     // as a torch `c10.dll` load error with no hint that onnxruntime -- which
     // needs the same MSVC redistributable -- had already failed for the same
-    // reason. Carry the first cause too when the loader logged one.
+    // reason. Carry the first cause too when the loader (or the backend
+    // re-import in KOMPRESS_PREFETCH_PY) logged one.
     let onnx_cause: Option<String> = tail
         .lines()
         .map(str::trim)
         .rev()
-        .find(|line| line.contains("ONNX load failed"))
+        .find(|line| {
+            line.contains("ONNX load failed")
+                || (line.starts_with("import onnxruntime failed")
+                    && !line.starts_with(detail.as_str()))
+        })
         .map(|line| line.chars().take(160).collect());
 
     // The Sentry fingerprint is the bracketed category, so widening the detail
@@ -5091,10 +5117,7 @@ impl ToolManager {
 
         let mut child = crate::proc::command(python)
             .arg("-c")
-            .arg(
-                "from headroom.transforms.kompress_compressor import KompressCompressor; \
-                 KompressCompressor().preload(allow_download=True)",
-            )
+            .arg(KOMPRESS_PREFETCH_PY)
             .current_dir(&self.runtime.root_dir)
             .env("PYTHONNOUSERSITE", "1")
             .env("PYTHONUNBUFFERED", "1")
@@ -18836,6 +18859,43 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         assert!(cause.contains("onnxruntime_pybind11_state"), "{cause}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// RUST-75: the wheel's probes swallow the backend import error, so the
+    /// log tail held only the generic ImportError and filed as `[other]`. The
+    /// re-import lines KOMPRESS_PREFETCH_PY prints restore the cause.
+    #[test]
+    fn summarize_kompress_prefetch_failure_reads_the_backend_reimport_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kompress-prefetch.log");
+        fs::write(
+            &log,
+            "ImportError: Kompress requires onnxruntime or torch. Install with: pip install headroom-ai[proxy]\n\
+             import onnxruntime failed: ImportError: DLL load failed while importing onnxruntime_pybind11_state: x\n\
+             import torch failed: OSError: [WinError 1114] y. Error loading \"C:\\venv\\torch\\lib\\c10.dll\"\n",
+        )
+        .unwrap();
+        let cause = summarize_kompress_prefetch_failure(&log);
+        assert!(
+            cause.starts_with("[missing native dep] import torch failed: OSError: [WinError 1114]"),
+            "{cause}"
+        );
+        assert!(
+            cause.contains("(after import onnxruntime failed: ImportError: DLL load failed"),
+            "{cause}"
+        );
+
+        // onnxruntime as the last line is the detail, not repeated as its cause.
+        fs::write(
+            &log,
+            "ImportError: Kompress requires onnxruntime or torch.\n\
+             import onnxruntime failed: ModuleNotFoundError: No module named 'onnxruntime'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            summarize_kompress_prefetch_failure(&log),
+            "[other] import onnxruntime failed: ModuleNotFoundError: No module named 'onnxruntime'"
+        );
     }
 
     /// An updater relaunch leaves :6768 held by nobody for a moment. Treating
