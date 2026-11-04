@@ -19964,13 +19964,13 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
     /// test drives a fake. This one installs the pinned release (URL, checksum,
     /// archive layout) and runs the real hook on it, so a bump that changes
     /// what rtk answers fails here. Needs the network, so CI opts in on Linux
-    /// and macOS with HEADROOM_TEST_PINNED_RTK=1.
+    /// and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
     #[test]
     #[cfg(unix)]
     fn pinned_rtk_keeps_the_hook_contract() {
         use std::io::Write as _;
-        if std::env::var_os("HEADROOM_TEST_PINNED_RTK").is_none() {
-            eprintln!("skipping: set HEADROOM_TEST_PINNED_RTK=1 to install the pinned rtk");
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!("skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned rtk");
             return;
         }
         let (root, _runtime, manager) = seed_test_runtime("pinned-rtk");
