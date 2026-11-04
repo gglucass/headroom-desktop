@@ -7668,6 +7668,17 @@ fn quit_needs_confirm(state: tauri::State<'_, AppState>) -> bool {
     quit_strands_sessions(&state)
 }
 
+/// When the tray's Quit last handed the confirm to the dashboard.
+static TRAY_QUIT_HANDED_OFF_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Whether the tray's Quit may hand off to the dashboard's confirm again. Not
+/// within a minute of the last hand-off: a dashboard that cannot show the
+/// dialog (CrashFallback after a render crash, a dead webview) swallows it,
+/// and the tray is then the user's only way out, so their second Quit quits.
+fn tray_quit_may_hand_off(handed_off_at: Option<std::time::Instant>) -> bool {
+    handed_off_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60))
+}
+
 fn launched_from_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
@@ -11143,11 +11154,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 // have no dialog; checking them first keeps the window from
                 // flashing up before the quit.
                 let state = app.state::<AppState>();
-                if quit_strands_sessions(&state)
+                if tray_quit_may_hand_off(*TRAY_QUIT_HANDED_OFF_AT.lock())
+                    && quit_strands_sessions(&state)
                     && onboarding_complete(app)
                     && state.accepted_terms_version() >= state::REQUIRED_TERMS_VERSION
                     && show_primary_window(app, false).unwrap_or(false)
                 {
+                    *TRAY_QUIT_HANDED_OFF_AT.lock() = Some(std::time::Instant::now());
                     let _ = app.emit("open-view", "confirm-quit");
                 } else {
                     exit_headroom(app, QuitSource::TrayMenu);
@@ -18408,6 +18421,17 @@ Some unrelated content.
         // owner of a laptop that just woke is about to use it.
         assert_eq!(super::idle_minutes_after(minutes, true, false), 0);
         assert_eq!(super::idle_minutes_after(minutes, false, true), 0);
+    }
+
+    #[test]
+    fn a_second_tray_quit_within_a_minute_quits_instead_of_asking_again() {
+        let now = std::time::Instant::now();
+        assert!(super::tray_quit_may_hand_off(None));
+        // A crashed or dead dashboard never shows the dialog; the retry quits.
+        assert!(!super::tray_quit_may_hand_off(Some(now)));
+        assert!(super::tray_quit_may_hand_off(
+            now.checked_sub(std::time::Duration::from_secs(61))
+        ));
     }
 
     #[test]
