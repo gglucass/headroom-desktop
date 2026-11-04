@@ -1,0 +1,73 @@
+name: Bump addons
+
+# Proposes addon pin bumps and never merges them: one PR per addon into
+# staging, for the newest upstream release at least 7 days old
+# (scripts/bump-addons.py). An open PR already at that version is left alone.
+# Needs Settings > Actions > General > "Allow GitHub Actions to create and
+# approve pull requests".
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  # A PR opened with GITHUB_TOKEN starts no pull_request run, so Test is
+  # dispatched on each branch instead; its checks land on the PR's head commit.
+  actions: write
+
+concurrency:
+  group: bump-addons
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: staging
+          fetch-depth: 0
+
+      - name: Open or update a PR per addon
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          failed=0
+          for addon in rtk codebase-memory markitdown serena context7; do
+            branch="autobump/$addon"
+            open=$(gh pr list --head "$branch" --base staging --state open --json number,title -q '.[] | "\(.number) \(.title)"')
+            git checkout -q -f -B "$branch" origin/staging
+            if ! out=$(python3 scripts/bump-addons.py "$addon"); then
+              echo "::error::bumping $addon failed"
+              failed=1
+              continue
+            fi
+            if [ -z "$out" ]; then
+              # Staging caught up (a hand bump), so an open PR is stale.
+              if [ -n "$open" ]; then
+                gh pr close "${open%% *}" --delete-branch --comment "Staging already has this version or newer."
+              fi
+              continue
+            fi
+            title=$(head -n 1 <<<"$out")
+            body=$(tail -n +3 <<<"$out")
+            if [ "${open#* }" = "$title" ]; then
+              continue
+            fi
+            git commit -q -a -m "$title" -m "$body"
+            git push -q -f origin "$branch"
+            if [ -n "$open" ]; then
+              gh pr edit "${open%% *}" --title "$title" --body "$body"
+            else
+              gh pr create --base staging --head "$branch" --title "$title" --body "$body"
+            fi
+            gh workflow run test.yml --ref "$branch"
+          done
+          exit "$failed"

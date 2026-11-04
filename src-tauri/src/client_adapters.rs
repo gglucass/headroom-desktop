@@ -11429,7 +11429,10 @@ updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
 json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Headroom RTK auto-rewrite", "updatedInput": updated}}, sys.stdout)
 "##;
 
-fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
+pub(crate) fn build_headroom_rtk_hook(
+    managed_rtk_path: &Path,
+    managed_python_path: &Path,
+) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
     let python = shell_double_quote(&managed_python_path.to_string_lossy());
 
