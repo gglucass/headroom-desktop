@@ -154,8 +154,8 @@ jobs:
 
       - name: Run app test suite
         env:
-          # Installs the pinned rtk and runs the real hook on it.
-          HEADROOM_TEST_PINNED_RTK: "1"
+          # Installs the pinned addon binaries and runs them (needs network).
+          HEADROOM_TEST_PINNED_ADDONS: "1"
         run: ./scripts/verify-release.sh
 
       - name: Linux runtime boots and proxies a request
@@ -306,8 +306,8 @@ jobs:
         # the release workflows, so a macOS-only regression reached staging
         # green and surfaced at release cut. Gate it on PR instead.
         env:
-          # Installs the pinned rtk and runs the real hook on it.
-          HEADROOM_TEST_PINNED_RTK: "1"
+          # Installs the pinned addon binaries and runs them (needs network).
+          HEADROOM_TEST_PINNED_ADDONS: "1"
         run: ./scripts/verify-release.sh
 
   test-macos-wheel:
