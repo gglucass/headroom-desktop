@@ -2137,7 +2137,7 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.48.0";
+const RTK_VERSION: &str = "1.1.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
@@ -2615,15 +2615,15 @@ fn fetch_plugin_version(repo: &str) -> Option<String> {
     manifest.get("version")?.as_str().map(str::to_string)
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
+    "1623590dd8d65374f61589c599c764c08ba9ce993ebe6b601312a89a3c874558";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "a95f2c23e08572dcc84ddff5fbe432e41e7f94369622eb086cca49ae0b6f61e8";
+    "559156238dd3e148c84c88c3a62a7594b874f68793208994e1b02e77a9d9abf9";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "5ed65486a96077bd6bba7c87fdc9d0e4a1918d19619be3c87380888389a30c7c";
+    "57a4fac13d18da77f0577ea8b68def7934b934bf76d0a6e161f0bfd06b1e1078";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "e4e650fa1677c0de2f6839a6040d7b17f312d32f163c402b75af70e9e5af1a91";
+    "4dec94a64035e08189ae82fd5408fe4ae9ae27a665fc07e3e3ec3c4c2d8e8a3e";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "8c9ae56bacde865112777a9fe9791b449186d8b2a081c32c0772ef773f284f93";
+    "9b076379be9d86011ca3f3a0264d0be4851da5535453a47f67fa46b4e893fbb2";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -12803,9 +12803,13 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
         (os, arch) => bail!("unsupported RTK target: {os}/{arch}"),
     };
 
+    // rtk-oss: since 1.0.0 the plain `rtk` asset also links the BUSL-1.1
+    // rtk-engine, whose grant excludes paid products. The Apache-2.0 edition
+    // has the same rewrite and filters; it lacks only `rtk pipeline` and
+    // PostToolUse compression, which Headroom never runs.
     Ok(DownloadArtifact {
         url: format!(
-            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-{}.{}",
+            "https://github.com/rtk-ai/rtk/releases/download/v{}/rtk-oss-{}.{}",
             RTK_VERSION, target, extension
         ),
         sha256: Some(sha256),
