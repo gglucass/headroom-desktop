@@ -89,6 +89,7 @@ import {
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
+import { QuitConfirmModal } from "./components/QuitConfirmModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
 import { UsageDataPanel } from "./components/UsageDataPanel";
@@ -2037,6 +2038,7 @@ export default function App() {
   const [autoLearnEnabled, setAutoLearnEnabled] = useState<boolean | null>(null);
   const [autoLearnBusy, setAutoLearnBusy] = useState(false);
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
+  const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [uninstallBusy, setUninstallBusy] = useState(false);
   const [uninstallError, setUninstallError] = useState<string | null>(null);
   // "cancel" is not a plan: it is the cancel-subscription action, which shares the
@@ -4778,17 +4780,29 @@ export default function App() {
   }, [windowLabel]);
 
   // The tray menu's "Invite friends" item shows the window, then asks for the
-  // Invite view.
+  // Invite view; its "Quit Headroom" does the same for the quit confirm.
   useEffect(() => {
     const unlistenPromise = listen<string>("open-view", (event) => {
       if (event.payload === "invite") {
         setActiveView("invite");
+      } else if (event.payload === "confirm-quit") {
+        setShowQuitConfirm(true);
       }
     });
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
+
+  async function handleQuit() {
+    // A failed check must not leave Quit doing nothing.
+    const ask = await invoke<boolean>("quit_needs_confirm").catch(() => false);
+    if (ask) {
+      setShowQuitConfirm(true);
+    } else {
+      void invoke("quit_headroom");
+    }
+  }
 
   async function confirmMagicLinkSignIn() {
     if (!magicLinkPending) {
@@ -8721,13 +8735,17 @@ export default function App() {
               </button>
 <button
                 className="quit-button"
-                onClick={() => void invoke("quit_headroom")}
+                onClick={() => void handleQuit()}
                 type="button"
               >
                 Quit Headroom
               </button>
             </section>
           </div>
+
+          {showQuitConfirm ? (
+            <QuitConfirmModal onClose={() => setShowQuitConfirm(false)} />
+          ) : null}
 
           {setupStall && (
             <SetupStallModal

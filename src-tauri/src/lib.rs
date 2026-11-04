@@ -133,6 +133,8 @@ type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>
 enum QuitSource {
     SettingsButton,
     TrayMenu,
+    /// "Quit anyway" in the dialog that warns about open agent sessions.
+    QuitConfirm,
 }
 
 impl QuitSource {
@@ -140,6 +142,7 @@ impl QuitSource {
         match self {
             Self::SettingsButton => "settings_button",
             Self::TrayMenu => "tray_menu",
+            Self::QuitConfirm => "quit_confirm",
         }
     }
 }
@@ -7635,8 +7638,34 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn quit_headroom(app: AppHandle) {
-    exit_headroom(&app, QuitSource::SettingsButton);
+async fn quit_headroom(app: AppHandle, confirmed: Option<bool>) {
+    let source = if confirmed.unwrap_or(false) {
+        QuitSource::QuitConfirm
+    } else {
+        QuitSource::SettingsButton
+    };
+    exit_headroom(&app, source);
+}
+
+/// How recently an agent must have sent a request for Quit to ask first. Long
+/// enough to catch a session idle between prompts; Codex's app-server also
+/// polls `/v1/models`, which counts.
+const QUIT_CONFIRM_TRAFFIC_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// True when quitting would strand open agent sessions. Quit stops 6767 and
+/// switches every client back to its provider, but a running Claude Code or
+/// Codex reads its base URL only at start, so it keeps calling the dead port
+/// until restarted. Pause keeps 6767 forwarding direct, so the Quit buttons
+/// offer it instead. A window spectating another one's 6767 strands nothing.
+fn quit_strands_sessions(state: &AppState) -> bool {
+    !state.runtime_is_paused()
+        && !proxy_intercept::SPECTATING_TWIN.load(Ordering::Acquire)
+        && proxy_intercept::client_traffic_within(QUIT_CONFIRM_TRAFFIC_WINDOW)
+}
+
+#[tauri::command]
+fn quit_needs_confirm(state: tauri::State<'_, AppState>) -> bool {
+    quit_strands_sessions(&state)
 }
 
 fn launched_from_autostart() -> bool {
@@ -8938,6 +8967,7 @@ pub fn run() {
             set_usage_data_enabled,
             uninstall_and_quit,
             quit_headroom,
+            quit_needs_confirm,
             #[cfg(debug_assertions)]
             debug_force_proxy_bypass
         ])
@@ -11109,7 +11139,19 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "quit" => {
-                exit_headroom(app, QuitSource::TrayMenu);
+                // The dashboard asks first. Onboarding and the terms gate
+                // have no dialog; checking them first keeps the window from
+                // flashing up before the quit.
+                let state = app.state::<AppState>();
+                if quit_strands_sessions(&state)
+                    && onboarding_complete(app)
+                    && state.accepted_terms_version() >= state::REQUIRED_TERMS_VERSION
+                    && show_primary_window(app, false).unwrap_or(false)
+                {
+                    let _ = app.emit("open-view", "confirm-quit");
+                } else {
+                    exit_headroom(app, QuitSource::TrayMenu);
+                }
             }
             _ => {}
         });
@@ -13668,6 +13710,10 @@ mod tests {
                 "source": "tray_menu",
                 "runtime_paused": true,
             })
+        );
+        assert_eq!(
+            app_quit_requested_properties(QuitSource::QuitConfirm, false)["source"],
+            "quit_confirm"
         );
     }
 
