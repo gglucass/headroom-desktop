@@ -2180,17 +2180,17 @@ static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
+const CODEBASE_MEMORY_VERSION: &str = "0.12.1";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18";
+    "9bfcbe38414b47969a3e1d1c1999f5357409387c86fa3d24221b5458267660d2";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e";
+    "ca6e64397a8ae80cec898a8205a6aa16750ac798acc05a0c3ed983837944a581";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "c0e46c87cf37e35f1ac0bd9cc7e1d8b0ca4ef40034e1008805d709fa52a4e38a";
+    "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "032b33c1833919a2d1de67ff6367fa6ea46aee8689c86ef223c88fae3b6e4536";
+    "8c3d0341064301e78ecc84cf7348d4e2c6562a0f57448243ea560aaa34de36c1";
 const CODEBASE_MEMORY_SHA256_WINDOWS_X86_64: &str =
-    "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685";
+    "4e4e0f16b45233af5c757a1fcbe3c3b16e9056375b1fbe2ce020b6de75dedcc0";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -12848,12 +12848,18 @@ fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
             CODEBASE_MEMORY_SHA256_MACOS_X86_64,
             "tar.gz",
         ),
+        // The static `-portable` builds: the plain Linux ones link glibc 2.38,
+        // which Ubuntu 22.04, Debian 12 and RHEL 9 lack.
         ("linux", "aarch64") => (
-            "linux-arm64",
+            "linux-arm64-portable",
             CODEBASE_MEMORY_SHA256_LINUX_AARCH64,
             "tar.gz",
         ),
-        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64, "tar.gz"),
+        ("linux", "x86_64") => (
+            "linux-amd64-portable",
+            CODEBASE_MEMORY_SHA256_LINUX_X86_64,
+            "tar.gz",
+        ),
         ("windows", "x86_64") => (
             "windows-amd64",
             CODEBASE_MEMORY_SHA256_WINDOWS_X86_64,
@@ -20069,6 +20075,75 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         let gain: super::RtkDailyGainOutput =
             serde_json::from_slice(&gain.stdout).expect("gain json");
         assert!(gain.summary.is_some(), "the RTK tile reads summary");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every other codebase-memory test fakes the binary. This installs the
+    /// pinned release's archive (URL, checksum, layout) and starts its MCP
+    /// server, so a bump to a build that cannot run here fails: the Linux builds
+    /// pinned through 0.11.0 needed glibc 2.38. Needs the network, so CI opts in
+    /// on Linux and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
+    #[test]
+    #[cfg(unix)]
+    fn pinned_codebase_memory_serves_mcp() {
+        use std::io::Write as _;
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!(
+                "skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned codebase-memory"
+            );
+            return;
+        }
+        let root = unique_temp_dir("pinned-codebase-memory");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let artifact = codebase_memory_distribution_artifact().expect("supported target");
+        let archive = root.join(artifact.url.rsplit('/').next().unwrap());
+        super::download_to_path(&artifact.url, &archive, artifact.sha256)
+            .expect("download the pinned codebase-memory");
+        super::unpack_release_archive(&archive, &root).expect("unpack");
+
+        let mut child = crate::proc::command(root.join("codebase-memory-mcp"))
+            .current_dir(&home)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start codebase-memory");
+        let mut stdin = child.stdin.take().unwrap();
+        for request in [
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "headroom-test", "version": "1" } } }),
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        ] {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .expect("codebase-memory exits on EOF");
+        let replies: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let reply = |id: u64| {
+            replies
+                .iter()
+                .find(|reply| reply["id"] == id)
+                .unwrap_or_else(|| panic!("no reply to {id}: {replies:?}"))
+        };
+        assert_eq!(
+            reply(1)["result"]["serverInfo"]["version"],
+            super::CODEBASE_MEMORY_VERSION
+        );
+        assert!(
+            reply(2)["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{replies:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
