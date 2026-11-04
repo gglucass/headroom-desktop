@@ -6,6 +6,9 @@ on:
       - main
       - staging
   pull_request:
+  # bump-addons.yml dispatches this on its PR branches: a PR opened with
+  # GITHUB_TOKEN starts no pull_request run.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -98,6 +101,9 @@ jobs:
         # here and lands as silently inert vendors on user machines.
         run: python scripts/check-sitecustomize-syntax.py
 
+      - name: Addon bump script picks the right release
+        run: python scripts/bump-addons.py --self-test
+
       - name: Linux runtime lock resolves to wheels only
         # Mirrors the Windows job's check: a pin with no manylinux wheel makes
         # bootstrap compile from source on the user's machine. No --platform,
@@ -147,6 +153,9 @@ jobs:
         run: npm run lint
 
       - name: Run app test suite
+        env:
+          # Installs the pinned rtk and runs the real hook on it.
+          HEADROOM_TEST_PINNED_RTK: "1"
         run: ./scripts/verify-release.sh
 
       - name: Linux runtime boots and proxies a request
@@ -296,6 +305,9 @@ jobs:
         # macOS is the primary platform but was previously only gated inside
         # the release workflows, so a macOS-only regression reached staging
         # green and surfaced at release cut. Gate it on PR instead.
+        env:
+          # Installs the pinned rtk and runs the real hook on it.
+          HEADROOM_TEST_PINNED_RTK: "1"
         run: ./scripts/verify-release.sh
 
   test-macos-wheel:

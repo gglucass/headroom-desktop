@@ -19964,6 +19964,118 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The rewrite hook auto-allows on rtk's exit code, and every other rtk
+    /// test drives a fake. This one installs the pinned release (URL, checksum,
+    /// archive layout) and runs the real hook on it, so a bump that changes
+    /// what rtk answers fails here. Needs the network, so CI opts in on Linux
+    /// and macOS with HEADROOM_TEST_PINNED_RTK=1.
+    #[test]
+    #[cfg(unix)]
+    fn pinned_rtk_keeps_the_hook_contract() {
+        use std::io::Write as _;
+        if std::env::var_os("HEADROOM_TEST_PINNED_RTK").is_none() {
+            eprintln!("skipping: set HEADROOM_TEST_PINNED_RTK=1 to install the pinned rtk");
+            return;
+        }
+        let (root, _runtime, manager) = seed_test_runtime("pinned-rtk");
+        manager.install_rtk().expect("install the pinned rtk");
+        let rtk = manager.rtk_entrypoint();
+        let (home, project) = (root.join("home"), root.join("project"));
+        fs::create_dir_all(home.join(".claude")).expect("home");
+        fs::create_dir_all(&project).expect("project");
+        // No rule names git, so `git status` takes the read-only path (exit 3).
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"permissions":{"allow":["Bash(git log:*)"],"ask":["Bash(cargo test:*)"],"deny":["Bash(cargo build:*)"]}}"#,
+        )
+        .expect("settings");
+        let hook = root.join("hook.sh");
+        fs::write(
+            &hook,
+            crate::client_adapters::build_headroom_rtk_hook(&rtk, Path::new("/usr/bin/python3")),
+        )
+        .expect("hook");
+        let rtk_in_home = |args: &[&str]| {
+            let mut cmd = crate::proc::command(&rtk);
+            cmd.args(args)
+                .env("HOME", &home)
+                .env("RTK_TELEMETRY_DISABLED", "1");
+            cmd
+        };
+
+        let version = rtk_in_home(&["--version"]).output().expect("rtk --version");
+        let version = String::from_utf8_lossy(&version.stdout).into_owned();
+        assert_eq!(
+            version.split_whitespace().nth(1),
+            Some(RTK_VERSION),
+            "{version}"
+        );
+
+        let run = |command: &str| {
+            let mut child = crate::proc::command("bash")
+                .arg(&hook)
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("RTK_TELEMETRY_DISABLED", "1")
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn hook");
+            let input = serde_json::json!({
+                "permission_mode": "default",
+                "cwd": project,
+                "tool_input": { "command": command },
+            });
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().expect("run hook");
+            assert!(
+                out.status.success(),
+                "{command}: hook exited {}",
+                out.status
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // An allow rule (rtk exits 0) and one plain read-only command (3).
+        for command in ["git log -5", "git status"] {
+            let out = run(command);
+            let decision: serde_json::Value = serde_json::from_str(&out).expect(&out);
+            let decision = &decision["hookSpecificOutput"];
+            assert_eq!(decision["permissionDecision"], "allow", "{command}: {out}");
+            let rewritten = decision["updatedInput"]["command"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                rewritten.ends_with(&format!("/rtk {command}")),
+                "{command}: {out}"
+            );
+        }
+        // Everything else reaches Claude Code untouched: a deny rule (2), an
+        // ask rule, a destructive tail, no rtk equivalent (1), and --check.
+        for command in [
+            "cargo build",
+            "cargo test",
+            "git status; rm -rf ~/x",
+            "echo hi",
+            "git diff --check",
+        ] {
+            assert_eq!(run(command), "", "{command}");
+        }
+
+        let gain = rtk_in_home(&["gain", "--daily", "--format", "json"])
+            .output()
+            .expect("rtk gain");
+        let gain: super::RtkDailyGainOutput =
+            serde_json::from_slice(&gain.stdout).expect("gain json");
+        assert!(gain.summary.is_some(), "the RTK tile reads summary");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rtk_distribution_artifact_is_pinned_to_current_release_with_checksum() {
         let artifact = rtk_distribution_artifact().expect("supported RTK target");
