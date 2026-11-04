@@ -21973,6 +21973,111 @@ time.sleep(30)
         );
     }
 
+    /// Boots the backend through the app's own spawn against the runtime in
+    /// HEADROOM_DATA_DIR, waits for /readyz, and sends one request through it
+    /// to a fake upstream. CI's Linux job runs it: every other job only
+    /// dry-runs the Linux lock, so nothing ever started the runtime Linux users
+    /// get. Opt-in, because it takes port 6768 and reclaims a Headroom backend
+    /// it finds there: the release-train gates run on a machine with a live app.
+    #[test]
+    fn backend_boots_and_proxies_a_request_from_the_installed_runtime() {
+        use std::io::{Read, Write};
+        if std::env::var("HEADROOM_BACKEND_BOOT_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set HEADROOM_BACKEND_BOOT_TEST=1 (takes port 6768)");
+            return;
+        }
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        std::thread::spawn(move || {
+            for mut stream in upstream.incoming().flatten() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let head_end = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let body_len = head
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < head_end + body_len {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen.lock().unwrap().push(path);
+                let body = r#"{"id":"msg_boot","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":1}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        crate::upstream_override::publish(crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: upstream_url,
+            ..Default::default()
+        });
+
+        let runtime = ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir());
+        let logs = runtime.logs_dir();
+        let manager = ToolManager::new(runtime);
+        let mut child = manager
+            .start_headroom_background(false)
+            .expect("the backend did not start");
+        let port = backend_port::get();
+        let ready = (0..360).any(|_| {
+            probe_backend_readyz_ok(port) || {
+                std::thread::sleep(Duration::from_millis(500));
+                false
+            }
+        });
+        let reply = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", "sk-ant-boot-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with ok"}]}"#)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .map(|r| (r.status().as_u16(), r.text().unwrap_or_default()));
+        let _ = child.kill();
+        let _ = child.wait();
+        let proxy_log = log_tail(&logs.join(format!("proxy-{port}.log")), 6000);
+
+        assert!(ready, "/readyz never answered 2xx on {port}\n{proxy_log}");
+        let (status, body) =
+            reply.unwrap_or_else(|err| panic!("request failed: {err}\n{proxy_log}"));
+        assert_eq!(status, 200, "body: {body}\n{proxy_log}");
+        assert!(
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with("/v1/messages")),
+            "the fake upstream saw {:?}\n{proxy_log}",
+            paths.lock().unwrap()
+        );
+    }
+
     /// Regression: a relaunch mid-startup left a proxy polling for readiness
     /// that outlived the app and held the port (rc.1 -> rc.3, 2026-10-02).
     #[cfg(unix)]

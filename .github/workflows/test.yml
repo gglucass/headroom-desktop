@@ -149,6 +149,35 @@ jobs:
       - name: Run app test suite
         run: ./scripts/verify-release.sh
 
+      - name: Linux runtime boots and proxies a request
+        # The lock step above only dry-runs, and the installed-wheel tests run
+        # on macOS, so no job ever started the runtime Linux users get: a bad
+        # pin or a Linux-only import error shipped as a bootstrap failure.
+        # Build it the way the app does (the lock with resolution, then the
+        # pinned wheel --no-deps) and boot it through the app's own spawn.
+        shell: bash
+        env:
+          HEADROOM_DATA_DIR: ${{ runner.temp }}/headroom-linux
+          HEADROOM_BACKEND_BOOT_TEST: '1'
+        run: |
+          pin=$(sed -n 's/^pub(crate) const HEADROOM_PINNED_VERSION: &str = "\(.*\)";/\1/p' src-tauri/src/tool_manager.rs)
+          test -n "$pin"
+          py="$HEADROOM_DATA_DIR/headroom/runtime/venv/bin/python"
+          python -m venv "$HEADROOM_DATA_DIR/headroom/runtime/venv"
+          "$py" -m pip install --quiet --only-binary=:all: \
+            --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1 \
+            -r src-tauri/python/headroom-linux-requirements.lock
+          "$py" -m pip install --quiet --no-deps --only-binary=:all: "headroom-ai==$pin"
+          # The suite's own build, run directly (as test-macos-wheel does).
+          bin=$(cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.executable != null) | .executable')
+          test -x "$bin"
+          cd src-tauri
+          "$bin" backend_boots_and_proxies_a_request_from_the_installed_runtime --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/boot-test.log"
+          if grep 'skipping:' "$RUNNER_TEMP/boot-test.log"; then exit 1; fi
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/boot-test.log"
+
   test-windows:
     runs-on: windows-latest
     timeout-minutes: 30
