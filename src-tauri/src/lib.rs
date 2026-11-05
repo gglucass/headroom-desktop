@@ -3392,6 +3392,11 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
                 // A cause with its own remedy (RUST-CS: WinError 10013) gets
                 // its own issue instead of sharing the exit-class bucket.
                 fp.extend(startup_error_fingerprint_key(Some(technical_err.as_str())));
+                // A unix stall arrives as a SIGABRT dump, a Windows one as the
+                // stall-dump stacks; RUST-F2 is the Windows slow-host class.
+                if category == "startup-timeout" && cfg!(unix) {
+                    fp.push("unix");
+                }
                 scope.set_fingerprint(Some(fp.as_slice()));
                 // Who signalled a child that died before binding: our own
                 // recent kills, oldest first, or empty when we sent none.

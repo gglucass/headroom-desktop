@@ -11627,8 +11627,11 @@ fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16))
 /// all-threads dump that follows them runs well past the 80-line tail Sentry
 /// gets (RUST-C7: seven idle threads plus a 100-frame import chain), so the one
 /// line that says access violation / Aborted / OMP error was exactly what got
-/// cut. Keeps the last few matches: the log is append-only across attempts and
-/// the newest dump is the one being reported.
+/// cut. So were the innermost frames under `Current thread`, which name what a
+/// unix startup timeout's SIGABRT caught the backend stuck in (RUST-F2 on
+/// macOS: a 100-frame litellm import), so the first few of those come along.
+/// Keeps the last few matches: the log is append-only across attempts and the
+/// newest dump is the one being reported.
 fn fatal_header_lines(path: &Path) -> Vec<String> {
     const MARKERS: &[&str] = &[
         "Fatal Python error",
@@ -11636,18 +11639,30 @@ fn fatal_header_lines(path: &Path) -> Vec<String> {
         "OMP: Error",
         "Current thread 0x",
     ];
-    const KEEP: usize = 6;
+    const FRAMES: usize = 3;
+    const KEEP: usize = 12;
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut frames_left = 0;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if MARKERS.iter().any(|m| line.contains(m)) {
-            if kept.len() == KEEP {
-                kept.pop_front();
-            }
-            kept.push_back(redact_sensitive(&line));
+            frames_left = if line.contains("Current thread 0x") {
+                FRAMES
+            } else {
+                0
+            };
+        } else if frames_left > 0 && line.trim_start().starts_with("File \"") {
+            frames_left -= 1;
+        } else {
+            frames_left = 0;
+            continue;
         }
+        if kept.len() == KEEP {
+            kept.pop_front();
+        }
+        kept.push_back(redact_sensitive(&line));
     }
     kept.into_iter().collect()
 }
@@ -18537,9 +18552,15 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         }
         std::fs::write(&log, body).unwrap();
         let excerpt = super::crash_log_excerpt(&log);
+        // The innermost frames come along (RUST-F2: what the stall was in),
+        // the rest of the dump does not.
         assert!(
             excerpt.starts_with(
-                "--- fatal markers ---\nFatal Python error: Aborted\nCurrent thread 0x00001234"
+                "--- fatal markers ---\nFatal Python error: Aborted\n\
+                 Current thread 0x00001234 (most recent call first):\n  \
+                 File \"sklearn/__init__.py\", line 0 in <module>\n  \
+                 File \"sklearn/__init__.py\", line 1 in <module>\n  \
+                 File \"sklearn/__init__.py\", line 2 in <module>\n--- tail ---\n"
             ),
             "{excerpt}"
         );
