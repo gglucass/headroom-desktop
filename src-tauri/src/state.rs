@@ -877,6 +877,7 @@ impl AppState {
         // Before the proxy starts: venvs that got markitdown[all] before
         // 0.9.49 (or kept olefile after uninstalling it) still hold olefile.
         self.tool_manager.remove_olefile();
+        self.tool_manager.restore_missing_lock_pins();
 
         // Pre-wrapper installs still have a bare symlink shim; refresh it so
         // the conversion counter starts recording without a reinstall.

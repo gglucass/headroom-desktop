@@ -8544,6 +8544,31 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Put back lock packages whose dist-info is gone. A pip install denied
+    /// mid-replace leaves one: on Windows, 0.9.56's MarkItDown 0.1.7 install
+    /// hit WinError 5 on the running backend's onnxruntime DLL, leaving
+    /// `~nnxruntime` stashes, no onnxruntime dist-info and an onnxruntime that
+    /// cannot import. Nothing else re-syncs it, since the receipt's lock sha
+    /// still matches. A dist-info scan, so the launch path can call it every
+    /// time; it must run before the proxy holds the DLLs.
+    pub fn restore_missing_lock_pins(&self) {
+        let python = self.runtime.managed_python();
+        let installed = venv_dist_infos(&python);
+        // Empty means unreadable or not installed yet: the bootstrap's job.
+        if installed.is_empty() {
+            return;
+        }
+        let missing = missing_lock_packages(&installed, bootstrap_requirements_lock());
+        if missing.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = missing.iter().map(String::as_str).collect();
+        log::warn!("lock packages {names:?} have no dist-info; reinstalling them from the lock");
+        if let Err(err) = self.reinstall_lock_pins(&names, "missing-pins-repair.lock") {
+            log::warn!("reinstalling the lock's {names:?} failed: {err:#}");
+        }
+    }
+
     /// Pillow opens FlashPix and MIC images only when olefile imports, and its
     /// FlashPix decoder has a heap write (CVE-2026-112398) that a crafted
     /// agent-traffic image reaches through headroom-ai's bare Image.open.
@@ -14920,6 +14945,35 @@ fn moved_lock_packages(
                 .iter()
                 .any(|d| d.starts_with(&format!("{key}-")) && **d != pinned);
             moved.then(|| name.trim().to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Lock packages with no dist-info at any version in `installed`, as the lock
+/// spells them. Entries with an environment marker are skipped: they need not
+/// apply to this machine (shortcut: no marker evaluation, so a missing
+/// marker'd pin such as macOS's onnxruntime goes unseen; add it if one turns
+/// up broken).
+fn missing_lock_packages(
+    installed: &std::collections::BTreeSet<String>,
+    lock: &str,
+) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
+    lock_entries(lock)
+        .iter()
+        .filter(|entry| !entry.contains(';'))
+        .filter_map(|entry| {
+            let (name, _) = entry.split_whitespace().next()?.split_once("==")?;
+            // `httpx[http2,socks]` (Linux lock) installs as `httpx-*.dist-info`.
+            let prefix = format!("{}-", norm(name.split('[').next()?));
+            // The version starts with a digit, so `mcp` is not `mcp-server-1-0`.
+            let present = installed.iter().any(|d| {
+                d.strip_prefix(&prefix)
+                    .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+            });
+            (!present).then(|| name.trim().to_string())
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -23108,6 +23162,55 @@ Always run the linter first.
             vec!["magika".to_string(), "onnxruntime".to_string()]
         );
         assert!(super::moved_lock_packages(&before, &before, lock).is_empty());
+    }
+
+    /// win-mini after 0.9.56's denied MarkItDown 0.1.7 install: onnxruntime
+    /// had only pip's `~nnxruntime` stash left. It is found, and so is a name
+    /// that only prefixes another package; a marker'd pin, a moved pin and a
+    /// pin with extras are not.
+    #[test]
+    fn launch_finds_lock_pins_with_no_dist_info() {
+        let lock = "onnxruntime==1.27.0 \\\n    --hash=sha256:aa\n\
+                    magika==1.0.3 \\\n    --hash=sha256:bb\n\
+                    mcp==1.9.0 \\\n    --hash=sha256:cc\n\
+                    httpx[http2,socks]==0.28.1 \\\n    --hash=sha256:ee\n\
+                    torch==2.12.1; sys_platform == \"darwin\" \\\n    --hash=sha256:dd\n";
+        let installed = [
+            "~nnxruntime-1-27-0",
+            "magika-0-6-3",
+            "mcp-server-x-1-0",
+            "httpx-0-28-1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::missing_lock_packages(&installed, lock),
+            vec!["mcp".to_string(), "onnxruntime".to_string()]
+        );
+        // A venv holding exactly each bundled lock reads nothing missing, or
+        // every launch would reinstall a pin.
+        for os in ["macos", "linux", "windows"] {
+            let lock = super::bootstrap_requirements_lock_for_target(os);
+            let installed = super::lock_entries(lock)
+                .iter()
+                .filter_map(|e| {
+                    let (name, version) = e.split_whitespace().next()?.split_once("==")?;
+                    let name = name.split('[').next()?;
+                    let version = version.split(';').next()?;
+                    Some(
+                        format!("{name}-{version}")
+                            .to_ascii_lowercase()
+                            .replace(['_', '.'], "-"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                super::missing_lock_packages(&installed, lock),
+                Vec::<String>::new(),
+                "{os}"
+            );
+        }
     }
 
     #[test]
