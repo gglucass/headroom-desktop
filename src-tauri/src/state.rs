@@ -3814,6 +3814,22 @@ impl AppState {
                 }
                 Ok(())
             }
+            // The backend turned healthy between the 800ms probe above and
+            // the reclaim's own (a busy one answers /readyz slowly), and the
+            // reclaim leaves a healthy backend alone: adopt it as that probe
+            // would have, under the same argv gate (RUST-6J on 0.9.56).
+            Err(err)
+                if crate::tool_manager::reclaim_found_healthy_backend(&err)
+                    && crate::tool_manager::running_proxy_matches_expected_args() =>
+            {
+                log::info!(
+                    "ensure_headroom_running: backend on port {} became healthy during the start; adopting it",
+                    crate::backend_port::DEFAULT_BACKEND_PORT
+                );
+                crate::backend_port::set(crate::backend_port::DEFAULT_BACKEND_PORT);
+                *self.last_startup_error.lock() = None;
+                Ok(())
+            }
             Err(err) => {
                 *self.last_startup_error.lock() = Some(format!("{err:#}"));
                 Err(err)

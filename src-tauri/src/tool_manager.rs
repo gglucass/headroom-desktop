@@ -11286,6 +11286,14 @@ fn kill_pid(pid: u32, force: bool) {
     }
 }
 
+/// The reclaim bail for a backend that answers /readyz: it is left alone.
+const RECLAIM_FOUND_HEALTHY_BACKEND: &str = "backend answers /readyz";
+
+/// The start bailed only because a healthy backend already holds 6768.
+pub(crate) fn reclaim_found_healthy_backend(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(&format!("[reclaim: {RECLAIM_FOUND_HEALTHY_BACKEND}]"))
+}
+
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     // The bracket names which check refused: the four bails read identically
     // in Sentry, so RUST-6J could never say which one the field hits.
@@ -11297,7 +11305,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     let released =
         || TcpListener::bind(("127.0.0.1", port)).is_ok() && listener_process(port).is_none();
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
-        return Err(held("backend answers /readyz"));
+        return Err(held(RECLAIM_FOUND_HEALTHY_BACKEND));
     }
     let Some((_, pid)) = listener_process(port) else {
         if released() {
@@ -16310,17 +16318,17 @@ mod tests {
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         proxy_argv_keeps_messages_as_set, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, wheel_download_failure_reported,
-        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
-        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
+        reclaim_found_healthy_backend, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
+        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
+        wheel_download_failure_reported, widen_silence_for_unpack, CommandFailure, HeadroomRelease,
+        ManagedRuntime, OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
@@ -21500,11 +21508,14 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // Normal launch: a healthy occupant is left alone, reclaim bails.
-        assert!(
-            reclaim_orphan_proxy(port, false).is_err(),
-            "force=false must bail on a healthy occupant"
-        );
+        // Normal launch: a healthy occupant is left alone, reclaim bails, and
+        // the bail says so for ensure_headroom_running to adopt it (RUST-6J).
+        let refused = reclaim_orphan_proxy(port, false)
+            .expect_err("force=false must bail on a healthy occupant");
+        assert!(reclaim_found_healthy_backend(&refused), "{refused:#}");
+        assert!(!reclaim_found_healthy_backend(&anyhow::anyhow!(
+            format_already_running_bail(port)
+        )));
         assert!(
             probe_backend_readyz_ok(port),
             "force=false must NOT kill the healthy occupant"
