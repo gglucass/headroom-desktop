@@ -14840,12 +14840,16 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
 /// 'pip._vendor.cachecontrol' (unknown location)`, `No module named
 /// 'pip._internal.cli'`), or pip is missing outright. Every install, rollback
 /// and repair through that pip fails the same way (RUST-29/RUST-JF, six hosts
-/// in RUST-6S's `other` since 0.9.7).
+/// in RUST-6S's `other` since 0.9.7). Or pip's own dist-info has no RECORD,
+/// which ensurepip leaves when it dies mid-install: pip runs, but the lock's
+/// pip upgrade cannot uninstall it (`uninstall-no-record-file`, RUST-6S on
+/// 0.9.56 after an ensurepip Errno 13).
 fn pip_itself_broken(evidence: &str) -> bool {
     let lower = evidence.to_ascii_lowercase();
     lower.contains("no module named pip")
         || lower.contains("no module named 'pip.")
         || lower.contains("from 'pip.")
+        || lower.contains("no record file was found for pip.")
 }
 
 /// Normalized `name-version` of every `*.dist-info` dir in the venv
@@ -27334,6 +27338,13 @@ exit 0
             ),
             (
                 "exit=1; stderr tail: ModuleNotFoundError: No module named 'pip._internal.cli'",
+                "pip-broken",
+            ),
+            // RUST-6S on 0.9.56, verbatim: ensurepip died before writing RECORD.
+            (
+                "exit=1; stderr tail: error: uninstall-no-record-file\n\n\
+                 × Cannot uninstall pip None\n\
+                 ╰─> The package's contents are unknown: no RECORD file was found for pip.",
                 "pip-broken",
             ),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.
