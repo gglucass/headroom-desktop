@@ -12180,9 +12180,9 @@ fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
 }
 
 /// Returns the full command line of whatever process is currently listening on
-/// the proxy port, or `None` if we couldn't determine it.
-pub fn running_proxy_argv() -> Option<String> {
-    let (_, pid) = listener_process(backend_port::get())?;
+/// `port`, or `None` if we couldn't determine it.
+pub fn running_proxy_argv(port: u16) -> Option<String> {
+    let (_, pid) = listener_process(port)?;
     ps_command(pid)
 }
 
@@ -12231,7 +12231,13 @@ fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
 /// True if the running proxy's argv contains every flag we expect this build
 /// to pass. Used to detect proxies left over from an older desktop version.
 pub fn running_proxy_matches_expected_args() -> bool {
-    let Some(argv) = running_proxy_argv() else {
+    running_proxy_matches_expected_args_on(backend_port::get())
+}
+
+/// `running_proxy_matches_expected_args` for the listener on `port`, for a
+/// caller about to adopt a port other than the selected one.
+pub fn running_proxy_matches_expected_args_on(port: u16) -> bool {
+    let Some(argv) = running_proxy_argv(port) else {
         // Fail open. The caller kills the backend when this is false, and
         // "we could not read the listener's argv" is not evidence that it is
         // stale. Returning false here meant every ensure-running pass on a
