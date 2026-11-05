@@ -2138,20 +2138,20 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
     }
 }
 const RTK_VERSION: &str = "1.1.0";
-const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
+const MARKITDOWN_PINNED_VERSION: &str = "0.1.9";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
 
-/// serena-agent pins every dependency exactly, and 1.7.0 pins
+/// serena-agent pins every dependency exactly, and 1.7.0 through 2.1.0 pin
 /// cryptography==50.0.0, whose macOS wheels are arm64-only (49.0.0 dropped
 /// universal2). On an Intel Mac pip fell back to the sdist, which needs a Rust
 /// toolchain, so every Serena install there failed with "Failed building wheel
 /// for cryptography" from the 1.6.1 -> 1.7.0 bump (2026-08-13) on (RUST-F6).
 /// 1.6.1 pins cryptography==48.0.1, the universal2 build the runtime lock also
-/// pins for Intel, and matches 1.7.0 on everything Headroom drives: the
+/// pins for Intel, and matches 2.1.0 on everything Headroom drives: the
 /// start-mcp-server flags, the claude-code/codex contexts,
 /// `web_dashboard_interface`, the dashboard port and `/get_tool_stats`, and the
-/// tool-call log line. Its closure resolves wheels-only on x86_64 macOS
+/// tool-call log line's `SERENA_TOOL_CALL_LOG_MARKER`. Its closure resolves wheels-only on x86_64 macOS
 /// (proxy-tools, pure Python, builds from its sdist as on every platform).
 /// Drop the Intel branch once the pin's cryptography ships an x86_64 macOS
 /// wheel.
@@ -2159,7 +2159,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
     if intel_mac {
         "1.6.1"
     } else {
-        "1.7.0"
+        "2.1.0"
     }
 }
 /// Serena runs its Python language servers (pyright, basedpyright, ty,
@@ -2167,7 +2167,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
 /// symbol query failed after a clean install, so uv lives in serena's venv and
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
+const CONTEXT7_PINNED_VERSION: &str = "4.4.4";
 /// Context7's own hosted MCP server. The server ignores `via=headroom`; it is
 /// how uninstall tells this entry from one a user added by hand, which
 /// Context7's own docs tell them to do.
@@ -2180,17 +2180,17 @@ static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
+const CODEBASE_MEMORY_VERSION: &str = "0.12.1";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18";
+    "9bfcbe38414b47969a3e1d1c1999f5357409387c86fa3d24221b5458267660d2";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e";
+    "ca6e64397a8ae80cec898a8205a6aa16750ac798acc05a0c3ed983837944a581";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "c0e46c87cf37e35f1ac0bd9cc7e1d8b0ca4ef40034e1008805d709fa52a4e38a";
+    "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "032b33c1833919a2d1de67ff6367fa6ea46aee8689c86ef223c88fae3b6e4536";
+    "8c3d0341064301e78ecc84cf7348d4e2c6562a0f57448243ea560aaa34de36c1";
 const CODEBASE_MEMORY_SHA256_WINDOWS_X86_64: &str =
-    "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685";
+    "4e4e0f16b45233af5c757a1fcbe3c3b16e9056375b1fbe2ce020b6de75dedcc0";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -3514,8 +3514,8 @@ impl ToolManager {
 
     /// Today's serena tool calls, counted from `~/.serena/logs/<local day>/`.
     /// Serena's usage stats are in-memory only (analytics.py), so its log
-    /// files are the only persisted trace: one line containing
-    /// "; session_id: " per tool application (tools_base.py, pinned v1.7.0).
+    /// files are the only persisted trace: one `SERENA_TOOL_CALL_LOG_MARKER`
+    /// line per tool application.
     /// Local day matches serena's own log-dir bucketing (datetime.now()).
     /// 60s cache: Result lines make these files large enough that scanning on
     /// every dashboard poll would be wasteful.
@@ -8464,12 +8464,12 @@ impl ToolManager {
         // Even after a failure: pip keeps the packages it installed before it.
         self.remove_olefile();
         installed?;
-        // markitdown's own pins move lock packages below their hashed pins:
-        // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
-        // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
-        // back every lock package the install changed, found by diffing the
-        // venv's dist-info dirs, so a future pin moving another one is caught
-        // too. magika 1.0.3 and onnxruntime 1.27.0 both run markitdown 0.1.7.
+        // markitdown's own pins can move lock packages off their hashed pins:
+        // 0.1.7's magika~=0.6.1 did everywhere, and on Windows its onnxruntime
+        // too (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass).
+        // 0.1.9 accepts the lock's magika 1.0.3 and moves nothing. Put back
+        // every lock package an install changed, found by diffing the venv's
+        // dist-info dirs, so a future pin moving one is caught too.
         // Warn-only: failing here would take the addon down over a pin.
         let lock = bootstrap_requirements_lock();
         let moved: Vec<String> = moved_lock_packages(
@@ -9908,9 +9908,11 @@ fn codex_list_line_installed(line: &str, plugin_ref: &str) -> bool {
     words.next() == Some(plugin_ref) && words.next().is_some_and(|w| w.starts_with("installed"))
 }
 
-/// One serena tool application logs exactly one line containing this marker
-/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.7.0).
-const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
+/// One serena tool application logs exactly one line, from
+/// `tools_base.py` `_log_tool_application`, and serena's log format
+/// (`%(name)s:%(funcName)s:%(lineno)d`) names that function on it, from 1.6.1
+/// through 2.1.0. 2.0 dropped the `; session_id: ` suffix this used to count.
+const SERENA_TOOL_CALL_LOG_MARKER: &str = ":_log_tool_application:";
 
 /// Serena's dashboard API binds the first free port scanning upward from here
 /// (`constants.py` 0x5EDA, `dashboard.py` `_find_first_free_port`).
@@ -11284,6 +11286,14 @@ fn kill_pid(pid: u32, force: bool) {
     }
 }
 
+/// The reclaim bail for a backend that answers /readyz: it is left alone.
+const RECLAIM_FOUND_HEALTHY_BACKEND: &str = "backend answers /readyz";
+
+/// The start bailed only because a healthy backend already holds 6768.
+pub(crate) fn reclaim_found_healthy_backend(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(&format!("[reclaim: {RECLAIM_FOUND_HEALTHY_BACKEND}]"))
+}
+
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     // The bracket names which check refused: the four bails read identically
     // in Sentry, so RUST-6J could never say which one the field hits.
@@ -11295,7 +11305,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     let released =
         || TcpListener::bind(("127.0.0.1", port)).is_ok() && listener_process(port).is_none();
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
-        return Err(held("backend answers /readyz"));
+        return Err(held(RECLAIM_FOUND_HEALTHY_BACKEND));
     }
     let Some((_, pid)) = listener_process(port) else {
         if released() {
@@ -12852,12 +12862,18 @@ fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
             CODEBASE_MEMORY_SHA256_MACOS_X86_64,
             "tar.gz",
         ),
+        // The static `-portable` builds: the plain Linux ones link glibc 2.38,
+        // which Ubuntu 22.04, Debian 12 and RHEL 9 lack.
         ("linux", "aarch64") => (
-            "linux-arm64",
+            "linux-arm64-portable",
             CODEBASE_MEMORY_SHA256_LINUX_AARCH64,
             "tar.gz",
         ),
-        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64, "tar.gz"),
+        ("linux", "x86_64") => (
+            "linux-amd64-portable",
+            CODEBASE_MEMORY_SHA256_LINUX_X86_64,
+            "tar.gz",
+        ),
         ("windows", "x86_64") => (
             "windows-amd64",
             CODEBASE_MEMORY_SHA256_WINDOWS_X86_64,
@@ -14832,12 +14848,16 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
 /// 'pip._vendor.cachecontrol' (unknown location)`, `No module named
 /// 'pip._internal.cli'`), or pip is missing outright. Every install, rollback
 /// and repair through that pip fails the same way (RUST-29/RUST-JF, six hosts
-/// in RUST-6S's `other` since 0.9.7).
+/// in RUST-6S's `other` since 0.9.7). Or pip's own dist-info has no RECORD,
+/// which ensurepip leaves when it dies mid-install: pip runs, but the lock's
+/// pip upgrade cannot uninstall it (`uninstall-no-record-file`, RUST-6S on
+/// 0.9.56 after an ensurepip Errno 13).
 fn pip_itself_broken(evidence: &str) -> bool {
     let lower = evidence.to_ascii_lowercase();
     lower.contains("no module named pip")
         || lower.contains("no module named 'pip.")
         || lower.contains("from 'pip.")
+        || lower.contains("no record file was found for pip.")
 }
 
 /// Normalized `name-version` of every `*.dist-info` dir in the venv
@@ -16298,17 +16318,17 @@ mod tests {
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         proxy_argv_keeps_messages_as_set, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, wheel_download_failure_reported,
-        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
-        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
+        reclaim_found_healthy_backend, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
+        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
+        wheel_download_failure_reported, widen_silence_for_unpack, CommandFailure, HeadroomRelease,
+        ManagedRuntime, OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
@@ -19968,13 +19988,13 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
     /// test drives a fake. This one installs the pinned release (URL, checksum,
     /// archive layout) and runs the real hook on it, so a bump that changes
     /// what rtk answers fails here. Needs the network, so CI opts in on Linux
-    /// and macOS with HEADROOM_TEST_PINNED_RTK=1.
+    /// and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
     #[test]
     #[cfg(unix)]
     fn pinned_rtk_keeps_the_hook_contract() {
         use std::io::Write as _;
-        if std::env::var_os("HEADROOM_TEST_PINNED_RTK").is_none() {
-            eprintln!("skipping: set HEADROOM_TEST_PINNED_RTK=1 to install the pinned rtk");
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!("skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned rtk");
             return;
         }
         let (root, _runtime, manager) = seed_test_runtime("pinned-rtk");
@@ -20073,6 +20093,75 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         let gain: super::RtkDailyGainOutput =
             serde_json::from_slice(&gain.stdout).expect("gain json");
         assert!(gain.summary.is_some(), "the RTK tile reads summary");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every other codebase-memory test fakes the binary. This installs the
+    /// pinned release's archive (URL, checksum, layout) and starts its MCP
+    /// server, so a bump to a build that cannot run here fails: the Linux builds
+    /// pinned through 0.11.0 needed glibc 2.38. Needs the network, so CI opts in
+    /// on Linux and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
+    #[test]
+    #[cfg(unix)]
+    fn pinned_codebase_memory_serves_mcp() {
+        use std::io::Write as _;
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!(
+                "skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned codebase-memory"
+            );
+            return;
+        }
+        let root = unique_temp_dir("pinned-codebase-memory");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let artifact = codebase_memory_distribution_artifact().expect("supported target");
+        let archive = root.join(artifact.url.rsplit('/').next().unwrap());
+        super::download_to_path(&artifact.url, &archive, artifact.sha256)
+            .expect("download the pinned codebase-memory");
+        super::unpack_release_archive(&archive, &root).expect("unpack");
+
+        let mut child = crate::proc::command(root.join("codebase-memory-mcp"))
+            .current_dir(&home)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start codebase-memory");
+        let mut stdin = child.stdin.take().unwrap();
+        for request in [
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "headroom-test", "version": "1" } } }),
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        ] {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .expect("codebase-memory exits on EOF");
+        let replies: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let reply = |id: u64| {
+            replies
+                .iter()
+                .find(|reply| reply["id"] == id)
+                .unwrap_or_else(|| panic!("no reply to {id}: {replies:?}"))
+        };
+        assert_eq!(
+            reply(1)["result"]["serverInfo"]["version"],
+            super::CODEBASE_MEMORY_VERSION
+        );
+        assert!(
+            reply(2)["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{replies:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21419,11 +21508,14 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // Normal launch: a healthy occupant is left alone, reclaim bails.
-        assert!(
-            reclaim_orphan_proxy(port, false).is_err(),
-            "force=false must bail on a healthy occupant"
-        );
+        // Normal launch: a healthy occupant is left alone, reclaim bails, and
+        // the bail says so for ensure_headroom_running to adopt it (RUST-6J).
+        let refused = reclaim_orphan_proxy(port, false)
+            .expect_err("force=false must bail on a healthy occupant");
+        assert!(reclaim_found_healthy_backend(&refused), "{refused:#}");
+        assert!(!reclaim_found_healthy_backend(&anyhow::anyhow!(
+            format_already_running_bail(port)
+        )));
         assert!(
             probe_backend_readyz_ok(port),
             "force=false must NOT kill the healthy occupant"
@@ -23905,12 +23997,17 @@ Always run the linter first.
         fs::create_dir_all(&dir).expect("log dir");
         fs::write(
             dir.join("mcp_20260723_1.txt"),
-            "INFO find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
-             INFO Result: 42 lines\n\
-             INFO read_file: {\"path\": \"x.rs\"}; session_id: abc\n",
+            // A 1.x line (Intel Macs), a result, and a 2.x line.
+            "INFO  2026-07-23 10:00:00,000 [Thread-1] serena.tools.tools_base:_log_tool_application:279 - find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
+             INFO  2026-07-23 10:00:01,000 [Thread-1] serena.tools.tools_base:_log_tool_result:300 - Result: 42 lines\n\
+             INFO  2026-07-23 10:00:02,000 [Task-2:GetSymbolsOverviewTool] serena.tools.tools_base:_log_tool_application:256 - get_symbols_overview: relative_path='x.rs'\n",
         )
         .expect("log file");
-        fs::write(dir.join("ignored.log"), "x: {}; session_id: zzz\n").expect("non-txt");
+        fs::write(
+            dir.join("ignored.log"),
+            "serena.tools.tools_base:_log_tool_application:256 - x\n",
+        )
+        .expect("non-txt");
         assert_eq!(super::count_serena_tool_calls_in_dir(&dir), Some(2));
 
         fs::remove_dir_all(&dir).ok();
@@ -27252,6 +27349,13 @@ exit 0
             ),
             (
                 "exit=1; stderr tail: ModuleNotFoundError: No module named 'pip._internal.cli'",
+                "pip-broken",
+            ),
+            // RUST-6S on 0.9.56, verbatim: ensurepip died before writing RECORD.
+            (
+                "exit=1; stderr tail: error: uninstall-no-record-file\n\n\
+                 × Cannot uninstall pip None\n\
+                 ╰─> The package's contents are unknown: no RECORD file was found for pip.",
                 "pip-broken",
             ),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.

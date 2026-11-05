@@ -11113,7 +11113,7 @@ if not any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in root
 # Rules match the redirected cache path, never the PDF, so the allow below would
 # dodge every Read rule, and a block on reads outside the project (the cache is
 # outside it). Leave the read to Claude Code wherever one could apply.
-rules = settings(data, windows=True)
+rules = settings(data)
 if rules is None or rules[2] or any(not isinstance(r, str) or r.partition("(")[0].strip() == "Read" for r in rules[0] + rules[1]):
     sys.exit(0)
 try:
@@ -11204,27 +11204,101 @@ import glob, json, re, subprocess
 
 def cli_rules():
     # Rules on an ancestor command line: --settings, --disallowedTools.
+    win = sys.platform == "win32"
     try:
-        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+        procs = win_procs() if win else ps_procs()
     except Exception:
         return True
-    procs = {}
-    for row in rows:
-        parts = row.split(None, 2)
-        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
-            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
     pid = os.getppid()
     for _ in range(64):
         if pid == 0:
             return False
         if pid not in procs:
-            return True
+            # ps lists every process; win_procs stops where the chain does.
+            return not win
         pid, command = procs[pid]
-        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE) sets env only.
-        command = command.replace("--settings {\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}}", "")
+        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+        # sets env only. Quotes go first: a Windows command line escapes them.
+        command = re.sub(r"[\\\"]", "", command).replace("--settings {env:{ANTHROPIC_BASE_URL:https://api.anthropic.com}}", "")
         if re.search(r"--(managed-)?settings|--disallowed", command):
             return True
     return True
+
+
+def ps_procs():
+    rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    procs = {}
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    return procs
+
+
+def win_procs():
+    # The ancestors of this process as ps_procs rows: parents from a toolhelp
+    # snapshot, command lines from ProcessCommandLineInformation (Windows 8.1+).
+    # A parent that exited or that this user cannot read ends the chain, since
+    # Claude Code and its launcher run as this user. A reused pid only adds
+    # command lines to check, so at worst it keeps the hook silent.
+    import ctypes
+    from ctypes import wintypes as w
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("pid", w.DWORD), ("heap", ctypes.c_size_t), ("module", w.DWORD), ("threads", w.DWORD), ("ppid", w.DWORD), ("base", ctypes.c_long), ("flags", w.DWORD), ("exe", ctypes.c_wchar * 260)]
+
+    class Text(ctypes.Structure):
+        _fields_ = [("length", w.USHORT), ("maximum", w.USHORT), ("buffer", ctypes.c_void_p)]
+
+    k32, nt = ctypes.WinDLL("kernel32"), ctypes.WinDLL("ntdll")
+    k32.CreateToolhelp32Snapshot.restype = k32.OpenProcess.restype = w.HANDLE
+    k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(Entry)]
+    k32.CloseHandle.argtypes = [w.HANDLE]
+    k32.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+    nt.NtQueryInformationProcess.argtypes = [w.HANDLE, w.ULONG, ctypes.c_void_p, w.ULONG, ctypes.POINTER(w.ULONG)]
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, ctypes.c_void_p(-1).value):
+        raise OSError("no process snapshot")
+    parents, entry = {}, Entry(size=ctypes.sizeof(Entry))
+    try:
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            parents[entry.pid] = entry.ppid
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    procs, pid = {}, os.getppid()
+    while pid in parents and pid not in procs:
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            break
+        try:
+            size = w.ULONG(0)
+            nt.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(size))
+            buf = ctypes.create_string_buffer(size.value or 1)
+            if nt.NtQueryInformationProcess(handle, 60, buf, size, ctypes.byref(size)):
+                break
+            text = Text.from_buffer(buf)
+            line = ctypes.wstring_at(text.buffer, text.length // 2) if text.buffer else ""
+            # A venv python.exe is a launcher that runs this interpreter as its
+            # child with the same arguments: this script, not rules.
+            exe, n = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
+            if not procs and k32.QueryFullProcessImageNameW(handle, 0, exe, ctypes.byref(n)) and os.path.normcase(exe.value) == os.path.normcase(sys.executable):
+                line = ""
+            procs[pid] = (parents[pid], line)
+        finally:
+            k32.CloseHandle(handle)
+        pid = parents[pid]
+    return procs
+
+
+def empty(path):
+    # Claude Code caches "no server-managed settings" as {}.
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f) == {}
+    except Exception:
+        return False
 
 
 def policy_keys():
@@ -11241,18 +11315,17 @@ def policy_keys():
     return False
 
 
-def settings(data, windows=False):
+def settings(data):
     # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
     # or None when a source cannot be read here: registry and MDM policies,
     # managed files (a policyHelper hides their rules), the server-managed cache.
-    # Windows only when the caller opts in (the rtk verdict never has).
     win = sys.platform == "win32"
-    if win and not windows:
-        return None
     conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     managed = [os.path.join(os.environ.get("ProgramFiles") or "C:\\Program Files", "ClaudeCode")] if win else ["/Library/Application Support/ClaudeCode", "/etc/claude-code"]
     opaque = [os.path.join(d, n) for d in managed for n in ("managed-settings.json", "managed-settings.d")]
-    opaque.append(os.path.join(conf, "remote-settings.json"))
+    remote = os.path.join(conf, "remote-settings.json")
+    if not empty(remote):
+        opaque.append(remote)
     if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
         return None
     if any(os.path.exists(p) for p in opaque):
@@ -11288,10 +11361,7 @@ def settings(data, windows=False):
             return None
         ask, deny = ask + more_ask, deny + more_deny
         blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
-    # ponytail: Windows has no ps, so an ancestor --settings or
-    # --disallowedTools goes unseen there; read the parent chain through
-    # CreateToolhelp32Snapshot (ctypes) if that ever matters.
-    return None if not win and cli_rules() else (ask, deny, blocks)
+    return None if cli_rules() else (ask, deny, blocks)
 "##;
 
 /// The rtk hook's last step, after HOOK_RULES_PY: prints allow-with-the-rewrite,
@@ -11409,10 +11479,7 @@ mode, cmd = data.get("permission_mode"), tool_input.get("command")
 if os.environ.get("HEADROOM_RTK_RC") == "0":
     # rtk judged only the rules it can read. A managed, MDM or command-line
     # deny it never saw would be dodged by this allow, so stay silent there.
-    # ponytail: Windows keeps the unconditional allow, since settings() cannot
-    # read registry policies and gating would turn RTK off there outright;
-    # close it by reading HKLM\SOFTWARE\Policies\ClaudeCode via winreg.
-    if sys.platform != "win32" and settings(data) is None:
+    if settings(data) is None:
         sys.exit(0)
 else:
     ro =mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
@@ -12806,11 +12873,12 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn hook_rules_read_windows_sources_only_when_asked() {
+    fn hook_rules_read_windows_sources() {
         // The rules reader under a stand-in win32 (hook tests only run on unix
-        // CI): the rtk verdict still gets None there, the MarkItDown hook reads
-        // the files, and either policy key or Program Files managed settings
-        // makes it None again (the sources Claude Code 2.1.284 reads).
+        // CI): it reads the files, and either policy key, Program Files managed
+        // settings (the sources Claude Code 2.1.284 reads) or rules on Claude
+        // Code's command line make it None. win_procs is stubbed with that
+        // command line, under a parent that has exited.
         let root = unique_temp_dir("headroom-hook-rules-win");
         let (conf, project, pf) = (root.join("conf"), root.join("project"), root.join("pf"));
         for dir in [&conf, &project, &pf] {
@@ -12828,15 +12896,16 @@ def open_key(hive, path):
 winreg.OpenKey, winreg.CloseKey = open_key, lambda key: None
 sys.modules["winreg"] = winreg
 sys.platform = "win32"
-data = {"cwd": sys.argv[2]}
-print(settings(data) is None, settings(data, windows=True) is None)
+win_procs = lambda: {os.getppid(): (4242424, sys.argv[3])}
+print(settings({"cwd": sys.argv[2]}) is None)
 "#;
-        let run = |keys: &str| {
+        let run = |keys: &str, claude: &str| {
             let output = crate::proc::command("/usr/bin/python3")
                 .arg("-c")
                 .arg(format!("{}\n{check}", super::HOOK_RULES_PY))
                 .arg(keys)
                 .arg(&project)
+                .arg(claude)
                 .env("CLAUDE_CONFIG_DIR", &conf)
                 .env("ProgramFiles", &pf)
                 .env_remove("CLAUDE_PROJECT_DIR")
@@ -12847,12 +12916,27 @@ print(settings(data) is None, settings(data, windows=True) is None)
             String::from_utf8_lossy(&output.stdout).trim().to_string()
                 + &String::from_utf8_lossy(&output.stderr)
         };
-        assert_eq!(run(""), "True False");
-        assert_eq!(run("HKLM"), "True True");
-        assert_eq!(run("HKCU"), "True True");
+        let claude = "C:\\Users\\me\\.local\\bin\\claude.exe --resume s1";
+        assert_eq!(run("", claude), "False");
+        assert_eq!(run("HKLM", claude), "True");
+        assert_eq!(run("HKCU", claude), "True");
+        let denied = format!("{claude} --disallowedTools Bash");
+        assert_eq!(run("", &denied), "True");
+        // The relaunch's override as Python's subprocess quotes it on Windows.
+        let relaunch = format!(
+            "{claude} --settings \"{}\"",
+            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
+        );
+        assert_eq!(run("", &relaunch), "False");
+        let remote = conf.join("remote-settings.json");
+        fs::write(&remote, "{}").expect("empty remote settings");
+        assert_eq!(run("", claude), "False");
+        fs::write(&remote, r#"{"permissions":{"deny":["Bash"]}}"#).expect("remote settings");
+        assert_eq!(run("", claude), "True");
+        fs::remove_file(&remote).expect("remove remote settings");
         fs::create_dir_all(pf.join("ClaudeCode")).expect("managed dir");
         fs::write(pf.join("ClaudeCode").join("managed-settings.json"), "{}").expect("managed");
-        assert_eq!(run(""), "True True");
+        assert_eq!(run("", claude), "True");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -14613,7 +14697,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // turned RTK off for every remote-control session); any other does.
         assert!(super::HOOK_RULES_PY.contains(&format!(
             "--settings {}",
-            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
+            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "")
         )));
     }
 
