@@ -26219,7 +26219,7 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             text.contains("[mcp_servers.other]") && text.contains("# the user's note"),
             "{text}"
         );
-        let check = std::process::Command::new(&python)
+        let check = crate::proc::command(&python)
             .args([
                 "-c",
                 "import sys, tomllib; tomllib.loads(open(sys.argv[1]).read())",
