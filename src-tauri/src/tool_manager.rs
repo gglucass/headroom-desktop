@@ -2194,6 +2194,86 @@ const CODEBASE_MEMORY_SHA256_WINDOWS_X86_64: &str =
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// `keep_markers`, which every MCP helper below calls before it removes or
+/// replaces an entry the ledger says Headroom installed (see its docstring).
+macro_rules! mcp_helper_keep_markers {
+    () => {
+        r##"import sys
+
+
+def keep_markers(registrar, name):
+    """Put every [mcp_servers.<name>] table Headroom owns back between its markers.
+
+    `codex mcp add` rewrites config.toml and drops the comment line above a
+    table, so Headroom's start marker goes, and Codex keeps per-tool tables
+    (`[mcp_servers.<name>.tools.<tool>]`) wherever it adds them. The registrar
+    then reads the entry as user-managed (no removal, no update), or removes
+    the block and leaves a per-tool table that stops Codex loading its config.
+    Callers check the ledger first. Best effort: it reads private registrar
+    helpers, so any surprise leaves the file as it was.
+    """
+    try:
+        from headroom import fsutil
+        from headroom.mcp_registry import codex as toml_module
+
+        if not isinstance(registrar, toml_module._TomlMarkerRegistrar):
+            return
+        path = registrar._config_file
+        if not path.exists():
+            return
+        start, end = toml_module._marker_start(name), toml_module._marker_end(name)
+        text = registrar._read_text()
+        lines = text.splitlines(keepends=True)
+        bare = [line.rstrip("\r\n") for line in lines]
+
+        def owned(line):
+            key = toml_module._table_path(line)
+            return key is not None and key[:2] == ["mcp_servers", name]
+
+        heads = [i for i, line in enumerate(lines) if owned(line)]
+        if not heads:
+            return
+        if start in bare and end in bare:
+            lo, hi = bare.index(start), bare.index(end)
+            if all(lo < i < hi for i in heads):
+                return
+        # Chunks: the preamble, then one per table header. Trailing blank and
+        # comment lines of an owned chunk stay where they are: a comment there
+        # usually belongs to the table after it.
+        chunks = [[]]
+        for line in lines:
+            if line.rstrip("\r\n") in (start, end):
+                continue
+            if toml_module._table_path(line) is not None:
+                chunks.append([])
+            chunks[-1].append(line)
+        kept, block, at = [], [], None
+        for chunk in chunks:
+            if chunk and owned(chunk[0]):
+                cut = len(chunk)
+                while cut > 1 and (not chunk[cut - 1].strip() or chunk[cut - 1].lstrip().startswith("#")):
+                    cut -= 1
+                if at is None:
+                    at = len(kept)
+                block.extend(chunk[:cut])
+                kept.append(chunk[cut:])
+            else:
+                kept.append(chunk)
+        block = [line if line.endswith("\n") else line + "\n" for line in block]
+        before = "".join("".join(c) for c in kept[:at])
+        if before and not before.endswith("\n"):
+            before += "\n"
+        new = before + start + "\n" + "".join(block) + end + "\n" + "".join("".join(c) for c in kept[at:])
+        import tomllib
+
+        if tomllib.loads(new) != tomllib.loads(text):
+            return
+        fsutil.write_text(path, new)
+    except Exception as exc:
+        print(f"{registrar.name}: left {name}'s markers alone: {exc}", file=sys.stderr)
+"##
+    };
+}
 /// Registers/unregisters the managed Serena MCP entry with every detected
 /// agent, reusing the bundled headroom package's registrars and install
 /// ledger instead of reimplementing Claude Code JSON / Codex TOML handling in
@@ -2201,7 +2281,9 @@ const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
 /// argv: `register <serena-bin> [<uvx>]` | `unregister`.
-const SERENA_MCP_HELPER: &str = r#"
+const SERENA_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import sys
 
 from headroom.mcp_registry import (
@@ -2245,6 +2327,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("serena")
         ):
+            keep_markers(registrar, "serena")
             result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2259,6 +2342,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: serena entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "serena")
         if registrar.unregister_server("serena"):
             clear_install(registrar.name, "serena")
             print(f"{registrar.name}: removed")
@@ -2266,7 +2350,8 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the Context7 MCP entry: Context7's hosted server (`CONTEXT7_HOSTED_URL`)
 /// for Claude Code, Codex and OpenCode, and for Grok, which has no URL
@@ -2275,7 +2360,9 @@ if failures:
 /// package's script. The wheel's registrars only write command servers, so
 /// this process teaches them the URL form each agent's config uses.
 /// argv: `register <url> [<script>]` | `unregister`.
-const CONTEXT7_MCP_HELPER: &str = r#"
+const CONTEXT7_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import dataclasses
 import re
 import sys
@@ -2421,6 +2508,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("context7")
             if headroom_installed_matching(registrar.name, current) or npx_era(current):
+                keep_markers(registrar, "context7")
                 result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2435,6 +2523,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: context7 entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "context7")
         if registrar.unregister_server("context7"):
             clear_install(registrar.name, "context7")
             print(f"{registrar.name}: removed")
@@ -2442,12 +2531,15 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the codebase-memory MCP entry. `CBM_CACHE_DIR` points its index databases
 /// into Headroom's managed tools dir so uninstalling removes them too.
 /// argv: `register <binary> <cache-dir>` | `unregister`.
-const CODEBASE_MEMORY_MCP_HELPER: &str = r#"
+const CODEBASE_MEMORY_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import sys
 
 from headroom.mcp_registry import (
@@ -2480,6 +2572,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("codebase-memory")
         ):
+            keep_markers(registrar, "codebase-memory")
             result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2494,6 +2587,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: codebase-memory entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "codebase-memory")
         if registrar.unregister_server("codebase-memory"):
             clear_install(registrar.name, "codebase-memory")
             print(f"{registrar.name}: removed")
@@ -2501,7 +2595,8 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// A marketplace plugin addon installed through the host CLIs' own
 /// `<cli> plugin ...` managers. The install/enable/uninstall plumbing is
 /// shared; addons differ only in these identifiers.
@@ -8770,13 +8865,14 @@ impl ToolManager {
         if self.serena_uvx().exists() {
             args.push(&uvx);
         }
-        self.run_mcp_helper(&args)
-            .context("registering serena MCP server")
+        self.run_mcp_helper(&args, "Adding Serena to your agents")
     }
 
     fn unregister_serena_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "unregister"])
-            .context("unregistering serena MCP server")
+        self.run_mcp_helper(
+            &["-c", SERENA_MCP_HELPER, "unregister"],
+            "Removing Serena from your agents",
+        )
     }
 
     pub fn context7_installed(&self) -> bool {
@@ -8946,13 +9042,14 @@ impl ToolManager {
         let script = script.map(|script| script.to_string_lossy().into_owned());
         let mut args = vec!["-c", CONTEXT7_MCP_HELPER, "register", CONTEXT7_HOSTED_URL];
         args.extend(script.as_deref());
-        self.run_mcp_helper(&args)
-            .context("registering context7 MCP server")
+        self.run_mcp_helper(&args, "Adding Context7 to your agents")
     }
 
     fn unregister_context7_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", CONTEXT7_MCP_HELPER, "unregister"])
-            .context("unregistering context7 MCP server")
+        self.run_mcp_helper(
+            &["-c", CONTEXT7_MCP_HELPER, "unregister"],
+            "Removing Context7 from your agents",
+        )
     }
 
     pub fn codebase_memory_entrypoint(&self) -> PathBuf {
@@ -9121,22 +9218,29 @@ impl ToolManager {
             .codebase_memory_cache_dir()
             .to_string_lossy()
             .into_owned();
-        self.run_mcp_helper(&[
-            "-c",
-            CODEBASE_MEMORY_MCP_HELPER,
-            "register",
-            &binary,
-            &cache_dir,
-        ])
-        .context("registering codebase-memory MCP server")
+        self.run_mcp_helper(
+            &[
+                "-c",
+                CODEBASE_MEMORY_MCP_HELPER,
+                "register",
+                &binary,
+                &cache_dir,
+            ],
+            "Adding Codebase Memory to your agents",
+        )
     }
 
     fn unregister_codebase_memory_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", CODEBASE_MEMORY_MCP_HELPER, "unregister"])
-            .context("unregistering codebase-memory MCP server")
+        self.run_mcp_helper(
+            &["-c", CODEBASE_MEMORY_MCP_HELPER, "unregister"],
+            "Removing Codebase Memory from your agents",
+        )
     }
 
-    fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
+    /// `action` names the step for the error: its Display is all the add-on
+    /// card shows, and "unregistering codebase-memory MCP server" alone read
+    /// as a progress label that never finished (a support report, 2026-11-04).
+    fn run_mcp_helper(&self, args: &[&str], action: &str) -> Result<()> {
         // The Codex/Grok registrars delete their whole marker span on
         // unregister, other apps' tables inside it included.
         crate::client_adapters::protect_foreign_mcp_tables();
@@ -9153,21 +9257,28 @@ impl ToolManager {
             let user_config = err
                 .downcast_ref::<CommandFailure>()
                 .is_some_and(|failure| mcp_helper_failed_on_user_config(&failure.stderr));
-            if user_config {
+            let reason = err
+                .downcast_ref::<CommandFailure>()
+                .and_then(|failure| {
+                    failure
+                        .stderr
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                })
+                .unwrap_or("see the log")
+                .to_string();
+            let err = if user_config {
                 // The registrars parse stricter than the clients (a TOML 1.1
                 // trailing comma, JSONC comments): some of these configs are
                 // valid and the addon silently never registers. One grouped
                 // warning (sanitize_event: once per host per day) keeps the
                 // count visible; the log lines stay out of Sentry.
-                let line = err
-                    .downcast_ref::<CommandFailure>()
-                    .and_then(|failure| failure.stderr.lines().rev().find(|l| !l.trim().is_empty()))
-                    .unwrap_or_default()
-                    .to_string();
                 sentry::with_scope(
                     |scope| {
                         scope.set_fingerprint(Some(&["mcp-helper-user-config"]));
-                        scope.set_extra("registrar_line", line.into());
+                        scope.set_extra("registrar_line", reason.clone().into());
                     },
                     || {
                         sentry::capture_message(
@@ -9179,7 +9290,8 @@ impl ToolManager {
                 err.context(crate::client_adapters::UNPARSEABLE_SETTINGS)
             } else {
                 err
-            }
+            };
+            err.context(format!("{action} failed: {reason}"))
         })
     }
 
@@ -26023,6 +26135,99 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(!read(".claude.json").contains("npx"));
         assert!(!read(".codex/config.toml").contains("npx"));
         assert!(read(".config/opencode/opencode.json").contains("npx"));
+    }
+
+    /// `codex mcp add` (0.166) rewrites config.toml without the comment above
+    /// a table, so Headroom's start marker goes and the new table lands
+    /// before the end marker; "always allow" adds a per-tool table. Disabling
+    /// failed on "codex: removal failed" (a WSL report, 2026-11-04), and a
+    /// per-tool table left behind stops Codex loading its config. The real
+    /// helper must update and then remove the entry, keeping the user's.
+    #[test]
+    fn codebase_memory_helper_handles_a_config_codex_rewrote_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".codex", ".headroom"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let config = home.path().join(".codex/config.toml");
+        std::fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .arg("-c")
+                .arg(super::CODEBASE_MEMORY_MCP_HELPER)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{text}");
+            text
+        };
+        let read = || std::fs::read_to_string(&config).unwrap();
+        let start = "# --- Headroom MCP server: codebase-memory ---\n";
+        let end = "# --- end Headroom MCP server: codebase-memory ---";
+        let codex_rewrite = || {
+            let text = read().replace(start, "").replace(
+                end,
+                &format!("[mcp_servers.other]\ncommand = \"/bin/echo\"\n# the user's note\n{end}"),
+            );
+            std::fs::write(&config, text).unwrap();
+        };
+
+        assert!(run(&["register", "/cbm/old", "/cbm/cache"]).contains("codex: registered"));
+        codex_rewrite();
+        let updated = run(&["register", "/cbm/new", "/cbm/cache"]);
+        assert!(updated.contains("codex: registered"), "{updated}");
+        let text = read();
+        assert_eq!(
+            text.matches("[mcp_servers.codebase-memory]").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("/cbm/new") && text.contains("[mcp_servers.other]"),
+            "{text}"
+        );
+
+        // A second `codex mcp add` drops the marker again; "always allow"
+        // appends the per-tool table.
+        std::fs::write(
+            &config,
+            read().replace(start, "")
+                + "\n[mcp_servers.codebase-memory.tools.search_graph]\napproval_mode = \"approve\"\n",
+        )
+        .unwrap();
+        let gone = run(&["unregister"]);
+        assert!(gone.contains("codex: removed"), "{gone}");
+        let text = read();
+        assert!(!text.contains("codebase-memory"), "{text}");
+        assert!(
+            text.contains("[mcp_servers.other]") && text.contains("# the user's note"),
+            "{text}"
+        );
+        let check = std::process::Command::new(&python)
+            .args([
+                "-c",
+                "import sys, tomllib; tomllib.loads(open(sys.argv[1]).read())",
+            ])
+            .arg(&config)
+            .status()
+            .unwrap();
+        assert!(check.success(), "{text}");
     }
 
     #[test]
