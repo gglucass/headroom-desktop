@@ -11724,11 +11724,33 @@ exit 0
 
 // Inside the hook's single-quoted `-c`, so it must hold no single quote.
 const RTK_CODEX_HOOK_PY: &str = r#"
-import glob, json, os, re, shlex, subprocess, sys
+import ast, glob, json, os, re, shlex, subprocess, sys
 RAW = re.compile(r"(?:^|[\s;&|(])(?:grep|egrep|fgrep|rg|ag|ack|jq|yq)(?=[\s;&|)]|$)"
     r"|(?:^|\s)(?:--check|--porcelain\S*|-z|--json\S*|--format\S*|--pretty\S*"
     r"|-o\s*(?:json|yaml)|--output[=\s](?:json|yaml))(?=\s|$)")
-GATED = re.compile(r"decision\s*=\s*[\"\x27](?:forbidden|prompt)")
+def allow_only_rules(text):
+    # Rules are Starlark: a decision can be a constant or an expression. Only
+    # the simple allow rules Codex saves after approvals are safe to rewrite
+    # around. Any other form stays with the original command and its rules.
+    try:
+        statements = ast.parse(text).body
+    except SyntaxError:
+        return False
+    for statement in statements:
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+            return False
+        call = statement.value
+        if not isinstance(call.func, ast.Name) or call.func.id != "prefix_rule":
+            return False
+        if call.args or any(kw.arg is None for kw in call.keywords):
+            return False
+        decisions = [kw.value for kw in call.keywords if kw.arg == "decision"]
+        if len(decisions) != 1 or not isinstance(decisions[0], ast.Constant) or decisions[0].value != "allow":
+            return False
+        if any(isinstance(node, ast.Call) and node is not call for node in ast.walk(call)):
+            return False
+    return True
+
 raw = sys.stdin.read()
 data = json.loads(raw)
 cmd = data.get("tool_input", {}).get("command")
@@ -11745,10 +11767,10 @@ for home in homes:
     for path in glob.glob(os.path.join(glob.escape(home), "rules", "*.rules")):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                gated = GATED.search(f.read())
+                safe = allow_only_rules(f.read())
         except OSError:
-            continue
-        if gated:
+            sys.exit(0)
+        if not safe:
             sys.exit(0)
 rtk = os.environ["HEADROOM_RTK"]
 out = subprocess.run([rtk, "hook", "codex"], input=raw, capture_output=True, text=True, timeout=8).stdout
@@ -14569,12 +14591,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             assert_eq!(run(cmd), "", "{cmd} stays raw");
         }
 
-        fs::write(
-            codex_home.join("rules").join("guard.rules"),
+        for rule in [
             "prefix_rule(pattern=[\"git\", \"push\"], decision=\"forbidden\")\n",
-        )
-        .unwrap();
-        assert_eq!(run("git status"), "", "a forbidden rule keeps it raw");
+            "DENY = \"forbidden\"\nprefix_rule(pattern=[\"git\", \"push\"], decision=DENY)\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"for\" + \"bidden\")\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"allow\" if False else \"prompt\")\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\n",
+        ] {
+            fs::write(codex_home.join("rules").join("guard.rules"), rule).unwrap();
+            assert_eq!(run("git status"), "", "{rule} keeps the command raw");
+        }
         fs::remove_file(codex_home.join("rules").join("guard.rules")).unwrap();
 
         write_rtk("#!/bin/sh\necho not json\n");
