@@ -3908,14 +3908,20 @@ fn ensure_codex_rtk_hook(
         &build_headroom_rtk_codex_hook(managed_rtk_path, managed_python_path),
         true,
     )?;
+    let command = hook_shell_command(&script_path)?;
+    if !guard_registered_in_hooks(&codex_hooks_json_path(), &command)? {
+        // Replace an earlier unquoted command instead of leaving a failing
+        // hook beside the corrected one. An unchanged command keeps trust.
+        remove_guard_hook_entries(
+            &codex_hooks_json_path(),
+            &script_path.display().to_string(),
+            false,
+            None,
+        )?;
+    }
     let (mut changed, mut backups) = register_hook_entries(
         &codex_hooks_json_path(),
-        &[(
-            "PreToolUse",
-            Some("Bash"),
-            &hook_shell_command(&script_path)?,
-            "",
-        )],
+        &[("PreToolUse", Some("Bash"), &command, "")],
     )?;
     if script_changed {
         changed.insert(0, script_path.display().to_string());
@@ -18351,6 +18357,19 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let home = TestHome::new();
         let codex_home = home.path().join("Jane's Codex $HOME `literal`");
         std::env::set_var("CODEX_HOME", &codex_home);
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            super::codex_hooks_json_path(),
+            serde_json::json!({"hooks": {"PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    {"type": "command", "command": super::headroom_rtk_codex_hook_path()},
+                    {"type": "command", "command": "echo user-hook"}
+                ]
+            }]}})
+            .to_string(),
+        )
+        .unwrap();
         let rtk = home.path().join("rtk");
         fs::write(
             &rtk,
@@ -18364,7 +18383,26 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         let hooks: Value =
             serde_json::from_str(&fs::read_to_string(super::codex_hooks_json_path()).unwrap())
                 .unwrap();
-        let command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo user-hook"
+        );
+        assert!(
+            super::ensure_codex_rtk_hook(&rtk, Path::new("/usr/bin/python3"))
+                .unwrap()
+                .0
+                .is_empty(),
+            "current registration keeps its trust"
+        );
+        let command = hooks["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
             .as_str()
             .unwrap();
         // Run exactly the command Codex reads, rather than passing the script
@@ -18400,10 +18438,9 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
             .ends_with("rtk git status"));
         super::remove_codex_rtk_hook().unwrap();
         assert!(!super::headroom_rtk_codex_hook_path().exists());
-        assert!(
-            !super::codex_hooks_json_path().exists(),
-            "hook registration removed too"
-        );
+        let remaining = fs::read_to_string(super::codex_hooks_json_path()).unwrap();
+        assert!(!remaining.contains("headroom-rtk-codex"), "{remaining}");
+        assert!(remaining.contains("echo user-hook"), "{remaining}");
     }
 
     fn touch(path: &Path) -> PathBuf {
