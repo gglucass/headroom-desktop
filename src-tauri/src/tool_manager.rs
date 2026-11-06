@@ -8627,8 +8627,10 @@ impl ToolManager {
     pub fn restore_missing_lock_pins(&self) {
         let python = self.runtime.managed_python();
         let installed = venv_dist_infos(&python);
-        // Empty means unreadable or not installed yet: the bootstrap's job.
-        if installed.is_empty() {
+        // Empty means unreadable or not installed yet: the bootstrap's job. A
+        // venv on another lock (an upgrade that rolled back, or ran out of
+        // retries) lacks the new lock's added pins by design: the upgrade's job.
+        if installed.is_empty() || self.lock_pins_differ_from_installed() {
             return;
         }
         let missing = missing_lock_packages(&installed, bootstrap_requirements_lock());
@@ -23314,6 +23316,48 @@ Always run the linter first.
                 "{os}"
             );
         }
+    }
+
+    /// A venv an upgrade rolled back is still on the previous lock, so it lacks
+    /// the new lock's added pins by design. Launch leaves those to the upgrade
+    /// instead of force-installing them, without deps, into the old venv.
+    #[test]
+    fn launch_repairs_missing_lock_pins_only_on_the_synced_lock() {
+        let (root, runtime, manager) = seed_test_runtime("missing-pins-lock-sha");
+        let site = runtime.venv_dir.join("lib").join("site-packages");
+        fs::create_dir_all(site.join("unrelated-1.0.dist-info")).unwrap();
+        let repair = runtime.downloads_dir.join("missing-pins-repair.lock");
+        let receipt = |sha: String| {
+            fs::write(
+                runtime.tools_dir.join("headroom.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": HEADROOM_PINNED_VERSION,
+                    "artifact": { "requirementsLockSha256": sha },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        receipt(requirements_lock_sha("old-lock==1.0\n"));
+        manager.restore_missing_lock_pins();
+        assert!(!repair.exists(), "a stale lock is the upgrade's to install");
+
+        // On the synced lock the same venv is repaired; a stub stands in for pip.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let python = runtime.managed_python();
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+            receipt(requirements_lock_sha(super::bootstrap_requirements_lock()));
+            manager.restore_missing_lock_pins();
+            assert!(
+                repair.exists(),
+                "the synced lock's missing pins are reinstalled"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
