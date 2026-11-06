@@ -7592,6 +7592,8 @@ impl ToolManager {
                 "--retries",
                 "10",
                 PIP_ONLY_BINARY,
+                "--find-links",
+                VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -23503,6 +23505,43 @@ Always run the linter first.
                 "the synced lock's missing pins are reinstalled"
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn targeted_lock_reinstall_keeps_the_bootstrap_wheel_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, runtime, manager) = seed_test_runtime("targeted-reinstall-wheels");
+        let python = runtime.managed_python();
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // hnswlib has only an sdist on PyPI. A targeted repair must find the
+        // same prebuilt, hash-checked wheel as bootstrap, including on Linux
+        // where this test uses the local lock's httpx pin as a stand-in.
+        let package = if cfg!(target_os = "macos") {
+            "hnswlib"
+        } else {
+            "httpx[http2,socks]"
+        };
+        manager
+            .reinstall_lock_pins(&[package], "repair.lock")
+            .unwrap();
+        let args = fs::read_to_string(format!("{}.args", python.display())).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--find-links", super::VENDOR_WHEELS_INDEX_URL]),
+            "targeted repair must use bootstrap's wheel source: {args:?}"
+        );
+        assert!(args.contains(&super::PIP_ONLY_BINARY));
+        assert!(args.contains(&"--require-hashes"));
+        let pins = fs::read_to_string(runtime.downloads_dir.join("repair.lock")).unwrap();
+        assert!(pins.starts_with(&format!("{package}==")), "{pins}");
+        assert!(pins.contains("--hash=sha256:"), "{pins}");
         let _ = fs::remove_dir_all(root);
     }
 
