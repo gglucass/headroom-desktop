@@ -452,9 +452,9 @@ Can also write every thread's stack to HEADROOM_STARTUP_STALL_DUMP when the
 proxy has not bound its port HEADROOM_STARTUP_STALL_DUMP_SECS after start
 (desktop diagnostic, RUST-P1). The desktop sets both on Windows only.
 
-Also gives Windows' WMI queries a timeout, so a wedged WMI service cannot
-hold the backend's imports forever (RUST-F2). Kill switch:
-HEADROOM_WMI_TIMEOUT_SECS=0.
+Also keeps Python's platform module off WMI on Windows, so a wedged or slow
+WMI service can neither hold the backend's imports forever (RUST-F2) nor crash
+them (RUST-V2). Kill switch: HEADROOM_SKIP_WMI=0.
 """
 import faulthandler
 import os as _hd_os
@@ -473,50 +473,28 @@ except Exception:
 # the end (see _HD_VENDORS).
 _hd_bound = set()
 
-# --- WMI queries time out (posture, RUST-F2) -----------------------------------
+# --- No WMI queries (posture, RUST-F2, RUST-V2) ------------------------------
 # Python 3.12's platform module asks WMI first for the Windows version, and
-# `_wmi.exec_query` bounds the connect (~1s) but not the read, so a wedged WMI
-# service blocks it forever. aiohttp calls platform.system() at import, so such
-# a backend never bound its port (stall dumps at 486s on two hosts, both in
-# platform._wmi_query). Past the timeout the query raises OSError, which
-# platform answers from sys.getwindowsversion() and `ver`, and WMI is not asked
-# again in this process (3.13's platform does the same after a failed query).
-# Arms wherever `_wmi` exists (Windows). The stuck query keeps a daemon thread.
-# Kill switch: HEADROOM_WMI_TIMEOUT_SECS=0.
+# `_wmi.exec_query` hands its native query thread a pointer into the caller's
+# stack, then returns on its own 1s/100ms waits while that thread still runs,
+# and never returns when a wedged WMI stalls the read. aiohttp calls
+# platform.system() at import, so a wedged WMI kept the backend from binding
+# (RUST-F2). 0.9.56 joined the query on a short-lived thread: when the query
+# gave up, that thread's stack was freed under the still-running native thread,
+# and the backend died of an access violation mid-import on every launch
+# (RUST-V2/V9). platform answers from sys.getwindowsversion() and `ver`
+# instead, as it does where `_wmi` is missing and as Python 3.11 always did.
+# Arms wherever `_wmi` exists (Windows). Kill switch: HEADROOM_SKIP_WMI=0.
 try:
     import platform as _hd_platform
 
-    _hd_wmi_secs = _hd_os.environ.get("HEADROOM_WMI_TIMEOUT_SECS", "5")
-    if getattr(_hd_platform, "_wmi", None) is not None and _hd_wmi_secs.isdigit() and int(_hd_wmi_secs) > 0:
-        import threading as _hd_threading
+    if getattr(_hd_platform, "_wmi", None) is not None and _hd_os.environ.get("HEADROOM_SKIP_WMI") != "0":
 
-        _hd_wmi_query = _hd_platform._wmi_query
-        _hd_wmi_dead = []
+        def _hd_no_wmi_query(*keys):
+            raise OSError("not supported")
 
-        def _hd_wmi_timed_query(*args, **kwargs):
-            if _hd_wmi_dead:
-                raise OSError("WMI timed out earlier in this process")
-            box = []
-
-            def run():
-                try:
-                    box.append((_hd_wmi_query(*args, **kwargs), None))
-                except BaseException as exc:
-                    box.append((None, exc))
-
-            worker = _hd_threading.Thread(target=run, name="headroom-wmi-query", daemon=True)
-            worker.start()
-            worker.join(int(_hd_wmi_secs))
-            if not box:
-                _hd_wmi_dead.append(True)
-                raise OSError("WMI query timed out after %ss" % _hd_wmi_secs)
-            result, exc = box[0]
-            if exc is not None:
-                raise exc
-            return result
-
-        _hd_platform._wmi_query = _hd_wmi_timed_query
-        _hd_bound.add("wmi_timeout")
+        _hd_platform._wmi_query = _hd_no_wmi_query
+        _hd_bound.add("skip_wmi")
 except Exception:
     pass
 
@@ -1991,7 +1969,7 @@ _HD_VENDORS = (
     "deferred_tool_affinity",
     "loop_stall_dump",
     "startup_stall_dump",
-    "wmi_timeout",
+    "skip_wmi",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -17259,11 +17237,11 @@ asyncio.run(main())
         );
     }
 
-    /// RUST-F2: a WMI query that never returns must not hold the backend's
-    /// imports. macOS has no `_wmi`, so a fake one stands in: the OS query
-    /// answers, the CPU query hangs.
+    /// RUST-F2 + RUST-V2: platform never calls `_wmi`, whose query can hang
+    /// forever or leave a native thread reading a freed stack. macOS has no
+    /// `_wmi`, so a fake one stands in and fails the probe if it is called.
     #[test]
-    fn wmi_timeout_behaves_against_the_installed_wheel() {
+    fn skip_wmi_behaves_against_the_installed_wheel() {
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17274,31 +17252,25 @@ asyncio.run(main())
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         std::fs::write(
             dir.path().join("_wmi.py"),
-            "import time\n\
-             def exec_query(query):\n    \
-                 if 'Win32_Processor' in query:\n        \
-                     time.sleep(60)\n    \
+            "def exec_query(query):\n    \
+                 print('wmi called')\n    \
                  return 'Version=10.0.26200\\0ProductType=1'\n",
         )
         .unwrap();
         let probe = r#"
-import platform, time
+import platform
 print(platform._wmi_query.__name__)
-assert list(platform._wmi_query("OS", "Version", "ProductType")) == ["10.0.26200", "1"]
-for hung in (True, False):
-    start = time.monotonic()
+for table in ("OS", "CPU"):
     try:
-        platform._wmi_query("CPU" if hung else "OS", "Version")
-        raise SystemExit("answered after the timeout")
+        list(platform._wmi_query(table, "Version"))
     except OSError:
-        took = time.monotonic() - start
-        assert (0.5 < took < 10) if hung else took < 0.5, (hung, took)
+        pass
 "#;
-        let run = |secs: &str| {
+        let run = |skip: &str| {
             crate::proc::command(&python)
                 .args(["-c", probe])
                 .env("PYTHONPATH", dir.path())
-                .env("HEADROOM_WMI_TIMEOUT_SECS", secs)
+                .env("HEADROOM_SKIP_WMI", skip)
                 .output()
                 .expect("run probe")
         };
@@ -17309,16 +17281,14 @@ for hung in (True, False):
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).lines().next(),
-            Some("_hd_wmi_timed_query")
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "_hd_no_wmi_query"
         );
-        let off = crate::proc::command(&python)
-            .args(["-c", "import platform; print(platform._wmi_query.__name__)"])
-            .env("PYTHONPATH", dir.path())
-            .env("HEADROOM_WMI_TIMEOUT_SECS", "0")
-            .output()
-            .expect("run probe");
-        assert_eq!(String::from_utf8_lossy(&off.stdout).trim(), "_wmi_query");
+        let off = run("0");
+        assert_eq!(
+            String::from_utf8_lossy(&off.stdout).trim(),
+            "_wmi_query\nwmi called\nwmi called"
+        );
     }
 
     #[test]
