@@ -498,6 +498,55 @@ try:
 except Exception:
     pass
 
+# --- sklearn that will not import stays out of transformers (posture) --------
+# Smart App Control can block single unsigned binaries: on one Windows machine
+# three SciPy extensions (_lsap, _direct, _hausdorff; customer report
+# 2026-11-06). transformers imports sklearn.metrics whenever sklearn is
+# installed (generation/candidate_generator.py, reached from AutoTokenizer), so
+# that ImportError failed Kompress's ONNX and PyTorch loads and every request
+# went through uncompressed. Kompress uses neither package: when
+# transformers.generation first loads (the import that pulls sklearn in, so a
+# healthy machine imports it no earlier than before) this imports
+# sklearn.metrics once, and if that fails it marks sklearn and scipy absent (a
+# None in sys.modules makes find_spec answer None, and transformers checks
+# sklearn only after this) and leaves the error in
+# HEADROOM_SKLEARN_BLOCK_MARKER for the desktop to report. A no-op where sklearn
+# imports or is not installed (the Linux lock). Kill switch:
+# HEADROOM_SKLEARN_BLOCK_GUARD=0.
+_hd_sbg_flag = _hd_os.environ.get("HEADROOM_SKLEARN_BLOCK_GUARD", "1")
+if _hd_sbg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+
+        class _HdSklearnBlockGuard:
+            @classmethod
+            def find_spec(cls, name, path=None, target=None):
+                if name != "transformers.generation":
+                    return None
+                try:
+                    _hd_sys.meta_path.remove(cls)  # one-shot
+                except ValueError:
+                    return None  # another thread got here first
+                try:
+                    import sklearn.metrics  # noqa: F401
+                except Exception as exc:
+                    if getattr(exc, "name", None) == "sklearn":
+                        return None  # not installed: transformers already skips it
+                    _hd_sys.modules["sklearn"] = None
+                    _hd_sys.modules["scipy"] = None
+                    marker = _hd_os.environ.get("HEADROOM_SKLEARN_BLOCK_MARKER")
+                    if marker:
+                        try:
+                            with open(marker, "w", encoding="utf-8") as fh:
+                                fh.write("%s: %s" % (type(exc).__name__, exc))
+                        except OSError:
+                            pass
+                return None
+
+        _hd_sys.meta_path.insert(0, _HdSklearnBlockGuard)
+        _hd_bound.add("sklearn_block_guard")
+    except Exception:
+        pass
+
 # --- Pre-bind stall dump (desktop diagnostic, RUST-P1) ------------------------
 # A backend that never binds its port is killed at the desktop's startup
 # timeout. On unix that kill starts with SIGABRT, so faulthandler leaves every
@@ -1970,6 +2019,7 @@ _HD_VENDORS = (
     "loop_stall_dump",
     "startup_stall_dump",
     "skip_wmi",
+    "sklearn_block_guard",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -4021,6 +4071,15 @@ impl ToolManager {
                 // spawn so a dump on disk always belongs to this attempt.
                 let stall_path = logs_dir.join("startup-stall.txt");
                 let _ = std::fs::remove_file(&stall_path);
+                // Left by the sitecustomize sklearn_block_guard of an earlier
+                // backend. shortcut: reported at the next spawn, so a backend
+                // that never restarts never reports; read it on the status
+                // poll if the count needs to be prompt.
+                let sklearn_marker = logs_dir.join("sklearn-blocked.txt");
+                if let Ok(cause) = std::fs::read_to_string(&sklearn_marker) {
+                    let _ = std::fs::remove_file(&sklearn_marker);
+                    report_sklearn_blocked(&cause);
+                }
                 // From create_app on, the wheel logs every startup step to its
                 // own file and nothing to stdout/stderr, so `log_path` ends at
                 // the banner however far the start got (RUST-P1).
@@ -4531,6 +4590,7 @@ impl ToolManager {
                         .env_remove("REQUESTS_CA_BUNDLE");
                 }
                 command.envs(startup_stall_dump_env(&stall_path));
+                command.env("HEADROOM_SKLEARN_BLOCK_MARKER", &sklearn_marker);
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -15235,6 +15295,24 @@ fn http_status_code_in(lower: &str) -> Option<u16> {
         .and_then(|tok| tok.parse::<u16>().ok())
 }
 
+/// A backend's sklearn would not import, so the sitecustomize
+/// `sklearn_block_guard` hid it and SciPy (Smart App Control blocking unsigned
+/// SciPy files, customer report 2026-11-06). Kompress still loads, so nothing
+/// else reports it; this counts the machines that would need a signed runtime.
+fn report_sklearn_blocked(cause: &str) {
+    let cause: String = cause.trim().chars().take(300).collect();
+    sentry::with_scope(
+        |scope| scope.set_fingerprint(Some(["sklearn-blocked"].as_slice())),
+        || {
+            sentry::capture_message(
+                &format!("sklearn would not import, so Kompress loaded without it: {cause}"),
+                sentry::Level::Warning,
+            );
+        },
+    );
+    log::info!("sklearn would not import in the last backend: {cause}");
+}
+
 /// Report a direct-wheel download that fell back to the pip index.
 ///
 /// Warning, not Error: the fallback install that follows normally succeeds, so
@@ -17403,6 +17481,74 @@ with open(_p, encoding="utf-8") as _f:
             stdout.contains("ImportError DLL load failed while importing _overlapped"),
             "{stdout}\n{stderr}"
         );
+    }
+
+    /// Smart App Control blocked three unsigned SciPy files (customer report
+    /// 2026-11-06), and transformers' sklearn import took Kompress's tokenizer
+    /// load down with them.
+    #[test]
+    fn sklearn_block_guard_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hd_site.py"), super::SITECUSTOMIZE_PY).unwrap();
+        std::fs::write(
+            dir.path().join("sitecustomize.py"),
+            r#"import os, sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name in ("scipy.optimize._lsap", "scipy.optimize._direct", "scipy.spatial._hausdorff"):
+            raise ImportError("DLL load failed while importing %s: An Application Control policy has blocked this file." % name.rpartition(".")[2])
+if os.environ.get("HD_PROBE_BLOCK") == "1":
+    sys.meta_path.insert(0, _Block())
+_p = os.path.join(os.path.dirname(__file__), "hd_site.py")
+with open(_p, encoding="utf-8") as _f:
+    exec(compile(_f.read(), _p, "exec"))
+"#,
+        )
+        .unwrap();
+        let probe = "import sys\n\
+                     from transformers import AutoTokenizer\n\
+                     from transformers.utils import is_sklearn_available\n\
+                     print(is_sklearn_available(), sys.modules.get('scipy', 0) is None)\n";
+        let marker = dir.path().join("sklearn-blocked.txt");
+        let run = |block: &str, guard: &str| {
+            crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HD_PROBE_BLOCK", block)
+                .env("HEADROOM_SKLEARN_BLOCK_GUARD", guard)
+                .env("HEADROOM_SKLEARN_BLOCK_MARKER", &marker)
+                .output()
+                .expect("run probe")
+        };
+        let out = run("1", "1");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "False True");
+        let cause = std::fs::read_to_string(&marker).expect("marker");
+        assert!(
+            cause.contains("An Application Control policy has blocked this file"),
+            "{cause}"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        let out = run("0", "1");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True False");
+        assert!(!marker.exists());
+
+        let out = run("1", "0");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Application Control"));
     }
 
     #[test]
