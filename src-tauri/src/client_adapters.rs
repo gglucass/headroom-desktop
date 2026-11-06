@@ -11669,7 +11669,10 @@ fi
 # (never the .zprofile/.zshrc where the managed PATH export lands). Prepend the
 # managed bin dir to PATH for this one invocation so every `rtk`, at any
 # position, resolves regardless of which profile files the shell sourced.
-REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
+# rtk does not recognize this hook as installed, so it tells the agent to run
+# `rtk init -g` (a second hook): daily, and on every call on Windows, where
+# rtk 1.1.0 never refreshes its once-a-day marker.
+REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\" RTK_SUPPRESS_HOOK_WARNING=1; $REWRITTEN"
 
 HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
   "$HEADROOM_PYTHON" -X utf8 -c '{rules}{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
@@ -11747,7 +11750,9 @@ if not isinstance(new, str) or new == cmd:
     sys.exit(0)
 # rtk emits a bare `rtk`, at the start or after `&&`, which a stale PATH (or
 # an older rtk the user installed) would resolve wrong.
-update["command"] = "export PATH=" + shlex.quote(os.path.dirname(rtk)) + ":\"$PATH\"; " + new
+# RTK_SUPPRESS_HOOK_WARNING: rtk does not see this hook and would tell the
+# agent to run `rtk init -g` (see build_headroom_rtk_hook).
+update["command"] = "export PATH=" + shlex.quote(os.path.dirname(rtk)) + ":\"$PATH\" RTK_SUPPRESS_HOOK_WARNING=1; " + new
 print(json.dumps(reply))
 "#;
 
@@ -14531,12 +14536,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // The prefix, space in the path and all, makes `rtk` the managed one.
         let resolved = crate::proc::command("bash")
             .arg("-c")
-            .arg(format!("{prefix}command -v rtk"))
+            .arg(format!(
+                "{prefix}command -v rtk; printenv RTK_SUPPRESS_HOOK_WARNING"
+            ))
             .output()
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&resolved.stdout).trim(),
-            rtk.display().to_string()
+            format!("{}\n1", rtk.display())
         );
 
         for cmd in [
@@ -14915,6 +14922,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             stdout.contains("&& rtk "),
             "embedded rtk token must be preserved, got: {stdout:?}"
+        );
+        // rtk's "No hook installed - run `rtk init -g`" would reach the agent.
+        assert!(
+            stdout.contains("\\\"$PATH\\\" RTK_SUPPRESS_HOOK_WARNING=1; cd /tmp && rtk "),
+            "rewrite must silence rtk's missing-hook warning, got: {stdout:?}"
         );
 
         let _ = fs::remove_dir_all(root);
