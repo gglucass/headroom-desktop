@@ -10603,6 +10603,12 @@ fn kill_processes_by_command_pattern(
             if found.status.code() == Some(1) {
                 return Ok(());
             }
+            // Killed from outside (RUST-3D: a logout, shutdown or OOM kill
+            // takes pgrep down with the session), which no change here helps.
+            if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&found.status) {
+                log::info!("process sweep: pgrep killed by signal {signal} for '{pattern}'");
+                return Ok(());
+            }
             return Err(anyhow!(
                 "pgrep exited with status {:?} for pattern '{}'",
                 found.status.code(),
