@@ -4651,7 +4651,16 @@ fn hook_shell_command(hook_path: &Path) -> Result<String> {
     hook_path
         .to_str()
         .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))
-        .map(str::to_string)
+        .map(|path| {
+            if path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+            {
+                path.to_string()
+            } else {
+                format!("\"{}\"", shell_double_quote(path))
+            }
+        })
 }
 
 fn ensure_claude_settings_hook(
@@ -5231,7 +5240,9 @@ fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
 /// python3) can't leave the entry behind when the script is deleted.
 fn command_contains(command: &Value, fragment: &str) -> bool {
     match command {
-        Value::String(s) => s.contains(fragment),
+        Value::String(s) => {
+            s.contains(fragment) || (cfg!(unix) && s.contains(&shell_double_quote(fragment)))
+        }
         Value::Array(parts) => parts
             .iter()
             .filter_map(Value::as_str)
@@ -18304,6 +18315,69 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         } else {
             assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_rtk_registered_command_runs_from_a_shell_sensitive_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let codex_home = home.path().join("Jane's Codex $HOME `literal`");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let rtk = home.path().join("rtk");
+        fs::write(
+            &rtk,
+            r#"#!/bin/sh
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"rtk git status"}}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rtk, fs::Permissions::from_mode(0o755)).unwrap();
+        super::ensure_codex_rtk_hook(&rtk, Path::new("/usr/bin/python3")).unwrap();
+        let hooks: Value =
+            serde_json::from_str(&fs::read_to_string(super::codex_hooks_json_path()).unwrap())
+                .unwrap();
+        let command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        // Run exactly the command Codex reads, rather than passing the script
+        // as a separate argv element (which would hide missing shell quotes).
+        let mut child = crate::proc::command("bash")
+            .args(["-c", command])
+            .current_dir(home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"tool_input":{"command":"git status"}}"#)
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "registered hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_slice(&output.stdout).expect("hook rewrites the command");
+        assert!(reply["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("rtk git status"));
+        super::remove_codex_rtk_hook().unwrap();
+        assert!(!super::headroom_rtk_codex_hook_path().exists());
+        assert!(
+            !super::codex_hooks_json_path().exists(),
+            "hook registration removed too"
+        );
     }
 
     fn touch(path: &Path) -> PathBuf {
