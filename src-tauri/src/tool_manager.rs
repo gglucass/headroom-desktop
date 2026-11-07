@@ -9849,6 +9849,8 @@ const NO_GIT_FOR_PLUGIN: &str = if cfg!(target_os = "macos") {
     "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again."
 };
 
+const XCODE_LICENSE_FOR_PLUGIN: &str = "Git on this Mac is waiting for the Xcode license. Claude Code and Codex need Git to download this addon: run `sudo xcodebuild -license` in Terminal, accept it, then try again.";
+
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
 /// Plugin-addon prerequisites this machine lacks ("cli", "node", "git"), all
@@ -15360,7 +15362,11 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
-        "git-missing" | "cli-missing" | "settings-unparseable" | "github-unreachable"
+        "git-missing"
+            | "xcode-license"
+            | "cli-missing"
+            | "settings-unparseable"
+            | "github-unreachable"
     )
 }
 
@@ -15381,7 +15387,12 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("'git' not found")
+    if lower.contains("you have not agreed to the xcode license") {
+        // macOS's git refuses to run until the user accepts the Xcode license
+        // (RUST-P0 on 0.9.56), which only `sudo xcodebuild -license` does.
+        // Checked first for the same reason as git-missing below.
+        "xcode-license"
+    } else if lower.contains("'git' not found")
         || (lower.contains("failed to run git") && lower.contains("program not found"))
         || lower.contains("failed to locate 'git'")
         || lower.contains("xcrun: error: invalid active developer path")
@@ -16258,10 +16269,10 @@ fn settle_plugin_hosts(
                     },
                 );
             }
-            if category == "git-missing" {
-                format!("{NO_GIT_FOR_PLUGIN} ")
-            } else {
-                format!("installing the {id} plugin failed: {detail}. ")
+            match category {
+                "git-missing" => format!("{NO_GIT_FOR_PLUGIN} "),
+                "xcode-license" => format!("{XCODE_LICENSE_FOR_PLUGIN} "),
+                _ => format!("installing the {id} plugin failed: {detail}. "),
             }
         };
         if !outdated.is_empty() {
@@ -28097,6 +28108,20 @@ exit 0
                 "host-config-invalid",
             ),
             ("Codex: CLI not found on PATH", "cli-missing"),
+            // RUST-P0 on 0.9.56: git on macOS blocked by an unaccepted Xcode
+            // license, then the install's consequence.
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\nAdding \
+                 marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: Failed to \
+                 clone marketplace repository: You have not agreed to the Xcode license \
+                 agreements. Please run 'sudo xcodebuild -license' from within a Terminal \
+                 window to review and agree to the Xcode and Apple SDKs license.\n: command \
+                 failed (exit 1): ~/.local/bin/claude plugin install chisle@chisle\nstdout:\n\n\
+                 stderr:\n\u{2718} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" \
+                 not found in marketplace \"chisle\".",
+                "xcode-license",
+            ),
             (
                 "Claude Code: command failed (exit 1): ~/.local/bin/claude plugin install \
                  caveman@caveman --scope user\nstdout:\n\nstderr:\nerror: unknown option '--scope'",
