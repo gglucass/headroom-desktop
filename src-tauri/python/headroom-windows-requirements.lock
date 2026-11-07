@@ -286,6 +286,13 @@ six==1.17.0 \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
 sniffio==1.3.1 \
     --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2
+# socksio is httpx's socks5 backend. The app passes a socks5:// proxy through to
+# the backend (strip_unsupported_proxy_env), and without socksio httpx raises
+# ImportError in AsyncClient() and the backend dies before opening its port on
+# every start (RUST-VF/RUST-SR on 0.9.56). Not a headroom-ai dependency, so a
+# fresh resolution drops it: keep it (the Linux lock carries it via httpx[socks]).
+socksio==1.0.0 \
+    --hash=sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3
 sqlite-vec==0.1.9 \
     --hash=sha256:4a28dc12fa4b53d7b1dced22da2488fade444e96b5d16fd2d698cd670675cf32
 sse-starlette==3.4.5 \
