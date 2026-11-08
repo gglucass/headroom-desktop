@@ -292,6 +292,8 @@ const CODEX_FAILURE_STREAK_REPORT_AT: u64 = 10;
 static UPSTREAM_ERROR_LAST_REPORTED: Mutex<Vec<((&'static str, u16), u64)>> =
     Mutex::new(Vec::new());
 const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
+static HEADROOM_BODY_LIMIT_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+
 /// Epoch-second of the last backend 502 whose body said the provider's TLS
 /// certificate could not be verified (a corporate proxy / antivirus re-signing
 /// HTTPS), or of a bypass forward that failed its own handshake that way.
@@ -3629,6 +3631,10 @@ fn report_upstream_error(
     // explicit capture below is the only Sentry path.
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     log::warn!("{client} upstream error {status} on {path}: {raw_snippet}");
+    if is_headroom_body_limit_error(&body) {
+        report_headroom_body_limit(client, "backend", status, None);
+        return;
+    }
     // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
     // that Headroom neither caused nor can fix, and so is a 408 (RUST-KM:
     // Anthropic `timeout_error`), which the SDKs retry just like a 5xx. Capturing every one just burns
@@ -3669,14 +3675,11 @@ fn report_upstream_error(
     if status == 401 && !is_missing_auth_error(&body) {
         return;
     }
-    // 413 is a size cap refusing the body the CLIENT built (a provider gateway's
-    // limit, or the backend's own content-length check): the conversation
-    // outgrew it. The backend only ever forwards the same or a smaller body, so
-    // no release of ours changes the outcome, and the client already shows the
-    // error. RUST-55 (codex), RUST-F7 (claude-code) and RUST-K6 (opencode, a
-    // gateway's `gateway_error`) were all this, one hand-archived issue per
-    // client. Except the backend's fail-closed refusal after its OWN compression
-    // failed: that one is ours.
+    // Provider size caps refuse the body the client built; a Headroom release
+    // cannot raise them. The backend's own cap was classified and reported
+    // above. Keep reporting a backend 413 when its OWN compression failed.
+    // RUST-55 (codex), RUST-F7 (claude-code) and RUST-K6 (opencode) were
+    // provider caps, one hand-archived issue per client.
     if status == 413 && !is_compression_refused_error(&body) {
         return;
     }
@@ -3840,6 +3843,51 @@ fn is_geo_blocked_opencode_error(body: &[u8]) -> bool {
 fn is_compression_refused_error(body: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"\"compression_refused\"";
     body.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+}
+
+/// Only the proxy's own fixed error messages qualify; provider size caps stay
+/// out of Sentry because changing Headroom cannot raise a provider's limit.
+fn is_headroom_body_limit_error(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &json["error"];
+    if error["type"] != "invalid_request_error" {
+        return false;
+    }
+    let message = error["message"].as_str().unwrap_or_default();
+    (error["code"] == "invalid_json" && message == "Invalid request body: too large")
+        || (error["code"] == "request_too_large"
+            && message.starts_with("Request body too large. Maximum size is ")
+            && message.ends_with("MB"))
+}
+
+fn report_headroom_body_limit(
+    client: &'static str,
+    source: &'static str,
+    status: u16,
+    bytes: Option<usize>,
+) {
+    if !should_report_throttled(&HEADROOM_BODY_LIMIT_LAST_REPORTED) {
+        return;
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("upstream_client", client);
+            scope.set_tag("body_limit_source", source);
+            scope.set_tag("upstream_status", status);
+            if let Some(bytes) = bytes {
+                scope.set_extra("request_bytes", (bytes as u64).into());
+            }
+            scope.set_fingerprint(Some(&["headroom-body-limit", client]));
+        },
+        || {
+            sentry::capture_message(
+                &format!("Headroom request body limit rejected {client} traffic"),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 /// The backend's CCR retrieve route (`/v1/retrieve`, `/v1/retrieve/<hash>`,
@@ -4756,6 +4804,16 @@ async fn forward_direct_to_anthropic(
 
     // Cap the client-declared body before it sizes the allocation below.
     if parsed.content_length.is_some_and(|n| n > MAX_DIRECT_BODY) {
+        report_headroom_body_limit(
+            if is_codex_request_head(&parsed) {
+                "codex"
+            } else {
+                "other"
+            },
+            "intercept",
+            413,
+            parsed.content_length,
+        );
         let _ = client
             .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -10257,6 +10315,23 @@ mod tests {
             br#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#
         ));
         assert!(!is_compression_refused_error(b""));
+    }
+
+    #[test]
+    fn headroom_body_limit_errors_are_distinct_from_provider_caps() {
+        assert!(super::is_headroom_body_limit_error(
+            br#"{"error":{"message":"Invalid request body: too large","type":"invalid_request_error","code":"invalid_json"}}"#
+        ));
+        assert!(super::is_headroom_body_limit_error(
+            br#"{"error":{"message":"Request body too large. Maximum size is 100MB","type":"invalid_request_error","code":"request_too_large"}}"#
+        ));
+        assert!(!super::is_headroom_body_limit_error(
+            br#"{"error":{"type":"invalid_request_error","code":"request_too_large"}}"#
+        ));
+        assert!(!super::is_headroom_body_limit_error(
+            br#"{"error":{"type":"gateway_error","message":"payload too large"}}"#
+        ));
+        assert!(!super::is_headroom_body_limit_error(b""));
     }
 
     #[test]
