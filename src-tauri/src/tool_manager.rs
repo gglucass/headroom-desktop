@@ -621,6 +621,18 @@ except Exception:
     pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
+    # Image-heavy Codex chats need to reach remote compaction before the
+    # proxy's 100 MiB decompressed-body ceiling rejects their zstd request.
+    try:
+        from headroom.proxy import helpers as _hd_body_helpers
+
+        if (_hd_body_helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024 and
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_body_helpers.MAX_REQUEST_BODY_SIZE):
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 128 * 1024 * 1024
+            _hd_bound.add("codex_compaction_body")
+    except Exception:
+        pass
+
     # Tool-schema dollar unfold (see the module docstring for the
     # contamination this prevents). The wrapper strikes at the single choke
     # point every caller funnels through: SavingsTracker.record_request is
@@ -1997,6 +2009,7 @@ except Exception:
 # (image isolation) inherit it but start with `-c`.
 _HD_VENDORS = (
     "user_turn_verbatim",
+    "codex_compaction_body",
     "savings_fold_guard",
     "cache_integrity",
     "prefix_replay_guard",
@@ -16999,6 +17012,40 @@ mod tests {
         // #3194), so the desktop lift is gone with the pin bump.
         assert!(!py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
         assert!(!py.contains("additional_tools"));
+    }
+
+    /// A zstd Codex request just past 100 MiB must reach remote compaction.
+    #[test]
+    fn codex_compaction_body_cap_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.proxy import helpers
+import zstandard
+assert helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 128 * 1024 * 1024
+body = zstandard.ZstdCompressor().compress(b'x' * (101 * 1024 * 1024))
+assert len(helpers._zstd_bounded(body)) == 101 * 1024 * 1024
+print('ok')
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run Codex compaction body probe");
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
     }
 
     /// The fold guard against the installed wheel: a priced request with $1 of
