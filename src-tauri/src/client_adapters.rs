@@ -135,10 +135,10 @@ fn ensure_rtk_integrations_for_targets(
     changed_files.append(&mut hook_updates.0);
     backup_files.append(&mut hook_updates.1);
 
-    // Codex has no PreToolUse-style hook, so the auto-rewrite can't be wired the
-    // way it is for Claude Code. Mirror the MarkItDown approach: drop a managed
-    // `~/.codex/AGENTS.md` nudge telling Codex to route shell commands through
-    // the managed `rtk` binary (which is already on PATH via the block above).
+    // Codex: a managed `~/.codex/AGENTS.md` nudge telling it to prefix shell
+    // commands with the managed `rtk`, plus RTK's own PreToolUse hook. The hook
+    // runs only once the user trusts it in Codex's /hooks, so the nudge stays.
+    // Codex's Bash tool is PowerShell on Windows, which the bash hook can't serve.
     if is_codex_enabled() {
         let agents = rtk_codex_agents_path();
         let (codex_changed, codex_backup) =
@@ -148,6 +148,11 @@ fn ensure_rtk_integrations_for_targets(
         }
         if let Some(path) = codex_backup {
             backup_files.push(path.display().to_string());
+        }
+        if !cfg!(windows) {
+            let mut hook_updates = ensure_codex_rtk_hook(managed_rtk_path, managed_python_path)?;
+            changed_files.append(&mut hook_updates.0);
+            backup_files.append(&mut hook_updates.1);
         }
     }
 
@@ -182,8 +187,9 @@ pub fn set_codex_skill_nudge(id: &str, skill: &str, on: bool) -> Result<()> {
     Ok(())
 }
 
-/// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
-/// through the managed `rtk` binary by being told to prefix them with it.
+/// Codex nudge: until the user trusts the RTK hook in /hooks (and always on
+/// Windows), Codex routes shell commands through the managed `rtk` binary only
+/// by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
     let bin = shell_word(managed_rtk_path);
     format!(
@@ -301,7 +307,7 @@ pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
 }
 
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
-/// RTK PATH export, the Claude Code hook, and the Codex AGENTS.md nudge (without
+/// RTK PATH export, the Claude Code hook, and the Codex nudge and hook (without
 /// touching `ANTHROPIC_BASE_URL` routing) and persists the opt-out so bootstrap
 /// won't re-add them. Enabling clears the flag and re-applies the integrations.
 pub fn set_rtk_enabled(
@@ -332,6 +338,7 @@ pub fn set_rtk_enabled(
             let _ = std::fs::remove_file(&hook_path);
         }
         let _ = remove_managed_block(&rtk_codex_agents_path(), "rtk");
+        let _ = remove_codex_rtk_hook();
     }
 
     Ok(())
@@ -2307,6 +2314,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
+    if let Err(err) = remove_codex_rtk_hook() {
+        log::warn!("cleanup: removing the Codex RTK hook failed: {err}");
+    }
     // The plugin addons' Codex skill nudges: uninstall_and_quit removes them
     // through ToolManager::uninstall_plugin, which `--uninstall` does not have.
     for (id, skill) in crate::tool_manager::CODEX_SKILL_NUDGES {
@@ -2505,6 +2515,7 @@ fn managed_backup_targets() -> Vec<PathBuf> {
     targets.push(codex_config_toml_path());
     targets.push(codex_hooks_json_path());
     targets.push(codex_guard_hook_path());
+    targets.push(headroom_rtk_codex_hook_path());
     targets.push(grok_config_toml_path());
     // Both possible opencode config names: backups are created next to
     // whichever file was active at apply/disable time.
@@ -3882,6 +3893,51 @@ fn ensure_claude_code_rtk_hook(
     backup_files.extend(settings_backups);
 
     Ok((changed_files, backup_files))
+}
+
+/// RTK's own Codex hook (`rtk hook codex`), run from a script that pins the
+/// managed rtk (see `build_headroom_rtk_codex_hook`). Codex trusts the
+/// hooks.json entry, not the script, so a script update keeps the user's trust.
+fn ensure_codex_rtk_hook(
+    managed_rtk_path: &Path,
+    managed_python_path: &Path,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let script_path = headroom_rtk_codex_hook_path();
+    let (script_changed, script_backup) = write_file_if_changed(
+        &script_path,
+        &build_headroom_rtk_codex_hook(managed_rtk_path, managed_python_path),
+        true,
+    )?;
+    let (mut changed, mut backups) = register_hook_entries(
+        &codex_hooks_json_path(),
+        &[(
+            "PreToolUse",
+            Some("Bash"),
+            &hook_shell_command(&script_path)?,
+            "",
+        )],
+    )?;
+    if script_changed {
+        changed.insert(0, script_path.display().to_string());
+    }
+    if let Some(backup) = script_backup {
+        backups.insert(0, backup.display().to_string());
+    }
+    Ok((changed, backups))
+}
+
+fn remove_codex_rtk_hook() -> Result<()> {
+    let script_path = headroom_rtk_codex_hook_path();
+    remove_guard_hook_entries(
+        &codex_hooks_json_path(),
+        &script_path.display().to_string(),
+        true,
+        None,
+    )?;
+    if script_path.exists() {
+        let _ = std::fs::remove_file(&script_path);
+    }
+    Ok(())
 }
 
 /// Whether `rtk rewrite`'s exit code is a permission verdict (0 only when every
@@ -7477,6 +7533,10 @@ fn codex_hooks_json_path() -> PathBuf {
 
 fn codex_guard_hook_path() -> PathBuf {
     codex_home().join("hooks").join("headroom-codex-guard.py")
+}
+
+fn headroom_rtk_codex_hook_path() -> PathBuf {
+    codex_home().join("hooks").join("headroom-rtk-codex.sh")
 }
 
 /// Interpreter used by the Claude/Codex session-start guard hooks: the system
@@ -11113,7 +11173,7 @@ if not any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in root
 # Rules match the redirected cache path, never the PDF, so the allow below would
 # dodge every Read rule, and a block on reads outside the project (the cache is
 # outside it). Leave the read to Claude Code wherever one could apply.
-rules = settings(data, windows=True)
+rules = settings(data)
 if rules is None or rules[2] or any(not isinstance(r, str) or r.partition("(")[0].strip() == "Read" for r in rules[0] + rules[1]):
     sys.exit(0)
 try:
@@ -11204,27 +11264,101 @@ import glob, json, re, subprocess
 
 def cli_rules():
     # Rules on an ancestor command line: --settings, --disallowedTools.
+    win = sys.platform == "win32"
     try:
-        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+        procs = win_procs() if win else ps_procs()
     except Exception:
         return True
-    procs = {}
-    for row in rows:
-        parts = row.split(None, 2)
-        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
-            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
     pid = os.getppid()
     for _ in range(64):
         if pid == 0:
             return False
         if pid not in procs:
-            return True
+            # ps lists every process; win_procs stops where the chain does.
+            return not win
         pid, command = procs[pid]
-        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE) sets env only.
-        command = command.replace("--settings {\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}}", "")
+        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+        # sets env only. Quotes go first: a Windows command line escapes them.
+        command = re.sub(r"[\\\"]", "", command).replace("--settings {env:{ANTHROPIC_BASE_URL:https://api.anthropic.com}}", "")
         if re.search(r"--(managed-)?settings|--disallowed", command):
             return True
     return True
+
+
+def ps_procs():
+    rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    procs = {}
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    return procs
+
+
+def win_procs():
+    # The ancestors of this process as ps_procs rows: parents from a toolhelp
+    # snapshot, command lines from ProcessCommandLineInformation (Windows 8.1+).
+    # A parent that exited or that this user cannot read ends the chain, since
+    # Claude Code and its launcher run as this user. A reused pid only adds
+    # command lines to check, so at worst it keeps the hook silent.
+    import ctypes
+    from ctypes import wintypes as w
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("pid", w.DWORD), ("heap", ctypes.c_size_t), ("module", w.DWORD), ("threads", w.DWORD), ("ppid", w.DWORD), ("base", ctypes.c_long), ("flags", w.DWORD), ("exe", ctypes.c_wchar * 260)]
+
+    class Text(ctypes.Structure):
+        _fields_ = [("length", w.USHORT), ("maximum", w.USHORT), ("buffer", ctypes.c_void_p)]
+
+    k32, nt = ctypes.WinDLL("kernel32"), ctypes.WinDLL("ntdll")
+    k32.CreateToolhelp32Snapshot.restype = k32.OpenProcess.restype = w.HANDLE
+    k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [w.HANDLE, ctypes.POINTER(Entry)]
+    k32.CloseHandle.argtypes = [w.HANDLE]
+    k32.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+    nt.NtQueryInformationProcess.argtypes = [w.HANDLE, w.ULONG, ctypes.c_void_p, w.ULONG, ctypes.POINTER(w.ULONG)]
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, ctypes.c_void_p(-1).value):
+        raise OSError("no process snapshot")
+    parents, entry = {}, Entry(size=ctypes.sizeof(Entry))
+    try:
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            parents[entry.pid] = entry.ppid
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    procs, pid = {}, os.getppid()
+    while pid in parents and pid not in procs:
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            break
+        try:
+            size = w.ULONG(0)
+            nt.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(size))
+            buf = ctypes.create_string_buffer(size.value or 1)
+            if nt.NtQueryInformationProcess(handle, 60, buf, size, ctypes.byref(size)):
+                break
+            text = Text.from_buffer(buf)
+            line = ctypes.wstring_at(text.buffer, text.length // 2) if text.buffer else ""
+            # A venv python.exe is a launcher that runs this interpreter as its
+            # child with the same arguments: this script, not rules.
+            exe, n = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
+            if not procs and k32.QueryFullProcessImageNameW(handle, 0, exe, ctypes.byref(n)) and os.path.normcase(exe.value) == os.path.normcase(sys.executable):
+                line = ""
+            procs[pid] = (parents[pid], line)
+        finally:
+            k32.CloseHandle(handle)
+        pid = parents[pid]
+    return procs
+
+
+def empty(path):
+    # Claude Code caches "no server-managed settings" as {}.
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f) == {}
+    except Exception:
+        return False
 
 
 def policy_keys():
@@ -11241,18 +11375,17 @@ def policy_keys():
     return False
 
 
-def settings(data, windows=False):
+def settings(data):
     # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
     # or None when a source cannot be read here: registry and MDM policies,
     # managed files (a policyHelper hides their rules), the server-managed cache.
-    # Windows only when the caller opts in (the rtk verdict never has).
     win = sys.platform == "win32"
-    if win and not windows:
-        return None
     conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     managed = [os.path.join(os.environ.get("ProgramFiles") or "C:\\Program Files", "ClaudeCode")] if win else ["/Library/Application Support/ClaudeCode", "/etc/claude-code"]
     opaque = [os.path.join(d, n) for d in managed for n in ("managed-settings.json", "managed-settings.d")]
-    opaque.append(os.path.join(conf, "remote-settings.json"))
+    remote = os.path.join(conf, "remote-settings.json")
+    if not empty(remote):
+        opaque.append(remote)
     if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
         return None
     if any(os.path.exists(p) for p in opaque):
@@ -11288,10 +11421,7 @@ def settings(data, windows=False):
             return None
         ask, deny = ask + more_ask, deny + more_deny
         blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
-    # ponytail: Windows has no ps, so an ancestor --settings or
-    # --disallowedTools goes unseen there; read the parent chain through
-    # CreateToolhelp32Snapshot (ctypes) if that ever matters.
-    return None if not win and cli_rules() else (ask, deny, blocks)
+    return None if cli_rules() else (ask, deny, blocks)
 "##;
 
 /// The rtk hook's last step, after HOOK_RULES_PY: prints allow-with-the-rewrite,
@@ -11409,10 +11539,7 @@ mode, cmd = data.get("permission_mode"), tool_input.get("command")
 if os.environ.get("HEADROOM_RTK_RC") == "0":
     # rtk judged only the rules it can read. A managed, MDM or command-line
     # deny it never saw would be dodged by this allow, so stay silent there.
-    # ponytail: Windows keeps the unconditional allow, since settings() cannot
-    # read registry policies and gating would turn RTK off there outright;
-    # close it by reading HKLM\SOFTWARE\Policies\ClaudeCode via winreg.
-    if sys.platform != "win32" and settings(data) is None:
+    if settings(data) is None:
         sys.exit(0)
 else:
     ro =mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
@@ -11542,7 +11669,10 @@ fi
 # (never the .zprofile/.zshrc where the managed PATH export lands). Prepend the
 # managed bin dir to PATH for this one invocation so every `rtk`, at any
 # position, resolves regardless of which profile files the shell sourced.
-REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
+# rtk does not recognize this hook as installed, so it tells the agent to run
+# `rtk init -g` (a second hook): daily, and on every call on Windows, where
+# rtk 1.1.0 never refreshes its once-a-day marker.
+REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\" RTK_SUPPRESS_HOOK_WARNING=1; $REWRITTEN"
 
 HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
   "$HEADROOM_PYTHON" -X utf8 -c '{rules}{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
@@ -11551,6 +11681,80 @@ HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$R
         verdict = RTK_HOOK_VERDICT_PY
     )
 }
+
+/// The Codex PreToolUse hook: RTK's own `rtk hook codex` on the managed binary.
+/// Codex applies `updatedInput` only beside `permissionDecision: allow`, which
+/// it does not support on its own, so the reply rewrites without approving.
+/// It changes nothing, and Codex runs the original command, when:
+/// - the command needs verbatim output: `rtk grep`/`rg` drop -A/-B context
+///   and indentation (Codex greps code it is about to patch), `rtk jq`
+///   rewrites the JSON, and `rtk git diff --check` drops its report;
+/// - a Codex rules file has a `prompt` or `forbidden` rule, since rules match
+///   the rewritten `rtk git push`, not the `git push` the user wrote one for.
+fn build_headroom_rtk_codex_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+HEADROOM_RTK="{rtk}"
+HEADROOM_PYTHON="{python}"
+
+if [ ! -x "$HEADROOM_RTK" ] || [ ! -x "$HEADROOM_PYTHON" ]; then
+  exit 0
+fi
+
+# Any failure prints nothing: Codex then runs the command as written.
+HEADROOM_RTK="$HEADROOM_RTK" "$HEADROOM_PYTHON" -I -X utf8 -c '{py}' 2>/dev/null
+exit 0
+"#,
+        rtk = shell_double_quote(&managed_rtk_path.to_string_lossy()),
+        python = shell_double_quote(&managed_python_path.to_string_lossy()),
+        py = RTK_CODEX_HOOK_PY,
+    )
+}
+
+// Inside the hook's single-quoted `-c`, so it must hold no single quote.
+const RTK_CODEX_HOOK_PY: &str = r#"
+import glob, json, os, re, shlex, subprocess, sys
+RAW = re.compile(r"(?:^|[\s;&|(])(?:grep|egrep|fgrep|rg|ag|ack|jq|yq)(?=[\s;&|)]|$)"
+    r"|(?:^|\s)(?:--check|--porcelain\S*|-z|--json\S*|--format\S*|--pretty\S*"
+    r"|-o\s*(?:json|yaml)|--output[=\s](?:json|yaml))(?=\s|$)")
+GATED = re.compile(r"decision\s*=\s*[\"\x27](?:forbidden|prompt)")
+raw = sys.stdin.read()
+data = json.loads(raw)
+cmd = data.get("tool_input", {}).get("command")
+if not isinstance(cmd, str) or RAW.search(cmd):
+    sys.exit(0)
+homes = [os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "/etc/codex"]
+d = os.path.abspath(data.get("cwd") or os.getcwd())
+while True:
+    homes.append(os.path.join(d, ".codex"))
+    if os.path.dirname(d) == d:
+        break
+    d = os.path.dirname(d)
+for home in homes:
+    for path in glob.glob(os.path.join(glob.escape(home), "rules", "*.rules")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                gated = GATED.search(f.read())
+        except OSError:
+            continue
+        if gated:
+            sys.exit(0)
+rtk = os.environ["HEADROOM_RTK"]
+out = subprocess.run([rtk, "hook", "codex"], input=raw, capture_output=True, text=True, timeout=8).stdout
+if not out.strip():
+    sys.exit(0)
+reply = json.loads(out)
+update = reply["hookSpecificOutput"]["updatedInput"]
+new = update["command"]
+if not isinstance(new, str) or new == cmd:
+    sys.exit(0)
+# rtk emits a bare `rtk`, at the start or after `&&`, which a stale PATH (or
+# an older rtk the user installed) would resolve wrong.
+# RTK_SUPPRESS_HOOK_WARNING: rtk does not see this hook and would tell the
+# agent to run `rtk init -g` (see build_headroom_rtk_hook).
+update["command"] = "export PATH=" + shlex.quote(os.path.dirname(rtk)) + ":\"$PATH\" RTK_SUPPRESS_HOOK_WARNING=1; " + new
+print(json.dumps(reply))
+"#;
 
 /// The user's home, as the tools we configure see it. The one resolver every
 /// module goes through.
@@ -12806,11 +13010,12 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn hook_rules_read_windows_sources_only_when_asked() {
+    fn hook_rules_read_windows_sources() {
         // The rules reader under a stand-in win32 (hook tests only run on unix
-        // CI): the rtk verdict still gets None there, the MarkItDown hook reads
-        // the files, and either policy key or Program Files managed settings
-        // makes it None again (the sources Claude Code 2.1.284 reads).
+        // CI): it reads the files, and either policy key, Program Files managed
+        // settings (the sources Claude Code 2.1.284 reads) or rules on Claude
+        // Code's command line make it None. win_procs is stubbed with that
+        // command line, under a parent that has exited.
         let root = unique_temp_dir("headroom-hook-rules-win");
         let (conf, project, pf) = (root.join("conf"), root.join("project"), root.join("pf"));
         for dir in [&conf, &project, &pf] {
@@ -12828,15 +13033,16 @@ def open_key(hive, path):
 winreg.OpenKey, winreg.CloseKey = open_key, lambda key: None
 sys.modules["winreg"] = winreg
 sys.platform = "win32"
-data = {"cwd": sys.argv[2]}
-print(settings(data) is None, settings(data, windows=True) is None)
+win_procs = lambda: {os.getppid(): (4242424, sys.argv[3])}
+print(settings({"cwd": sys.argv[2]}) is None)
 "#;
-        let run = |keys: &str| {
+        let run = |keys: &str, claude: &str| {
             let output = crate::proc::command("/usr/bin/python3")
                 .arg("-c")
                 .arg(format!("{}\n{check}", super::HOOK_RULES_PY))
                 .arg(keys)
                 .arg(&project)
+                .arg(claude)
                 .env("CLAUDE_CONFIG_DIR", &conf)
                 .env("ProgramFiles", &pf)
                 .env_remove("CLAUDE_PROJECT_DIR")
@@ -12847,12 +13053,27 @@ print(settings(data) is None, settings(data, windows=True) is None)
             String::from_utf8_lossy(&output.stdout).trim().to_string()
                 + &String::from_utf8_lossy(&output.stderr)
         };
-        assert_eq!(run(""), "True False");
-        assert_eq!(run("HKLM"), "True True");
-        assert_eq!(run("HKCU"), "True True");
+        let claude = "C:\\Users\\me\\.local\\bin\\claude.exe --resume s1";
+        assert_eq!(run("", claude), "False");
+        assert_eq!(run("HKLM", claude), "True");
+        assert_eq!(run("HKCU", claude), "True");
+        let denied = format!("{claude} --disallowedTools Bash");
+        assert_eq!(run("", &denied), "True");
+        // The relaunch's override as Python's subprocess quotes it on Windows.
+        let relaunch = format!(
+            "{claude} --settings \"{}\"",
+            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
+        );
+        assert_eq!(run("", &relaunch), "False");
+        let remote = conf.join("remote-settings.json");
+        fs::write(&remote, "{}").expect("empty remote settings");
+        assert_eq!(run("", claude), "False");
+        fs::write(&remote, r#"{"permissions":{"deny":["Bash"]}}"#).expect("remote settings");
+        assert_eq!(run("", claude), "True");
+        fs::remove_file(&remote).expect("remove remote settings");
         fs::create_dir_all(pf.join("ClaudeCode")).expect("managed dir");
         fs::write(pf.join("ClaudeCode").join("managed-settings.json"), "{}").expect("managed");
-        assert_eq!(run(""), "True True");
+        assert_eq!(run("", claude), "True");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -14253,6 +14474,106 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[cfg(unix)]
+    fn codex_rtk_hook_rewrites_through_the_managed_rtk_and_keeps_verbatim_commands_raw() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_temp_dir("headroom-codex-rtk-hook");
+        let bin = root.join("managed bin");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(codex_home.join("rules")).unwrap();
+        // Stands in for `rtk hook codex` 1.1.0: a bare leading rtk, the other
+        // tool_input fields kept.
+        let rtk = bin.join("rtk");
+        let write_rtk = |body: &str| {
+            fs::write(&rtk, body).unwrap();
+            fs::set_permissions(&rtk, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_rtk(
+            "#!/usr/bin/python3\nimport json, sys\nd = json.load(sys.stdin)\n\
+             u = dict(d[\"tool_input\"], command=\"rtk \" + d[\"tool_input\"][\"command\"])\n\
+             print(json.dumps({\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \
+             \"permissionDecision\": \"allow\", \"updatedInput\": u}}))\n",
+        );
+        let hook = root.join("hook.sh");
+        fs::write(
+            &hook,
+            super::build_headroom_rtk_codex_hook(&rtk, Path::new("/usr/bin/python3")),
+        )
+        .unwrap();
+        let run = |cmd: &str| -> String {
+            let stdin = serde_json::json!({
+                "cwd": root,
+                "tool_input": {"command": cmd, "workdir": "/w"},
+            })
+            .to_string();
+            let out = crate::proc::command("bash")
+                .arg(&hook)
+                .env("CODEX_HOME", &codex_home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
+                    child.wait_with_output()
+                })
+                .unwrap();
+            assert!(out.status.success(), "hook exits 0 for {cmd}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        fs::write(
+            codex_home.join("rules").join("default.rules"),
+            "prefix_rule(pattern=[\"cargo\", \"test\"], decision=\"allow\")\n",
+        )
+        .unwrap();
+        let reply: Value = serde_json::from_str(&run("git status")).expect("a rewrite");
+        let update = &reply["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(update["workdir"], "/w");
+        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "allow");
+        let rewritten = update["command"].as_str().unwrap();
+        let prefix = rewritten.strip_suffix("rtk git status").expect(rewritten);
+        // The prefix, space in the path and all, makes `rtk` the managed one.
+        let resolved = crate::proc::command("bash")
+            .arg("-c")
+            .arg(format!(
+                "{prefix}command -v rtk; printenv RTK_SUPPRESS_HOOK_WARNING"
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&resolved.stdout).trim(),
+            format!("{}\n1", rtk.display())
+        );
+
+        for cmd in [
+            "rg -n foo src",
+            "cd web && grep -rn -A3 foo .",
+            "jq .name package.json",
+            "git diff --cached --check",
+            "git status --porcelain",
+            "gh pr list --json number",
+            "kubectl get pods -o json",
+        ] {
+            assert_eq!(run(cmd), "", "{cmd} stays raw");
+        }
+
+        fs::write(
+            codex_home.join("rules").join("guard.rules"),
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"forbidden\")\n",
+        )
+        .unwrap();
+        assert_eq!(run("git status"), "", "a forbidden rule keeps it raw");
+        fs::remove_file(codex_home.join("rules").join("guard.rules")).unwrap();
+
+        write_rtk("#!/bin/sh\necho not json\n");
+        assert_eq!(run("git status"), "", "bad rtk output fails open");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
         let root = unique_temp_dir("headroom-hook-bash-ok");
         fs::create_dir_all(&root).expect("create root");
@@ -14602,6 +14923,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             stdout.contains("&& rtk "),
             "embedded rtk token must be preserved, got: {stdout:?}"
         );
+        // rtk's "No hook installed - run `rtk init -g`" would reach the agent.
+        assert!(
+            stdout.contains("\\\"$PATH\\\" RTK_SUPPRESS_HOOK_WARNING=1; cd /tmp && rtk "),
+            "rewrite must silence rtk's missing-hook warning, got: {stdout:?}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -14613,7 +14939,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // turned RTK off for every remote-control session); any other does.
         assert!(super::HOOK_RULES_PY.contains(&format!(
             "--settings {}",
-            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
+            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "")
         )));
     }
 
@@ -16729,13 +17055,26 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             body.contains(&rtk.display().to_string()),
             "nudge references the managed rtk path: {body}"
         );
+        let script = super::headroom_rtk_codex_hook_path();
+        let command = script.display().to_string();
+        if cfg!(unix) {
+            assert!(script.exists(), "Codex RTK hook script written");
+            assert!(
+                super::guard_registered_in_hooks(&super::codex_hooks_json_path(), &command)
+                    .unwrap()
+            );
+        }
 
-        // Disabling RTK must remove the managed block.
+        // Disabling RTK must remove the managed block and the hook.
         super::set_rtk_enabled(false, &rtk, &python).expect("disable rtk");
         let after = fs::read_to_string(&agents).unwrap_or_default();
         assert!(
             !after.contains("Headroom RTK"),
             "nudge removed on disable: {after}"
+        );
+        assert!(!script.exists());
+        assert!(
+            !super::guard_registered_in_hooks(&super::codex_hooks_json_path(), &command).unwrap()
         );
     }
 

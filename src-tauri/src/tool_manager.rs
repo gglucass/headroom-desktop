@@ -452,9 +452,9 @@ Can also write every thread's stack to HEADROOM_STARTUP_STALL_DUMP when the
 proxy has not bound its port HEADROOM_STARTUP_STALL_DUMP_SECS after start
 (desktop diagnostic, RUST-P1). The desktop sets both on Windows only.
 
-Also gives Windows' WMI queries a timeout, so a wedged WMI service cannot
-hold the backend's imports forever (RUST-F2). Kill switch:
-HEADROOM_WMI_TIMEOUT_SECS=0.
+Also keeps Python's platform module off WMI on Windows, so a wedged or slow
+WMI service can neither hold the backend's imports forever (RUST-F2) nor crash
+them (RUST-V2). Kill switch: HEADROOM_SKIP_WMI=0.
 """
 import faulthandler
 import os as _hd_os
@@ -473,50 +473,28 @@ except Exception:
 # the end (see _HD_VENDORS).
 _hd_bound = set()
 
-# --- WMI queries time out (posture, RUST-F2) -----------------------------------
+# --- No WMI queries (posture, RUST-F2, RUST-V2) ------------------------------
 # Python 3.12's platform module asks WMI first for the Windows version, and
-# `_wmi.exec_query` bounds the connect (~1s) but not the read, so a wedged WMI
-# service blocks it forever. aiohttp calls platform.system() at import, so such
-# a backend never bound its port (stall dumps at 486s on two hosts, both in
-# platform._wmi_query). Past the timeout the query raises OSError, which
-# platform answers from sys.getwindowsversion() and `ver`, and WMI is not asked
-# again in this process (3.13's platform does the same after a failed query).
-# Arms wherever `_wmi` exists (Windows). The stuck query keeps a daemon thread.
-# Kill switch: HEADROOM_WMI_TIMEOUT_SECS=0.
+# `_wmi.exec_query` hands its native query thread a pointer into the caller's
+# stack, then returns on its own 1s/100ms waits while that thread still runs,
+# and never returns when a wedged WMI stalls the read. aiohttp calls
+# platform.system() at import, so a wedged WMI kept the backend from binding
+# (RUST-F2). 0.9.56 joined the query on a short-lived thread: when the query
+# gave up, that thread's stack was freed under the still-running native thread,
+# and the backend died of an access violation mid-import on every launch
+# (RUST-V2/V9). platform answers from sys.getwindowsversion() and `ver`
+# instead, as it does where `_wmi` is missing and as Python 3.11 always did.
+# Arms wherever `_wmi` exists (Windows). Kill switch: HEADROOM_SKIP_WMI=0.
 try:
     import platform as _hd_platform
 
-    _hd_wmi_secs = _hd_os.environ.get("HEADROOM_WMI_TIMEOUT_SECS", "5")
-    if getattr(_hd_platform, "_wmi", None) is not None and _hd_wmi_secs.isdigit() and int(_hd_wmi_secs) > 0:
-        import threading as _hd_threading
+    if getattr(_hd_platform, "_wmi", None) is not None and _hd_os.environ.get("HEADROOM_SKIP_WMI") != "0":
 
-        _hd_wmi_query = _hd_platform._wmi_query
-        _hd_wmi_dead = []
+        def _hd_no_wmi_query(*keys):
+            raise OSError("not supported")
 
-        def _hd_wmi_timed_query(*args, **kwargs):
-            if _hd_wmi_dead:
-                raise OSError("WMI timed out earlier in this process")
-            box = []
-
-            def run():
-                try:
-                    box.append((_hd_wmi_query(*args, **kwargs), None))
-                except BaseException as exc:
-                    box.append((None, exc))
-
-            worker = _hd_threading.Thread(target=run, name="headroom-wmi-query", daemon=True)
-            worker.start()
-            worker.join(int(_hd_wmi_secs))
-            if not box:
-                _hd_wmi_dead.append(True)
-                raise OSError("WMI query timed out after %ss" % _hd_wmi_secs)
-            result, exc = box[0]
-            if exc is not None:
-                raise exc
-            return result
-
-        _hd_platform._wmi_query = _hd_wmi_timed_query
-        _hd_bound.add("wmi_timeout")
+        _hd_platform._wmi_query = _hd_no_wmi_query
+        _hd_bound.add("skip_wmi")
 except Exception:
     pass
 
@@ -1991,7 +1969,7 @@ _HD_VENDORS = (
     "deferred_tool_affinity",
     "loop_stall_dump",
     "startup_stall_dump",
-    "wmi_timeout",
+    "skip_wmi",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -2138,20 +2116,20 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
     }
 }
 const RTK_VERSION: &str = "1.1.0";
-const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
+const MARKITDOWN_PINNED_VERSION: &str = "0.1.9";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
 
-/// serena-agent pins every dependency exactly, and 1.7.0 pins
+/// serena-agent pins every dependency exactly, and 1.7.0 through 2.1.0 pin
 /// cryptography==50.0.0, whose macOS wheels are arm64-only (49.0.0 dropped
 /// universal2). On an Intel Mac pip fell back to the sdist, which needs a Rust
 /// toolchain, so every Serena install there failed with "Failed building wheel
 /// for cryptography" from the 1.6.1 -> 1.7.0 bump (2026-08-13) on (RUST-F6).
 /// 1.6.1 pins cryptography==48.0.1, the universal2 build the runtime lock also
-/// pins for Intel, and matches 1.7.0 on everything Headroom drives: the
+/// pins for Intel, and matches 2.1.0 on everything Headroom drives: the
 /// start-mcp-server flags, the claude-code/codex contexts,
 /// `web_dashboard_interface`, the dashboard port and `/get_tool_stats`, and the
-/// tool-call log line. Its closure resolves wheels-only on x86_64 macOS
+/// tool-call log line's `SERENA_TOOL_CALL_LOG_MARKER`. Its closure resolves wheels-only on x86_64 macOS
 /// (proxy-tools, pure Python, builds from its sdist as on every platform).
 /// Drop the Intel branch once the pin's cryptography ships an x86_64 macOS
 /// wheel.
@@ -2159,7 +2137,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
     if intel_mac {
         "1.6.1"
     } else {
-        "1.7.0"
+        "2.1.0"
     }
 }
 /// Serena runs its Python language servers (pyright, basedpyright, ty,
@@ -2167,7 +2145,7 @@ const fn serena_pinned_version(intel_mac: bool) -> &'static str {
 /// symbol query failed after a clean install, so uv lives in serena's venv and
 /// the MCP entry points `UVX` at it.
 const SERENA_UV_PINNED_VERSION: &str = "0.12.23";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
+const CONTEXT7_PINNED_VERSION: &str = "4.4.4";
 /// Context7's own hosted MCP server. The server ignores `via=headroom`; it is
 /// how uninstall tells this entry from one a user added by hand, which
 /// Context7's own docs tell them to do.
@@ -2180,20 +2158,100 @@ static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.11.0";
+const CODEBASE_MEMORY_VERSION: &str = "0.12.1";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18";
+    "9bfcbe38414b47969a3e1d1c1999f5357409387c86fa3d24221b5458267660d2";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e";
+    "ca6e64397a8ae80cec898a8205a6aa16750ac798acc05a0c3ed983837944a581";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "c0e46c87cf37e35f1ac0bd9cc7e1d8b0ca4ef40034e1008805d709fa52a4e38a";
+    "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "032b33c1833919a2d1de67ff6367fa6ea46aee8689c86ef223c88fae3b6e4536";
+    "8c3d0341064301e78ecc84cf7348d4e2c6562a0f57448243ea560aaa34de36c1";
 const CODEBASE_MEMORY_SHA256_WINDOWS_X86_64: &str =
-    "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685";
+    "4e4e0f16b45233af5c757a1fcbe3c3b16e9056375b1fbe2ce020b6de75dedcc0";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// `keep_markers`, which every MCP helper below calls before it removes or
+/// replaces an entry the ledger says Headroom installed (see its docstring).
+macro_rules! mcp_helper_keep_markers {
+    () => {
+        r##"import sys
+
+
+def keep_markers(registrar, name):
+    """Put every [mcp_servers.<name>] table Headroom owns back between its markers.
+
+    `codex mcp add` rewrites config.toml and drops the comment line above a
+    table, so Headroom's start marker goes, and Codex keeps per-tool tables
+    (`[mcp_servers.<name>.tools.<tool>]`) wherever it adds them. The registrar
+    then reads the entry as user-managed (no removal, no update), or removes
+    the block and leaves a per-tool table that stops Codex loading its config.
+    Callers check the ledger first. Best effort: it reads private registrar
+    helpers, so any surprise leaves the file as it was.
+    """
+    try:
+        from headroom import fsutil
+        from headroom.mcp_registry import codex as toml_module
+
+        if not isinstance(registrar, toml_module._TomlMarkerRegistrar):
+            return
+        path = registrar._config_file
+        if not path.exists():
+            return
+        start, end = toml_module._marker_start(name), toml_module._marker_end(name)
+        text = registrar._read_text()
+        lines = text.splitlines(keepends=True)
+        bare = [line.rstrip("\r\n") for line in lines]
+
+        def owned(line):
+            key = toml_module._table_path(line)
+            return key is not None and key[:2] == ["mcp_servers", name]
+
+        heads = [i for i, line in enumerate(lines) if owned(line)]
+        if not heads:
+            return
+        if start in bare and end in bare:
+            lo, hi = bare.index(start), bare.index(end)
+            if all(lo < i < hi for i in heads):
+                return
+        # Chunks: the preamble, then one per table header. Trailing blank and
+        # comment lines of an owned chunk stay where they are: a comment there
+        # usually belongs to the table after it.
+        chunks = [[]]
+        for line in lines:
+            if line.rstrip("\r\n") in (start, end):
+                continue
+            if toml_module._table_path(line) is not None:
+                chunks.append([])
+            chunks[-1].append(line)
+        kept, block, at = [], [], None
+        for chunk in chunks:
+            if chunk and owned(chunk[0]):
+                cut = len(chunk)
+                while cut > 1 and (not chunk[cut - 1].strip() or chunk[cut - 1].lstrip().startswith("#")):
+                    cut -= 1
+                if at is None:
+                    at = len(kept)
+                block.extend(chunk[:cut])
+                kept.append(chunk[cut:])
+            else:
+                kept.append(chunk)
+        block = [line if line.endswith("\n") else line + "\n" for line in block]
+        before = "".join("".join(c) for c in kept[:at])
+        if before and not before.endswith("\n"):
+            before += "\n"
+        new = before + start + "\n" + "".join(block) + end + "\n" + "".join("".join(c) for c in kept[at:])
+        import tomllib
+
+        if tomllib.loads(new) != tomllib.loads(text):
+            return
+        fsutil.write_text(path, new)
+    except Exception as exc:
+        print(f"{registrar.name}: left {name}'s markers alone: {exc}", file=sys.stderr)
+"##
+    };
+}
 /// Registers/unregisters the managed Serena MCP entry with every detected
 /// agent, reusing the bundled headroom package's registrars and install
 /// ledger instead of reimplementing Claude Code JSON / Codex TOML handling in
@@ -2201,7 +2259,9 @@ const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
 /// argv: `register <serena-bin> [<uvx>]` | `unregister`.
-const SERENA_MCP_HELPER: &str = r#"
+const SERENA_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import sys
 
 from headroom.mcp_registry import (
@@ -2245,6 +2305,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("serena")
         ):
+            keep_markers(registrar, "serena")
             result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2259,6 +2320,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: serena entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "serena")
         if registrar.unregister_server("serena"):
             clear_install(registrar.name, "serena")
             print(f"{registrar.name}: removed")
@@ -2266,7 +2328,8 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the Context7 MCP entry: Context7's hosted server (`CONTEXT7_HOSTED_URL`)
 /// for Claude Code, Codex and OpenCode, and for Grok, which has no URL
@@ -2275,7 +2338,9 @@ if failures:
 /// package's script. The wheel's registrars only write command servers, so
 /// this process teaches them the URL form each agent's config uses.
 /// argv: `register <url> [<script>]` | `unregister`.
-const CONTEXT7_MCP_HELPER: &str = r#"
+const CONTEXT7_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import dataclasses
 import re
 import sys
@@ -2421,6 +2486,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("context7")
             if headroom_installed_matching(registrar.name, current) or npx_era(current):
+                keep_markers(registrar, "context7")
                 result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2435,6 +2501,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: context7 entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "context7")
         if registrar.unregister_server("context7"):
             clear_install(registrar.name, "context7")
             print(f"{registrar.name}: removed")
@@ -2442,12 +2509,15 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the codebase-memory MCP entry. `CBM_CACHE_DIR` points its index databases
 /// into Headroom's managed tools dir so uninstalling removes them too.
 /// argv: `register <binary> <cache-dir>` | `unregister`.
-const CODEBASE_MEMORY_MCP_HELPER: &str = r#"
+const CODEBASE_MEMORY_MCP_HELPER: &str = concat!(
+    mcp_helper_keep_markers!(),
+    r#"
 import sys
 
 from headroom.mcp_registry import (
@@ -2480,6 +2550,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
             registrar.name, registrar.get_server("codebase-memory")
         ):
+            keep_markers(registrar, "codebase-memory")
             result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
@@ -2494,6 +2565,7 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: codebase-memory entry is user-managed, leaving it")
             continue
+        keep_markers(registrar, "codebase-memory")
         if registrar.unregister_server("codebase-memory"):
             clear_install(registrar.name, "codebase-memory")
             print(f"{registrar.name}: removed")
@@ -2501,7 +2573,8 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             failures.append(f"{registrar.name}: removal failed")
 if failures:
     sys.exit("; ".join(failures))
-"#;
+"#
+);
 /// A marketplace plugin addon installed through the host CLIs' own
 /// `<cli> plugin ...` managers. The install/enable/uninstall plumbing is
 /// shared; addons differ only in these identifiers.
@@ -3514,8 +3587,8 @@ impl ToolManager {
 
     /// Today's serena tool calls, counted from `~/.serena/logs/<local day>/`.
     /// Serena's usage stats are in-memory only (analytics.py), so its log
-    /// files are the only persisted trace: one line containing
-    /// "; session_id: " per tool application (tools_base.py, pinned v1.7.0).
+    /// files are the only persisted trace: one `SERENA_TOOL_CALL_LOG_MARKER`
+    /// line per tool application.
     /// Local day matches serena's own log-dir bucketing (datetime.now()).
     /// 60s cache: Result lines make these files large enough that scanning on
     /// every dashboard poll would be wasteful.
@@ -8464,12 +8537,12 @@ impl ToolManager {
         // Even after a failure: pip keeps the packages it installed before it.
         self.remove_olefile();
         installed?;
-        // markitdown's own pins move lock packages below their hashed pins:
-        // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
-        // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
-        // back every lock package the install changed, found by diffing the
-        // venv's dist-info dirs, so a future pin moving another one is caught
-        // too. magika 1.0.3 and onnxruntime 1.27.0 both run markitdown 0.1.7.
+        // markitdown's own pins can move lock packages off their hashed pins:
+        // 0.1.7's magika~=0.6.1 did everywhere, and on Windows its onnxruntime
+        // too (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass).
+        // 0.1.9 accepts the lock's magika 1.0.3 and moves nothing. Put back
+        // every lock package an install changed, found by diffing the venv's
+        // dist-info dirs, so a future pin moving one is caught too.
         // Warn-only: failing here would take the addon down over a pin.
         let lock = bootstrap_requirements_lock();
         let moved: Vec<String> = moved_lock_packages(
@@ -8542,6 +8615,33 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// Put back lock packages whose dist-info is gone. A pip install denied
+    /// mid-replace leaves one: on Windows, 0.9.56's MarkItDown 0.1.7 install
+    /// hit WinError 5 on the running backend's onnxruntime DLL, leaving
+    /// `~nnxruntime` stashes, no onnxruntime dist-info and an onnxruntime that
+    /// cannot import. Nothing else re-syncs it, since the receipt's lock sha
+    /// still matches. A dist-info scan, so the launch path can call it every
+    /// time; it must run before the proxy holds the DLLs.
+    pub fn restore_missing_lock_pins(&self) {
+        let python = self.runtime.managed_python();
+        let installed = venv_dist_infos(&python);
+        // Empty means unreadable or not installed yet: the bootstrap's job. A
+        // venv on another lock (an upgrade that rolled back, or ran out of
+        // retries) lacks the new lock's added pins by design: the upgrade's job.
+        if installed.is_empty() || self.lock_pins_differ_from_installed() {
+            return;
+        }
+        let missing = missing_lock_packages(&installed, bootstrap_requirements_lock());
+        if missing.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = missing.iter().map(String::as_str).collect();
+        log::warn!("lock packages {names:?} have no dist-info; reinstalling them from the lock");
+        if let Err(err) = self.reinstall_lock_pins(&names, "missing-pins-repair.lock") {
+            log::warn!("reinstalling the lock's {names:?} failed: {err:#}");
+        }
     }
 
     /// Pillow opens FlashPix and MIC images only when olefile imports, and its
@@ -8745,13 +8845,14 @@ impl ToolManager {
         if self.serena_uvx().exists() {
             args.push(&uvx);
         }
-        self.run_mcp_helper(&args)
-            .context("registering serena MCP server")
+        self.run_mcp_helper(&args, "Adding Serena to your agents")
     }
 
     fn unregister_serena_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", SERENA_MCP_HELPER, "unregister"])
-            .context("unregistering serena MCP server")
+        self.run_mcp_helper(
+            &["-c", SERENA_MCP_HELPER, "unregister"],
+            "Removing Serena from your agents",
+        )
     }
 
     pub fn context7_installed(&self) -> bool {
@@ -8921,13 +9022,14 @@ impl ToolManager {
         let script = script.map(|script| script.to_string_lossy().into_owned());
         let mut args = vec!["-c", CONTEXT7_MCP_HELPER, "register", CONTEXT7_HOSTED_URL];
         args.extend(script.as_deref());
-        self.run_mcp_helper(&args)
-            .context("registering context7 MCP server")
+        self.run_mcp_helper(&args, "Adding Context7 to your agents")
     }
 
     fn unregister_context7_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", CONTEXT7_MCP_HELPER, "unregister"])
-            .context("unregistering context7 MCP server")
+        self.run_mcp_helper(
+            &["-c", CONTEXT7_MCP_HELPER, "unregister"],
+            "Removing Context7 from your agents",
+        )
     }
 
     pub fn codebase_memory_entrypoint(&self) -> PathBuf {
@@ -9096,22 +9198,29 @@ impl ToolManager {
             .codebase_memory_cache_dir()
             .to_string_lossy()
             .into_owned();
-        self.run_mcp_helper(&[
-            "-c",
-            CODEBASE_MEMORY_MCP_HELPER,
-            "register",
-            &binary,
-            &cache_dir,
-        ])
-        .context("registering codebase-memory MCP server")
+        self.run_mcp_helper(
+            &[
+                "-c",
+                CODEBASE_MEMORY_MCP_HELPER,
+                "register",
+                &binary,
+                &cache_dir,
+            ],
+            "Adding Codebase Memory to your agents",
+        )
     }
 
     fn unregister_codebase_memory_mcp(&self) -> Result<()> {
-        self.run_mcp_helper(&["-c", CODEBASE_MEMORY_MCP_HELPER, "unregister"])
-            .context("unregistering codebase-memory MCP server")
+        self.run_mcp_helper(
+            &["-c", CODEBASE_MEMORY_MCP_HELPER, "unregister"],
+            "Removing Codebase Memory from your agents",
+        )
     }
 
-    fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
+    /// `action` names the step for the error: its Display is all the add-on
+    /// card shows, and "unregistering codebase-memory MCP server" alone read
+    /// as a progress label that never finished (a support report, 2026-11-04).
+    fn run_mcp_helper(&self, args: &[&str], action: &str) -> Result<()> {
         // The Codex/Grok registrars delete their whole marker span on
         // unregister, other apps' tables inside it included.
         crate::client_adapters::protect_foreign_mcp_tables();
@@ -9128,21 +9237,28 @@ impl ToolManager {
             let user_config = err
                 .downcast_ref::<CommandFailure>()
                 .is_some_and(|failure| mcp_helper_failed_on_user_config(&failure.stderr));
-            if user_config {
+            let reason = err
+                .downcast_ref::<CommandFailure>()
+                .and_then(|failure| {
+                    failure
+                        .stderr
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                })
+                .unwrap_or("see the log")
+                .to_string();
+            let err = if user_config {
                 // The registrars parse stricter than the clients (a TOML 1.1
                 // trailing comma, JSONC comments): some of these configs are
                 // valid and the addon silently never registers. One grouped
                 // warning (sanitize_event: once per host per day) keeps the
                 // count visible; the log lines stay out of Sentry.
-                let line = err
-                    .downcast_ref::<CommandFailure>()
-                    .and_then(|failure| failure.stderr.lines().rev().find(|l| !l.trim().is_empty()))
-                    .unwrap_or_default()
-                    .to_string();
                 sentry::with_scope(
                     |scope| {
                         scope.set_fingerprint(Some(&["mcp-helper-user-config"]));
-                        scope.set_extra("registrar_line", line.into());
+                        scope.set_extra("registrar_line", reason.clone().into());
                     },
                     || {
                         sentry::capture_message(
@@ -9154,7 +9270,8 @@ impl ToolManager {
                 err.context(crate::client_adapters::UNPARSEABLE_SETTINGS)
             } else {
                 err
-            }
+            };
+            err.context(format!("{action} failed: {reason}"))
         })
     }
 
@@ -9908,9 +10025,11 @@ fn codex_list_line_installed(line: &str, plugin_ref: &str) -> bool {
     words.next() == Some(plugin_ref) && words.next().is_some_and(|w| w.starts_with("installed"))
 }
 
-/// One serena tool application logs exactly one line containing this marker
-/// (`tools_base.py` `_log_tool_application`, stable through pinned v1.7.0).
-const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
+/// One serena tool application logs exactly one line, from
+/// `tools_base.py` `_log_tool_application`, and serena's log format
+/// (`%(name)s:%(funcName)s:%(lineno)d`) names that function on it, from 1.6.1
+/// through 2.1.0. 2.0 dropped the `; session_id: ` suffix this used to count.
+const SERENA_TOOL_CALL_LOG_MARKER: &str = ":_log_tool_application:";
 
 /// Serena's dashboard API binds the first free port scanning upward from here
 /// (`constants.py` 0x5EDA, `dashboard.py` `_find_first_free_port`).
@@ -11284,6 +11403,14 @@ fn kill_pid(pid: u32, force: bool) {
     }
 }
 
+/// The reclaim bail for a backend that answers /readyz: it is left alone.
+const RECLAIM_FOUND_HEALTHY_BACKEND: &str = "backend answers /readyz";
+
+/// The start bailed only because a healthy backend already holds 6768.
+pub(crate) fn reclaim_found_healthy_backend(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(&format!("[reclaim: {RECLAIM_FOUND_HEALTHY_BACKEND}]"))
+}
+
 fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     // The bracket names which check refused: the four bails read identically
     // in Sentry, so RUST-6J could never say which one the field hits.
@@ -11295,7 +11422,7 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     let released =
         || TcpListener::bind(("127.0.0.1", port)).is_ok() && listener_process(port).is_none();
     if !force_unhealthy_too && probe_backend_readyz_ok(port) {
-        return Err(held("backend answers /readyz"));
+        return Err(held(RECLAIM_FOUND_HEALTHY_BACKEND));
     }
     let Some((_, pid)) = listener_process(port) else {
         if released() {
@@ -11592,8 +11719,11 @@ fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16))
 /// all-threads dump that follows them runs well past the 80-line tail Sentry
 /// gets (RUST-C7: seven idle threads plus a 100-frame import chain), so the one
 /// line that says access violation / Aborted / OMP error was exactly what got
-/// cut. Keeps the last few matches: the log is append-only across attempts and
-/// the newest dump is the one being reported.
+/// cut. So were the innermost frames under `Current thread`, which name what a
+/// unix startup timeout's SIGABRT caught the backend stuck in (RUST-F2 on
+/// macOS: a 100-frame litellm import), so the first few of those come along.
+/// Keeps the last few matches: the log is append-only across attempts and the
+/// newest dump is the one being reported.
 fn fatal_header_lines(path: &Path) -> Vec<String> {
     const MARKERS: &[&str] = &[
         "Fatal Python error",
@@ -11601,18 +11731,30 @@ fn fatal_header_lines(path: &Path) -> Vec<String> {
         "OMP: Error",
         "Current thread 0x",
     ];
-    const KEEP: usize = 6;
+    const FRAMES: usize = 3;
+    const KEEP: usize = 12;
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut frames_left = 0;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if MARKERS.iter().any(|m| line.contains(m)) {
-            if kept.len() == KEEP {
-                kept.pop_front();
-            }
-            kept.push_back(redact_sensitive(&line));
+            frames_left = if line.contains("Current thread 0x") {
+                FRAMES
+            } else {
+                0
+            };
+        } else if frames_left > 0 && line.trim_start().starts_with("File \"") {
+            frames_left -= 1;
+        } else {
+            frames_left = 0;
+            continue;
         }
+        if kept.len() == KEEP {
+            kept.pop_front();
+        }
+        kept.push_back(redact_sensitive(&line));
     }
     kept.into_iter().collect()
 }
@@ -12170,9 +12312,9 @@ fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
 }
 
 /// Returns the full command line of whatever process is currently listening on
-/// the proxy port, or `None` if we couldn't determine it.
-pub fn running_proxy_argv() -> Option<String> {
-    let (_, pid) = listener_process(backend_port::get())?;
+/// `port`, or `None` if we couldn't determine it.
+pub fn running_proxy_argv(port: u16) -> Option<String> {
+    let (_, pid) = listener_process(port)?;
     ps_command(pid)
 }
 
@@ -12221,7 +12363,13 @@ fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
 /// True if the running proxy's argv contains every flag we expect this build
 /// to pass. Used to detect proxies left over from an older desktop version.
 pub fn running_proxy_matches_expected_args() -> bool {
-    let Some(argv) = running_proxy_argv() else {
+    running_proxy_matches_expected_args_on(backend_port::get())
+}
+
+/// `running_proxy_matches_expected_args` for the listener on `port`, for a
+/// caller about to adopt a port other than the selected one.
+pub fn running_proxy_matches_expected_args_on(port: u16) -> bool {
+    let Some(argv) = running_proxy_argv(port) else {
         // Fail open. The caller kills the backend when this is false, and
         // "we could not read the listener's argv" is not evidence that it is
         // stale. Returning false here meant every ensure-running pass on a
@@ -12852,12 +13000,18 @@ fn codebase_memory_distribution_artifact() -> Result<DownloadArtifact> {
             CODEBASE_MEMORY_SHA256_MACOS_X86_64,
             "tar.gz",
         ),
+        // The static `-portable` builds: the plain Linux ones link glibc 2.38,
+        // which Ubuntu 22.04, Debian 12 and RHEL 9 lack.
         ("linux", "aarch64") => (
-            "linux-arm64",
+            "linux-arm64-portable",
             CODEBASE_MEMORY_SHA256_LINUX_AARCH64,
             "tar.gz",
         ),
-        ("linux", "x86_64") => ("linux-amd64", CODEBASE_MEMORY_SHA256_LINUX_X86_64, "tar.gz"),
+        ("linux", "x86_64") => (
+            "linux-amd64-portable",
+            CODEBASE_MEMORY_SHA256_LINUX_X86_64,
+            "tar.gz",
+        ),
         ("windows", "x86_64") => (
             "windows-amd64",
             CODEBASE_MEMORY_SHA256_WINDOWS_X86_64,
@@ -14832,12 +14986,16 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
 /// 'pip._vendor.cachecontrol' (unknown location)`, `No module named
 /// 'pip._internal.cli'`), or pip is missing outright. Every install, rollback
 /// and repair through that pip fails the same way (RUST-29/RUST-JF, six hosts
-/// in RUST-6S's `other` since 0.9.7).
+/// in RUST-6S's `other` since 0.9.7). Or pip's own dist-info has no RECORD,
+/// which ensurepip leaves when it dies mid-install: pip runs, but the lock's
+/// pip upgrade cannot uninstall it (`uninstall-no-record-file`, RUST-6S on
+/// 0.9.56 after an ensurepip Errno 13).
 fn pip_itself_broken(evidence: &str) -> bool {
     let lower = evidence.to_ascii_lowercase();
     lower.contains("no module named pip")
         || lower.contains("no module named 'pip.")
         || lower.contains("from 'pip.")
+        || lower.contains("no record file was found for pip.")
 }
 
 /// Normalized `name-version` of every `*.dist-info` dir in the venv
@@ -14894,6 +15052,35 @@ fn moved_lock_packages(
                 .iter()
                 .any(|d| d.starts_with(&format!("{key}-")) && **d != pinned);
             moved.then(|| name.trim().to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Lock packages with no dist-info at any version in `installed`, as the lock
+/// spells them. Entries with an environment marker are skipped: they need not
+/// apply to this machine (shortcut: no marker evaluation, so a missing
+/// marker'd pin such as macOS's onnxruntime goes unseen; add it if one turns
+/// up broken).
+fn missing_lock_packages(
+    installed: &std::collections::BTreeSet<String>,
+    lock: &str,
+) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
+    lock_entries(lock)
+        .iter()
+        .filter(|entry| !entry.contains(';'))
+        .filter_map(|entry| {
+            let (name, _) = entry.split_whitespace().next()?.split_once("==")?;
+            // `httpx[http2,socks]` (Linux lock) installs as `httpx-*.dist-info`.
+            let prefix = format!("{}-", norm(name.split('[').next()?));
+            // The version starts with a digit, so `mcp` is not `mcp-server-1-0`.
+            let present = installed.iter().any(|d| {
+                d.strip_prefix(&prefix)
+                    .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+            });
+            (!present).then(|| name.trim().to_string())
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -16298,17 +16485,17 @@ mod tests {
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         proxy_argv_keeps_messages_as_set, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, wheel_download_failure_reported,
-        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
-        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
+        reclaim_found_healthy_backend, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
+        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
+        wheel_download_failure_reported, widen_silence_for_unpack, CommandFailure, HeadroomRelease,
+        ManagedRuntime, OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
@@ -17052,11 +17239,11 @@ asyncio.run(main())
         );
     }
 
-    /// RUST-F2: a WMI query that never returns must not hold the backend's
-    /// imports. macOS has no `_wmi`, so a fake one stands in: the OS query
-    /// answers, the CPU query hangs.
+    /// RUST-F2 + RUST-V2: platform never calls `_wmi`, whose query can hang
+    /// forever or leave a native thread reading a freed stack. macOS has no
+    /// `_wmi`, so a fake one stands in and fails the probe if it is called.
     #[test]
-    fn wmi_timeout_behaves_against_the_installed_wheel() {
+    fn skip_wmi_behaves_against_the_installed_wheel() {
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -17067,31 +17254,25 @@ asyncio.run(main())
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         std::fs::write(
             dir.path().join("_wmi.py"),
-            "import time\n\
-             def exec_query(query):\n    \
-                 if 'Win32_Processor' in query:\n        \
-                     time.sleep(60)\n    \
+            "def exec_query(query):\n    \
+                 print('wmi called')\n    \
                  return 'Version=10.0.26200\\0ProductType=1'\n",
         )
         .unwrap();
         let probe = r#"
-import platform, time
+import platform
 print(platform._wmi_query.__name__)
-assert list(platform._wmi_query("OS", "Version", "ProductType")) == ["10.0.26200", "1"]
-for hung in (True, False):
-    start = time.monotonic()
+for table in ("OS", "CPU"):
     try:
-        platform._wmi_query("CPU" if hung else "OS", "Version")
-        raise SystemExit("answered after the timeout")
+        list(platform._wmi_query(table, "Version"))
     except OSError:
-        took = time.monotonic() - start
-        assert (0.5 < took < 10) if hung else took < 0.5, (hung, took)
+        pass
 "#;
-        let run = |secs: &str| {
+        let run = |skip: &str| {
             crate::proc::command(&python)
                 .args(["-c", probe])
                 .env("PYTHONPATH", dir.path())
-                .env("HEADROOM_WMI_TIMEOUT_SECS", secs)
+                .env("HEADROOM_SKIP_WMI", skip)
                 .output()
                 .expect("run probe")
         };
@@ -17102,16 +17283,14 @@ for hung in (True, False):
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).lines().next(),
-            Some("_hd_wmi_timed_query")
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "_hd_no_wmi_query"
         );
-        let off = crate::proc::command(&python)
-            .args(["-c", "import platform; print(platform._wmi_query.__name__)"])
-            .env("PYTHONPATH", dir.path())
-            .env("HEADROOM_WMI_TIMEOUT_SECS", "0")
-            .output()
-            .expect("run probe");
-        assert_eq!(String::from_utf8_lossy(&off.stdout).trim(), "_wmi_query");
+        let off = run("0");
+        assert_eq!(
+            String::from_utf8_lossy(&off.stdout).trim(),
+            "_wmi_query\nwmi called\nwmi called"
+        );
     }
 
     #[test]
@@ -18457,9 +18636,15 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         }
         std::fs::write(&log, body).unwrap();
         let excerpt = super::crash_log_excerpt(&log);
+        // The innermost frames come along (RUST-F2: what the stall was in),
+        // the rest of the dump does not.
         assert!(
             excerpt.starts_with(
-                "--- fatal markers ---\nFatal Python error: Aborted\nCurrent thread 0x00001234"
+                "--- fatal markers ---\nFatal Python error: Aborted\n\
+                 Current thread 0x00001234 (most recent call first):\n  \
+                 File \"sklearn/__init__.py\", line 0 in <module>\n  \
+                 File \"sklearn/__init__.py\", line 1 in <module>\n  \
+                 File \"sklearn/__init__.py\", line 2 in <module>\n--- tail ---\n"
             ),
             "{excerpt}"
         );
@@ -19968,13 +20153,13 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
     /// test drives a fake. This one installs the pinned release (URL, checksum,
     /// archive layout) and runs the real hook on it, so a bump that changes
     /// what rtk answers fails here. Needs the network, so CI opts in on Linux
-    /// and macOS with HEADROOM_TEST_PINNED_RTK=1.
+    /// and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
     #[test]
     #[cfg(unix)]
     fn pinned_rtk_keeps_the_hook_contract() {
         use std::io::Write as _;
-        if std::env::var_os("HEADROOM_TEST_PINNED_RTK").is_none() {
-            eprintln!("skipping: set HEADROOM_TEST_PINNED_RTK=1 to install the pinned rtk");
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!("skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned rtk");
             return;
         }
         let (root, _runtime, manager) = seed_test_runtime("pinned-rtk");
@@ -20073,6 +20258,75 @@ print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
         let gain: super::RtkDailyGainOutput =
             serde_json::from_slice(&gain.stdout).expect("gain json");
         assert!(gain.summary.is_some(), "the RTK tile reads summary");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every other codebase-memory test fakes the binary. This installs the
+    /// pinned release's archive (URL, checksum, layout) and starts its MCP
+    /// server, so a bump to a build that cannot run here fails: the Linux builds
+    /// pinned through 0.11.0 needed glibc 2.38. Needs the network, so CI opts in
+    /// on Linux and macOS with HEADROOM_TEST_PINNED_ADDONS=1.
+    #[test]
+    #[cfg(unix)]
+    fn pinned_codebase_memory_serves_mcp() {
+        use std::io::Write as _;
+        if std::env::var_os("HEADROOM_TEST_PINNED_ADDONS").is_none() {
+            eprintln!(
+                "skipping: set HEADROOM_TEST_PINNED_ADDONS=1 to install the pinned codebase-memory"
+            );
+            return;
+        }
+        let root = unique_temp_dir("pinned-codebase-memory");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let artifact = codebase_memory_distribution_artifact().expect("supported target");
+        let archive = root.join(artifact.url.rsplit('/').next().unwrap());
+        super::download_to_path(&artifact.url, &archive, artifact.sha256)
+            .expect("download the pinned codebase-memory");
+        super::unpack_release_archive(&archive, &root).expect("unpack");
+
+        let mut child = crate::proc::command(root.join("codebase-memory-mcp"))
+            .current_dir(&home)
+            .env("HOME", &home)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start codebase-memory");
+        let mut stdin = child.stdin.take().unwrap();
+        for request in [
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "headroom-test", "version": "1" } } }),
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        ] {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .expect("codebase-memory exits on EOF");
+        let replies: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let reply = |id: u64| {
+            replies
+                .iter()
+                .find(|reply| reply["id"] == id)
+                .unwrap_or_else(|| panic!("no reply to {id}: {replies:?}"))
+        };
+        assert_eq!(
+            reply(1)["result"]["serverInfo"]["version"],
+            super::CODEBASE_MEMORY_VERSION
+        );
+        assert!(
+            reply(2)["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{replies:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21419,11 +21673,14 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // Normal launch: a healthy occupant is left alone, reclaim bails.
-        assert!(
-            reclaim_orphan_proxy(port, false).is_err(),
-            "force=false must bail on a healthy occupant"
-        );
+        // Normal launch: a healthy occupant is left alone, reclaim bails, and
+        // the bail says so for ensure_headroom_running to adopt it (RUST-6J).
+        let refused = reclaim_orphan_proxy(port, false)
+            .expect_err("force=false must bail on a healthy occupant");
+        assert!(reclaim_found_healthy_backend(&refused), "{refused:#}");
+        assert!(!reclaim_found_healthy_backend(&anyhow::anyhow!(
+            format_already_running_bail(port)
+        )));
         assert!(
             probe_backend_readyz_ok(port),
             "force=false must NOT kill the healthy occupant"
@@ -23012,6 +23269,97 @@ Always run the linter first.
         assert!(super::moved_lock_packages(&before, &before, lock).is_empty());
     }
 
+    /// win-mini after 0.9.56's denied MarkItDown 0.1.7 install: onnxruntime
+    /// had only pip's `~nnxruntime` stash left. It is found, and so is a name
+    /// that only prefixes another package; a marker'd pin, a moved pin and a
+    /// pin with extras are not.
+    #[test]
+    fn launch_finds_lock_pins_with_no_dist_info() {
+        let lock = "onnxruntime==1.27.0 \\\n    --hash=sha256:aa\n\
+                    magika==1.0.3 \\\n    --hash=sha256:bb\n\
+                    mcp==1.9.0 \\\n    --hash=sha256:cc\n\
+                    httpx[http2,socks]==0.28.1 \\\n    --hash=sha256:ee\n\
+                    torch==2.12.1; sys_platform == \"darwin\" \\\n    --hash=sha256:dd\n";
+        let installed = [
+            "~nnxruntime-1-27-0",
+            "magika-0-6-3",
+            "mcp-server-x-1-0",
+            "httpx-0-28-1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::missing_lock_packages(&installed, lock),
+            vec!["mcp".to_string(), "onnxruntime".to_string()]
+        );
+        // A venv holding exactly each bundled lock reads nothing missing, or
+        // every launch would reinstall a pin.
+        for os in ["macos", "linux", "windows"] {
+            let lock = super::bootstrap_requirements_lock_for_target(os);
+            let installed = super::lock_entries(lock)
+                .iter()
+                .filter_map(|e| {
+                    let (name, version) = e.split_whitespace().next()?.split_once("==")?;
+                    let name = name.split('[').next()?;
+                    let version = version.split(';').next()?;
+                    Some(
+                        format!("{name}-{version}")
+                            .to_ascii_lowercase()
+                            .replace(['_', '.'], "-"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                super::missing_lock_packages(&installed, lock),
+                Vec::<String>::new(),
+                "{os}"
+            );
+        }
+    }
+
+    /// A venv an upgrade rolled back is still on the previous lock, so it lacks
+    /// the new lock's added pins by design. Launch leaves those to the upgrade
+    /// instead of force-installing them, without deps, into the old venv.
+    #[test]
+    fn launch_repairs_missing_lock_pins_only_on_the_synced_lock() {
+        let (root, runtime, manager) = seed_test_runtime("missing-pins-lock-sha");
+        let site = runtime.venv_dir.join("lib").join("site-packages");
+        fs::create_dir_all(site.join("unrelated-1.0.dist-info")).unwrap();
+        let repair = runtime.downloads_dir.join("missing-pins-repair.lock");
+        let receipt = |sha: String| {
+            fs::write(
+                runtime.tools_dir.join("headroom.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": HEADROOM_PINNED_VERSION,
+                    "artifact": { "requirementsLockSha256": sha },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        receipt(requirements_lock_sha("old-lock==1.0\n"));
+        manager.restore_missing_lock_pins();
+        assert!(!repair.exists(), "a stale lock is the upgrade's to install");
+
+        // On the synced lock the same venv is repaired; a stub stands in for pip.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let python = runtime.managed_python();
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+            receipt(requirements_lock_sha(super::bootstrap_requirements_lock()));
+            manager.restore_missing_lock_pins();
+            assert!(
+                repair.exists(),
+                "the synced lock's missing pins are reinstalled"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn lock_entry_matches_the_exact_package_with_its_hashes() {
         let lock = "# header\n\
@@ -23905,12 +24253,17 @@ Always run the linter first.
         fs::create_dir_all(&dir).expect("log dir");
         fs::write(
             dir.join("mcp_20260723_1.txt"),
-            "INFO find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
-             INFO Result: 42 lines\n\
-             INFO read_file: {\"path\": \"x.rs\"}; session_id: abc\n",
+            // A 1.x line (Intel Macs), a result, and a 2.x line.
+            "INFO  2026-07-23 10:00:00,000 [Thread-1] serena.tools.tools_base:_log_tool_application:279 - find_symbol: {\"name\": \"foo\"}; session_id: abc\n\
+             INFO  2026-07-23 10:00:01,000 [Thread-1] serena.tools.tools_base:_log_tool_result:300 - Result: 42 lines\n\
+             INFO  2026-07-23 10:00:02,000 [Task-2:GetSymbolsOverviewTool] serena.tools.tools_base:_log_tool_application:256 - get_symbols_overview: relative_path='x.rs'\n",
         )
         .expect("log file");
-        fs::write(dir.join("ignored.log"), "x: {}; session_id: zzz\n").expect("non-txt");
+        fs::write(
+            dir.join("ignored.log"),
+            "serena.tools.tools_base:_log_tool_application:256 - x\n",
+        )
+        .expect("non-txt");
         assert_eq!(super::count_serena_tool_calls_in_dir(&dir), Some(2));
 
         fs::remove_dir_all(&dir).ok();
@@ -25798,6 +26151,99 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(read(".config/opencode/opencode.json").contains("npx"));
     }
 
+    /// `codex mcp add` (0.166) rewrites config.toml without the comment above
+    /// a table, so Headroom's start marker goes and the new table lands
+    /// before the end marker; "always allow" adds a per-tool table. Disabling
+    /// failed on "codex: removal failed" (a WSL report, 2026-11-04), and a
+    /// per-tool table left behind stops Codex loading its config. The real
+    /// helper must update and then remove the entry, keeping the user's.
+    #[test]
+    fn codebase_memory_helper_handles_a_config_codex_rewrote_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".codex", ".headroom"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let config = home.path().join(".codex/config.toml");
+        std::fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .arg("-c")
+                .arg(super::CODEBASE_MEMORY_MCP_HELPER)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{text}");
+            text
+        };
+        let read = || std::fs::read_to_string(&config).unwrap();
+        let start = "# --- Headroom MCP server: codebase-memory ---\n";
+        let end = "# --- end Headroom MCP server: codebase-memory ---";
+        let codex_rewrite = || {
+            let text = read().replace(start, "").replace(
+                end,
+                &format!("[mcp_servers.other]\ncommand = \"/bin/echo\"\n# the user's note\n{end}"),
+            );
+            std::fs::write(&config, text).unwrap();
+        };
+
+        assert!(run(&["register", "/cbm/old", "/cbm/cache"]).contains("codex: registered"));
+        codex_rewrite();
+        let updated = run(&["register", "/cbm/new", "/cbm/cache"]);
+        assert!(updated.contains("codex: registered"), "{updated}");
+        let text = read();
+        assert_eq!(
+            text.matches("[mcp_servers.codebase-memory]").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("/cbm/new") && text.contains("[mcp_servers.other]"),
+            "{text}"
+        );
+
+        // A second `codex mcp add` drops the marker again; "always allow"
+        // appends the per-tool table.
+        std::fs::write(
+            &config,
+            read().replace(start, "")
+                + "\n[mcp_servers.codebase-memory.tools.search_graph]\napproval_mode = \"approve\"\n",
+        )
+        .unwrap();
+        let gone = run(&["unregister"]);
+        assert!(gone.contains("codex: removed"), "{gone}");
+        let text = read();
+        assert!(!text.contains("codebase-memory"), "{text}");
+        assert!(
+            text.contains("[mcp_servers.other]") && text.contains("# the user's note"),
+            "{text}"
+        );
+        let check = crate::proc::command(&python)
+            .args([
+                "-c",
+                "import sys, tomllib; tomllib.loads(open(sys.argv[1]).read())",
+            ])
+            .arg(&config)
+            .status()
+            .unwrap();
+        assert!(check.success(), "{text}");
+    }
+
     #[test]
     fn plugin_disabled_receipt_reports_installed_not_missing() {
         // A receipt with enabled:false means the user disabled it via the app.
@@ -27252,6 +27698,13 @@ exit 0
             ),
             (
                 "exit=1; stderr tail: ModuleNotFoundError: No module named 'pip._internal.cli'",
+                "pip-broken",
+            ),
+            // RUST-6S on 0.9.56, verbatim: ensurepip died before writing RECORD.
+            (
+                "exit=1; stderr tail: error: uninstall-no-record-file\n\n\
+                 × Cannot uninstall pip None\n\
+                 ╰─> The package's contents are unknown: no RECORD file was found for pip.",
                 "pip-broken",
             ),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.

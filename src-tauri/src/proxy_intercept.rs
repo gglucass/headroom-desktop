@@ -3240,7 +3240,9 @@ const BACKEND_SSE_ERROR: &[u8] = b"event: error\ndata: ";
 /// 0.9.36 hit ten failed streams in a row from the same minute (2026-10-07
 /// 21:06 UTC), OpenAI's Codex incident day. The backend's own frames
 /// (`api_error`, the residual-CCR one) carry no code, and `invalid_prompt`
-/// could be a body we built, so those keep counting.
+/// could be a body we built, so those keep counting. OpenAI's codeless
+/// `service_unavailable_error` ("Unable to verify model access right now",
+/// RUST-V3) is a type the backend never writes, so it is the provider's too.
 fn provider_failed_turn(body: &[u8]) -> bool {
     /// The codes Codex itself classifies (codex-api `responses_error.rs`) as
     /// overload, rate limit, quota, context window or content policy, plus
@@ -3266,6 +3268,7 @@ fn provider_failed_turn(body: &[u8]) -> bool {
             .as_str()
             .or(json["code"].as_str())
             .is_some_and(|code| PROVIDER_CODES.contains(&code))
+            || json["error"]["type"] == "service_unavailable_error"
     })
 }
 
@@ -7817,6 +7820,11 @@ mod tests {
         // The Codex backend's in-band error event (openai/codex#51886).
         assert_eq!(
             outcome(b"event: error\ndata: {\"type\":\"error\",\"sequence_number\":29810,\"error\":{\"type\":\"server_error\",\"code\":\"request_timeout\",\"message\":\"m\",\"param\":null}}\n\n"),
+            None
+        );
+        // RUST-V3, verbatim: OpenAI's codeless in-band 503.
+        assert_eq!(
+            outcome(b"event: error\ndata: {\"type\":\"error\",\"sequence_number\":3,\"error\":{\"type\":\"service_unavailable_error\",\"code\":null,\"message\":\"Unable to verify model access right now. Please retry.\",\"param\":null}}\n\n"),
             None
         );
         // The backend could not reach OpenAI mid-stream: the user's network.

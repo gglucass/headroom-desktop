@@ -51,12 +51,13 @@ ADDONS = {
         "assets": {
             "CODEBASE_MEMORY_SHA256_MACOS_AARCH64": "codebase-memory-mcp-darwin-arm64.tar.gz",
             "CODEBASE_MEMORY_SHA256_MACOS_X86_64": "codebase-memory-mcp-darwin-amd64.tar.gz",
-            "CODEBASE_MEMORY_SHA256_LINUX_AARCH64": "codebase-memory-mcp-linux-arm64.tar.gz",
-            "CODEBASE_MEMORY_SHA256_LINUX_X86_64": "codebase-memory-mcp-linux-amd64.tar.gz",
+            "CODEBASE_MEMORY_SHA256_LINUX_AARCH64": "codebase-memory-mcp-linux-arm64-portable.tar.gz",
+            "CODEBASE_MEMORY_SHA256_LINUX_X86_64": "codebase-memory-mcp-linux-amd64-portable.tar.gz",
             "CODEBASE_MEMORY_SHA256_WINDOWS_X86_64": "codebase-memory-mcp-windows-amd64.zip",
         },
-        "check": "CI does not run this binary. Install it from the Addons tab and check that "
-        "Claude Code and Codex list its MCP tools.",
+        "check": "CI installs this build on Linux and macOS and starts its MCP server "
+        "(`pinned_codebase_memory_serves_mcp`). Read the changelog for changes to the CLI or "
+        "to where it keeps its indexes.",
     },
     "markitdown": {
         "pypi": "markitdown",

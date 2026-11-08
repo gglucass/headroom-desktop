@@ -877,6 +877,7 @@ impl AppState {
         // Before the proxy starts: venvs that got markitdown[all] before
         // 0.9.49 (or kept olefile after uninstalling it) still hold olefile.
         self.tool_manager.remove_olefile();
+        self.tool_manager.restore_missing_lock_pins();
 
         // Pre-wrapper installs still have a bare symlink shim; refresh it so
         // the conversion counter starts recording without a reinstall.
@@ -3812,6 +3813,26 @@ impl AppState {
                     );
                     self.stop_headroom();
                 }
+                Ok(())
+            }
+            // The backend turned healthy between the 800ms probe above and
+            // the reclaim's own (a busy one answers /readyz slowly), and the
+            // reclaim leaves a healthy backend alone: adopt it as that probe
+            // would have, under the same argv gate (RUST-6J on 0.9.56). The
+            // gate reads 6768 itself: the selected port can still be a dead
+            // fallback, whose missing listener would fail it open.
+            Err(err)
+                if crate::tool_manager::reclaim_found_healthy_backend(&err)
+                    && crate::tool_manager::running_proxy_matches_expected_args_on(
+                        crate::backend_port::DEFAULT_BACKEND_PORT,
+                    ) =>
+            {
+                log::info!(
+                    "ensure_headroom_running: backend on port {} became healthy during the start; adopting it",
+                    crate::backend_port::DEFAULT_BACKEND_PORT
+                );
+                crate::backend_port::set(crate::backend_port::DEFAULT_BACKEND_PORT);
+                *self.last_startup_error.lock() = None;
                 Ok(())
             }
             Err(err) => {
@@ -10580,6 +10601,12 @@ fn kill_processes_by_command_pattern(
         // pgrep exits 1 for "no match".
         if !found.status.success() {
             if found.status.code() == Some(1) {
+                return Ok(());
+            }
+            // Killed from outside (RUST-3D: a logout, shutdown or OOM kill
+            // takes pgrep down with the session), which no change here helps.
+            if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&found.status) {
+                log::info!("process sweep: pgrep killed by signal {signal} for '{pattern}'");
                 return Ok(());
             }
             return Err(anyhow!(
