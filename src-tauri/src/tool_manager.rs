@@ -7295,7 +7295,11 @@ impl ToolManager {
                     VENDOR_WHEELS_INDEX_URL,
                     "--extra-index-url",
                     "https://pypi.org/simple",
-                    "--upgrade",
+                    // No `--upgrade`: every lock entry is an exact pin, so pip
+                    // already replaces the pins that moved, and `--upgrade`
+                    // made it ask the index about each unchanged one too. On a
+                    // network that reset PyPI that was ~4 min of retries per
+                    // pin, 12h with the backend down (RUST-VH).
                     "--requirement",
                     lock_path.to_string_lossy().as_ref(),
                 ],
@@ -7608,10 +7612,10 @@ impl ToolManager {
         )
     }
 
-    /// Restore deps from `previous_lock_backup` via
-    /// `pip install --upgrade -r <backup>` — packages already at the old pin
-    /// are skipped by pip, only packages that were actually churned by the
-    /// failed upgrade get reinstalled.
+    /// Restore deps from `previous_lock_backup` via `pip install -r <backup>`:
+    /// packages already at the old pin are skipped with no index lookup, only
+    /// packages that were actually churned by the failed upgrade get
+    /// reinstalled.
     fn pip_restore_deps_from_backup(&self, backup_lock: &Path) -> Result<()> {
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
@@ -7628,7 +7632,6 @@ impl ToolManager {
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
-                "--upgrade",
                 "--requirement",
                 backup_lock.to_string_lossy().as_ref(),
             ],
@@ -25202,6 +25205,29 @@ Always run the linter first.
             manager.headroom_receipt_backup_path().exists(),
             "receipt backup kept for recovery"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn pip_restore_deps_from_backup_asks_no_index_about_unchanged_pins() {
+        // RUST-VH: `--upgrade` made pip look up every unchanged exact pin on
+        // the index, 12 hours of retries on a network that reset PyPI.
+        let (root, runtime, manager) = seed_test_runtime("restore-deps-no-upgrade");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
+        );
+        let backup = root.join("old.lock");
+        fs::write(&backup, b"old-lock==1.0\n").expect("seed lock");
+
+        manager
+            .pip_restore_deps_from_backup(&backup)
+            .expect("fake pip succeeds");
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("--requirement"), "{calls}");
+        assert!(!calls.contains("--upgrade"), "{calls}");
         let _ = fs::remove_dir_all(root);
     }
 
