@@ -1240,13 +1240,35 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
+    #[cfg(target_os = "macos")]
+    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
     let installed = install_pending_update(&pending_update.0, emitter).await;
+    #[cfg(target_os = "macos")]
+    let installed = installed.map_err(|err| {
+        annotate_bare_not_found(
+            err,
+            current_app_bundle_path().is_some_and(|bundle| bundle.exists()),
+            overlapped,
+        )
+    });
     // Windows never gets here (the installer exits the app); elsewhere the new
     // build is on disk and runs at the next restart.
     if installed.is_ok() {
         UPDATE_STAGED.store(true, Ordering::Release);
     }
     installed
+}
+
+/// RUST-HZ: steps of the plugin's bundle swap fail on a bare "(os error 2)"
+/// that names no path, after every guard above passed. Whether the bundle
+/// survived and whether another install already ran tells the swap's renames
+/// from its extraction and from a race between two installs.
+#[cfg(target_os = "macos")]
+fn annotate_bare_not_found(err: String, bundle_present: bool, overlapped: bool) -> String {
+    if err != "No such file or directory (os error 2)" {
+        return err;
+    }
+    format!("{err} [bundle present after: {bundle_present}, another install running: {overlapped}]")
 }
 
 /// Set once an installed update is waiting for the restart that runs it.
@@ -14475,6 +14497,25 @@ mod tests {
         assert!(
             !super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire),
             "flag outlived the install, so the window can never auto-hide again"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn annotate_bare_not_found_names_the_swap_state_only_on_a_bare_enoent() {
+        assert_eq!(
+            super::annotate_bare_not_found(
+                "No such file or directory (os error 2)".into(),
+                false,
+                true
+            ),
+            "No such file or directory (os error 2) \
+             [bundle present after: false, another install running: true]"
+        );
+        let with_path = "No such file or directory (os error 2) at path \"/tmp/x\"";
+        assert_eq!(
+            super::annotate_bare_not_found(with_path.into(), true, false),
+            with_path
         );
     }
 
