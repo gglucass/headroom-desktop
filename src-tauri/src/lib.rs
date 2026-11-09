@@ -4086,15 +4086,18 @@ pub(crate) fn capture_upgrade_failure(
     let err_capped: String = technical_err.chars().take(400).collect();
     summary.push_str(&format!(" err={err_capped}"));
 
-    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err);
     // The boot-validation chain carries the proxy log tail, and the spawn
     // error from the new venv rides along in the boot diagnostics; either can
-    // hold the socket verdict.
+    // hold the socket or App Control verdict (an App Control host filed
+    // RUST-2Z at Error on 0.9.57 through the diagnostics alone). Only the
+    // narrow App Control matcher reads the diagnostics: they hold a log tail.
+    let ensure_error = boot_diagnostics
+        .as_ref()
+        .and_then(|d| d.ensure_error.as_deref());
+    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err)
+        || ensure_error.is_some_and(is_windows_app_control_block);
     let loopback_socket_denied = is_loopback_socket_denied_signal(&technical_err)
-        || boot_diagnostics
-            .as_ref()
-            .and_then(|d| d.ensure_error.as_deref())
-            .is_some_and(is_loopback_socket_denied_signal);
+        || ensure_error.is_some_and(is_loopback_socket_denied_signal);
     // A verdict of the machine's own configuration is not a defect in the
     // wheel we installed: the same host failed the 0.35.0 rollback exactly as
     // it failed the 0.37.0 target (RUST-2Z's regression). It is already
@@ -18734,6 +18737,19 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(raw)),
             Some("startup_endpoint_protection")
         );
+    }
+
+    /// `capture_upgrade_failure` reads a boot-validation `ensure_error` with
+    /// this matcher. RUST-2Z's 0.9.57 App Control event must leave the defect
+    /// fingerprint; its 0.9.56 access violation (RUST-V2's crash) must not.
+    #[test]
+    fn a_boot_validation_spawn_error_names_app_control_but_not_a_crash() {
+        assert!(is_windows_app_control_block(
+            r"starting headroom background process: ~\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe proxy --port 6768: An Application Control policy has blocked this file. (os error 4551)"
+        ));
+        assert!(!is_windows_app_control_block(
+            "unable to keep headroom running in background (onnx probe: onnxruntime imports cleanly) (prior attempts: headroom.exe: exited with status exit code: 0xc0000005 before opening port 6768): exited with status exit code: 0x80000001 before opening port 6768\n--- fatal markers ---\nWindows fatal exception: access violation"
+        ));
     }
 
     #[test]
