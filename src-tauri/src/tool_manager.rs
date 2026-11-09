@@ -10691,13 +10691,19 @@ fn update_claude_json_at(
         let mut config: Value = if path.exists() {
             let bytes =
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            // A Windows editor's BOM reads as a stray character at line 1
+            // column 1 (RUST-VR, as RUST-61 for opencode.json).
+            let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(&bytes);
             if bytes.iter().all(|b| b.is_ascii_whitespace()) {
                 json!({})
             } else {
-                serde_json::from_slice(&bytes).with_context(|| {
+                // The shared refusal phrase keeps a file Claude Code cannot
+                // read either out of Sentry.
+                serde_json::from_slice(bytes).with_context(|| {
                     format!(
-                        "parsing {} failed; refusing to overwrite potentially valid user config",
-                        path.display()
+                        "parsing {} failed; {}",
+                        path.display(),
+                        crate::client_adapters::UNPARSEABLE_SETTINGS
                     )
                 })?
             }
@@ -27376,9 +27382,26 @@ exit 0
         let err =
             super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
                 .unwrap_err();
-        assert!(err.to_string().contains("refusing to overwrite"));
+        // The shared phrase `logging::skip_sentry` drops (RUST-VR).
+        assert!(err
+            .to_string()
+            .contains(crate::client_adapters::UNPARSEABLE_SETTINGS));
         // Original bytes untouched.
         assert_eq!(fs::read(&path).unwrap(), br#"{"oauthAccount":{"id":"ab"#);
+    }
+
+    #[test]
+    fn claude_json_write_reads_a_bom_prefixed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, "\u{feff}{\"oauthAccount\":{\"id\":\"abc\"}}").unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .expect("a BOM is not a parse error");
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+        assert!(after["mcpServers"]["headroom"].is_object());
     }
 
     #[test]
