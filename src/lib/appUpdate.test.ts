@@ -287,9 +287,10 @@ describe("app update helpers", () => {
         "error sending request for url (https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json)"
       )
     ).toBeUndefined();
-    expect(await reportedLevel("Could not fetch a valid release JSON from the remote")).toEqual(
-      expect.objectContaining({ level: "warning" })
-    );
+    // RUST-GW: the uptime monitor on latest.json covers a broken manifest.
+    expect(
+      await reportedLevel("Could not fetch a valid release JSON from the remote")
+    ).toBeUndefined();
     expect(await reportedLevel("signature verification failed")).toEqual(
       expect.objectContaining({ level: "error" })
     );

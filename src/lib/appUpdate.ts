@@ -173,16 +173,16 @@ export async function runAppUpdateCheck({
     };
   } catch (error) {
     if (background) {
-      // A transport failure reaching github.com is the user's network
+      // A failure reaching github.com is the user's network or GitHub
       // (RUST-GM, ~350 events a week with nothing to act on), so it is not
-      // reported; the next background check retries. "Could not fetch a valid
-      // release JSON" (RUST-GW) still reports below Error: from many hosts at
-      // once it would mean our own latest.json is broken.
+      // reported; the next background check retries. That includes "Could
+      // not fetch a valid release JSON" (RUST-GW, every endpoint non-2xx):
+      // the `web` uptime monitor on latest.json already alerts once on a
+      // broken manifest, and GitHub's 2026-11-08 release outage filed 529.
       const detail = describeInvokeError(error, "");
-      const releaseJson = /valid release JSON/i.test(detail);
-      if (releaseJson || !TRANSPORT_FAILURE.test(detail)) {
+      if (!TRANSPORT_FAILURE.test(detail)) {
         Sentry.captureException(error, {
-          level: releaseJson ? "warning" : "error",
+          level: "error",
           tags: { flow: "app_update_check" },
         });
       }

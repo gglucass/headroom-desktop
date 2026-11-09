@@ -1240,13 +1240,35 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
+    #[cfg(target_os = "macos")]
+    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
     let installed = install_pending_update(&pending_update.0, emitter).await;
+    #[cfg(target_os = "macos")]
+    let installed = installed.map_err(|err| {
+        annotate_bare_not_found(
+            err,
+            current_app_bundle_path().is_some_and(|bundle| bundle.exists()),
+            overlapped,
+        )
+    });
     // Windows never gets here (the installer exits the app); elsewhere the new
     // build is on disk and runs at the next restart.
     if installed.is_ok() {
         UPDATE_STAGED.store(true, Ordering::Release);
     }
     installed
+}
+
+/// RUST-HZ: steps of the plugin's bundle swap fail on a bare "(os error 2)"
+/// that names no path, after every guard above passed. Whether the bundle
+/// survived and whether another install already ran tells the swap's renames
+/// from its extraction and from a race between two installs.
+#[cfg(target_os = "macos")]
+fn annotate_bare_not_found(err: String, bundle_present: bool, overlapped: bool) -> String {
+    if err != "No such file or directory (os error 2)" {
+        return err;
+    }
+    format!("{err} [bundle present after: {bundle_present}, another install running: {overlapped}]")
 }
 
 /// Set once an installed update is waiting for the restart that runs it.
@@ -4064,15 +4086,18 @@ pub(crate) fn capture_upgrade_failure(
     let err_capped: String = technical_err.chars().take(400).collect();
     summary.push_str(&format!(" err={err_capped}"));
 
-    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err);
     // The boot-validation chain carries the proxy log tail, and the spawn
     // error from the new venv rides along in the boot diagnostics; either can
-    // hold the socket verdict.
+    // hold the socket or App Control verdict (an App Control host filed
+    // RUST-2Z at Error on 0.9.57 through the diagnostics alone). Only the
+    // narrow App Control matcher reads the diagnostics: they hold a log tail.
+    let ensure_error = boot_diagnostics
+        .as_ref()
+        .and_then(|d| d.ensure_error.as_deref());
+    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err)
+        || ensure_error.is_some_and(is_windows_app_control_block);
     let loopback_socket_denied = is_loopback_socket_denied_signal(&technical_err)
-        || boot_diagnostics
-            .as_ref()
-            .and_then(|d| d.ensure_error.as_deref())
-            .is_some_and(is_loopback_socket_denied_signal);
+        || ensure_error.is_some_and(is_loopback_socket_denied_signal);
     // A verdict of the machine's own configuration is not a defect in the
     // wheel we installed: the same host failed the 0.35.0 rollback exactly as
     // it failed the 0.37.0 target (RUST-2Z's regression). It is already
@@ -11065,7 +11090,39 @@ static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync
 static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
 
+/// The libraries libappindicator-sys tries, in its order. When none loads it
+/// panics, which killed every launch on a Linux without one (RUST-VQ: CachyOS).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const APPINDICATOR_LIBRARIES: [&str; 4] = [
+    "libayatana-appindicator3.so.1",
+    "libappindicator3.so.1",
+    "libayatana-appindicator3.so",
+    "libappindicator3.so",
+];
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn any_library_loads(names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let Ok(name) = std::ffi::CString::new(*name) else {
+            return false;
+        };
+        // Left open: the tray's own loader opens the same library next, and
+        // unloading a GObject library is not safe.
+        // SAFETY: `name` is a valid C string; the handle is only null-checked.
+        !unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) }.is_null()
+    })
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    // Same as a GNOME without the AppIndicator extension: no icon, the window
+    // and a relaunch still work. Every tray consumer handles a missing tray.
+    #[cfg(target_os = "linux")]
+    if !any_library_loads(&APPINDICATOR_LIBRARIES) {
+        log::info!(
+            "tray: neither libayatana-appindicator3 nor libappindicator3 is installed; running without a tray icon"
+        );
+        return Ok(());
+    }
     // Opens Headroom like "show"; enabled so it reads as the menu's headline.
     let savings = tauri::menu::MenuItem::with_id(
         app,
@@ -13796,6 +13853,20 @@ mod tests {
         assert!(still_ignored, "an inherited SIG_IGN was replaced");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tray_library_probe_skips_a_missing_library() {
+        let missing = "libheadroom-no-such-library.so.1";
+        assert!(!super::any_library_loads(&[missing]));
+        let present = if cfg!(target_os = "macos") {
+            "/usr/lib/libSystem.B.dylib"
+        } else {
+            "libc.so.6"
+        };
+        assert!(super::any_library_loads(&[missing, present]));
+        assert_eq!(super::APPINDICATOR_LIBRARIES.len(), 4);
+    }
+
     #[test]
     fn tray_visual_keeps_running_during_brief_unhealthy_probe_blips() {
         let mut unhealthy_streak = 0;
@@ -14475,6 +14546,25 @@ mod tests {
         assert!(
             !super::INSTALLING_UPDATE.load(std::sync::atomic::Ordering::Acquire),
             "flag outlived the install, so the window can never auto-hide again"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn annotate_bare_not_found_names_the_swap_state_only_on_a_bare_enoent() {
+        assert_eq!(
+            super::annotate_bare_not_found(
+                "No such file or directory (os error 2)".into(),
+                false,
+                true
+            ),
+            "No such file or directory (os error 2) \
+             [bundle present after: false, another install running: true]"
+        );
+        let with_path = "No such file or directory (os error 2) at path \"/tmp/x\"";
+        assert_eq!(
+            super::annotate_bare_not_found(with_path.into(), true, false),
+            with_path
         );
     }
 
@@ -18647,6 +18737,19 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(raw)),
             Some("startup_endpoint_protection")
         );
+    }
+
+    /// `capture_upgrade_failure` reads a boot-validation `ensure_error` with
+    /// this matcher. RUST-2Z's 0.9.57 App Control event must leave the defect
+    /// fingerprint; its 0.9.56 access violation (RUST-V2's crash) must not.
+    #[test]
+    fn a_boot_validation_spawn_error_names_app_control_but_not_a_crash() {
+        assert!(is_windows_app_control_block(
+            r"starting headroom background process: ~\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe proxy --port 6768: An Application Control policy has blocked this file. (os error 4551)"
+        ));
+        assert!(!is_windows_app_control_block(
+            "unable to keep headroom running in background (onnx probe: onnxruntime imports cleanly) (prior attempts: headroom.exe: exited with status exit code: 0xc0000005 before opening port 6768): exited with status exit code: 0x80000001 before opening port 6768\n--- fatal markers ---\nWindows fatal exception: access violation"
+        ));
     }
 
     #[test]

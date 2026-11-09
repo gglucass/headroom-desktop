@@ -3908,14 +3908,20 @@ fn ensure_codex_rtk_hook(
         &build_headroom_rtk_codex_hook(managed_rtk_path, managed_python_path),
         true,
     )?;
+    let command = hook_shell_command(&script_path)?;
+    if !guard_registered_in_hooks(&codex_hooks_json_path(), &command)? {
+        // Replace an earlier unquoted command instead of leaving a failing
+        // hook beside the corrected one. An unchanged command keeps trust.
+        remove_guard_hook_entries(
+            &codex_hooks_json_path(),
+            &script_path.display().to_string(),
+            false,
+            None,
+        )?;
+    }
     let (mut changed, mut backups) = register_hook_entries(
         &codex_hooks_json_path(),
-        &[(
-            "PreToolUse",
-            Some("Bash"),
-            &hook_shell_command(&script_path)?,
-            "",
-        )],
+        &[("PreToolUse", Some("Bash"), &command, "")],
     )?;
     if script_changed {
         changed.insert(0, script_path.display().to_string());
@@ -4651,7 +4657,16 @@ fn hook_shell_command(hook_path: &Path) -> Result<String> {
     hook_path
         .to_str()
         .ok_or_else(|| anyhow!("hook path contains invalid UTF-8: {}", hook_path.display()))
-        .map(str::to_string)
+        .map(|path| {
+            if path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+            {
+                path.to_string()
+            } else {
+                format!("\"{}\"", shell_double_quote(path))
+            }
+        })
 }
 
 fn ensure_claude_settings_hook(
@@ -5231,7 +5246,9 @@ fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
 /// python3) can't leave the entry behind when the script is deleted.
 fn command_contains(command: &Value, fragment: &str) -> bool {
     match command {
-        Value::String(s) => s.contains(fragment),
+        Value::String(s) => {
+            s.contains(fragment) || (cfg!(unix) && s.contains(&shell_double_quote(fragment)))
+        }
         Value::Array(parts) => parts
             .iter()
             .filter_map(Value::as_str)
@@ -11713,11 +11730,33 @@ exit 0
 
 // Inside the hook's single-quoted `-c`, so it must hold no single quote.
 const RTK_CODEX_HOOK_PY: &str = r#"
-import glob, json, os, re, shlex, subprocess, sys
+import ast, glob, json, os, re, shlex, subprocess, sys
 RAW = re.compile(r"(?:^|[\s;&|(])(?:grep|egrep|fgrep|rg|ag|ack|jq|yq)(?=[\s;&|)]|$)"
     r"|(?:^|\s)(?:--check|--porcelain\S*|-z|--json\S*|--format\S*|--pretty\S*"
     r"|-o\s*(?:json|yaml)|--output[=\s](?:json|yaml))(?=\s|$)")
-GATED = re.compile(r"decision\s*=\s*[\"\x27](?:forbidden|prompt)")
+def allow_only_rules(text):
+    # Rules are Starlark: a decision can be a constant or an expression. Only
+    # the simple allow rules Codex saves after approvals are safe to rewrite
+    # around. Any other form stays with the original command and its rules.
+    try:
+        statements = ast.parse(text).body
+    except SyntaxError:
+        return False
+    for statement in statements:
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+            return False
+        call = statement.value
+        if not isinstance(call.func, ast.Name) or call.func.id != "prefix_rule":
+            return False
+        if call.args or any(kw.arg is None for kw in call.keywords):
+            return False
+        decisions = [kw.value for kw in call.keywords if kw.arg == "decision"]
+        if len(decisions) != 1 or not isinstance(decisions[0], ast.Constant) or decisions[0].value != "allow":
+            return False
+        if any(isinstance(node, ast.Call) and node is not call for node in ast.walk(call)):
+            return False
+    return True
+
 raw = sys.stdin.read()
 data = json.loads(raw)
 cmd = data.get("tool_input", {}).get("command")
@@ -11734,10 +11773,10 @@ for home in homes:
     for path in glob.glob(os.path.join(glob.escape(home), "rules", "*.rules")):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                gated = GATED.search(f.read())
+                safe = allow_only_rules(f.read())
         except OSError:
-            continue
-        if gated:
+            sys.exit(0)
+        if not safe:
             sys.exit(0)
 rtk = os.environ["HEADROOM_RTK"]
 out = subprocess.run([rtk, "hook", "codex"], input=raw, capture_output=True, text=True, timeout=8).stdout
@@ -14558,12 +14597,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             assert_eq!(run(cmd), "", "{cmd} stays raw");
         }
 
-        fs::write(
-            codex_home.join("rules").join("guard.rules"),
+        for rule in [
             "prefix_rule(pattern=[\"git\", \"push\"], decision=\"forbidden\")\n",
-        )
-        .unwrap();
-        assert_eq!(run("git status"), "", "a forbidden rule keeps it raw");
+            "DENY = \"forbidden\"\nprefix_rule(pattern=[\"git\", \"push\"], decision=DENY)\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"for\" + \"bidden\")\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"allow\" if False else \"prompt\")\n",
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\n",
+        ] {
+            fs::write(codex_home.join("rules").join("guard.rules"), rule).unwrap();
+            assert_eq!(run("git status"), "", "{rule} keeps the command raw");
+        }
         fs::remove_file(codex_home.join("rules").join("guard.rules")).unwrap();
 
         write_rtk("#!/bin/sh\necho not json\n");
@@ -18304,6 +18347,100 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         } else {
             assert_eq!(cmd, "/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_rtk_registered_command_runs_from_a_shell_sensitive_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let codex_home = home.path().join("Jane's Codex $HOME `literal`");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            super::codex_hooks_json_path(),
+            serde_json::json!({"hooks": {"PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    {"type": "command", "command": super::headroom_rtk_codex_hook_path()},
+                    {"type": "command", "command": "echo user-hook"}
+                ]
+            }]}})
+            .to_string(),
+        )
+        .unwrap();
+        let rtk = home.path().join("rtk");
+        fs::write(
+            &rtk,
+            r#"#!/bin/sh
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"command":"rtk git status"}}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rtk, fs::Permissions::from_mode(0o755)).unwrap();
+        super::ensure_codex_rtk_hook(&rtk, Path::new("/usr/bin/python3")).unwrap();
+        let hooks: Value =
+            serde_json::from_str(&fs::read_to_string(super::codex_hooks_json_path()).unwrap())
+                .unwrap();
+        assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo user-hook"
+        );
+        assert!(
+            super::ensure_codex_rtk_hook(&rtk, Path::new("/usr/bin/python3"))
+                .unwrap()
+                .0
+                .is_empty(),
+            "current registration keeps its trust"
+        );
+        let command = hooks["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        // Run exactly the command Codex reads, rather than passing the script
+        // as a separate argv element (which would hide missing shell quotes).
+        let mut child = crate::proc::command("bash")
+            .args(["-c", command])
+            .current_dir(home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"tool_input":{"command":"git status"}}"#)
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "registered hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_slice(&output.stdout).expect("hook rewrites the command");
+        assert!(reply["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("rtk git status"));
+        super::remove_codex_rtk_hook().unwrap();
+        assert!(!super::headroom_rtk_codex_hook_path().exists());
+        let remaining = fs::read_to_string(super::codex_hooks_json_path()).unwrap();
+        assert!(!remaining.contains("headroom-rtk-codex"), "{remaining}");
+        assert!(remaining.contains("echo user-hook"), "{remaining}");
     }
 
     fn touch(path: &Path) -> PathBuf {

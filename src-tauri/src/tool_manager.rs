@@ -498,6 +498,55 @@ try:
 except Exception:
     pass
 
+# --- sklearn that will not import stays out of transformers (posture) --------
+# Smart App Control can block single unsigned binaries: on one Windows machine
+# three SciPy extensions (_lsap, _direct, _hausdorff; customer report
+# 2026-11-06). transformers imports sklearn.metrics whenever sklearn is
+# installed (generation/candidate_generator.py, reached from AutoTokenizer), so
+# that ImportError failed Kompress's ONNX and PyTorch loads and every request
+# went through uncompressed. Kompress uses neither package: when
+# transformers.generation first loads (the import that pulls sklearn in, so a
+# healthy machine imports it no earlier than before) this imports
+# sklearn.metrics once, and if that fails it marks sklearn and scipy absent (a
+# None in sys.modules makes find_spec answer None, and transformers checks
+# sklearn only after this) and leaves the error in
+# HEADROOM_SKLEARN_BLOCK_MARKER for the desktop to report. A no-op where sklearn
+# imports or is not installed (the Linux lock). Kill switch:
+# HEADROOM_SKLEARN_BLOCK_GUARD=0.
+_hd_sbg_flag = _hd_os.environ.get("HEADROOM_SKLEARN_BLOCK_GUARD", "1")
+if _hd_sbg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+
+        class _HdSklearnBlockGuard:
+            @classmethod
+            def find_spec(cls, name, path=None, target=None):
+                if name != "transformers.generation":
+                    return None
+                try:
+                    _hd_sys.meta_path.remove(cls)  # one-shot
+                except ValueError:
+                    return None  # another thread got here first
+                try:
+                    import sklearn.metrics  # noqa: F401
+                except Exception as exc:
+                    if getattr(exc, "name", None) == "sklearn":
+                        return None  # not installed: transformers already skips it
+                    _hd_sys.modules["sklearn"] = None
+                    _hd_sys.modules["scipy"] = None
+                    marker = _hd_os.environ.get("HEADROOM_SKLEARN_BLOCK_MARKER")
+                    if marker:
+                        try:
+                            with open(marker, "w", encoding="utf-8") as fh:
+                                fh.write("%s: %s" % (type(exc).__name__, exc))
+                        except OSError:
+                            pass
+                return None
+
+        _hd_sys.meta_path.insert(0, _HdSklearnBlockGuard)
+        _hd_bound.add("sklearn_block_guard")
+    except Exception:
+        pass
+
 # --- Pre-bind stall dump (desktop diagnostic, RUST-P1) ------------------------
 # A backend that never binds its port is killed at the desktop's startup
 # timeout. On unix that kill starts with SIGABRT, so faulthandler leaves every
@@ -572,6 +621,18 @@ except Exception:
     pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
+    # Image-heavy Codex chats need to reach remote compaction before the
+    # proxy's 100 MiB decompressed-body ceiling rejects their zstd request.
+    try:
+        from headroom.proxy import helpers as _hd_body_helpers
+
+        if (_hd_body_helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024 and
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_body_helpers.MAX_REQUEST_BODY_SIZE):
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 128 * 1024 * 1024
+            _hd_bound.add("codex_compaction_body")
+    except Exception:
+        pass
+
     # Tool-schema dollar unfold (see the module docstring for the
     # contamination this prevents). The wrapper strikes at the single choke
     # point every caller funnels through: SavingsTracker.record_request is
@@ -1948,6 +2009,7 @@ except Exception:
 # (image isolation) inherit it but start with `-c`.
 _HD_VENDORS = (
     "user_turn_verbatim",
+    "codex_compaction_body",
     "savings_fold_guard",
     "cache_integrity",
     "prefix_replay_guard",
@@ -1970,6 +2032,7 @@ _HD_VENDORS = (
     "loop_stall_dump",
     "startup_stall_dump",
     "skip_wmi",
+    "sklearn_block_guard",
 )
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
     try:
@@ -4021,6 +4084,15 @@ impl ToolManager {
                 // spawn so a dump on disk always belongs to this attempt.
                 let stall_path = logs_dir.join("startup-stall.txt");
                 let _ = std::fs::remove_file(&stall_path);
+                // Left by the sitecustomize sklearn_block_guard of an earlier
+                // backend. shortcut: reported at the next spawn, so a backend
+                // that never restarts never reports; read it on the status
+                // poll if the count needs to be prompt.
+                let sklearn_marker = logs_dir.join("sklearn-blocked.txt");
+                if let Ok(cause) = std::fs::read_to_string(&sklearn_marker) {
+                    let _ = std::fs::remove_file(&sklearn_marker);
+                    report_sklearn_blocked(&cause);
+                }
                 // From create_app on, the wheel logs every startup step to its
                 // own file and nothing to stdout/stderr, so `log_path` ends at
                 // the banner however far the start got (RUST-P1).
@@ -4531,6 +4603,7 @@ impl ToolManager {
                         .env_remove("REQUESTS_CA_BUNDLE");
                 }
                 command.envs(startup_stall_dump_env(&stall_path));
+                command.env("HEADROOM_SKLEARN_BLOCK_MARKER", &sklearn_marker);
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -5529,7 +5602,7 @@ impl ToolManager {
 
         // Both callers run with the proxy down (upgrade, launch self-heal),
         // but Claude Code's `headroom mcp serve` servers hold .pyd files this
-        // `--upgrade` replaces, failing every retry on Windows.
+        // a lock re-sync replaces, failing every retry on Windows.
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         let deps_start = Instant::now();
         let progress_ref = std::cell::RefCell::new(&mut progress);
@@ -5549,7 +5622,9 @@ impl ToolManager {
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
-                "--upgrade",
+                // Exact pins replace only changed dependencies. `--upgrade`
+                // also queries the index for every satisfied pin, keeping
+                // lock-only updates offline for hours on a resetting network.
                 "--requirement",
                 lock_path.to_string_lossy().as_ref(),
             ],
@@ -6868,7 +6943,7 @@ impl ToolManager {
 
         // In-place path: mutate the live venv rather than rebuilding it.
         // Covers both the wheel-only case (lock unchanged) and the lock-churn
-        // case (`pip install --upgrade -r lock` reinstalls only the pins that
+        // case (`pip install -r lock` reinstalls only the pins that
         // actually differ). Skipped when `force_rebuild` is set (user-
         // initiated recovery from a botched in-place upgrade) or when
         // `prepare_in_place_upgrade` decides the receipt isn't safe to
@@ -7235,7 +7310,11 @@ impl ToolManager {
                     VENDOR_WHEELS_INDEX_URL,
                     "--extra-index-url",
                     "https://pypi.org/simple",
-                    "--upgrade",
+                    // No `--upgrade`: every lock entry is an exact pin, so pip
+                    // already replaces the pins that moved, and `--upgrade`
+                    // made it ask the index about each unchanged one too. On a
+                    // network that reset PyPI that was ~4 min of retries per
+                    // pin, 12h with the backend down (RUST-VH).
                     "--requirement",
                     lock_path.to_string_lossy().as_ref(),
                 ],
@@ -7532,6 +7611,8 @@ impl ToolManager {
                 "--retries",
                 "10",
                 PIP_ONLY_BINARY,
+                "--find-links",
+                VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
                 "--no-deps",
@@ -7546,10 +7627,10 @@ impl ToolManager {
         )
     }
 
-    /// Restore deps from `previous_lock_backup` via
-    /// `pip install --upgrade -r <backup>` — packages already at the old pin
-    /// are skipped by pip, only packages that were actually churned by the
-    /// failed upgrade get reinstalled.
+    /// Restore deps from `previous_lock_backup` via `pip install -r <backup>`:
+    /// packages already at the old pin are skipped with no index lookup, only
+    /// packages that were actually churned by the failed upgrade get
+    /// reinstalled.
     fn pip_restore_deps_from_backup(&self, backup_lock: &Path) -> Result<()> {
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
@@ -7566,7 +7647,6 @@ impl ToolManager {
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
-                "--upgrade",
                 "--requirement",
                 backup_lock.to_string_lossy().as_ref(),
             ],
@@ -9787,6 +9867,8 @@ const NO_GIT_FOR_PLUGIN: &str = if cfg!(target_os = "macos") {
     "Git was not found. Claude Code and Codex need it to download this addon: install it from https://git-scm.com, then restart Headroom and try again."
 };
 
+const XCODE_LICENSE_FOR_PLUGIN: &str = "Git on this Mac is waiting for the Xcode license. Claude Code and Codex need Git to download this addon: run `sudo xcodebuild -license` in Terminal, accept it, then try again.";
+
 const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
 
 /// Plugin-addon prerequisites this machine lacks ("cli", "node", "git"), all
@@ -10611,13 +10693,19 @@ fn update_claude_json_at(
         let mut config: Value = if path.exists() {
             let bytes =
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            // A Windows editor's BOM reads as a stray character at line 1
+            // column 1 (RUST-VR, as RUST-61 for opencode.json).
+            let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(&bytes);
             if bytes.iter().all(|b| b.is_ascii_whitespace()) {
                 json!({})
             } else {
-                serde_json::from_slice(&bytes).with_context(|| {
+                // The shared refusal phrase keeps a file Claude Code cannot
+                // read either out of Sentry.
+                serde_json::from_slice(bytes).with_context(|| {
                     format!(
-                        "parsing {} failed; refusing to overwrite potentially valid user config",
-                        path.display()
+                        "parsing {} failed; {}",
+                        path.display(),
+                        crate::client_adapters::UNPARSEABLE_SETTINGS
                     )
                 })?
             }
@@ -15235,6 +15323,24 @@ fn http_status_code_in(lower: &str) -> Option<u16> {
         .and_then(|tok| tok.parse::<u16>().ok())
 }
 
+/// A backend's sklearn would not import, so the sitecustomize
+/// `sklearn_block_guard` hid it and SciPy (Smart App Control blocking unsigned
+/// SciPy files, customer report 2026-11-06). Kompress still loads, so nothing
+/// else reports it; this counts the machines that would need a signed runtime.
+fn report_sklearn_blocked(cause: &str) {
+    let cause: String = cause.trim().chars().take(300).collect();
+    sentry::with_scope(
+        |scope| scope.set_fingerprint(Some(["sklearn-blocked"].as_slice())),
+        || {
+            sentry::capture_message(
+                &format!("sklearn would not import, so Kompress loaded without it: {cause}"),
+                sentry::Level::Warning,
+            );
+        },
+    );
+    log::info!("sklearn would not import in the last backend: {cause}");
+}
+
 /// Report a direct-wheel download that fell back to the pip index.
 ///
 /// Warning, not Error: the fallback install that follows normally succeeds, so
@@ -15280,7 +15386,11 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
-        "git-missing" | "cli-missing" | "settings-unparseable" | "github-unreachable"
+        "git-missing"
+            | "xcode-license"
+            | "cli-missing"
+            | "settings-unparseable"
+            | "github-unreachable"
     )
 }
 
@@ -15301,7 +15411,12 @@ fn wheel_download_failure_reported(category: &str) -> bool {
 /// regresses the moment a sibling shape reappears.
 fn plugin_install_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
-    if lower.contains("'git' not found")
+    if lower.contains("you have not agreed to the xcode license") {
+        // macOS's git refuses to run until the user accepts the Xcode license
+        // (RUST-P0 on 0.9.56), which only `sudo xcodebuild -license` does.
+        // Checked first for the same reason as git-missing below.
+        "xcode-license"
+    } else if lower.contains("'git' not found")
         || (lower.contains("failed to run git") && lower.contains("program not found"))
         || lower.contains("failed to locate 'git'")
         || lower.contains("xcrun: error: invalid active developer path")
@@ -16178,10 +16293,10 @@ fn settle_plugin_hosts(
                     },
                 );
             }
-            if category == "git-missing" {
-                format!("{NO_GIT_FOR_PLUGIN} ")
-            } else {
-                format!("installing the {id} plugin failed: {detail}. ")
+            match category {
+                "git-missing" => format!("{NO_GIT_FOR_PLUGIN} "),
+                "xcode-license" => format!("{XCODE_LICENSE_FOR_PLUGIN} "),
+                _ => format!("installing the {id} plugin failed: {detail}. "),
             }
         };
         if !outdated.is_empty() {
@@ -16907,6 +17022,40 @@ mod tests {
         assert!(!py.contains("additional_tools"));
     }
 
+    /// A zstd Codex request just past 100 MiB must reach remote compaction.
+    #[test]
+    fn codex_compaction_body_cap_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.proxy import helpers
+import zstandard
+assert helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 128 * 1024 * 1024
+body = zstandard.ZstdCompressor().compress(b'x' * (101 * 1024 * 1024))
+assert len(helpers._zstd_bounded(body)) == 101 * 1024 * 1024
+print('ok')
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env("PYTHONPATH", dir.path())
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run Codex compaction body probe");
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
     /// The fold guard against the installed wheel: a priced request with $1 of
     /// compression and $5 of tool-schema savings adds $1 to the persisted
     /// compression dollars, and $6 (the fold) with the kill switch. 0.41.0
@@ -17403,6 +17552,74 @@ with open(_p, encoding="utf-8") as _f:
             stdout.contains("ImportError DLL load failed while importing _overlapped"),
             "{stdout}\n{stderr}"
         );
+    }
+
+    /// Smart App Control blocked three unsigned SciPy files (customer report
+    /// 2026-11-06), and transformers' sklearn import took Kompress's tokenizer
+    /// load down with them.
+    #[test]
+    fn sklearn_block_guard_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hd_site.py"), super::SITECUSTOMIZE_PY).unwrap();
+        std::fs::write(
+            dir.path().join("sitecustomize.py"),
+            r#"import os, sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name in ("scipy.optimize._lsap", "scipy.optimize._direct", "scipy.spatial._hausdorff"):
+            raise ImportError("DLL load failed while importing %s: An Application Control policy has blocked this file." % name.rpartition(".")[2])
+if os.environ.get("HD_PROBE_BLOCK") == "1":
+    sys.meta_path.insert(0, _Block())
+_p = os.path.join(os.path.dirname(__file__), "hd_site.py")
+with open(_p, encoding="utf-8") as _f:
+    exec(compile(_f.read(), _p, "exec"))
+"#,
+        )
+        .unwrap();
+        let probe = "import sys\n\
+                     from transformers import AutoTokenizer\n\
+                     from transformers.utils import is_sklearn_available\n\
+                     print(is_sklearn_available(), sys.modules.get('scipy', 0) is None)\n";
+        let marker = dir.path().join("sklearn-blocked.txt");
+        let run = |block: &str, guard: &str| {
+            crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HD_PROBE_BLOCK", block)
+                .env("HEADROOM_SKLEARN_BLOCK_GUARD", guard)
+                .env("HEADROOM_SKLEARN_BLOCK_MARKER", &marker)
+                .output()
+                .expect("run probe")
+        };
+        let out = run("1", "1");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "False True");
+        let cause = std::fs::read_to_string(&marker).expect("marker");
+        assert!(
+            cause.contains("An Application Control policy has blocked this file"),
+            "{cause}"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        let out = run("0", "1");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True False");
+        assert!(!marker.exists());
+
+        let out = run("1", "0");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Application Control"));
     }
 
     #[test]
@@ -23184,7 +23401,7 @@ Always run the linter first.
             .expect("a hashed force-reinstall");
         let resync = argvs
             .iter()
-            .position(|a| a.contains("--upgrade") && a.contains("--requirement"))
+            .position(|a| a.contains("--requirement") && !a.contains("--force-reinstall"))
             .expect("a lock re-sync");
         assert!(force < resync, "{argvs:#?}");
         let entry = super::lock_entries_named(super::bootstrap_requirements_lock(), "httpcore")
@@ -23357,6 +23574,43 @@ Always run the linter first.
                 "the synced lock's missing pins are reinstalled"
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn targeted_lock_reinstall_keeps_the_bootstrap_wheel_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, runtime, manager) = seed_test_runtime("targeted-reinstall-wheels");
+        let python = runtime.managed_python();
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // hnswlib has only an sdist on PyPI. A targeted repair must find the
+        // same prebuilt, hash-checked wheel as bootstrap, including on Linux
+        // where this test uses the local lock's httpx pin as a stand-in.
+        let package = if cfg!(target_os = "macos") {
+            "hnswlib"
+        } else {
+            "httpx[http2,socks]"
+        };
+        manager
+            .reinstall_lock_pins(&[package], "repair.lock")
+            .unwrap();
+        let args = fs::read_to_string(format!("{}.args", python.display())).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--find-links", super::VENDOR_WHEELS_INDEX_URL]),
+            "targeted repair must use bootstrap's wheel source: {args:?}"
+        );
+        assert!(args.contains(&super::PIP_ONLY_BINARY));
+        assert!(args.contains(&"--require-hashes"));
+        let pins = fs::read_to_string(runtime.downloads_dir.join("repair.lock")).unwrap();
+        assert!(pins.starts_with(&format!("{package}==")), "{pins}");
+        assert!(pins.contains("--hash=sha256:"), "{pins}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25011,6 +25265,29 @@ Always run the linter first.
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn pip_restore_deps_from_backup_asks_no_index_about_unchanged_pins() {
+        // RUST-VH: `--upgrade` made pip look up every unchanged exact pin on
+        // the index, 12 hours of retries on a network that reset PyPI.
+        let (root, runtime, manager) = seed_test_runtime("restore-deps-no-upgrade");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!("#!/bin/sh\necho \"$*\" >> {}\nexit 0\n", log.display()),
+        );
+        let backup = root.join("old.lock");
+        fs::write(&backup, b"old-lock==1.0\n").expect("seed lock");
+
+        manager
+            .pip_restore_deps_from_backup(&backup)
+            .expect("fake pip succeeds");
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("--requirement"), "{calls}");
+        assert!(!calls.contains("--upgrade"), "{calls}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn recover_from_interrupted_upgrade_finishes_when_the_lock_snapshot_is_already_gone() {
         // Pre-fix builds consumed the lock snapshot after the dep restore and
         // then kept the marker when the headroom-ai reinstall failed. Every
@@ -25483,10 +25760,14 @@ Always run the linter first.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn repair_stale_requirements_updates_receipt_and_emits_progress() {
+    fn repair_stale_requirements_keeps_satisfied_pins_and_updates_receipt() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
         let _home = HomeGuard::new(&root);
-        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", log.display()),
+        );
         write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
@@ -25502,6 +25783,14 @@ Always run the linter first.
         manager
             .repair_stale_requirements_with_progress(|step| steps.push(step.step.to_string()))
             .expect("repair succeeds");
+
+        // Lock-only updates (such as adding socksio on the same wheel pin)
+        // must not ask PyPI about every unchanged package, just like the
+        // in-place wheel upgrade and rollback paths (RUST-VH).
+        let args = fs::read_to_string(&log).expect("pip argv");
+        let args: Vec<_> = args.lines().collect();
+        assert!(!args.contains(&"--upgrade"), "{args:?}");
+        assert!(args.contains(&"--requirement"), "{args:?}");
 
         assert!(steps.iter().any(|step| step == "Repairing dependencies"));
         assert!(steps.iter().any(|step| step == "Configuring integrations"));
@@ -27107,9 +27396,26 @@ exit 0
         let err =
             super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
                 .unwrap_err();
-        assert!(err.to_string().contains("refusing to overwrite"));
+        // The shared phrase `logging::skip_sentry` drops (RUST-VR).
+        assert!(err
+            .to_string()
+            .contains(crate::client_adapters::UNPARSEABLE_SETTINGS));
         // Original bytes untouched.
         assert_eq!(fs::read(&path).unwrap(), br#"{"oauthAccount":{"id":"ab"#);
+    }
+
+    #[test]
+    fn claude_json_write_reads_a_bom_prefixed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, "\u{feff}{\"oauthAccount\":{\"id\":\"abc\"}}").unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .expect("a BOM is not a parse error");
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+        assert!(after["mcpServers"]["headroom"].is_object());
     }
 
     #[test]
@@ -27912,6 +28218,20 @@ exit 0
                 "host-config-invalid",
             ),
             ("Codex: CLI not found on PATH", "cli-missing"),
+            // RUST-P0 on 0.9.56: git on macOS blocked by an unaccepted Xcode
+            // license, then the install's consequence.
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~/.local/bin/claude plugin marketplace add JayPokale/Chisle\nstdout:\nAdding \
+                 marketplace\u{2026}\n\nstderr:\n\u{2718} Failed to add marketplace: Failed to \
+                 clone marketplace repository: You have not agreed to the Xcode license \
+                 agreements. Please run 'sudo xcodebuild -license' from within a Terminal \
+                 window to review and agree to the Xcode and Apple SDKs license.\n: command \
+                 failed (exit 1): ~/.local/bin/claude plugin install chisle@chisle\nstdout:\n\n\
+                 stderr:\n\u{2718} Failed to install plugin \"chisle@chisle\": Plugin \"chisle\" \
+                 not found in marketplace \"chisle\".",
+                "xcode-license",
+            ),
             (
                 "Claude Code: command failed (exit 1): ~/.local/bin/claude plugin install \
                  caveman@caveman --scope user\nstdout:\n\nstderr:\nerror: unknown option '--scope'",
