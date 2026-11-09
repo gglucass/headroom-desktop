@@ -5602,7 +5602,7 @@ impl ToolManager {
 
         // Both callers run with the proxy down (upgrade, launch self-heal),
         // but Claude Code's `headroom mcp serve` servers hold .pyd files this
-        // `--upgrade` replaces, failing every retry on Windows.
+        // a lock re-sync replaces, failing every retry on Windows.
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         let deps_start = Instant::now();
         let progress_ref = std::cell::RefCell::new(&mut progress);
@@ -5622,7 +5622,9 @@ impl ToolManager {
                 VENDOR_WHEELS_INDEX_URL,
                 "--extra-index-url",
                 "https://pypi.org/simple",
-                "--upgrade",
+                // Exact pins replace only changed dependencies. `--upgrade`
+                // also queries the index for every satisfied pin, keeping
+                // lock-only updates offline for hours on a resetting network.
                 "--requirement",
                 lock_path.to_string_lossy().as_ref(),
             ],
@@ -6941,7 +6943,7 @@ impl ToolManager {
 
         // In-place path: mutate the live venv rather than rebuilding it.
         // Covers both the wheel-only case (lock unchanged) and the lock-churn
-        // case (`pip install --upgrade -r lock` reinstalls only the pins that
+        // case (`pip install -r lock` reinstalls only the pins that
         // actually differ). Skipped when `force_rebuild` is set (user-
         // initiated recovery from a botched in-place upgrade) or when
         // `prepare_in_place_upgrade` decides the receipt isn't safe to
@@ -23399,7 +23401,7 @@ Always run the linter first.
             .expect("a hashed force-reinstall");
         let resync = argvs
             .iter()
-            .position(|a| a.contains("--upgrade") && a.contains("--requirement"))
+            .position(|a| a.contains("--requirement") && !a.contains("--force-reinstall"))
             .expect("a lock re-sync");
         assert!(force < resync, "{argvs:#?}");
         let entry = super::lock_entries_named(super::bootstrap_requirements_lock(), "httpcore")
@@ -25758,10 +25760,14 @@ Always run the linter first.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn repair_stale_requirements_updates_receipt_and_emits_progress() {
+    fn repair_stale_requirements_keeps_satisfied_pins_and_updates_receipt() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
         let _home = HomeGuard::new(&root);
-        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", log.display()),
+        );
         write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
@@ -25777,6 +25783,14 @@ Always run the linter first.
         manager
             .repair_stale_requirements_with_progress(|step| steps.push(step.step.to_string()))
             .expect("repair succeeds");
+
+        // Lock-only updates (such as adding socksio on the same wheel pin)
+        // must not ask PyPI about every unchanged package, just like the
+        // in-place wheel upgrade and rollback paths (RUST-VH).
+        let args = fs::read_to_string(&log).expect("pip argv");
+        let args: Vec<_> = args.lines().collect();
+        assert!(!args.contains(&"--upgrade"), "{args:?}");
+        assert!(args.contains(&"--requirement"), "{args:?}");
 
         assert!(steps.iter().any(|step| step == "Repairing dependencies"));
         assert!(steps.iter().any(|step| step == "Configuring integrations"));
