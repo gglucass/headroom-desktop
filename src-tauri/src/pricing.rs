@@ -4451,9 +4451,17 @@ fn fetch_remote_account_with_base_url(
         )));
     }
 
-    response
-        .json::<RemoteAccountEnvelope>()
-        .map_err(|err| RemoteAccountSyncError::Other(format!("decode: {err}")))
+    response.json::<RemoteAccountEnvelope>().map_err(|err| {
+        // reqwest's text alone is "error decoding response body" for both a
+        // payload this build cannot parse and the client timeout firing
+        // mid-body, which blocking reqwest reports as a decode error (RUST-8Z).
+        let text = format!("decode: {}", transport_cause_chain(&err));
+        if err.is_timeout() || err.is_body() {
+            RemoteAccountSyncError::Transport(text)
+        } else {
+            RemoteAccountSyncError::Other(text)
+        }
+    })
 }
 
 fn http_client() -> Result<Client, String> {
@@ -7365,6 +7373,25 @@ mod tests {
         .expect_err("headroom-web's 403");
         server.join().unwrap();
         assert!(err.reached_headroom(), "{err:?}");
+    }
+
+    /// RUST-8Z: an account payload this build cannot parse says why.
+    #[test]
+    fn account_sync_decode_failure_names_its_cause() {
+        let identity = super::IdentityPayload::default();
+        let (port, server) = spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 200 OK");
+        let err = super::fetch_remote_account_with_base_url(
+            "token",
+            &identity,
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect_err("no account in the payload");
+        server.join().unwrap();
+        assert!(err.reached_headroom(), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("missing field `account`"),
+            "{err:?}"
+        );
     }
 
     #[test]
