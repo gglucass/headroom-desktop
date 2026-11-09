@@ -43,6 +43,12 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 // always-on proxy). 100 MiB clears Anthropic's 32 MB request limit with room to
 // spare for image payloads.
 const MAX_DIRECT_BODY: usize = 100 * 1024 * 1024;
+// The bundled Python proxy accepts 128 MiB after decoding a Codex zstd body.
+// Inspect in bounded chunks before handing it a request that it would reject.
+const MAX_CODEX_DECODED_BODY: usize = 128 * 1024 * 1024;
+// A measured request can hold up to 100 MiB compressed in this process, and
+// direct forwarding can briefly copy it. Bound total memory across sessions.
+static CODEX_BODY_PROBES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -2458,6 +2464,52 @@ async fn handle(
         stamp_headroom_bypass_header(&mut buf);
     }
 
+    // Codex's streaming zstd frame has no decoded-size header. Count output
+    // without retaining it, then forward the original compressed bytes direct
+    // if the Python backend would reject them before remote compaction. Keep
+    // the existing 100 MiB wire bound: this path buffers one compressed body.
+    if is_codex && !is_opencode && !is_grok {
+        if let Some(total) = parsed_head.as_ref().and_then(codex_zstd_body_len) {
+            let probe_permit = CODEX_BODY_PROBES.acquire().await.expect("never closed");
+            let head_end = find_header_end(&buf).expect("parsed request has headers") + 4;
+            let buffered = buf.len().saturating_sub(head_end);
+            if buffered < total {
+                buf.resize(head_end + total, 0);
+                if !matches!(
+                    tokio::time::timeout(
+                        BODY_READ_TIMEOUT,
+                        client.read_exact(&mut buf[head_end + buffered..]),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ) {
+                    return;
+                }
+            } else {
+                buf.truncate(head_end + total);
+            }
+            let decoded_limit = MAX_CODEX_DECODED_BODY;
+            let measured = tokio::task::spawn_blocking(move || {
+                let over = zstd_body_exceeds_limit(&buf[head_end..], decoded_limit);
+                (buf, over)
+            })
+            .await;
+            let Ok((returned, over)) = measured else {
+                return;
+            };
+            buf = returned;
+            if over == Some(true) {
+                log::info!(
+                    "[proxy_intercept] Codex zstd body over backend decoded limit: wire_bytes={total} decoded_bytes>{decoded_limit}; forwarding compressed body direct"
+                );
+                strip_request_header(&mut buf, "x-headroom-bypass");
+                forward_direct_with_body_permit(client, buf, &upstream_base, probe_permit).await;
+                return;
+            }
+            drop(probe_permit);
+        }
+    }
+
     // OpenCode / Grok honor the account wall the same way: Python stays up
     // (it owns their upstream routing) but is told to pass the request
     // through untouched.
@@ -4675,10 +4727,24 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 /// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
 /// request to the real Anthropic endpoint over TLS with `reqwest`, then stream
 /// the response back as HTTP/1.1 chunked transfer.
-async fn forward_direct_to_anthropic(
+async fn forward_direct_to_anthropic(client: TcpStream, header_buf: Vec<u8>, upstream_base: &str) {
+    forward_direct_with_optional_body_permit(client, header_buf, upstream_base, None).await;
+}
+
+async fn forward_direct_with_body_permit(
+    client: TcpStream,
+    header_buf: Vec<u8>,
+    upstream_base: &str,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) {
+    forward_direct_with_optional_body_permit(client, header_buf, upstream_base, Some(permit)).await;
+}
+
+async fn forward_direct_with_optional_body_permit(
     mut client: TcpStream,
     mut header_buf: Vec<u8>,
     upstream_base: &str,
+    body_permit: Option<tokio::sync::SemaphorePermit<'static>>,
 ) {
     let plugin_route = take_plugin_route(&mut header_buf);
     let header_end = match find_header_end(&header_buf) {
@@ -4904,6 +4970,9 @@ async fn forward_direct_to_anthropic(
             return;
         }
     };
+    // Large Codex bodies need the memory permit only through upload. A model
+    // response can stream for minutes, during which no request body remains.
+    drop(body_permit);
     // Plugin-routed 429s are OpenCode's or Grok's, not Codex's or Claude's.
     if resp.status().as_u16() == 429 && plugin_route.is_none() {
         if is_codex_request_head(&parsed) {
@@ -5581,6 +5650,30 @@ fn is_codex_models_fetch(head: &ParsedRequestHead) -> bool {
 
 fn is_codex_request_head(head: &ParsedRequestHead) -> bool {
     is_openai_path(&head.path) || is_codex_models_fetch(head)
+}
+
+fn codex_zstd_body_len(head: &ParsedRequestHead) -> Option<usize> {
+    if !head.method.eq_ignore_ascii_case("POST")
+        || !head.path.starts_with("/v1/responses")
+        || request_head_has_header(head, "expect")
+        || request_head_has_header(head, "transfer-encoding")
+        || !head.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding") && value.eq_ignore_ascii_case("zstd")
+        })
+    {
+        return None;
+    }
+    head.content_length
+        .filter(|&len| len > 0 && len <= MAX_DIRECT_BODY)
+}
+
+fn zstd_body_exceeds_limit(body: &[u8], limit: usize) -> Option<bool> {
+    use std::io::Read;
+
+    let decoder = zstd::stream::read::Decoder::new(body).ok()?;
+    let mut bounded = decoder.take(limit as u64 + 1);
+    let decoded = std::io::copy(&mut bounded, &mut std::io::sink()).ok()?;
+    Some(decoded > limit as u64)
 }
 
 /// Return true if a Claude Code User-Agent came from the VS Code extension
@@ -6994,6 +7087,162 @@ mod tests {
                 .await
                 .is_err(),
             "nothing reaches the saturated backend"
+        );
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    fn codex_zstd_size_probe_is_bounded_and_tolerates_bad_frames() {
+        let body = zstd::stream::encode_all(&b"image history"[..], 1).unwrap();
+        assert_eq!(super::zstd_body_exceeds_limit(&body, 13), Some(false));
+        assert_eq!(super::zstd_body_exceeds_limit(&body, 12), Some(true));
+        assert_eq!(super::zstd_body_exceeds_limit(b"not zstd", 12), None);
+        let another = zstd::stream::encode_all(&b"more images"[..], 1).unwrap();
+        let joined = [body, another].concat();
+        assert_eq!(super::zstd_body_exceeds_limit(&joined, 13), Some(true));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fitting_zstd_codex_body_stays_on_backend() {
+        let compressed = zstd::stream::encode_all(&b"small image history"[..], 1).unwrap();
+        let expected_len = compressed.len();
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let mut received = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.expect("read backend request");
+                assert!(n > 0, "request ended before its body");
+                received.extend_from_slice(&tmp[..n]);
+                if let Some(end) = find_header_end(&received) {
+                    if received.len() >= end + 4 + expected_len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("respond backend");
+            received
+        });
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = Some("http://127.0.0.1:1".to_string());
+        let mut client = TcpStream::connect(addr).await.expect("connect intercept");
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        );
+        client.write_all(head.as_bytes()).await.expect("send head");
+        client.write_all(&compressed).await.expect("send body");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("backend response completes")
+            .expect("read backend response");
+        let received = timeout(Duration::from_secs(1), backend_task)
+            .await
+            .expect("backend completed")
+            .expect("backend task");
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+
+        let end = find_header_end(&received).expect("backend headers");
+        let forwarded_head = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+        assert!(forwarded_head.contains("x-client: codex"));
+        assert_eq!(&received[end + 4..], compressed.as_slice());
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A Codex request that would cross the Python decoder's 128 MiB ceiling
+    /// goes to the account's Codex upstream with its zstd bytes unchanged.
+    #[tokio::test]
+    #[serial]
+    async fn oversized_decoded_codex_body_bypasses_backend_without_reencoding() {
+        use std::io::Write;
+
+        // Streaming encoding matches Codex's size-unknown zstd frame. The
+        // compressed body stays tiny, so this test does not allocate 129 MiB.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        let chunk = [b'x'; 64 * 1024];
+        for _ in 0..(129 * 16) {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 16 * 1024);
+
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream_listener.accept().await.expect("upstream accept");
+            let mut received = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.expect("read upstream request");
+                assert!(n > 0, "request ended before its body");
+                received.extend_from_slice(&tmp[..n]);
+                if let Some(end) = find_header_end(&received) {
+                    let head = String::from_utf8_lossy(&received[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(str::to_string)
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .expect("forwarded content length");
+                    if received.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("respond upstream");
+            received
+        });
+
+        let (addr, task) = start_intercept("http://127.0.0.1:1".to_string()).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
+        let mut client = TcpStream::connect(addr).await.expect("connect intercept");
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nChatGPT-Account-Id: acct_1\r\nContent-Encoding: zstd\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        );
+        client.write_all(head.as_bytes()).await.expect("send head");
+        client.write_all(&compressed).await.expect("send zstd body");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("direct response completes")
+            .expect("read direct response");
+        let received = timeout(Duration::from_secs(1), upstream_task)
+            .await
+            .expect("upstream completed")
+            .expect("upstream task");
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
+
+        let end = find_header_end(&received).expect("upstream headers");
+        let forwarded_head = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+        assert!(forwarded_head.starts_with("post /responses http/1.1"));
+        assert!(forwarded_head.contains("content-encoding: zstd"));
+        assert!(forwarded_head.contains("chatgpt-account-id: acct_1"));
+        assert_eq!(&received[end + 4..], compressed.as_slice());
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            timeout(Duration::from_millis(200), backend_listener.accept())
+                .await
+                .is_err(),
+            "oversized decoded body must not reach Headroom backend"
         );
 
         task.abort();
