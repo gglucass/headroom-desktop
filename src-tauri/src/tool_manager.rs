@@ -621,14 +621,99 @@ except Exception:
     pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
-    # Image-heavy Codex chats need to reach remote compaction before the
-    # proxy's 100 MiB decompressed-body ceiling rejects their zstd request.
+    # Codex replays old tool images as data URLs when it starts a new turn.
+    # Its compaction request can be plain JSON (>100 MiB), so the proxy must
+    # accept it and remove old tool images before forwarding to OpenAI.
+    # Keep the original 100 MiB wire limit for every other client.
     try:
+        import importlib.metadata as _hd_metadata
         from headroom.proxy import helpers as _hd_body_helpers
+        from headroom.proxy import request_body_limit as _hd_body_limit
+        from headroom.proxy import turn_hooks as _hd_turn_hooks
 
-        if (_hd_body_helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024 and
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_body_helpers.MAX_REQUEST_BODY_SIZE):
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 128 * 1024 * 1024
+        _hd_old_cap = 100 * 1024 * 1024
+        _hd_codex_cap = 256 * 1024 * 1024
+        if (_hd_os.environ.get("HEADROOM_CODEX_IMAGE_HISTORY", "1") != "0"
+            and _hd_metadata.version("headroom-ai") == "0.42.0"
+            and _hd_body_helpers.MAX_REQUEST_BODY_SIZE == _hd_old_cap
+            and _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_old_cap):
+            _hd_original_body_limit_call = _hd_body_limit.RequestBodyLimitMiddleware.__call__
+
+            async def _hd_codex_body_limit_call(self, scope, receive, send):
+                headers = dict(scope.get("headers") or ())
+                codex = (scope.get("type") == "http"
+                         and scope.get("path") == "/v1/responses"
+                         and headers.get(b"x-client", b"").lower() == b"codex")
+                if codex:
+                    return await _hd_original_body_limit_call(self, scope, receive, send)
+                limited = _hd_body_limit.RequestBodyLimitMiddleware(
+                    self.app, max_bytes=_hd_old_cap
+                )
+                return await _hd_original_body_limit_call(limited, scope, receive, send)
+
+            class _hd_CodexImageHistoryHook:
+                name = "headroom_codex_image_history"
+                priority = 90
+
+                def on_responses_create(self, request):
+                    if (request.transport != "http"
+                        or request.headers.get("x-client", "").lower() != "codex"):
+                        return None
+                    items = request.body.get("input")
+                    if not isinstance(items, list):
+                        return None
+                    candidates = []
+                    image_bytes = 0
+                    for i, item in enumerate(items):
+                        if not isinstance(item, dict) or item.get("type") not in (
+                            "function_call_output", "custom_tool_call_output"
+                        ):
+                            continue
+                        blocks = item.get("output")
+                        if not isinstance(blocks, list):
+                            continue
+                        for j, block in enumerate(blocks):
+                            if not isinstance(block, dict) or block.get("type") != "input_image":
+                                continue
+                            url = block.get("image_url")
+                            if isinstance(url, str) and url.startswith("data:image/"):
+                                image_bytes += len(url)
+                                candidates.append((i, j, len(url)))
+                    # Content-Length is the decoded size for plain requests;
+                    # for zstd it is the small wire size, so use image bytes.
+                    declared = int(request.headers.get("content-length", "0") or "0")
+                    if request.headers.get("content-encoding"):
+                        declared = 0
+                    remaining = max(declared, image_bytes + 16 * 1024 * 1024)
+                    target = 80 * 1024 * 1024
+                    if remaining <= target:
+                        return None
+                    changed = list(items)
+                    removed = 0
+                    for i, j, size in candidates:
+                        if remaining <= target:
+                            break
+                        if changed[i] is items[i]:
+                            changed[i] = {**items[i], "output": list(items[i]["output"])}
+                        changed[i]["output"][j] = {
+                            "type": "input_text",
+                            "text": "[Earlier tool image omitted; use its saved file if needed.]",
+                        }
+                        remaining -= size
+                        removed += 1
+                    if removed:
+                        import logging
+                        logging.getLogger("headroom.proxy").info(
+                            "event=codex_image_history_pruned count=%d estimated_bytes=%d",
+                            removed, remaining,
+                        )
+                        return {**request.body, "input": changed}
+                    return None
+
+            _hd_body_limit.RequestBodyLimitMiddleware.__call__ = _hd_codex_body_limit_call
+            _hd_body_helpers.MAX_REQUEST_BODY_SIZE = _hd_codex_cap
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = _hd_codex_cap
+            _hd_turn_hooks.register_turn_hook(_hd_CodexImageHistoryHook())
             _hd_bound.add("codex_compaction_body")
     except Exception:
         pass
@@ -17161,7 +17246,7 @@ mod tests {
         assert!(!py.contains("additional_tools"));
     }
 
-    /// A zstd Codex request just past 100 MiB must reach remote compaction.
+    /// A plain 179 MiB Codex replay must pass the guard and prune old images.
     #[test]
     fn codex_compaction_body_cap_against_the_installed_wheel() {
         let python =
@@ -17173,12 +17258,53 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         let probe = r#"
-from headroom.proxy import helpers
+import asyncio
+import json
+from headroom.proxy import helpers, request_body_limit, turn_hooks
 import zstandard
-assert helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024
-assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 128 * 1024 * 1024
-body = zstandard.ZstdCompressor().compress(b'x' * (101 * 1024 * 1024))
-assert len(helpers._zstd_bounded(body)) == 101 * 1024 * 1024
+assert helpers.MAX_REQUEST_BODY_SIZE == 256 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 256 * 1024 * 1024
+body = zstandard.ZstdCompressor().compress(b'x' * (179 * 1024 * 1024))
+assert len(helpers._zstd_bounded(body)) == 179 * 1024 * 1024
+
+async def check_limit(client, size):
+    called = []
+    async def app(scope, receive, send):
+        called.append(True)
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b''})
+    sent = []
+    scope = {'type': 'http', 'path': '/v1/responses', 'headers': [
+        (b'x-client', client.encode()), (b'content-length', str(size).encode())]}
+    async def send(message):
+        sent.append(message)
+    await request_body_limit.RequestBodyLimitMiddleware(app)(scope, None, send)
+    return called, sent[0]['status']
+
+assert asyncio.run(check_limit('codex', 179 * 1024 * 1024)) == ([True], 200)
+assert asyncio.run(check_limit('codex', 257 * 1024 * 1024)) == ([], 413)
+assert asyncio.run(check_limit('opencode', 179 * 1024 * 1024)) == ([], 413)
+
+image = 'data:image/png;base64,' + 'A' * (24 * 1024 * 1024)
+items = [{'type': 'function_call_output', 'call_id': str(i), 'output': [
+    {'type': 'input_image', 'image_url': image}]} for i in range(5)]
+user = {'role': 'user', 'content': [{'type': 'input_image', 'image_url': image}]}
+original = {'model': 'gpt-6-sol', 'input': [*items, user]}
+async def prune(body, client='codex', size=140 * 1024 * 1024):
+    await turn_hooks.run_responses_create_hooks(body, headers={
+        'x-client': client, 'content-length': str(size)}, transport='http')
+asyncio.run(prune(original))
+assert [i['output'][0]['type'] for i in original['input'][:5]] == [
+    'input_text', 'input_text', 'input_text', 'input_image', 'input_image']
+assert original['input'][-1] == user
+assert all(i['output'][0]['type'] == 'input_image' for i in items)
+assert len(json.dumps(original)) < 100 * 1024 * 1024
+small = {'input': items[:1]}
+asyncio.run(prune(small, size=10 * 1024 * 1024))
+assert small['input'] == items[:1]
+other = {'input': items}
+asyncio.run(prune(other, client='opencode'))
+assert other['input'] == items
 print('ok')
 "#;
         let out = crate::proc::command(&python)
