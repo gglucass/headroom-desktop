@@ -3926,109 +3926,120 @@ impl ToolManager {
             // The chosen port is stored in `backend_port` so the intercept,
             // health probes, and spawn args all pick it up.
             let initial_state = diagnose_proxy_port_settled(backend_port::DEFAULT_BACKEND_PORT);
-            match initial_state {
+            let occupant = match initial_state {
                 PortState::Free => {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
+                    None
                 }
-                PortState::HeadroomRunning => {
-                    reclaim_orphan_proxy(
-                        backend_port::DEFAULT_BACKEND_PORT,
-                        reclaim_healthy_orphan || first_start,
-                    )?;
-                    backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
-                }
+                PortState::HeadroomRunning => match reclaim_orphan_proxy(
+                    backend_port::DEFAULT_BACKEND_PORT,
+                    reclaim_healthy_orphan || first_start,
+                ) {
+                    Ok(()) => {
+                        backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
+                        None
+                    }
+                    Err(err) => match unreleased_backend_occupant(&err) {
+                        // A socket that outlives its killed backend (Windows:
+                        // still owned by the exiting pid, or by pid 0) used to
+                        // fail this start until a later one saw a foreign
+                        // occupant and fell back anyway (RUST-6J).
+                        Some(occupant) => Some((occupant, None)),
+                        None => return Err(err),
+                    },
+                },
                 PortState::ForeignOccupant(detail) => {
                     let pid = parse_pid_from_lsof_detail(&detail);
-                    let try_bind = |port: u16| TcpListener::bind(("127.0.0.1", port)).is_ok();
-                    match backend_port::select_fallback(detail.clone(), pid, try_bind) {
-                        Ok(SelectedFallback {
-                            port,
+                    Some((detail, pid))
+                }
+            };
+            if let Some((detail, pid)) = occupant {
+                let try_bind = |port: u16| TcpListener::bind(("127.0.0.1", port)).is_ok();
+                match backend_port::select_fallback(detail.clone(), pid, try_bind) {
+                    Ok(SelectedFallback {
+                        port,
+                        original_occupant,
+                        original_pid,
+                    }) => {
+                        backend_port::set(port);
+                        log::warn!(
+                            "[backend_port] {} held by {}; falling back to {}",
+                            backend_port::DEFAULT_BACKEND_PORT,
                             original_occupant,
-                            original_pid,
-                        }) => {
-                            backend_port::set(port);
-                            log::warn!(
-                                "[backend_port] {} held by {}; falling back to {}",
-                                backend_port::DEFAULT_BACKEND_PORT,
-                                original_occupant,
-                                port,
-                            );
-                            sentry::with_scope(
-                                |scope| {
-                                    scope.set_tag("flow", "backend_port_fallback");
-                                    scope.set_tag(
-                                        "occupant_cmd",
-                                        original_occupant
-                                            .split(" pid ")
-                                            .next()
-                                            .unwrap_or("unknown"),
-                                    );
-                                    scope.set_extra(
-                                        "original_port",
-                                        backend_port::DEFAULT_BACKEND_PORT.into(),
-                                    );
-                                    scope.set_extra("chosen_port", port.into());
-                                    if let Some(p) = original_pid {
-                                        scope.set_extra("occupant_pid", p.into());
-                                        // The name alone ("Python") cannot tell
-                                        // a dev server from our own backend's
-                                        // offspring; RUST-ED regressed four times
-                                        // on one Mac with nothing more to go on.
-                                        #[cfg(not(windows))]
-                                        {
-                                            if let Some(cmd) = ps_field(p, "command=") {
-                                                scope.set_extra(
-                                                    "occupant_command",
-                                                    redact_command_line(&cmd).into(),
-                                                );
-                                            }
-                                            let parent = ps_field(p, "ppid=")
-                                                .and_then(|pp| pp.parse::<u32>().ok())
-                                                .and_then(|pp| ps_field(pp, "command="));
-                                            if let Some(parent) = parent {
-                                                scope.set_extra(
-                                                    "occupant_parent",
-                                                    redact_command_line(&parent).into(),
-                                                );
-                                            }
+                            port,
+                        );
+                        sentry::with_scope(
+                            |scope| {
+                                scope.set_tag("flow", "backend_port_fallback");
+                                scope.set_tag(
+                                    "occupant_cmd",
+                                    original_occupant.split(" pid ").next().unwrap_or("unknown"),
+                                );
+                                scope.set_extra(
+                                    "original_port",
+                                    backend_port::DEFAULT_BACKEND_PORT.into(),
+                                );
+                                scope.set_extra("chosen_port", port.into());
+                                if let Some(p) = original_pid {
+                                    scope.set_extra("occupant_pid", p.into());
+                                    // The name alone ("Python") cannot tell
+                                    // a dev server from our own backend's
+                                    // offspring; RUST-ED regressed four times
+                                    // on one Mac with nothing more to go on.
+                                    #[cfg(not(windows))]
+                                    {
+                                        if let Some(cmd) = ps_field(p, "command=") {
+                                            scope.set_extra(
+                                                "occupant_command",
+                                                redact_command_line(&cmd).into(),
+                                            );
+                                        }
+                                        let parent = ps_field(p, "ppid=")
+                                            .and_then(|pp| pp.parse::<u32>().ok())
+                                            .and_then(|pp| ps_field(pp, "command="));
+                                        if let Some(parent) = parent {
+                                            scope.set_extra(
+                                                "occupant_parent",
+                                                redact_command_line(&parent).into(),
+                                            );
                                         }
                                     }
-                                    // Fixed fingerprint: the occupant name,
-                                    // its pid and the chosen port are all in
-                                    // the message, so one condition opened an
-                                    // issue per fallback (RUST-81, RUST-7F)
-                                    // and none of them could be resolved.
-                                    // Same fix as `orphan_proxy_reclaimed`;
-                                    // the occupant is on a tag for filtering.
-                                    scope.set_fingerprint(Some(&["backend_port_fallback"]));
-                                },
-                                || {
-                                    sentry::capture_message(
-                                        &format!(
-                                            "backend_port_fallback: {} held by {}, using {}",
-                                            backend_port::DEFAULT_BACKEND_PORT,
-                                            original_occupant,
-                                            port,
-                                        ),
-                                        sentry::Level::Info,
-                                    );
-                                },
-                            );
-                        }
-                        Err(AllForeign {
-                            original_occupant,
-                            fallback_range,
-                            ..
-                        }) => {
-                            bail!(
-                                "{}",
-                                format_all_foreign_bail(
-                                    backend_port::DEFAULT_BACKEND_PORT,
-                                    &original_occupant,
-                                    fallback_range,
-                                )
-                            );
-                        }
+                                }
+                                // Fixed fingerprint: the occupant name,
+                                // its pid and the chosen port are all in
+                                // the message, so one condition opened an
+                                // issue per fallback (RUST-81, RUST-7F)
+                                // and none of them could be resolved.
+                                // Same fix as `orphan_proxy_reclaimed`;
+                                // the occupant is on a tag for filtering.
+                                scope.set_fingerprint(Some(&["backend_port_fallback"]));
+                            },
+                            || {
+                                sentry::capture_message(
+                                    &format!(
+                                        "backend_port_fallback: {} held by {}, using {}",
+                                        backend_port::DEFAULT_BACKEND_PORT,
+                                        original_occupant,
+                                        port,
+                                    ),
+                                    sentry::Level::Info,
+                                );
+                            },
+                        );
+                    }
+                    Err(AllForeign {
+                        original_occupant,
+                        fallback_range,
+                        ..
+                    }) => {
+                        bail!(
+                            "{}",
+                            format_all_foreign_bail(
+                                backend_port::DEFAULT_BACKEND_PORT,
+                                &original_occupant,
+                                fallback_range,
+                            )
+                        );
                     }
                 }
             }
@@ -11494,6 +11505,21 @@ fn kill_pid(pid: u32, force: bool) {
 /// The reclaim bail for a backend that answers /readyz: it is left alone.
 const RECLAIM_FOUND_HEALTHY_BACKEND: &str = "backend answers /readyz";
 
+/// The occupant to name in the port fallback when a reclaim could not free the
+/// port, or None when its bail must stand: a healthy backend (the caller adopts
+/// it) or an error that is not a reclaim bail.
+fn unreleased_backend_occupant(err: &anyhow::Error) -> Option<String> {
+    if reclaim_found_healthy_backend(err) {
+        return None;
+    }
+    let msg = format!("{err:#}");
+    let (_, why) = msg.rsplit_once("[reclaim: ")?;
+    Some(format!(
+        "an unreleased backend [{}]",
+        why.strip_suffix(']')?
+    ))
+}
+
 /// The start bailed only because a healthy backend already holds 6768.
 pub(crate) fn reclaim_found_healthy_backend(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(&format!("[reclaim: {RECLAIM_FOUND_HEALTHY_BACKEND}]"))
@@ -16603,14 +16629,15 @@ mod tests {
         reclaim_found_healthy_backend, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
-        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
-        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
-        wheel_download_failure_reported, widen_silence_for_unpack, CommandFailure, HeadroomRelease,
-        ManagedRuntime, OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION, SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure,
+        unreleased_backend_occupant, upstream_spawn_env, verify_sha256_file, wait_for_port_free,
+        wheel_download_failure_category, wheel_download_failure_reported, widen_silence_for_unpack,
+        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
+        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RECLAIM_FOUND_HEALTHY_BACKEND, RTK_VERSION,
+        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
@@ -21915,6 +21942,25 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn only_an_unreleased_port_falls_back_after_a_failed_reclaim() {
+        let bail =
+            |why: &str| anyhow::anyhow!("{} [reclaim: {why}]", format_already_running_bail(6768));
+        assert_eq!(
+            unreleased_backend_occupant(&bail("still held 5s after kill, by the killed pid"))
+                .as_deref(),
+            Some("an unreleased backend [still held 5s after kill, by the killed pid]")
+        );
+        assert_eq!(
+            unreleased_backend_occupant(&bail(RECLAIM_FOUND_HEALTHY_BACKEND)),
+            None
+        );
+        assert_eq!(
+            unreleased_backend_occupant(&anyhow::anyhow!("spawn failed")),
+            None
+        );
     }
 
     /// RUST-6J: the watchdog's hung-kill stop does not wait for the orphan to
