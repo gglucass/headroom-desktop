@@ -1206,6 +1206,41 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
+# --- Codex TLS EPERM: route raw ssl errors through the existing retry ---------
+# Python's ssl.SSLError can escape httpx.AsyncClient.send without being wrapped
+# as a TransportError. The streaming forwarder retries TransportError before
+# sending response headers, but the raw exception reaches the outer 502 catch
+# instead. Only translate EPERM during a Codex Responses connection; other TLS
+# errors (notably certificate verification) retain their original diagnosis.
+# Exact-pin gated to 0.42.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
+_hd_tls_flag = _hd_os.environ.get("HEADROOM_CODEX_TLS_RETRY", "1")
+if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import errno as _hd_tls_errno
+        import importlib.metadata as _hd_tls_meta
+        import ssl as _hd_tls_ssl
+        import httpx as _hd_tls_httpx
+
+        if _hd_tls_meta.version("headroom-ai") == "0.42.0":
+            _hd_tls_orig_send = _hd_tls_httpx.AsyncClient.send
+
+            async def _hd_tls_send(self, request, *args, **kwargs):
+                try:
+                    return await _hd_tls_orig_send(self, request, *args, **kwargs)
+                except _hd_tls_ssl.SSLError as exc:
+                    if (
+                        exc.errno == _hd_tls_errno.EPERM
+                        and request.url.host in ("chatgpt.com", "api.openai.com")
+                        and request.url.path.endswith("/responses")
+                    ):
+                        raise _hd_tls_httpx.ConnectError(str(exc), request=request) from exc
+                    raise
+
+            _hd_tls_httpx.AsyncClient.send = _hd_tls_send
+            _hd_bound.add("codex_tls_retry")
+    except Exception:
+        pass
+
 # --- Request-log body window: 20, not 100 (desktop setting) -------------------
 # With --log-messages (the Activity before/after view) the wheel
 # keeps request, compressed and response bodies on its newest
@@ -2015,6 +2050,7 @@ _HD_VENDORS = (
     "prefix_replay_guard",
     "cc_switch_reset",
     "tool_ref_hint",
+    "codex_tls_retry",
     "message_window",
     "embed_batch_cap",
     "maturation_floor",
@@ -18083,6 +18119,38 @@ print(wired, matured(True), matured(False))
             String::from_utf8_lossy(&off.stdout).contains("REFUSED"),
             "with the flag off the wheel should refuse\n{}",
             String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn codex_tls_retry_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-codex-tls-retry.py");
+        let dir = std::env::temp_dir().join(format!("hd-codex-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run Codex TLS retry probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("OK Codex TLS EPERM is retryable"),
+            "Codex TLS retry vendor failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
