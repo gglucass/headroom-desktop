@@ -685,7 +685,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     if request.headers.get("content-encoding"):
                         declared = 0
                     remaining = max(declared, image_bytes + 16 * 1024 * 1024)
-                    target = 80 * 1024 * 1024
+                    # The proxy may accept a large replay, but the upstream
+                    # connection can still close on a ~66 MiB forwarded body.
+                    target = 24 * 1024 * 1024
                     if remaining <= target:
                         return None
                     changed = list(items)
@@ -17295,13 +17297,14 @@ async def prune(body, client='codex', size=140 * 1024 * 1024):
         'x-client': client, 'content-length': str(size)}, transport='http')
 asyncio.run(prune(original))
 assert [i['output'][0]['type'] for i in original['input'][:5]] == [
-    'input_text', 'input_text', 'input_text', 'input_image', 'input_image']
+    'input_text'] * 5
 assert original['input'][-1] == user
 assert all(i['output'][0]['type'] == 'input_image' for i in items)
-assert len(json.dumps(original)) < 100 * 1024 * 1024
-small = {'input': items[:1]}
+assert len(json.dumps(original)) < 32 * 1024 * 1024
+small = {'input': [{'type': 'function_call_output', 'output': [
+    {'type': 'input_image', 'image_url': 'data:image/png;base64,' + 'A' * 100}]}]}
 asyncio.run(prune(small, size=10 * 1024 * 1024))
-assert small['input'] == items[:1]
+assert small['input'][0]['output'][0]['type'] == 'input_image'
 other = {'input': items}
 asyncio.run(prune(other, client='opencode'))
 assert other['input'] == items
