@@ -4345,6 +4345,19 @@ impl ToolManager {
                         if cache_ttl_learn { "1" } else { "0" },
                     )
                     .env("HEADROOM_CACHE_TTL_LEARNED_PATH", &ttl_seed_path)
+                    // Keep each conversation's prefix tracker across a backend
+                    // restart. Without it the next turn re-runs the history at
+                    // frozen=0 and re-writes the provider cache. The file holds
+                    // conversation content (mode 0600) and is deleted once loaded.
+                    // shortcut: the wheel saves it last in lifespan shutdown, so it
+                    // lands inside stop_headroom's 2s SIGTERM grace only when no
+                    // request is in flight (uvicorn waits up to 10s for one), and
+                    // never on Windows, whose stop is always a forced kill; upgrade
+                    // when the wheel saves on SIGTERM itself.
+                    .env(
+                        "HEADROOM_PREFIX_STATE_FILE",
+                        self.runtime.root_dir.join("prefix_state.json"),
+                    )
                     // Off-path background compression (#1171). The Kompress ML pass
                     // over the stable prefix is CPU-bound Rust that releases the GIL,
                     // so 3+ concurrent Claude Code sessions run their passes in true
@@ -17048,6 +17061,58 @@ print('ok')
             .env("HEADROOM_SDK", "headroom-desktop-proxy")
             .output()
             .expect("run Codex compaction body probe");
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    /// The spawn's HEADROOM_PREFIX_STATE_FILE still does something on the pinned
+    /// wheel: a frozen tracker saved by one store resumes at the same freeze in
+    /// a fresh one, the file is gone once loaded, and the proxy server still
+    /// loads and saves through it. A renamed env var would drop silently.
+    #[test]
+    fn prefix_state_file_round_trips_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = r#"
+import inspect, os
+from headroom.cache import prefix_tracker as pt
+from headroom.proxy import server
+path = pt.prefix_state_file()
+assert path, "the wheel no longer reads HEADROOM_PREFIX_STATE_FILE"
+msgs = [{"role": "user", "content": "x " * 3000}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}]
+store = pt.SessionTrackerStore()
+tracker = store.resolve_tracker("s1", "anthropic", msgs, cache_ttl_seconds=3600)
+tracker.update_from_response(6000, 0, msgs, message_token_counts=[3000, 1, 1], original_messages=msgs)
+frozen = tracker.get_frozen_message_count()
+assert frozen > 0, frozen
+assert store.save_state(path) == 1
+fresh = pt.SessionTrackerStore()
+assert fresh.load_state(path) == 1 and not os.path.exists(path)
+nxt = msgs + [{"role": "assistant", "content": "done"}, {"role": "user", "content": "more"}]
+resumed = fresh.resolve_tracker("s1", "anthropic", nxt, cache_ttl_seconds=3600).get_frozen_message_count()
+assert resumed == frozen, (resumed, frozen)
+src = inspect.getsource(server)
+assert "load_state(self._prefix_state_file)" in src and "save_state(self._prefix_state_file)" in src
+print("ok")
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env(
+                "HEADROOM_PREFIX_STATE_FILE",
+                dir.path().join("prefix_state.json"),
+            )
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run prefix state round-trip probe");
         assert!(
             out.status.success(),
             "stderr:\n{}",
