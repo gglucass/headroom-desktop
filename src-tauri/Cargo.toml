@@ -32,7 +32,7 @@ rand = "0.9"
 # .tls_built_in_root_certs(false) (every_reqwest_client_decides_about_the_system_proxy).
 # system-proxy is macOS-only, in the target table below.
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # No sentry "rustls" feature: it only feeds sentry's ureq transport (unused) and pulls
 # webpki-roots 0.26 (RUSTSEC-2026-0381); the reqwest transport gets rustls from reqwest above.
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest"] }
