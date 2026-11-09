@@ -11087,7 +11087,39 @@ static TRAY_MENU: std::sync::OnceLock<tauri::menu::Menu<tauri::Wry>> = std::sync
 static TRAY_SAVINGS_ITEM: std::sync::OnceLock<tauri::menu::MenuItem<tauri::Wry>> =
     std::sync::OnceLock::new();
 
+/// The libraries libappindicator-sys tries, in its order. When none loads it
+/// panics, which killed every launch on a Linux without one (RUST-VQ: CachyOS).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const APPINDICATOR_LIBRARIES: [&str; 4] = [
+    "libayatana-appindicator3.so.1",
+    "libappindicator3.so.1",
+    "libayatana-appindicator3.so",
+    "libappindicator3.so",
+];
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn any_library_loads(names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let Ok(name) = std::ffi::CString::new(*name) else {
+            return false;
+        };
+        // Left open: the tray's own loader opens the same library next, and
+        // unloading a GObject library is not safe.
+        // SAFETY: `name` is a valid C string; the handle is only null-checked.
+        !unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) }.is_null()
+    })
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    // Same as a GNOME without the AppIndicator extension: no icon, the window
+    // and a relaunch still work. Every tray consumer handles a missing tray.
+    #[cfg(target_os = "linux")]
+    if !any_library_loads(&APPINDICATOR_LIBRARIES) {
+        log::info!(
+            "tray: neither libayatana-appindicator3 nor libappindicator3 is installed; running without a tray icon"
+        );
+        return Ok(());
+    }
     // Opens Headroom like "show"; enabled so it reads as the menu's headline.
     let savings = tauri::menu::MenuItem::with_id(
         app,
@@ -13816,6 +13848,20 @@ mod tests {
         let still_ignored = super::signal_is_ignored(libc::SIGUSR2);
         unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
         assert!(still_ignored, "an inherited SIG_IGN was replaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tray_library_probe_skips_a_missing_library() {
+        let missing = "libheadroom-no-such-library.so.1";
+        assert!(!super::any_library_loads(&[missing]));
+        let present = if cfg!(target_os = "macos") {
+            "/usr/lib/libSystem.B.dylib"
+        } else {
+            "libc.so.6"
+        };
+        assert!(super::any_library_loads(&[missing, present]));
+        assert_eq!(super::APPINDICATOR_LIBRARIES.len(), 4);
     }
 
     #[test]
