@@ -4353,7 +4353,7 @@ impl ToolManager {
                     // lands inside stop_headroom's 2s SIGTERM grace only when no
                     // request is in flight (uvicorn waits up to 10s for one), and
                     // never on Windows, whose stop is always a forced kill; upgrade
-                    // when the wheel saves on SIGTERM itself.
+                    // when the pinned wheel ships upstream #4715 (save on SIGTERM).
                     .env(
                         "HEADROOM_PREFIX_STATE_FILE",
                         self.runtime.root_dir.join("prefix_state.json"),
