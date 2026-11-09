@@ -1321,6 +1321,68 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # Memory only: on any binding failure the wheel's batch of 256 stands.
         pass
 
+# --- Path fold: pure listings only, never markup (vendor, upstream owed) -------
+# The lossless path fold matched HTML closing tags as file paths (`</body>` is dir
+# `</` plus base `body>`) and folded any text with two such lines. The content
+# router tries every lossless fold on each mixed section, so an HTML page tail
+# with a JSON-LD block (Bash or MCP output) reached the model as
+# `</\nbody>\nhtml>`, and it wrote that broken HTML back. Template closers
+# (`{{/if}}`) and `N/A` values split the same way. Mirrors upstream PR #4716:
+# path_heading folds only when every non-blank line is a path row, and the
+# pattern rejects `<`, `>`, `;` and directory segments of only punctuation.
+# compact_lossless looks path_heading up as a module global per call, and the
+# replacement reads _PATH_ROW_RE the same way; nothing imports either by value.
+# Drop once the pinned wheel ships #4716. Exact-pin gated to wheel 0.42.0;
+# stands down when the wheel's own path_heading already leaves markup and mixed
+# text alone. Kill switch: HEADROOM_PATH_FOLD_MARKUP_GUARD=0.
+_hd_pfm_flag = _hd_os.environ.get("HEADROOM_PATH_FOLD_MARKUP_GUARD", "1")
+if _hd_pfm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_pfm_meta
+
+        if _hd_pfm_meta.version("headroom-ai") == "0.42.0":
+            from headroom.transforms import lossless_compaction as _hd_pfm_mod
+
+            if any(
+                _hd_pfm_mod.path_heading(t) != t
+                for t in ("</p>\n</b>\n", "{{/if}}\n{{/each}}\n", "a/b\na/c\nx y\n")
+            ):
+                import re as _hd_pfm_re
+
+                _hd_pfm_mod._PATH_ROW_RE = _hd_pfm_re.compile(
+                    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
+                )
+
+                def _hd_pfm_heading(text):
+                    lines, had_trailing = _hd_pfm_mod._split_keep_trailing(text)
+                    matches = []
+                    for ln in lines:
+                        m = _hd_pfm_mod._PATH_ROW_RE.match(ln)
+                        if ln and not m:  # not a pure listing; stop at the first such line
+                            return text
+                        matches.append(m)
+                    if sum(1 for m in matches if m) < 2:
+                        return text
+                    out = []
+                    current = None
+                    for line, m in zip(lines, matches):
+                        if m:
+                            d = m.group("dir")
+                            if d != current:
+                                out.append(d)
+                                current = d
+                            out.append(m.group("base"))
+                        else:  # blank line inside/around the listing
+                            out.append(line)
+                            current = None
+                    return _hd_pfm_mod._join(out, had_trailing)
+
+                _hd_pfm_mod.path_heading = _hd_pfm_heading
+                _hd_bound.add("path_fold_markup_guard")
+    except Exception:
+        # Output only: on any binding failure the wheel's fold stands.
+        pass
+
 # --- Read maturation: never inside the provider-cached prefix (vendor) --------
 # Maturation swaps a quiet Read for a marker only "while it is outside the
 # frozen prefix", but the Anthropic handler hands it the pipeline's freeze
@@ -2053,6 +2115,7 @@ _HD_VENDORS = (
     "codex_tls_retry",
     "message_window",
     "embed_batch_cap",
+    "path_fold_markup_guard",
     "maturation_floor",
     "proxied_guarded_upstreams",
     "output_warmup",
@@ -18010,6 +18073,70 @@ print(len(scorer._encode(["record"] * 40)), seen, shrink)
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "40 [16] [None]"
+        );
+    }
+
+    #[test]
+    fn path_fold_markup_guard_behaves_against_the_installed_wheel() {
+        // The lossless path fold split `</body>` into dir `</` + base `body>`, and
+        // template closers the same way, so the model saw (and wrote back) broken
+        // markup. With the guard they come back as-is, also through the router's
+        // mixed route (an HTML tail after a JSON-LD block), and a real path
+        // listing still folds.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.transforms.lossless_compaction import compact_lossless as c
+from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+print(repr(c("  </script>\n</body>\n</html>\n", "paths")))
+print(repr(c("{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n", "paths")))
+print(repr(c("{{/if}}\n{{/each}}\n", "paths")))
+print(repr(c("src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n", "paths")))
+body = "".join(f"    <p>Paragraph {i} of the example page with some ordinary text.</p>\n" for i in range(20))
+ld = '{\n  "@type": "Product",\n  "name": "Example Widget"\n}'
+tail = "  <main>\n" + body + "  </main>\n  <script type='application/ld+json'>\n" + ld + "\n  </script>\n</body>\n</html>\n"
+r = ContentRouter(ContentRouterConfig()).compress(tail)
+print(r.strategy_used.value, r.compressed.endswith("  </script>\n</body>\n</html>\n"))
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_PATH_FOLD_MARKUP_GUARD", flag)
+                .env_remove("HEADROOM_LOSSLESS_COMPACTION")
+                .output()
+                .expect("run path fold markup probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let paths = r"'src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n'";
+        assert_eq!(
+            run("1"),
+            [
+                r"'  </script>\n</body>\n</html>\n'",
+                r"'{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n'",
+                r"'{{/if}}\n{{/each}}\n'",
+                paths,
+                "mixed True",
+            ]
+            .join("\n")
+        );
+        // Off restores the wheel's fold, which also proves the probe sees it.
+        assert_eq!(
+            run("0"),
+            [
+                r"'  </script>\n</\nbody>\nhtml>\n'",
+                r"'{{#if active}}\n<p>{{name}}</\np>\n{{/\nif}}\neach}}\n'",
+                r"'{{/\nif}}\neach}}\n'",
+                paths,
+                "mixed False",
+            ]
+            .join("\n")
         );
     }
 
