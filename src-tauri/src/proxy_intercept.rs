@@ -3852,12 +3852,17 @@ fn is_headroom_body_limit_error(body: &[u8]) -> bool {
         return false;
     };
     let error = &json["error"];
-    if error["type"] != "invalid_request_error" {
-        return false;
-    }
+    let kind = error["type"].as_str().unwrap_or_default();
+    let code = &error["code"];
     let message = error["message"].as_str().unwrap_or_default();
-    (error["code"] == "invalid_json" && message == "Invalid request body: too large")
-        || (error["code"] == "request_too_large"
+    // Anthropic's handlers omit `code` and put the wire-size refusal in
+    // `type`; OpenAI's handlers use invalid_request_error plus a code. Both
+    // call the same reader and return the same fixed size-limit messages.
+    (kind == "invalid_request_error"
+        && (code.is_null() || code == "invalid_json")
+        && message == "Invalid request body: too large")
+        || (((kind == "invalid_request_error" && code == "request_too_large")
+            || (kind == "request_too_large" && code.is_null()))
             && message.starts_with("Request body too large. Maximum size is ")
             && message.ends_with("MB"))
 }
@@ -10332,6 +10337,26 @@ mod tests {
             br#"{"error":{"type":"gateway_error","message":"payload too large"}}"#
         ));
         assert!(!super::is_headroom_body_limit_error(b""));
+    }
+
+    #[test]
+    fn headroom_body_limit_errors_include_anthropic_handler_shapes() {
+        // The pinned wheel's /v1/messages and /v1/messages/count_tokens
+        // handlers omit OpenAI's error.code, for both size rejection paths.
+        assert!(super::is_headroom_body_limit_error(
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request body: too large"}}"#
+        ));
+        assert!(super::is_headroom_body_limit_error(
+            br#"{"type":"error","error":{"type":"request_too_large","message":"Request body too large. Maximum size is 100MB"}}"#
+        ));
+        // Provider errors of the same types still stay in their own buckets.
+        for body in [
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#.as_slice(),
+            br#"{"type":"error","error":{"type":"request_too_large","message":"request exceeds provider limit"}}"#,
+            br#"{"error":{"type":"invalid_request_error","code":"other_error","message":"Invalid request body: too large"}}"#,
+        ] {
+            assert!(!super::is_headroom_body_limit_error(body));
+        }
     }
 
     #[test]
