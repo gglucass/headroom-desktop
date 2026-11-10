@@ -7675,7 +7675,14 @@ impl ToolManager {
         if let Err(err) = self.smoke_test_markitdown() {
             let exception = command_failure_last_line(&err)
                 .map_or_else(String::new, |line| format!("{line}; "));
-            log::warn!("markitdown smoke test failed after upgrade: {exception}{err:#}");
+            let detail = format!("{exception}{err:#}");
+            // App Control refusing markitdown.exe is the machine's policy
+            // (RUST-W0); the runtime's own start failure tells the user.
+            if crate::is_windows_app_control_block(&detail) {
+                log::info!("markitdown smoke test failed after upgrade: {detail}");
+            } else {
+                log::warn!("markitdown smoke test failed after upgrade: {detail}");
+            }
         }
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
