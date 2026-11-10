@@ -15667,6 +15667,15 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // 120s"). Checked before the install's "not found in marketplace" for
         // the same reason as git-missing.
         "github-unreachable"
+    } else if lower.contains("eperm: operation not permitted")
+        || lower.contains("ebusy: resource busy or locked")
+    {
+        // Claude Code could not move its fresh marketplace clone into place
+        // (RUST-P0 on 0.9.58, Windows: EPERM on the rename, while Codex got
+        // "Access is denied" in its own folder): something on the machine
+        // holds or guards the folder. Checked before the install's "not found
+        // in marketplace" for the same reason as git-missing.
+        "permission"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -28711,6 +28720,24 @@ exit 0
                  \"caveman@caveman\" at user scope\u{2026}\n\nstderr:\n\n[headroom] killed: no \
                  output for 180s (stalled installer)\n",
                 "host-cli-stalled",
+            ),
+            // RUST-P0 on 0.9.58: the marketplace clone could not be moved into
+            // place, then the install's consequence.
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JuliusBrussee/caveman\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Fetching the marketplace from GitHub failed on both attempts. \
+                 HTTPS (https://github.com/JuliusBrussee/caveman.git): Failed to move the new \
+                 marketplace clone into place at \
+                 ~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman. Please try again.\n\n\
+                 Technical details: EPERM: operation not permitted, rename \
+                 '~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman..clone' -> \
+                 '~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman'\n: command failed \
+                 (exit 1): ~\\.local\\bin\\claude.exe plugin install caveman@caveman\nstdout:\n\n\
+                 stderr:\n\u{d7} Failed to install plugin \"caveman@caveman\": Plugin \"caveman\" \
+                 not found in marketplace \"caveman\".",
+                "permission",
             ),
             (
                 "Claude Code: marketplace add failed first: command failed (exit 1): \
