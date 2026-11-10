@@ -447,6 +447,21 @@ describe("app update helpers", () => {
     expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
+  it("leaves a background install's twice-dropped download to the next check (RUST-VY)", async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+    const outage = "Download request failed with status: 504 Gateway Timeout";
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce(outage)
+      .mockResolvedValueOnce(availableUpdate)
+      .mockRejectedValueOnce(outage);
+
+    const result = await runAppUpdateInstall({ availableUpdate, quiet: true, invokeFn });
+
+    expect(result.statusCopy).toMatch(/connection dropped/);
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
   it("shows the read-only-bundle refusal without reporting it (RUST-JK)", async () => {
     const readOnly =
       "Headroom cannot update itself because it is running from a read-only folder. " +

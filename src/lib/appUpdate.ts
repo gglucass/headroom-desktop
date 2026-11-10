@@ -407,11 +407,14 @@ export async function runAppUpdateInstall({
     const packagePrompt = PACKAGE_INSTALL_FAILED.test(detail);
     const diskFull = DISK_FULL.test(detail);
     // A quiet install reaching the admin prompt means the writability gate
-    // missed a case, so that one still reports.
+    // missed a case, so that one still reports. A quiet install's dropped
+    // download is the background check's case: the next hourly check retries
+    // it, and GitHub's release outage on 2026-11-09 filed it (RUST-VY).
     if (
       !READ_ONLY_BUNDLE.test(detail) &&
       !diskFull &&
-      !((adminPrompt || packagePrompt) && !quiet)
+      !((adminPrompt || packagePrompt) && !quiet) &&
+      !(transport && quiet)
     ) {
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",

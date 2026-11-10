@@ -621,14 +621,101 @@ except Exception:
     pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
-    # Image-heavy Codex chats need to reach remote compaction before the
-    # proxy's 100 MiB decompressed-body ceiling rejects their zstd request.
+    # Codex replays old tool images as data URLs when it starts a new turn.
+    # Its compaction request can be plain JSON (>100 MiB), so the proxy must
+    # accept it and remove old tool images before forwarding to OpenAI.
+    # Keep the original 100 MiB wire limit for every other client.
     try:
+        import importlib.metadata as _hd_metadata
         from headroom.proxy import helpers as _hd_body_helpers
+        from headroom.proxy import request_body_limit as _hd_body_limit
+        from headroom.proxy import turn_hooks as _hd_turn_hooks
 
-        if (_hd_body_helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024 and
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_body_helpers.MAX_REQUEST_BODY_SIZE):
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 128 * 1024 * 1024
+        _hd_old_cap = 100 * 1024 * 1024
+        _hd_codex_cap = 256 * 1024 * 1024
+        if (_hd_os.environ.get("HEADROOM_CODEX_IMAGE_HISTORY", "1") != "0"
+            and _hd_metadata.version("headroom-ai") == "0.42.0"
+            and _hd_body_helpers.MAX_REQUEST_BODY_SIZE == _hd_old_cap
+            and _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_old_cap):
+            _hd_original_body_limit_call = _hd_body_limit.RequestBodyLimitMiddleware.__call__
+
+            async def _hd_codex_body_limit_call(self, scope, receive, send):
+                headers = dict(scope.get("headers") or ())
+                codex = (scope.get("type") == "http"
+                         and scope.get("path") == "/v1/responses"
+                         and headers.get(b"x-client", b"").lower() == b"codex")
+                if codex:
+                    return await _hd_original_body_limit_call(self, scope, receive, send)
+                limited = _hd_body_limit.RequestBodyLimitMiddleware(
+                    self.app, max_bytes=_hd_old_cap
+                )
+                return await _hd_original_body_limit_call(limited, scope, receive, send)
+
+            class _hd_CodexImageHistoryHook:
+                name = "headroom_codex_image_history"
+                priority = 90
+
+                def on_responses_create(self, request):
+                    if (request.transport != "http"
+                        or request.headers.get("x-client", "").lower() != "codex"):
+                        return None
+                    items = request.body.get("input")
+                    if not isinstance(items, list):
+                        return None
+                    candidates = []
+                    image_bytes = 0
+                    for i, item in enumerate(items):
+                        if not isinstance(item, dict) or item.get("type") not in (
+                            "function_call_output", "custom_tool_call_output"
+                        ):
+                            continue
+                        blocks = item.get("output")
+                        if not isinstance(blocks, list):
+                            continue
+                        for j, block in enumerate(blocks):
+                            if not isinstance(block, dict) or block.get("type") != "input_image":
+                                continue
+                            url = block.get("image_url")
+                            if isinstance(url, str) and url.startswith("data:image/"):
+                                image_bytes += len(url)
+                                candidates.append((i, j, len(url)))
+                    # Content-Length is the decoded size for plain requests;
+                    # for zstd it is the small wire size, so use image bytes.
+                    declared = int(request.headers.get("content-length", "0") or "0")
+                    if request.headers.get("content-encoding"):
+                        declared = 0
+                    remaining = max(declared, image_bytes + 16 * 1024 * 1024)
+                    # The proxy may accept a large replay, but the upstream
+                    # connection can still close on a ~66 MiB forwarded body.
+                    target = 24 * 1024 * 1024
+                    if remaining <= target:
+                        return None
+                    changed = list(items)
+                    removed = 0
+                    for i, j, size in candidates:
+                        if remaining <= target:
+                            break
+                        if changed[i] is items[i]:
+                            changed[i] = {**items[i], "output": list(items[i]["output"])}
+                        changed[i]["output"][j] = {
+                            "type": "input_text",
+                            "text": "[Earlier tool image omitted; use its saved file if needed.]",
+                        }
+                        remaining -= size
+                        removed += 1
+                    if removed:
+                        import logging
+                        logging.getLogger("headroom.proxy").info(
+                            "event=codex_image_history_pruned count=%d estimated_bytes=%d",
+                            removed, remaining,
+                        )
+                        return {**request.body, "input": changed}
+                    return None
+
+            _hd_body_limit.RequestBodyLimitMiddleware.__call__ = _hd_codex_body_limit_call
+            _hd_body_helpers.MAX_REQUEST_BODY_SIZE = _hd_codex_cap
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = _hd_codex_cap
+            _hd_turn_hooks.register_turn_hook(_hd_CodexImageHistoryHook())
             _hd_bound.add("codex_compaction_body")
     except Exception:
         pass
@@ -1206,6 +1293,41 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
+# --- Codex TLS EPERM: route raw ssl errors through the existing retry ---------
+# Python's ssl.SSLError can escape httpx.AsyncClient.send without being wrapped
+# as a TransportError. The streaming forwarder retries TransportError before
+# sending response headers, but the raw exception reaches the outer 502 catch
+# instead. Only translate EPERM during a Codex Responses connection; other TLS
+# errors (notably certificate verification) retain their original diagnosis.
+# Exact-pin gated to 0.42.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
+_hd_tls_flag = _hd_os.environ.get("HEADROOM_CODEX_TLS_RETRY", "1")
+if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import errno as _hd_tls_errno
+        import importlib.metadata as _hd_tls_meta
+        import ssl as _hd_tls_ssl
+        import httpx as _hd_tls_httpx
+
+        if _hd_tls_meta.version("headroom-ai") == "0.42.0":
+            _hd_tls_orig_send = _hd_tls_httpx.AsyncClient.send
+
+            async def _hd_tls_send(self, request, *args, **kwargs):
+                try:
+                    return await _hd_tls_orig_send(self, request, *args, **kwargs)
+                except _hd_tls_ssl.SSLError as exc:
+                    if (
+                        exc.errno == _hd_tls_errno.EPERM
+                        and request.url.host in ("chatgpt.com", "api.openai.com")
+                        and request.url.path.endswith("/responses")
+                    ):
+                        raise _hd_tls_httpx.ConnectError(str(exc), request=request) from exc
+                    raise
+
+            _hd_tls_httpx.AsyncClient.send = _hd_tls_send
+            _hd_bound.add("codex_tls_retry")
+    except Exception:
+        pass
+
 # --- Request-log body window: 20, not 100 (desktop setting) -------------------
 # With --log-messages (the Activity before/after view) the wheel
 # keeps request, compressed and response bodies on its newest
@@ -1284,6 +1406,68 @@ if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
             _hd_bound.add("embed_batch_cap")
     except Exception:
         # Memory only: on any binding failure the wheel's batch of 256 stands.
+        pass
+
+# --- Path fold: pure listings only, never markup (vendor, upstream owed) -------
+# The lossless path fold matched HTML closing tags as file paths (`</body>` is dir
+# `</` plus base `body>`) and folded any text with two such lines. The content
+# router tries every lossless fold on each mixed section, so an HTML page tail
+# with a JSON-LD block (Bash or MCP output) reached the model as
+# `</\nbody>\nhtml>`, and it wrote that broken HTML back. Template closers
+# (`{{/if}}`) and `N/A` values split the same way. Mirrors upstream PR #4716:
+# path_heading folds only when every non-blank line is a path row, and the
+# pattern rejects `<`, `>`, `;` and directory segments of only punctuation.
+# compact_lossless looks path_heading up as a module global per call, and the
+# replacement reads _PATH_ROW_RE the same way; nothing imports either by value.
+# Drop once the pinned wheel ships #4716. Exact-pin gated to wheel 0.42.0;
+# stands down when the wheel's own path_heading already leaves markup and mixed
+# text alone. Kill switch: HEADROOM_PATH_FOLD_MARKUP_GUARD=0.
+_hd_pfm_flag = _hd_os.environ.get("HEADROOM_PATH_FOLD_MARKUP_GUARD", "1")
+if _hd_pfm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_pfm_meta
+
+        if _hd_pfm_meta.version("headroom-ai") == "0.42.0":
+            from headroom.transforms import lossless_compaction as _hd_pfm_mod
+
+            if any(
+                _hd_pfm_mod.path_heading(t) != t
+                for t in ("</p>\n</b>\n", "{{/if}}\n{{/each}}\n", "a/b\na/c\nx y\n")
+            ):
+                import re as _hd_pfm_re
+
+                _hd_pfm_mod._PATH_ROW_RE = _hd_pfm_re.compile(
+                    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
+                )
+
+                def _hd_pfm_heading(text):
+                    lines, had_trailing = _hd_pfm_mod._split_keep_trailing(text)
+                    matches = []
+                    for ln in lines:
+                        m = _hd_pfm_mod._PATH_ROW_RE.match(ln)
+                        if ln and not m:  # not a pure listing; stop at the first such line
+                            return text
+                        matches.append(m)
+                    if sum(1 for m in matches if m) < 2:
+                        return text
+                    out = []
+                    current = None
+                    for line, m in zip(lines, matches):
+                        if m:
+                            d = m.group("dir")
+                            if d != current:
+                                out.append(d)
+                                current = d
+                            out.append(m.group("base"))
+                        else:  # blank line inside/around the listing
+                            out.append(line)
+                            current = None
+                    return _hd_pfm_mod._join(out, had_trailing)
+
+                _hd_pfm_mod.path_heading = _hd_pfm_heading
+                _hd_bound.add("path_fold_markup_guard")
+    except Exception:
+        # Output only: on any binding failure the wheel's fold stands.
         pass
 
 # --- Read maturation: never inside the provider-cached prefix (vendor) --------
@@ -2015,8 +2199,10 @@ _HD_VENDORS = (
     "prefix_replay_guard",
     "cc_switch_reset",
     "tool_ref_hint",
+    "codex_tls_retry",
     "message_window",
     "embed_batch_cap",
+    "path_fold_markup_guard",
     "maturation_floor",
     "proxied_guarded_upstreams",
     "output_warmup",
@@ -3926,109 +4112,120 @@ impl ToolManager {
             // The chosen port is stored in `backend_port` so the intercept,
             // health probes, and spawn args all pick it up.
             let initial_state = diagnose_proxy_port_settled(backend_port::DEFAULT_BACKEND_PORT);
-            match initial_state {
+            let occupant = match initial_state {
                 PortState::Free => {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
+                    None
                 }
-                PortState::HeadroomRunning => {
-                    reclaim_orphan_proxy(
-                        backend_port::DEFAULT_BACKEND_PORT,
-                        reclaim_healthy_orphan || first_start,
-                    )?;
-                    backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
-                }
+                PortState::HeadroomRunning => match reclaim_orphan_proxy(
+                    backend_port::DEFAULT_BACKEND_PORT,
+                    reclaim_healthy_orphan || first_start,
+                ) {
+                    Ok(()) => {
+                        backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
+                        None
+                    }
+                    Err(err) => match unreleased_backend_occupant(&err) {
+                        // A socket that outlives its killed backend (Windows:
+                        // still owned by the exiting pid, or by pid 0) used to
+                        // fail this start until a later one saw a foreign
+                        // occupant and fell back anyway (RUST-6J).
+                        Some(occupant) => Some((occupant, None)),
+                        None => return Err(err),
+                    },
+                },
                 PortState::ForeignOccupant(detail) => {
                     let pid = parse_pid_from_lsof_detail(&detail);
-                    let try_bind = |port: u16| TcpListener::bind(("127.0.0.1", port)).is_ok();
-                    match backend_port::select_fallback(detail.clone(), pid, try_bind) {
-                        Ok(SelectedFallback {
-                            port,
+                    Some((detail, pid))
+                }
+            };
+            if let Some((detail, pid)) = occupant {
+                let try_bind = |port: u16| TcpListener::bind(("127.0.0.1", port)).is_ok();
+                match backend_port::select_fallback(detail.clone(), pid, try_bind) {
+                    Ok(SelectedFallback {
+                        port,
+                        original_occupant,
+                        original_pid,
+                    }) => {
+                        backend_port::set(port);
+                        log::warn!(
+                            "[backend_port] {} held by {}; falling back to {}",
+                            backend_port::DEFAULT_BACKEND_PORT,
                             original_occupant,
-                            original_pid,
-                        }) => {
-                            backend_port::set(port);
-                            log::warn!(
-                                "[backend_port] {} held by {}; falling back to {}",
-                                backend_port::DEFAULT_BACKEND_PORT,
-                                original_occupant,
-                                port,
-                            );
-                            sentry::with_scope(
-                                |scope| {
-                                    scope.set_tag("flow", "backend_port_fallback");
-                                    scope.set_tag(
-                                        "occupant_cmd",
-                                        original_occupant
-                                            .split(" pid ")
-                                            .next()
-                                            .unwrap_or("unknown"),
-                                    );
-                                    scope.set_extra(
-                                        "original_port",
-                                        backend_port::DEFAULT_BACKEND_PORT.into(),
-                                    );
-                                    scope.set_extra("chosen_port", port.into());
-                                    if let Some(p) = original_pid {
-                                        scope.set_extra("occupant_pid", p.into());
-                                        // The name alone ("Python") cannot tell
-                                        // a dev server from our own backend's
-                                        // offspring; RUST-ED regressed four times
-                                        // on one Mac with nothing more to go on.
-                                        #[cfg(not(windows))]
-                                        {
-                                            if let Some(cmd) = ps_field(p, "command=") {
-                                                scope.set_extra(
-                                                    "occupant_command",
-                                                    redact_command_line(&cmd).into(),
-                                                );
-                                            }
-                                            let parent = ps_field(p, "ppid=")
-                                                .and_then(|pp| pp.parse::<u32>().ok())
-                                                .and_then(|pp| ps_field(pp, "command="));
-                                            if let Some(parent) = parent {
-                                                scope.set_extra(
-                                                    "occupant_parent",
-                                                    redact_command_line(&parent).into(),
-                                                );
-                                            }
+                            port,
+                        );
+                        sentry::with_scope(
+                            |scope| {
+                                scope.set_tag("flow", "backend_port_fallback");
+                                scope.set_tag(
+                                    "occupant_cmd",
+                                    original_occupant.split(" pid ").next().unwrap_or("unknown"),
+                                );
+                                scope.set_extra(
+                                    "original_port",
+                                    backend_port::DEFAULT_BACKEND_PORT.into(),
+                                );
+                                scope.set_extra("chosen_port", port.into());
+                                if let Some(p) = original_pid {
+                                    scope.set_extra("occupant_pid", p.into());
+                                    // The name alone ("Python") cannot tell
+                                    // a dev server from our own backend's
+                                    // offspring; RUST-ED regressed four times
+                                    // on one Mac with nothing more to go on.
+                                    #[cfg(not(windows))]
+                                    {
+                                        if let Some(cmd) = ps_field(p, "command=") {
+                                            scope.set_extra(
+                                                "occupant_command",
+                                                redact_command_line(&cmd).into(),
+                                            );
+                                        }
+                                        let parent = ps_field(p, "ppid=")
+                                            .and_then(|pp| pp.parse::<u32>().ok())
+                                            .and_then(|pp| ps_field(pp, "command="));
+                                        if let Some(parent) = parent {
+                                            scope.set_extra(
+                                                "occupant_parent",
+                                                redact_command_line(&parent).into(),
+                                            );
                                         }
                                     }
-                                    // Fixed fingerprint: the occupant name,
-                                    // its pid and the chosen port are all in
-                                    // the message, so one condition opened an
-                                    // issue per fallback (RUST-81, RUST-7F)
-                                    // and none of them could be resolved.
-                                    // Same fix as `orphan_proxy_reclaimed`;
-                                    // the occupant is on a tag for filtering.
-                                    scope.set_fingerprint(Some(&["backend_port_fallback"]));
-                                },
-                                || {
-                                    sentry::capture_message(
-                                        &format!(
-                                            "backend_port_fallback: {} held by {}, using {}",
-                                            backend_port::DEFAULT_BACKEND_PORT,
-                                            original_occupant,
-                                            port,
-                                        ),
-                                        sentry::Level::Info,
-                                    );
-                                },
-                            );
-                        }
-                        Err(AllForeign {
-                            original_occupant,
-                            fallback_range,
-                            ..
-                        }) => {
-                            bail!(
-                                "{}",
-                                format_all_foreign_bail(
-                                    backend_port::DEFAULT_BACKEND_PORT,
-                                    &original_occupant,
-                                    fallback_range,
-                                )
-                            );
-                        }
+                                }
+                                // Fixed fingerprint: the occupant name,
+                                // its pid and the chosen port are all in
+                                // the message, so one condition opened an
+                                // issue per fallback (RUST-81, RUST-7F)
+                                // and none of them could be resolved.
+                                // Same fix as `orphan_proxy_reclaimed`;
+                                // the occupant is on a tag for filtering.
+                                scope.set_fingerprint(Some(&["backend_port_fallback"]));
+                            },
+                            || {
+                                sentry::capture_message(
+                                    &format!(
+                                        "backend_port_fallback: {} held by {}, using {}",
+                                        backend_port::DEFAULT_BACKEND_PORT,
+                                        original_occupant,
+                                        port,
+                                    ),
+                                    sentry::Level::Info,
+                                );
+                            },
+                        );
+                    }
+                    Err(AllForeign {
+                        original_occupant,
+                        fallback_range,
+                        ..
+                    }) => {
+                        bail!(
+                            "{}",
+                            format_all_foreign_bail(
+                                backend_port::DEFAULT_BACKEND_PORT,
+                                &original_occupant,
+                                fallback_range,
+                            )
+                        );
                     }
                 }
             }
@@ -4345,6 +4542,19 @@ impl ToolManager {
                         if cache_ttl_learn { "1" } else { "0" },
                     )
                     .env("HEADROOM_CACHE_TTL_LEARNED_PATH", &ttl_seed_path)
+                    // Keep each conversation's prefix tracker across a backend
+                    // restart. Without it the next turn re-runs the history at
+                    // frozen=0 and re-writes the provider cache. The file holds
+                    // conversation content (mode 0600) and is deleted once loaded.
+                    // shortcut: the wheel saves it last in lifespan shutdown, so it
+                    // lands inside stop_headroom's 2s SIGTERM grace only when no
+                    // request is in flight (uvicorn waits up to 10s for one), and
+                    // never on Windows, whose stop is always a forced kill; upgrade
+                    // when the pinned wheel ships upstream #4715 (save on SIGTERM).
+                    .env(
+                        "HEADROOM_PREFIX_STATE_FILE",
+                        self.runtime.root_dir.join("prefix_state.json"),
+                    )
                     // Off-path background compression (#1171). The Kompress ML pass
                     // over the stable prefix is CPU-bound Rust that releases the GIL,
                     // so 3+ concurrent Claude Code sessions run their passes in true
@@ -7465,7 +7675,14 @@ impl ToolManager {
         if let Err(err) = self.smoke_test_markitdown() {
             let exception = command_failure_last_line(&err)
                 .map_or_else(String::new, |line| format!("{line}; "));
-            log::warn!("markitdown smoke test failed after upgrade: {exception}{err:#}");
+            let detail = format!("{exception}{err:#}");
+            // App Control refusing markitdown.exe is the machine's policy
+            // (RUST-W0); the runtime's own start failure tells the user.
+            if crate::is_windows_app_control_block(&detail) {
+                log::info!("markitdown smoke test failed after upgrade: {detail}");
+            } else {
+                log::warn!("markitdown smoke test failed after upgrade: {detail}");
+            }
         }
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
@@ -11494,6 +11711,21 @@ fn kill_pid(pid: u32, force: bool) {
 /// The reclaim bail for a backend that answers /readyz: it is left alone.
 const RECLAIM_FOUND_HEALTHY_BACKEND: &str = "backend answers /readyz";
 
+/// The occupant to name in the port fallback when a reclaim could not free the
+/// port, or None when its bail must stand: a healthy backend (the caller adopts
+/// it) or an error that is not a reclaim bail.
+fn unreleased_backend_occupant(err: &anyhow::Error) -> Option<String> {
+    if reclaim_found_healthy_backend(err) {
+        return None;
+    }
+    let msg = format!("{err:#}");
+    let (_, why) = msg.rsplit_once("[reclaim: ")?;
+    Some(format!(
+        "an unreleased backend [{}]",
+        why.strip_suffix(']')?
+    ))
+}
+
 /// The start bailed only because a healthy backend already holds 6768.
 pub(crate) fn reclaim_found_healthy_backend(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(&format!("[reclaim: {RECLAIM_FOUND_HEALTHY_BACKEND}]"))
@@ -15442,6 +15674,15 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // 120s"). Checked before the install's "not found in marketplace" for
         // the same reason as git-missing.
         "github-unreachable"
+    } else if lower.contains("eperm: operation not permitted")
+        || lower.contains("ebusy: resource busy or locked")
+    {
+        // Claude Code could not move its fresh marketplace clone into place
+        // (RUST-P0 on 0.9.58, Windows: EPERM on the rename, while Codex got
+        // "Access is denied" in its own folder): something on the machine
+        // holds or guards the folder. Checked before the install's "not found
+        // in marketplace" for the same reason as git-missing.
+        "permission"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -16603,14 +16844,15 @@ mod tests {
         reclaim_found_healthy_backend, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
-        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
-        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
-        wheel_download_failure_reported, widen_silence_for_unpack, CommandFailure, HeadroomRelease,
-        ManagedRuntime, OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION, SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure,
+        unreleased_backend_occupant, upstream_spawn_env, verify_sha256_file, wait_for_port_free,
+        wheel_download_failure_category, wheel_download_failure_reported, widen_silence_for_unpack,
+        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
+        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RECLAIM_FOUND_HEALTHY_BACKEND, RTK_VERSION,
+        SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
@@ -17022,7 +17264,7 @@ mod tests {
         assert!(!py.contains("additional_tools"));
     }
 
-    /// A zstd Codex request just past 100 MiB must reach remote compaction.
+    /// A plain 179 MiB Codex replay must pass the guard and prune old images.
     #[test]
     fn codex_compaction_body_cap_against_the_installed_wheel() {
         let python =
@@ -17034,12 +17276,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
         let probe = r#"
-from headroom.proxy import helpers
+import asyncio
+import json
+from headroom.proxy import helpers, request_body_limit, turn_hooks
 import zstandard
-assert helpers.MAX_REQUEST_BODY_SIZE == 100 * 1024 * 1024
-assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 128 * 1024 * 1024
-body = zstandard.ZstdCompressor().compress(b'x' * (101 * 1024 * 1024))
-assert len(helpers._zstd_bounded(body)) == 101 * 1024 * 1024
+assert helpers.MAX_REQUEST_BODY_SIZE == 256 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 256 * 1024 * 1024
+body = zstandard.ZstdCompressor().compress(b'x' * (179 * 1024 * 1024))
+assert len(helpers._zstd_bounded(body)) == 179 * 1024 * 1024
+
+async def check_limit(client, size):
+    called = []
+    async def app(scope, receive, send):
+        called.append(True)
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b''})
+    sent = []
+    scope = {'type': 'http', 'path': '/v1/responses', 'headers': [
+        (b'x-client', client.encode()), (b'content-length', str(size).encode())]}
+    async def send(message):
+        sent.append(message)
+    await request_body_limit.RequestBodyLimitMiddleware(app)(scope, None, send)
+    return called, sent[0]['status']
+
+assert asyncio.run(check_limit('codex', 179 * 1024 * 1024)) == ([True], 200)
+assert asyncio.run(check_limit('codex', 257 * 1024 * 1024)) == ([], 413)
+assert asyncio.run(check_limit('opencode', 179 * 1024 * 1024)) == ([], 413)
+
+image = 'data:image/png;base64,' + 'A' * (24 * 1024 * 1024)
+items = [{'type': 'function_call_output', 'call_id': str(i), 'output': [
+    {'type': 'input_image', 'image_url': image}]} for i in range(5)]
+user = {'role': 'user', 'content': [{'type': 'input_image', 'image_url': image}]}
+original = {'model': 'gpt-6-sol', 'input': [*items, user]}
+async def prune(body, client='codex', size=140 * 1024 * 1024):
+    await turn_hooks.run_responses_create_hooks(body, headers={
+        'x-client': client, 'content-length': str(size)}, transport='http')
+asyncio.run(prune(original))
+assert [i['output'][0]['type'] for i in original['input'][:5]] == [
+    'input_text'] * 5
+assert original['input'][-1] == user
+assert all(i['output'][0]['type'] == 'input_image' for i in items)
+assert len(json.dumps(original)) < 32 * 1024 * 1024
+small = {'input': [{'type': 'function_call_output', 'output': [
+    {'type': 'input_image', 'image_url': 'data:image/png;base64,' + 'A' * 100}]}]}
+asyncio.run(prune(small, size=10 * 1024 * 1024))
+assert small['input'][0]['output'][0]['type'] == 'input_image'
+other = {'input': items}
+asyncio.run(prune(other, client='opencode'))
+assert other['input'] == items
 print('ok')
 "#;
         let out = crate::proc::command(&python)
@@ -17048,6 +17332,58 @@ print('ok')
             .env("HEADROOM_SDK", "headroom-desktop-proxy")
             .output()
             .expect("run Codex compaction body probe");
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    /// The spawn's HEADROOM_PREFIX_STATE_FILE still does something on the pinned
+    /// wheel: a frozen tracker saved by one store resumes at the same freeze in
+    /// a fresh one, the file is gone once loaded, and the proxy server still
+    /// loads and saves through it. A renamed env var would drop silently.
+    #[test]
+    fn prefix_state_file_round_trips_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = r#"
+import inspect, os
+from headroom.cache import prefix_tracker as pt
+from headroom.proxy import server
+path = pt.prefix_state_file()
+assert path, "the wheel no longer reads HEADROOM_PREFIX_STATE_FILE"
+msgs = [{"role": "user", "content": "x " * 3000}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}]
+store = pt.SessionTrackerStore()
+tracker = store.resolve_tracker("s1", "anthropic", msgs, cache_ttl_seconds=3600)
+tracker.update_from_response(6000, 0, msgs, message_token_counts=[3000, 1, 1], original_messages=msgs)
+frozen = tracker.get_frozen_message_count()
+assert frozen > 0, frozen
+assert store.save_state(path) == 1
+fresh = pt.SessionTrackerStore()
+assert fresh.load_state(path) == 1 and not os.path.exists(path)
+nxt = msgs + [{"role": "assistant", "content": "done"}, {"role": "user", "content": "more"}]
+resumed = fresh.resolve_tracker("s1", "anthropic", nxt, cache_ttl_seconds=3600).get_frozen_message_count()
+assert resumed == frozen, (resumed, frozen)
+src = inspect.getsource(server)
+assert "load_state(self._prefix_state_file)" in src and "save_state(self._prefix_state_file)" in src
+print("ok")
+"#;
+        let out = crate::proc::command(&python)
+            .args(["-c", probe])
+            .env(
+                "HEADROOM_PREFIX_STATE_FILE",
+                dir.path().join("prefix_state.json"),
+            )
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run prefix state round-trip probe");
         assert!(
             out.status.success(),
             "stderr:\n{}",
@@ -17886,6 +18222,70 @@ print(len(scorer._encode(["record"] * 40)), seen, shrink)
     }
 
     #[test]
+    fn path_fold_markup_guard_behaves_against_the_installed_wheel() {
+        // The lossless path fold split `</body>` into dir `</` + base `body>`, and
+        // template closers the same way, so the model saw (and wrote back) broken
+        // markup. With the guard they come back as-is, also through the router's
+        // mixed route (an HTML tail after a JSON-LD block), and a real path
+        // listing still folds.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+from headroom.transforms.lossless_compaction import compact_lossless as c
+from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+print(repr(c("  </script>\n</body>\n</html>\n", "paths")))
+print(repr(c("{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n", "paths")))
+print(repr(c("{{/if}}\n{{/each}}\n", "paths")))
+print(repr(c("src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n", "paths")))
+body = "".join(f"    <p>Paragraph {i} of the example page with some ordinary text.</p>\n" for i in range(20))
+ld = '{\n  "@type": "Product",\n  "name": "Example Widget"\n}'
+tail = "  <main>\n" + body + "  </main>\n  <script type='application/ld+json'>\n" + ld + "\n  </script>\n</body>\n</html>\n"
+r = ContentRouter(ContentRouterConfig()).compress(tail)
+print(r.strategy_used.value, r.compressed.endswith("  </script>\n</body>\n</html>\n"))
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_PATH_FOLD_MARKUP_GUARD", flag)
+                .env_remove("HEADROOM_LOSSLESS_COMPACTION")
+                .output()
+                .expect("run path fold markup probe");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let paths = r"'src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n'";
+        assert_eq!(
+            run("1"),
+            [
+                r"'  </script>\n</body>\n</html>\n'",
+                r"'{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n'",
+                r"'{{/if}}\n{{/each}}\n'",
+                paths,
+                "mixed True",
+            ]
+            .join("\n")
+        );
+        // Off restores the wheel's fold, which also proves the probe sees it.
+        assert_eq!(
+            run("0"),
+            [
+                r"'  </script>\n</\nbody>\nhtml>\n'",
+                r"'{{#if active}}\n<p>{{name}}</\np>\n{{/\nif}}\neach}}\n'",
+                r"'{{/\nif}}\neach}}\n'",
+                paths,
+                "mixed False",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
     fn maturation_floor_behaves_against_the_installed_wheel() {
         // RUST-DP: a Read quiet for 5 turns sits inside the provider-cached prefix,
         // and the handler's freeze count (here 1) is below the floor finalize_turn
@@ -17991,6 +18391,38 @@ print(wired, matured(True), matured(False))
             String::from_utf8_lossy(&off.stdout).contains("REFUSED"),
             "with the flag off the wheel should refuse\n{}",
             String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn codex_tls_retry_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-codex-tls-retry.py");
+        let dir = std::env::temp_dir().join(format!("hd-codex-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run Codex TLS retry probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("OK Codex TLS EPERM is retryable"),
+            "Codex TLS retry vendor failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
@@ -21915,6 +22347,25 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn only_an_unreleased_port_falls_back_after_a_failed_reclaim() {
+        let bail =
+            |why: &str| anyhow::anyhow!("{} [reclaim: {why}]", format_already_running_bail(6768));
+        assert_eq!(
+            unreleased_backend_occupant(&bail("still held 5s after kill, by the killed pid"))
+                .as_deref(),
+            Some("an unreleased backend [still held 5s after kill, by the killed pid]")
+        );
+        assert_eq!(
+            unreleased_backend_occupant(&bail(RECLAIM_FOUND_HEALTHY_BACKEND)),
+            None
+        );
+        assert_eq!(
+            unreleased_backend_occupant(&anyhow::anyhow!("spawn failed")),
+            None
+        );
     }
 
     /// RUST-6J: the watchdog's hung-kill stop does not wait for the orphan to
@@ -28276,6 +28727,24 @@ exit 0
                  \"caveman@caveman\" at user scope\u{2026}\n\nstderr:\n\n[headroom] killed: no \
                  output for 180s (stalled installer)\n",
                 "host-cli-stalled",
+            ),
+            // RUST-P0 on 0.9.58: the marketplace clone could not be moved into
+            // place, then the install's consequence.
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\.local\\bin\\claude.exe plugin marketplace add JuliusBrussee/caveman\n\
+                 stdout:\nAdding marketplace\u{2026}\n\nstderr:\n\u{d7} Failed to add \
+                 marketplace: Fetching the marketplace from GitHub failed on both attempts. \
+                 HTTPS (https://github.com/JuliusBrussee/caveman.git): Failed to move the new \
+                 marketplace clone into place at \
+                 ~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman. Please try again.\n\n\
+                 Technical details: EPERM: operation not permitted, rename \
+                 '~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman..clone' -> \
+                 '~\\.claude\\plugins\\marketplaces\\JuliusBrussee-caveman'\n: command failed \
+                 (exit 1): ~\\.local\\bin\\claude.exe plugin install caveman@caveman\nstdout:\n\n\
+                 stderr:\n\u{d7} Failed to install plugin \"caveman@caveman\": Plugin \"caveman\" \
+                 not found in marketplace \"caveman\".",
+                "permission",
             ),
             (
                 "Claude Code: marketplace add failed first: command failed (exit 1): \

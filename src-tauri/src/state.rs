@@ -9750,6 +9750,15 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
                 .into(),
         );
     }
+    // The log tail names it, three lines below the generic exit (RUST-BA).
+    // Must precede the exited-before-port branch, which would swallow it.
+    if crate::is_out_of_memory_signal(raw) {
+        return Some(
+            "Your computer ran out of memory while Headroom's runtime was starting. \
+             Close some apps, then quit and reopen Headroom."
+                .into(),
+        );
+    }
     if raw.contains("exited with status") && raw.contains("before opening port") {
         return Some(
             "The Headroom Python runtime crashed at startup. \
@@ -12549,6 +12558,19 @@ mod tests {
         let hint = classify_startup_error(raw).expect("crash should classify");
         assert!(hint.contains("crashed at startup"), "got: {hint}");
         assert!(hint.contains("logs"));
+    }
+
+    #[test]
+    fn classify_startup_error_names_a_machine_out_of_memory() {
+        // RUST-BA on 0.9.58, Windows, verbatim log tail.
+        let raw = "unable to keep headroom running in background: \
+            ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe -m \
+            headroom.proxy.server --port 6768 exited with status exit code: 1 before opening port \
+            6768\n--- log tail ---\nOpenBLAS error: Memory allocation still failed after 10 \
+            retries, giving up.\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("out of memory should classify");
+        assert!(hint.contains("ran out of memory"), "got: {hint}");
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 
     #[test]

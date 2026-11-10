@@ -3394,10 +3394,12 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
 
     // A base interpreter that lost a stdlib file (antivirus quarantine,
     // RUST-SM) is the machine's fault, and the next launch re-downloads the
-    // base: Warning, as the upgrade path files the same cause (RUST-K0).
-    let level = if startup_error_fingerprint_key(Some(technical_err.as_str()))
-        == Some("startup_runtime_missing_stdlib")
-    {
+    // base: Warning, as the upgrade path files the same cause (RUST-K0). So is
+    // a machine out of memory (RUST-BA), which the hint tells the user.
+    let level = if matches!(
+        startup_error_fingerprint_key(Some(technical_err.as_str())),
+        Some("startup_runtime_missing_stdlib") | Some("startup_out_of_memory")
+    ) {
         sentry::Level::Warning
     } else {
         sentry::Level::Error
@@ -3558,6 +3560,10 @@ pub(crate) fn startup_error_fingerprint_key(
         // Same for a third-party package: the in-startup repair re-syncs the
         // lock, so an event here means that repair did not take either.
         Some("startup_venv_missing_dependency")
+    } else if is_out_of_memory_signal(err) {
+        // Not a crash of ours: the machine had no memory to give the runtime
+        // as it started (RUST-BA), so it is not the exit-1 grab-bag either.
+        Some("startup_out_of_memory")
     } else if crate::tool_manager::onnx_probe_crashed(err) {
         // The machine's onnxruntime aborts the interpreter as it loads, so the
         // proxy dies mid-import with no traceback (RUST-C7). The startup path
@@ -4114,10 +4120,13 @@ pub(crate) fn capture_upgrade_failure(
     // `startup_runtime_missing_stdlib`. One AV-hit host reopened RUST-29 on
     // 0.9.48 three times in seven minutes.
     let corrupt_base = tool_manager::is_corrupt_base_stdlib_signal(&technical_err);
+    let out_of_memory = is_out_of_memory_signal(&technical_err)
+        || ensure_error.is_some_and(is_out_of_memory_signal);
     let level = if endpoint_protection_suspected
         || loopback_socket_denied
         || network_refused
         || corrupt_base
+        || out_of_memory
     {
         sentry::protocol::Level::Warning
     } else {
@@ -4131,6 +4140,8 @@ pub(crate) fn capture_upgrade_failure(
         "network"
     } else if corrupt_base {
         "corrupt_base_stdlib"
+    } else if out_of_memory {
+        "out_of_memory"
     } else {
         outcome.unwrap_or("none")
     };
@@ -4395,6 +4406,13 @@ pub(crate) fn is_loopback_socket_denied_signal(text: &str) -> bool {
     lower.contains("winerror 10013") || lower.contains("os error 10013")
 }
 
+/// The runtime died because the machine could not give it memory as it
+/// started: numpy's OpenBLAS gives up committing its thread buffers (RUST-BA,
+/// Windows 0.9.58). A fresh runtime would die the same way.
+pub(crate) fn is_out_of_memory_signal(text: &str) -> bool {
+    text.contains("OpenBLAS error: Memory allocation")
+}
+
 /// Our own package is in site-packages but not all of it: a torn or partial
 /// wheel install leaves `headroom` importable while a submodule is missing, so
 /// the proxy dies on import before it can bind. No respawn fixes it and it is
@@ -4425,13 +4443,15 @@ pub(crate) fn missing_dependency_modules(text: &str) -> Vec<&str> {
 }
 
 /// True for a `startup_error_fingerprint_key` that names a verdict of the
-/// machine's own configuration rather than anything we ship: reported once per
-/// session by `capture_headroom_start_failure` with a user-facing remedy, so
-/// the give-up and upgrade events that follow it stay at Warning.
+/// machine's own configuration or resources rather than anything we ship.
+/// These have a user-facing remedy, so the give-up and upgrade events that
+/// follow the start failure stay at Warning.
 pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
     matches!(
         key,
-        Some("startup_endpoint_protection") | Some("startup_loopback_socket_denied")
+        Some("startup_endpoint_protection")
+            | Some("startup_loopback_socket_denied")
+            | Some("startup_out_of_memory")
     )
 }
 
@@ -18421,6 +18441,88 @@ Some unrelated content.
     }
 
     #[test]
+    fn out_of_memory_stays_environmental_through_watchdog_give_up() {
+        let death = "exited with status exit code: 1 before opening port 6768";
+        let tail = "OpenBLAS error: Memory allocation still failed after 10 retries, giving up.";
+        let startup_error = format!("{death}\n--- log tail ---\n{tail}");
+        for (error, log_tail) in [
+            (Some(startup_error.as_str()), None),
+            (Some(death), Some(tail)),
+        ] {
+            let key = give_up_startup_key(error, log_tail);
+            assert_eq!(key, Some("startup_out_of_memory"));
+            // This is the predicate that keeps repeated startup failures at
+            // Warning in capture_watchdog_give_up.
+            assert!(is_environmental_startup_key(key));
+        }
+        assert_eq!(
+            super::auto_pause_notification_body(Some(&startup_error)),
+            "Your computer ran out of memory while Headroom's runtime was starting. \
+             Open Headroom to see how to fix it."
+        );
+        assert!(!super::startup_death_needs_rebuild(Some(&startup_error)));
+    }
+
+    #[test]
+    fn out_of_memory_upgrade_reports_keep_the_machine_cause() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        let memory = "OpenBLAS error: Memory allocation still failed after 10 retries, giving up.";
+        sentry::Hub::run(hub, || {
+            // Boot validation can carry the startup error in either channel.
+            for (err, diagnostics) in [
+                (anyhow::anyhow!(memory), None),
+                (
+                    anyhow::anyhow!("new runtime did not start"),
+                    Some(super::UpgradeBootDiagnostics {
+                        ensure_error: Some(memory.into()),
+                        ..Default::default()
+                    }),
+                ),
+            ] {
+                super::capture_upgrade_failure(
+                    &err,
+                    false,
+                    "boot_validation",
+                    Some("not_started"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    diagnostics,
+                );
+            }
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events.iter() {
+            assert_eq!(event.level, sentry::Level::Warning);
+            assert_eq!(
+                event.fingerprint.as_ref(),
+                &["runtime_upgrade", "boot_validation", "out_of_memory"]
+            );
+        }
+    }
+
+    #[test]
     fn missing_headroom_module_signal_only_fires_for_our_own_package() {
         // RUST-CY verbatim: the venv kept `headroom` but lost a submodule, so
         // every launch died on the same import until the wheel was reinstalled.
@@ -18477,6 +18579,9 @@ Some unrelated content.
             "exited with status exit status: 1 before opening port 6768\n--- log tail ---\n\
              Library not loaded: onnxruntime.dylib (code signature invalid)",
             "headroom proxy already running on port 6768",
+            // RUST-BA on 0.9.58: no memory for the runtime, verbatim tail.
+            "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+             OpenBLAS error: Memory allocation still failed after 10 retries, giving up.",
         ] {
             assert!(
                 !super::startup_death_needs_rebuild(Some(other)),
@@ -18654,6 +18759,14 @@ Some unrelated content.
         assert_eq!(
             startup_error_fingerprint_key(Some("(onnx probe: onnxruntime imports cleanly)")),
             None
+        );
+        // RUST-BA on 0.9.58: the machine had no memory for the runtime.
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+                 OpenBLAS error: Memory allocation still failed after 10 retries, giving up."
+            )),
+            Some("startup_out_of_memory")
         );
     }
 
