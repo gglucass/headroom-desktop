@@ -25,28 +25,37 @@
 # 0.41.0's core requires_dist adds truststore>=0.10.0, so truststore 0.10.4
 # (the macOS and Windows locks' pin, a pure-Python wheel) is added here.
 # 0.42.0: hf-xet 1.5.1 -> 1.6.0, its new core floor (see the macOS lock).
+# 0.44.0: mcp 1.30.0 -> 2.3.0 with mcp-types, httpx2 and httpcore2 (#4603),
+# click 8.5.0, opentelemetry-api 1.45.1, tomlkit 0.15.2 and python-socks 3.2.0,
+# the new floors (see the macOS lock). No tree-sitter or opentelemetry-sdk here.
 # ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
 # only two binaries, used only by the opt-in --intercept-tool-results the app never
 # passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
 # (RUST-6S on 0.9.46). scripts/check-python-locks.py excuses it.
-click==8.4.0 \
-    --hash=sha256:40c50b7c6c6adac2823d411041ec84f3f103f1b280d5e9ce0d7f998995832f81
+click==8.5.0 \
+    --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360
 fastapi==0.136.1 \
     --hash=sha256:a6e9d7eeada96c93a4d69cb03836b44fa34e2854accb7244a1ece36cd4781c3f
+httpcore2==2.16.0 \
+    --hash=sha256:5c4358319f2602d984ad93182c9fee5160f22e9da7babdda870a5e7c4e2dc34f
 httpx[http2,socks]==0.28.1 \
     --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+httpx2==2.16.0 \
+    --hash=sha256:fd2c5d7909e8d86fe92d53020c310ca0e4e431b838c207c5754b9bbf0308d49a
 litellm==1.88.6 \
     --hash=sha256:8c01f7e9aebded5b3509128be648518a2ec4f1feb8dfb87a539895091651898b
 magika==1.0.3 \
     --hash=sha256:3e9b49134e8116ee40b431664dcbed9e199413efddcce1a173c734b4e0521529 \
     --hash=sha256:938d8e033953f2ddeb8c35dc423aa289ca116bfa7a71a778f6e77460f9025803
-mcp==1.30.0 \
-    --hash=sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0
+mcp==2.3.0 \
+    --hash=sha256:dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377
+mcp-types==2.3.0 \
+    --hash=sha256:968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d
 onnxruntime==1.26.0 \
     --hash=sha256:91f2bb870a4b9224eba0a6728c1fa7a9e552b8e59e1083c51fbbc3d013f2b5c0 \
     --hash=sha256:9b6dd70599005bd1bf29779f04a91978b92b5e719c11a20068a8f8e535f725b6
-opentelemetry-api==1.41.1 \
-    --hash=sha256:a22df900e75c76dc08440710e51f52f1aa6b451b429298896023e60db5b3139f
+opentelemetry-api==1.45.1 \
+    --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb
 openai==2.37.0 \
     --hash=sha256:814633888b8f3b1ffd6615697c6e4ef93632d08b7c2e28c8c5ef3556e5a10107
 orjson==3.11.9 \
@@ -56,6 +65,8 @@ pip==26.2.2 \
     --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70
 pydantic==2.13.4 \
     --hash=sha256:45a282cde31d808236fd7ea9d919b128653c8b38b393d1c4ab335c62924d9aba
+python-socks[asyncio]==3.2.0 \
+    --hash=sha256:4cb349f43043eeeb12d10919cb992a7ce8671c2c5a836a47cb0c29d8def11d24
 pyyaml==6.0.3 \
     --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28 \
     --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
@@ -67,8 +78,8 @@ sqlite-vec==0.1.9 \
 tiktoken==0.13.0 \
     --hash=sha256:3f277ebea5edd7b8bf03c6f9431e1d67d517530115572b2dc1d465326e8f88c7 \
     --hash=sha256:a116178fa7e1b4065bff05214360373a65cac22f965be7b3f73d00a0dbfe7649
-tomlkit==0.15.1 \
-    --hash=sha256:177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304
+tomlkit==0.15.2 \
+    --hash=sha256:05562412163a3037b94497385fb7f9204c637bc605af7a48199e41cf2272f437
 truststore==0.10.4 \
     --hash=sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981
 transformers==5.12.1 \

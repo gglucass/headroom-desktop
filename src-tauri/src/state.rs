@@ -15629,9 +15629,10 @@ mod tests {
         // write once when it equals the uncached input (inferred) and sums a
         // reported one, disjoint since #4237 (0.42.0). The feed carries no
         // cache_inferred flag; /stats `prefix_cache.totals` drops inferred
-        // writes natively since #4285 (0.42.0), so it is summed raw. Recheck
-        // both on the bump.
-        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.42.0");
+        // writes natively since #4285 (0.42.0), so it is summed raw. Rechecked
+        // for 0.44.0: its only feed write change is Anthropic's. Recheck both
+        // on the bump.
+        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.44.0");
     }
 
     /// The /stats contract, in one place: every primary JSON path this app
