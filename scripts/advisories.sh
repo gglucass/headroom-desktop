@@ -45,14 +45,6 @@ python() {
   #   GHSA-g6cj-pr64-35w5 / GHSA-jwv3-5hgf-82ww / GHSA-m2h6-j472-rp4c,
   #   verified unreachable 2026-08-17 (see headroom-requirements.lock).
   #   Drop with that pin.
-  # - CVE-2026-114603 (opentelemetry-api <1.45.1, quadratic regex in
-  #   TraceState.from_header): reached only by extracting an inbound W3C
-  #   tracestate header. headroom uses OpenTelemetry to export its own
-  #   spans and metrics and never extracts inbound trace context, and
-  #   litellm's extract_traceparent runs only under its otel callback,
-  #   which headroom does not register. The 1.45.1 family adds two packages
-  #   to the closure and every lock change re-syncs each install's runtime,
-  #   so the bump rides the next lock refresh; drop the ignore with it.
   # - GHSA-xmj3-9gf7-h52w (setuptools 81.0.0, macOS and Windows locks:
   #   Wheel.install_as_egg writes an __init__.py stub at a path a wheel's
   #   namespace_packages.txt picks, Windows only): fix 84.1.0, but torch
@@ -86,7 +78,6 @@ python() {
       --ignore-vuln PYSEC-2026-3552 \
       --ignore-vuln PYSEC-2026-3553 \
       --ignore-vuln PYSEC-2026-3554 \
-      --ignore-vuln CVE-2026-114603 \
       --ignore-vuln GHSA-xmj3-9gf7-h52w \
       --ignore-vuln GHSA-g5ff-637f-6q2m || status=1
   done
