@@ -4120,10 +4120,13 @@ pub(crate) fn capture_upgrade_failure(
     // `startup_runtime_missing_stdlib`. One AV-hit host reopened RUST-29 on
     // 0.9.48 three times in seven minutes.
     let corrupt_base = tool_manager::is_corrupt_base_stdlib_signal(&technical_err);
+    let out_of_memory = is_out_of_memory_signal(&technical_err)
+        || ensure_error.is_some_and(is_out_of_memory_signal);
     let level = if endpoint_protection_suspected
         || loopback_socket_denied
         || network_refused
         || corrupt_base
+        || out_of_memory
     {
         sentry::protocol::Level::Warning
     } else {
@@ -4137,6 +4140,8 @@ pub(crate) fn capture_upgrade_failure(
         "network"
     } else if corrupt_base {
         "corrupt_base_stdlib"
+    } else if out_of_memory {
+        "out_of_memory"
     } else {
         outcome.unwrap_or("none")
     };
@@ -4438,13 +4443,15 @@ pub(crate) fn missing_dependency_modules(text: &str) -> Vec<&str> {
 }
 
 /// True for a `startup_error_fingerprint_key` that names a verdict of the
-/// machine's own configuration rather than anything we ship: reported once per
-/// session by `capture_headroom_start_failure` with a user-facing remedy, so
-/// the give-up and upgrade events that follow it stay at Warning.
+/// machine's own configuration or resources rather than anything we ship.
+/// These have a user-facing remedy, so the give-up and upgrade events that
+/// follow the start failure stay at Warning.
 pub(crate) fn is_environmental_startup_key(key: Option<&str>) -> bool {
     matches!(
         key,
-        Some("startup_endpoint_protection") | Some("startup_loopback_socket_denied")
+        Some("startup_endpoint_protection")
+            | Some("startup_loopback_socket_denied")
+            | Some("startup_out_of_memory")
     )
 }
 
@@ -11761,7 +11768,6 @@ pub(crate) fn startup_death_needs_rebuild(last_startup_error: Option<&str>) -> b
         && err.contains("before opening port")
         && !is_environmental_startup_key(key)
         && key != Some("startup_port_conflict")
-        && key != Some("startup_out_of_memory")
 }
 
 /// Claims the watchdog's runtime rebuild once per app version, persisted in
@@ -18432,6 +18438,88 @@ Some unrelated content.
             None
         );
         assert_eq!(give_up_startup_key(None, None), None);
+    }
+
+    #[test]
+    fn out_of_memory_stays_environmental_through_watchdog_give_up() {
+        let death = "exited with status exit code: 1 before opening port 6768";
+        let tail = "OpenBLAS error: Memory allocation still failed after 10 retries, giving up.";
+        let startup_error = format!("{death}\n--- log tail ---\n{tail}");
+        for (error, log_tail) in [
+            (Some(startup_error.as_str()), None),
+            (Some(death), Some(tail)),
+        ] {
+            let key = give_up_startup_key(error, log_tail);
+            assert_eq!(key, Some("startup_out_of_memory"));
+            // This is the predicate that keeps repeated startup failures at
+            // Warning in capture_watchdog_give_up.
+            assert!(is_environmental_startup_key(key));
+        }
+        assert_eq!(
+            super::auto_pause_notification_body(Some(&startup_error)),
+            "Your computer ran out of memory while Headroom's runtime was starting. \
+             Open Headroom to see how to fix it."
+        );
+        assert!(!super::startup_death_needs_rebuild(Some(&startup_error)));
+    }
+
+    #[test]
+    fn out_of_memory_upgrade_reports_keep_the_machine_cause() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        let memory = "OpenBLAS error: Memory allocation still failed after 10 retries, giving up.";
+        sentry::Hub::run(hub, || {
+            // Boot validation can carry the startup error in either channel.
+            for (err, diagnostics) in [
+                (anyhow::anyhow!(memory), None),
+                (
+                    anyhow::anyhow!("new runtime did not start"),
+                    Some(super::UpgradeBootDiagnostics {
+                        ensure_error: Some(memory.into()),
+                        ..Default::default()
+                    }),
+                ),
+            ] {
+                super::capture_upgrade_failure(
+                    &err,
+                    false,
+                    "boot_validation",
+                    Some("not_started"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    diagnostics,
+                );
+            }
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events.iter() {
+            assert_eq!(event.level, sentry::Level::Warning);
+            assert_eq!(
+                event.fingerprint.as_ref(),
+                &["runtime_upgrade", "boot_validation", "out_of_memory"]
+            );
+        }
     }
 
     #[test]
