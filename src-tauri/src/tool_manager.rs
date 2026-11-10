@@ -15122,8 +15122,12 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
 /// that exists everywhere (RUST-90/91: TLS-broken middleware on one machine).
 /// Requires BOTH signals so a genuinely bad pin with an incidental fetch
 /// warning keeps its no-matching-dist verdict (RUST-6S listed real versions).
+/// pip logs a connection error's "Could not fetch URL" at debug, so resets
+/// that outlast `--retries` leave only urllib3's retry warnings (RUST-29 on
+/// 0.9.58: pypi.org reset every hf-xet lookup, filed as a bad pin at Error).
 pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
-    lower.contains("could not fetch url") && lower.contains("from versions: none")
+    (lower.contains("could not fetch url") || lower.contains("after connection broken by"))
+        && lower.contains("from versions: none")
 }
 
 /// Coarse cause class for a pip failure, used as the Sentry fingerprint.
@@ -19802,6 +19806,14 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         assert!(pip_index_fetch_failed(
             "could not fetch url https://pypi.org/simple/x/: ssl eof\n\
              error: could not find a version that satisfies x==1 (from versions: none)"
+        ));
+        // RUST-29 on 0.9.58: connection resets print only retry warnings.
+        assert!(pip_index_fetch_failed(
+            "warning: retrying (retry(total=0, connect=none, read=none, redirect=none, \
+             status=none)) after connection broken by 'connectionreseterror(10054)': \
+             /simple/hf-xet/\n\
+             error: could not find a version that satisfies the requirement \
+             hf-xet==1.6.0 (from versions: none)"
         ));
         // A real bad pin lists the versions pip DID see (RUST-6S).
         assert!(!pip_index_fetch_failed(
