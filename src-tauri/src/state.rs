@@ -896,9 +896,13 @@ impl AppState {
         }
         self.tool_manager.ensure_codex_skill_nudges();
         self.tool_manager.hide_ponytail_band_once();
-        // npm can take a minute, and this runs before the proxy starts.
+        // npm can take a minute, and this runs before the proxy starts. One
+        // thread: both helpers rewrite the same agent configs.
         let tools = self.tool_manager.clone();
-        std::thread::spawn(move || tools.ensure_context7_registration());
+        std::thread::spawn(move || {
+            tools.ensure_context7_registration();
+            tools.ensure_serena_registration();
+        });
 
         // Heals installs already in the field: older installs and pre-fix venv
         // swaps never vendored the MSVC runtime DLLs, so on a redist-less

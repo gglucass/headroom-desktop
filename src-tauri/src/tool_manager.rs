@@ -2082,6 +2082,10 @@ pub(crate) const CONTEXT7_HOSTED_URL: &str = "https://mcp.context7.com/mcp?via=h
 /// minute could otherwise interleave with it and leave the receipt and the
 /// agents' entries disagreeing.
 static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// Same as `CONTEXT7_LIFECYCLE`, for Serena's launch move to `SERENA_MAIN`.
+static SERENA_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// What serena's console script runs; serena-agent has no `python -m` entry.
+const SERENA_MAIN: &str = "from serena.cli import top_level; top_level()";
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -2185,7 +2189,7 @@ def keep_markers(registrar, name):
 /// Rust. Mirrors upstream `_setup_serena_mcp` / `_remove_headroom_installed_serena_mcp`
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
-/// argv: `register <serena-bin> [<uvx>]` | `unregister`.
+/// argv: `register <command> <uvx or ""> [<launch args>...]` | `unregister`.
 const SERENA_MCP_HELPER: &str = concat!(
     mcp_helper_keep_markers!(),
     r#"
@@ -2206,7 +2210,8 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
-env = {"UVX": sys.argv[3]} if len(sys.argv) > 3 else {}
+env = {"UVX": sys.argv[3]} if len(sys.argv) > 3 and sys.argv[3] else {}
+launch = tuple(sys.argv[4:])
 failures = []
 # Claude/Codex only: serena's --context values are named profiles and no
 # grok/opencode context has been validated against serena yet.
@@ -2218,7 +2223,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         spec = ServerSpec(
             name="serena",
             command=sys.argv[2],
-            args=(
+            args=launch + (
                 "start-mcp-server",
                 "--project-from-cwd",
                 "--context",
@@ -6440,10 +6445,23 @@ impl ToolManager {
         if !self.markitdown_installed() {
             return Ok(());
         }
-        let bin = self.markitdown_entrypoint();
-        run_command_with_timeout(&bin, &["--help"], &self.runtime.root_dir, timeout)
-            .with_context(|| format!("running markitdown smoke test with {}", bin.display()))?;
-        Ok(())
+        self.run_markitdown_help(timeout)
+            .context("running markitdown smoke test")
+    }
+
+    /// What the shims run: python, never markitdown.exe, which Smart App
+    /// Control blocks (RUST-W0; see `serena_command`).
+    fn run_markitdown_help(&self, timeout: Duration) -> Result<()> {
+        run_command_with_timeout(
+            &self.runtime.managed_python(),
+            &[
+                "-c",
+                crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
+                "--help",
+            ],
+            &self.runtime.root_dir,
+            timeout,
+        )
     }
 
     /// Plugin addons are host plugins, not binaries we own, so "smoke test"
@@ -8467,11 +8485,11 @@ impl ToolManager {
         };
         format!(
             "@echo off\r\n\
-             setlocal\r\n\
-             rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+             setlocal DisableDelayedExpansion\r\n\
+             rem Headroom-managed markitdown shim. Runs markitdown, then counts a conversion that succeeded.\r\n\
              rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
              set PYTHONUTF8=1\r\n\
-             \"{real}\" %*\r\n\
+             \"{python}\" -c \"{main}\" %*\r\n\
              if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
              if \"%~1\"==\"\" exit /b 0\r\n\
              if \"%~1\"==\"--help\" exit /b 0\r\n\
@@ -8483,7 +8501,11 @@ impl ToolManager {
              move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
              exit /b 0\r\n",
             counter = from_shim(self.markitdown_conversion_counter_path()),
-            real = from_shim(self.markitdown_entrypoint()),
+            // Not markitdown.exe: Smart App Control blocks pip's per-machine
+            // launchers (see `serena_command`). Single quotes keep the code one
+            // cmd argument.
+            python = from_shim(self.runtime.managed_python()),
+            main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO.replace('"', "'"),
         )
     }
 
@@ -8542,14 +8564,7 @@ impl ToolManager {
         // pays Gatekeeper/EDR scanning of the new files plus cold imports
         // (RUST-22). The core 15s bound here killed it, and a venv rebuild then
         // uninstalled the addon (RUST-M0, macOS 27).
-        let smoke = || {
-            run_command_with_timeout(
-                &self.markitdown_entrypoint(),
-                &["--help"],
-                &self.runtime.root_dir,
-                MARKITDOWN_SMOKE_TEST_TIMEOUT,
-            )
-        };
+        let smoke = || self.run_markitdown_help(MARKITDOWN_SMOKE_TEST_TIMEOUT);
         smoke()
             .or_else(|_| smoke())
             .context("markitdown installed but failed its smoke test")?;
@@ -8699,6 +8714,25 @@ impl ToolManager {
         self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
+    fn serena_python(&self) -> PathBuf {
+        self.serena_venv_dir()
+            .join(bin_subdir())
+            .join(python_exe_name())
+    }
+
+    /// How agents start Serena. Not serena.exe on Windows: pip writes that
+    /// launcher on each machine with the machine's own paths inside, so no two
+    /// copies match and Smart App Control, which only runs files it knows,
+    /// blocks it every time (customer report 2026-11-10). python.exe is the
+    /// same file everywhere, and the backend already runs on it there.
+    fn serena_command(&self) -> (PathBuf, Vec<&'static str>) {
+        if cfg!(target_os = "windows") {
+            (self.serena_python(), vec!["-c", SERENA_MAIN])
+        } else {
+            (self.serena_entrypoint(), Vec::new())
+        }
+    }
+
     pub fn serena_uvx(&self) -> PathBuf {
         let name = if cfg!(target_os = "windows") {
             "uvx.exe"
@@ -8719,6 +8753,7 @@ impl ToolManager {
     }
 
     pub fn install_serena(&self) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         retire_venv(&self.serena_venv_dir())?;
         // --clear so a retry after a partial install starts from a clean venv.
         run_command_with_timeout(
@@ -8733,12 +8768,8 @@ impl ToolManager {
             Duration::from_secs(120),
         )
         .context("creating serena venv")?;
-        let serena_python = self
-            .serena_venv_dir()
-            .join(bin_subdir())
-            .join(python_exe_name());
         run_pip_install_with_retries_streaming(
-            &serena_python,
+            &self.serena_python(),
             &[
                 "-m",
                 "pip",
@@ -8761,23 +8792,62 @@ impl ToolManager {
                 );
             }
         }
+        // The way agents will start it, so a launch Windows blocks fails here.
+        let (command, mut smoke) = self.serena_command();
+        smoke.push("--help");
         run_command_with_timeout(
-            &self.serena_entrypoint(),
-            &["--help"],
+            &command,
+            &smoke,
             &self.runtime.root_dir,
             SERENA_SMOKE_TEST_TIMEOUT,
         )
         .context("serena installed but failed its smoke test")?;
         self.register_serena_mcp()?;
         set_serena_global_gitignore(true);
+        self.write_serena_receipt(true)
+    }
+
+    fn write_serena_receipt(&self, enabled: bool) -> Result<()> {
         self.write_tool_receipt(
             "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": true }),
-        )?;
-        Ok(())
+            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled, "python_launch": true }),
+        )
+    }
+
+    /// Windows installs from before `serena_command` still start serena.exe,
+    /// which Smart App Control blocks; an enabled one moves over at launch. A
+    /// failure keeps the old entry, and the next launch tries again.
+    pub fn ensure_serena_registration(&self) {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
+        if !self.serena_needs_move(cfg!(target_os = "windows")) {
+            return;
+        }
+        let moved = self.register_serena_mcp().and_then(|()| {
+            // Keeps the installed version: only a reinstall changes it.
+            let mut receipt = self
+                .read_tool_receipt("serena")
+                .unwrap_or_else(|| json!({}));
+            if let Some(fields) = receipt.as_object_mut() {
+                fields.insert("python_launch".into(), json!(true));
+            }
+            self.write_tool_receipt("serena", receipt)
+        });
+        match moved {
+            Ok(()) => log::info!("serena moved to the python.exe launch"),
+            Err(err) => log::warn!("moving serena to the python.exe launch failed: {err:#}"),
+        }
+    }
+
+    fn serena_needs_move(&self, windows: bool) -> bool {
+        let moved = self
+            .read_tool_receipt("serena")
+            .and_then(|r| r.get("python_launch")?.as_bool())
+            == Some(true);
+        windows && self.serena_installed() && self.tool_enabled("serena") && !moved
     }
 
     pub fn set_serena_enabled(&self, enabled: bool) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         if !self.serena_installed() {
             bail!("serena is not installed");
         }
@@ -8786,14 +8856,11 @@ impl ToolManager {
         } else {
             self.unregister_serena_mcp()?;
         }
-        self.write_tool_receipt(
-            "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled }),
-        )?;
-        Ok(())
+        self.write_serena_receipt(enabled)
     }
 
     pub fn uninstall_serena(&self) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         // Unregister before deleting the venv, and fail if it doesn't land: a
         // leftover MCP entry pointing at a deleted binary would make every new
         // agent session spawn a failing server.
@@ -8813,13 +8880,16 @@ impl ToolManager {
 
     fn register_serena_mcp(&self) -> Result<()> {
         set_serena_browser_dashboard();
-        let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
-        let uvx = self.serena_uvx().to_string_lossy().into_owned();
-        let mut args = vec!["-c", SERENA_MCP_HELPER, "register", &entrypoint];
+        let (command, launch) = self.serena_command();
+        let command = command.to_string_lossy().into_owned();
         // A pre-uv venv keeps registering without it, as before.
-        if self.serena_uvx().exists() {
-            args.push(&uvx);
-        }
+        let uvx = if self.serena_uvx().exists() {
+            self.serena_uvx().to_string_lossy().into_owned()
+        } else {
+            String::new()
+        };
+        let mut args = vec!["-c", SERENA_MCP_HELPER, "register", &command, &uvx];
+        args.extend(launch);
         self.run_mcp_helper(&args, "Adding Serena to your agents")
     }
 
@@ -24027,6 +24097,23 @@ Always run the linter first.
         assert!(!listed_tool(&manager, "serena").update_available);
     }
 
+    #[test]
+    fn only_an_enabled_windows_serena_without_the_python_launch_moves_at_launch() {
+        let (_root, runtime, manager) = seed_test_runtime("serena-move");
+        let entrypoint = manager.serena_entrypoint();
+        fs::create_dir_all(entrypoint.parent().expect("bin parent")).expect("bin dir");
+        fs::write(&entrypoint, b"#!/bin/sh\n").expect("entrypoint");
+        let receipt =
+            |json: &str| fs::write(runtime.tools_dir.join("serena.json"), json).expect("receipt");
+        receipt(r#"{"version":"2.0.0","enabled":true}"#);
+        assert!(manager.serena_needs_move(true));
+        assert!(!manager.serena_needs_move(false));
+        receipt(r#"{"version":"2.0.0","enabled":false}"#);
+        assert!(!manager.serena_needs_move(true));
+        receipt(r#"{"version":"2.0.0","enabled":true,"python_launch":true}"#);
+        assert!(!manager.serena_needs_move(true));
+    }
+
     fn retired_leftovers(parent: &Path) -> usize {
         fs::read_dir(parent)
             .expect("read parent")
@@ -26247,6 +26334,84 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(read(".config/opencode/opencode.json").contains("npx"));
     }
 
+    /// The real Serena helper against the installed wheel's registrars, in a
+    /// scratch home: a serena.exe entry from before `serena_command` moves to
+    /// the python.exe launch with the uvx env kept, a rerun is a no-op, and
+    /// unregister removes it.
+    #[test]
+    fn serena_helper_moves_an_entry_to_the_python_launch_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".codex", ".claude", ".headroom"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{text}");
+            text
+        };
+        let helper = super::SERENA_MCP_HELPER;
+        let (exe, venv_python, uvx) = (
+            "/v/Scripts/serena.exe",
+            "/v/Scripts/python.exe",
+            "/v/Scripts/uvx.exe",
+        );
+        let old = run(&["-c", helper, "register", exe, uvx]);
+        assert!(old.contains("claude: registered"), "{old}");
+        let new_form = [
+            "-c",
+            helper,
+            "register",
+            venv_python,
+            uvx,
+            "-c",
+            super::SERENA_MAIN,
+        ];
+        let moved = run(&new_form);
+        for agent in ["claude: registered", "codex: registered"] {
+            assert!(moved.contains(agent), "{moved}");
+        }
+        let read = |path: &str| std::fs::read_to_string(home.path().join(path)).unwrap();
+        let claude: serde_json::Value = serde_json::from_str(&read(".claude.json")).unwrap();
+        let entry = &claude["mcpServers"]["serena"];
+        assert_eq!(entry["command"], venv_python, "{entry}");
+        assert_eq!(
+            entry["args"].as_array().unwrap()[..3],
+            ["-c", super::SERENA_MAIN, "start-mcp-server"],
+            "{entry}"
+        );
+        assert_eq!(entry["env"]["UVX"], uvx, "{entry}");
+        let codex = read(".codex/config.toml");
+        assert!(
+            codex.contains(venv_python) && !codex.contains(exe),
+            "{codex}"
+        );
+
+        let again = run(&new_form);
+        assert!(!again.contains(": registered"), "a rerun rewrote: {again}");
+        let gone = run(&["-c", helper, "unregister"]);
+        assert_eq!(gone.matches(": removed").count(), 2, "{gone}");
+        assert!(!read(".claude.json").contains("serena"));
+    }
+
     /// `codex mcp add` (0.166) rewrites config.toml without the comment above
     /// a table, so Headroom's start marker goes and the new table lands
     /// before the end marker; "always allow" adds a per-tool table. Disabling
@@ -26668,6 +26833,14 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(script.is_ascii(), "{script}");
         assert!(script.contains("\"%~dp0..\\runtime"), "{script}");
         assert!(script.contains("set \"C=%~dp0..\\tools"), "{script}");
+        // python.exe, not pip's markitdown.exe launcher, which Smart App
+        // Control blocks; the code is one quoted argument with no `"` inside.
+        let launch = script
+            .lines()
+            .find(|l| l.contains(" -c "))
+            .expect("launch line");
+        assert!(!launch.contains("markitdown.exe"), "{launch}");
+        assert_eq!(launch.matches('"').count(), 4, "{launch}");
         // cmd opens a `<` redirect before `2>nul` applies, so reading the
         // counter bare printed "The system cannot find the file specified."
         // on the first conversion (rc9 win-test VM). No counter yet reads as 0.
@@ -26857,14 +27030,19 @@ assert OpencodeRegistrar().register_server(own).ok"#,
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
+    fn smoke_test_markitdown_succeeds_when_python_runs_it() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
         fs::write(
             runtime.tools_dir.join("markitdown.json"),
             br#"{"version":"0.1.6","enabled":true}"#,
         )
         .expect("receipt");
-        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 9\n");
+        // python -c <main> --help, as the shims run it; markitdown.exe never.
+        write_executable(
+            &manager.managed_python(),
+            "#!/bin/sh\n[ \"$1\" = -c ] && [ \"$3\" = --help ] && case \"$2\" in *markitdown.__main__*) exit 0;; esac\nexit 4\n",
+        );
 
         manager
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
@@ -26881,7 +27059,8 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             br#"{"version":"0.1.6","enabled":true}"#,
         )
         .expect("receipt");
-        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 3\n");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        write_executable(&manager.managed_python(), "#!/bin/sh\nexit 3\n");
 
         manager
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
