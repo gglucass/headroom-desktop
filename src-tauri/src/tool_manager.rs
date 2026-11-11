@@ -6882,7 +6882,12 @@ impl ToolManager {
         // initiated recovery from a botched in-place upgrade) or when
         // `prepare_in_place_upgrade` decides the receipt isn't safe to
         // mutate in-place.
-        if !force_rebuild {
+        // A same-version artifact replacement (the signed Windows wheel) must
+        // retain the original venv: an in-place rollback records only a version
+        // and cannot distinguish the old artifact from the replacement.
+        let replacing_same_version =
+            self.installed_headroom_version().as_deref() == Some(release.version.as_str());
+        if !force_rebuild && !replacing_same_version {
             if let Some(ctx) = self.prepare_in_place_upgrade() {
                 return self.in_place_upgrade_headroom(release, ctx, progress);
             }
@@ -7460,8 +7465,7 @@ impl ToolManager {
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
         let pinned = pinned_headroom_release()?;
-        let sha256 = (version == pinned.version).then_some(pinned.index_sha256.as_str());
-        let spec = headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)?;
+        let spec = self.headroom_reinstall_requirement(version, &pinned)?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
@@ -7484,6 +7488,24 @@ impl ToolManager {
             |_| {},
         )
         .with_context(|| format!("reinstalling Headroom version {version}"))
+    }
+
+    fn headroom_reinstall_requirement(
+        &self,
+        version: &str,
+        pinned: &HeadroomRelease,
+    ) -> Result<String> {
+        if version == pinned.version && pinned.sha256 != pinned.index_sha256 {
+            // Repairs must keep the signed Windows extension. Reinstalling the
+            // same version from PyPI replaced it with unsigned bytes and App
+            // Control refused the repaired runtime. Download/verify first, so
+            // a network failure leaves the installed files untouched.
+            let wheel_path = self.wheel_download_path(&pinned.wheel_url);
+            download_to_path(&pinned.wheel_url, &wheel_path, Some(&pinned.sha256))?;
+            return Ok(wheel_path.to_string_lossy().into_owned());
+        }
+        let sha256 = (version == pinned.version).then_some(pinned.index_sha256.as_str());
+        headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)
     }
 
     /// Recover from a pydantic / pydantic-core version skew (the SystemError
@@ -20152,6 +20174,43 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
     }
 
     #[test]
+    fn signed_wheel_repair_reuses_the_verified_artifact_instead_of_pypi() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        manager.runtime.ensure_layout().unwrap();
+        let mut win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        let signed = b"signed wheel fixture";
+        win.sha256 = super::sha256_bytes(signed);
+        let wheel_path = manager.wheel_download_path(&win.wheel_url);
+        fs::write(&wheel_path, signed).unwrap();
+        let arg = manager
+            .headroom_reinstall_requirement(&win.version, &win)
+            .unwrap();
+        assert_eq!(PathBuf::from(arg), wheel_path);
+        super::verify_sha256_file(&wheel_path, &win.sha256).unwrap();
+
+        // A rollback to another engine must still restore that engine.
+        assert_eq!(
+            manager
+                .headroom_reinstall_requirement("0.43.0", &win)
+                .unwrap(),
+            "headroom-ai==0.43.0"
+        );
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        let arg = manager
+            .headroom_reinstall_requirement(&mac.version, &mac)
+            .unwrap();
+        let requirements = fs::read_to_string(arg.strip_prefix("--requirement=").unwrap()).unwrap();
+        assert_eq!(
+            requirements,
+            format!(
+                "headroom-ai=={} --hash=sha256:{}\n",
+                mac.version, mac.index_sha256
+            )
+        );
+    }
+
+    #[test]
     fn abandoned_bootstrap_marker_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
@@ -25572,6 +25631,45 @@ Always run the linter first.
         );
         // Stale backup purged (either consumed during restore or cleaned at start).
         assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn same_version_artifact_upgrade_restores_original_venv_on_failure() {
+        let (root, runtime, manager) = seed_test_runtime("same-version-artifact");
+        let version = HEADROOM_PINNED_VERSION;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "version": version,
+            "artifact": {"requirementsLockSha256": requirements_lock_sha(super::bootstrap_requirements_lock())},
+        }))
+        .unwrap();
+        fs::write(manager.headroom_receipt_path(), &receipt).unwrap();
+        // Eligible for the old in-place path. A failed pip install and its
+        // failed pip rollback must not lose this otherwise-working runtime.
+        assert!(manager.prepare_in_place_upgrade().is_some());
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 1\n");
+        let wheel = b"replacement wheel fixture";
+        let release = HeadroomRelease {
+            version: version.into(),
+            wheel_url: format!("http://127.0.0.1:9/headroom_ai-{version}-py3-none-any.whl"),
+            sha256: super::sha256_bytes(wheel),
+            index_sha256: "original artifact hash".into(),
+        };
+        fs::write(manager.wheel_download_path(&release.wheel_url), wheel).unwrap();
+        // No standalone Python: rebuilding fails before installation. The
+        // directory swap must put the original venv and receipt back exactly.
+        let outcome = manager.atomic_upgrade_headroom(&release, |_| {}, false);
+        assert!(matches!(
+            outcome,
+            UpgradeOutcome::InstallFailed { restored: true, .. }
+        ));
+        assert_eq!(
+            fs::read(runtime.venv_dir.join("marker")).unwrap(),
+            b"live-v1"
+        );
+        assert_eq!(fs::read(manager.headroom_receipt_path()).unwrap(), receipt);
+        assert!(!manager.upgrade_interrupted());
         let _ = fs::remove_dir_all(root);
     }
 
