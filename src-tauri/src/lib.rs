@@ -9805,6 +9805,10 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // workspace owner to refill in order to continue.` -- the ChatGPT
         // workspace's credit pool.
         "out of credits",
+        // RUST-W8: Codex on an Ollama Cloud model, `ERROR: stream
+        // disconnected before completion: Add usage credits or subscribe and
+        // save up to 66%: https://ollama.com/plans` -- Ollama's credit pool.
+        "add usage credits",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -17517,6 +17521,11 @@ Some unrelated content.
         // RUST-QQ verbatim (Codex).
         let workspace = "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.";
         assert_eq!(learn_failure_agent_limit_line(workspace), Some(workspace));
+        // RUST-W8 verbatim (Codex on an Ollama Cloud model), after its
+        // reconnect lines.
+        let ollama = "ERROR: stream disconnected before completion: Add usage credits or subscribe and save up to 66%: https://ollama.com/plans (ref: 2ba04edb-7d50-4461-abb3-b144d71d7ea3)";
+        let stderr = format!("ERROR: Reconnecting... 5/5\n{ollama}\n");
+        assert_eq!(learn_failure_agent_limit_line(&stderr), Some(ollama));
     }
 
     #[test]
