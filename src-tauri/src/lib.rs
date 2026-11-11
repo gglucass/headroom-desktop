@@ -4028,7 +4028,7 @@ pub(crate) struct UpgradeBootDiagnostics {
 
 /// The upgrade died on a pip run the pip runner files under `network`: the
 /// machine's network refused PyPI (a web filter's 403, an offline host).
-fn upgrade_pip_network_refused(err: &anyhow::Error) -> bool {
+pub(crate) fn upgrade_pip_network_refused(err: &anyhow::Error) -> bool {
     let is_pip = err
         .chain()
         .filter_map(|c| c.downcast_ref::<tool_manager::CommandFailure>())
@@ -18997,6 +18997,19 @@ Some unrelated content.
             ),
         );
         assert!(upgrade_pip_network_refused(&forbidden));
+        // RUST-29 / RUST-W5 on 0.9.59: pypi.org reset every index lookup, so
+        // only urllib3's retry warnings precede "(from versions: none)".
+        let reset = failure(
+            &pip,
+            "WARNING: Retrying (Retry(total=9, connect=None, read=None, redirect=None, \
+             status=None)) after connection broken by 'ProtocolError('Connection aborted.', \
+             RemoteDisconnected('Remote end closed connection without response'))': \
+             /simple/headroom-ai/\n\
+             ERROR: Could not find a version that satisfies the requirement \
+             headroom-ai==0.41.0 (from versions: none)\n\
+             ERROR: No matching distribution found for headroom-ai==0.41.0\n",
+        );
+        assert!(upgrade_pip_network_refused(&reset));
 
         // The open WinError 32 question must keep reopening RUST-29.
         let file_lock = failure(

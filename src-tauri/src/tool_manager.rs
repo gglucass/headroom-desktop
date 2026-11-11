@@ -6749,7 +6749,15 @@ impl ToolManager {
             if let Err(err) =
                 self.restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
             {
-                log::warn!(
+                // Offline, or a network that resets PyPI (RUST-W5), is that
+                // case: local log only. Any other pip failure still reports.
+                let level = if crate::upgrade_pip_network_refused(&err) {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
                     "recover_from_interrupted_upgrade: {err:#}; keeping upgrade marker for retry"
                 );
                 return false;
