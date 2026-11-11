@@ -4028,7 +4028,7 @@ pub(crate) struct UpgradeBootDiagnostics {
 
 /// The upgrade died on a pip run the pip runner files under `network`: the
 /// machine's network refused PyPI (a web filter's 403, an offline host).
-fn upgrade_pip_network_refused(err: &anyhow::Error) -> bool {
+pub(crate) fn upgrade_pip_network_refused(err: &anyhow::Error) -> bool {
     let is_pip = err
         .chain()
         .filter_map(|c| c.downcast_ref::<tool_manager::CommandFailure>())
@@ -9805,6 +9805,10 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // workspace owner to refill in order to continue.` -- the ChatGPT
         // workspace's credit pool.
         "out of credits",
+        // RUST-W8: Codex on an Ollama Cloud model, `ERROR: stream
+        // disconnected before completion: Add usage credits or subscribe and
+        // save up to 66%: https://ollama.com/plans` -- Ollama's credit pool.
+        "add usage credits",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -17517,6 +17521,11 @@ Some unrelated content.
         // RUST-QQ verbatim (Codex).
         let workspace = "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.";
         assert_eq!(learn_failure_agent_limit_line(workspace), Some(workspace));
+        // RUST-W8 verbatim (Codex on an Ollama Cloud model), after its
+        // reconnect lines.
+        let ollama = "ERROR: stream disconnected before completion: Add usage credits or subscribe and save up to 66%: https://ollama.com/plans (ref: 2ba04edb-7d50-4461-abb3-b144d71d7ea3)";
+        let stderr = format!("ERROR: Reconnecting... 5/5\n{ollama}\n");
+        assert_eq!(learn_failure_agent_limit_line(&stderr), Some(ollama));
     }
 
     #[test]
@@ -18988,6 +18997,19 @@ Some unrelated content.
             ),
         );
         assert!(upgrade_pip_network_refused(&forbidden));
+        // RUST-29 / RUST-W5 on 0.9.59: pypi.org reset every index lookup, so
+        // only urllib3's retry warnings precede "(from versions: none)".
+        let reset = failure(
+            &pip,
+            "WARNING: Retrying (Retry(total=9, connect=None, read=None, redirect=None, \
+             status=None)) after connection broken by 'ProtocolError('Connection aborted.', \
+             RemoteDisconnected('Remote end closed connection without response'))': \
+             /simple/headroom-ai/\n\
+             ERROR: Could not find a version that satisfies the requirement \
+             headroom-ai==0.41.0 (from versions: none)\n\
+             ERROR: No matching distribution found for headroom-ai==0.41.0\n",
+        );
+        assert!(upgrade_pip_network_refused(&reset));
 
         // The open WinError 32 question must keep reopening RUST-29.
         let file_lock = failure(

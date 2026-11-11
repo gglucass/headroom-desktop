@@ -9534,8 +9534,8 @@ pub(crate) fn claude_statusline_script_path() -> PathBuf {
 /// Percentages are cut to whole numbers as strings: bash's float printf reads
 /// "23.5" as invalid under a comma-decimal locale.
 ///
-/// Plain bash, parsing with regexes, because it runs every second
-/// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
+/// Plain bash, parsing with regexes, because it runs every second outside
+/// Windows (`statusline_entry`): ~4 ms per render against ~30 ms for a Python start.
 /// No subshells or external commands on the common path: under Git Bash each
 /// is an MSYS fork, and the six per render this used to cost took +8.3% of a
 /// 2-vCPU Windows VM per Claude Code session, +3.5% without them (win-test,
@@ -9661,7 +9661,8 @@ fn is_our_statusline(value: &Value) -> bool {
 }
 
 /// The script path after a leading bash program, as Windows writes the
-/// command: `"C:\Program Files\Git\bin\bash.exe" "<script>"`, or bare `bash`.
+/// command: `source "<script>"` ([`statusline_command`]), or as older builds
+/// did, `"C:\Program Files\Git\bin\bash.exe" "<script>"` or bare `bash`.
 fn without_bash_program(command: &str) -> Option<&str> {
     let command = command.trim();
     let (program, rest) = match command.strip_prefix('"') {
@@ -9669,7 +9670,26 @@ fn without_bash_program(command: &str) -> Option<&str> {
         None => command.split_once(char::is_whitespace)?,
     };
     let name = program.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
-    matches!(name.as_str(), "bash" | "bash.exe").then_some(rest)
+    matches!(name.as_str(), "bash" | "bash.exe" | "source").then_some(rest)
+}
+
+/// The command Claude Code runs for our status line. On Windows Claude Code
+/// already runs the line through Git Bash (`bash.exe -c <command>`), so the
+/// script is sourced into that shell: naming bash.exe again started two more
+/// processes per render (win-mini, 2026-11-10). `source`, not `.`: a
+/// PowerShell that ever got the line fails on an unknown command instead of
+/// opening the .sh through its file association. Forward slashes, so bash does
+/// not search PATH for a sourced name without a `/`.
+fn statusline_command(script: &Path, windows: bool) -> String {
+    let path = script.to_string_lossy();
+    if windows {
+        format!(
+            "source \"{}\"",
+            shell_double_quote(&path.replace('\\', "/"))
+        )
+    } else {
+        format!("\"{}\"", shell_double_quote(&path))
+    }
 }
 
 fn is_our_statusline_command(command: &str) -> bool {
@@ -9684,6 +9704,32 @@ fn is_our_statusline_command(command: &str) -> bool {
         !path.contains(['"', ';', '&', '|', '`', '\n'])
             && path.rsplit(['/', '\\']).next() == Some(CLAUDE_STATUSLINE_SCRIPT)
     })
+}
+
+/// Our `statusLine` entry. Outside Windows it re-renders every second
+/// (`refreshInterval`) so the highlight switches off on time and a saving
+/// landing between Claude Code's own event-driven renders shows. Not on
+/// Windows: each render there starts Claude Code's Git Bash (two processes and
+/// a conhost), and once a second per session stalled the whole machine (input
+/// stutter, games unplayable). A user's edits to our entry (a removed or
+/// changed `refreshInterval`, `padding`) are kept: only the command is ours.
+/// Pure so both branches are tested everywhere.
+fn statusline_entry(command: &str, current: Option<&Value>, windows: bool) -> Value {
+    let mut entry = match current {
+        Some(current) => current.clone(),
+        None if windows => serde_json::json!({}),
+        None => serde_json::json!({ "refreshInterval": 1 }),
+    };
+    entry["type"] = "command".into();
+    entry["command"] = command.into();
+    // shortcut: a Windows user's own refreshInterval of exactly 1 reads as the
+    // default older builds wrote there and is dropped; 2 or more is kept.
+    if windows && entry["refreshInterval"] == 1 {
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("refreshInterval");
+        }
+    }
+    entry
 }
 
 /// `statusLine` is a single slot in ~/.claude/settings.json. Ours goes in only
@@ -9712,10 +9758,7 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
             if current.is_some_and(|v| !is_our_statusline(v)) {
                 return Ok(false);
             }
-            // refreshInterval: the highlight has to switch off on time, and a
-            // saving can land between Claude Code's own event-driven renders.
-            let desired =
-                serde_json::json!({ "type": "command", "command": command, "refreshInterval": 1 });
+            let desired = statusline_entry(command, current, cfg!(windows));
             if current == Some(&desired) {
                 return Ok(false);
             }
@@ -9742,10 +9785,8 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
     Ok(true)
 }
 
-/// Install the savings statusline. On Windows Claude Code runs statusline
-/// commands through Git Bash, as it does the hooks, so the command names
-/// bash.exe the way theirs does (`hook_shell_command`). A no-op when the user
-/// turned it off or already has a statusline of their own.
+/// Install the savings statusline ([`statusline_command`]). A no-op when the
+/// user turned it off or already has a statusline of their own.
 fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     crate::claude_statusline::set_off(false);
     if is_statusline_disabled() {
@@ -9768,11 +9809,7 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     if let Some(backup) = backup {
         backups.push(backup.display().to_string());
     }
-    let command = if cfg!(windows) {
-        hook_shell_command(&script)?
-    } else {
-        format!("\"{}\"", shell_double_quote(&script.to_string_lossy()))
-    };
+    let command = statusline_command(&script, cfg!(windows));
     if set_claude_statusline_setting(Some(&command))? {
         changed.push(claude_settings_path().display().to_string());
     }
@@ -20249,6 +20286,45 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         assert!(!ours(
             r#"bash "C:\Users\a\mine.sh"; "C:\Users\a\.claude\hooks\headroom-statusline.sh""#
         ));
+        assert!(!ours(r#"source "C:/Users/a/mine.sh""#));
+    }
+
+    /// A once-a-second re-render on Windows, each through two more bash
+    /// processes, stalled a customer's machine. Windows sources the script
+    /// into Claude Code's own Git Bash with no timer, and the entry older
+    /// builds wrote there is still ours, so setup rewrites it. A user's edits
+    /// to our entry are kept on every OS.
+    #[test]
+    fn statusline_entry_times_only_off_windows_and_keeps_user_edits() {
+        use super::{is_our_statusline, statusline_command, statusline_entry};
+        let script = std::path::Path::new(r"C:\Users\a b\.claude\hooks\headroom-statusline.sh");
+        let command = statusline_command(script, true);
+        assert_eq!(
+            command,
+            r#"source "C:/Users/a b/.claude/hooks/headroom-statusline.sh""#
+        );
+        let fresh = statusline_entry(&command, None, true);
+        assert!(is_our_statusline(&fresh));
+        assert_eq!(fresh, json!({ "type": "command", "command": command }));
+        assert_eq!(statusline_entry("x", None, false)["refreshInterval"], 1);
+
+        let old = json!({
+            "type": "command",
+            "command": r#""C:\Program Files\Git\bin\bash.exe" "C:\Users\a b\.claude\hooks\headroom-statusline.sh""#,
+            "refreshInterval": 1,
+            "padding": 0,
+        });
+        assert!(is_our_statusline(&old));
+        assert_eq!(
+            statusline_entry(&command, Some(&old), true),
+            json!({ "type": "command", "command": command, "padding": 0 })
+        );
+
+        let slow = json!({ "type": "command", "command": command, "refreshInterval": 10 });
+        assert_eq!(statusline_entry(&command, Some(&slow), true), slow);
+        let mac = "\"/Users/a/.claude/hooks/headroom-statusline.sh\"";
+        let untimed = json!({ "type": "command", "command": mac });
+        assert_eq!(statusline_entry(mac, Some(&untimed), false), untimed);
     }
 
     #[cfg(unix)]
@@ -20268,6 +20344,17 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         assert!(script.contains(&crate::claude_statusline::state_path().display().to_string()));
         let (changed, _) = ensure_claude_statusline().expect("reinstall");
         assert!(changed.is_empty(), "idempotent: {changed:?}");
+
+        // Edits to our entry stick: a removed timer is not put back.
+        assert_eq!(read()["statusLine"]["refreshInterval"], 1);
+        let mut edited = read();
+        let line = edited["statusLine"].as_object_mut().unwrap();
+        line.remove("refreshInterval");
+        line.insert("padding".into(), 0.into());
+        std::fs::write(&settings, serde_json::to_vec(&edited).unwrap()).unwrap();
+        let (changed, _) = ensure_claude_statusline().expect("setup over an edited line");
+        assert!(changed.is_empty(), "edits kept: {changed:?}");
+        assert_eq!(read()["statusLine"], edited["statusLine"]);
 
         // Unwiring (quit, pause, connector off) keeps it, saying Headroom is
         // off; routing again clears that.

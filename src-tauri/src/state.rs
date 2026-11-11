@@ -896,9 +896,13 @@ impl AppState {
         }
         self.tool_manager.ensure_codex_skill_nudges();
         self.tool_manager.hide_ponytail_band_once();
-        // npm can take a minute, and this runs before the proxy starts.
+        // npm can take a minute, and this runs before the proxy starts. One
+        // thread: both helpers rewrite the same agent configs.
         let tools = self.tool_manager.clone();
-        std::thread::spawn(move || tools.ensure_context7_registration());
+        std::thread::spawn(move || {
+            tools.ensure_context7_registration();
+            tools.ensure_serena_registration();
+        });
 
         // Heals installs already in the field: older installs and pre-fix venv
         // swaps never vendored the MSVC runtime DLLs, so on a redist-less
@@ -15629,9 +15633,10 @@ mod tests {
         // write once when it equals the uncached input (inferred) and sums a
         // reported one, disjoint since #4237 (0.42.0). The feed carries no
         // cache_inferred flag; /stats `prefix_cache.totals` drops inferred
-        // writes natively since #4285 (0.42.0), so it is summed raw. Recheck
-        // both on the bump.
-        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.42.0");
+        // writes natively since #4285 (0.42.0), so it is summed raw. Rechecked
+        // for 0.44.0: its only feed write change is Anthropic's. Recheck both
+        // on the bump.
+        assert_eq!(crate::tool_manager::HEADROOM_PINNED_VERSION, "0.44.0");
     }
 
     /// The /stats contract, in one place: every primary JSON path this app

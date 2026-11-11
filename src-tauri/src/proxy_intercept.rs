@@ -3936,7 +3936,9 @@ fn report_headroom_body_limit(
             if let Some(bytes) = bytes {
                 scope.set_extra("request_bytes", (bytes as u64).into());
             }
-            scope.set_fingerprint(Some(&["headroom-body-limit", client]));
+            // Per source: the direct path cannot prune images, so its 413 must
+            // not reopen the backend's Codex image-history fix (RUST-VZ).
+            scope.set_fingerprint(Some(&["headroom-body-limit", client, source]));
         },
         || {
             sentry::capture_message(

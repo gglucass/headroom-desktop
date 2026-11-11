@@ -34,7 +34,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.42.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.44.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Kill the RUST-9F onnxruntime import probe after this long: a native
@@ -634,7 +634,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
         _hd_old_cap = 100 * 1024 * 1024
         _hd_codex_cap = 256 * 1024 * 1024
         if (_hd_os.environ.get("HEADROOM_CODEX_IMAGE_HISTORY", "1") != "0"
-            and _hd_metadata.version("headroom-ai") == "0.42.0"
+            and _hd_metadata.version("headroom-ai") == "0.44.0"
             and _hd_body_helpers.MAX_REQUEST_BODY_SIZE == _hd_old_cap
             and _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_old_cap):
             _hd_original_body_limit_call = _hd_body_limit.RequestBodyLimitMiddleware.__call__
@@ -650,6 +650,34 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     self.app, max_bytes=_hd_old_cap
                 )
                 return await _hd_original_body_limit_call(limited, scope, receive, send)
+
+            # Since #4142 (0.43.0) a Responses body over 16 MiB goes upstream as the
+            # client's own bytes, re-serialized only when the ChatGPT store flag
+            # flips, so the pruned body was dropped exactly where it matters. The
+            # handler's first store check after the hooks reports the pruned body
+            # as changed, which makes that branch serialize it.
+            # shortcut: a pruned body of 16 MiB or less also logs "forced
+            # store=false" once; split the check per call site if that log matters.
+            import contextvars as _hd_cih_cv
+
+            _hd_cih_pruned = _hd_cih_cv.ContextVar("hd_codex_image_pruned", default=None)
+
+            def _hd_cih_arm_store_check():
+                mod = _hd_sys.modules.get("headroom.proxy.handlers.openai")
+                orig = getattr(mod, "_ensure_chatgpt_responses_store_false", None)
+                if orig is None or getattr(orig, "_hd_cih", False):
+                    return
+
+                def _hd_cih_store_check(payload, *, is_chatgpt_auth):
+                    changed = orig(payload, is_chatgpt_auth=is_chatgpt_auth)
+                    pruned = _hd_cih_pruned.get()
+                    if pruned is not None and isinstance(payload, dict) and payload.get("input") is pruned:
+                        _hd_cih_pruned.set(None)
+                        return True
+                    return changed
+
+                _hd_cih_store_check._hd_cih = True
+                mod._ensure_chatgpt_responses_store_false = _hd_cih_store_check
 
             class _hd_CodexImageHistoryHook:
                 name = "headroom_codex_image_history"
@@ -709,6 +737,8 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             "event=codex_image_history_pruned count=%d estimated_bytes=%d",
                             removed, remaining,
                         )
+                        _hd_cih_arm_store_check()
+                        _hd_cih_pruned.set(changed)
                         return {**request.body, "input": changed}
                     return None
 
@@ -771,7 +801,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # four-argument signature raised TypeError on every Anthropic request.
     try:
         from importlib import metadata as _hd_ci_meta
-        if (_hd_ci_meta.version("headroom-ai") == "0.42.0" and
+        if (_hd_ci_meta.version("headroom-ai") == "0.44.0" and
             _hd_os.environ.get("HEADROOM_CACHE_INTEGRITY", "1").strip().lower()
                 not in ("0", "false", "no", "off")):
             import contextvars as _hd_ci_cv
@@ -1091,6 +1121,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             self._hd_ccs_own_ports = ports - {None}
             # Already rstripped, which is what the loop guard compares against.
             self.proxy_url = _hd_ccs_url
+            if hasattr(self, "_is_self"):
+                # 0.44.0's guard also skips `localhost:<port>`, which then stays in
+                # settings.json, where the app's exact-URL check reads it as
+                # unrouted. Exact-match keeps 0.42.0's flow: rewrite to the
+                # intercept URL, with the guarded set below refusing the capture.
+                self._is_self = lambda url: url.rstrip("/") == self.proxy_url
             _hd_ccs_set = self._set_upstream
 
             def _hd_ccs_guarded_set(url):
@@ -1240,13 +1276,13 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 # insert inside the message (valid whether the body is JSON or an SSE error event),
 # guarded so it never touches a StreamingResponse, a non-400, or an already-hinted
 # body. Fail-open: any error returns the original response untouched.
-# Exact-pin gated to wheel 0.42.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
+# Exact-pin gated to wheel 0.44.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
 _hd_hint_flag = _hd_os.environ.get("HEADROOM_TOOL_REF_HINT", "1")
 if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_hint_meta
 
-        if _hd_hint_meta.version("headroom-ai") == "0.42.0":
+        if _hd_hint_meta.version("headroom-ai") == "0.44.0":
             from headroom.proxy.handlers import streaming as _hd_hint_mod
 
             _hd_hint_sig = b"not found in available tools"
@@ -1299,7 +1335,7 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # sending response headers, but the raw exception reaches the outer 502 catch
 # instead. Only translate EPERM during a Codex Responses connection; other TLS
 # errors (notably certificate verification) retain their original diagnosis.
-# Exact-pin gated to 0.42.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
+# Exact-pin gated to 0.44.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
 _hd_tls_flag = _hd_os.environ.get("HEADROOM_CODEX_TLS_RETRY", "1")
 if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
@@ -1308,7 +1344,7 @@ if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         import ssl as _hd_tls_ssl
         import httpx as _hd_tls_httpx
 
-        if _hd_tls_meta.version("headroom-ai") == "0.42.0":
+        if _hd_tls_meta.version("headroom-ai") == "0.44.0":
             _hd_tls_orig_send = _hd_tls_httpx.AsyncClient.send
 
             async def _hd_tls_send(self, request, *args, **kwargs):
@@ -1352,172 +1388,6 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
         # Memory only: the wheel's 100-entry window stands.
         pass
 
-# --- Embedding relevance: 16 texts per ONNX run, not 256 (vendor, upstream owed) -
-# The content router's relevance split embeds every record of a tool output in
-# one fastembed embed() at its default batch of 256, padded to the longest text.
-# fastembed's ONNX session keeps ORT's CPU arena on and the arena never shrinks,
-# so it grows to the biggest batch the proxy ever scored: 2.5 GB pinned on a
-# 4-day macOS proxy (2026-10-27), out of the periodic trim's reach. 16 retained
-# ~10x less and ran faster, with the same keep/drop decisions. Python only: the
-# Rust core's scorer never loads its model in 0.41.0. Drop when the wheel has
-# `embedding.EMBED_BATCH_SIZE` (upstream PR #4507).
-# Concurrent splits still stacked the arena to +2.2 GB, so each run also asks ORT
-# to hand its free arena regions back: +80 MB settled after 4 parallel 128-record
-# splits, same speed (M6, 2026-10-29). Only under MallocLargeCache=0, which the
-# wheel's macOS CLI re-exec sets (#2879): without it libmalloc keeps the freed
-# blocks dirty and shrinking re-grew the arena to +3.8 GB. Windows and Linux are
-# unmeasured and never set it, so they keep the cap alone.
-# Exact-pin gated to wheel 0.42.0. Kill switches: HEADROOM_EMBED_BATCH_CAP=0,
-# HEADROOM_EMBED_ARENA_SHRINK=0 (shrinkage only).
-_hd_ebc_flag = _hd_os.environ.get("HEADROOM_EMBED_BATCH_CAP", "1")
-if _hd_ebc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import importlib.metadata as _hd_ebc_meta
-
-        if _hd_ebc_meta.version("headroom-ai") == "0.42.0":
-            from headroom.relevance import embedding as _hd_ebc_mod
-
-            _hd_ebc_shrink = (
-                _hd_os.environ.get("MallocLargeCache") == "0"
-                and _hd_os.environ.get("HEADROOM_EMBED_ARENA_SHRINK", "1").strip().lower()
-                not in ("", "0", "false", "no", "off")
-            )
-
-            def _hd_ebc_arm(model):
-                model._hd_ebc_armed = True
-                import onnxruntime as _hd_ebc_ort
-
-                session = model.model.model  # TextEmbedding -> OnnxTextEmbedding -> InferenceSession
-                opts = _hd_ebc_ort.RunOptions()
-                opts.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
-                run = session.run
-                session.run = lambda names, feed, run_options=None: run(names, feed, run_options or opts)
-
-            def _hd_ebc_encode(self, texts):
-                model = self._get_model()
-                if _hd_ebc_shrink and not getattr(model, "_hd_ebc_armed", False):
-                    try:
-                        _hd_ebc_arm(model)
-                    except Exception:
-                        pass  # Memory only: the arena keeps its high-water mark.
-                return _hd_ebc_mod._get_numpy().array(list(model.embed(texts, batch_size=16)))
-
-            _hd_ebc_mod.EmbeddingScorer._encode = _hd_ebc_encode
-            _hd_bound.add("embed_batch_cap")
-    except Exception:
-        # Memory only: on any binding failure the wheel's batch of 256 stands.
-        pass
-
-# --- Path fold: pure listings only, never markup (vendor, upstream owed) -------
-# The lossless path fold matched HTML closing tags as file paths (`</body>` is dir
-# `</` plus base `body>`) and folded any text with two such lines. The content
-# router tries every lossless fold on each mixed section, so an HTML page tail
-# with a JSON-LD block (Bash or MCP output) reached the model as
-# `</\nbody>\nhtml>`, and it wrote that broken HTML back. Template closers
-# (`{{/if}}`) and `N/A` values split the same way. Mirrors upstream PR #4716:
-# path_heading folds only when every non-blank line is a path row, and the
-# pattern rejects `<`, `>`, `;` and directory segments of only punctuation.
-# compact_lossless looks path_heading up as a module global per call, and the
-# replacement reads _PATH_ROW_RE the same way; nothing imports either by value.
-# Drop once the pinned wheel ships #4716. Exact-pin gated to wheel 0.42.0;
-# stands down when the wheel's own path_heading already leaves markup and mixed
-# text alone. Kill switch: HEADROOM_PATH_FOLD_MARKUP_GUARD=0.
-_hd_pfm_flag = _hd_os.environ.get("HEADROOM_PATH_FOLD_MARKUP_GUARD", "1")
-if _hd_pfm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import importlib.metadata as _hd_pfm_meta
-
-        if _hd_pfm_meta.version("headroom-ai") == "0.42.0":
-            from headroom.transforms import lossless_compaction as _hd_pfm_mod
-
-            if any(
-                _hd_pfm_mod.path_heading(t) != t
-                for t in ("</p>\n</b>\n", "{{/if}}\n{{/each}}\n", "a/b\na/c\nx y\n")
-            ):
-                import re as _hd_pfm_re
-
-                _hd_pfm_mod._PATH_ROW_RE = _hd_pfm_re.compile(
-                    r"^(?P<dir>(?:\.{0,2}/)?(?:(?=[^/]*\w)[^/\s:<>;]+/)+)(?P<base>[^/\s:<>;]+)$"
-                )
-
-                def _hd_pfm_heading(text):
-                    lines, had_trailing = _hd_pfm_mod._split_keep_trailing(text)
-                    matches = []
-                    for ln in lines:
-                        m = _hd_pfm_mod._PATH_ROW_RE.match(ln)
-                        if ln and not m:  # not a pure listing; stop at the first such line
-                            return text
-                        matches.append(m)
-                    if sum(1 for m in matches if m) < 2:
-                        return text
-                    out = []
-                    current = None
-                    for line, m in zip(lines, matches):
-                        if m:
-                            d = m.group("dir")
-                            if d != current:
-                                out.append(d)
-                                current = d
-                            out.append(m.group("base"))
-                        else:  # blank line inside/around the listing
-                            out.append(line)
-                            current = None
-                    return _hd_pfm_mod._join(out, had_trailing)
-
-                _hd_pfm_mod.path_heading = _hd_pfm_heading
-                _hd_bound.add("path_fold_markup_guard")
-    except Exception:
-        # Output only: on any binding failure the wheel's fold stands.
-        pass
-
-# --- Read maturation: never inside the provider-cached prefix (vendor) --------
-# Maturation swaps a quiet Read for a marker only "while it is outside the
-# frozen prefix", but the Anthropic handler hands it the pipeline's freeze
-# count, min(provider floor, local compression-cache count), and runs it AFTER
-# finalize_turn replayed the provider floor. The local count stops at the first
-# tool_result the cache never stored (a Read, which the router excludes), so it
-# sits at 2 for a whole Claude Code session and every Read matures inside the
-# cached prefix 5 quiet turns later: forwarded bytes change 9 messages back from
-# the floor and the tail re-writes (Sentry RUST-DP, prefix_rewrite, 436 users).
-# finalize_turn's confirmed_frozen_count is that floor; maturation gets the
-# larger of the two, so a cached Read stays verbatim, as the module documents.
-# Turns that skip the replay (cold cache, restart) keep the wheel's count.
-# Exact-pin gated to wheel 0.42.0, which still passes the clamped count.
-# Kill switch: HEADROOM_MATURATION_FLOOR=0.
-_hd_mf_flag = _hd_os.environ.get("HEADROOM_MATURATION_FLOOR", "1")
-if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import contextvars as _hd_mf_cv
-        import importlib.metadata as _hd_mf_meta
-
-        if _hd_mf_meta.version("headroom-ai") == "0.42.0":
-            from headroom.proxy import session_engine as _hd_mf_se
-            from headroom.transforms import read_maturation as _hd_mf_rm
-
-            _hd_mf_floor = _hd_mf_cv.ContextVar("desktop_maturation_floor", default=0)
-            _hd_mf_finalize = _hd_mf_se.finalize_turn
-            _hd_mf_apply = _hd_mf_rm.ReadMaturationManager.apply
-
-            def _hd_mf_finalize_turn(*args, **kwargs):
-                _hd_mf_floor.set(max(int(kwargs.get("confirmed_frozen_count") or 0), 0))
-                return _hd_mf_finalize(*args, **kwargs)
-
-            def _hd_mf_apply_floored(self, messages, frozen_message_count=0):
-                floor = _hd_mf_floor.get()
-                # One replay floor per maturation pass: the request task owns it.
-                _hd_mf_floor.set(0)
-                return _hd_mf_apply(self, messages,
-                                    frozen_message_count=max(frozen_message_count, floor))
-
-            # The handler imports finalize_turn per request, so the module
-            # attribute is what it calls.
-            _hd_mf_se.finalize_turn = _hd_mf_finalize_turn
-            _hd_mf_rm.ReadMaturationManager.apply = _hd_mf_apply_floored
-            _hd_bound.add("maturation_floor")
-    except Exception:
-        # On any binding failure the wheel's maturation stands.
-        pass
-
 # Proxied guarded upstreams (desktop posture; upstream #3804 shipped as an
 # allowlist): since 0.39.0 the wheel pins caller-supplied upstreams
 # (x-headroom-base-url) to the address the SSRF guard judged, and refuses them
@@ -1533,13 +1403,13 @@ if _hd_mf_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # forwards on the guard's name verdict, the 0.38.0 behaviour; direct routes stay
 # pinned and internal answers are still refused. No self-neutralization: the
 # wheel has no blanket allow to detect, so re-check on each bump whether it grew
-# one. Exact-pin gated to wheel 0.42.0.
+# one. Exact-pin gated to wheel 0.44.0.
 _hd_pgu_flag = _hd_os.environ.get("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "")
 if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
     try:
         import importlib.metadata as _hd_pgu_meta
 
-        if _hd_pgu_meta.version("headroom-ai") == "0.42.0":
+        if _hd_pgu_meta.version("headroom-ai") == "0.44.0":
             from headroom.proxy import upstream_pinning as _hd_pgu_mod
 
             _hd_pgu_cls = _hd_pgu_mod.GuardedUpstreamRefusingTransport
@@ -1581,7 +1451,7 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
 # so a backend restarted sooner lost its warm-up replies (the train guest sat at
 # 10 after 35 of them, 2026-10-17): each warm-up reply is written until the
 # baseline reaches the target. Not a wheel bug, so it never self-neutralizes.
-# Exact-pin gated to wheel 0.42.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+# Exact-pin gated to wheel 0.44.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
 _hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
 if _hd_os.environ.get(
     "HEADROOM_SDK"
@@ -1589,7 +1459,7 @@ if _hd_os.environ.get(
     try:
         import importlib.metadata as _hd_ow_meta
 
-        if _hd_ow_meta.version("headroom-ai") == "0.42.0":
+        if _hd_ow_meta.version("headroom-ai") == "0.44.0":
             import contextvars as _hd_ow_cv
 
             from headroom.proxy import output_savings as _hd_ow_os
@@ -1644,7 +1514,8 @@ if _hd_os.environ.get(
                 if not _hd_ow_recorded[0]:
                     return _hd_ow_orig_reload(self)
                 try:
-                    disk = _hd_ow_os.SavingsLedger.load(self._path)
+                    # As the wheel's own reload: no legacy-arm warning per /stats poll.
+                    disk = _hd_ow_os.SavingsLedger.load(self._path, warn_legacy=False)
                 except OSError:
                     return None
                 if disk.baseline.total_samples > self._ledger.baseline.total_samples:
@@ -1673,58 +1544,6 @@ if _hd_os.environ.get(
     except Exception:
         pass
 
-# --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
-# The learn prompt asks for each rule's content as "1-3 bullet points", and a
-# model that returns them as a JSON array killed the whole analysis: the wheel's
-# _parse_llm_response (0.39.0 through 0.42.0) calls .strip() on section/content
-# unchecked ("'list' object has no attribute 'strip'", RUST-K5). Normalize first: a list of strings
-# becomes bullet lines (kept, where #2471 drops it), any other non-string
-# becomes "" so the parser skips that rule, and a null rules list reads as
-# empty. The desktop puts this file on the learn subprocess's PYTHONPATH too.
-# Exact-pin gated to wheel 0.42.0; self-neutralizes once the wheel carries
-# #2471's `_as_str`. Kill switch: HEADROOM_LEARN_RULE_COERCE=0.
-_hd_lrc_flag = _hd_os.environ.get("HEADROOM_LEARN_RULE_COERCE", "1")
-if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import importlib.metadata as _hd_lrc_meta
-
-        if _hd_lrc_meta.version("headroom-ai") == "0.42.0":
-            from headroom.learn import analyzer as _hd_lrc_mod
-
-            if not hasattr(_hd_lrc_mod, "_as_str"):
-                _hd_lrc_orig = _hd_lrc_mod._parse_llm_response
-
-                def _hd_lrc_text(val):
-                    if isinstance(val, list) and all(isinstance(v, str) for v in val):
-                        return "\n".join(
-                            v if v.lstrip().startswith(("-", "*")) else f"- {v}"
-                            for v in val
-                        )
-                    return val if isinstance(val, str) else ""
-
-                def _hd_lrc_parse(raw):
-                    if isinstance(raw, dict):
-                        raw = dict(raw)
-                        for key in ("context_file_rules", "memory_file_rules"):
-                            raw[key] = [
-                                {
-                                    **r,
-                                    "section": r.get("section")
-                                    if isinstance(r.get("section"), str)
-                                    else "",
-                                    "content": _hd_lrc_text(r.get("content")),
-                                }
-                                if isinstance(r, dict)
-                                else r
-                                for r in (raw.get(key) or [])
-                            ]
-                    return _hd_lrc_orig(raw)
-
-                _hd_lrc_mod._parse_llm_response = _hd_lrc_parse
-                _hd_bound.add("learn_rule_coerce")
-    except Exception:
-        pass
-
 # --- Learn: a rescan sees the block the last scan wrote (vendor, upstream owed) -
 # ClaudeCodeWriter writes a project's learned block to CLAUDE.local.md (the home
 # project's to ~/.claude/CLAUDE.md), but discover_projects points context_file,
@@ -1737,14 +1556,14 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # block, and the prompt asks for a prior heading to be reused as written.
 # ClaudeCodeWriter ignores context_file, so only the analysis input changes.
 # The wheel merges worktrees itself (#3854), so merged projects are covered.
-# Exact-pin gated to wheel 0.42.0; self-neutralizes once the plugin or the
+# Exact-pin gated to wheel 0.44.0; self-neutralizes once the plugin or the
 # analyzer names CLAUDE.local.md. Kill switch: HEADROOM_LEARN_PRIOR_LOCAL=0.
 _hd_lpl_flag = _hd_os.environ.get("HEADROOM_LEARN_PRIOR_LOCAL", "1")
 if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_lpl_meta
 
-        if _hd_lpl_meta.version("headroom-ai") == "0.42.0":
+        if _hd_lpl_meta.version("headroom-ai") == "0.44.0":
             import inspect as _hd_lpl_inspect
             from pathlib import Path as _hd_lpl_Path
 
@@ -1952,141 +1771,6 @@ if _hd_lse_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
-# --- Learn: OpenCode's v2 session tables (vendor, upstream owed) --------------
-# OpenCode moved sessions from session/message/part to session_v2 and
-# session_message (tool calls inside each row's data.content), and a database a
-# current OpenCode created has no `session` table at all. The wheel's plugin
-# (0.41.0, 0.42.0) reads only v1, so every learn scan there died on "no such table:
-# session" (RUST-HJ, 6 hosts). On a v2 database the plugin's connection gets
-# TEMP views with the v1 names and shape, so its own queries and parsing run
-# unchanged; TEMP objects never touch the user's file, and a v1 database gets
-# none. The part view inverts OpenCode's own v1 -> v2 migration (migrateTool:
-# callID -> id, tool -> name, output -> content text, error -> error.message).
-# On Windows v2 stores C:/x while the plugin matches str(Path(worktree)), C:\x.
-# Exact-pin gated to wheel 0.42.0; self-neutralizes once the plugin names
-# session_v2. Kill switch: HEADROOM_LEARN_OPENCODE_V2=0.
-_hd_oc2_flag = _hd_os.environ.get("HEADROOM_LEARN_OPENCODE_V2", "1")
-if _hd_oc2_flag.strip().lower() not in ("", "0", "false", "no", "off"):
-    try:
-        import importlib.metadata as _hd_oc2_meta
-
-        if _hd_oc2_meta.version("headroom-ai") == "0.42.0":
-            import inspect as _hd_oc2_inspect
-            import sqlite3 as _hd_oc2_sqlite
-            import types as _hd_oc2_types
-
-            from headroom.learn.plugins import opencode as _hd_oc2_mod
-
-            if "session_v2" not in _hd_oc2_inspect.getsource(_hd_oc2_mod):
-                _hd_oc2_worktree = (
-                    "replace(worktree, '/', '\\')" if _hd_os.name == "nt" else "worktree"
-                )
-                _HD_OC2_VIEWS = (
-                    "CREATE TEMP VIEW project AS SELECT id, name, "
-                    + _hd_oc2_worktree
-                    + " AS worktree FROM main.project",
-                    "CREATE TEMP VIEW session AS"
-                    " SELECT id, project_id, time_created FROM main.session_v2",
-                    "CREATE TEMP VIEW message AS SELECT id, session_id FROM main.session_message",
-                    "CREATE TEMP VIEW part AS"
-                    " SELECT m.id AS message_id,"
-                    "  json_object('type', 'tool', 'tool', t.value ->> '$.name',"
-                    "   'callID', t.value ->> '$.id',"
-                    "   'state', json_object('status', t.value ->> '$.state.status',"
-                    "    'input', t.value -> '$.state.input',"
-                    "    'output', coalesce(t.value ->> '$.state.error.message',"
-                    "     (SELECT group_concat(c.value ->> '$.text', char(10))"
-                    "      FROM json_each(t.value, '$.state.content') c"
-                    "      WHERE c.value ->> '$.type' = 'text'), ''))) AS data,"
-                    "  coalesce(t.value ->> '$.time.created', m.time_created) AS time_created"
-                    " FROM main.session_message m, json_each(m.data, '$.content') t"
-                    " WHERE t.value ->> '$.type' = 'tool'",
-                )
-
-                def _hd_oc2_connect(*args, **kwargs):
-                    conn = _hd_oc2_sqlite.connect(*args, **kwargs)
-                    try:
-                        tables = {
-                            r[0]
-                            for r in conn.execute(
-                                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                            )
-                        }
-                        if "session" not in tables and {
-                            "project",
-                            "session_v2",
-                            "session_message",
-                        } <= tables:
-                            for stmt in _HD_OC2_VIEWS:
-                                conn.execute(stmt)
-                    except _hd_oc2_sqlite.Error:
-                        pass
-                    return conn
-
-                _hd_oc2_shim = _hd_oc2_types.ModuleType("sqlite3")
-                _hd_oc2_shim.__dict__.update(_hd_oc2_sqlite.__dict__)
-                _hd_oc2_shim.connect = _hd_oc2_connect
-                _hd_oc2_mod.sqlite3 = _hd_oc2_shim
-                _hd_bound.add("learn_opencode_v2")
-    except Exception:
-        pass
-
-# --- Prefix tracker: a deferred tool load is not a new conversation -----------
-# The tracker lineage is keyed on a fingerprint of the cache-key segments
-# before the messages, the whole `tools` array included. Claude Code appends
-# every tool ToolSearch loads to `tools`, still marked defer_loading, and
-# Anthropic leaves deferred tools out of the cached prompt (a direct session
-# keeps reading its cache across the load). The proxy saw a new conversation:
-# a fresh tracker, frozen=0, and the whole history re-run through the
-# pipeline, whose output differs from the bytes already cached (reads that
-# were recent then and are older now, a background Kompress result), so the
-# message tier was re-written. On one machine over 5 days, the turn after a
-# deferred load missed big 21.9% of the time against 0.4% for every other
-# turn: 53 misses, 9.2M tokens, 12% of all cache writes (2026-10-13). The
-# fingerprint now leaves deferred tools out, as Anthropic's key does; a change
-# to any tool the prompt renders still starts a new lineage. RAISES cache reads,
-# tokens saved unchanged in aggregate, so check cache_read per request with
-# savings:did after the stable ships.
-# Exact-pin gated to wheel 0.42.0; self-neutralizes when the wheel's
-# fingerprint already ignores a deferred tool. Kill switch:
-# HEADROOM_DEFERRED_TOOL_AFFINITY=0.
-_hd_dta_flag = _hd_os.environ.get("HEADROOM_DEFERRED_TOOL_AFFINITY", "1")
-if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and (
-    _hd_dta_flag.strip().lower() not in ("", "0", "false", "no", "off")
-):
-    try:
-        import importlib.metadata as _hd_dta_meta
-
-        if _hd_dta_meta.version("headroom-ai") == "0.42.0":
-            from headroom.cache import prefix_tracker as _hd_dta_pt
-
-            _hd_dta_orig = _hd_dta_pt.segment_fingerprint
-
-            def _hd_dta_fingerprint(value):
-                if isinstance(value, dict) and isinstance(value.get("tools"), list):
-                    value = {
-                        **value,
-                        "tools": [
-                            t
-                            for t in value["tools"]
-                            if not (isinstance(t, dict) and t.get("defer_loading"))
-                        ],
-                    }
-                return _hd_dta_orig(value)
-
-            _hd_dta_tool = {"name": "Read", "input_schema": {"type": "object"}}
-            _hd_dta_deferred = {"name": "x", "defer_loading": True, "input_schema": {}}
-            if _hd_dta_orig({"tools": [_hd_dta_tool]}) != _hd_dta_orig(
-                {"tools": [_hd_dta_tool, _hd_dta_deferred]}
-            ):
-                # The handler imports the name at call time, so the module
-                # attribute is the one it reads.
-                _hd_dta_pt.segment_fingerprint = _hd_dta_fingerprint
-                _hd_bound.add("deferred_tool_affinity")
-    except Exception:
-        # Fail-open to the wheel's fingerprint.
-        pass
-
 # --- Event-loop stall dump (desktop diagnostic, RUST-86) ----------------------
 # /stats on the backend port times out after 15s while /readyz answers right
 # after, on idle hosts as often as busy ones: something holds the event loop
@@ -2201,20 +1885,14 @@ _HD_VENDORS = (
     "tool_ref_hint",
     "codex_tls_retry",
     "message_window",
-    "embed_batch_cap",
-    "path_fold_markup_guard",
-    "maturation_floor",
     "proxied_guarded_upstreams",
     "output_warmup",
-    "learn_rule_coerce",
     "learn_prior_local",
     "learn_block_cap",
     "learn_drop_error_recovery",
     "learn_codex_retries",
     "learn_stderr_squeeze",
     "learn_stdin_early_exit",
-    "learn_opencode_v2",
-    "deferred_tool_affinity",
     "loop_stall_dump",
     "startup_stall_dump",
     "skip_wmi",
@@ -2404,6 +2082,12 @@ pub(crate) const CONTEXT7_HOSTED_URL: &str = "https://mcp.context7.com/mcp?via=h
 /// minute could otherwise interleave with it and leave the receipt and the
 /// agents' entries disagreeing.
 static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// Same as `CONTEXT7_LIFECYCLE`, for Serena's launch move to `SERENA_MAIN`.
+static SERENA_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// What serena's console script runs; serena-agent has no `python -m` entry.
+/// Agents start it in the project directory. As with MarkItDown's `-c` launch,
+/// remove the cwd before importing: a project's serena.py must never run.
+const SERENA_MAIN: &str = "import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]; from serena.cli import top_level; top_level()";
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -2507,7 +2191,7 @@ def keep_markers(registrar, name):
 /// Rust. Mirrors upstream `_setup_serena_mcp` / `_remove_headroom_installed_serena_mcp`
 /// (headroom.cli.wrap): only entries the ledger proves Headroom installed are
 /// ever overwritten or removed — a user-managed serena entry is left alone.
-/// argv: `register <serena-bin> [<uvx>]` | `unregister`.
+/// argv: `register <command> <uvx or ""> [<launch args>...]` | `unregister`.
 const SERENA_MCP_HELPER: &str = concat!(
     mcp_helper_keep_markers!(),
     r#"
@@ -2528,7 +2212,8 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
-env = {"UVX": sys.argv[3]} if len(sys.argv) > 3 else {}
+env = {"UVX": sys.argv[3]} if len(sys.argv) > 3 and sys.argv[3] else {}
+launch = tuple(sys.argv[4:])
 failures = []
 # Claude/Codex only: serena's --context values are named profiles and no
 # grok/opencode context has been validated against serena yet.
@@ -2540,7 +2225,7 @@ for registrar, context in ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar()
         spec = ServerSpec(
             name="serena",
             command=sys.argv[2],
-            args=(
+            args=launch + (
                 "start-mcp-server",
                 "--project-from-cwd",
                 "--context",
@@ -4260,7 +3945,7 @@ impl ToolManager {
                 }
             }
 
-            for (executable, args) in &startup_variants {
+            for (idx, (executable, args)) in startup_variants.iter().enumerate() {
                 // A quit or relaunch mid-startup: stop_headroom's sweep killed
                 // the variant being polled, the loop read that as a failed start
                 // and spawned the next one after the sweep, and that proxy
@@ -4820,14 +4505,19 @@ impl ToolManager {
                 // of RUST-9M's rename (Sentry RUST-9X, launch auto-start on
                 // 0.8.8). Transient by nature; retry briefly before failing
                 // the launch.
-                let mut child = crate::client_adapters::retry_transient_denied(|| command.spawn())
+                let spawned = crate::client_adapters::retry_transient_denied(|| command.spawn())
                     .with_context(|| {
                         format!(
                             "starting headroom background process: {} {}",
                             executable.display(),
                             args.join(" ")
                         )
-                    })?;
+                    });
+                let Some(mut child) =
+                    spawned_or_next_variant(spawned, idx + 1 < startup_variants.len())?
+                else {
+                    continue;
+                };
                 // Dies with the app, however the app dies (see winproc).
                 #[cfg(windows)]
                 crate::winproc::adopt_into_proxy_job(&child);
@@ -6762,10 +6452,23 @@ impl ToolManager {
         if !self.markitdown_installed() {
             return Ok(());
         }
-        let bin = self.markitdown_entrypoint();
-        run_command_with_timeout(&bin, &["--help"], &self.runtime.root_dir, timeout)
-            .with_context(|| format!("running markitdown smoke test with {}", bin.display()))?;
-        Ok(())
+        self.run_markitdown_help(timeout)
+            .context("running markitdown smoke test")
+    }
+
+    /// What the shims run: python, never markitdown.exe, which Smart App
+    /// Control blocks (RUST-W0; see `serena_command`).
+    fn run_markitdown_help(&self, timeout: Duration) -> Result<()> {
+        run_command_with_timeout(
+            &self.runtime.managed_python(),
+            &[
+                "-c",
+                crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
+                "--help",
+            ],
+            &self.runtime.root_dir,
+            timeout,
+        )
     }
 
     /// Plugin addons are host plugins, not binaries we own, so "smoke test"
@@ -7053,7 +6756,15 @@ impl ToolManager {
             if let Err(err) =
                 self.restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
             {
-                log::warn!(
+                // Offline, or a network that resets PyPI (RUST-W5), is that
+                // case: local log only. Any other pip failure still reports.
+                let level = if crate::upgrade_pip_network_refused(&err) {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
                     "recover_from_interrupted_upgrade: {err:#}; keeping upgrade marker for retry"
                 );
                 return false;
@@ -8789,11 +8500,11 @@ impl ToolManager {
         };
         format!(
             "@echo off\r\n\
-             setlocal\r\n\
-             rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+             setlocal DisableDelayedExpansion\r\n\
+             rem Headroom-managed markitdown shim. Runs markitdown, then counts a conversion that succeeded.\r\n\
              rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
              set PYTHONUTF8=1\r\n\
-             \"{real}\" %*\r\n\
+             \"{python}\" -c \"{main}\" %*\r\n\
              if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
              if \"%~1\"==\"\" exit /b 0\r\n\
              if \"%~1\"==\"--help\" exit /b 0\r\n\
@@ -8805,7 +8516,11 @@ impl ToolManager {
              move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
              exit /b 0\r\n",
             counter = from_shim(self.markitdown_conversion_counter_path()),
-            real = from_shim(self.markitdown_entrypoint()),
+            // Not markitdown.exe: Smart App Control blocks pip's per-machine
+            // launchers (see `serena_command`). Single quotes keep the code one
+            // cmd argument.
+            python = from_shim(self.runtime.managed_python()),
+            main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO.replace('"', "'"),
         )
     }
 
@@ -8864,14 +8579,7 @@ impl ToolManager {
         // pays Gatekeeper/EDR scanning of the new files plus cold imports
         // (RUST-22). The core 15s bound here killed it, and a venv rebuild then
         // uninstalled the addon (RUST-M0, macOS 27).
-        let smoke = || {
-            run_command_with_timeout(
-                &self.markitdown_entrypoint(),
-                &["--help"],
-                &self.runtime.root_dir,
-                MARKITDOWN_SMOKE_TEST_TIMEOUT,
-            )
-        };
+        let smoke = || self.run_markitdown_help(MARKITDOWN_SMOKE_TEST_TIMEOUT);
         smoke()
             .or_else(|_| smoke())
             .context("markitdown installed but failed its smoke test")?;
@@ -9021,6 +8729,25 @@ impl ToolManager {
         self.serena_venv_dir().join(bin_subdir()).join(name)
     }
 
+    fn serena_python(&self) -> PathBuf {
+        self.serena_venv_dir()
+            .join(bin_subdir())
+            .join(python_exe_name())
+    }
+
+    /// How agents start Serena. Not serena.exe on Windows: pip writes that
+    /// launcher on each machine with the machine's own paths inside, so no two
+    /// copies match and Smart App Control, which only runs files it knows,
+    /// blocks it every time (customer report 2026-11-10). python.exe is the
+    /// same file everywhere, and the backend already runs on it there.
+    fn serena_command(&self) -> (PathBuf, Vec<&'static str>) {
+        if cfg!(target_os = "windows") {
+            (self.serena_python(), vec!["-c", SERENA_MAIN])
+        } else {
+            (self.serena_entrypoint(), Vec::new())
+        }
+    }
+
     pub fn serena_uvx(&self) -> PathBuf {
         let name = if cfg!(target_os = "windows") {
             "uvx.exe"
@@ -9041,6 +8768,7 @@ impl ToolManager {
     }
 
     pub fn install_serena(&self) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         retire_venv(&self.serena_venv_dir())?;
         // --clear so a retry after a partial install starts from a clean venv.
         run_command_with_timeout(
@@ -9055,12 +8783,8 @@ impl ToolManager {
             Duration::from_secs(120),
         )
         .context("creating serena venv")?;
-        let serena_python = self
-            .serena_venv_dir()
-            .join(bin_subdir())
-            .join(python_exe_name());
         run_pip_install_with_retries_streaming(
-            &serena_python,
+            &self.serena_python(),
             &[
                 "-m",
                 "pip",
@@ -9083,23 +8807,92 @@ impl ToolManager {
                 );
             }
         }
+        // The way agents will start it, so a launch Windows blocks fails here.
+        let (command, mut smoke) = self.serena_command();
+        smoke.push("--help");
         run_command_with_timeout(
-            &self.serena_entrypoint(),
-            &["--help"],
+            &command,
+            &smoke,
             &self.runtime.root_dir,
             SERENA_SMOKE_TEST_TIMEOUT,
         )
         .context("serena installed but failed its smoke test")?;
         self.register_serena_mcp()?;
         set_serena_global_gitignore(true);
+        self.write_serena_receipt(true)
+    }
+
+    fn write_serena_receipt(&self, enabled: bool) -> Result<()> {
         self.write_tool_receipt(
             "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": true }),
-        )?;
-        Ok(())
+            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled, "python_launch": true, "python_launch_safe_path": true }),
+        )
+    }
+
+    /// Windows installs from before `serena_command` still start serena.exe,
+    /// which Smart App Control blocks; early python launches also need the cwd
+    /// guard. An enabled one moves over at launch. A failure is retried at the
+    /// next launch.
+    pub fn ensure_serena_registration(&self) {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
+        if !self.serena_needs_move(cfg!(target_os = "windows")) {
+            return;
+        }
+        let moved = self.register_serena_mcp().and_then(|()| {
+            // Keeps the installed version: only a reinstall changes it.
+            let mut receipt = self.read_serena_receipt_for_move()?;
+            if let Some(fields) = receipt.as_object_mut() {
+                fields.insert("python_launch".into(), json!(true));
+                fields.insert("python_launch_safe_path".into(), json!(true));
+            }
+            self.write_tool_receipt("serena", receipt)
+        });
+        match moved {
+            Ok(()) => log::info!("serena moved to the python.exe launch"),
+            Err(err) => log::warn!("moving serena to the python.exe launch failed: {err:#}"),
+        }
+    }
+
+    fn serena_needs_move(&self, windows: bool) -> bool {
+        if !windows || !self.serena_installed() {
+            return false;
+        }
+        match self.read_serena_receipt_for_move() {
+            Ok(receipt) => {
+                receipt.get("enabled").and_then(Value::as_bool) != Some(false)
+                    && receipt
+                        .get("python_launch_safe_path")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+            }
+            Err(err) => {
+                log::warn!("serena launch migration skipped: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// A failed read must not turn a disabled addon into an enabled one or
+    /// replace its receipt with defaults. Read again before writing as well:
+    /// registering with the agents can take long enough for the file to change.
+    fn read_serena_receipt_for_move(&self) -> Result<Value> {
+        let path = self.runtime.tools_dir.join("serena.json");
+        let bytes = crate::state::read_state_file(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
+            Ok(receipt) => Ok(Value::Object(receipt)),
+            Err(err) => {
+                let backup = crate::client_adapters::backup_if_exists(&path)?;
+                bail!(
+                    "invalid Serena receipt at {}; leaving it unchanged (backup: {backup:?}): {err}",
+                    path.display()
+                );
+            }
+        }
     }
 
     pub fn set_serena_enabled(&self, enabled: bool) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         if !self.serena_installed() {
             bail!("serena is not installed");
         }
@@ -9108,14 +8901,11 @@ impl ToolManager {
         } else {
             self.unregister_serena_mcp()?;
         }
-        self.write_tool_receipt(
-            "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled }),
-        )?;
-        Ok(())
+        self.write_serena_receipt(enabled)
     }
 
     pub fn uninstall_serena(&self) -> Result<()> {
+        let _lifecycle = SERENA_LIFECYCLE.lock();
         // Unregister before deleting the venv, and fail if it doesn't land: a
         // leftover MCP entry pointing at a deleted binary would make every new
         // agent session spawn a failing server.
@@ -9135,13 +8925,16 @@ impl ToolManager {
 
     fn register_serena_mcp(&self) -> Result<()> {
         set_serena_browser_dashboard();
-        let entrypoint = self.serena_entrypoint().to_string_lossy().into_owned();
-        let uvx = self.serena_uvx().to_string_lossy().into_owned();
-        let mut args = vec!["-c", SERENA_MCP_HELPER, "register", &entrypoint];
+        let (command, launch) = self.serena_command();
+        let command = command.to_string_lossy().into_owned();
         // A pre-uv venv keeps registering without it, as before.
-        if self.serena_uvx().exists() {
-            args.push(&uvx);
-        }
+        let uvx = if self.serena_uvx().exists() {
+            self.serena_uvx().to_string_lossy().into_owned()
+        } else {
+            String::new()
+        };
+        let mut args = vec!["-c", SERENA_MCP_HELPER, "register", &command, &uvx];
+        args.extend(launch);
         self.run_mcp_helper(&args, "Adding Serena to your agents")
     }
 
@@ -13142,24 +12935,24 @@ fn headroom_index_requirement(
 pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/fe/d1/3449535c6776f106687ff58bfee0a626176069c0b884721ac839dc653ed7/headroom_ai-0.42.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "b175cccbfb8cbcabd0a9e9406379eee910d10fe14130f55b7beabec62194a48e",
+            "https://files.pythonhosted.org/packages/42/b7/1ab4da6f7a091fd1a102b5194828f9a588b6b4f11b522f38b86b125770a3/headroom_ai-0.44.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "9b084f4cd9918af2d0970450ff3e990fffc29a8220dc5e24fa0f33a4dd0359cc",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/35/90/ad2ddb1f4aee89cf0cab9b05c030ba7d9f553f2a0340f9cca9083e0751b1/headroom_ai-0.42.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "531f25f0a1bed35130301c3219fc94391a72f1b550c4ad456af6ed2345d1ef05",
+            "https://files.pythonhosted.org/packages/37/58/cb856a12253468d2c70ea6223531a34558f57f294196f75172343833f164/headroom_ai-0.44.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "2ab9d0c7ced1b94220597b2a48996693ebc0a61dd1ce38749709ae299b3f51da",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/c1/cc/f54d9d36bfb8acbbca5f56ff800a27c83d2488c4c3f900ac1a2564ba61a9/headroom_ai-0.42.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "82972c52804f7d691dcf73b8f32acbd754b8c2262e56b2365d0741d99e517db8",
+            "https://files.pythonhosted.org/packages/5e/d9/2ff01892de67c0824d024cdb0152e371bb8cd5ced8ed6c2a66ad5c5f13a4/headroom_ai-0.44.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "58f2e6ac736fe882f83cae0a3bffad7ce574d12587eb999d6501bffd053a75cd",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/82/76/34c9b66a878b7ce69aa27761c41f341a8863945f2a681f8d2920c778c3d7/headroom_ai-0.42.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "fbb3ceb8f6c3f208edcc3aad43c0e03e0db45636d9d2061525ad0d0a166da146",
+            "https://files.pythonhosted.org/packages/8f/63/39c8f6bd317714bc6a68775be5da5e15bca9e91d5f95e259bc00e6de6f7f/headroom_ai-0.44.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "3b5c7fd289e7d227dcd9b896615541ea9d3d37388bd97b3257fc8769c4b7ef70",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/21/21/233710bc313c07cf652ed4234574f8906becdbe22b559413394e775fd8eb/headroom_ai-0.42.0-cp310-abi3-win_amd64.whl",
-            "df31ddff684f8a8f1001d3ab2b04c6b508dfc32e6d7ff3464cf669b7085deb63",
+            "https://files.pythonhosted.org/packages/67/05/3e61efd4aff135c053ac2d3f5fa51f1ab458758d03229656194aa7ef409e/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
+            "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -15122,8 +14915,12 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
 /// that exists everywhere (RUST-90/91: TLS-broken middleware on one machine).
 /// Requires BOTH signals so a genuinely bad pin with an incidental fetch
 /// warning keeps its no-matching-dist verdict (RUST-6S listed real versions).
+/// pip logs a connection error's "Could not fetch URL" at debug, so resets
+/// that outlast `--retries` leave only urllib3's retry warnings (RUST-29 on
+/// 0.9.58: pypi.org reset every hf-xet lookup, filed as a bad pin at Error).
 pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
-    lower.contains("could not fetch url") && lower.contains("from versions: none")
+    (lower.contains("could not fetch url") || lower.contains("after connection broken by"))
+        && lower.contains("from versions: none")
 }
 
 /// Coarse cause class for a pip failure, used as the Sentry fingerprint.
@@ -15534,6 +15331,9 @@ fn wheel_download_failure_category(detail: &str) -> &'static str {
         || lower.contains("connection closed")
         || lower.contains("error sending request")
         || lower.contains("channel closed")
+        // Windows words a reset "forcibly closed by the remote host", and
+        // localizes it (RUST-W6); the code is the stable handle.
+        || lower.contains("(os error 10054)")
     {
         "connection"
     } else if crate::is_disk_full_signal(&lower) {
@@ -16637,6 +16437,22 @@ fn claim_once(flag: &AtomicBool, applies: bool) -> bool {
     applies && !flag.swap(true, Ordering::AcqRel)
 }
 
+/// A startup variant Windows refuses to even start falls through to the next
+/// one: App Control blocked the `headroom.exe` launcher pip wrote on that
+/// machine, and the start failed without trying `python.exe -m`, the same
+/// file on every machine (RUST-G1, 0.9.60-rc.3). The last variant's refusal
+/// is the start's error.
+fn spawned_or_next_variant<T>(spawned: Result<T>, has_next: bool) -> Result<Option<T>> {
+    match spawned {
+        Ok(child) => Ok(Some(child)),
+        Err(err) if has_next => {
+            log::info!("{err:#}; trying the next startup variant");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// True for a startup exit that means the process was taken down mid-flight
 /// rather than exiting on its own terms: Windows reports a native abort as
 /// 0xffffffff (and the 0xc00000xx family), unix as a signal.
@@ -17264,7 +17080,8 @@ mod tests {
         assert!(!py.contains("additional_tools"));
     }
 
-    /// A plain 179 MiB Codex replay must pass the guard and prune old images.
+    /// A plain 179 MiB Codex replay must pass the guard, prune old images, and
+    /// reach the >16 MiB passthrough as the pruned body, not the client's bytes.
     #[test]
     fn codex_compaction_body_cap_against_the_installed_wheel() {
         let python =
@@ -17308,10 +17125,18 @@ items = [{'type': 'function_call_output', 'call_id': str(i), 'output': [
     {'type': 'input_image', 'image_url': image}]} for i in range(5)]
 user = {'role': 'user', 'content': [{'type': 'input_image', 'image_url': image}]}
 original = {'model': 'gpt-6-sol', 'input': [*items, user]}
+# The handler forwards a body over 16 MiB as the client's bytes unless its
+# store check says the body changed (#4142); the pruned body must say so once.
+import inspect, re
+from headroom.proxy.handlers import openai as oa
+assert re.search(r"outbound_body_bytes = original_body_bytes\s+if _ensure_chatgpt_responses_store_false\(body",
+                 inspect.getsource(oa)), "the >16 MiB Responses passthrough changed shape"
 async def prune(body, client='codex', size=140 * 1024 * 1024):
     await turn_hooks.run_responses_create_hooks(body, headers={
         'x-client': client, 'content-length': str(size)}, transport='http')
-asyncio.run(prune(original))
+    check = oa._ensure_chatgpt_responses_store_false
+    return [check(body, is_chatgpt_auth=False), check(body, is_chatgpt_auth=False)]
+assert asyncio.run(prune(original)) == [True, False]
 assert [i['output'][0]['type'] for i in original['input'][:5]] == [
     'input_text'] * 5
 assert original['input'][-1] == user
@@ -17319,10 +17144,10 @@ assert all(i['output'][0]['type'] == 'input_image' for i in items)
 assert len(json.dumps(original)) < 32 * 1024 * 1024
 small = {'input': [{'type': 'function_call_output', 'output': [
     {'type': 'input_image', 'image_url': 'data:image/png;base64,' + 'A' * 100}]}]}
-asyncio.run(prune(small, size=10 * 1024 * 1024))
+assert asyncio.run(prune(small, size=10 * 1024 * 1024)) == [False, False]
 assert small['input'][0]['output'][0]['type'] == 'input_image'
 other = {'input': items}
-asyncio.run(prune(other, client='opencode'))
+assert asyncio.run(prune(other, client='opencode')) == [False, False]
 assert other['input'] == items
 print('ok')
 "#;
@@ -17484,7 +17309,7 @@ print(round(t.snapshot()["lifetime"]["compression_savings_usd"], 6))
         // this pins the shape.
         let py = super::SITECUSTOMIZE_PY;
         assert!(py.contains("HEADROOM_TOOL_REF_HINT"));
-        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.42.0""#));
+        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.44.0""#));
         // Wraps the buffered-error seam and post-processes its Response.
         assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
         assert!(py.contains("def _hd_hint_apply(result):"));
@@ -17974,7 +17799,7 @@ with open(_p, encoding="utf-8") as _f:
             "else {}",
             crate::output_savings::OUTPUT_WARMUP_REPLIES
         )));
-        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.42.0""#));
+        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.44.0""#));
         assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
         assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
         assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));
@@ -18042,7 +17867,10 @@ with open(_p, encoding="utf-8") as _f:
         // #3878, #3881, #3885, #3892, #3907, #3926, #3928, #3930, #3932,
         // #3934, #3938, #3940, #3941, #3946, #3977, #4023, #4034); the
         // learn loop budget, web search history, buffered upstream stream
-        // and stream hang-up shipped in 0.42.0 (#4269, #4202, #4206, #4286).
+        // and stream hang-up shipped in 0.42.0 (#4269, #4202, #4206, #4286);
+        // embed batch cap, path fold markup guard, maturation floor, learn
+        // rule coercion, learn OpenCode v2 and deferred tool affinity shipped
+        // in 0.44.0 (#4507/#4567, #4716, #4522, #2471, #4199, #4204).
         // Re-vendoring any of them would double-apply the fix; image_memo and
         // image_worker_reap raised a TypeError on every image call once
         // retargeted.
@@ -18098,6 +17926,12 @@ with open(_p, encoding="utf-8") as _f:
             "web_search_history",
             "buffered_upstream_stream",
             "stream_hangup_after_terminal",
+            "embed_batch_cap",
+            "path_fold_markup_guard",
+            "maturation_floor",
+            "learn_rule_coerce",
+            "learn_opencode_v2",
+            "deferred_tool_affinity",
         ] {
             assert!(
                 !py.contains(&format!(r#"_hd_bound.add("{name}")"#)),
@@ -18149,196 +17983,6 @@ print(RequestLogger.MESSAGE_WINDOW, sum(e["request_messages"] is not None
         assert_eq!(on, "20 20");
         // Off keeps the wheel's window, which also proves the probe sees it.
         assert_eq!(run("0"), "100 22");
-    }
-
-    #[test]
-    fn embed_batch_cap_behaves_against_the_installed_wheel() {
-        // The relevance scorer's fastembed calls run 16 texts per ONNX batch, not
-        // fastembed's 256 that grew ORT's arena to 2.5 GB, and with the large
-        // cache off each ONNX run shrinks the arena. A fake model records the
-        // batch_size and run options the installed EmbeddingScorer._encode passes.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
-        let probe = r#"
-from headroom.relevance.embedding import EmbeddingScorer
-seen = []
-class Model:
-    def __init__(self):
-        self.model = Onnx()
-    def embed(self, texts, **kwargs):
-        seen.append(kwargs.get("batch_size"))
-        self.model.model.run(["out"], {})
-        return [[1.0, 0.0] for _ in texts]
-class Onnx:
-    def __init__(self):
-        self.model = Session()
-class Session:
-    def run(self, names, feed, run_options=None):
-        shrink.append(run_options and run_options.get_run_config_entry("memory.enable_memory_arena_shrinkage"))
-shrink = []
-model = Model()
-scorer = EmbeddingScorer()
-scorer._get_model = lambda: model
-print(len(scorer._encode(["record"] * 40)), seen, shrink)
-"#;
-        let run = |flag: &str, large_cache: Option<&str>| {
-            let mut command = crate::proc::command(&python);
-            command
-                .args(["-c", probe])
-                .env("PYTHONPATH", dir.path())
-                .env("HEADROOM_EMBED_BATCH_CAP", flag)
-                .env_remove("HEADROOM_EMBED_ARENA_SHRINK")
-                .env_remove("MallocLargeCache");
-            if let Some(value) = large_cache {
-                command.env("MallocLargeCache", value);
-            }
-            let out = command.output().expect("run embed batch cap probe");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_eq!(run("1", Some("0")), "40 [16] ['cpu:0']");
-        // Shrinking with libmalloc's large cache on re-grows the arena; stay out.
-        assert_eq!(run("1", None), "40 [16] [None]");
-        // Off keeps fastembed's default, which also proves the probe sees it.
-        assert_eq!(run("0", Some("0")), "40 [None] [None]");
-        // The shrink kill switch keeps the cap and drops only the run options.
-        let out = crate::proc::command(&python)
-            .args(["-c", probe])
-            .env("PYTHONPATH", dir.path())
-            .env("HEADROOM_EMBED_BATCH_CAP", "1")
-            .env("HEADROOM_EMBED_ARENA_SHRINK", "0")
-            .env("MallocLargeCache", "0")
-            .output()
-            .expect("run embed batch cap probe");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "40 [16] [None]"
-        );
-    }
-
-    #[test]
-    fn path_fold_markup_guard_behaves_against_the_installed_wheel() {
-        // The lossless path fold split `</body>` into dir `</` + base `body>`, and
-        // template closers the same way, so the model saw (and wrote back) broken
-        // markup. With the guard they come back as-is, also through the router's
-        // mixed route (an HTML tail after a JSON-LD block), and a real path
-        // listing still folds.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
-        let probe = r#"
-from headroom.transforms.lossless_compaction import compact_lossless as c
-from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-print(repr(c("  </script>\n</body>\n</html>\n", "paths")))
-print(repr(c("{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n", "paths")))
-print(repr(c("{{/if}}\n{{/each}}\n", "paths")))
-print(repr(c("src/app/main.rs\nsrc/app/lib.rs\nsrc/app/util.rs\ntests/a.rs\n", "paths")))
-body = "".join(f"    <p>Paragraph {i} of the example page with some ordinary text.</p>\n" for i in range(20))
-ld = '{\n  "@type": "Product",\n  "name": "Example Widget"\n}'
-tail = "  <main>\n" + body + "  </main>\n  <script type='application/ld+json'>\n" + ld + "\n  </script>\n</body>\n</html>\n"
-r = ContentRouter(ContentRouterConfig()).compress(tail)
-print(r.strategy_used.value, r.compressed.endswith("  </script>\n</body>\n</html>\n"))
-"#;
-        let run = |flag: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", dir.path())
-                .env("HEADROOM_PATH_FOLD_MARKUP_GUARD", flag)
-                .env_remove("HEADROOM_LOSSLESS_COMPACTION")
-                .output()
-                .expect("run path fold markup probe");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let paths = r"'src/app/\nmain.rs\nlib.rs\nutil.rs\ntests/\na.rs\n'";
-        assert_eq!(
-            run("1"),
-            [
-                r"'  </script>\n</body>\n</html>\n'",
-                r"'{{#if active}}\n<p>{{name}}</p>\n{{/if}}\n{{/each}}\n'",
-                r"'{{/if}}\n{{/each}}\n'",
-                paths,
-                "mixed True",
-            ]
-            .join("\n")
-        );
-        // Off restores the wheel's fold, which also proves the probe sees it.
-        assert_eq!(
-            run("0"),
-            [
-                r"'  </script>\n</\nbody>\nhtml>\n'",
-                r"'{{#if active}}\n<p>{{name}}</\np>\n{{/\nif}}\neach}}\n'",
-                r"'{{/\nif}}\neach}}\n'",
-                paths,
-                "mixed False",
-            ]
-            .join("\n")
-        );
-    }
-
-    #[test]
-    fn maturation_floor_behaves_against_the_installed_wheel() {
-        // RUST-DP: a Read quiet for 5 turns sits inside the provider-cached prefix,
-        // and the handler's freeze count (here 1) is below the floor finalize_turn
-        // replayed. With a replay the Read must stay verbatim; without one (cold
-        // cache) it matures, so the floor never outlives its request's pass.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
-        let probe = r#"
-import inspect
-from headroom.config import ReadMaturationConfig
-from headroom.proxy import session_engine
-from headroom.proxy.handlers import anthropic as handler
-from headroom.transforms.read_maturation import ReadMaturationManager
-src = inspect.getsource(handler)
-# The vendor relies on the handler importing finalize_turn per request and
-# maturing Reads after that replay.
-wired = ("            from headroom.proxy.session_engine import finalize_turn\n" in src
-         and src.index("_final = finalize_turn(") < src.index("maturation_mgr.apply("))
-msgs = [{"role": "user", "content": "fix the retry"},
-        {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read",
-                                           "input": {"file_path": "/repo/net.rs"}}]},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "x" * 4096}]}]
-for k in range(5):
-    msgs += [{"role": "assistant", "content": [{"type": "tool_use", "id": f"b{k}", "name": "Bash",
-                                                "input": {"command": "cargo test"}}]},
-             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"b{k}", "content": "ok"}]}]
-def matured(replayed):
-    mgr = ReadMaturationManager(ReadMaturationConfig(enabled=True, quiesce_turns=5,
-                                                     max_hold_turns=25, min_size_bytes=2048))
-    if replayed:
-        prev = msgs[:-2]
-        session_engine.finalize_turn(msgs, msgs, prev, prev, confirmed_frozen_count=len(prev))
-    return mgr.apply(msgs, frozen_message_count=1).newly_matured
-print(wired, matured(True), matured(False))
-"#;
-        let run = |flag: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", dir.path())
-                .env("HEADROOM_MATURATION_FLOOR", flag)
-                .output()
-                .expect("run maturation floor probe");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_eq!(run("1"), "True 0 1");
-        // Off is the wheel's own behaviour: the cached Read matures.
-        assert_eq!(run("0"), "True 1 1");
     }
 
     #[test]
@@ -18550,73 +18194,6 @@ print(wired, matured(True), matured(False))
     }
 
     #[test]
-    fn learn_opencode_v2_behaves_against_the_installed_wheel() {
-        // RUST-HJ: a current OpenCode's database has session_v2 and no
-        // `session`, and every learn scan died on "no such table: session".
-        // Rows follow OpenCode's own v1 -> v2 migration (migrateTool). The kill
-        // switch brings the crash back; the user's file never gets a view.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() {
-            eprintln!("skipping: no managed runtime at {}", python.display());
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-learn-oc2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        let probe = r#"import json, sqlite3, tempfile
-from pathlib import Path
-t = Path(tempfile.mkdtemp())
-db = t / 'opencode.db'
-c = sqlite3.connect(db)
-c.executescript('CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT);'
-    'CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, directory TEXT NOT NULL, time_created INTEGER);'
-    'CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER, data TEXT NOT NULL);')
-w = (t / 'app').as_posix()
-c.execute("INSERT INTO project VALUES ('p1', ?, 'app')", (w,))
-c.execute("INSERT INTO session_v2 VALUES ('s1', 'p1', ?, 1761000000000)", (w,))
-data = {'type': 'assistant', 'content': [{'type': 'text', 'text': 'hi'},
-    {'type': 'tool', 'id': 'call_1', 'name': 'bash', 'state': {'status': 'completed', 'input': {'command': 'ls'}, 'content': [{'type': 'text', 'text': 'a.txt'}]}, 'time': {'created': 1761000000001}},
-    {'type': 'tool', 'id': 'call_2', 'name': 'read', 'state': {'status': 'error', 'input': {'filePath': '/x'}, 'error': {'type': 'tool.execution', 'message': 'File not found: /x'}}, 'time': {'created': 1761000000002}}]}
-c.execute("INSERT INTO session_message VALUES ('m1', 's1', 'assistant', 0, 1761000000000, ?)", (json.dumps(data),))
-c.commit()
-c.close()
-from headroom.learn.plugins.opencode import OpenCodePlugin
-p = OpenCodePlugin(db_path=db)
-try:
-    projects = p.discover_projects()
-except sqlite3.OperationalError as e:
-    print(e)
-    raise SystemExit
-calls = [(tc.name, tc.tool_call_id, tc.input_data, tc.output, tc.is_error) for s in p.scan_project(projects[0]) for tc in s.tool_calls]
-views = sqlite3.connect(db).execute("SELECT count(*) FROM sqlite_master WHERE type = 'view'").fetchone()[0]
-print(len(projects), calls, views)"#;
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_LEARN_OPENCODE_V2", kill)
-                .output()
-                .expect("run learn probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            on,
-            "1 [('Bash', 'call_1', {'command': 'ls'}, 'a.txt', False), \
-             ('read', 'call_2', {'filePath': '/x'}, 'File not found: /x', True)] 0",
-            "stderr:\n{on_err}"
-        );
-        assert_eq!(off, "no such table: session", "stderr:\n{off_err}");
-    }
-
-    #[test]
     fn learn_prior_local_behaves_against_the_installed_wheel() {
         // A rescan saw only CLAUDE.md, never the CLAUDE.local.md block the last
         // scan wrote, so it renamed every section and both copies survived
@@ -18788,103 +18365,6 @@ print(len(projects), calls, views)"#;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(on, "RuntimeError True", "stderr:\n{on_err}");
         assert_eq!(off, "BrokenPipeError False", "stderr:\n{off_err}");
-    }
-
-    #[test]
-    fn deferred_tool_affinity_behaves_against_the_installed_wheel() {
-        // A tool ToolSearch loads joins `tools` with defer_loading and keeps
-        // the conversation on its tracker; a rendered tool still splits it.
-        // The kill switch restores the wheel's split on both.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-deferred-aff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        // cache_ttl_seconds as 0.41.0's Anthropic handler passes it, through
-        // the cache_integrity wrapper that binds beside this vendor.
-        let probe = "import sitecustomize\n\
-                     from headroom.cache import prefix_tracker as pt\n\
-                     R = {'name': 'Read', 'input_schema': {'type': 'object'}}\n\
-                     D = {'name': 'mcp__x__search', 'defer_loading': True, 'input_schema': {}}\n\
-                     W = {'name': 'Write', 'input_schema': {'type': 'object'}}\n\
-                     def aff(tools):\n    \
-                         return pt.segment_fingerprint({'model': 'm', 'tools': tools, 'tool_choice': None, 'thinking': None, 'output_config': None})\n\
-                     s = pt.SessionTrackerStore()\n\
-                     m = [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'ok'}]\n\
-                     t1 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R]), cache_ttl_seconds=3600)\n\
-                     m = m + [{'role': 'user', 'content': 'go'}]\n\
-                     t2 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D]), cache_ttl_seconds=3600)\n\
-                     m = m + [{'role': 'assistant', 'content': 'k'}]\n\
-                     t3 = s.resolve_tracker('sid', 'anthropic', messages=m, cache_affinity=aff([R, D, W]), cache_ttl_seconds=3600)\n\
-                     print(t1 is t2, t2 is t3, 'deferred_tool_affinity' in sitecustomize._hd_bound)";
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_SDK", "headroom-desktop-proxy")
-                .env("HEADROOM_DEFERRED_TOOL_AFFINITY", kill)
-                .output()
-                .expect("run deferred tool affinity probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (off, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        if on.ends_with("False") {
-            eprintln!("skipping: deferred tool affinity vendor did not bind (wheel bumped?)");
-            return;
-        }
-        assert_eq!(on, "True False True", "stderr:\n{on_err}");
-        assert_eq!(off, "False False False", "stderr:\n{off_err}");
-    }
-
-    #[test]
-    fn learn_rule_coercion_behaves_against_the_installed_wheel() {
-        // RUST-K5: list content becomes bullets, a non-string section drops
-        // its rule, a null rules list reads as empty; the kill switch restores
-        // the wheel's crash.
-        let python =
-            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
-        if !python.exists() || !installed_wheel_is_pinned(&python) {
-            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("hd-learn-rc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp inject dir");
-        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
-            .expect("write sitecustomize");
-        let probe = "from headroom.learn.analyzer import _parse_llm_response as p\n\
-                     r = p({'context_file_rules': [{'section': 'Env', 'content': ['a', '- b']},\n\
-                     {'section': ['x'], 'content': 'y'}], 'memory_file_rules': None})\n\
-                     print(repr([x.content for x in r]))";
-        let run = |kill: &str| {
-            let out = crate::proc::command(&python)
-                .args(["-c", probe])
-                .env("PYTHONPATH", &dir)
-                .env("HEADROOM_LEARN_RULE_COERCE", kill)
-                .output()
-                .expect("run learn probe");
-            (
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-            )
-        };
-        let (on, on_err) = run("1");
-        let (_, off_err) = run("0");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(on, r"['- a\n- b']", "stderr:\n{on_err}");
-        assert!(
-            off_err.contains("has no attribute 'strip'"),
-            "kill switch did not unbind:\n{off_err}"
-        );
     }
 
     #[test]
@@ -19623,6 +19103,25 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
     }
 
     #[test]
+    fn a_variant_that_cannot_be_started_falls_through_to_the_next() {
+        let blocked = || -> anyhow::Result<u32> {
+            Err(anyhow::anyhow!(
+                "An Application Control policy has blocked this file. (os error 4551)"
+            ))
+        };
+        assert!(matches!(
+            super::spawned_or_next_variant(blocked(), true),
+            Ok(None)
+        ));
+        let last = super::spawned_or_next_variant(blocked(), false).unwrap_err();
+        assert!(format!("{last:#}").contains("os error 4551"));
+        assert!(matches!(
+            super::spawned_or_next_variant(Ok(7), true),
+            Ok(Some(7))
+        ));
+    }
+
+    #[test]
     fn claim_once_is_not_burned_by_a_failure_of_another_shape() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let flag = AtomicBool::new(false);
@@ -19802,6 +19301,14 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         assert!(pip_index_fetch_failed(
             "could not fetch url https://pypi.org/simple/x/: ssl eof\n\
              error: could not find a version that satisfies x==1 (from versions: none)"
+        ));
+        // RUST-29 on 0.9.58: connection resets print only retry warnings.
+        assert!(pip_index_fetch_failed(
+            "warning: retrying (retry(total=0, connect=none, read=none, redirect=none, \
+             status=none)) after connection broken by 'connectionreseterror(10054)': \
+             /simple/hf-xet/\n\
+             error: could not find a version that satisfies the requirement \
+             hf-xet==1.6.0 (from versions: none)"
         ));
         // A real bad pin lists the versions pip DID see (RUST-6S).
         assert!(!pip_index_fetch_failed(
@@ -20258,6 +19765,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
+            // RUST-W6 verbatim.
+            (
+                "reading download body: request or response body error: error reading a body from connection: An existing connection was forcibly closed by the remote host. (os error 10054)",
+                "connection",
+            ),
             ("writing /tmp/a.partial: Permission denied (os error 13)", "permission"),
             ("downloading https://x/a.whl: something new", "other"),
         ];
@@ -20357,9 +19869,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
         let probe = r#"
 from headroom.cli.proxy import proxy
 from headroom.rollout import resolve_rollout
-flag = next(p for p in proxy.params if p.name == "intercept_tool_results")
+# The value click resolves with no argument: click 8.5 keeps a bare
+# is_flag option's `default` attribute as Sentinel.UNSET.
+ctx = proxy.make_context("proxy", [], resilient_parsing=True)
 snapshot = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
-print(flag.default, snapshot.is_enabled("tool_result_interceptors"))
+print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_interceptors"))
 "#;
         let out = crate::proc::command(&python)
             .args(["-c", probe])
@@ -24671,6 +24185,137 @@ Always run the linter first.
         assert!(!listed_tool(&manager, "serena").update_available);
     }
 
+    #[test]
+    fn only_an_enabled_windows_serena_without_the_safe_python_launch_moves_at_launch() {
+        let (_root, runtime, manager) = seed_test_runtime("serena-move");
+        let entrypoint = manager.serena_entrypoint();
+        fs::create_dir_all(entrypoint.parent().expect("bin parent")).expect("bin dir");
+        fs::write(&entrypoint, b"#!/bin/sh\n").expect("entrypoint");
+        let receipt =
+            |json: &str| fs::write(runtime.tools_dir.join("serena.json"), json).expect("receipt");
+        receipt(r#"{"version":"2.0.0","enabled":true}"#);
+        assert!(manager.serena_needs_move(true));
+        assert!(!manager.serena_needs_move(false));
+        receipt(r#"{"version":"2.0.0","enabled":false}"#);
+        assert!(!manager.serena_needs_move(true));
+        receipt(r#"{"version":"2.0.0","enabled":true,"python_launch":true}"#);
+        assert!(
+            manager.serena_needs_move(true),
+            "early rc launches lack the cwd guard"
+        );
+        receipt(
+            r#"{"version":"2.0.0","enabled":true,"python_launch":true,"python_launch_safe_path":true}"#,
+        );
+        assert!(!manager.serena_needs_move(true));
+    }
+
+    #[test]
+    fn serena_launch_migration_preserves_invalid_receipts() {
+        for invalid in [r#"{"version":"2.0.0","enabled":false"#, "null", "[]"] {
+            let (_root, runtime, manager) = seed_test_runtime("serena-invalid-receipt");
+            let entrypoint = manager.serena_entrypoint();
+            fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+            fs::write(entrypoint, b"unused").unwrap();
+            let receipt = runtime.tools_dir.join("serena.json");
+            fs::write(&receipt, invalid).unwrap();
+            for _ in 0..2 {
+                assert!(
+                    !manager.serena_needs_move(true),
+                    "invalid settings must not enable registration: {invalid}"
+                );
+                assert_eq!(fs::read_to_string(&receipt).unwrap(), invalid);
+            }
+            let backups: Vec<_> = fs::read_dir(&runtime.tools_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("serena.json.headroom-backup-")
+                })
+                .collect();
+            assert!(!backups.is_empty(), "invalid receipt must be backed up");
+            for backup in backups {
+                assert_eq!(fs::read_to_string(backup.path()).unwrap(), invalid);
+            }
+        }
+    }
+
+    #[test]
+    fn serena_launch_migration_requires_a_readable_receipt() {
+        let (_root, runtime, manager) = seed_test_runtime("serena-unreadable-receipt");
+        let entrypoint = manager.serena_entrypoint();
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(entrypoint, b"unused").unwrap();
+        // Reading a directory as a file fails on every supported platform.
+        let receipt = runtime.tools_dir.join("serena.json");
+        fs::create_dir(&receipt).unwrap();
+        assert!(manager.serena_installed());
+        assert!(!manager.serena_needs_move(true));
+        assert!(receipt.is_dir());
+    }
+
+    #[cfg(unix)] // Executes the Windows launch snippet with /usr/bin/python3.
+    #[test]
+    fn serena_python_launch_does_not_import_project_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let installed = root.path().join("site-packages");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(installed.join("serena")).unwrap();
+        fs::write(installed.join("serena/__init__.py"), "").unwrap();
+        fs::write(
+            installed.join("serena/cli.py"),
+            "import json, sys\ndef top_level():\n    print(json.dumps(sys.argv[1:]))\n",
+        )
+        .unwrap();
+        // Empty PYTHONPATH entries also insert the absolute cwd, in addition
+        // to the empty sys.path[0] Python puts there for -c.
+        let pythonpath = std::env::join_paths([Path::new(""), &project, &installed]).unwrap();
+        let run = || {
+            let out = crate::proc::command("/usr/bin/python3")
+                .args([
+                    "-c",
+                    super::SERENA_MAIN,
+                    "start-mcp-server",
+                    "--project-from-cwd",
+                ])
+                .current_dir(&project)
+                .env_remove("PYTHONHOME")
+                .env("PYTHONPATH", &pythonpath)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                serde_json::json!(["start-mcp-server", "--project-from-cwd"])
+            );
+        };
+        fs::write(
+            project.join("serena.py"),
+            "raise RuntimeError('project module ran')\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("json.py"),
+            "raise RuntimeError('project dependency ran')\n",
+        )
+        .unwrap();
+        run();
+        fs::remove_file(project.join("serena.py")).unwrap();
+        fs::create_dir(project.join("serena")).unwrap();
+        fs::write(
+            project.join("serena/__init__.py"),
+            "raise RuntimeError('project package ran')\n",
+        )
+        .unwrap();
+        run();
+    }
+
     fn retired_leftovers(parent: &Path) -> usize {
         fs::read_dir(parent)
             .expect("read parent")
@@ -26891,6 +26536,84 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(read(".config/opencode/opencode.json").contains("npx"));
     }
 
+    /// The real Serena helper against the installed wheel's registrars, in a
+    /// scratch home: a serena.exe entry from before `serena_command` moves to
+    /// the python.exe launch with the uvx env kept, a rerun is a no-op, and
+    /// unregister removes it.
+    #[test]
+    fn serena_helper_moves_an_entry_to_the_python_launch_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".codex", ".claude", ".headroom"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let run = |args: &[&str]| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("HEADROOM_WORKSPACE_DIR", home.path().join(".headroom"))
+                .env("PATH", home.path())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{text}");
+            text
+        };
+        let helper = super::SERENA_MCP_HELPER;
+        let (exe, venv_python, uvx) = (
+            "/v/Scripts/serena.exe",
+            "/v/Scripts/python.exe",
+            "/v/Scripts/uvx.exe",
+        );
+        let old = run(&["-c", helper, "register", exe, uvx]);
+        assert!(old.contains("claude: registered"), "{old}");
+        let new_form = [
+            "-c",
+            helper,
+            "register",
+            venv_python,
+            uvx,
+            "-c",
+            super::SERENA_MAIN,
+        ];
+        let moved = run(&new_form);
+        for agent in ["claude: registered", "codex: registered"] {
+            assert!(moved.contains(agent), "{moved}");
+        }
+        let read = |path: &str| std::fs::read_to_string(home.path().join(path)).unwrap();
+        let claude: serde_json::Value = serde_json::from_str(&read(".claude.json")).unwrap();
+        let entry = &claude["mcpServers"]["serena"];
+        assert_eq!(entry["command"], venv_python, "{entry}");
+        assert_eq!(
+            entry["args"].as_array().unwrap()[..3],
+            ["-c", super::SERENA_MAIN, "start-mcp-server"],
+            "{entry}"
+        );
+        assert_eq!(entry["env"]["UVX"], uvx, "{entry}");
+        let codex = read(".codex/config.toml");
+        assert!(
+            codex.contains(venv_python) && !codex.contains(exe),
+            "{codex}"
+        );
+
+        let again = run(&new_form);
+        assert!(!again.contains(": registered"), "a rerun rewrote: {again}");
+        let gone = run(&["-c", helper, "unregister"]);
+        assert_eq!(gone.matches(": removed").count(), 2, "{gone}");
+        assert!(!read(".claude.json").contains("serena"));
+    }
+
     /// `codex mcp add` (0.166) rewrites config.toml without the comment above
     /// a table, so Headroom's start marker goes and the new table lands
     /// before the end marker; "always allow" adds a per-tool table. Disabling
@@ -27312,6 +27035,14 @@ assert OpencodeRegistrar().register_server(own).ok"#,
         assert!(script.is_ascii(), "{script}");
         assert!(script.contains("\"%~dp0..\\runtime"), "{script}");
         assert!(script.contains("set \"C=%~dp0..\\tools"), "{script}");
+        // python.exe, not pip's markitdown.exe launcher, which Smart App
+        // Control blocks; the code is one quoted argument with no `"` inside.
+        let launch = script
+            .lines()
+            .find(|l| l.contains(" -c "))
+            .expect("launch line");
+        assert!(!launch.contains("markitdown.exe"), "{launch}");
+        assert_eq!(launch.matches('"').count(), 4, "{launch}");
         // cmd opens a `<` redirect before `2>nul` applies, so reading the
         // counter bare printed "The system cannot find the file specified."
         // on the first conversion (rc9 win-test VM). No counter yet reads as 0.
@@ -27501,14 +27232,19 @@ assert OpencodeRegistrar().register_server(own).ok"#,
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
+    fn smoke_test_markitdown_succeeds_when_python_runs_it() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
         fs::write(
             runtime.tools_dir.join("markitdown.json"),
             br#"{"version":"0.1.6","enabled":true}"#,
         )
         .expect("receipt");
-        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 9\n");
+        // python -c <main> --help, as the shims run it; markitdown.exe never.
+        write_executable(
+            &manager.managed_python(),
+            "#!/bin/sh\n[ \"$1\" = -c ] && [ \"$3\" = --help ] && case \"$2\" in *markitdown.__main__*) exit 0;; esac\nexit 4\n",
+        );
 
         manager
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
@@ -27525,7 +27261,8 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             br#"{"version":"0.1.6","enabled":true}"#,
         )
         .expect("receipt");
-        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 3\n");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        write_executable(&manager.managed_python(), "#!/bin/sh\nexit 3\n");
 
         manager
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)

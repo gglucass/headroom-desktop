@@ -211,6 +211,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("tao::") && msg.starts_with("D-Bus message processing error") {
         return true;
     }
+    // tauri-runtime-wry re-themes every webview when Windows' light/dark
+    // setting changes, and logs WebView2's refusal at error: 0x8007139F
+    // (ERROR_INVALID_STATE) for a webview it cannot update right now (RUST-W7,
+    // one host). The window keeps its old theme until the next change, and no
+    // release of ours changes that.
+    if target.starts_with("tauri_runtime_wry") && msg.starts_with("failed to set theme") {
+        return true;
+    }
     // proxy_intercept bypass forwarders (plain + websocket-upgrade variant):
     // when CC is bypassing the local Python proxy and we re-issue directly to
     // the upstream API, transient network failures aren't actionable — client
@@ -1603,6 +1611,14 @@ mod tests {
             "headroom_desktop_lib::keychain",
             "D-Bus message processing error: Failed to read/write data, disconnected from D-Bus?"
         ));
+    }
+
+    #[test]
+    fn skips_wrys_refused_theme_change() {
+        // RUST-W7 verbatim.
+        let msg = "failed to set theme: WebView2 error: WindowsError(Error { code: HRESULT(0x8007139F), message: \"The group or resource is not in the correct state to perform the requested operation.\" })";
+        assert!(skip_sentry("tauri_runtime_wry", msg));
+        assert!(!skip_sentry("headroom_desktop_lib", msg));
     }
 
     #[test]

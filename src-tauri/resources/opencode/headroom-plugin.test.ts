@@ -51,13 +51,13 @@ describe("OpenCode 2.x model routing", () => {
   it("leaves a provider the transform does not handle alone", async () => {
     const [model] = await routedModels([
       {
-        providerID: "anthropic",
-        id: "claude-sonnet-4-5",
-        package: "@opencode/ai/providers/anthropic",
-        settings: { baseURL: "https://api.anthropic.com/v1" },
+        providerID: "google",
+        id: "gemini-3-pro",
+        package: "@opencode/ai/providers/google",
+        settings: { baseURL: "https://generativelanguage.googleapis.com/v1beta" },
       },
     ]);
-    expect(model.settings.baseURL).toBe("https://api.anthropic.com/v1");
+    expect(model.settings.baseURL).toBe("https://generativelanguage.googleapis.com/v1beta");
     expect(model.headers).toBeUndefined();
   });
 });
