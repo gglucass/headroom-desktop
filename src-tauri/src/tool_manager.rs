@@ -8840,9 +8840,7 @@ impl ToolManager {
         }
         let moved = self.register_serena_mcp().and_then(|()| {
             // Keeps the installed version: only a reinstall changes it.
-            let mut receipt = self
-                .read_tool_receipt("serena")
-                .unwrap_or_else(|| json!({}));
+            let mut receipt = self.read_serena_receipt_for_move()?;
             if let Some(fields) = receipt.as_object_mut() {
                 fields.insert("python_launch".into(), json!(true));
                 fields.insert("python_launch_safe_path".into(), json!(true));
@@ -8856,11 +8854,41 @@ impl ToolManager {
     }
 
     fn serena_needs_move(&self, windows: bool) -> bool {
-        let moved = self
-            .read_tool_receipt("serena")
-            .and_then(|r| r.get("python_launch_safe_path")?.as_bool())
-            == Some(true);
-        windows && self.serena_installed() && self.tool_enabled("serena") && !moved
+        if !windows || !self.serena_installed() {
+            return false;
+        }
+        match self.read_serena_receipt_for_move() {
+            Ok(receipt) => {
+                receipt.get("enabled").and_then(Value::as_bool) != Some(false)
+                    && receipt
+                        .get("python_launch_safe_path")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+            }
+            Err(err) => {
+                log::warn!("serena launch migration skipped: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// A failed read must not turn a disabled addon into an enabled one or
+    /// replace its receipt with defaults. Read again before writing as well:
+    /// registering with the agents can take long enough for the file to change.
+    fn read_serena_receipt_for_move(&self) -> Result<Value> {
+        let path = self.runtime.tools_dir.join("serena.json");
+        let bytes = crate::state::read_state_file(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
+            Ok(receipt) => Ok(Value::Object(receipt)),
+            Err(err) => {
+                let backup = crate::client_adapters::backup_if_exists(&path)?;
+                bail!(
+                    "invalid Serena receipt at {}; leaving it unchanged (backup: {backup:?}): {err}",
+                    path.display()
+                );
+            }
+        }
     }
 
     pub fn set_serena_enabled(&self, enabled: bool) -> Result<()> {
@@ -24179,6 +24207,52 @@ Always run the linter first.
             r#"{"version":"2.0.0","enabled":true,"python_launch":true,"python_launch_safe_path":true}"#,
         );
         assert!(!manager.serena_needs_move(true));
+    }
+
+    #[test]
+    fn serena_launch_migration_preserves_invalid_receipts() {
+        for invalid in [r#"{"version":"2.0.0","enabled":false"#, "null", "[]"] {
+            let (_root, runtime, manager) = seed_test_runtime("serena-invalid-receipt");
+            let entrypoint = manager.serena_entrypoint();
+            fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+            fs::write(entrypoint, b"unused").unwrap();
+            let receipt = runtime.tools_dir.join("serena.json");
+            fs::write(&receipt, invalid).unwrap();
+            for _ in 0..2 {
+                assert!(
+                    !manager.serena_needs_move(true),
+                    "invalid settings must not enable registration: {invalid}"
+                );
+                assert_eq!(fs::read_to_string(&receipt).unwrap(), invalid);
+            }
+            let backups: Vec<_> = fs::read_dir(&runtime.tools_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("serena.json.headroom-backup-")
+                })
+                .collect();
+            assert!(!backups.is_empty(), "invalid receipt must be backed up");
+            for backup in backups {
+                assert_eq!(fs::read_to_string(backup.path()).unwrap(), invalid);
+            }
+        }
+    }
+
+    #[test]
+    fn serena_launch_migration_requires_a_readable_receipt() {
+        let (_root, runtime, manager) = seed_test_runtime("serena-unreadable-receipt");
+        let entrypoint = manager.serena_entrypoint();
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(entrypoint, b"unused").unwrap();
+        // Reading a directory as a file fails on every supported platform.
+        let receipt = runtime.tools_dir.join("serena.json");
+        fs::create_dir(&receipt).unwrap();
+        assert!(manager.serena_installed());
+        assert!(!manager.serena_needs_move(true));
+        assert!(receipt.is_dir());
     }
 
     #[cfg(unix)] // Executes the Windows launch snippet with /usr/bin/python3.
