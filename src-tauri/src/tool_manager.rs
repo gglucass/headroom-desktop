@@ -12819,6 +12819,11 @@ impl HeadroomRelease {
     pub fn version(&self) -> &str {
         &self.version
     }
+
+    #[cfg(test)]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
