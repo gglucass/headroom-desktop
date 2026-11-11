@@ -13782,14 +13782,20 @@ mod tests {
     ) {
         let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(base_dir);
         fs::create_dir_all(&runtime.tools_dir).expect("create tools dir");
+        // A real install records the pin's artifact hash. Windows re-packs the
+        // pin (signed _core.pyd), so without it the receipt reads as an
+        // unsigned install that is due an upgrade, on Windows only.
+        let pinned = crate::tool_manager::pinned_headroom_release().expect("pinned release");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             format!(
                 r#"{{
                     "version":"{}",
-                    "artifact":{{"requirementsLockSha256":"{}"}}
+                    "artifact":{{"sha256":"{}","requirementsLockSha256":"{}"}}
                 }}"#,
-                version, requirements_lock_sha256
+                version,
+                pinned.sha256(),
+                requirements_lock_sha256
             ),
         )
         .expect("write receipt");

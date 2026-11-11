@@ -43,9 +43,10 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 // always-on proxy). 100 MiB clears Anthropic's 32 MB request limit with room to
 // spare for image payloads.
 const MAX_DIRECT_BODY: usize = 100 * 1024 * 1024;
-// The bundled Python proxy accepts 256 MiB for image-heavy Codex requests.
+// The bundled Python proxy decodes up to 512 MiB for image-heavy Codex requests
+// (2x its 256 MiB wire cap). Keep in step with the sitecustomize vendor.
 // Inspect in bounded chunks before handing it a request that it would reject.
-const MAX_CODEX_DECODED_BODY: usize = 256 * 1024 * 1024;
+const MAX_CODEX_DECODED_BODY: usize = 512 * 1024 * 1024;
 // A measured request can hold up to 100 MiB compressed in this process, and
 // direct forwarding can briefly copy it. Bound total memory across sessions.
 static CODEX_BODY_PROBES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -7162,7 +7163,7 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
-    /// A Codex request that would cross the Python decoder's 256 MiB ceiling
+    /// A Codex request that would cross the Python decoder's 512 MiB ceiling
     /// goes to the account's Codex upstream with its zstd bytes unchanged.
     #[tokio::test]
     #[serial]
@@ -7170,14 +7171,14 @@ mod tests {
         use std::io::Write;
 
         // Streaming encoding matches Codex's size-unknown zstd frame. The
-        // compressed body stays tiny, so this test does not allocate 257 MiB.
+        // compressed body stays tiny, so this test does not allocate 513 MiB.
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
         let chunk = [b'x'; 64 * 1024];
-        for _ in 0..(257 * 16) {
+        for _ in 0..=(super::MAX_CODEX_DECODED_BODY / chunk.len()) {
             encoder.write_all(&chunk).unwrap();
         }
         let compressed = encoder.finish().unwrap();
-        assert!(compressed.len() < 16 * 1024);
+        assert!(compressed.len() < 64 * 1024);
 
         let (backend_listener, backend_addr) = bind_ephemeral().await;
         backend_port::set(backend_addr.port());

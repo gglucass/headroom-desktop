@@ -744,7 +744,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
             _hd_body_limit.RequestBodyLimitMiddleware.__call__ = _hd_codex_body_limit_call
             _hd_body_helpers.MAX_REQUEST_BODY_SIZE = _hd_codex_cap
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = _hd_codex_cap
+            # zstd shrinks base64 images only to ~75%, so a 256 MiB wire body
+            # decodes to ~340 MiB; a 256 MiB decoded cap 400'd it (RUST-VZ).
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 2 * _hd_codex_cap
             _hd_turn_hooks.register_turn_hook(_hd_CodexImageHistoryHook())
             _hd_bound.add("codex_compaction_body")
     except Exception:
@@ -5436,13 +5438,24 @@ impl ToolManager {
             })
     }
 
-    /// Returns the pinned release if the installed version differs from the pin.
+    /// Returns the pinned release when the engine or its signed artifact changed.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
-        let installed = self.installed_headroom_version()?;
-        if installed == HEADROOM_PINNED_VERSION {
+        self.check_headroom_upgrade_to(pinned_headroom_release().ok()?)
+    }
+
+    fn check_headroom_upgrade_to(&self, release: HeadroomRelease) -> Option<HeadroomRelease> {
+        let receipt = self.read_headroom_receipt()?;
+        let installed = receipt.get("version")?.as_str()?;
+        // Signing changes the Windows artifact without changing the engine
+        // version. Version-only checks left existing unsigned 0.44.0 installs
+        // behind, including machines whose _core.pyd App Control refused.
+        let artifact_matches = release.sha256 == release.index_sha256
+            || receipt.pointer("/artifact/sha256").and_then(Value::as_str)
+                == Some(release.sha256.as_str());
+        if installed == release.version && artifact_matches {
             return None;
         }
-        pinned_headroom_release().ok()
+        Some(release)
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -6219,7 +6232,7 @@ impl ToolManager {
             headroom_index_requirement(
                 &self.runtime.downloads_dir,
                 &release.version,
-                Some(&release.sha256),
+                Some(&release.index_sha256),
             )?
         };
         run_pip_install_with_retries_streaming(
@@ -6869,7 +6882,12 @@ impl ToolManager {
         // initiated recovery from a botched in-place upgrade) or when
         // `prepare_in_place_upgrade` decides the receipt isn't safe to
         // mutate in-place.
-        if !force_rebuild {
+        // A same-version artifact replacement (the signed Windows wheel) must
+        // retain the original venv: an in-place rollback records only a version
+        // and cannot distinguish the old artifact from the replacement.
+        let replacing_same_version =
+            self.installed_headroom_version().as_deref() == Some(release.version.as_str());
+        if !force_rebuild && !replacing_same_version {
             if let Some(ctx) = self.prepare_in_place_upgrade() {
                 return self.in_place_upgrade_headroom(release, ctx, progress);
             }
@@ -7309,7 +7327,7 @@ impl ToolManager {
             match headroom_index_requirement(
                 &self.runtime.downloads_dir,
                 &release.version,
-                Some(&release.sha256),
+                Some(&release.index_sha256),
             ) {
                 Ok(arg) => arg,
                 Err(err) => {
@@ -7447,8 +7465,7 @@ impl ToolManager {
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
         let pinned = pinned_headroom_release()?;
-        let sha256 = (version == pinned.version).then_some(pinned.sha256.as_str());
-        let spec = headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)?;
+        let spec = self.headroom_reinstall_requirement(version, &pinned)?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
@@ -7471,6 +7488,24 @@ impl ToolManager {
             |_| {},
         )
         .with_context(|| format!("reinstalling Headroom version {version}"))
+    }
+
+    fn headroom_reinstall_requirement(
+        &self,
+        version: &str,
+        pinned: &HeadroomRelease,
+    ) -> Result<String> {
+        if version == pinned.version && pinned.sha256 != pinned.index_sha256 {
+            // Repairs must keep the signed Windows extension. Reinstalling the
+            // same version from PyPI replaced it with unsigned bytes and App
+            // Control refused the repaired runtime. Download/verify first, so
+            // a network failure leaves the installed files untouched.
+            let wheel_path = self.wheel_download_path(&pinned.wheel_url);
+            download_to_path(&pinned.wheel_url, &wheel_path, Some(&pinned.sha256))?;
+            return Ok(wheel_path.to_string_lossy().into_owned());
+        }
+        let sha256 = (version == pinned.version).then_some(pinned.index_sha256.as_str());
+        headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)
     }
 
     /// Recover from a pydantic / pydantic-core version skew (the SystemError
@@ -12770,15 +12805,24 @@ struct DownloadArtifact {
 }
 
 /// Metadata for a specific headroom-ai release fetched from PyPI.
+#[derive(Clone)]
 pub(crate) struct HeadroomRelease {
     version: String,
     wheel_url: String,
     sha256: String,
+    /// PyPI's own file, which the index fallback and repairs install. Differs
+    /// from `sha256` only where `wheel_url` is a re-pack (Windows).
+    index_sha256: String,
 }
 
 impl HeadroomRelease {
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    #[cfg(test)]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
     }
 }
 
@@ -12933,7 +12977,11 @@ fn headroom_index_requirement(
 }
 
 pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
-    let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+    pinned_headroom_release_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> {
+    let (url, sha256) = match (os, arch) {
         ("macos", "aarch64") => (
             "https://files.pythonhosted.org/packages/42/b7/1ab4da6f7a091fd1a102b5194828f9a588b6b4f11b522f38b86b125770a3/headroom_ai-0.44.0-cp310-abi3-macosx_11_0_arm64.whl",
             "9b084f4cd9918af2d0970450ff3e990fffc29a8220dc5e24fa0f33a4dd0359cc",
@@ -12951,16 +12999,25 @@ pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
             "3b5c7fd289e7d227dcd9b896615541ea9d3d37388bd97b3257fc8769c4b7ef70",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/67/05/3e61efd4aff135c053ac2d3f5fa51f1ab458758d03229656194aa7ef409e/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
-            "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
+            "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-0.44.0/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
+            "bc7b95ca60485f86cb61ecae3edb023d79a72051a089be8d5a1756e7125671bc",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
+    };
+    // Windows installs PyPI's wheel re-packed around an Authenticode-signed
+    // `_core.pyd` (scripts/sign-windows-wheel.py): Smart App Control blocks the
+    // unsigned one of every new release, and the upgrade rolled back to a wheel
+    // the pinned vendors skip (RUST-W1). The index fallback stays PyPI's file.
+    let index_sha256 = match os {
+        "windows" => "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
+        _ => sha256,
     };
 
     Ok(HeadroomRelease {
         version: HEADROOM_PINNED_VERSION.into(),
         wheel_url: url.into(),
         sha256: sha256.into(),
+        index_sha256: index_sha256.into(),
     })
 }
 
@@ -16696,9 +16753,12 @@ mod tests {
     fn index_fallback_for_the_pinned_engine_is_hash_checked() {
         let dir = tempfile::tempdir().unwrap();
         let pinned = super::pinned_headroom_release().unwrap();
-        let arg =
-            super::headroom_index_requirement(dir.path(), &pinned.version, Some(&pinned.sha256))
-                .unwrap();
+        let arg = super::headroom_index_requirement(
+            dir.path(),
+            &pinned.version,
+            Some(&pinned.index_sha256),
+        )
+        .unwrap();
         let file = arg
             .strip_prefix("--requirement=")
             .expect("a requirements file");
@@ -16706,7 +16766,7 @@ mod tests {
             std::fs::read_to_string(file).unwrap(),
             format!(
                 "headroom-ai=={} --hash=sha256:{}\n",
-                pinned.version, pinned.sha256
+                pinned.version, pinned.index_sha256
             )
         );
         // An older version has no hash in this build.
@@ -17098,7 +17158,7 @@ import json
 from headroom.proxy import helpers, request_body_limit, turn_hooks
 import zstandard
 assert helpers.MAX_REQUEST_BODY_SIZE == 256 * 1024 * 1024
-assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 256 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 512 * 1024 * 1024
 body = zstandard.ZstdCompressor().compress(b'x' * (179 * 1024 * 1024))
 assert len(helpers._zstd_bounded(body)) == 179 * 1024 * 1024
 
@@ -20054,6 +20114,105 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
             release.wheel_url
         );
         assert_eq!(release.sha256.len(), 64, "sha256 must be pinned");
+    }
+
+    #[test]
+    fn windows_installs_the_signed_wheel_of_the_pin() {
+        // A bump that re-picks PyPI's Windows wheel skips the signing step
+        // (docs/wheel-bump.md), and Smart App Control blocks it (RUST-W1).
+        let win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        assert!(
+            win.wheel_url.starts_with(&format!(
+                "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-{HEADROOM_PINNED_VERSION}/"
+            )),
+            "{}",
+            win.wheel_url
+        );
+        assert_ne!(
+            win.sha256, win.index_sha256,
+            "index fallback must be PyPI's file"
+        );
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        assert_eq!(mac.sha256, mac.index_sha256);
+    }
+
+    #[test]
+    fn signed_wheel_upgrade_detects_same_version_unsigned_installs() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        manager.runtime.ensure_layout().unwrap();
+        let win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        for artifact in [json!({}), json!({"sha256": win.index_sha256})] {
+            manager
+                .write_tool_receipt(
+                    "headroom",
+                    json!({
+                        "version": win.version, "artifact": artifact,
+                    }),
+                )
+                .unwrap();
+            assert!(manager.check_headroom_upgrade_to(win.clone()).is_some());
+        }
+        manager
+            .write_tool_receipt(
+                "headroom",
+                json!({
+                    "version": win.version, "artifact": {"sha256": win.sha256},
+                }),
+            )
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(win).is_none());
+
+        // Other platforms still use the engine version, including old receipts
+        // that predate artifact hashes.
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        manager
+            .write_tool_receipt("headroom", json!({"version": mac.version}))
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(mac.clone()).is_none());
+        manager
+            .write_tool_receipt("headroom", json!({"version": "0.43.0"}))
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(mac).is_some());
+    }
+
+    #[test]
+    fn signed_wheel_repair_reuses_the_verified_artifact_instead_of_pypi() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        manager.runtime.ensure_layout().unwrap();
+        let mut win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        let signed = b"signed wheel fixture";
+        win.sha256 = super::sha256_bytes(signed);
+        let wheel_path = manager.wheel_download_path(&win.wheel_url);
+        fs::write(&wheel_path, signed).unwrap();
+        let arg = manager
+            .headroom_reinstall_requirement(&win.version, &win)
+            .unwrap();
+        assert_eq!(PathBuf::from(arg), wheel_path);
+        super::verify_sha256_file(&wheel_path, &win.sha256).unwrap();
+
+        // A rollback to another engine must still restore that engine.
+        assert_eq!(
+            manager
+                .headroom_reinstall_requirement("0.43.0", &win)
+                .unwrap(),
+            "headroom-ai==0.43.0"
+        );
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        let arg = manager
+            .headroom_reinstall_requirement(&mac.version, &mac)
+            .unwrap();
+        let requirements = fs::read_to_string(arg.strip_prefix("--requirement=").unwrap()).unwrap();
+        assert_eq!(
+            requirements,
+            format!(
+                "headroom-ai=={} --hash=sha256:{}\n",
+                mac.version, mac.index_sha256
+            )
+        );
     }
 
     #[test]
@@ -25039,6 +25198,7 @@ Always run the linter first.
             version: "0.10.8".into(),
             wheel_url: "https://new.example/headroom_ai-0.10.8.whl".into(),
             sha256: "newnewnew".into(),
+            index_sha256: "newnewnew".into(),
         };
         let mcp = serde_json::json!({ "configured": true, "proxyUrl": "http://127.0.0.1:6767" });
         manager
@@ -25455,6 +25615,7 @@ Always run the linter first.
             version: "0.0.0-test".into(),
             wheel_url: "https://example.invalid/headroom.whl".into(),
             sha256: "deadbeef".into(),
+            index_sha256: "deadbeef".into(),
         };
 
         let outcome = manager.atomic_upgrade_headroom(&release, |_| {}, false);
@@ -25475,6 +25636,45 @@ Always run the linter first.
         );
         // Stale backup purged (either consumed during restore or cleaned at start).
         assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn same_version_artifact_upgrade_restores_original_venv_on_failure() {
+        let (root, runtime, manager) = seed_test_runtime("same-version-artifact");
+        let version = HEADROOM_PINNED_VERSION;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "version": version,
+            "artifact": {"requirementsLockSha256": requirements_lock_sha(super::bootstrap_requirements_lock())},
+        }))
+        .unwrap();
+        fs::write(manager.headroom_receipt_path(), &receipt).unwrap();
+        // Eligible for the old in-place path. A failed pip install and its
+        // failed pip rollback must not lose this otherwise-working runtime.
+        assert!(manager.prepare_in_place_upgrade().is_some());
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 1\n");
+        let wheel = b"replacement wheel fixture";
+        let release = HeadroomRelease {
+            version: version.into(),
+            wheel_url: format!("http://127.0.0.1:9/headroom_ai-{version}-py3-none-any.whl"),
+            sha256: super::sha256_bytes(wheel),
+            index_sha256: "original artifact hash".into(),
+        };
+        fs::write(manager.wheel_download_path(&release.wheel_url), wheel).unwrap();
+        // No standalone Python: rebuilding fails before installation. The
+        // directory swap must put the original venv and receipt back exactly.
+        let outcome = manager.atomic_upgrade_headroom(&release, |_| {}, false);
+        assert!(matches!(
+            outcome,
+            UpgradeOutcome::InstallFailed { restored: true, .. }
+        ));
+        assert_eq!(
+            fs::read(runtime.venv_dir.join("marker")).unwrap(),
+            b"live-v1"
+        );
+        assert_eq!(fs::read(manager.headroom_receipt_path()).unwrap(), receipt);
+        assert!(!manager.upgrade_interrupted());
         let _ = fs::remove_dir_all(root);
     }
 
