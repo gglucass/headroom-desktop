@@ -12960,8 +12960,8 @@ fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> 
             "3b5c7fd289e7d227dcd9b896615541ea9d3d37388bd97b3257fc8769c4b7ef70",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/67/05/3e61efd4aff135c053ac2d3f5fa51f1ab458758d03229656194aa7ef409e/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
-            "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
+            "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-0.44.0/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
+            "bc7b95ca60485f86cb61ecae3edb023d79a72051a089be8d5a1756e7125671bc",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -20075,6 +20075,26 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
             release.wheel_url
         );
         assert_eq!(release.sha256.len(), 64, "sha256 must be pinned");
+    }
+
+    #[test]
+    fn windows_installs_the_signed_wheel_of_the_pin() {
+        // A bump that re-picks PyPI's Windows wheel skips the signing step
+        // (docs/wheel-bump.md), and Smart App Control blocks it (RUST-W1).
+        let win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        assert!(
+            win.wheel_url.starts_with(&format!(
+                "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-{HEADROOM_PINNED_VERSION}/"
+            )),
+            "{}",
+            win.wheel_url
+        );
+        assert_ne!(
+            win.sha256, win.index_sha256,
+            "index fallback must be PyPI's file"
+        );
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        assert_eq!(mac.sha256, mac.index_sha256);
     }
 
     #[test]
