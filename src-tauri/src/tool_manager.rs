@@ -744,7 +744,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
             _hd_body_limit.RequestBodyLimitMiddleware.__call__ = _hd_codex_body_limit_call
             _hd_body_helpers.MAX_REQUEST_BODY_SIZE = _hd_codex_cap
-            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = _hd_codex_cap
+            # zstd shrinks base64 images only to ~75%, so a 256 MiB wire body
+            # decodes to ~340 MiB; a 256 MiB decoded cap 400'd it (RUST-VZ).
+            _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE = 2 * _hd_codex_cap
             _hd_turn_hooks.register_turn_hook(_hd_CodexImageHistoryHook())
             _hd_bound.add("codex_compaction_body")
     except Exception:
@@ -17098,7 +17100,7 @@ import json
 from headroom.proxy import helpers, request_body_limit, turn_hooks
 import zstandard
 assert helpers.MAX_REQUEST_BODY_SIZE == 256 * 1024 * 1024
-assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 256 * 1024 * 1024
+assert helpers.MAX_DECOMPRESSED_BODY_SIZE == 512 * 1024 * 1024
 body = zstandard.ZstdCompressor().compress(b'x' * (179 * 1024 * 1024))
 assert len(helpers._zstd_bounded(body)) == 179 * 1024 * 1024
 
