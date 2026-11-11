@@ -15294,6 +15294,9 @@ fn wheel_download_failure_category(detail: &str) -> &'static str {
         || lower.contains("connection closed")
         || lower.contains("error sending request")
         || lower.contains("channel closed")
+        // Windows words a reset "forcibly closed by the remote host", and
+        // localizes it (RUST-W6); the code is the stable handle.
+        || lower.contains("(os error 10054)")
     {
         "connection"
     } else if crate::is_disk_full_signal(&lower) {
@@ -19690,6 +19693,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
+            // RUST-W6 verbatim.
+            (
+                "reading download body: request or response body error: error reading a body from connection: An existing connection was forcibly closed by the remote host. (os error 10054)",
+                "connection",
+            ),
             ("writing /tmp/a.partial: Permission denied (os error 13)", "permission"),
             ("downloading https://x/a.whl: something new", "other"),
         ];
