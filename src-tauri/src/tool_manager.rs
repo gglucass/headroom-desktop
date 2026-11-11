@@ -2085,7 +2085,9 @@ static CONTEXT7_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// Same as `CONTEXT7_LIFECYCLE`, for Serena's launch move to `SERENA_MAIN`.
 static SERENA_LIFECYCLE: Mutex<()> = Mutex::new(());
 /// What serena's console script runs; serena-agent has no `python -m` entry.
-const SERENA_MAIN: &str = "from serena.cli import top_level; top_level()";
+/// Agents start it in the project directory. As with MarkItDown's `-c` launch,
+/// remove the cwd before importing: a project's serena.py must never run.
+const SERENA_MAIN: &str = "import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]; from serena.cli import top_level; top_level()";
 /// npm downloads the package into the tools dir; slow networks need headroom
 /// over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -8823,13 +8825,14 @@ impl ToolManager {
     fn write_serena_receipt(&self, enabled: bool) -> Result<()> {
         self.write_tool_receipt(
             "serena",
-            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled, "python_launch": true }),
+            json!({ "version": SERENA_PINNED_VERSION, "enabled": enabled, "python_launch": true, "python_launch_safe_path": true }),
         )
     }
 
     /// Windows installs from before `serena_command` still start serena.exe,
-    /// which Smart App Control blocks; an enabled one moves over at launch. A
-    /// failure keeps the old entry, and the next launch tries again.
+    /// which Smart App Control blocks; early python launches also need the cwd
+    /// guard. An enabled one moves over at launch. A failure is retried at the
+    /// next launch.
     pub fn ensure_serena_registration(&self) {
         let _lifecycle = SERENA_LIFECYCLE.lock();
         if !self.serena_needs_move(cfg!(target_os = "windows")) {
@@ -8842,6 +8845,7 @@ impl ToolManager {
                 .unwrap_or_else(|| json!({}));
             if let Some(fields) = receipt.as_object_mut() {
                 fields.insert("python_launch".into(), json!(true));
+                fields.insert("python_launch_safe_path".into(), json!(true));
             }
             self.write_tool_receipt("serena", receipt)
         });
@@ -8854,7 +8858,7 @@ impl ToolManager {
     fn serena_needs_move(&self, windows: bool) -> bool {
         let moved = self
             .read_tool_receipt("serena")
-            .and_then(|r| r.get("python_launch")?.as_bool())
+            .and_then(|r| r.get("python_launch_safe_path")?.as_bool())
             == Some(true);
         windows && self.serena_installed() && self.tool_enabled("serena") && !moved
     }
@@ -24154,7 +24158,7 @@ Always run the linter first.
     }
 
     #[test]
-    fn only_an_enabled_windows_serena_without_the_python_launch_moves_at_launch() {
+    fn only_an_enabled_windows_serena_without_the_safe_python_launch_moves_at_launch() {
         let (_root, runtime, manager) = seed_test_runtime("serena-move");
         let entrypoint = manager.serena_entrypoint();
         fs::create_dir_all(entrypoint.parent().expect("bin parent")).expect("bin dir");
@@ -24167,7 +24171,75 @@ Always run the linter first.
         receipt(r#"{"version":"2.0.0","enabled":false}"#);
         assert!(!manager.serena_needs_move(true));
         receipt(r#"{"version":"2.0.0","enabled":true,"python_launch":true}"#);
+        assert!(
+            manager.serena_needs_move(true),
+            "early rc launches lack the cwd guard"
+        );
+        receipt(
+            r#"{"version":"2.0.0","enabled":true,"python_launch":true,"python_launch_safe_path":true}"#,
+        );
         assert!(!manager.serena_needs_move(true));
+    }
+
+    #[cfg(unix)] // Executes the Windows launch snippet with /usr/bin/python3.
+    #[test]
+    fn serena_python_launch_does_not_import_project_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let installed = root.path().join("site-packages");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(installed.join("serena")).unwrap();
+        fs::write(installed.join("serena/__init__.py"), "").unwrap();
+        fs::write(
+            installed.join("serena/cli.py"),
+            "import json, sys\ndef top_level():\n    print(json.dumps(sys.argv[1:]))\n",
+        )
+        .unwrap();
+        // Empty PYTHONPATH entries also insert the absolute cwd, in addition
+        // to the empty sys.path[0] Python puts there for -c.
+        let pythonpath = std::env::join_paths([Path::new(""), &project, &installed]).unwrap();
+        let run = || {
+            let out = crate::proc::command("/usr/bin/python3")
+                .args([
+                    "-c",
+                    super::SERENA_MAIN,
+                    "start-mcp-server",
+                    "--project-from-cwd",
+                ])
+                .current_dir(&project)
+                .env_remove("PYTHONHOME")
+                .env("PYTHONPATH", &pythonpath)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                serde_json::json!(["start-mcp-server", "--project-from-cwd"])
+            );
+        };
+        fs::write(
+            project.join("serena.py"),
+            "raise RuntimeError('project module ran')\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("json.py"),
+            "raise RuntimeError('project dependency ran')\n",
+        )
+        .unwrap();
+        run();
+        fs::remove_file(project.join("serena.py")).unwrap();
+        fs::create_dir(project.join("serena")).unwrap();
+        fs::write(
+            project.join("serena/__init__.py"),
+            "raise RuntimeError('project package ran')\n",
+        )
+        .unwrap();
+        run();
     }
 
     fn retired_leftovers(parent: &Path) -> usize {
