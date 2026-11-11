@@ -6221,7 +6221,7 @@ impl ToolManager {
             headroom_index_requirement(
                 &self.runtime.downloads_dir,
                 &release.version,
-                Some(&release.sha256),
+                Some(&release.index_sha256),
             )?
         };
         run_pip_install_with_retries_streaming(
@@ -7311,7 +7311,7 @@ impl ToolManager {
             match headroom_index_requirement(
                 &self.runtime.downloads_dir,
                 &release.version,
-                Some(&release.sha256),
+                Some(&release.index_sha256),
             ) {
                 Ok(arg) => arg,
                 Err(err) => {
@@ -7449,7 +7449,7 @@ impl ToolManager {
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
         let pinned = pinned_headroom_release()?;
-        let sha256 = (version == pinned.version).then_some(pinned.sha256.as_str());
+        let sha256 = (version == pinned.version).then_some(pinned.index_sha256.as_str());
         let spec = headroom_index_requirement(&self.runtime.downloads_dir, version, sha256)?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
@@ -12776,6 +12776,9 @@ pub(crate) struct HeadroomRelease {
     version: String,
     wheel_url: String,
     sha256: String,
+    /// PyPI's own file, which the index fallback and repairs install. Differs
+    /// from `sha256` only where `wheel_url` is a re-pack (Windows).
+    index_sha256: String,
 }
 
 impl HeadroomRelease {
@@ -12935,7 +12938,11 @@ fn headroom_index_requirement(
 }
 
 pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
-    let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
+    pinned_headroom_release_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> {
+    let (url, sha256) = match (os, arch) {
         ("macos", "aarch64") => (
             "https://files.pythonhosted.org/packages/42/b7/1ab4da6f7a091fd1a102b5194828f9a588b6b4f11b522f38b86b125770a3/headroom_ai-0.44.0-cp310-abi3-macosx_11_0_arm64.whl",
             "9b084f4cd9918af2d0970450ff3e990fffc29a8220dc5e24fa0f33a4dd0359cc",
@@ -12958,11 +12965,20 @@ pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
+    // Windows installs PyPI's wheel re-packed around an Authenticode-signed
+    // `_core.pyd` (scripts/sign-windows-wheel.py): Smart App Control blocks the
+    // unsigned one of every new release, and the upgrade rolled back to a wheel
+    // the pinned vendors skip (RUST-W1). The index fallback stays PyPI's file.
+    let index_sha256 = match os {
+        "windows" => "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
+        _ => sha256,
+    };
 
     Ok(HeadroomRelease {
         version: HEADROOM_PINNED_VERSION.into(),
         wheel_url: url.into(),
         sha256: sha256.into(),
+        index_sha256: index_sha256.into(),
     })
 }
 
@@ -16698,9 +16714,12 @@ mod tests {
     fn index_fallback_for_the_pinned_engine_is_hash_checked() {
         let dir = tempfile::tempdir().unwrap();
         let pinned = super::pinned_headroom_release().unwrap();
-        let arg =
-            super::headroom_index_requirement(dir.path(), &pinned.version, Some(&pinned.sha256))
-                .unwrap();
+        let arg = super::headroom_index_requirement(
+            dir.path(),
+            &pinned.version,
+            Some(&pinned.index_sha256),
+        )
+        .unwrap();
         let file = arg
             .strip_prefix("--requirement=")
             .expect("a requirements file");
@@ -16708,7 +16727,7 @@ mod tests {
             std::fs::read_to_string(file).unwrap(),
             format!(
                 "headroom-ai=={} --hash=sha256:{}\n",
-                pinned.version, pinned.sha256
+                pinned.version, pinned.index_sha256
             )
         );
         // An older version has no hash in this build.
@@ -25041,6 +25060,7 @@ Always run the linter first.
             version: "0.10.8".into(),
             wheel_url: "https://new.example/headroom_ai-0.10.8.whl".into(),
             sha256: "newnewnew".into(),
+            index_sha256: "newnewnew".into(),
         };
         let mcp = serde_json::json!({ "configured": true, "proxyUrl": "http://127.0.0.1:6767" });
         manager
@@ -25457,6 +25477,7 @@ Always run the linter first.
             version: "0.0.0-test".into(),
             wheel_url: "https://example.invalid/headroom.whl".into(),
             sha256: "deadbeef".into(),
+            index_sha256: "deadbeef".into(),
         };
 
         let outcome = manager.atomic_upgrade_headroom(&release, |_| {}, false);

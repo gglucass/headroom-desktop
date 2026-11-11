@@ -1,0 +1,88 @@
+name: Sign Windows wheel
+
+# Publishes headroom-ai's Windows wheel with its _core.pyd Authenticode-signed,
+# so Smart App Control loads it (RUST-W1). Push a tag `signed-wheel-<version>`,
+# then paste the printed sha256 into the Windows arm of
+# `pinned_headroom_release` (docs/wheel-bump.md). A tag push, not a dispatch:
+# workflow_dispatch only sees workflows on main, and bumps land on staging.
+#
+# The asset is FROZEN once a shipped build pins its sha256. Never re-upload it;
+# a re-sign goes to a new tag.
+
+on:
+  push:
+    tags: ["signed-wheel-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    env:
+      # Read by artifact-signing-cli, as in the release workflows.
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install Azure Artifact Signing CLI
+        # Pinned on purpose: this binary runs with the signing secrets in env.
+        run: cargo install artifact-signing-cli --version =0.11.0 --locked
+
+      - name: Fetch PyPI's wheel
+        shell: bash
+        run: python scripts/sign-windows-wheel.py fetch "${GITHUB_REF_NAME#signed-wheel-}" work
+
+      - name: Sign _core.pyd
+        shell: bash
+        # Same endpoint, account and profile as tauri.conf.json's signCommand.
+        run: artifact-signing-cli -e https://neu.codesigning.azure.net -a extra-headroom -c extraheadroom -d Headroom work/_core.pyd
+
+      - name: Check the signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature work/_core.pyd
+          if ($sig.Status -ne 'Valid') { throw "_core.pyd signature: $($sig.Status) $($sig.StatusMessage)" }
+          $sig.SignerCertificate.Subject
+
+      - name: Re-pack the wheel
+        shell: bash
+        run: python scripts/sign-windows-wheel.py repack work
+
+      - name: Install it and load _core
+        shell: bash
+        # pip validates the re-packed wheel; loading the extension proves the
+        # signed DLL still initializes (headroom/__init__ needs every dependency).
+        run: |
+          python -m venv smoke
+          smoke/Scripts/python -m pip install --no-deps work/out/*.whl
+          smoke/Scripts/python -c "import importlib.machinery as m, importlib.util as u, sys; p = u.find_spec('headroom').submodule_search_locations[0] + '/_core.pyd'; spec = u.spec_from_file_location('headroom._core', p, loader=m.ExtensionFileLoader('headroom._core', p)); spec.loader.exec_module(u.module_from_spec(spec)); print('loaded', p)"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # --latest=false: a full release otherwise becomes releases/latest,
+          # which has no latest.json, and every install's update check 404s.
+          gh release create "$GITHUB_REF_NAME" work/out/*.whl \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest=false \
+            --title "Signed Windows wheel ($GITHUB_REF_NAME)" \
+            --notes "headroom-ai's PyPI wheel with headroom/_core.pyd Authenticode-signed for Smart App Control. Installed by headroom-desktop by URL and sha256."
+          sha=$(sha256sum work/out/*.whl | cut -d' ' -f1)
+          echo "sha256 $sha" | tee -a "$GITHUB_STEP_SUMMARY"
