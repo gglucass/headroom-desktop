@@ -3943,7 +3943,7 @@ impl ToolManager {
                 }
             }
 
-            for (executable, args) in &startup_variants {
+            for (idx, (executable, args)) in startup_variants.iter().enumerate() {
                 // A quit or relaunch mid-startup: stop_headroom's sweep killed
                 // the variant being polled, the loop read that as a failed start
                 // and spawned the next one after the sweep, and that proxy
@@ -4503,14 +4503,19 @@ impl ToolManager {
                 // of RUST-9M's rename (Sentry RUST-9X, launch auto-start on
                 // 0.8.8). Transient by nature; retry briefly before failing
                 // the launch.
-                let mut child = crate::client_adapters::retry_transient_denied(|| command.spawn())
+                let spawned = crate::client_adapters::retry_transient_denied(|| command.spawn())
                     .with_context(|| {
                         format!(
                             "starting headroom background process: {} {}",
                             executable.display(),
                             args.join(" ")
                         )
-                    })?;
+                    });
+                let Some(mut child) =
+                    spawned_or_next_variant(spawned, idx + 1 < startup_variants.len())?
+                else {
+                    continue;
+                };
                 // Dies with the app, however the app dies (see winproc).
                 #[cfg(windows)]
                 crate::winproc::adopt_into_proxy_job(&child);
@@ -16400,6 +16405,22 @@ fn claim_once(flag: &AtomicBool, applies: bool) -> bool {
     applies && !flag.swap(true, Ordering::AcqRel)
 }
 
+/// A startup variant Windows refuses to even start falls through to the next
+/// one: App Control blocked the `headroom.exe` launcher pip wrote on that
+/// machine, and the start failed without trying `python.exe -m`, the same
+/// file on every machine (RUST-G1, 0.9.60-rc.3). The last variant's refusal
+/// is the start's error.
+fn spawned_or_next_variant<T>(spawned: Result<T>, has_next: bool) -> Result<Option<T>> {
+    match spawned {
+        Ok(child) => Ok(Some(child)),
+        Err(err) if has_next => {
+            log::info!("{err:#}; trying the next startup variant");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// True for a startup exit that means the process was taken down mid-flight
 /// rather than exiting on its own terms: Windows reports a native abort as
 /// 0xffffffff (and the 0xc00000xx family), unix as a signal.
@@ -19047,6 +19068,25 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             !head.contains("--memory-db-path"),
             "args must not lead: {head}"
         );
+    }
+
+    #[test]
+    fn a_variant_that_cannot_be_started_falls_through_to_the_next() {
+        let blocked = || -> anyhow::Result<u32> {
+            Err(anyhow::anyhow!(
+                "An Application Control policy has blocked this file. (os error 4551)"
+            ))
+        };
+        assert!(matches!(
+            super::spawned_or_next_variant(blocked(), true),
+            Ok(None)
+        ));
+        let last = super::spawned_or_next_variant(blocked(), false).unwrap_err();
+        assert!(format!("{last:#}").contains("os error 4551"));
+        assert!(matches!(
+            super::spawned_or_next_variant(Ok(7), true),
+            Ok(Some(7))
+        ));
     }
 
     #[test]
