@@ -5438,13 +5438,24 @@ impl ToolManager {
             })
     }
 
-    /// Returns the pinned release if the installed version differs from the pin.
+    /// Returns the pinned release when the engine or its signed artifact changed.
     pub fn check_headroom_upgrade(&self) -> Option<HeadroomRelease> {
-        let installed = self.installed_headroom_version()?;
-        if installed == HEADROOM_PINNED_VERSION {
+        self.check_headroom_upgrade_to(pinned_headroom_release().ok()?)
+    }
+
+    fn check_headroom_upgrade_to(&self, release: HeadroomRelease) -> Option<HeadroomRelease> {
+        let receipt = self.read_headroom_receipt()?;
+        let installed = receipt.get("version")?.as_str()?;
+        // Signing changes the Windows artifact without changing the engine
+        // version. Version-only checks left existing unsigned 0.44.0 installs
+        // behind, including machines whose _core.pyd App Control refused.
+        let artifact_matches = release.sha256 == release.index_sha256
+            || receipt.pointer("/artifact/sha256").and_then(Value::as_str)
+                == Some(release.sha256.as_str());
+        if installed == release.version && artifact_matches {
             return None;
         }
-        pinned_headroom_release().ok()
+        Some(release)
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -12772,6 +12783,7 @@ struct DownloadArtifact {
 }
 
 /// Metadata for a specific headroom-ai release fetched from PyPI.
+#[derive(Clone)]
 pub(crate) struct HeadroomRelease {
     version: String,
     wheel_url: String,
@@ -20095,6 +20107,48 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
         );
         let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
         assert_eq!(mac.sha256, mac.index_sha256);
+    }
+
+    #[test]
+    fn signed_wheel_upgrade_detects_same_version_unsigned_installs() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        manager.runtime.ensure_layout().unwrap();
+        let win = super::pinned_headroom_release_for("windows", "x86_64").unwrap();
+        for artifact in [json!({}), json!({"sha256": win.index_sha256})] {
+            manager
+                .write_tool_receipt(
+                    "headroom",
+                    json!({
+                        "version": win.version, "artifact": artifact,
+                    }),
+                )
+                .unwrap();
+            assert!(manager.check_headroom_upgrade_to(win.clone()).is_some());
+        }
+        manager
+            .write_tool_receipt(
+                "headroom",
+                json!({
+                    "version": win.version, "artifact": {"sha256": win.sha256},
+                }),
+            )
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(win).is_none());
+
+        // Other platforms still use the engine version, including old receipts
+        // that predate artifact hashes.
+        let mac = super::pinned_headroom_release_for("macos", "aarch64").unwrap();
+        manager
+            .write_tool_receipt("headroom", json!({"version": mac.version}))
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(mac.clone()).is_none());
+        manager
+            .write_tool_receipt("headroom", json!({"version": "0.43.0"}))
+            .unwrap();
+        assert!(manager.check_headroom_upgrade_to(mac).is_some());
     }
 
     #[test]
