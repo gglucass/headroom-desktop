@@ -4617,10 +4617,9 @@ impl AppState {
             // bring it back so Codex keeps getting optimized.
             if self.proxy_bypass.swap(false, AcqRel) {
                 if let Err(err) = self.ensure_headroom_running() {
-                    crate::log_headroom_start_failure(
-                        "enter_claude_gate: ensure_headroom_running failed",
-                        &format!("{err:#}"),
-                    );
+                    // Local only: the capture below is the Sentry path, and a bridged
+                    // warn filed the same failure twice (RUST-WA beside RUST-6J).
+                    log::info!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
                     crate::capture_headroom_start_failure("enter_claude_gate", &err);
                 }
             }
@@ -4643,10 +4642,8 @@ impl AppState {
         self.claude_only_bypass.store(false, Release);
         if self.proxy_bypass.swap(false, AcqRel) {
             if let Err(err) = self.ensure_headroom_running() {
-                crate::log_headroom_start_failure(
-                    "exit_claude_gate: ensure_headroom_running failed",
-                    &format!("{err:#}"),
-                );
+                // Local only, as in enter_claude_gate (RUST-WA).
+                log::info!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
                 crate::capture_headroom_start_failure("exit_claude_gate", &err);
             }
         }
