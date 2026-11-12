@@ -6796,9 +6796,15 @@ impl ToolManager {
 
         if backup_dir.exists() {
             // The live venv (if present) is a partial/unknown new install.
-            // Blow it away and put the backup back in its place.
+            // Move it aside and put the backup back in its place. Deleting it
+            // in place stopped partway on a held file ("directory is not
+            // empty", then "Access is denied") and left the torn venv live
+            // beside the good backup, so bootstrap ran a pip with no
+            // pip._internal.cli in it (RUST-WE/WG/WF).
             if venv_dir.exists() {
-                if let Err(err) = std::fs::remove_dir_all(venv_dir) {
+                if let Err(err) = Self::retry_fs("retiring partial venv", || {
+                    retire_venv(venv_dir).map_err(|e| std::io::Error::other(format!("{e:#}")))
+                }) {
                     log::error!(
                         "recover_from_interrupted_upgrade: failed to remove partial venv at {}: {err}",
                         venv_dir.display()
@@ -7751,11 +7757,13 @@ impl ToolManager {
         // Code session spawned off the NEW venv holds files in it, and the
         // remove failing here is the restored=false that bricks the runtime.
         // Retried: Windows releases a killed process's handles a beat late,
-        // and scanners hold freshly written .pyd files.
+        // and scanners hold freshly written .pyd files. Moved aside rather
+        // than deleted in place, which stops partway on a held file.
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         if self.runtime.venv_dir.exists() {
-            if let Err(err) = Self::retry_fs("removing partial venv", || {
-                std::fs::remove_dir_all(&self.runtime.venv_dir)
+            if let Err(err) = Self::retry_fs("retiring partial venv", || {
+                retire_venv(&self.runtime.venv_dir)
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))
             }) {
                 log::error!(
                     "rollback: failed to remove partial venv at {}: {err}",
@@ -25318,6 +25326,35 @@ Always run the linter first.
             !manager.upgrade_marker_path().exists(),
             "marker cleared after recovery"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_from_interrupted_upgrade_restores_backup_when_the_partial_venv_resists_deletion() {
+        // RUST-WE/WG: deleting the partial venv in place stopped partway on a
+        // held file, recovery gave up, and the torn venv stayed live beside
+        // the good backup. A read-only dir is the Unix stand-in for the held
+        // file: it blocks the in-place delete, not a move aside.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("interrupted-held");
+        let backup = manager.venv_backup_dir();
+        fs::rename(&runtime.venv_dir, &backup).expect("move aside");
+        let held = runtime.venv_dir.join("Lib").join("pip");
+        fs::create_dir_all(&held).expect("partial venv");
+        fs::write(held.join("__main__.py"), b"torn").expect("partial");
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o555)).expect("chmod");
+        manager
+            .write_upgrade_marker("0.8.2", None, None)
+            .expect("marker");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "original restored"
+        );
+        assert!(!backup.exists(), "backup consumed");
+        assert!(!manager.upgrade_marker_path().exists(), "marker cleared");
         let _ = fs::remove_dir_all(root);
     }
 
