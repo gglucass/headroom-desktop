@@ -795,6 +795,33 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
+    # Codex savings on Claude Code's rule (upstream PR, branch
+    # fix/responses-savings-per-request). Anthropic books each request's own
+    # removals, re-sent cached history included; 0.44.0 books a /v1/responses
+    # request net of what its conversation's earlier turns removed, so Codex
+    # read several times lower for the same work. A ledger that declines
+    # ("this path does not distinguish") sends the funnel to its per-request
+    # fallback, the figure every other path books. The upstream fix deletes
+    # the ledger, so this stands down on the wheel that ships it. Exact-pin
+    # 0.44.0. Kill switch: HEADROOM_RESPONSES_SAVINGS_PER_REQUEST=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_RESPONSES_SAVINGS_PER_REQUEST", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import importlib.metadata as _hd_rs_meta
+
+            import headroom.proxy.conversation_savings as _hd_rs_cs
+
+            if _hd_rs_meta.version("headroom-ai") == "0.44.0" and hasattr(
+                _hd_rs_cs, "ConversationSavings"
+            ):
+                _hd_rs_cs.ConversationSavings.novel = (
+                    lambda self, conversation_key, cumulative: None
+                )
+                _hd_bound.add("responses_savings_per_request")
+    except Exception:
+        pass
+
     # Observe confirmed prefix rewrites independently of the replay/lineage
     # fixes. Only numeric diagnostics cross /stats to the desktop's Sentry SDK.
     # No provider calls, disk writes, or request mutations in this observer.
@@ -1881,6 +1908,7 @@ _HD_VENDORS = (
     "user_turn_verbatim",
     "codex_compaction_body",
     "savings_fold_guard",
+    "responses_savings_per_request",
     "cache_integrity",
     "prefix_replay_guard",
     "cc_switch_reset",
@@ -6796,9 +6824,15 @@ impl ToolManager {
 
         if backup_dir.exists() {
             // The live venv (if present) is a partial/unknown new install.
-            // Blow it away and put the backup back in its place.
+            // Move it aside and put the backup back in its place. Deleting it
+            // in place stopped partway on a held file ("directory is not
+            // empty", then "Access is denied") and left the torn venv live
+            // beside the good backup, so bootstrap ran a pip with no
+            // pip._internal.cli in it (RUST-WE/WG/WF).
             if venv_dir.exists() {
-                if let Err(err) = std::fs::remove_dir_all(venv_dir) {
+                if let Err(err) = Self::retry_fs("retiring partial venv", || {
+                    retire_venv(venv_dir).map_err(|e| std::io::Error::other(format!("{e:#}")))
+                }) {
                     log::error!(
                         "recover_from_interrupted_upgrade: failed to remove partial venv at {}: {err}",
                         venv_dir.display()
@@ -6874,6 +6908,15 @@ impl ToolManager {
         // move-aside and success-commit), the backup is the REAL venv.
         // Restore it before doing anything destructive.
         let _recovered = self.recover_from_interrupted_upgrade();
+        if self.upgrade_interrupted() {
+            // Failed recovery keeps the marker and its only known-good
+            // backups for retry. They must not enter the stale-backup purge
+            // or be overwritten by a new in-place upgrade snapshot.
+            return UpgradeOutcome::InstallFailed {
+                restored: false,
+                error: anyhow::Error::new(RecoveryIncomplete),
+            };
+        }
 
         // In-place path: mutate the live venv rather than rebuilding it.
         // Covers both the wheel-only case (lock unchanged) and the lock-churn
@@ -7398,21 +7441,7 @@ impl ToolManager {
             };
         }
 
-        // Optional addon: an in-place upgrade keeps the venv, so markitdown
-        // should still run. Warn-only — a broken optional addon must not fail
-        // the core Headroom upgrade.
-        if let Err(err) = self.smoke_test_markitdown() {
-            let exception = command_failure_last_line(&err)
-                .map_or_else(String::new, |line| format!("{line}; "));
-            let detail = format!("{exception}{err:#}");
-            // App Control refusing markitdown.exe is the machine's policy
-            // (RUST-W0); the runtime's own start failure tells the user.
-            if crate::is_windows_app_control_block(&detail) {
-                log::info!("markitdown smoke test failed after upgrade: {detail}");
-            } else {
-                log::warn!("markitdown smoke test failed after upgrade: {detail}");
-            }
-        }
+        self.check_markitdown_after_upgrade();
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
                 log::warn!("{} smoke test failed after upgrade: {err:#}", plugin.id);
@@ -7751,11 +7780,13 @@ impl ToolManager {
         // Code session spawned off the NEW venv holds files in it, and the
         // remove failing here is the restored=false that bricks the runtime.
         // Retried: Windows releases a killed process's handles a beat late,
-        // and scanners hold freshly written .pyd files.
+        // and scanners hold freshly written .pyd files. Moved aside rather
+        // than deleted in place, which stops partway on a held file.
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         if self.runtime.venv_dir.exists() {
-            if let Err(err) = Self::retry_fs("removing partial venv", || {
-                std::fs::remove_dir_all(&self.runtime.venv_dir)
+            if let Err(err) = Self::retry_fs("retiring partial venv", || {
+                retire_venv(&self.runtime.venv_dir)
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))
             }) {
                 log::error!(
                     "rollback: failed to remove partial venv at {}: {err}",
@@ -8715,6 +8746,53 @@ impl ToolManager {
         }
     }
 
+    /// Optional addon: an in-place upgrade keeps the venv, so markitdown
+    /// should still run. Warn-only: a broken optional addon must not fail the
+    /// core Headroom upgrade.
+    fn check_markitdown_after_upgrade(&self) {
+        let Err(err) = self.smoke_test_markitdown() else {
+            return;
+        };
+        let last_line = command_failure_last_line(&err).unwrap_or_default();
+        let detail = if last_line.is_empty() {
+            format!("{err:#}")
+        } else {
+            format!("{last_line}; {err:#}")
+        };
+        // App Control refusing markitdown.exe is the machine's policy
+        // (RUST-W0); the runtime's own start failure tells the user.
+        if crate::is_windows_app_control_block(&detail) {
+            log::info!("markitdown smoke test failed after upgrade: {detail}");
+            return;
+        }
+        // One of its dependencies is gone (RUST-WC: bs4), so every Office read
+        // dies on the import. The pinned install puts missing dependencies
+        // back; until then nothing else would.
+        if last_line.starts_with("ModuleNotFoundError") {
+            match self.reinstall_markitdown() {
+                Ok(()) => {
+                    log::info!("markitdown failed after upgrade ({last_line}); reinstalled it");
+                    return;
+                }
+                Err(repair) => log::info!("reinstalling markitdown failed: {repair:#}"),
+            }
+        }
+        log::warn!("markitdown smoke test failed after upgrade: {detail}");
+    }
+
+    /// `install_markitdown`, keeping the user's enabled flag (the install
+    /// writes its receipt enabled).
+    fn reinstall_markitdown(&self) -> Result<()> {
+        let enabled = self.tool_enabled("markitdown");
+        self.install_markitdown().and_then(|()| {
+            if enabled {
+                Ok(())
+            } else {
+                self.set_markitdown_enabled(false)
+            }
+        })
+    }
+
     /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
     /// while its receipt, shim and agent nudges survive and send every Office
     /// read to a command that dies with ModuleNotFoundError. Reinstall it,
@@ -8726,15 +8804,7 @@ impl ToolManager {
         {
             return;
         }
-        let enabled = self.tool_enabled("markitdown");
-        let restored = self.install_markitdown().and_then(|()| {
-            if enabled {
-                Ok(())
-            } else {
-                self.set_markitdown_enabled(false)
-            }
-        });
-        if let Err(err) = restored {
+        if let Err(err) = self.reinstall_markitdown() {
             log::warn!("markitdown reinstall after a venv rebuild failed, removing it: {err:#}");
             if let Err(err) =
                 crate::client_adapters::disable_markitdown_integration(&self.markitdown_shim_path())
@@ -15355,9 +15425,13 @@ fn remove_venv_pip(python: &Path) -> Result<()> {
 /// neither changes when the pin does.
 fn wheel_download_failure_category(detail: &str) -> &'static str {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("(connect)") && lower.contains("timed out") {
+    if lower.contains("(connect)")
+        && (lower.contains("timed out") || lower.contains("(os error 10060)"))
+    {
         // The TCP connect never completed: the host cannot reach the CDN at
         // all, like `dns` (RUST-NN). A slow download times out on a read.
+        // Windows localizes the words, so its WSAETIMEDOUT code counts too
+        // (RUST-WD read "Se produjo un error ...").
         "connect-timeout"
     } else if lower.contains("operation timed out") || lower.contains("timed out") {
         "timeout"
@@ -16211,6 +16285,22 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
     Ok(())
 }
+
+/// An upgrade refused because the previous one's recovery failed. That failure
+/// already reported itself (or stayed local by design, as a PyPI-refusing
+/// network does), so `capture_upgrade_failure` skips this consequence.
+#[derive(Debug)]
+pub struct RecoveryIncomplete;
+
+impl std::fmt::Display for RecoveryIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "previous runtime upgrade recovery is incomplete; retry after resolving the recovery failure",
+        )
+    }
+}
+
+impl std::error::Error for RecoveryIncomplete {}
 
 /// Structured failure from a shell-out. Carried through `anyhow::Error` so callers
 /// can `.context()` as usual, and capture sites (e.g. Sentry) can downcast to pull
@@ -17324,6 +17414,67 @@ print(round(t.snapshot()["lifetime"]["compression_savings_usd"], 6))
         assert_eq!(on, "1.0", "stderr:\n{on_err}");
         let (off, off_err) = run("0");
         assert_eq!(off, "6.0", "stderr:\n{off_err}");
+    }
+
+    /// Codex booked on Claude Code's rule against the installed wheel: three
+    /// turns of one Responses conversation removing 600, 700 and 700 tokens
+    /// book all three through the real funnel, and the wheel's
+    /// once-per-conversation 600, 100, 0 with the kill switch.
+    #[test]
+    fn responses_savings_per_request_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+
+class Handler:
+    def __init__(self):
+        self.metrics = MagicMock()
+        self.metrics.record_request = AsyncMock()
+        self.cost_tracker = MagicMock()
+        self.logger = None
+
+async def main():
+    h = Handler()
+    for saved in (600, 700, 700):
+        await emit_request_outcome(h, RequestOutcome(
+            request_id="r", provider="openai", model="gpt-5.5",
+            original_tokens=1000 + saved, optimized_tokens=1000, output_tokens=10,
+            tokens_saved=saved, attempted_input_tokens=2000,
+            conversation_key="conv", conversation_tokens_saved=saved))
+    booked = [c.kwargs["tokens_saved"] for c in h.metrics.record_request.await_args_list]
+    priced = [c.args[1] for c in h.cost_tracker.record_tokens.call_args_list]
+    assert booked == priced, (booked, priced)
+    print(",".join(map(str, booked)))
+
+asyncio.run(main())
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_RESPONSES_SAVINGS_PER_REQUEST", flag)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run responses savings probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        assert_eq!(on, "600,700,700", "stderr:\n{on_err}");
+        let (off, off_err) = run("0");
+        assert_eq!(off, "600,100,0", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -19825,6 +19976,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
+            // RUST-WD: a Spanish Windows connect timeout.
+            (
+                "downloading https://github.com/a.whl: error sending request for url (https://github.com/a.whl): client error (Connect): tcp connect error: Se produjo un error durante el intento de conexión ya que la parte conectada no respondió adecuadamente tras un periodo de tiempo (os error 10060)",
+                "connect-timeout",
+            ),
             // RUST-W6 verbatim.
             (
                 "reading download body: request or response body error: error reading a body from connection: An existing connection was forcibly closed by the remote host. (os error 10054)",
@@ -25321,6 +25477,35 @@ Always run the linter first.
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recover_from_interrupted_upgrade_restores_backup_when_the_partial_venv_resists_deletion() {
+        // RUST-WE/WG: deleting the partial venv in place stopped partway on a
+        // held file, recovery gave up, and the torn venv stayed live beside
+        // the good backup. A read-only dir is the Unix stand-in for the held
+        // file: it blocks the in-place delete, not a move aside.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("interrupted-held");
+        let backup = manager.venv_backup_dir();
+        fs::rename(&runtime.venv_dir, &backup).expect("move aside");
+        let held = runtime.venv_dir.join("Lib").join("pip");
+        fs::create_dir_all(&held).expect("partial venv");
+        fs::write(held.join("__main__.py"), b"torn").expect("partial");
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o555)).expect("chmod");
+        manager
+            .write_upgrade_marker("0.8.2", None, None)
+            .expect("marker");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(
+            runtime.venv_dir.join("marker").exists(),
+            "original restored"
+        );
+        assert!(!backup.exists(), "backup consumed");
+        assert!(!manager.upgrade_marker_path().exists(), "marker cleared");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn recover_from_interrupted_upgrade_is_noop_without_marker() {
         let (root, _runtime, manager) = seed_test_runtime("interrupted-noop");
@@ -25636,6 +25821,50 @@ Always run the linter first.
         );
         // Stale backup purged (either consumed during restore or cleaned at start).
         assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // read-only parent models a directory rename denied by Windows
+    fn atomic_upgrade_keeps_the_good_backup_when_interrupted_recovery_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("atomic-failed-recovery");
+        let backup = manager.venv_backup_dir();
+        fs::rename(&runtime.venv_dir, &backup).expect("backup");
+        fs::create_dir_all(&runtime.venv_dir).expect("partial venv");
+        fs::write(runtime.venv_dir.join("partial"), b"torn").expect("partial");
+        manager
+            .write_upgrade_marker("0.8.2", None, None)
+            .expect("marker");
+        let receipt_backup = manager.headroom_receipt_backup_path();
+        fs::write(&receipt_backup, b"original receipt").expect("receipt backup");
+        let permissions = fs::metadata(&runtime.runtime_dir).unwrap().permissions();
+        // The live venv cannot move aside. Deleting the backup can still
+        // delete its contents before removal of its root directory fails.
+        fs::set_permissions(&runtime.runtime_dir, fs::Permissions::from_mode(0o555))
+            .expect("read-only parent");
+        let release = HeadroomRelease {
+            version: "0.8.3".into(),
+            wheel_url: "http://127.0.0.1:9/headroom.whl".into(),
+            sha256: "unused".into(),
+            index_sha256: "unused".into(),
+        };
+        let mut steps = Vec::new();
+        let outcome =
+            manager.atomic_upgrade_headroom(&release, |update| steps.push(update.step), true);
+        fs::set_permissions(&runtime.runtime_dir, permissions).expect("restore permissions");
+
+        assert!(matches!(
+            outcome,
+            UpgradeOutcome::InstallFailed {
+                restored: false,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(backup.join("marker")).unwrap(), b"live-v1");
+        assert_eq!(fs::read(receipt_backup).unwrap(), b"original receipt");
+        assert!(manager.upgrade_interrupted(), "recovery can retry");
+        assert_eq!(steps, ["Preparing update"]);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -27468,6 +27697,42 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
             .expect_err("smoke test should fail");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// RUST-WC: after an in-place upgrade markitdown died on a missing bs4,
+    /// and nothing put it back, so every Office read failed.
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn markitdown_missing_a_module_after_upgrade_is_reinstalled_keeping_its_flag() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-missing-dep");
+        let _home = HomeGuard::new(&root.join("home"));
+        let receipt = runtime.tools_dir.join("markitdown.json");
+        fs::write(&receipt, br#"{"version":"0.1.9","enabled":false}"#).expect("receipt");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        let log = root.join("argv.log");
+        let fixed = root.join("bs4-back");
+        write_executable(
+            &manager.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *'markitdown[all]=='*) touch {fixed}; exit 0;; esac\n\
+                 if [ \"$1\" = -c ] && [ \"$3\" = --help ]; then [ -e {fixed} ] && exit 0; \
+                 echo \"ModuleNotFoundError: No module named 'bs4'\" >&2; exit 1; fi\nexit 0\n",
+                log = log.display(),
+                fixed = fixed.display(),
+            ),
+        );
+
+        manager.check_markitdown_after_upgrade();
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("markitdown[all]=="), "{calls}");
+        assert!(fixed.exists(), "reinstalled");
+        assert!(
+            !manager.tool_enabled("markitdown"),
+            "kept the user's off switch"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

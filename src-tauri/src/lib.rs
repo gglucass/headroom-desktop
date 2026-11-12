@@ -167,12 +167,21 @@ fn noop_app_update_progress_emitter() -> AppUpdateProgressEmitter {
 
 trait InstallableAppUpdate: Send {
     fn metadata(&self) -> AvailableAppUpdate;
+    #[cfg(target_os = "macos")]
+    fn bundle_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     fn install(self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture;
 }
 
 struct TauriPendingUpdate(Update);
 
 impl InstallableAppUpdate for TauriPendingUpdate {
+    #[cfg(target_os = "macos")]
+    fn bundle_path(&self) -> Option<std::path::PathBuf> {
+        current_app_bundle_path()
+    }
+
     fn metadata(&self) -> AvailableAppUpdate {
         let published_at = self.0.date.as_ref().and_then(|date| {
             date.format(&time::format_description::well_known::Rfc3339)
@@ -1240,23 +1249,81 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
-    #[cfg(target_os = "macos")]
-    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
     let installed = install_pending_update(&pending_update.0, emitter).await;
-    #[cfg(target_os = "macos")]
-    let installed = installed.map_err(|err| {
-        annotate_bare_not_found(
-            err,
-            current_app_bundle_path().is_some_and(|bundle| bundle.exists()),
-            overlapped,
-        )
-    });
     // Windows never gets here (the installer exits the app); elsewhere the new
     // build is on disk and runs at the next restart.
     if installed.is_ok() {
         UPDATE_STAGED.store(true, Ordering::Release);
     }
     installed
+}
+
+/// RUST-WB: tauri-plugin-updater 2.10.0's macOS swap moves the running bundle
+/// into a TempDir, and when its final rename fails it returns early, so the
+/// TempDir's drop deletes Headroom.app (and the user's clients then point at a
+/// dead port once it quits). An APFS clone taken before the install (instant,
+/// no extra space; `bundle_is_on_another_volume` keeps it on one volume) puts
+/// the bundle back. Dropping it removes the copy.
+#[cfg(target_os = "macos")]
+struct BundleSafetyCopy {
+    bundle: std::path::PathBuf,
+    copy: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl BundleSafetyCopy {
+    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        // A failed restore may have left the only working bundle in a prior
+        // copy. Each attempt owns its path; never delete another attempt's.
+        let copy = copy.with_extension(uuid::Uuid::new_v4().to_string());
+        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes()).ok()?;
+        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes()).ok()?;
+        // SAFETY: both are valid NUL-terminated paths that outlive the call.
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+            log::info!(
+                "update: no bundle safety copy: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self {
+            bundle: bundle.to_path_buf(),
+            copy,
+        })
+    }
+
+    /// True when the install lost the bundle and the copy took its place. A
+    /// failed restore keeps the copy: it is then the only Headroom.app left.
+    fn restore_if_lost(&mut self) -> bool {
+        if self.bundle.exists() {
+            return false;
+        }
+        // direct-write: moves the app's own bundle clone back, a directory swap
+        match std::fs::rename(&self.copy, &self.bundle) {
+            Ok(()) => {
+                log::info!("update: the swap lost {:?}; restored it", self.bundle);
+                true
+            }
+            Err(err) => {
+                log::error!(
+                    "update: the swap lost {:?} and restoring it failed: {err}; a copy is at {:?}",
+                    self.bundle,
+                    self.copy
+                );
+                // An empty path makes Drop leave the copy alone.
+                self.copy = std::path::PathBuf::new();
+                false
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for BundleSafetyCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.copy);
+    }
 }
 
 /// RUST-HZ: steps of the plugin's bundle swap fail on a bare "(os error 2)"
@@ -1447,6 +1514,11 @@ async fn install_pending_update<U>(
 where
     U: InstallableAppUpdate,
 {
+    // A check can refill the pending slot while another caller downloads.
+    // Serialize the complete install, including bundle recovery, so the two
+    // swaps cannot delete each other's app or bypass the safety copy.
+    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _install = INSTALL_LOCK.lock().await;
     let update = {
         let mut pending = pending_update.lock();
         // `install` consumes the update handle, so a FAILED install empties the
@@ -1465,8 +1537,40 @@ where
     // lands, and the window they were just looking at is gone - leaving "Restart
     // now" behind a tray click nobody would think to make. Hold the window open
     // for the length of the install.
+    #[cfg(target_os = "macos")]
+    let bundle = update.bundle_path();
+    #[cfg(target_os = "macos")]
+    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
+    // Both the webview command and the headless idle applier install here.
+    #[cfg(target_os = "macos")]
+    let safety_copy = bundle
+        .as_deref()
+        .filter(|_| !overlapped)
+        .and_then(|bundle| {
+            BundleSafetyCopy::take(
+                bundle,
+                std::env::temp_dir().join("headroom-update-bundle-copy"),
+            )
+        });
     INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
+    #[cfg(target_os = "macos")]
+    let result = result.map_err(|err| {
+        annotate_bare_not_found(
+            err,
+            bundle.as_deref().is_some_and(std::path::Path::exists),
+            overlapped,
+        )
+    });
+    #[cfg(target_os = "macos")]
+    let result = match (result, safety_copy) {
+        (Err(err), Some(mut copy)) => Err(if copy.restore_if_lost() {
+            format!("{err} [bundle restored]")
+        } else {
+            err
+        }),
+        (result, _) => result,
+    };
     INSTALLING_UPDATE.store(false, Ordering::Release);
     result
 }
@@ -4056,6 +4160,12 @@ pub(crate) fn capture_upgrade_failure(
     log_tail: Option<&str>,
     boot_diagnostics: Option<UpgradeBootDiagnostics>,
 ) {
+    // The recovery failure that caused this refusal filed its own issue
+    // (RUST-WG) or stayed local by design; a twin here reopened RUST-29.
+    if err.is::<tool_manager::RecoveryIncomplete>() {
+        log::info!("skipping Sentry capture for runtime_upgrade_failed ({phase}): {err:#}");
+        return;
+    }
     let technical_err = format!("{err:#}");
     let cmd_failure = err
         .chain()
@@ -4494,6 +4604,9 @@ pub(crate) fn is_disk_full_signal(text: &str) -> bool {
         // is locale-independent; on Linux errno 112 is EHOSTDOWN, hence the gate.
         || lower.contains("not enough space on the disk")
         || (cfg!(windows) && lower.contains("(os error 112)"))
+        // The runtime upgrade's own 1 GB pre-check (RUST-29 on 0.9.61 filed it
+        // at Error, and the user got no disk-space hint).
+        || lower.contains("insufficient disk space")
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because
@@ -4582,7 +4695,7 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
     {
         return Some("Couldn't reach PyPI. Check your network and retry.".into());
     }
-    if chain.contains("no space") || chain.contains("disk full") || chain.contains("enospc") {
+    if chain.contains("no space") || is_disk_full_signal(&chain) {
         return Some(
             "Not enough disk space to install the update. Free up space and retry.".into(),
         );
@@ -14531,6 +14644,7 @@ mod tests {
     /// handler hides the window 150ms later. The flag is what keeps "Restart
     /// now" on screen instead of behind an unexplained tray click.
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_holds_the_window_open_while_it_runs() {
         struct FlagObservingUpdate(Arc<Mutex<Option<bool>>>);
 
@@ -14592,7 +14706,110 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
+    #[serial_test::serial]
+    fn install_pending_update_restores_a_bundle_lost_by_an_idle_install() {
+        struct LosingUpdate(std::path::PathBuf);
+        impl InstallableAppUpdate for LosingUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!()
+            }
+            fn bundle_path(&self) -> Option<std::path::PathBuf> {
+                Some(self.0.clone())
+            }
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    std::fs::remove_dir_all(&self.0).unwrap();
+                    Err("swap failed".into())
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .unwrap_err();
+        assert_eq!(error, "swap failed [bundle restored]");
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_safety_copy_restores_a_bundle_the_swap_lost() {
+        let root = std::env::temp_dir().join(format!("hr-bundle-copy-{}", std::process::id()));
+        let bundle = root.join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents").join("Info.plist"), b"old").unwrap();
+        let copy = root.join("copy");
+
+        let mut kept = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        let kept_path = kept.copy.clone();
+        assert!(!kept.restore_if_lost(), "bundle still there");
+        drop(kept);
+        assert!(!kept_path.exists(), "copy removed after a clean install");
+
+        let mut lost = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        std::fs::remove_dir_all(&bundle).unwrap();
+        assert!(lost.restore_if_lost());
+        assert_eq!(
+            std::fs::read(bundle.join("Contents").join("Info.plist")).unwrap(),
+            b"old"
+        );
+        drop(lost);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_safety_copy_preserves_a_failed_restore_across_later_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("Applications");
+        let bundle = parent.join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        let copy = root.path().join("copy");
+        let mut first = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        let preserved = first.copy.clone();
+        // The installer lost the bundle and its parent now refuses a restore.
+        std::fs::remove_dir_all(&parent).unwrap();
+        std::fs::write(&parent, b"blocked").unwrap();
+        assert!(!first.restore_if_lost());
+        drop(first);
+        assert_eq!(
+            std::fs::read(preserved.join("Contents/Info.plist")).unwrap(),
+            b"old"
+        );
+
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"new").unwrap();
+        let second = super::BundleSafetyCopy::take(&bundle, copy).expect("next APFS clone");
+        let second_path = second.copy.clone();
+        assert_eq!(
+            std::fs::read(preserved.join("Contents/Info.plist")).unwrap(),
+            b"old",
+            "a retry discarded the only preserved copy of the old bundle"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+        assert!(preserved.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn install_pending_update_requires_a_checked_update() {
         let pending = Mutex::new(None::<FakePendingUpdate>);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14614,6 +14831,71 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn install_pending_update_serializes_a_rechecked_update() {
+        struct OrderedUpdate {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            started: &'static str,
+            finished: &'static str,
+            ready: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl InstallableAppUpdate for OrderedUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!()
+            }
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    self.events.lock().push(self.started);
+                    if let Some(ready) = self.ready {
+                        ready.send(()).unwrap();
+                    }
+                    tokio::task::yield_now().await;
+                    self.events.lock().push(self.finished);
+                    Ok(())
+                })
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let pending = Mutex::new(Some(OrderedUpdate {
+            events: Arc::clone(&events),
+            started: "first started",
+            finished: "first finished",
+            ready: Some(ready),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = install_pending_update(&pending, noop_app_update_progress_emitter());
+            let rechecked = async {
+                started.await.unwrap();
+                // A concurrent feed check stages another handle mid-download.
+                *pending.lock() = Some(OrderedUpdate {
+                    events: Arc::clone(&events),
+                    started: "second started",
+                    finished: "second finished",
+                    ready: None,
+                });
+                install_pending_update(&pending, noop_app_update_progress_emitter()).await
+            };
+            let (first, second) = tokio::join!(biased; first, rechecked);
+            first.unwrap();
+            second.unwrap();
+        });
+        assert_eq!(
+            *events.lock(),
+            [
+                "first started",
+                "first finished",
+                "second started",
+                "second finished"
+            ]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn install_pending_update_runs_the_installer_and_clears_the_slot() {
         let pending = Mutex::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
@@ -14635,6 +14917,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_forwards_progress_to_emitter() {
         struct ProgressEmittingFake {
             metadata: AvailableAppUpdate,
@@ -14738,6 +15021,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_returns_install_failures_after_taking_the_slot() {
         let pending = Mutex::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
@@ -18519,6 +18803,18 @@ Some unrelated content.
                     diagnostics,
                 );
             }
+            // A refusal after a failed recovery files nothing: its cause did.
+            super::capture_upgrade_failure(
+                &anyhow::Error::new(crate::tool_manager::RecoveryIncomplete),
+                false,
+                "install",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         });
         let events = recorder.0.lock().unwrap();
         assert_eq!(events.len(), 2);
@@ -18908,6 +19204,10 @@ Some unrelated content.
         ));
         assert!(is_disk_full_signal("ENOSPC: no space left"));
         assert!(is_disk_full_signal("disk full"));
+        let precheck = "insufficient disk space for runtime upgrade: 84 MB free, 1024 MB required";
+        assert!(is_disk_full_signal(precheck));
+        let hint = classify_upgrade_error(&anyhow::anyhow!(precheck)).expect("must classify");
+        assert!(hint.contains("disk space"), "{hint}");
         // Case-insensitive.
         assert!(is_disk_full_signal("NO SPACE LEFT ON DEVICE"));
     }
