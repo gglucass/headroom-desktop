@@ -7404,21 +7404,7 @@ impl ToolManager {
             };
         }
 
-        // Optional addon: an in-place upgrade keeps the venv, so markitdown
-        // should still run. Warn-only — a broken optional addon must not fail
-        // the core Headroom upgrade.
-        if let Err(err) = self.smoke_test_markitdown() {
-            let exception = command_failure_last_line(&err)
-                .map_or_else(String::new, |line| format!("{line}; "));
-            let detail = format!("{exception}{err:#}");
-            // App Control refusing markitdown.exe is the machine's policy
-            // (RUST-W0); the runtime's own start failure tells the user.
-            if crate::is_windows_app_control_block(&detail) {
-                log::info!("markitdown smoke test failed after upgrade: {detail}");
-            } else {
-                log::warn!("markitdown smoke test failed after upgrade: {detail}");
-            }
-        }
+        self.check_markitdown_after_upgrade();
         for plugin in &PLUGIN_ADDONS {
             if let Err(err) = self.smoke_test_plugin(plugin.id) {
                 log::warn!("{} smoke test failed after upgrade: {err:#}", plugin.id);
@@ -8723,6 +8709,53 @@ impl ToolManager {
         }
     }
 
+    /// Optional addon: an in-place upgrade keeps the venv, so markitdown
+    /// should still run. Warn-only: a broken optional addon must not fail the
+    /// core Headroom upgrade.
+    fn check_markitdown_after_upgrade(&self) {
+        let Err(err) = self.smoke_test_markitdown() else {
+            return;
+        };
+        let last_line = command_failure_last_line(&err).unwrap_or_default();
+        let detail = if last_line.is_empty() {
+            format!("{err:#}")
+        } else {
+            format!("{last_line}; {err:#}")
+        };
+        // App Control refusing markitdown.exe is the machine's policy
+        // (RUST-W0); the runtime's own start failure tells the user.
+        if crate::is_windows_app_control_block(&detail) {
+            log::info!("markitdown smoke test failed after upgrade: {detail}");
+            return;
+        }
+        // One of its dependencies is gone (RUST-WC: bs4), so every Office read
+        // dies on the import. The pinned install puts missing dependencies
+        // back; until then nothing else would.
+        if last_line.starts_with("ModuleNotFoundError") {
+            match self.reinstall_markitdown() {
+                Ok(()) => {
+                    log::info!("markitdown failed after upgrade ({last_line}); reinstalled it");
+                    return;
+                }
+                Err(repair) => log::info!("reinstalling markitdown failed: {repair:#}"),
+            }
+        }
+        log::warn!("markitdown smoke test failed after upgrade: {detail}");
+    }
+
+    /// `install_markitdown`, keeping the user's enabled flag (the install
+    /// writes its receipt enabled).
+    fn reinstall_markitdown(&self) -> Result<()> {
+        let enabled = self.tool_enabled("markitdown");
+        self.install_markitdown().and_then(|()| {
+            if enabled {
+                Ok(())
+            } else {
+                self.set_markitdown_enabled(false)
+            }
+        })
+    }
+
     /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
     /// while its receipt, shim and agent nudges survive and send every Office
     /// read to a command that dies with ModuleNotFoundError. Reinstall it,
@@ -8734,15 +8767,7 @@ impl ToolManager {
         {
             return;
         }
-        let enabled = self.tool_enabled("markitdown");
-        let restored = self.install_markitdown().and_then(|()| {
-            if enabled {
-                Ok(())
-            } else {
-                self.set_markitdown_enabled(false)
-            }
-        });
-        if let Err(err) = restored {
+        if let Err(err) = self.reinstall_markitdown() {
             log::warn!("markitdown reinstall after a venv rebuild failed, removing it: {err:#}");
             if let Err(err) =
                 crate::client_adapters::disable_markitdown_integration(&self.markitdown_shim_path())
@@ -27514,6 +27539,42 @@ assert OpencodeRegistrar().register_server(own).ok"#,
             .smoke_test_markitdown_with_timeout(super::MARKITDOWN_SMOKE_TEST_TIMEOUT)
             .expect_err("smoke test should fail");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// RUST-WC: after an in-place upgrade markitdown died on a missing bs4,
+    /// and nothing put it back, so every Office read failed.
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn markitdown_missing_a_module_after_upgrade_is_reinstalled_keeping_its_flag() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-missing-dep");
+        let _home = HomeGuard::new(&root.join("home"));
+        let receipt = runtime.tools_dir.join("markitdown.json");
+        fs::write(&receipt, br#"{"version":"0.1.9","enabled":false}"#).expect("receipt");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+        let log = root.join("argv.log");
+        let fixed = root.join("bs4-back");
+        write_executable(
+            &manager.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\n\
+                 case \"$*\" in *'markitdown[all]=='*) touch {fixed}; exit 0;; esac\n\
+                 if [ \"$1\" = -c ] && [ \"$3\" = --help ]; then [ -e {fixed} ] && exit 0; \
+                 echo \"ModuleNotFoundError: No module named 'bs4'\" >&2; exit 1; fi\nexit 0\n",
+                log = log.display(),
+                fixed = fixed.display(),
+            ),
+        );
+
+        manager.check_markitdown_after_upgrade();
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        assert!(calls.contains("markitdown[all]=="), "{calls}");
+        assert!(fixed.exists(), "reinstalled");
+        assert!(
+            !manager.tool_enabled("markitdown"),
+            "kept the user's off switch"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
