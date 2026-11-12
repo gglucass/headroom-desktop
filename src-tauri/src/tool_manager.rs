@@ -6880,6 +6880,17 @@ impl ToolManager {
         // move-aside and success-commit), the backup is the REAL venv.
         // Restore it before doing anything destructive.
         let _recovered = self.recover_from_interrupted_upgrade();
+        if self.upgrade_interrupted() {
+            // Failed recovery keeps the marker and its only known-good
+            // backups for retry. They must not enter the stale-backup purge
+            // or be overwritten by a new in-place upgrade snapshot.
+            return UpgradeOutcome::InstallFailed {
+                restored: false,
+                error: anyhow!(
+                    "previous runtime upgrade recovery is incomplete; retry after resolving the recovery failure"
+                ),
+            };
+        }
 
         // In-place path: mutate the live venv rather than rebuilding it.
         // Covers both the wheel-only case (lock unchanged) and the lock-churn
@@ -25707,6 +25718,50 @@ Always run the linter first.
         );
         // Stale backup purged (either consumed during restore or cleaned at start).
         assert!(!stale_backup.exists(), "stale backup removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // read-only parent models a directory rename denied by Windows
+    fn atomic_upgrade_keeps_the_good_backup_when_interrupted_recovery_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("atomic-failed-recovery");
+        let backup = manager.venv_backup_dir();
+        fs::rename(&runtime.venv_dir, &backup).expect("backup");
+        fs::create_dir_all(&runtime.venv_dir).expect("partial venv");
+        fs::write(runtime.venv_dir.join("partial"), b"torn").expect("partial");
+        manager
+            .write_upgrade_marker("0.8.2", None, None)
+            .expect("marker");
+        let receipt_backup = manager.headroom_receipt_backup_path();
+        fs::write(&receipt_backup, b"original receipt").expect("receipt backup");
+        let permissions = fs::metadata(&runtime.runtime_dir).unwrap().permissions();
+        // The live venv cannot move aside. Deleting the backup can still
+        // delete its contents before removal of its root directory fails.
+        fs::set_permissions(&runtime.runtime_dir, fs::Permissions::from_mode(0o555))
+            .expect("read-only parent");
+        let release = HeadroomRelease {
+            version: "0.8.3".into(),
+            wheel_url: "http://127.0.0.1:9/headroom.whl".into(),
+            sha256: "unused".into(),
+            index_sha256: "unused".into(),
+        };
+        let mut steps = Vec::new();
+        let outcome =
+            manager.atomic_upgrade_headroom(&release, |update| steps.push(update.step), true);
+        fs::set_permissions(&runtime.runtime_dir, permissions).expect("restore permissions");
+
+        assert!(matches!(
+            outcome,
+            UpgradeOutcome::InstallFailed {
+                restored: false,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(backup.join("marker")).unwrap(), b"live-v1");
+        assert_eq!(fs::read(receipt_backup).unwrap(), b"original receipt");
+        assert!(manager.upgrade_interrupted(), "recovery can retry");
+        assert_eq!(steps, ["Preparing update"]);
         let _ = fs::remove_dir_all(root);
     }
 
