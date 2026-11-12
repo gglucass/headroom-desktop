@@ -167,12 +167,21 @@ fn noop_app_update_progress_emitter() -> AppUpdateProgressEmitter {
 
 trait InstallableAppUpdate: Send {
     fn metadata(&self) -> AvailableAppUpdate;
+    #[cfg(target_os = "macos")]
+    fn bundle_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     fn install(self, progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture;
 }
 
 struct TauriPendingUpdate(Update);
 
 impl InstallableAppUpdate for TauriPendingUpdate {
+    #[cfg(target_os = "macos")]
+    fn bundle_path(&self) -> Option<std::path::PathBuf> {
+        current_app_bundle_path()
+    }
+
     fn metadata(&self) -> AvailableAppUpdate {
         let published_at = self.0.date.as_ref().and_then(|date| {
             date.format(&time::format_description::well_known::Rfc3339)
@@ -1240,35 +1249,7 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
-    #[cfg(target_os = "macos")]
-    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
-    #[cfg(target_os = "macos")]
-    let safety_copy = current_app_bundle_path()
-        .filter(|_| !overlapped)
-        .and_then(|bundle| {
-            BundleSafetyCopy::take(
-                &bundle,
-                std::env::temp_dir().join("headroom-update-bundle-copy"),
-            )
-        });
     let installed = install_pending_update(&pending_update.0, emitter).await;
-    #[cfg(target_os = "macos")]
-    let installed = installed.map_err(|err| {
-        annotate_bare_not_found(
-            err,
-            current_app_bundle_path().is_some_and(|bundle| bundle.exists()),
-            overlapped,
-        )
-    });
-    #[cfg(target_os = "macos")]
-    let installed = match (installed, safety_copy) {
-        (Err(err), Some(mut copy)) => Err(if copy.restore_if_lost() {
-            format!("{err} [bundle restored]")
-        } else {
-            err
-        }),
-        (installed, _) => installed,
-    };
     // Windows never gets here (the installer exits the app); elsewhere the new
     // build is on disk and runs at the next restart.
     if installed.is_ok() {
@@ -1550,8 +1531,40 @@ where
     // lands, and the window they were just looking at is gone - leaving "Restart
     // now" behind a tray click nobody would think to make. Hold the window open
     // for the length of the install.
+    #[cfg(target_os = "macos")]
+    let bundle = update.bundle_path();
+    #[cfg(target_os = "macos")]
+    let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
+    // Both the webview command and the headless idle applier install here.
+    #[cfg(target_os = "macos")]
+    let safety_copy = bundle
+        .as_deref()
+        .filter(|_| !overlapped)
+        .and_then(|bundle| {
+            BundleSafetyCopy::take(
+                bundle,
+                std::env::temp_dir().join("headroom-update-bundle-copy"),
+            )
+        });
     INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
+    #[cfg(target_os = "macos")]
+    let result = result.map_err(|err| {
+        annotate_bare_not_found(
+            err,
+            bundle.as_deref().is_some_and(std::path::Path::exists),
+            overlapped,
+        )
+    });
+    #[cfg(target_os = "macos")]
+    let result = match (result, safety_copy) {
+        (Err(err), Some(mut copy)) => Err(if copy.restore_if_lost() {
+            format!("{err} [bundle restored]")
+        } else {
+            err
+        }),
+        (result, _) => result,
+    };
     INSTALLING_UPDATE.store(false, Ordering::Release);
     result
 }
@@ -14683,6 +14696,46 @@ mod tests {
         assert_eq!(
             super::annotate_bare_not_found(with_path.into(), true, false),
             with_path
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn install_pending_update_restores_a_bundle_lost_by_an_idle_install() {
+        struct LosingUpdate(std::path::PathBuf);
+        impl InstallableAppUpdate for LosingUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!()
+            }
+            fn bundle_path(&self) -> Option<std::path::PathBuf> {
+                Some(self.0.clone())
+            }
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    std::fs::remove_dir_all(&self.0).unwrap();
+                    Err("swap failed".into())
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .unwrap_err();
+        assert_eq!(error, "swap failed [bundle restored]");
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            b"old"
         );
     }
 
