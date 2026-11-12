@@ -9466,7 +9466,9 @@ fn remove_claude_remote_control_command() -> Result<()> {
             false,
             Some(&["Stop", "UserPromptSubmit"]),
         ) {
-            log::warn!("removing the Remote Control hooks failed: {err}");
+            // `{err:#}`: the bare top context read only "reading
+            // ~/.claude/settings.json" and hid why (RUST-W9).
+            log::warn!("removing the Remote Control hooks failed: {err:#}");
             hooks_removed = false;
         }
     }
