@@ -1514,6 +1514,11 @@ async fn install_pending_update<U>(
 where
     U: InstallableAppUpdate,
 {
+    // A check can refill the pending slot while another caller downloads.
+    // Serialize the complete install, including bundle recovery, so the two
+    // swaps cannot delete each other's app or bypass the safety copy.
+    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _install = INSTALL_LOCK.lock().await;
     let update = {
         let mut pending = pending_update.lock();
         // `install` consumes the update handle, so a FAILED install empties the
@@ -14639,6 +14644,7 @@ mod tests {
     /// handler hides the window 150ms later. The flag is what keeps "Restart
     /// now" on screen instead of behind an unexplained tray click.
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_holds_the_window_open_while_it_runs() {
         struct FlagObservingUpdate(Arc<Mutex<Option<bool>>>);
 
@@ -14803,6 +14809,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_requires_a_checked_update() {
         let pending = Mutex::new(None::<FakePendingUpdate>);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14824,6 +14831,71 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn install_pending_update_serializes_a_rechecked_update() {
+        struct OrderedUpdate {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            started: &'static str,
+            finished: &'static str,
+            ready: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl InstallableAppUpdate for OrderedUpdate {
+            fn metadata(&self) -> AvailableAppUpdate {
+                unreachable!()
+            }
+            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+                Box::pin(async move {
+                    self.events.lock().push(self.started);
+                    if let Some(ready) = self.ready {
+                        ready.send(()).unwrap();
+                    }
+                    tokio::task::yield_now().await;
+                    self.events.lock().push(self.finished);
+                    Ok(())
+                })
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let pending = Mutex::new(Some(OrderedUpdate {
+            events: Arc::clone(&events),
+            started: "first started",
+            finished: "first finished",
+            ready: Some(ready),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = install_pending_update(&pending, noop_app_update_progress_emitter());
+            let rechecked = async {
+                started.await.unwrap();
+                // A concurrent feed check stages another handle mid-download.
+                *pending.lock() = Some(OrderedUpdate {
+                    events: Arc::clone(&events),
+                    started: "second started",
+                    finished: "second finished",
+                    ready: None,
+                });
+                install_pending_update(&pending, noop_app_update_progress_emitter()).await
+            };
+            let (first, second) = tokio::join!(biased; first, rechecked);
+            first.unwrap();
+            second.unwrap();
+        });
+        assert_eq!(
+            *events.lock(),
+            [
+                "first started",
+                "first finished",
+                "second started",
+                "second finished"
+            ]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn install_pending_update_runs_the_installer_and_clears_the_slot() {
         let pending = Mutex::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
@@ -14845,6 +14917,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_forwards_progress_to_emitter() {
         struct ProgressEmittingFake {
             metadata: AvailableAppUpdate,
@@ -14948,6 +15021,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn install_pending_update_returns_install_failures_after_taking_the_slot() {
         let pending = Mutex::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
