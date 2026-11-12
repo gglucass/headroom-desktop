@@ -15363,9 +15363,13 @@ fn remove_venv_pip(python: &Path) -> Result<()> {
 /// neither changes when the pin does.
 fn wheel_download_failure_category(detail: &str) -> &'static str {
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("(connect)") && lower.contains("timed out") {
+    if lower.contains("(connect)")
+        && (lower.contains("timed out") || lower.contains("(os error 10060)"))
+    {
         // The TCP connect never completed: the host cannot reach the CDN at
         // all, like `dns` (RUST-NN). A slow download times out on a read.
+        // Windows localizes the words, so its WSAETIMEDOUT code counts too
+        // (RUST-WD read "Se produjo un error ...").
         "connect-timeout"
     } else if lower.contains("operation timed out") || lower.contains("timed out") {
         "timeout"
@@ -19833,6 +19837,11 @@ print('output_warmup' in sitecustomize._hd_bound, sorted({a for a, _ in first}),
             ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
             ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
             ("downloading https://x/a.whl: error sending request", "connection"),
+            // RUST-WD: a Spanish Windows connect timeout.
+            (
+                "downloading https://github.com/a.whl: error sending request for url (https://github.com/a.whl): client error (Connect): tcp connect error: Se produjo un error durante el intento de conexión ya que la parte conectada no respondió adecuadamente tras un periodo de tiempo (os error 10060)",
+                "connect-timeout",
+            ),
             // RUST-W6 verbatim.
             (
                 "reading download body: request or response body error: error reading a body from connection: An existing connection was forcibly closed by the remote host. (os error 10054)",
