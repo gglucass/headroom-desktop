@@ -1263,7 +1263,8 @@ async fn install_app_update(
 /// TempDir's drop deletes Headroom.app (and the user's clients then point at a
 /// dead port once it quits). An APFS clone taken before the install (instant,
 /// no extra space; `bundle_is_on_another_volume` keeps it on one volume) puts
-/// the bundle back. Dropping it removes the copy.
+/// the bundle back. Dropping it removes the copy. With no copy the install is
+/// refused (`NO_BUNDLE_COPY_MESSAGE`), so a failed swap can never lose the app.
 #[cfg(target_os = "macos")]
 struct BundleSafetyCopy {
     bundle: std::path::PathBuf,
@@ -1272,22 +1273,18 @@ struct BundleSafetyCopy {
 
 #[cfg(target_os = "macos")]
 impl BundleSafetyCopy {
-    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> Option<Self> {
+    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> std::io::Result<Self> {
         use std::os::unix::ffi::OsStrExt;
         // A failed restore may have left the only working bundle in a prior
         // copy. Each attempt owns its path; never delete another attempt's.
         let copy = copy.with_extension(uuid::Uuid::new_v4().to_string());
-        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes()).ok()?;
-        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes()).ok()?;
+        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes())?;
+        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes())?;
         // SAFETY: both are valid NUL-terminated paths that outlive the call.
         if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
-            log::info!(
-                "update: no bundle safety copy: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
-        Some(Self {
+        Ok(Self {
             bundle: bundle.to_path_buf(),
             copy,
         })
@@ -1542,16 +1539,22 @@ where
     #[cfg(target_os = "macos")]
     let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
     // Both the webview command and the headless idle applier install here.
+    // INSTALL_LOCK rules out a concurrent swap, so every install takes a copy,
+    // and one that cannot (unreadable file, full disk) leaves this build running.
     #[cfg(target_os = "macos")]
     let safety_copy = bundle
         .as_deref()
-        .filter(|_| !overlapped)
-        .and_then(|bundle| {
+        .map(|bundle| {
             BundleSafetyCopy::take(
                 bundle,
                 std::env::temp_dir().join("headroom-update-bundle-copy"),
             )
-        });
+            .map_err(|err| {
+                log::info!("update: refusing install; no bundle safety copy of {bundle:?}: {err}");
+                format!("{NO_BUNDLE_COPY_MESSAGE} ({err})")
+            })
+        })
+        .transpose()?;
     INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
     #[cfg(target_os = "macos")]
@@ -1702,6 +1705,15 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 const MOVED_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it was moved or deleted while running. \
      Quit Headroom, open it from its current location, then check for updates again.";
+
+/// The message shown when no safety copy of the bundle could be taken, so the
+/// install is refused (RUST-WB). See `BundleSafetyCopy`. The OS error follows
+/// it, which lets the frontend show a full disk as such.
+#[cfg(target_os = "macos")]
+const NO_BUNDLE_COPY_MESSAGE: &str =
+    "Headroom kept this version because it could not make a backup copy of itself to \
+     update safely. Download the newest version from https://extraheadroom.com/dl/mac \
+     and replace Headroom in your Applications folder.";
 
 /// The message shown when the running bundle is on another volume than
 /// `$TMPDIR`. See `bundle_is_on_another_volume`.
@@ -14706,25 +14718,65 @@ mod tests {
         );
     }
 
+    /// An installer whose swap deletes the bundle and fails (RUST-WB).
+    #[cfg(target_os = "macos")]
+    struct LosingUpdate(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl InstallableAppUpdate for LosingUpdate {
+        fn metadata(&self) -> AvailableAppUpdate {
+            unreachable!()
+        }
+        fn bundle_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.clone())
+        }
+        fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+            Box::pin(async move {
+                std::fs::remove_dir_all(&self.0).unwrap();
+                Err("swap failed".into())
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn install_pending_update_refuses_to_swap_without_a_safety_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        // One unreadable file makes clonefile fail with EACCES.
+        let unreadable = bundle.join("Contents/unreadable");
+        std::fs::write(&unreadable, b"x").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .unwrap_err();
+        assert!(error.starts_with(super::NO_BUNDLE_COPY_MESSAGE), "{error}");
+        assert!(
+            error.ends_with("(Permission denied (os error 13))"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            b"old",
+            "the swap ran without a safety copy and lost the app"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial]
     fn install_pending_update_restores_a_bundle_lost_by_an_idle_install() {
-        struct LosingUpdate(std::path::PathBuf);
-        impl InstallableAppUpdate for LosingUpdate {
-            fn metadata(&self) -> AvailableAppUpdate {
-                unreachable!()
-            }
-            fn bundle_path(&self) -> Option<std::path::PathBuf> {
-                Some(self.0.clone())
-            }
-            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
-                Box::pin(async move {
-                    std::fs::remove_dir_all(&self.0).unwrap();
-                    Err("swap failed".into())
-                })
-            }
-        }
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("Headroom.app");
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
