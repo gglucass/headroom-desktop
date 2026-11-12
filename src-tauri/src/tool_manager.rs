@@ -6886,9 +6886,7 @@ impl ToolManager {
             // or be overwritten by a new in-place upgrade snapshot.
             return UpgradeOutcome::InstallFailed {
                 restored: false,
-                error: anyhow!(
-                    "previous runtime upgrade recovery is incomplete; retry after resolving the recovery failure"
-                ),
+                error: anyhow::Error::new(RecoveryIncomplete),
             };
         }
 
@@ -16259,6 +16257,22 @@ fn run_command(binary: &Path, args: &[&str], cwd: &Path) -> Result<()> {
 
     Ok(())
 }
+
+/// An upgrade refused because the previous one's recovery failed. That failure
+/// already reported itself (or stayed local by design, as a PyPI-refusing
+/// network does), so `capture_upgrade_failure` skips this consequence.
+#[derive(Debug)]
+pub struct RecoveryIncomplete;
+
+impl std::fmt::Display for RecoveryIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "previous runtime upgrade recovery is incomplete; retry after resolving the recovery failure",
+        )
+    }
+}
+
+impl std::error::Error for RecoveryIncomplete {}
 
 /// Structured failure from a shell-out. Carried through `anyhow::Error` so callers
 /// can `.context()` as usual, and capture sites (e.g. Sentry) can downcast to pull

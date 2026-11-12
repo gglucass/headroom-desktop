@@ -4056,6 +4056,12 @@ pub(crate) fn capture_upgrade_failure(
     log_tail: Option<&str>,
     boot_diagnostics: Option<UpgradeBootDiagnostics>,
 ) {
+    // The recovery failure that caused this refusal filed its own issue
+    // (RUST-WG) or stayed local by design; a twin here reopened RUST-29.
+    if err.is::<tool_manager::RecoveryIncomplete>() {
+        log::info!("skipping Sentry capture for runtime_upgrade_failed ({phase}): {err:#}");
+        return;
+    }
     let technical_err = format!("{err:#}");
     let cmd_failure = err
         .chain()
@@ -18522,6 +18528,18 @@ Some unrelated content.
                     diagnostics,
                 );
             }
+            // A refusal after a failed recovery files nothing: its cause did.
+            super::capture_upgrade_failure(
+                &anyhow::Error::new(crate::tool_manager::RecoveryIncomplete),
+                false,
+                "install",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         });
         let events = recorder.0.lock().unwrap();
         assert_eq!(events.len(), 2);
