@@ -7,9 +7,9 @@
 //! its conversation up in this file by the `session_id` Claude Code passes it
 //! on stdin. Token counts only, never content.
 //!
-//! Summing a conversation's `tokens_saved` counts each removed token once:
-//! Anthropic's cached prefix is frozen, so a turn's figure covers only content
-//! new to the conversation (see the wheel's conversation_savings.py).
+//! Summing a conversation's `tokens_saved` books each request's removals,
+//! including those re-sent in the frozen cached prefix: the per-request rule
+//! every Claude Code savings figure uses.
 //!
 //! The script parses this file with a bash regex, not a JSON parser (a Python
 //! start cost ~30 ms and it runs every second), so `Session`'s field order is

@@ -795,6 +795,33 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
+    # Codex savings on Claude Code's rule (upstream PR, branch
+    # fix/responses-savings-per-request). Anthropic books each request's own
+    # removals, re-sent cached history included; 0.44.0 books a /v1/responses
+    # request net of what its conversation's earlier turns removed, so Codex
+    # read several times lower for the same work. A ledger that declines
+    # ("this path does not distinguish") sends the funnel to its per-request
+    # fallback, the figure every other path books. The upstream fix deletes
+    # the ledger, so this stands down on the wheel that ships it. Exact-pin
+    # 0.44.0. Kill switch: HEADROOM_RESPONSES_SAVINGS_PER_REQUEST=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_RESPONSES_SAVINGS_PER_REQUEST", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import importlib.metadata as _hd_rs_meta
+
+            import headroom.proxy.conversation_savings as _hd_rs_cs
+
+            if _hd_rs_meta.version("headroom-ai") == "0.44.0" and hasattr(
+                _hd_rs_cs, "ConversationSavings"
+            ):
+                _hd_rs_cs.ConversationSavings.novel = (
+                    lambda self, conversation_key, cumulative: None
+                )
+                _hd_bound.add("responses_savings_per_request")
+    except Exception:
+        pass
+
     # Observe confirmed prefix rewrites independently of the replay/lineage
     # fixes. Only numeric diagnostics cross /stats to the desktop's Sentry SDK.
     # No provider calls, disk writes, or request mutations in this observer.
@@ -1881,6 +1908,7 @@ _HD_VENDORS = (
     "user_turn_verbatim",
     "codex_compaction_body",
     "savings_fold_guard",
+    "responses_savings_per_request",
     "cache_integrity",
     "prefix_replay_guard",
     "cc_switch_reset",
@@ -17386,6 +17414,67 @@ print(round(t.snapshot()["lifetime"]["compression_savings_usd"], 6))
         assert_eq!(on, "1.0", "stderr:\n{on_err}");
         let (off, off_err) = run("0");
         assert_eq!(off, "6.0", "stderr:\n{off_err}");
+    }
+
+    /// Codex booked on Claude Code's rule against the installed wheel: three
+    /// turns of one Responses conversation removing 600, 700 and 700 tokens
+    /// book all three through the real funnel, and the wheel's
+    /// once-per-conversation 600, 100, 0 with the kill switch.
+    #[test]
+    fn responses_savings_per_request_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = r#"
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+
+class Handler:
+    def __init__(self):
+        self.metrics = MagicMock()
+        self.metrics.record_request = AsyncMock()
+        self.cost_tracker = MagicMock()
+        self.logger = None
+
+async def main():
+    h = Handler()
+    for saved in (600, 700, 700):
+        await emit_request_outcome(h, RequestOutcome(
+            request_id="r", provider="openai", model="gpt-5.5",
+            original_tokens=1000 + saved, optimized_tokens=1000, output_tokens=10,
+            tokens_saved=saved, attempted_input_tokens=2000,
+            conversation_key="conv", conversation_tokens_saved=saved))
+    booked = [c.kwargs["tokens_saved"] for c in h.metrics.record_request.await_args_list]
+    priced = [c.args[1] for c in h.cost_tracker.record_tokens.call_args_list]
+    assert booked == priced, (booked, priced)
+    print(",".join(map(str, booked)))
+
+asyncio.run(main())
+"#;
+        let run = |flag: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_RESPONSES_SAVINGS_PER_REQUEST", flag)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run responses savings probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        assert_eq!(on, "600,700,700", "stderr:\n{on_err}");
+        let (off, off_err) = run("0");
+        assert_eq!(off, "600,100,0", "stderr:\n{off_err}");
     }
 
     #[test]
