@@ -1274,8 +1274,9 @@ struct BundleSafetyCopy {
 impl BundleSafetyCopy {
     fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> Option<Self> {
         use std::os::unix::ffi::OsStrExt;
-        // A copy left by a process that died mid-install would block the clone.
-        let _ = std::fs::remove_dir_all(&copy);
+        // A failed restore may have left the only working bundle in a prior
+        // copy. Each attempt owns its path; never delete another attempt's.
+        let copy = copy.with_extension(uuid::Uuid::new_v4().to_string());
         let src = std::ffi::CString::new(bundle.as_os_str().as_bytes()).ok()?;
         let dst = std::ffi::CString::new(copy.as_os_str().as_bytes()).ok()?;
         // SAFETY: both are valid NUL-terminated paths that outlive the call.
@@ -14749,9 +14750,10 @@ mod tests {
         let copy = root.join("copy");
 
         let mut kept = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        let kept_path = kept.copy.clone();
         assert!(!kept.restore_if_lost(), "bundle still there");
         drop(kept);
-        assert!(!copy.exists(), "copy removed after a clean install");
+        assert!(!kept_path.exists(), "copy removed after a clean install");
 
         let mut lost = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
         std::fs::remove_dir_all(&bundle).unwrap();
@@ -14762,6 +14764,42 @@ mod tests {
         );
         drop(lost);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_safety_copy_preserves_a_failed_restore_across_later_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("Applications");
+        let bundle = parent.join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        let copy = root.path().join("copy");
+        let mut first = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        let preserved = first.copy.clone();
+        // The installer lost the bundle and its parent now refuses a restore.
+        std::fs::remove_dir_all(&parent).unwrap();
+        std::fs::write(&parent, b"blocked").unwrap();
+        assert!(!first.restore_if_lost());
+        drop(first);
+        assert_eq!(
+            std::fs::read(preserved.join("Contents/Info.plist")).unwrap(),
+            b"old"
+        );
+
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"new").unwrap();
+        let second = super::BundleSafetyCopy::take(&bundle, copy).expect("next APFS clone");
+        let second_path = second.copy.clone();
+        assert_eq!(
+            std::fs::read(preserved.join("Contents/Info.plist")).unwrap(),
+            b"old",
+            "a retry discarded the only preserved copy of the old bundle"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+        assert!(preserved.exists());
     }
 
     #[test]
