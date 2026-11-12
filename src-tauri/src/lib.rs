@@ -4494,6 +4494,9 @@ pub(crate) fn is_disk_full_signal(text: &str) -> bool {
         // is locale-independent; on Linux errno 112 is EHOSTDOWN, hence the gate.
         || lower.contains("not enough space on the disk")
         || (cfg!(windows) && lower.contains("(os error 112)"))
+        // The runtime upgrade's own 1 GB pre-check (RUST-29 on 0.9.61 filed it
+        // at Error, and the user got no disk-space hint).
+        || lower.contains("insufficient disk space")
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because
@@ -4582,7 +4585,7 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
     {
         return Some("Couldn't reach PyPI. Check your network and retry.".into());
     }
-    if chain.contains("no space") || chain.contains("disk full") || chain.contains("enospc") {
+    if chain.contains("no space") || is_disk_full_signal(&chain) {
         return Some(
             "Not enough disk space to install the update. Free up space and retry.".into(),
         );
@@ -18908,6 +18911,10 @@ Some unrelated content.
         ));
         assert!(is_disk_full_signal("ENOSPC: no space left"));
         assert!(is_disk_full_signal("disk full"));
+        let precheck = "insufficient disk space for runtime upgrade: 84 MB free, 1024 MB required";
+        assert!(is_disk_full_signal(precheck));
+        let hint = classify_upgrade_error(&anyhow::anyhow!(precheck)).expect("must classify");
+        assert!(hint.contains("disk space"), "{hint}");
         // Case-insensitive.
         assert!(is_disk_full_signal("NO SPACE LEFT ON DEVICE"));
     }
