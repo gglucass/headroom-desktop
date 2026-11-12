@@ -5397,8 +5397,11 @@ fn codex_sqlite_store_expected() -> bool {
 /// by its `threads` table and no-ops on anything else (logs/goals/memories). A
 /// rename can no longer silently split the history menu. A missing dir
 /// (`read_dir` error) is skipped. Paths are deduped in case the two dirs ever
-/// resolve to the same place.
+/// resolve to the same place. Codex's own logs/goals/memories stores are left
+/// out: they never hold `threads`, and a running Codex keeps them locked past
+/// `busy_timeout`, which was every RUST-TE event (logs_2, goals_1).
 fn discover_codex_state_dbs() -> Vec<PathBuf> {
+    const NON_THREAD_STORES: [&str; 3] = ["logs_", "goals_", "memories_"];
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for dir in codex_state_dirs() {
@@ -5407,7 +5410,10 @@ fn discover_codex_state_dbs() -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             if path.extension().and_then(|e| e.to_str()) == Some("sqlite")
+                && !NON_THREAD_STORES.iter().any(|p| name.starts_with(p))
                 && seen.insert(path.clone())
             {
                 out.push(path);
@@ -23347,6 +23353,9 @@ sys.exit(3)
         std::fs::File::create(codex.join("sqlite").join("threads.sqlite")).unwrap();
         // A non-sqlite file in the same dir must be ignored.
         std::fs::File::create(codex.join("config.toml")).unwrap();
+        // RUST-TE: Codex's own non-thread stores, locked by a running Codex.
+        std::fs::File::create(codex.join("sqlite").join("logs_2.sqlite")).unwrap();
+        std::fs::File::create(codex.join("sqlite").join("goals_1.sqlite")).unwrap();
 
         let names: BTreeSet<String> = discover_codex_state_dbs()
             .into_iter()
