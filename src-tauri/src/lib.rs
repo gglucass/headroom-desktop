@@ -1242,6 +1242,15 @@ async fn install_app_update(
     });
     #[cfg(target_os = "macos")]
     let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
+    #[cfg(target_os = "macos")]
+    let safety_copy = current_app_bundle_path()
+        .filter(|_| !overlapped)
+        .and_then(|bundle| {
+            BundleSafetyCopy::take(
+                &bundle,
+                std::env::temp_dir().join("headroom-update-bundle-copy"),
+            )
+        });
     let installed = install_pending_update(&pending_update.0, emitter).await;
     #[cfg(target_os = "macos")]
     let installed = installed.map_err(|err| {
@@ -1251,12 +1260,88 @@ async fn install_app_update(
             overlapped,
         )
     });
+    #[cfg(target_os = "macos")]
+    let installed = match (installed, safety_copy) {
+        (Err(err), Some(mut copy)) => Err(if copy.restore_if_lost() {
+            format!("{err} [bundle restored]")
+        } else {
+            err
+        }),
+        (installed, _) => installed,
+    };
     // Windows never gets here (the installer exits the app); elsewhere the new
     // build is on disk and runs at the next restart.
     if installed.is_ok() {
         UPDATE_STAGED.store(true, Ordering::Release);
     }
     installed
+}
+
+/// RUST-WB: tauri-plugin-updater 2.10.0's macOS swap moves the running bundle
+/// into a TempDir, and when its final rename fails it returns early, so the
+/// TempDir's drop deletes Headroom.app (and the user's clients then point at a
+/// dead port once it quits). An APFS clone taken before the install (instant,
+/// no extra space; `bundle_is_on_another_volume` keeps it on one volume) puts
+/// the bundle back. Dropping it removes the copy.
+#[cfg(target_os = "macos")]
+struct BundleSafetyCopy {
+    bundle: std::path::PathBuf,
+    copy: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl BundleSafetyCopy {
+    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        // A copy left by a process that died mid-install would block the clone.
+        let _ = std::fs::remove_dir_all(&copy);
+        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes()).ok()?;
+        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes()).ok()?;
+        // SAFETY: both are valid NUL-terminated paths that outlive the call.
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+            log::info!(
+                "update: no bundle safety copy: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self {
+            bundle: bundle.to_path_buf(),
+            copy,
+        })
+    }
+
+    /// True when the install lost the bundle and the copy took its place. A
+    /// failed restore keeps the copy: it is then the only Headroom.app left.
+    fn restore_if_lost(&mut self) -> bool {
+        if self.bundle.exists() {
+            return false;
+        }
+        // direct-write: moves the app's own bundle clone back, a directory swap
+        match std::fs::rename(&self.copy, &self.bundle) {
+            Ok(()) => {
+                log::info!("update: the swap lost {:?}; restored it", self.bundle);
+                true
+            }
+            Err(err) => {
+                log::error!(
+                    "update: the swap lost {:?} and restoring it failed: {err}; a copy is at {:?}",
+                    self.bundle,
+                    self.copy
+                );
+                // An empty path makes Drop leave the copy alone.
+                self.copy = std::path::PathBuf::new();
+                false
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for BundleSafetyCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.copy);
+    }
 }
 
 /// RUST-HZ: steps of the plugin's bundle swap fail on a bare "(os error 2)"
@@ -14599,6 +14684,31 @@ mod tests {
             super::annotate_bare_not_found(with_path.into(), true, false),
             with_path
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_safety_copy_restores_a_bundle_the_swap_lost() {
+        let root = std::env::temp_dir().join(format!("hr-bundle-copy-{}", std::process::id()));
+        let bundle = root.join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents").join("Info.plist"), b"old").unwrap();
+        let copy = root.join("copy");
+
+        let mut kept = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        assert!(!kept.restore_if_lost(), "bundle still there");
+        drop(kept);
+        assert!(!copy.exists(), "copy removed after a clean install");
+
+        let mut lost = super::BundleSafetyCopy::take(&bundle, copy.clone()).expect("APFS clone");
+        std::fs::remove_dir_all(&bundle).unwrap();
+        assert!(lost.restore_if_lost());
+        assert_eq!(
+            std::fs::read(bundle.join("Contents").join("Info.plist")).unwrap(),
+            b"old"
+        );
+        drop(lost);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
