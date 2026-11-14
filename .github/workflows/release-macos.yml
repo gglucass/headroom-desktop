@@ -415,7 +415,7 @@ jobs:
     needs: release
     if: needs.release.outputs.should_release == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -449,6 +449,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
@@ -466,12 +471,16 @@ jobs:
         # crates.io versions are immutable; bump by hand after reviewing the diff.
         run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
+      - name: Build and verify signed Windows runtime
+        shell: pwsh
+        run: ./scripts/build-windows-signed-runtime.ps1
+
       - name: Build NSIS installer
         shell: bash
         # NSIS only: bundle.targets is "all", which also builds an MSI this
-        # workflow never publishes. signCommand signs both the inner .exe and
-        # the installer; SmartScreen still warns until reputation accrues; the release notes should keep saying so.
-        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        # workflow never publishes. signCommand signs the app and installer;
+        # the step above signs every PE in the bundled Python runtime.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.signed-windows.conf.json
 
       - name: Publish Windows installer to the stable release
         shell: bash

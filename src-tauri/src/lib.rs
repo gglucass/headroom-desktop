@@ -7541,6 +7541,17 @@ fn get_claude_statusline_enabled() -> bool {
     !client_adapters::is_statusline_disabled()
 }
 
+#[tauri::command]
+fn get_vscode_wrapper_enabled() -> bool {
+    client_adapters::is_vscode_wrapper_enabled()
+}
+
+#[tauri::command]
+fn set_vscode_wrapper_enabled(enabled: bool) -> Result<bool, String> {
+    client_adapters::set_vscode_wrapper_enabled(enabled).map_err(|err| err.to_string())?;
+    Ok(client_adapters::is_vscode_wrapper_enabled())
+}
+
 /// Toggle the per-conversation savings line under Claude Code's prompt. Takes
 /// effect on Claude Code's next statusline render; no proxy restart needed.
 #[tauri::command]
@@ -9149,6 +9160,8 @@ pub fn run() {
             get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
+            get_vscode_wrapper_enabled,
+            set_vscode_wrapper_enabled,
             get_usage_data_enabled,
             set_usage_data_enabled,
             uninstall_and_quit,

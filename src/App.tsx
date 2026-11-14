@@ -92,6 +92,7 @@ import { ReconnectModal } from "./components/ReconnectModal";
 import { QuitConfirmModal } from "./components/QuitConfirmModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
+import { VSCodeWrapperPanel } from "./components/VSCodeWrapperPanel";
 import { UsageDataPanel } from "./components/UsageDataPanel";
 import {
   authCodeSentMessage,
@@ -8701,6 +8702,7 @@ export default function App() {
                   />
                   {/* Every platform: Windows installs the statusline too (Git Bash). */}
                   <ClaudeStatuslinePanel />
+                  <VSCodeWrapperPanel />
                 </div>
               </details>
 

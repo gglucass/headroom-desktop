@@ -272,6 +272,37 @@ pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
 }
 
+/// The Windows process wrapper is generated locally, so it has no publisher
+/// signature. Leave it off by default there for Smart App Control users.
+pub fn is_vscode_wrapper_enabled() -> bool {
+    load_setup_state()
+        .vscode_wrapper_enabled
+        .unwrap_or(!cfg!(windows))
+}
+
+pub fn set_vscode_wrapper_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    let previous = state.vscode_wrapper_enabled;
+    state.vscode_wrapper_enabled = Some(enabled);
+    write_setup_state(&state)?;
+    let applied = if enabled {
+        if cfg!(windows) {
+            ensure_windows_remote_control_panel().map(|_| ())
+        } else {
+            configure_vscode_process_wrapper().map(|_| ())
+        }
+    } else {
+        remove_vscode_process_wrapper().and_then(|_| remove_owned_vscode_panel_command())
+    };
+    if let Err(err) = applied {
+        state.vscode_wrapper_enabled = previous;
+        let _ = write_setup_state(&state);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Persist the statusline opt-out and apply it now: install it when Claude
 /// Code routes through Headroom, remove it otherwise.
 pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
@@ -3165,6 +3196,10 @@ struct ClientSetupState {
     /// true, client setup skips installing it.
     #[serde(default)]
     statusline_disabled: bool,
+    /// None follows the platform default: off on Windows, on elsewhere.
+    /// The Windows wrapper is generated on the user's machine and unsigned.
+    #[serde(default)]
+    vscode_wrapper_enabled: Option<bool>,
     /// User turned usage analytics and crash reports off in Settings
     /// (`analytics::sharing_enabled`).
     #[serde(default)]
@@ -9030,6 +9065,11 @@ fn windows_wrapper_parts() -> Option<(PathBuf, PathBuf)> {
 /// Windows gets the VS Code panel restart only: the terminal one needs the
 /// managed zsh/bash `claude` function, and PowerShell gets none.
 fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
+    if !is_vscode_wrapper_enabled() {
+        remove_vscode_process_wrapper()?;
+        remove_owned_vscode_panel_command()?;
+        return Ok((Vec::new(), Vec::new()));
+    }
     let Some((python, stub)) = windows_wrapper_parts() else {
         // No runtime yet: no wrapper, and no command offering a restart
         // nothing would perform. The next setup after bootstrap adds both.
@@ -9089,12 +9129,27 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
+fn remove_owned_vscode_panel_command() -> Result<()> {
+    let command = claude_remote_control_panel_command_path();
+    if std::fs::read_to_string(&command)
+        .is_ok_and(|content| content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
+    {
+        std::fs::remove_file(&command)
+            .with_context(|| format!("removing {}", command.display()))?;
+    }
+    Ok(())
+}
+
 /// Point the VS Code extension at the wrapper. On macOS and Linux only with a
 /// working /usr/bin/python3 (the wrapper's interpreter): without the Command
 /// Line Tools it is a stub that fails on macOS, a distro may not ship it at
 /// all, and every panel session would then fail to start. Windows checks its
 /// interpreter before building the .exe (`windows_wrapper_parts`).
 fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
+    if !is_vscode_wrapper_enabled() {
+        remove_vscode_process_wrapper()?;
+        return Ok((Vec::new(), Vec::new()));
+    }
     let settings_path = vscode_user_settings_path();
     if !settings_path.exists() {
         // No VS Code user settings at all: nothing launches through us yet, and
@@ -12926,6 +12981,7 @@ mod tests {
             rtk_disabled: false,
             auto_learn_disabled: false,
             statusline_disabled: false,
+            vscode_wrapper_enabled: None,
             usage_data_disabled: false,
             setup_versions: BTreeMap::new(),
         };
@@ -20615,6 +20671,35 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         // Silent once the app is gone: the line outlives a quit.
         std::fs::remove_file(&app).unwrap();
         assert_eq!(render(r#"{"session_id":"aaaa-just-saved"}"#), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vscode_wrapper_opt_out_survives_setup_repair() {
+        let _home = TestHome::new();
+        let vscode = vscode_user_settings_path();
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        std::fs::write(&vscode, "{\"editor.fontSize\": 13}\n").unwrap();
+
+        ensure_claude_remote_control_command().unwrap();
+        assert!(
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode)
+                .unwrap()
+                .contains_key(VSCODE_PROCESS_WRAPPER_KEY)
+        );
+
+        super::set_vscode_wrapper_enabled(false).unwrap();
+        ensure_claude_remote_control_command().unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(!settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert_eq!(settings["editor.fontSize"], 13);
+        assert!(!super::is_vscode_wrapper_enabled());
+
+        super::set_vscode_wrapper_enabled(true).unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
     }
 
     #[cfg(unix)]

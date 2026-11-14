@@ -36,7 +36,7 @@ jobs:
   windows:
     name: Windows x64 (download only)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     # A job-level block replaces the workflow's, so restate contents.
     # id-token + attestations are only for the provenance step below.
     permissions:
@@ -110,6 +110,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
@@ -131,12 +136,16 @@ jobs:
         # crates.io versions are immutable; bump by hand after reviewing the diff.
         run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
+      - name: Build and verify signed Windows runtime
+        shell: pwsh
+        run: ./scripts/build-windows-signed-runtime.ps1
+
       - name: Build NSIS installer
         shell: bash
         # NSIS only, same as the stable workflow: bundle.targets is "all", which
-        # also builds an MSI nothing publishes. signCommand signs both the inner
-        # .exe and the installer.
-        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        # also builds an MSI nothing publishes. signCommand signs the app and
+        # installer; the step above signs the bundled Python runtime.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.signed-windows.conf.json
 
       - name: Attest build provenance
         # Same as release-macos.yml: `gh attestation verify <file> --repo

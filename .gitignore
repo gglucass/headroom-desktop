@@ -25,3 +25,5 @@ __pycache__/
 # Benchmark venvs and run output (transcripts, patches); the harness itself is tracked
 .venv/
 /bench/*/results/
+src-tauri/resources/windows-signed-runtime.tar.gz
+signed-runtime-work/

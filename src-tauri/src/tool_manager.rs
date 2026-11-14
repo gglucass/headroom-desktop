@@ -35,6 +35,32 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
 pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.44.0";
+const SIGNED_WINDOWS_RUNTIME_FORMAT: &str = "1";
+
+// Release CI embeds the SHA of a prebuilt runtime after signing every PE in
+// it. A Windows release without that build input fails at compile time.
+fn signed_windows_runtime_sha() -> Option<&'static str> {
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        Some(env!("HEADROOM_SIGNED_RUNTIME_SHA256"))
+    }
+    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+    {
+        None
+    }
+}
+
+fn signed_windows_runtime_generation() -> Option<String> {
+    signed_windows_runtime_sha()?;
+    let release = pinned_headroom_release().ok()?;
+    Some(format!(
+        "{}:{}:{}:{}",
+        SIGNED_WINDOWS_RUNTIME_FORMAT,
+        PYTHON_SHA256_WINDOWS_X86_64,
+        release.sha256,
+        requirements_lock_sha(bootstrap_requirements_lock())
+    ))
+}
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Kill the RUST-9F onnxruntime import probe after this long: a native
@@ -3588,6 +3614,11 @@ impl ToolManager {
     /// click. READY, not `missing_runtime_marker`: on macOS and Linux the venv
     /// python is a symlink into the base, so it reads as missing first.
     pub fn base_interpreter_lost(&self) -> bool {
+        if signed_windows_runtime_sha().is_some() {
+            // Reinstall from the signed bundle, never from the unsigned
+            // python-build-standalone download.
+            return false;
+        }
         self.runtime.ready_flag().exists() && !self.runtime.standalone_runtime_intact()
     }
 
@@ -3622,6 +3653,12 @@ impl ToolManager {
             Some("base interpreter or its stdlib")
         } else if !self.runtime.venv_dir.join("pyvenv.cfg").exists() {
             Some("pyvenv.cfg")
+        } else if signed_windows_runtime_generation().is_some_and(|generation| {
+            std::fs::read_to_string(self.runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION"))
+                .ok()
+                .is_none_or(|installed| installed.trim() != generation)
+        }) {
+            Some("signed Windows runtime")
         } else {
             None
         }
@@ -5530,6 +5567,9 @@ impl ToolManager {
     where
         F: FnMut(BootstrapStepUpdate),
     {
+        if signed_windows_runtime_sha().is_some() {
+            return self.install_signed_windows_runtime(progress);
+        }
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
         let dep_total = requirements_lock_package_count(requirements_lock);
@@ -5631,6 +5671,10 @@ impl ToolManager {
     where
         F: FnMut(BootstrapStepUpdate),
     {
+        if signed_windows_runtime_sha().is_some() {
+            self.install_signed_windows_runtime(progress)?;
+            return Ok(self.runtime.clone());
+        }
         // Persist every milestone to the attempt marker. If this attempt dies
         // without a verdict (quit, crash, kill), the marker survives and the
         // next launch reports it as bootstrap_abandoned with the phase it
@@ -5742,6 +5786,189 @@ impl ToolManager {
         Ok(self.runtime.clone())
     }
 
+    /// Release builds on Windows unpack the CI-signed environment. Creating a
+    /// venv or running pip here would generate unsigned PE files on the user's
+    /// machine and defeat Smart App Control compatibility.
+    fn install_signed_windows_runtime<F>(&self, mut progress: F) -> Result<()>
+    where
+        F: FnMut(BootstrapStepUpdate),
+    {
+        let sha = signed_windows_runtime_sha().context("signed Windows runtime not configured")?;
+        self.runtime.ensure_layout()?;
+        let archive_path = std::env::current_exe()
+            .context("locating Headroom's signed runtime")?
+            .parent()
+            .context("Headroom executable has no parent directory")?
+            .join("windows-signed-runtime.tar.gz");
+        progress(BootstrapStepUpdate {
+            step: "Verifying runtime",
+            message: "Checking the signed Windows runtime bundle.".into(),
+            eta_seconds: 30,
+            percent: 15,
+        });
+        verify_sha256_file(&archive_path, sha)?;
+
+        let staging = self.runtime.runtime_dir.join("signed.extracting");
+        if staging.exists() {
+            Self::retry_fs("clearing partial signed runtime", || {
+                std::fs::remove_dir_all(&staging)
+            })?;
+        }
+        std::fs::create_dir_all(&staging)?;
+        progress(BootstrapStepUpdate {
+            step: "Installing runtime",
+            message: "Unpacking the signed Windows runtime.".into(),
+            eta_seconds: 90,
+            percent: 35,
+        });
+        let archive = std::fs::File::open(&archive_path)?;
+        Archive::new(GzDecoder::new(archive))
+            .unpack(&staging)
+            .context("unpacking signed Windows runtime")?;
+        for required in [
+            "python/python.exe",
+            "python/Lib/os.py",
+            "venv/Scripts/python.exe",
+            "venv/Scripts/headroom.exe",
+        ] {
+            if !staging.join(required).is_file() {
+                bail!("signed Windows runtime is missing {required}");
+            }
+        }
+        let base = self.runtime.python_dir.display();
+        let pyvenv = format!(
+            "home = {base}\ninclude-system-site-packages = false\nversion = 3.12.12\nexecutable = {}\n",
+            self.runtime.standalone_python().display()
+        );
+        crate::client_adapters::atomic_write(&staging.join("venv/pyvenv.cfg"), pyvenv.as_bytes())?;
+
+        crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
+        let marker = self.runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION");
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        let old_python = self.runtime.runtime_dir.join("python.signed-backup");
+        let old_venv = self.runtime.runtime_dir.join("venv.signed-backup");
+        for (live, backup) in [
+            (&self.runtime.python_dir, &old_python),
+            (&self.runtime.venv_dir, &old_venv),
+        ] {
+            if backup.exists() {
+                if live.exists() {
+                    Self::retry_fs("clearing old runtime backup", || {
+                        std::fs::remove_dir_all(backup)
+                    })?;
+                } else {
+                    Self::retry_fs("restoring interrupted runtime install", || {
+                        std::fs::rename(backup, live)
+                    })?;
+                }
+            }
+        }
+        for (live, backup) in [
+            (&self.runtime.python_dir, &old_python),
+            (&self.runtime.venv_dir, &old_venv),
+        ] {
+            if live.exists() {
+                if let Err(err) = Self::retry_fs("backing up previous runtime", || {
+                    std::fs::rename(live, backup)
+                }) {
+                    for (path, old) in [
+                        (&self.runtime.python_dir, &old_python),
+                        (&self.runtime.venv_dir, &old_venv),
+                    ] {
+                        if old.exists() {
+                            let _ = std::fs::rename(old, path);
+                        }
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+        let installed = (|| -> Result<()> {
+            Self::retry_fs("installing signed Python", || {
+                std::fs::rename(staging.join("python"), &self.runtime.python_dir)
+            })?;
+            Self::retry_fs("installing signed venv", || {
+                std::fs::rename(staging.join("venv"), &self.runtime.venv_dir)
+            })?;
+            run_python_command(
+                &self.runtime.managed_python(),
+                &["-c", "import headroom, headroom._core"],
+                &self.runtime.root_dir,
+            )
+            .context("starting signed Headroom runtime")?;
+            Ok(())
+        })();
+        if let Err(err) = installed {
+            for (live, backup) in [
+                (&self.runtime.python_dir, &old_python),
+                (&self.runtime.venv_dir, &old_venv),
+            ] {
+                if backup.exists() {
+                    let _ = std::fs::remove_dir_all(live);
+                    let _ = std::fs::rename(backup, live);
+                }
+            }
+            return Err(err);
+        }
+        progress(BootstrapStepUpdate {
+            step: "Configuring integrations",
+            message: "Connecting Headroom to your coding tools.".into(),
+            eta_seconds: 15,
+            percent: 90,
+        });
+        let mcp_install = match self.install_headroom_mcp() {
+            Ok(method) => {
+                json!({"configured": true, "proxyUrl": HEADROOM_PROXY_URL, "installMethod": method.as_str()})
+            }
+            Err(err) => {
+                log::info!("Headroom MCP setup skipped for signed runtime: {err:#}");
+                json!({"configured": false, "proxyUrl": HEADROOM_PROXY_URL, "error": err.to_string()})
+            }
+        };
+        let release = pinned_headroom_release()?;
+        self.write_tool_receipt(
+            "headroom",
+            json!({
+                "status": "healthy",
+                "installedBy": "Headroom",
+                "scope": "self-contained",
+                "runtime": "python",
+                "pythonExecutable": self.runtime.managed_python(),
+                "pipExecutable": self.runtime.managed_pip(),
+                "entrypoint": self.runtime.headroom_entrypoint(),
+                "source": self.manifests[0].source_url,
+                "version": release.version,
+                "artifact": {
+                    "url": release.wheel_url,
+                    "sha256": release.sha256,
+                    "requirementsLockSha256": requirements_lock_sha(bootstrap_requirements_lock()),
+                    "signedRuntimeSha256": sha
+                },
+                "mcp": mcp_install,
+                "ml": {"installed": true, "engine": "kompress"}
+            }),
+        )?;
+        self.write_ready_flag()?;
+        self.write_bootstrap_receipt()?;
+        let generation = signed_windows_runtime_generation()
+            .context("signed Windows runtime has no pinned generation")?;
+        crate::client_adapters::atomic_write(&marker, generation.as_bytes())?;
+        let _ = std::fs::remove_dir_all(&staging);
+        for backup in [&old_python, &old_venv] {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+        self.clear_bootstrap_attempt();
+        progress(BootstrapStepUpdate {
+            step: "Install complete",
+            message: "Signed Windows runtime installed.".into(),
+            eta_seconds: 0,
+            percent: 100,
+        });
+        Ok(())
+    }
+
     /// Download-only warm-up for the consented bootstrap: pulls the two big
     /// network artifacts (standalone Python tarball, pinned headroom wheel)
     /// into `downloads_dir` while the user is still in signup/client-setup.
@@ -5754,6 +5981,9 @@ impl ToolManager {
     /// dependencies" step) can't be prefetched without extracting Python
     /// first — revisit only if the remaining install time still hurts.
     pub fn prefetch_bootstrap_artifacts(&self) -> Result<()> {
+        if signed_windows_runtime_sha().is_some() {
+            return Ok(());
+        }
         self.runtime.ensure_layout()?;
         if !self.runtime.standalone_python().exists() {
             let artifact = python_distribution_artifact()?;
@@ -5784,6 +6014,20 @@ impl ToolManager {
     /// already has the redist (the common case) or the DLLs are in place.
     pub fn ensure_msvc_runtime_dlls(&self) -> Result<bool> {
         if !cfg!(target_os = "windows") {
+            return Ok(false);
+        }
+        if signed_windows_runtime_sha().is_some() {
+            let scripts = self.runtime.venv_dir.join("Scripts");
+            for directory in [&self.runtime.python_dir, &scripts] {
+                for name in ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"] {
+                    if !directory.join(name).is_file() {
+                        bail!(
+                            "signed Windows runtime is missing {name} in {}",
+                            directory.display()
+                        );
+                    }
+                }
+            }
             return Ok(false);
         }
         let system32 =
@@ -6389,6 +6633,15 @@ impl ToolManager {
     /// (RUST-29 on 0.9.29: killed at 15s, a working upgrade rolled back), and
     /// the retry runs with those scans cached. Only a repeat is a real hang.
     pub fn smoke_test_headroom(&self) -> Result<()> {
+        if signed_windows_runtime_sha().is_some() {
+            return self
+                .smoke_test_headroom_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
+                .or_else(|err| {
+                    log::info!("signed runtime smoke test failed; restoring bundle: {err:#}");
+                    self.install_signed_windows_runtime(|_| {})?;
+                    self.smoke_test_headroom_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
+                });
+        }
         self.smoke_test_headroom_first_within(HEADROOM_SMOKE_TEST_TIMEOUT)
     }
 
@@ -6892,6 +7145,12 @@ impl ToolManager {
     where
         F: FnMut(BootstrapStepUpdate),
     {
+        if signed_windows_runtime_sha().is_some() {
+            return UpgradeOutcome::InstallFailed {
+                restored: true,
+                error: anyhow!("Windows Headroom updates require a new signed desktop build"),
+            };
+        }
         progress(BootstrapStepUpdate {
             step: "Preparing update",
             message: "Checking for previous upgrade state.".into(),
@@ -7549,6 +7808,9 @@ impl ToolManager {
     /// Hash-checking mode like every other install from the lock (#125): a bare
     /// `pydantic` here took whatever PyPI served.
     fn repair_pydantic_core(&self) -> Result<()> {
+        if signed_windows_runtime_sha().is_some() {
+            return self.install_signed_windows_runtime(|_| {});
+        }
         self.reinstall_lock_pins(&["pydantic", "pydantic-core"], "pydantic-repair.lock")
             .context("reinstalling the lock's pydantic and pydantic-core")
     }
@@ -7560,6 +7822,9 @@ impl ToolManager {
     /// whole lock, which restores whatever else the same interruption took,
     /// under any import name.
     fn repair_missing_dependencies(&self, modules: &[String]) -> Result<()> {
+        if signed_windows_runtime_sha().is_some() {
+            return self.install_signed_windows_runtime(|_| {});
+        }
         let lock = bootstrap_requirements_lock();
         let pinned: Vec<&str> = modules
             .iter()
@@ -14017,7 +14282,30 @@ const PLUGIN_CMD_SILENCE_TIMEOUT: Duration = Duration::from_secs(180);
 const PYTHON_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn run_python_command(python: &Path, args: &[&str], cwd: &Path) -> Result<()> {
+    if signed_runtime_python(python)
+        && args.first() == Some(&"-m")
+        && (args.get(1) == Some(&"ensurepip")
+            || (args.get(1) == Some(&"pip")
+                && args
+                    .iter()
+                    .any(|arg| matches!(*arg, "install" | "uninstall"))))
+    {
+        bail!("the signed Windows runtime can only be changed by a signed desktop update");
+    }
     run_command_with_timeout(python, args, cwd, PYTHON_COMMAND_TIMEOUT)
+}
+
+fn signed_runtime_python(python: &Path) -> bool {
+    if signed_windows_runtime_sha().is_none() {
+        return false;
+    }
+    python
+        .parent()
+        .filter(|scripts| scripts.file_name().is_some_and(|name| name == "Scripts"))
+        .and_then(Path::parent)
+        .filter(|venv| venv.file_name().is_some_and(|name| name == "venv"))
+        .and_then(Path::parent)
+        .is_some_and(|runtime| runtime.file_name().is_some_and(|name| name == "runtime"))
 }
 
 /// Path to the output-shaper savings ledger, which `output_savings` also reads
@@ -15920,6 +16208,9 @@ fn run_pip_install_with_retries_streaming_inner<F>(
 where
     F: FnMut(&str),
 {
+    if signed_runtime_python(python) {
+        bail!("the signed Windows runtime can only be changed by a signed desktop update");
+    }
     let mut attempt: u32 = 0;
     let mut pip_reinstalled = false;
     loop {
