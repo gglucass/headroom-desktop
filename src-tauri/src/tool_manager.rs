@@ -5860,6 +5860,7 @@ impl ToolManager {
                     })?;
                 } else {
                     Self::retry_fs("restoring interrupted runtime install", || {
+                        // direct-write: restore a Headroom-owned runtime directory after an interrupted swap.
                         std::fs::rename(backup, live)
                     })?;
                 }
@@ -5871,6 +5872,7 @@ impl ToolManager {
         ] {
             if live.exists() {
                 if let Err(err) = Self::retry_fs("backing up previous runtime", || {
+                    // direct-write: atomically move a Headroom-owned runtime directory for rollback.
                     std::fs::rename(live, backup)
                 }) {
                     for (path, old) in [
@@ -5878,6 +5880,7 @@ impl ToolManager {
                         (&self.runtime.venv_dir, &old_venv),
                     ] {
                         if old.exists() {
+                            // direct-write: restore a Headroom-owned runtime directory after a failed backup.
                             let _ = std::fs::rename(old, path);
                         }
                     }
@@ -5887,9 +5890,11 @@ impl ToolManager {
         }
         let installed = (|| -> Result<()> {
             Self::retry_fs("installing signed Python", || {
+                // direct-write: publish a complete Headroom-owned Python directory.
                 std::fs::rename(staging.join("python"), &self.runtime.python_dir)
             })?;
             Self::retry_fs("installing signed venv", || {
+                // direct-write: publish a complete Headroom-owned venv directory.
                 std::fs::rename(staging.join("venv"), &self.runtime.venv_dir)
             })?;
             run_python_command(
@@ -5907,6 +5912,7 @@ impl ToolManager {
             ] {
                 if backup.exists() {
                     let _ = std::fs::remove_dir_all(live);
+                    // direct-write: restore a Headroom-owned runtime directory on failed install.
                     let _ = std::fs::rename(backup, live);
                 }
             }
