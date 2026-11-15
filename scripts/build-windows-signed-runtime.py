@@ -55,6 +55,18 @@ def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
 
 
+def remove_unused_tk(runtime):
+    # The pinned Python archive includes Tcl/Tk DLLs with old embedded
+    # signatures. SignTool rejects tcl86t.dll as a bad executable format, and
+    # Headroom does not use Python's optional Tk GUI or IDLE. Leave these out
+    # of the runtime instead of shipping files we cannot verify and re-sign.
+    base = runtime / "python"
+    for name in ("_tkinter.pyd", "tcl86t.dll", "tk86t.dll"):
+        (base / "DLLs" / name).unlink()
+    for name in ("tcl", "Lib/tkinter", "Lib/idlelib"):
+        shutil.rmtree(base / name)
+
+
 def prepare(work):
     runtime = work / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -68,6 +80,7 @@ def prepare(work):
     )
     with tarfile.open(archive, "r:gz") as source:
         source.extractall(runtime, filter="data")
+    remove_unused_tk(runtime)
     base_python = runtime / "python/python.exe"
     if not base_python.is_file():
         raise RuntimeError("pinned Python archive has no python.exe")
