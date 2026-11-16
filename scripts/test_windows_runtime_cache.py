@@ -29,6 +29,8 @@ class RuntimeCacheKeyTest(unittest.TestCase):
             self.assertEqual(key(), baseline)
             values["pinned"] = lambda name: original_pinned(name) + ("changed" if name == "PYTHON_STANDALONE_RELEASE" else "")
             self.assertNotEqual(key(), baseline)
+            values["pinned"] = lambda name: original_pinned(name) + ("changed" if name == "MARKITDOWN_PINNED_VERSION" else "")
+            self.assertNotEqual(key(), baseline)
             values["pinned"] = original_pinned
             with tempfile.TemporaryDirectory() as directory:
                 lock = Path(directory) / "requirements.lock"

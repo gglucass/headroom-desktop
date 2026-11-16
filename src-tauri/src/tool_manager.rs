@@ -62,12 +62,14 @@ fn signed_windows_runtime_url(sha: &str) -> String {
 fn signed_windows_runtime_generation() -> Option<String> {
     signed_windows_runtime_sha()?;
     let release = pinned_headroom_release().ok()?;
+    // MarkItDown is bundled too: rc.10/rc.11 runtimes without it must re-download.
     Some(format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:markitdown-{}",
         SIGNED_WINDOWS_RUNTIME_FORMAT,
         PYTHON_SHA256_WINDOWS_X86_64,
         release.sha256,
-        requirements_lock_sha(bootstrap_requirements_lock())
+        requirements_lock_sha(bootstrap_requirements_lock()),
+        MARKITDOWN_PINNED_VERSION
     ))
 }
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -7174,10 +7176,24 @@ impl ToolManager {
         F: FnMut(BootstrapStepUpdate),
     {
         if signed_windows_runtime_sha().is_some() {
-            return UpgradeOutcome::InstallFailed {
-                restored: true,
-                error: anyhow!("Windows Headroom updates require a new signed desktop build"),
-            };
+            // The archive holds the pinned release, so "Retry with full
+            // rebuild" and the watchdog's last resort reinstall it; another
+            // version needs a new signed desktop build.
+            if release.version != HEADROOM_PINNED_VERSION {
+                return UpgradeOutcome::InstallFailed {
+                    restored: true,
+                    error: anyhow!("Windows Headroom updates require a new signed desktop build"),
+                };
+            }
+            return self.install_signed_windows_runtime(progress).map_or_else(
+                |error| UpgradeOutcome::InstallFailed {
+                    restored: true,
+                    error,
+                },
+                |()| UpgradeOutcome::InstalledPendingValidation {
+                    pip_output_tail: String::new(),
+                },
+            );
         }
         progress(BootstrapStepUpdate {
             step: "Preparing update",
@@ -8893,48 +8909,53 @@ impl ToolManager {
     }
 
     pub fn install_markitdown(&self) -> Result<()> {
-        let before = venv_dist_infos(&self.runtime.managed_python());
-        let installed = run_pip_install_with_retries_streaming(
-            &self.runtime.managed_python(),
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--timeout",
-                "180",
-                "--retries",
-                "10",
-                &format!("markitdown[all]=={MARKITDOWN_PINNED_VERSION}"),
-            ],
-            &self.runtime.root_dir,
-            |line| log_pip_line("markitdown pip", line),
-        );
-        // Even after a failure: pip keeps the packages it installed before it.
-        self.remove_olefile();
-        installed?;
-        // markitdown's own pins can move lock packages off their hashed pins:
-        // 0.1.7's magika~=0.6.1 did everywhere, and on Windows its onnxruntime
-        // too (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass).
-        // 0.1.9 accepts the lock's magika 1.0.3 and moves nothing. Put back
-        // every lock package an install changed, found by diffing the venv's
-        // dist-info dirs, so a future pin moving one is caught too.
-        // Warn-only: failing here would take the addon down over a pin.
-        let lock = bootstrap_requirements_lock();
-        let moved: Vec<String> = moved_lock_packages(
-            &before,
-            &venv_dist_infos(&self.runtime.managed_python()),
-            lock,
-        );
-        if !moved.is_empty() {
-            let names: Vec<&str> = moved.iter().map(String::as_str).collect();
-            log::info!("markitdown moved lock pins {names:?}; restoring them");
-            if let Err(err) = self.reinstall_lock_pins(&names, "markitdown-restore.lock") {
-                log::warn!("restoring the lock's pins after markitdown failed: {err:#}");
+        // The signed Windows runtime ships MarkItDown (scripts/build-windows-
+        // signed-runtime.py) and pip may not change it: Install only switches
+        // that copy on.
+        if signed_windows_runtime_sha().is_none() {
+            let before = venv_dist_infos(&self.runtime.managed_python());
+            let installed = run_pip_install_with_retries_streaming(
+                &self.runtime.managed_python(),
+                &[
+                    "-m",
+                    "pip",
+                    "install",
+                    "--timeout",
+                    "180",
+                    "--retries",
+                    "10",
+                    &format!("markitdown[all]=={MARKITDOWN_PINNED_VERSION}"),
+                ],
+                &self.runtime.root_dir,
+                |line| log_pip_line("markitdown pip", line),
+            );
+            // Even after a failure: pip keeps the packages it installed before it.
+            self.remove_olefile();
+            installed?;
+            // markitdown's own pins can move lock packages off their hashed pins:
+            // 0.1.7's magika~=0.6.1 did everywhere, and on Windows its onnxruntime
+            // too (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass).
+            // 0.1.9 accepts the lock's magika 1.0.3 and moves nothing. Put back
+            // every lock package an install changed, found by diffing the venv's
+            // dist-info dirs, so a future pin moving one is caught too.
+            // Warn-only: failing here would take the addon down over a pin.
+            let lock = bootstrap_requirements_lock();
+            let moved: Vec<String> = moved_lock_packages(
+                &before,
+                &venv_dist_infos(&self.runtime.managed_python()),
+                lock,
+            );
+            if !moved.is_empty() {
+                let names: Vec<&str> = moved.iter().map(String::as_str).collect();
+                log::info!("markitdown moved lock pins {names:?}; restoring them");
+                if let Err(err) = self.reinstall_lock_pins(&names, "markitdown-restore.lock") {
+                    log::warn!("restoring the lock's pins after markitdown failed: {err:#}");
+                }
             }
         }
         if !self.markitdown_entrypoint().exists() {
             bail!(
-                "markitdown install completed but {} was not found",
+                "markitdown was not found at {}",
                 self.markitdown_entrypoint().display()
             );
         }
@@ -8966,13 +8987,16 @@ impl ToolManager {
     }
 
     pub fn uninstall_markitdown(&self) -> Result<()> {
-        let _ = run_command_streaming(
-            &self.runtime.managed_python(),
-            &["-m", "pip", "uninstall", "-y", "markitdown"],
-            &self.runtime.root_dir,
-            Some(PIP_OUTPUT_SILENCE_TIMEOUT),
-            &mut |line: &str| log_pip_line("markitdown pip uninstall", line),
-        );
+        // The signed runtime's copy stays: only its receipt and shim go.
+        if signed_windows_runtime_sha().is_none() {
+            let _ = run_command_streaming(
+                &self.runtime.managed_python(),
+                &["-m", "pip", "uninstall", "-y", "markitdown"],
+                &self.runtime.root_dir,
+                Some(PIP_OUTPUT_SILENCE_TIMEOUT),
+                &mut |line: &str| log_pip_line("markitdown pip uninstall", line),
+            );
+        }
         let shim = self.markitdown_shim_path();
         if shim.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&shim);
@@ -20768,6 +20792,27 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
     /// reinstall its archive instead. The engine-module repair went to pip and
     /// left the backend down (win-signed-repair, 0.9.63-rc.10). The branch only
     /// compiles into Windows release builds, hence a source check.
+    /// The signed Windows runtime ships MarkItDown and pip may not change it:
+    /// Install only switches it on, Uninstall leaves it (0.9.63-rc.11: Install
+    /// failed on win-mini). Windows release builds only, hence a source check.
+    #[test]
+    fn markitdown_never_runs_pip_on_a_signed_runtime() {
+        let source = include_str!("tool_manager.rs").replace('\r', "");
+        for function in ["pub fn install_markitdown(", "pub fn uninstall_markitdown("] {
+            let start = source.find(function).expect("function exists");
+            let body = &source[start..];
+            let body = &body[..body.find("\n    }\n").expect("function ends")];
+            let guard = body
+                .find("if signed_windows_runtime_sha().is_none() {")
+                .unwrap_or(usize::MAX);
+            let pip = body.find("\"pip\"").expect("the function runs pip");
+            assert!(
+                guard < pip,
+                "{function} must skip pip on a signed runtime: {body}"
+            );
+        }
+    }
+
     #[test]
     fn every_runtime_repair_reinstalls_a_signed_runtime_from_its_archive() {
         let source = include_str!("tool_manager.rs").replace('\r', "");
@@ -20775,6 +20820,7 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
             "fn pip_force_reinstall_headroom_version(",
             "fn repair_pydantic_core(",
             "fn repair_missing_dependencies(",
+            "fn atomic_upgrade_headroom<",
         ] {
             let start = source.find(repair).expect("repair exists");
             let body = &source[start..];
@@ -20786,6 +20832,7 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
                 "run_pip_install",
                 "reinstall_lock_pins",
                 "repair_stale_requirements",
+                "install_headroom_release",
             ]
             .iter()
             .filter_map(|call| body.find(call))

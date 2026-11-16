@@ -55,6 +55,16 @@ def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
 
 
+MARKITDOWN_EXTRAS = "pdf,docx,pptx,xlsx,xls,az-doc-intel,az-content-understanding,youtube-transcription"
+
+
+def pip_versions(python):
+    listed = subprocess.run(
+        [str(python), "-m", "pip", "list", "--format=json"], check=True, capture_output=True, text=True
+    ).stdout
+    return {package["name"].lower(): package["version"] for package in json.loads(listed)}
+
+
 def remove_unused_tk(runtime):
     # The pinned Python archive includes Tcl/Tk DLLs with old embedded
     # signatures. SignTool rejects tcl86t.dll as a bad executable format, and
@@ -97,6 +107,22 @@ def prepare(work):
     wheel = work / wheel_url.rsplit("/", 1)[-1]
     download(wheel_url, wheel, wheel_sha)
     run(python, "-m", "pip", "install", "--no-deps", wheel)
+
+    # MarkItDown ships inside the runtime: pip may not change a signed runtime
+    # on the user's machine, so its Add-ons Install only switches it on. No
+    # audio-transcription (32 MB; the shim blocks speech_recognition) and no
+    # outlook (its olefile reaches a Pillow CVE; see remove_olefile).
+    before = pip_versions(python)
+    run(
+        python, "-m", "pip", "install", "--timeout", "180", "--retries", "10",
+        "--only-binary=:all:", "--find-links", pinned("VENDOR_WHEELS_INDEX_URL"),
+        "--extra-index-url", "https://pypi.org/simple",
+        f"markitdown[{MARKITDOWN_EXTRAS}]=={pinned('MARKITDOWN_PINNED_VERSION')}",
+    )
+    after = pip_versions(python)
+    moved = sorted(f"{name} {version} -> {after.get(name)}" for name, version in before.items() if after.get(name) != version)
+    if moved:
+        raise RuntimeError(f"markitdown moved lock pins: {moved}")
 
     msvc_url = pinned("MSVC_RUNTIME_WHEEL_URL")
     msvc = work / msvc_url.rsplit("/", 1)[-1]
@@ -199,7 +225,7 @@ def cache_key():
     for name in (
         "PYTHON_STANDALONE_RELEASE", "PYTHON_SHA256_WINDOWS_X86_64",
         "VENDOR_WHEELS_INDEX_URL", "MSVC_RUNTIME_WHEEL_URL",
-        "MSVC_RUNTIME_WHEEL_SHA256",
+        "MSVC_RUNTIME_WHEEL_SHA256", "MARKITDOWN_PINNED_VERSION",
     ):
         digest.update(pinned(name).encode())
     for value in signed_wheel():
