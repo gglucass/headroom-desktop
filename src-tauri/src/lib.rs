@@ -10102,6 +10102,16 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
     {
         return true;
     }
+    // RUST-WZ: codex giving up on the 5xx our backend answers when IT never
+    // reached the provider. The proxy's own failure reporting covers the
+    // cases that are ours (see `with_unreachable_cause`).
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("ERROR: unexpected status 5"))
+        && (text.contains("\"upstream_unreachable\"") || text.contains("\"upstream_timeout\""))
+    {
+        return true;
+    }
     let mut statusless = false;
     for line in text
         .lines()
@@ -17944,6 +17954,15 @@ Some unrelated content.
         // timeout is a codex that was busy, not one that could not connect.
         assert!(!learn_failure_is_agent_api_unreachable(
             "LLM analysis failed: `codex exec --skip-git-repo-check` did not respond within 900s. Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
+        ));
+        // RUST-WZ, real tail: our backend never reached OpenAI, so codex's
+        // last word is the backend's 502.
+        assert!(learn_failure_is_agent_api_unreachable(
+            "ERROR: Reconnecting... 5/5\nERROR: unexpected status 502 Bad Gateway: event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect to upstream API. (request_id=hr_1794754342_000641)\", \"code\": \"upstream_unreachable\"}, \"request_id\": \"hr_1794754342_000641\"}, url: http://127.0.0.1:6767/v1/responses\n"
+        ));
+        // A 5xx that is our backend's own fault keeps reporting.
+        assert!(!learn_failure_is_agent_api_unreachable(
+            "ERROR: unexpected status 500 Internal Server Error: {\"error\": {\"type\": \"api_error\", \"code\": \"internal_error\"}}\n"
         ));
     }
 
