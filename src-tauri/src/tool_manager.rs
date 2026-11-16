@@ -14335,7 +14335,7 @@ fn lock_entries(lock: &str) -> Vec<String> {
 /// Hash a requirements lock file ignoring comments, blank lines and `--hash`
 /// options, so that header/comment churn and rehashing do not force a full
 /// `pip install` on upgrade.
-fn requirements_lock_sha(lock: &str) -> String {
+pub(crate) fn requirements_lock_sha(lock: &str) -> String {
     let mut hasher = Sha256::new();
     for requirement in lock_requirements(lock) {
         hasher.update(requirement.as_bytes());
@@ -14344,7 +14344,7 @@ fn requirements_lock_sha(lock: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn bootstrap_requirements_lock() -> &'static str {
+pub(crate) fn bootstrap_requirements_lock() -> &'static str {
     bootstrap_requirements_lock_for_target(std::env::consts::OS)
 }
 

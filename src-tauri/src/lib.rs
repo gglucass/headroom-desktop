@@ -2529,6 +2529,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 return;
             }
 
+            state.clear_upgrade_failure_if_runtime_current();
             if let Err(err) = client_adapters::ensure_rtk_integrations(
                 &state.tool_manager.rtk_entrypoint(),
                 &state.tool_manager.managed_python(),

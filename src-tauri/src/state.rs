@@ -2023,6 +2023,23 @@ impl AppState {
         persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
+    /// A full bootstrap that left the runtime current (launch recovery after a
+    /// failed signed-runtime repair, or Install) finished what the recorded
+    /// failure set out to do. Without this, Home kept "Headroom update didn't
+    /// finish" over a working runtime, undismissable since rollback_restored
+    /// was false (win-mini, 0.9.63-rc.13). A runtime still due maintenance
+    /// keeps the record and its retry budget.
+    pub(crate) fn clear_upgrade_failure_if_runtime_current(&self) {
+        if self.runtime_upgrade_failure().is_some()
+            && self.tool_manager.check_headroom_upgrade().is_none()
+            && !self.tool_manager.requirements_are_stale()
+        {
+            log::info!("runtime is current after bootstrap; clearing the recorded upgrade failure");
+            self.clear_upgrade_failure();
+            self.invalidate_runtime_status_cache();
+        }
+    }
+
     pub fn dismiss_upgrade_failure(&self) {
         self.clear_upgrade_failure();
         self.invalidate_runtime_status_cache();
@@ -15138,6 +15155,48 @@ mod tests {
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(plan.is_none());
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_bootstrap_that_left_the_runtime_current_clears_the_upgrade_failure() {
+        let failure = || RuntimeUpgradeFailure {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            target_headroom_version: crate::tool_manager::HEADROOM_PINNED_VERSION.into(),
+            fallback_headroom_version: None,
+            failure_phase: UpgradeFailurePhase::Install,
+            attempts: 0,
+            first_attempt_at: Utc::now(),
+            last_attempt_at: Utc::now(),
+            error_message: "Access is denied. (os error 5)".into(),
+            error_hint: None,
+            rollback_restored: false,
+        };
+        let base_dir = temp_test_dir("headroom-clear-failure-current");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // Still due a repair: the record and its retry budget stay.
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            "stale",
+        );
+        state.record_upgrade_failure(failure());
+        state.clear_upgrade_failure_if_runtime_current();
+        assert!(state.runtime_upgrade_failure().is_some());
+
+        // Current: the banner's record goes.
+        let current = crate::tool_manager::requirements_lock_sha(
+            crate::tool_manager::bootstrap_requirements_lock(),
+        );
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            &current,
+        );
+        state.clear_upgrade_failure_if_runtime_current();
+        assert!(state.runtime_upgrade_failure().is_none());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
