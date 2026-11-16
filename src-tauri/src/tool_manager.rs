@@ -15893,11 +15893,14 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     } else if lower.contains("git clone timed out")
         || lower.contains("could not resolve host: github.com")
         || lower.contains("failed to connect to github.com")
+        || lower.contains("ssl certificate problem")
     {
         // The marketplace clone never reached GitHub from this machine's
         // network (RUST-P0 on 0.9.51: Claude Code's "Git clone timed out after
-        // 120s"). Checked before the install's "not found in marketplace" for
-        // the same reason as git-missing.
+        // 120s"; on 0.9.62, git refusing the certificate a TLS-inspecting
+        // proxy or antivirus put in front of github.com). Checked before the
+        // install's "not found in marketplace" for the same reason as
+        // git-missing.
         "github-unreachable"
     } else if lower.contains("eperm: operation not permitted")
         || lower.contains("ebusy: resource busy or locked")
@@ -15908,6 +15911,13 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // holds or guards the folder. Checked before the install's "not found
         // in marketplace" for the same reason as git-missing.
         "permission"
+    } else if lower.contains("(stalled installer)") {
+        // Our own silence watchdog killed the host CLI (RUST-DQ: Linux
+        // `claude plugin update` quiet for 180s after "Checking for updates").
+        // Checked before the install's "not found in marketplace" for the same
+        // reason as git-missing (RUST-P0 on 0.9.62: a Codex marketplace add
+        // that stalled).
+        "host-cli-stalled"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -15920,10 +15930,13 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
     {
         "cli-version-skew"
     } else if lower.contains("failed to load configuration")
+        || lower.contains("failed to load marketplace configuration")
         || lower.contains("duplicate key")
         || lower.contains("toml parse error")
     {
-        // The host CLI cannot read its own config, so nothing we do lands.
+        // The host CLI cannot read its own config, so nothing we do lands
+        // (RUST-RA on 0.9.62: Claude Code's marketplace list starting with a
+        // byte-order mark, "JSON Parse error: Unrecognized token").
         "host-config-invalid"
     } else if lower.contains("invalid json syntax in settings file") {
         // Claude Code refusing a ~/.claude/settings.json the user broke by
@@ -15966,10 +15979,6 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // as a prompt; `run_plugin_cmd` now refuses such a CLI, so this bucket
         // reappearing is a new cause.
         "cli-not-authenticated"
-    } else if lower.contains("(stalled installer)") {
-        // Our own silence watchdog killed the host CLI (RUST-DQ: Linux
-        // `claude plugin update` quiet for 180s after "Checking for updates").
-        "host-cli-stalled"
     } else {
         "other"
     }
@@ -29333,6 +29342,42 @@ exit 0
                  to access 'https://github.com/JuliusBrussee/caveman.git/': Could not resolve \
                  host: github.com",
                 "github-unreachable",
+            ),
+            (
+                // RUST-P0 on 0.9.62, real (Windows): TLS inspection on the clone.
+                "Codex: marketplace add failed first: command failed (exit 1): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\5449c1f0f26f1f98\\codex.exe plugin \
+                 marketplace add JuliusBrussee/caveman\nstdout:\n\nstderr:\nError: git clone \
+                 https://github.com/JuliusBrussee/caveman.git checkout failed with status exit \
+                 code: 128\nstderr:\nCloning into 'checkout'...\nfatal: unable to access \
+                 'https://github.com/JuliusBrussee/caveman.git/': SSL certificate problem: \
+                 unable to get local issuer certificate\n: command failed (exit 1): codex.exe \
+                 plugin add caveman@caveman\nstdout:\n\nstderr:\nError: plugin `caveman` was \
+                 not found in marketplace `caveman`",
+                "github-unreachable",
+            ),
+            (
+                // RUST-P0 on 0.9.62, real (Windows): the stall is the cause.
+                "Codex: marketplace add failed first: command failed (killed by signal): \
+                 ~\\AppData\\Local\\OpenAI\\Codex\\bin\\5449c1f0f26f1f98\\codex.exe plugin \
+                 marketplace add DietrichGebert/ponytail\nstdout:\n\nstderr:\n\n[headroom] \
+                 killed: no output for 180s (stalled installer)\n: command failed (exit 1): \
+                 codex.exe plugin add ponytail@ponytail\nstdout:\n\nstderr:\nError: plugin \
+                 `ponytail` was not found in marketplace `ponytail`",
+                "host-cli-stalled",
+            ),
+            (
+                // RUST-RA on 0.9.62, real (Windows): a BOM in Claude Code's list.
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\AppData\\Roaming\\npm\\claude.cmd plugin marketplace add \
+                 DietrichGebert/ponytail\nstdout:\nAdding marketplace\u{2026}\n\nstderr:\n\
+                 \u{d7} Failed to add marketplace: Failed to load marketplace configuration: \
+                 JSON Parse error: Unrecognized token '\u{feff}'\n: command failed (exit 1): \
+                 claude.cmd plugin install ponytail@ponytail\nstdout:\nInstalling plugin \
+                 \"ponytail@ponytail\"...\n\nstderr:\n\u{d7} Failed to install plugin \
+                 \"ponytail@ponytail\": Failed to load marketplace configuration: JSON Parse \
+                 error: Unrecognized token '\u{feff}'",
+                "host-config-invalid",
             ),
             ("Codex: something we have not seen", "other"),
         ];
