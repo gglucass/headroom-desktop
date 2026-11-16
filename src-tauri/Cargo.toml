@@ -25,7 +25,6 @@ libc = "0.2"
 log = { version = "0.4", features = ["std"] }
 os_info = "3.10"
 parking_lot = "0.12"
-rand = "0.9"
 # rustls-tls-native-roots: trust the OS store (and SSL_CERT_FILE) on top of the
 # bundled webpki roots, so a TLS-inspecting network's corporate root works.
 # Loading it costs ~130ms per build on macOS, so loopback clients opt out with
@@ -39,7 +38,6 @@ sentry = { version = "0.35", default-features = false, features = ["backtrace", 
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.149", features = ["raw_value"] }
 sha2 = "=0.10.9"
-sys-locale = "0.3"
 tar = "0.4"
 tauri = { version = "=2.11.1", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
