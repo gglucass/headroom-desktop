@@ -21007,16 +21007,18 @@ for line in sys.stdin:
         std::fs::create_dir_all(&bin).unwrap();
         // A symlink, not a copy: a copied platform binary wedges on macOS
         // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
-        std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
+        // Ubuntu 26.04's uutils sleep picks its tool from the kernel's exec path,
+        // so it refuses to run as `claude`; perl (always on Ubuntu) runs under
+        // any name. macOS's perl re-execs a versioned binary, so it keeps sleep.
+        #[cfg(target_os = "linux")]
+        let (target, args) = ("/usr/bin/perl", ["-e", "sleep 30"].as_slice());
+        #[cfg(not(target_os = "linux"))]
+        let (target, args) = ("/bin/sleep", ["30"].as_slice());
+        std::os::unix::fs::symlink(target, bin.join("claude")).unwrap();
         let spawn_claude = || {
             use std::os::unix::process::CommandExt;
             let mut cmd = crate::proc::command(bin.join("claude"));
-            cmd.arg("30");
-            // Ubuntu's uutils sleep refuses an argv[0] that is not its own name.
-            // Linux names the process after the exec path, so `ps` still says
-            // claude; macOS names it after argv[0], so it keeps the default.
-            #[cfg(target_os = "linux")]
-            cmd.arg0("sleep");
+            cmd.args(args);
             // No controlling terminal, as on CI. With an empty
             // HEADROOM_REMOTE_CONTROL_TTY the script reads this pid's tty from
             // `ps`, so run from a terminal it found one and restarted.
