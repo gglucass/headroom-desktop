@@ -3609,17 +3609,25 @@ impl ToolManager {
         self.missing_runtime_marker().is_none()
     }
 
-    /// A finished install whose base interpreter is gone or lost part of its
-    /// stdlib, which `redownload_lost_base_interpreter` re-fetches without a
-    /// click. READY, not `missing_runtime_marker`: on macOS and Linux the venv
-    /// python is a symlink into the base, so it reads as missing first.
+    /// A finished install whose base interpreter is gone, or which needs the
+    /// signed Windows bundle, recovered through bootstrap without a click.
+    /// READY distinguishes it from a first run waiting for the setup wizard.
     pub fn base_interpreter_lost(&self) -> bool {
-        if signed_windows_runtime_sha().is_some() {
-            // Reinstall from the signed bundle, never from the unsigned
-            // python-build-standalone download.
-            return false;
-        }
-        self.runtime.ready_flag().exists() && !self.runtime.standalone_runtime_intact()
+        self.runtime_recovery_needed(signed_windows_runtime_generation().as_deref())
+    }
+
+    fn runtime_recovery_needed(&self, signed_generation: Option<&str>) -> bool {
+        self.runtime.ready_flag().exists()
+            && (!self.runtime.standalone_runtime_intact()
+                || signed_generation
+                    .is_some_and(|generation| !self.signed_runtime_generation_matches(generation)))
+    }
+
+    fn signed_runtime_generation_matches(&self, generation: &str) -> bool {
+        crate::state::read_state_file(&self.runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION"))
+            .is_ok_and(|installed| {
+                std::str::from_utf8(&installed).is_ok_and(|value| value.trim() == generation)
+            })
     }
 
     /// The first runtime file `python_runtime_installed` finds missing, named
@@ -3653,11 +3661,9 @@ impl ToolManager {
             Some("base interpreter or its stdlib")
         } else if !self.runtime.venv_dir.join("pyvenv.cfg").exists() {
             Some("pyvenv.cfg")
-        } else if signed_windows_runtime_generation().is_some_and(|generation| {
-            std::fs::read_to_string(self.runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION"))
-                .ok()
-                .is_none_or(|installed| installed.trim() != generation)
-        }) {
+        } else if signed_windows_runtime_generation()
+            .is_some_and(|generation| !self.signed_runtime_generation_matches(&generation))
+        {
             Some("signed Windows runtime")
         } else {
             None
@@ -23845,6 +23851,46 @@ Always run the linter first.
         assert_eq!(manager.missing_runtime_marker(), Some("venv READY flag"));
         fs::remove_file(&landmark).expect("remove landmark");
         assert!(!runtime.standalone_runtime_intact());
+    }
+
+    #[test]
+    fn signed_runtime_recovery_migrates_existing_installs_and_repairs_a_lost_base() {
+        let (root, runtime, manager) = seed_test_runtime("signed-runtime-recovery");
+        let generation = "1:python-sha:wheel-sha:lock-sha";
+        assert!(
+            !manager.runtime_recovery_needed(Some(generation)),
+            "a first run waits for the setup wizard"
+        );
+        for marker in [
+            runtime.ready_flag(),
+            runtime.managed_python(),
+            runtime.standalone_python(),
+        ] {
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(marker, b"").unwrap();
+        }
+        seed_stdlib_landmark(&runtime);
+        fs::write(runtime.venv_dir.join("pyvenv.cfg"), b"").unwrap();
+        assert!(!manager.runtime_recovery_needed(None));
+        assert!(
+            manager.runtime_recovery_needed(Some(generation)),
+            "an existing pip-installed runtime must migrate without an Install click"
+        );
+        let marker = runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION");
+        fs::write(&marker, generation).unwrap();
+        assert!(!manager.runtime_recovery_needed(Some(generation)));
+        assert!(
+            manager.runtime_recovery_needed(Some("2:python-sha:wheel-sha:lock-sha")),
+            "a new signed bundle must migrate automatically too"
+        );
+        fs::remove_file(runtime.standalone_python()).unwrap();
+        assert!(
+            manager.runtime_recovery_needed(Some(generation)),
+            "a quarantined signed interpreter must reinstall from the bundled archive"
+        );
+        fs::remove_file(runtime.ready_flag()).unwrap();
+        assert!(!manager.runtime_recovery_needed(Some(generation)));
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The venv python is a symlink into the base on macOS and Linux, so a
