@@ -21012,6 +21012,11 @@ for line in sys.stdin:
             use std::os::unix::process::CommandExt;
             let mut cmd = crate::proc::command(bin.join("claude"));
             cmd.arg("30");
+            // Ubuntu's uutils sleep refuses an argv[0] that is not its own name.
+            // Linux names the process after the exec path, so `ps` still says
+            // claude; macOS names it after argv[0], so it keeps the default.
+            #[cfg(target_os = "linux")]
+            cmd.arg0("sleep");
             // No controlling terminal, as on CI. With an empty
             // HEADROOM_REMOTE_CONTROL_TTY the script reads this pid's tty from
             // `ps`, so run from a terminal it found one and restarted.
