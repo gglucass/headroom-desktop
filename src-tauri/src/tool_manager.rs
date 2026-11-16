@@ -7780,6 +7780,10 @@ impl ToolManager {
     }
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
+        if signed_windows_runtime_sha().is_some() {
+            // pip may not touch the signed runtime; its archive holds the pin.
+            return self.install_signed_windows_runtime(|_| {});
+        }
         let pinned = pinned_headroom_release()?;
         let spec = self.headroom_reinstall_requirement(version, &pinned)?;
         run_pip_install_with_retries_clearing_locks(
@@ -20758,6 +20762,40 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// pip refuses to change a signed Windows runtime, so every repair must
+    /// reinstall its archive instead. The engine-module repair went to pip and
+    /// left the backend down (win-signed-repair, 0.9.63-rc.10). The branch only
+    /// compiles into Windows release builds, hence a source check.
+    #[test]
+    fn every_runtime_repair_reinstalls_a_signed_runtime_from_its_archive() {
+        let source = include_str!("tool_manager.rs").replace('\r', "");
+        for repair in [
+            "fn pip_force_reinstall_headroom_version(",
+            "fn repair_pydantic_core(",
+            "fn repair_missing_dependencies(",
+        ] {
+            let start = source.find(repair).expect("repair exists");
+            let body = &source[start..];
+            let body = &body[..body.find("\n    }\n").expect("repair ends")];
+            let signed = body
+                .find("return self.install_signed_windows_runtime(")
+                .unwrap_or(usize::MAX);
+            let pip = [
+                "run_pip_install",
+                "reinstall_lock_pins",
+                "repair_stale_requirements",
+            ]
+            .iter()
+            .filter_map(|call| body.find(call))
+            .min()
+            .expect("the repair runs pip");
+            assert!(
+                signed < pip,
+                "{repair} must reinstall a signed runtime before pip: {body}"
+            );
+        }
     }
 
     /// Every milestone re-writes the marker, so the success path must clear
