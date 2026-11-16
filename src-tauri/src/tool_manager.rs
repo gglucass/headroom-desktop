@@ -50,6 +50,15 @@ fn signed_windows_runtime_sha() -> Option<&'static str> {
     }
 }
 
+/// CI publishes each signed runtime as a frozen release named by its SHA-256
+/// (scripts/publish-windows-signed-runtime.sh). The installer stays small, and
+/// an app update downloads the runtime only when it changed.
+fn signed_windows_runtime_url(sha: &str) -> String {
+    format!(
+        "https://github.com/gglucass/headroom-desktop/releases/download/signed-windows-runtime-{sha}/windows-signed-runtime.tar.gz"
+    )
+}
+
 fn signed_windows_runtime_generation() -> Option<String> {
     signed_windows_runtime_sha()?;
     let release = pinned_headroom_release().ok()?;
@@ -5792,6 +5801,12 @@ impl ToolManager {
         Ok(self.runtime.clone())
     }
 
+    fn signed_windows_runtime_archive(&self, sha: &str) -> PathBuf {
+        self.runtime
+            .downloads_dir
+            .join(format!("windows-signed-runtime-{sha}.tar.gz"))
+    }
+
     /// Release builds on Windows unpack the CI-signed environment. Creating a
     /// venv or running pip here would generate unsigned PE files on the user's
     /// machine and defeat Smart App Control compatibility.
@@ -5801,18 +5816,31 @@ impl ToolManager {
     {
         let sha = signed_windows_runtime_sha().context("signed Windows runtime not configured")?;
         self.runtime.ensure_layout()?;
-        let archive_path = std::env::current_exe()
-            .context("locating Headroom's signed runtime")?
-            .parent()
-            .context("Headroom executable has no parent directory")?
-            .join("windows-signed-runtime.tar.gz");
+        // Kept after the install so a repair needs no network; pruned once a
+        // newer runtime is installed.
+        let archive_path = self.signed_windows_runtime_archive(sha);
         progress(BootstrapStepUpdate {
             step: "Verifying runtime",
-            message: "Checking the signed Windows runtime bundle.".into(),
+            message: "Checking Headroom's runtime.".into(),
             eta_seconds: 30,
-            percent: 15,
+            percent: 5,
         });
-        verify_sha256_file(&archive_path, sha)?;
+        let started_at = Instant::now();
+        download_to_path_with_progress(
+            &signed_windows_runtime_url(sha),
+            &archive_path,
+            Some(sha),
+            |downloaded, total| {
+                progress(download_progress_step(
+                    "Downloading runtime",
+                    "Downloading Headroom's runtime",
+                    downloaded,
+                    total,
+                    started_at,
+                    (5.0, 30.0),
+                ))
+            },
+        )?;
 
         let staging = self.runtime.runtime_dir.join("signed.extracting");
         if staging.exists() {
@@ -5971,6 +5999,10 @@ impl ToolManager {
         for backup in [&old_python, &old_venv] {
             let _ = std::fs::remove_dir_all(backup);
         }
+        self.prune_downloads(
+            "windows-signed-runtime-",
+            &format!("windows-signed-runtime-{sha}."),
+        );
         self.clear_bootstrap_attempt();
         progress(BootstrapStepUpdate {
             step: "Install complete",
@@ -5982,8 +6014,9 @@ impl ToolManager {
     }
 
     /// Download-only warm-up for the consented bootstrap: pulls the two big
-    /// network artifacts (standalone Python tarball, pinned headroom wheel)
-    /// into `downloads_dir` while the user is still in signup/client-setup.
+    /// network artifacts (standalone Python tarball, pinned headroom wheel),
+    /// or on a signed Windows build the signed runtime archive, into
+    /// `downloads_dir` while the user is still in signup/client-setup.
     /// Nothing is extracted or installed and nothing outside `downloads_dir`
     /// changes — `python_runtime_installed()` and every other installed-gate
     /// stays false, so consent semantics remain with bootstrap. Destinations
@@ -5993,7 +6026,17 @@ impl ToolManager {
     /// dependencies" step) can't be prefetched without extracting Python
     /// first — revisit only if the remaining install time still hurts.
     pub fn prefetch_bootstrap_artifacts(&self) -> Result<()> {
-        if signed_windows_runtime_sha().is_some() {
+        if let Some(sha) = signed_windows_runtime_sha() {
+            let installed = signed_windows_runtime_generation()
+                .is_some_and(|generation| self.signed_runtime_generation_matches(&generation));
+            if !installed {
+                self.runtime.ensure_layout()?;
+                download_to_path(
+                    &signed_windows_runtime_url(sha),
+                    &self.signed_windows_runtime_archive(sha),
+                    Some(sha),
+                )?;
+            }
             return Ok(());
         }
         self.runtime.ensure_layout()?;
@@ -6164,41 +6207,14 @@ impl ToolManager {
             &archive_path,
             artifact.sha256,
             |downloaded, total| {
-                let downloaded_mb = downloaded as f64 / 1_048_576.0;
-                let (message, percent, eta_seconds) = match total {
-                    Some(total) if total > 0 => {
-                        let total_mb = total as f64 / 1_048_576.0;
-                        let frac = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
-                        let percent = (18.0 + frac * 16.0).round().clamp(18.0, 34.0) as u8;
-                        let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
-                        let rate = downloaded as f64 / elapsed;
-                        let remaining = (total.saturating_sub(downloaded)) as f64;
-                        let eta = if rate > 1.0 {
-                            (remaining / rate).ceil() as u64
-                        } else {
-                            75
-                        };
-                        (
-                            format!(
-                                "Downloading Python runtime: {:.1} / {:.1} MB",
-                                downloaded_mb, total_mb
-                            ),
-                            percent,
-                            eta,
-                        )
-                    }
-                    _ => (
-                        format!("Downloading Python runtime: {:.1} MB", downloaded_mb),
-                        18,
-                        75,
-                    ),
-                };
-                emit_step(BootstrapStepUpdate {
-                    step: "Downloading Python",
-                    message,
-                    eta_seconds,
-                    percent,
-                });
+                emit_step(download_progress_step(
+                    "Downloading Python",
+                    "Downloading Python runtime",
+                    downloaded,
+                    total,
+                    started_at,
+                    (18.0, 34.0),
+                ))
             },
         )?;
 
@@ -13621,6 +13637,45 @@ where
     }
 }
 
+/// A bootstrap step for a streaming download, mapped onto the `span` of
+/// percents, so the bar keeps moving on a slow link.
+fn download_progress_step(
+    step: &'static str,
+    label: &str,
+    downloaded: u64,
+    total: Option<u64>,
+    started_at: Instant,
+    (low, high): (f64, f64),
+) -> BootstrapStepUpdate {
+    let downloaded_mb = downloaded as f64 / 1_048_576.0;
+    let (message, percent, eta_seconds) = match total {
+        Some(total) if total > 0 => {
+            let total_mb = total as f64 / 1_048_576.0;
+            let frac = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
+            let percent = (low + frac * (high - low)).round().clamp(low, high) as u8;
+            let rate = downloaded as f64 / started_at.elapsed().as_secs_f64().max(0.1);
+            let remaining = total.saturating_sub(downloaded) as f64;
+            let eta = if rate > 1.0 {
+                (remaining / rate).ceil() as u64
+            } else {
+                75
+            };
+            (
+                format!("{label}: {downloaded_mb:.1} / {total_mb:.1} MB"),
+                percent,
+                eta,
+            )
+        }
+        _ => (format!("{label}: {downloaded_mb:.1} MB"), low as u8, 75),
+    };
+    BootstrapStepUpdate {
+        step,
+        message,
+        eta_seconds,
+        percent,
+    }
+}
+
 /// Download `url` to `destination` with an optional progress callback.
 ///
 /// The callback receives `(downloaded_bytes, total_bytes)` and is called at
@@ -17130,6 +17185,7 @@ mod tests {
         SERENA_PINNED_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{codex_cached_plugin_version, MissingPluginPrereqs, NO_NODE_FOR_PLUGIN};
+    use super::{download_progress_step, signed_windows_runtime_url};
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
     use crate::models::ManagedTool;
@@ -23748,6 +23804,54 @@ Always run the linter first.
         assert!(metadata.sort_key.is_some());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_progress_step_maps_bytes_onto_the_step_span() {
+        const MB: u64 = 1_048_576;
+        let step = |downloaded, total| {
+            download_progress_step(
+                "Downloading runtime",
+                "Downloading Headroom's runtime",
+                downloaded,
+                total,
+                std::time::Instant::now(),
+                (5.0, 30.0),
+            )
+        };
+        let half = step(50 * MB, Some(100 * MB));
+        assert_eq!(half.percent, 18);
+        assert_eq!(
+            half.message,
+            "Downloading Headroom's runtime: 50.0 / 100.0 MB"
+        );
+        assert_eq!(step(100 * MB, Some(100 * MB)).percent, 30);
+        let no_length = step(MB, None);
+        assert_eq!((no_length.percent, no_length.eta_seconds), (5, 75));
+        assert_eq!(no_length.message, "Downloading Headroom's runtime: 1.0 MB");
+    }
+
+    /// The app downloads the signed runtime from the release CI publishes; a
+    /// rename on either side 404s every fresh Windows install.
+    #[test]
+    fn signed_windows_runtime_is_published_where_the_app_downloads_it() {
+        let script = include_str!("../../scripts/publish-windows-signed-runtime.sh");
+        assert!(script.contains(r#"tag="signed-windows-runtime-$sha""#));
+        assert!(script.contains(r#"name="windows-signed-runtime.tar.gz""#));
+        assert!(signed_windows_runtime_url("abc").ends_with(
+            "/gglucass/headroom-desktop/releases/download/signed-windows-runtime-abc/windows-signed-runtime.tar.gz"
+        ));
+        for workflow in [
+            include_str!("../../.github/workflows/release-macos-staging.yml"),
+            include_str!("../../.github/workflows/release-macos.yml"),
+            include_str!("../../.github/workflows/release-windows-download.yml"),
+        ] {
+            assert!(workflow.contains("./scripts/publish-windows-signed-runtime.sh"));
+            assert!(
+                !workflow.contains("tauri.signed-windows.conf.json"),
+                "the installer must not bundle the runtime"
+            );
+        }
     }
 
     #[test]

@@ -317,12 +317,18 @@ jobs:
           path: src-tauri/resources/windows-signed-runtime.tar.gz
           key: signed-windows-runtime-v1-${{ steps.signed-runtime-key.outputs.sha }}
 
+      - name: Publish signed Windows runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish-windows-signed-runtime.sh
+
       - name: Build NSIS installer
         shell: bash
         # NSIS only: bundle.targets is "all", which also builds an MSI this
         # workflow never publishes. signCommand signs the app and installer;
-        # the step above signs every PE in the bundled Python runtime.
-        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.signed-windows.conf.json
+        # the app downloads the signed runtime published above.
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Collect Windows installer
         shell: bash
