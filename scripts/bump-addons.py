@@ -64,7 +64,8 @@ ADDONS = {
         "pin": const_pin("MARKITDOWN_PINNED_VERSION"),
         "check": "CI does not install it. It goes into the runtime venv, so check that its "
         "dependencies leave the runtime lock's pins alone (magika, and onnxruntime on Windows), "
-        "then convert a PDF and a .docx.",
+        "then convert a PDF and a .docx. Regenerate src-tauri/python/markitdown-windows.lock "
+        "(its header says how): the signed Windows runtime installs MarkItDown from it.",
     },
     "serena": {
         "pypi": "serena-agent",

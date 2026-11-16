@@ -23,6 +23,7 @@ class RuntimeCacheKeyTest(unittest.TestCase):
         original_source = values["SOURCE"]
         original_pinned = values["pinned"]
         original_lock = values["LOCK"]
+        original_markitdown_lock = values["MARKITDOWN_LOCK"]
         try:
             baseline = key()
             values["SOURCE"] += "\n// unrelated change\n"
@@ -37,10 +38,16 @@ class RuntimeCacheKeyTest(unittest.TestCase):
                 lock.write_bytes(original_lock.read_bytes() + b"\n# changed\n")
                 values["LOCK"] = lock
                 self.assertNotEqual(key(), baseline)
+                values["LOCK"] = original_lock
+                markitdown_lock = Path(directory) / "markitdown.lock"
+                markitdown_lock.write_bytes(original_markitdown_lock.read_bytes() + b"\n# changed\n")
+                values["MARKITDOWN_LOCK"] = markitdown_lock
+                self.assertNotEqual(key(), baseline)
         finally:
             values["SOURCE"] = original_source
             values["pinned"] = original_pinned
             values["LOCK"] = original_lock
+            values["MARKITDOWN_LOCK"] = original_markitdown_lock
 
 
 if __name__ == "__main__":

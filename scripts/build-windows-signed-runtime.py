@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "src-tauri/src/tool_manager.rs").read_text(encoding="utf-8")
 LOCK = ROOT / "src-tauri/python/headroom-windows-requirements.lock"
+MARKITDOWN_LOCK = ROOT / "src-tauri/python/markitdown-windows.lock"
 
 
 def pinned(name):
@@ -53,9 +54,6 @@ def download(url, destination, expected_sha):
 
 def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
-
-
-MARKITDOWN_EXTRAS = "pdf,docx,pptx,xlsx,xls,az-doc-intel,az-content-understanding,youtube-transcription"
 
 
 def pip_versions(python):
@@ -109,20 +107,26 @@ def prepare(work):
     run(python, "-m", "pip", "install", "--no-deps", wheel)
 
     # MarkItDown ships inside the runtime: pip may not change a signed runtime
-    # on the user's machine, so its Add-ons Install only switches it on. No
-    # audio-transcription (32 MB; the shim blocks speech_recognition) and no
-    # outlook (its olefile reaches a Pillow CVE; see remove_olefile).
+    # on the user's machine, so its Add-ons Install only switches it on. Its
+    # lock holds what it adds to the Windows lock, hashed; --no-deps, so
+    # `pip check` proves the two together satisfy it.
     before = pip_versions(python)
     run(
         python, "-m", "pip", "install", "--timeout", "180", "--retries", "10",
         "--only-binary=:all:", "--find-links", pinned("VENDOR_WHEELS_INDEX_URL"),
-        "--extra-index-url", "https://pypi.org/simple",
-        f"markitdown[{MARKITDOWN_EXTRAS}]=={pinned('MARKITDOWN_PINNED_VERSION')}",
+        "--extra-index-url", "https://pypi.org/simple", "--no-deps", "-r", MARKITDOWN_LOCK,
     )
     after = pip_versions(python)
     moved = sorted(f"{name} {version} -> {after.get(name)}" for name, version in before.items() if after.get(name) != version)
     if moved:
         raise RuntimeError(f"markitdown moved lock pins: {moved}")
+    if after.get("markitdown") != pinned("MARKITDOWN_PINNED_VERSION"):
+        raise RuntimeError("markitdown-windows.lock does not pin MARKITDOWN_PINNED_VERSION")
+    added = set(after) - set(before)
+    check = subprocess.run([str(python), "-m", "pip", "check"], capture_output=True, text=True).stdout
+    broken = [line for line in check.splitlines() if line.split(" ", 1)[0].lower() in added]
+    if broken:
+        raise RuntimeError(f"markitdown-windows.lock misses dependencies: {broken}")
 
     msvc_url = pinned("MSVC_RUNTIME_WHEEL_URL")
     msvc = work / msvc_url.rsplit("/", 1)[-1]
@@ -159,6 +163,19 @@ def prepare(work):
     relocate(runtime)
     run(python, "-c", "import headroom, headroom._core")
     run(venv / "Scripts/headroom.exe", "--version")
+
+
+# Bundled MarkItDown cannot be repaired on the user's machine: prove here that
+# it converts, its converters import, and the extras left out stayed out.
+MARKITDOWN_SMOKE = """
+import importlib.util, io
+import mammoth, openpyxl, pandas, pdfminer, pdfplumber, pptx, xlrd
+from markitdown import MarkItDown
+for gone in ("olefile", "speech_recognition"):
+    assert importlib.util.find_spec(gone) is None, gone + " is bundled"
+text = MarkItDown().convert_stream(io.BytesIO(b"<h1>Headroom</h1>"), file_extension=".html").text_content
+assert "# Headroom" in text, text
+"""
 
 
 def relocate(runtime):
@@ -202,6 +219,7 @@ def smoke(runtime):
         run(relocated / "venv/Scripts/python.exe", "-c", "import headroom, headroom._core")
         run(relocated / "venv/Scripts/pip.exe", "--version")
         run(relocated / "venv/Scripts/headroom.exe", "--version")
+        run(relocated / "venv/Scripts/python.exe", "-c", MARKITDOWN_SMOKE)
     finally:
         relocated.rename(runtime)
         relocate(runtime)
@@ -230,7 +248,7 @@ def cache_key():
         digest.update(pinned(name).encode())
     for value in signed_wheel():
         digest.update(value.encode())
-    for path in (LOCK, ROOT / "scripts/headroom-launcher.rs", ROOT / "scripts/build-windows-signed-runtime.ps1", Path(__file__)):
+    for path in (LOCK, MARKITDOWN_LOCK, ROOT / "scripts/headroom-launcher.rs", ROOT / "scripts/build-windows-signed-runtime.ps1", Path(__file__)):
         digest.update(path.read_bytes())
     print(digest.hexdigest())
 

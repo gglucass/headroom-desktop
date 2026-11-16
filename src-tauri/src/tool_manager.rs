@@ -35,7 +35,6 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
 pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.44.0";
-const SIGNED_WINDOWS_RUNTIME_FORMAT: &str = "1";
 
 // Release CI embeds the SHA of a prebuilt runtime after signing every PE in
 // it. A Windows release without that build input fails at compile time.
@@ -59,18 +58,22 @@ fn signed_windows_runtime_url(sha: &str) -> String {
     )
 }
 
+/// What the installed runtime must match: the build's cache key, a hash of
+/// every input of the archive (scripts/build-windows-signed-runtime.py
+/// cache-key), so any change to it reaches installed users, not only a pin.
 fn signed_windows_runtime_generation() -> Option<String> {
-    signed_windows_runtime_sha()?;
-    let release = pinned_headroom_release().ok()?;
-    // MarkItDown is bundled too: rc.10/rc.11 runtimes without it must re-download.
-    Some(format!(
-        "{}:{}:{}:{}:markitdown-{}",
-        SIGNED_WINDOWS_RUNTIME_FORMAT,
-        PYTHON_SHA256_WINDOWS_X86_64,
-        release.sha256,
-        requirements_lock_sha(bootstrap_requirements_lock()),
-        MARKITDOWN_PINNED_VERSION
-    ))
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        const SIGNED_WINDOWS_RUNTIME_FORMAT: &str = "1";
+        Some(format!(
+            "{SIGNED_WINDOWS_RUNTIME_FORMAT}:{}",
+            env!("HEADROOM_SIGNED_RUNTIME_KEY")
+        ))
+    }
+    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+    {
+        None
+    }
 }
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -20786,6 +20789,21 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// The signed Windows runtime installs MarkItDown from its own hashed lock
+    /// (scripts/build-windows-signed-runtime.py). An add-on bump that leaves
+    /// the lock behind fails here, in the bump PR, not in the Windows rc build.
+    #[test]
+    fn the_windows_markitdown_lock_pins_markitdown_pinned_version() {
+        let pin = format!("markitdown=={MARKITDOWN_PINNED_VERSION} \\");
+        assert!(
+            include_str!("../python/markitdown-windows.lock")
+                .lines()
+                .any(|line| line.trim() == pin),
+            "regenerate src-tauri/python/markitdown-windows.lock for markitdown \
+             {MARKITDOWN_PINNED_VERSION} (its header says how)"
+        );
     }
 
     /// The signed Windows runtime ships MarkItDown and pip may not change it:
