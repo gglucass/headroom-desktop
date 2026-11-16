@@ -20788,10 +20788,6 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
         assert!(manager.take_abandoned_bootstrap().is_none());
     }
 
-    /// pip refuses to change a signed Windows runtime, so every repair must
-    /// reinstall its archive instead. The engine-module repair went to pip and
-    /// left the backend down (win-signed-repair, 0.9.63-rc.10). The branch only
-    /// compiles into Windows release builds, hence a source check.
     /// The signed Windows runtime ships MarkItDown and pip may not change it:
     /// Install only switches it on, Uninstall leaves it (0.9.63-rc.11: Install
     /// failed on win-mini). Windows release builds only, hence a source check.
@@ -20813,6 +20809,10 @@ print(ctx.params["intercept_tool_results"], snapshot.is_enabled("tool_result_int
         }
     }
 
+    /// pip refuses to change a signed Windows runtime, so every repair must
+    /// reinstall its archive instead. The engine-module repair went to pip and
+    /// left the backend down (win-signed-repair, 0.9.63-rc.10). The branch only
+    /// compiles into Windows release builds, hence a source check.
     #[test]
     fn every_runtime_repair_reinstalls_a_signed_runtime_from_its_archive() {
         let source = include_str!("tool_manager.rs").replace('\r', "");
