@@ -6035,7 +6035,7 @@ fn run_activity_observation(app: &AppHandle) {
     // No point nudging the user to run Train if the claude CLI isn't installed —
     // they'd just hit an install prompt. The Optimize tab surfaces the install
     // UI in that case; let them fix prereqs first.
-    if state.headroom_learn_prereq_status().claude_cli_available {
+    if state.claude_cli_available() {
         let _ = state.observe_train_suggestions(&projects);
     }
 }
@@ -17047,6 +17047,24 @@ Some unrelated content.
             body.contains("spawn_blocking(detect_headroom_learn_prereq_status)")
                 && !body.contains("detect_headroom_learn_prereq_status()"),
             "the prereq probe must not block an async worker: {body}"
+        );
+    }
+
+    /// The observer runs from launch, before sign-in. Probing Codex there ran
+    /// an XProtect-flagged `codex` and macOS showed "Malware Blocked" over the
+    /// sign-in screen of a fresh install (2026-11-12).
+    #[test]
+    fn activity_observer_never_probes_codex() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let start = source
+            .find("\nfn run_activity_observation(")
+            .expect("observer fn");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("fn end")];
+        assert!(
+            body.contains("state.claude_cli_available()")
+                && !body.contains("learn_prereq")
+                && !body.to_lowercase().contains("codex"),
+            "the observer must not run codex: {body}"
         );
     }
 

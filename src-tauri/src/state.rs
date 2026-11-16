@@ -658,6 +658,8 @@ pub struct AppState {
     /// fallback shell probe can take up to 2s, so we keep this sticky and
     /// expose an invalidator for the user's "Re-check" button.
     cached_headroom_learn_prereq: Mutex<Option<HeadroomLearnPrereqStatus>>,
+    /// Cached `claude_cli_available`, cleared with the prereq cache.
+    cached_claude_cli_available: Mutex<Option<bool>>,
     /// Cached `runtime_status()` output. The tray-icon updater, proxy
     /// watchdog, and frontend pollers all ask for runtime status on tight
     /// intervals; each uncached call hits `is_headroom_proxy_reachable`
@@ -798,6 +800,7 @@ impl AppState {
             cached_claude_code_projects: Mutex::new(None),
             claude_projects_cache_gen: std::sync::atomic::AtomicU64::new(0),
             cached_headroom_learn_prereq: Mutex::new(None),
+            cached_claude_cli_available: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
             runtime_status_refill: Mutex::new(()),
             kompress_prefetch_attempted: AtomicBool::new(false),
@@ -3248,8 +3251,23 @@ impl AppState {
         status
     }
 
+    /// The Claude half of the prereqs alone, for the background observer. It
+    /// runs from launch, before sign-in, and the full probe ran `codex
+    /// --version`: on a Codex build Apple's XProtect flags, macOS put "Malware
+    /// Blocked: codex" over Headroom's sign-in screen (a customer, 2026-11-12).
+    pub fn claude_cli_available(&self) -> bool {
+        if let Some(cached) = self.cached_headroom_learn_prereq.lock().as_ref() {
+            return cached.claude_cli_available;
+        }
+        *self
+            .cached_claude_cli_available
+            .lock()
+            .get_or_insert_with(|| crate::claude_cli::detect_claude_cli().is_some())
+    }
+
     pub fn invalidate_headroom_learn_prereq_cache(&self) {
         *self.cached_headroom_learn_prereq.lock() = None;
+        *self.cached_claude_cli_available.lock() = None;
     }
 
     fn list_claude_code_projects_uncached(&self) -> Result<Vec<ClaudeCodeProject>> {
