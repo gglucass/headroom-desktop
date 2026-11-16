@@ -286,12 +286,8 @@ pub fn set_vscode_wrapper_enabled(enabled: bool) -> Result<()> {
     let previous = state.vscode_wrapper_enabled;
     state.vscode_wrapper_enabled = Some(enabled);
     write_setup_state(&state)?;
-    let applied = if enabled {
-        if cfg!(windows) {
-            ensure_windows_remote_control_panel().map(|_| ())
-        } else {
-            configure_vscode_process_wrapper().map(|_| ())
-        }
+    let applied = if enabled && is_claude_code_enabled() {
+        ensure_claude_remote_control_command().map(|_| ())
     } else {
         remove_vscode_process_wrapper().and_then(|_| remove_owned_vscode_panel_command())
     };
@@ -9430,6 +9426,10 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
     }
     let mut changed = Vec::new();
     let mut backups = Vec::new();
+    let panel_enabled = is_vscode_wrapper_enabled();
+    if !panel_enabled {
+        remove_owned_vscode_panel_command()?;
+    }
     for (path, content, executable) in [
         (
             claude_remote_control_script_path(),
@@ -9452,6 +9452,9 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             true,
         ),
     ] {
+        if path == claude_remote_control_panel_command_path() && !panel_enabled {
+            continue;
+        }
         // Our commands carry the marker; a same-name file without it is the
         // user's own and stays, as remove_claude_remote_control_command leaves it.
         if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER)
@@ -20680,6 +20683,11 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         let vscode = vscode_user_settings_path();
         std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
         std::fs::write(&vscode, "{\"editor.fontSize\": 13}\n").unwrap();
+        let mut setup = super::load_setup_state();
+        setup
+            .configured_clients
+            .insert("claude_code".into(), "2026-11-16T00:00:00Z".into());
+        super::write_setup_state(&setup).unwrap();
 
         ensure_claude_remote_control_command().unwrap();
         assert!(
@@ -20689,7 +20697,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         );
 
         super::set_vscode_wrapper_enabled(false).unwrap();
+        assert!(!claude_remote_control_panel_command_path().exists());
         ensure_claude_remote_control_command().unwrap();
+        assert!(!claude_remote_control_panel_command_path().exists());
+        assert!(claude_remote_control_command_path().exists());
         let settings =
             parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
         assert!(!settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
@@ -20700,6 +20711,29 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         let settings =
             parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
         assert!(settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(claude_remote_control_panel_command_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_vscode_wrapper_while_disconnected_waits_for_client_setup() {
+        let _home = TestHome::new();
+        let vscode = vscode_user_settings_path();
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        std::fs::write(&vscode, "{\"editor.fontSize\": 13}\n").unwrap();
+
+        super::set_vscode_wrapper_enabled(false).unwrap();
+        super::set_vscode_wrapper_enabled(true).unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(!settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(!claude_remote_control_panel_command_path().exists());
+
+        ensure_claude_remote_control_command().unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(claude_remote_control_panel_command_path().exists());
     }
 
     #[cfg(unix)]
