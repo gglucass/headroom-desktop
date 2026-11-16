@@ -10105,11 +10105,32 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
     // RUST-WZ: codex giving up on the 5xx our backend answers when IT never
     // reached the provider. The proxy's own failure reporting covers the
     // cases that are ours (see `with_unreachable_cause`).
-    if text
-        .lines()
-        .any(|line| line.trim_start().starts_with("ERROR: unexpected status 5"))
-        && (text.contains("\"upstream_unreachable\"") || text.contains("\"upstream_timeout\""))
-    {
+    let mut lines = text.lines().peekable();
+    let mut upstream_unreachable = false;
+    while let Some(line) = lines.next() {
+        if !line.trim_start().starts_with("ERROR: unexpected status ") {
+            continue;
+        }
+        // Keep the status and its body together, including SSE's `data:`
+        // lines. A prior network retry must not hide a later internal error
+        // or a 400 caused by the prompt we built.
+        let mut diagnostic = line.to_string();
+        while lines
+            .peek()
+            .is_some_and(|line| !line.trim_start().starts_with("ERROR:"))
+        {
+            diagnostic.push('\n');
+            diagnostic.push_str(lines.next().unwrap());
+        }
+        if !line.trim_start().starts_with("ERROR: unexpected status 5")
+            || !(diagnostic.contains("\"upstream_unreachable\"")
+                || diagnostic.contains("\"upstream_timeout\""))
+        {
+            return false;
+        }
+        upstream_unreachable = true;
+    }
+    if upstream_unreachable {
         return true;
     }
     let mut statusless = false;
@@ -17991,6 +18012,24 @@ Some unrelated content.
                 "for: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn learn_network_retry_does_not_hide_a_later_prompt_or_internal_error() {
+        let network = "ERROR: unexpected status 502 Bad Gateway: event: error\ndata: {\"error\": {\"code\": \"upstream_unreachable\"}}\n";
+        assert!(learn_failure_is_agent_api_unreachable(network));
+        for final_error in [
+            "ERROR: unexpected status 400 Bad Request: {\"error\": {\"message\": \"prompt is too long\"}}\n",
+            "ERROR: unexpected status 500 Internal Server Error: {\"error\": {\"code\": \"internal_error\"}}\n",
+        ] {
+            assert!(
+                !learn_failure_is_agent_api_unreachable(&format!("{network}{final_error}")),
+                "the final failure must remain actionable: {final_error}"
+            );
+        }
+        assert!(learn_failure_is_agent_api_unreachable(&format!(
+            "{network}ERROR: unexpected status 504 Gateway Timeout: {{\"error\": {{\"code\": \"upstream_timeout\"}}}}\n"
+        )));
     }
 
     #[test]
