@@ -194,12 +194,32 @@ def archive(runtime, output):
     print(digest.hexdigest())
 
 
+def cache_key():
+    digest = hashlib.sha256()
+    for name in (
+        "PYTHON_STANDALONE_RELEASE", "PYTHON_SHA256_WINDOWS_X86_64",
+        "VENDOR_WHEELS_INDEX_URL", "MSVC_RUNTIME_WHEEL_URL",
+        "MSVC_RUNTIME_WHEEL_SHA256",
+    ):
+        digest.update(pinned(name).encode())
+    for value in signed_wheel():
+        digest.update(value.encode())
+    for path in (LOCK, ROOT / "scripts/headroom-launcher.rs", ROOT / "scripts/build-windows-signed-runtime.ps1", Path(__file__)):
+        digest.update(path.read_bytes())
+    print(digest.hexdigest())
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("prepare", "list-pe", "smoke", "archive"))
-    parser.add_argument("path", type=Path)
+    parser.add_argument("command", choices=("prepare", "list-pe", "smoke", "archive", "cache-key"))
+    parser.add_argument("path", nargs="?", type=Path)
     parser.add_argument("output", nargs="?", type=Path)
     args = parser.parse_args()
+    if args.command == "cache-key":
+        cache_key()
+        return
+    if args.path is None:
+        parser.error(f"{args.command} needs a path")
     if args.command == "prepare":
         prepare(args.path)
     elif args.command == "list-pe":

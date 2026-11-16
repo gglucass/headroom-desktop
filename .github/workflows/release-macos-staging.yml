@@ -289,6 +289,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Key signed Windows runtime
+        id: signed-runtime-key
+        shell: bash
+        run: echo "sha=$(python scripts/build-windows-signed-runtime.py cache-key)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore signed Windows runtime
+        id: signed-runtime-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/resources/windows-signed-runtime.tar.gz
+          key: signed-windows-runtime-v1-${{ steps.signed-runtime-key.outputs.sha }}
+
       - name: Install Azure Artifact Signing CLI
         # Pinned on purpose: this binary runs with the signing secrets in env.
         # crates.io versions are immutable; bump by hand after reviewing the diff.
@@ -297,6 +309,13 @@ jobs:
       - name: Build and verify signed Windows runtime
         shell: pwsh
         run: ./scripts/build-windows-signed-runtime.ps1
+
+      - name: Cache verified signed Windows runtime
+        if: steps.signed-runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/resources/windows-signed-runtime.tar.gz
+          key: signed-windows-runtime-v1-${{ steps.signed-runtime-key.outputs.sha }}
 
       - name: Build NSIS installer
         shell: bash
