@@ -3,18 +3,15 @@
 //! we don't fire Sentry on every detection. Instead we persist a marker to
 //! disk and only escalate to Sentry once the same conflict has survived
 //! multiple app launches — i.e. the user came back, didn't free the port,
-//! and is stuck. Recovery (proxy comes up after a marker exists) is reported
-//! to analytics with a time-to-recovery, then the marker is cleared.
+//! and is stuck. Recovery (proxy comes up after a marker exists) clears the
+//! marker.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use tauri::AppHandle;
 
-use crate::analytics;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs};
 
 const MARKER_FILE: &str = "port-conflict.json";
@@ -23,9 +20,6 @@ const MARKER_FILE: &str = "port-conflict.json";
 /// surface a Warning-level Sentry event. 1 = noisy (every fresh detection),
 /// 2 = "user closed and reopened the app and it's still broken".
 const PERSISTENT_LAUNCH_THRESHOLD: u32 = 2;
-
-const FAILURE_EVENT: &str = "proxy_start_blocked_port_conflict";
-const RECOVERY_EVENT: &str = "proxy_start_recovered_port_conflict";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortConflictMarker {
@@ -181,21 +175,6 @@ pub fn record_failure(err_chain: &str, increment_launches: bool) -> Option<PortC
     record_failure_at(&marker_path(), err_chain, increment_launches, Utc::now()).ok()
 }
 
-fn build_failure_props(marker: &PortConflictMarker) -> Map<String, Value> {
-    let mut props = Map::new();
-    if let Some(cmd) = &marker.occupant_cmd {
-        props.insert("occupant_cmd".to_string(), Value::from(cmd.clone()));
-    }
-    if let Some(pid) = marker.occupant_pid {
-        props.insert("occupant_pid".to_string(), Value::from(pid));
-    }
-    props.insert(
-        "consecutive_failed_launches".to_string(),
-        Value::from(marker.consecutive_failed_launches),
-    );
-    props
-}
-
 fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
     let occupant = marker
         .occupant_cmd
@@ -233,7 +212,7 @@ fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
 /// Returns `true` if the failure was a port conflict (caller should skip
 /// `capture_headroom_start_failure` for it). For unrelated errors, returns
 /// `false` and the caller should keep its existing reporting.
-pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launches: bool) -> bool {
+pub fn note_proxy_failed(err: &anyhow::Error, increment_launches: bool) -> bool {
     let err_chain = format!("{err:#}");
     if !is_port_conflict(&err_chain) {
         return false;
@@ -241,12 +220,6 @@ pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launche
     let Some(marker) = record_failure(&err_chain, increment_launches) else {
         return true;
     };
-
-    analytics::track_event(
-        app,
-        FAILURE_EVENT,
-        Some(Value::Object(build_failure_props(&marker))),
-    );
 
     if increment_launches && marker.consecutive_failed_launches >= PERSISTENT_LAUNCH_THRESHOLD {
         capture_persistent_to_sentry(&marker);
@@ -256,26 +229,9 @@ pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launche
 }
 
 /// Top-level hook: call after `ensure_headroom_running` returns Ok. Clears
-/// the marker if one is present and emits a recovery analytics event with
-/// `time_to_recovery_seconds`.
-pub fn note_proxy_started(app: &AppHandle) {
-    let Some(prior) = clear_marker() else {
-        return;
-    };
-
-    let now = Utc::now();
-    let time_to_recovery_seconds = now
-        .signed_duration_since(prior.detected_at)
-        .num_seconds()
-        .max(0);
-
-    let mut props = build_failure_props(&prior);
-    props.insert(
-        "time_to_recovery_seconds".to_string(),
-        Value::from(time_to_recovery_seconds),
-    );
-
-    analytics::track_event(app, RECOVERY_EVENT, Some(Value::Object(props)));
+/// the marker if one is present, so the launch counter starts over.
+pub fn note_proxy_started() {
+    clear_marker();
 }
 
 #[cfg(test)]

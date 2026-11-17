@@ -1791,7 +1791,6 @@ dependencies = [
  "os_info",
  "parking_lot",
  "plist",
- "rand 0.9.4",
  "reqwest 0.12.28",
  "rusqlite",
  "sentry",
@@ -1800,7 +1799,6 @@ dependencies = [
  "serial_test",
  "sha2",
  "socket2",
- "sys-locale",
  "tar",
  "tauri",
  "tauri-build",
@@ -4885,15 +4883,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "sys-locale"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
-dependencies = [
- "libc",
 ]
 
 [[package]]

@@ -10532,31 +10532,6 @@ fn replace_oss_plugin_hook_command(path: &Path, from: &str, to: &str) -> Result<
     Ok(true)
 }
 
-/// What the open-source plugin/CLI look like on this machine right now.
-pub struct OssPluginStatus {
-    pub plugin_installed: bool,
-    pub hook_absorbed: bool,
-    pub cli_on_path: bool,
-    /// An open-source proxy is serving on :8787 (the OSS default port).
-    pub oss_proxy_8787: bool,
-    /// Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
-    pub base_url_ours: bool,
-}
-
-/// True when Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
-fn claude_base_url_is_ours() -> bool {
-    std::fs::read_to_string(claude_settings_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| {
-            v.get("env")?
-                .get("ANTHROPIC_BASE_URL")?
-                .as_str()
-                .map(|url| url == HEADROOM_ANTHROPIC_BASE_URL)
-        })
-        .unwrap_or(false)
-}
-
 /// True when a real open-source `headroom` CLI exists for the plugin hook to
 /// run. `find_on_path` alone is not enough: a GUI launch inherits launchd's
 /// bare PATH, which never contains `~/.local/bin` -- exactly where the OSS
@@ -10568,7 +10543,8 @@ fn oss_cli_present() -> bool {
         || crate::claude_cli::probe_known_paths("headroom").is_some()
 }
 
-pub fn absorb_oss_plugin() -> OssPluginStatus {
+/// True when the plugin's bare hook command is now neutralized.
+pub fn absorb_oss_plugin() -> bool {
     // Probing runs `headroom --version` against every known install location,
     // so it execs whatever binary of that name happens to be on disk. Nobody
     // without the plugin needs that at every launch: the answer only decides
@@ -10604,27 +10580,17 @@ pub fn oss_plugin_hook_needs_absorbing() -> bool {
     })
 }
 
-fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> OssPluginStatus {
+fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> bool {
     let plugin_installed = oss_headroom_plugin_installed();
     let hooks = oss_headroom_plugin_hook_paths();
     let absorb = plugin_installed && !cli_on_path && !oss_absorb_disabled();
-    let hook_absorbed = {
-        let _guard = OSS_PLUGIN_HOOK_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
-            false
-        } else {
-            reconcile_oss_plugin_hooks(&hooks, absorb).0
-        }
-    };
-
-    OssPluginStatus {
-        plugin_installed,
-        hook_absorbed,
-        cli_on_path,
-        oss_proxy_8787: port_listening(8787),
-        base_url_ours: claude_base_url_is_ours(),
+    let _guard = OSS_PLUGIN_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+        false
+    } else {
+        reconcile_oss_plugin_hooks(&hooks, absorb).0
     }
 }
 
@@ -23661,26 +23627,22 @@ sys.exit(3)
         fs::create_dir_all(home.path().join(".local/bin")).unwrap();
 
         let before = snapshot_tree(home.path());
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
         let after = snapshot_tree(home.path());
 
         assert_eq!(before, after, "no-plugin users must see zero writes");
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
-        assert!(
-            status.base_url_ours,
-            "our routing is left exactly as it was"
-        );
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
     }
 
     #[test]
     fn state_1_app_alone_stays_inert() {
         let _home = TestHome::new();
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert!(!super::oss_plugin_hook_receipt_path().exists());
     }
 
@@ -23689,10 +23651,10 @@ sys.exit(3)
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(status.plugin_installed);
-        assert!(status.hook_absorbed);
+        assert!(super::oss_headroom_plugin_installed());
+        assert!(absorbed);
         let raw = fs::read_to_string(&hooks).unwrap();
         assert_eq!(
             raw.matches(&serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap())
@@ -23711,7 +23673,7 @@ sys.exit(3)
             seed_oss_plugin(home.path(), plugin_ref);
 
             assert!(
-                super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed,
+                super::absorb_oss_plugin_with_cli_on_path(false),
                 "{plugin_ref} should be recognised"
             );
         }
@@ -23722,7 +23684,7 @@ sys.exit(3)
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "ponytail@ponytail");
 
-        assert!(!super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(!super::oss_plugin_hook_receipt_path().exists());
     }
 
@@ -23730,12 +23692,11 @@ sys.exit(3)
     fn state_3_real_cli_on_path_is_never_shadowed() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(true);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(true);
 
-        assert!(status.cli_on_path);
-        assert!(!status.hook_absorbed);
+        assert!(!absorbed);
         assert_eq!(
             fs::read_to_string(hooks)
                 .unwrap()
@@ -23779,12 +23740,12 @@ sys.exit(3)
     fn removing_the_plugin_restores_its_hook_and_clears_the_receipt() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         seed_oss_plugin(home.path(), "ponytail@ponytail");
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert!(!super::oss_plugin_hook_receipt_path().exists());
         assert_eq!(
             fs::read_to_string(&hooks)
@@ -23803,7 +23764,7 @@ sys.exit(3)
         fs::write(&shim, "#!/bin/sh\necho not ours\n").unwrap();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert_eq!(
             fs::read_to_string(&shim).unwrap(),
             "#!/bin/sh\necho not ours\n"
@@ -23814,7 +23775,7 @@ sys.exit(3)
     fn failed_restore_preserves_the_receipt_for_a_later_retry() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         let managed = serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap();
         let corrupt = format!("{} trailing", fs::read_to_string(&hooks).unwrap());
@@ -23828,9 +23789,9 @@ sys.exit(3)
     }
 
     #[test]
-    fn state_4_oss_proxy_bypass_is_measured_not_fought() {
+    fn state_4_oss_proxy_bypass_is_left_alone() {
         // The user ran `headroom init` themselves, so their ANTHROPIC_BASE_URL
-        // points at the open-source proxy. We report it and change nothing.
+        // points at the open-source proxy. We change nothing.
         let home = TestHome::new();
         fs::create_dir_all(home.path().join(".claude")).unwrap();
         let settings = home.path().join(".claude/settings.json");
@@ -23838,13 +23799,9 @@ sys.exit(3)
         fs::write(&settings, original.to_string()).unwrap();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(status.plugin_installed);
-        assert!(
-            !status.base_url_ours,
-            "the bypass must be visible to telemetry"
-        );
+        assert!(super::oss_headroom_plugin_installed());
         assert_eq!(
             fs::read_to_string(&settings).unwrap(),
             original.to_string(),
@@ -23864,7 +23821,7 @@ sys.exit(3)
         // Nobody managed yet: an untouched plugin is not the recheck's job.
         assert!(!super::oss_plugin_hook_needs_absorbing());
 
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(
             !super::oss_plugin_hook_needs_absorbing(),
             "steady state must stay quiet"
@@ -23873,7 +23830,7 @@ sys.exit(3)
         // Claude Code updates the plugin: a new version dir, bare command back.
         let updated = seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
         assert!(super::oss_plugin_hook_needs_absorbing());
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(!fs::read_to_string(&updated)
             .unwrap()
             .contains(super::OSS_PLUGIN_HOOK_COMMAND));
@@ -23881,7 +23838,7 @@ sys.exit(3)
 
         // A real CLI appears, we hand the hook back, and the poll must not
         // immediately claim it again.
-        assert!(!super::absorb_oss_plugin_with_cli_on_path(true).hook_absorbed);
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(true));
         assert!(
             !super::oss_plugin_hook_needs_absorbing(),
             "a restored user must not be re-absorbed on a timer"
@@ -23892,7 +23849,7 @@ sys.exit(3)
     fn the_recheck_respects_the_kill_switch() {
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
         assert!(super::oss_plugin_hook_needs_absorbing());
 
@@ -23907,14 +23864,14 @@ sys.exit(3)
     fn the_kill_switch_absorbs_nothing_and_restores_what_it_finds() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         std::env::set_var("HEADROOM_ABSORB_OSS_PLUGIN", "0");
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
         std::env::remove_var("HEADROOM_ABSORB_OSS_PLUGIN");
 
-        assert!(status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        assert!(super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert_eq!(
             fs::read_to_string(&hooks)
                 .unwrap()
@@ -23929,7 +23886,7 @@ sys.exit(3)
     fn absorbing_the_hook_does_not_hide_a_real_oss_remnant() {
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         let foreign = home.path().join(".local/bin/headroom");
         fs::create_dir_all(foreign.parent().unwrap()).unwrap();

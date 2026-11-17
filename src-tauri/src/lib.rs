@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 
 use chrono::{Local, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
@@ -128,24 +128,6 @@ const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
 type InstallPendingUpdateFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuitSource {
-    SettingsButton,
-    TrayMenu,
-    /// "Quit anyway" in the dialog that warns about open agent sessions.
-    QuitConfirm,
-}
-
-impl QuitSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::SettingsButton => "settings_button",
-            Self::TrayMenu => "tray_menu",
-            Self::QuitConfirm => "quit_confirm",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "phase")]
@@ -534,11 +516,6 @@ fn maybe_fire_onboarding_recovery_nudge(
     let (title, body) = onboarding_recovery_copy(any_connector_enabled);
 
     let _ = show_notification_impl(app, title, body, None);
-    analytics::track_event(
-        app,
-        "onboarding_recovery_nudge_shown",
-        Some(json!({ "any_connector_enabled": any_connector_enabled })),
-    );
 }
 
 /// Copy for the recovery nudge, split by why nothing has come through. The
@@ -689,11 +666,6 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         unrouted_usage_copy(claude && !claude_desktop, codex)
     };
     let _ = show_notification_impl(app, title, body, None);
-    analytics::track_event(
-        app,
-        "unrouted_usage_nudge_shown",
-        Some(json!({ "claude": claude, "codex": codex, "claude_desktop": claude_desktop })),
-    );
 }
 
 /// True when an agent going direct is expected, so "active locally, nothing
@@ -866,7 +838,6 @@ fn maybe_fire_first_savings_notification(
         ),
         None,
     );
-    analytics::track_event(app, "first_savings_notification_shown", None);
 }
 
 /// Below this, a dollar figure undersells the moment more than it proves it:
@@ -1014,8 +985,6 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
 /// Posts the milestones `build_dashboard` found due, with the savings snapshot
 /// whose per-day rows carry the stuck-host alert's request and failure counts.
 fn report_pending_milestones(
-    app: &AppHandle,
-    state: &AppState,
     dashboard: &DashboardState,
     pending_milestones: &state::PendingMilestones,
 ) {
@@ -1025,19 +994,6 @@ fn report_pending_milestones(
     .flatten();
 
     for milestone_tokens_saved in &pending_milestones.token {
-        analytics::track_event(
-            app,
-            "lifetime_tokens_saved_milestone_reached",
-            Some(json!({
-                "milestone_tokens_saved": *milestone_tokens_saved,
-                "milestone_millions": milestone_tokens_saved / 1_000_000,
-                "milestone_kind": lifetime_token_milestone_kind(*milestone_tokens_saved),
-                "lifetime_tokens_saved": dashboard.lifetime_estimated_tokens_saved,
-                "lifetime_requests": dashboard.lifetime_requests,
-                "launch_count": state.launch_count(),
-                "launch_experience": state.launch_experience_label()
-            })),
-        );
         pricing::report_milestone(*milestone_tokens_saved, report.as_ref());
     }
 
@@ -1052,7 +1008,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         let state: State<'_, AppState> = app.state();
         let (mut dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
         // From the REAL dashboard, before the demo-data injector below.
-        report_pending_milestones(&app, &state, &dashboard, &pending_milestones);
+        report_pending_milestones(&dashboard, &pending_milestones);
 
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
@@ -1606,8 +1562,7 @@ async fn restart_app(app: AppHandle) {
     //
     // The relauncher is armed BEFORE the teardown below, because that teardown
     // can block the main thread for a long time (stop_headroom() does a
-    // `child.wait()` with no timeout on the Python backend, and
-    // analytics::shutdown() joins a worker whose last act is a network flush) —
+    // `child.wait()` with no timeout on the Python backend),
     // observed as "Headroom is not responding". A previous version used a blind
     // `sleep 1` before `open -n`, which raced that teardown: if we hadn't
     // exited (and released the single-instance lock) within 1s, the new
@@ -1652,7 +1607,6 @@ async fn restart_app(app: AppHandle) {
         let state: tauri::State<'_, AppState> = app.state();
         stop_headroom_for_exit(&state);
     }
-    analytics::shutdown(&app);
 
     // macOS hands the relaunch to the detached relauncher above, so it exits
     // rather than request_restart(): letting tauri spawn the new process too
@@ -2255,18 +2209,10 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
         "ponytail" | "caveman" | "chisle" => {
-            let outdated = state.tool_manager.install_plugin(id).map_err(|err| {
-                // Counts how often a missing Node.js or Git blocks an addon,
-                // to decide whether Headroom should supply them.
-                if let Some(missing) = err.downcast_ref::<tool_manager::MissingPluginPrereqs>() {
-                    analytics::track_event(
-                        app,
-                        "addon_install_blocked",
-                        Some(json!({ "addon": id, "missing": missing.0.join(",") })),
-                    );
-                }
-                err.to_string()
-            })?;
+            let outdated = state
+                .tool_manager
+                .install_plugin(id)
+                .map_err(|err| err.to_string())?;
             if let Some(host) = outdated {
                 let name = match id {
                     "caveman" => "Caveman",
@@ -2306,7 +2252,6 @@ fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, S
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(app, &format!("{id}_installed"), None);
     Ok(state.dashboard())
 }
 
@@ -2374,8 +2319,6 @@ fn set_addon_enabled_blocking(
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(app, &format!("{id}_{action}"), None);
     Ok(state.dashboard())
 }
 
@@ -2435,7 +2378,6 @@ fn uninstall_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState,
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(app, &format!("{id}_uninstalled"), None);
     Ok(state.dashboard())
 }
 
@@ -2473,14 +2415,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         already_installed
     };
 
-    if already_installed {
-        analytics::track_event(
-            &app,
-            "bootstrap_skipped",
-            Some(json!({ "reason": "already_installed" })),
-        );
-    } else {
-        analytics::track_event(&app, "bootstrap_started", None);
+    if !already_installed {
         pricing::report_funnel_step(&app, "bootstrap_started");
     }
 
@@ -2520,11 +2455,6 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 });
                 state.mark_bootstrap_failed(user_message_for(kind));
                 emit_bootstrap_progress(&app_handle, &state);
-                analytics::track_event(
-                    &app_handle,
-                    "bootstrap_failed",
-                    Some(json!({ "phase": "install_runtime", "kind": kind.as_str() })),
-                );
                 pricing::report_funnel_step(&app_handle, "bootstrap_failed");
                 return;
             }
@@ -2569,14 +2499,14 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             log::debug!("headroom auto-start failed after bootstrap: {err}");
             // Bootstrap finishes and immediately tries to start the proxy;
             // a port conflict here counts as a "fresh launch" stuck case.
-            let handled = port_conflict::note_proxy_failed(&app_handle, &err, true);
+            let handled = port_conflict::note_proxy_failed(&err, true);
             if !handled {
                 capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
             }
             // Fall through so the user is not stuck on the install loader
             // indefinitely. The install screen shows the startup error instead.
         } else {
-            port_conflict::note_proxy_started(&app_handle);
+            port_conflict::note_proxy_started();
             // The intercept layer on 6767 is always bound by the Rust app, so
             // reachability really means "headroom's backend on 6768 is up".
             // We probe it by hitting 6767/readyz — the intercept forwards to
@@ -2599,7 +2529,6 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.set_runtime_starting(false);
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
-        analytics::track_event(&app_handle, "bootstrap_completed", None);
         pricing::report_funnel_step(&app_handle, "bootstrap_completed");
     });
 
@@ -5443,7 +5372,6 @@ async fn request_headroom_auth_code(
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
         let request = pricing::request_auth_code(&state, &email)?;
-        analytics::track_event(&app, "auth_code_requested", None);
         Ok(request)
     })
     .await
@@ -5480,7 +5408,6 @@ async fn verify_headroom_auth_code(
                 state.apply_pricing_gates(&status);
             });
         }
-        analytics::track_event(&app, "auth_verified", None);
         // Pricing status is per-window UI state, so the window that did not run
         // the sign-in keeps rendering the signed-out code form until its own poll
         // ticks. Broadcast so every window re-reads it now.
@@ -5510,7 +5437,6 @@ async fn activate_headroom_account(app: AppHandle) -> Result<HeadroomPricingStat
         let state: State<'_, AppState> = app.state();
         let lifetime_tokens_saved = state.dashboard().lifetime_estimated_tokens_saved;
         let status = pricing::activate_account(&state, lifetime_tokens_saved)?;
-        analytics::track_event(&app, "account_activated", None);
         Ok(status)
     })
     .await
@@ -5533,13 +5459,6 @@ async fn create_headroom_checkout_session(
                 log::warn!("checkout could not be started: {err}");
             },
         )?;
-        analytics::track_event(
-            &app,
-            "checkout_started",
-            Some(json!({
-                "subscription_tier": subscription_tier_label(&subscription_tier)
-            })),
-        );
         Ok(url)
     })
     .await
@@ -5548,19 +5467,11 @@ async fn create_headroom_checkout_session(
 
 #[tauri::command]
 async fn change_headroom_subscription_plan(
-    app: AppHandle,
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         pricing::change_subscription_plan(subscription_tier, billing_period)?;
-        analytics::track_event(
-            &app,
-            "subscription_plan_changed",
-            Some(json!({
-                "subscription_tier": subscription_tier_label(&subscription_tier)
-            })),
-        );
         Ok(())
     })
     .await
@@ -5568,10 +5479,9 @@ async fn change_headroom_subscription_plan(
 }
 
 #[tauri::command]
-async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> {
+async fn reactivate_headroom_subscription() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         pricing::reactivate_subscription()?;
-        analytics::track_event(&app, "subscription_reactivated", None);
         Ok(())
     })
     .await
@@ -5579,10 +5489,9 @@ async fn reactivate_headroom_subscription(app: AppHandle) -> Result<(), String> 
 }
 
 #[tauri::command]
-async fn apply_headroom_referral_code(app: AppHandle, code: String) -> Result<(), String> {
+async fn apply_headroom_referral_code(code: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         pricing::apply_referral_code(&code)?;
-        analytics::track_event(&app, "referral_code_applied", None);
         Ok(())
     })
     .await
@@ -5655,13 +5564,7 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
 #[tauri::command]
 async fn mark_tip_seen(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        for kind in app.state::<AppState>().mark_tips_seen() {
-            analytics::track_event(
-                &app,
-                "activity_tip_seen",
-                Some(serde_json::json!({ "kind": kind.key() })),
-            );
-        }
+        app.state::<AppState>().mark_tips_seen();
     })
     .await
     .map_err(|err| err.to_string())
@@ -5696,11 +5599,6 @@ async fn apply_tip(app: AppHandle, kind: models::TipKind) -> Result<(), String> 
             _ => return Err(format!("{} has nothing to apply", kind.key())),
         };
         let result = client_adapters::set_claude_setting(path, value);
-        analytics::track_event(
-            &app,
-            "activity_tip_applied",
-            Some(serde_json::json!({ "kind": kind.key(), "ok": result.is_ok() })),
-        );
         result.map_err(|err| format!("{err:#}"))?;
         app.state::<AppState>().dismiss_tip(kind);
         Ok(())
@@ -6560,11 +6458,6 @@ async fn open_external_link(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn track_analytics_event(app: AppHandle, name: String, properties: Option<Value>) {
-    analytics::track_event(&app, &name, properties);
-}
-
-#[tauri::command]
 async fn submit_contact_request(
     url: String,
     email: String,
@@ -6747,16 +6640,6 @@ async fn apply_client_setup(
             // screen, and the dashboard connector toggle. First-write-wins
             // server-side, so post-onboarding re-applies are no-ops.
             pricing::report_funnel_step(&app, "client_setup_applied");
-            analytics::track_event(
-                &app,
-                "client_setup_applied",
-                Some(json!({
-                    "client_id": result.client_id.clone(),
-                    "already_configured": result.already_configured,
-                    "verified": result.verification.verified,
-                    "proxy_reachable": result.verification.proxy_reachable
-                })),
-            );
             // Setup returned Ok, but the post-write verification read the
             // files back and found the expected side effect missing. That's
             // the same class of bug as the MCP fallback silent-success —
@@ -6836,15 +6719,7 @@ async fn repair_client_setups(app: AppHandle) -> Result<Vec<String>, String> {
         {
             return Vec::new();
         }
-        let repaired = client_adapters::repair_client_setups();
-        for client_id in &repaired {
-            analytics::track_event(
-                &app,
-                "client_setup_auto_repaired",
-                Some(json!({ "client": client_id })),
-            );
-        }
-        repaired
+        client_adapters::repair_client_setups()
     })
     .await
     .map_err(|err| err.to_string())
@@ -7036,11 +6911,6 @@ async fn detect_unrouted_clients(
                     );
                 },
             );
-            analytics::track_event(
-                &app,
-                "client_unrouted_detected",
-                Some(json!({ "client": client_id, "enabled": enabled, "reapplied": reapplied })),
-            );
             found.push(UnroutedClient {
                 client_id: client_id.into(),
                 name: name.into(),
@@ -7074,7 +6944,7 @@ async fn get_client_connectors(app: AppHandle) -> Result<Vec<ClientConnectorStat
 }
 
 #[tauri::command]
-async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
+async fn disable_client_setup(client_id: String) -> Result<(), String> {
     // Before the disable, so the tray loop cannot see the connector gone
     // first and announce the user's own change as a disconnect.
     *LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
@@ -7087,11 +6957,6 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
             log::warn!("removing the headroom MCP server from Claude Code failed: {err:#}");
         }
     }
-    analytics::track_event(
-        &app,
-        "client_setup_disabled",
-        Some(json!({ "client_id": client_id })),
-    );
     Ok(())
 }
 
@@ -7259,24 +7124,6 @@ async fn save_upstream_override(
         });
         resumed?;
     }
-    analytics::track_event(
-        &app,
-        "upstream_override_saved",
-        Some(json!({
-            "mode": match next.mode {
-                UpstreamOverrideMode::Off => "off",
-                UpstreamOverrideMode::Fallback => "fallback",
-                UpstreamOverrideMode::Override => "override",
-            },
-            // The endpoint itself is the user's business; only whether one and
-            // a token are set.
-            "has_base_url": !next.base_url.is_empty(),
-            "has_token": next.has_token,
-            // Which preset, or "custom" -- enough to see whether the dropdown
-            // covers what people actually run without logging endpoints.
-            "provider": if next.provider.is_empty() { "custom" } else { next.provider.as_str() },
-        })),
-    );
     Ok(next.into())
 }
 
@@ -7353,7 +7200,6 @@ fn pause_headroom_blocking(app: AppHandle) -> Result<(), String> {
         state.mark_setup_wizard_complete();
     }
     client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
-    analytics::track_event(&app, "runtime_paused", None);
     Ok(())
 }
 
@@ -7371,7 +7217,6 @@ fn start_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let resumed = state.resume_runtime();
     std::thread::spawn(client_adapters::restore_client_setups);
     resumed.map_err(|err| err.to_string())?;
-    analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
 }
 
@@ -7394,7 +7239,6 @@ fn force_restart_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let resumed = state.resume_runtime();
     std::thread::spawn(client_adapters::restore_client_setups);
     resumed.map_err(|err| err.to_string())?;
-    analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
 }
 
@@ -7525,8 +7369,6 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
     )
     .map_err(|err| err.to_string())?;
     state.invalidate_runtime_status_cache();
-    let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(&app, &format!("rtk_{action}"), None);
     Ok(!client_adapters::is_rtk_disabled())
 }
 
@@ -7563,10 +7405,8 @@ fn set_vscode_wrapper_enabled(enabled: bool) -> Result<bool, String> {
 /// Toggle the per-conversation savings line under Claude Code's prompt. Takes
 /// effect on Claude Code's next statusline render; no proxy restart needed.
 #[tauri::command]
-async fn set_claude_statusline_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+async fn set_claude_statusline_enabled(enabled: bool) -> Result<bool, String> {
     client_adapters::set_statusline_enabled(enabled).map_err(|err| err.to_string())?;
-    let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(&app, &format!("claude_statusline_{action}"), None);
     Ok(!client_adapters::is_statusline_disabled())
 }
 
@@ -7600,8 +7440,6 @@ fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool
         }
     }
     state.invalidate_runtime_status_cache();
-    let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(&app, &format!("auto_learn_{action}"), None);
     Ok(!client_adapters::is_auto_learn_disabled())
 }
 
@@ -7810,12 +7648,6 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         removed.push(uninstaller.display().to_string());
     }
 
-    analytics::track_event(
-        &app,
-        "uninstall_completed",
-        Some(json!({ "removed_paths": removed.len() })),
-    );
-    analytics::shutdown(&app);
     if let Some(client) = sentry::Hub::current().client() {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
@@ -7832,13 +7664,8 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn quit_headroom(app: AppHandle, confirmed: Option<bool>) {
-    let source = if confirmed.unwrap_or(false) {
-        QuitSource::QuitConfirm
-    } else {
-        QuitSource::SettingsButton
-    };
-    exit_headroom(&app, source);
+async fn quit_headroom(app: AppHandle) {
+    exit_headroom(&app);
 }
 
 /// How recently an agent must have sent a request for Quit to ask first. Long
@@ -8131,11 +7958,10 @@ fn handle_uninstall_flag() {
     std::process::exit(0);
 }
 
-fn exit_headroom(app: &AppHandle, source: QuitSource) {
+fn exit_headroom(app: &AppHandle) {
     SHUTTING_DOWN.store(true, Ordering::Release);
-    let runtime_paused = {
+    {
         let state: tauri::State<'_, AppState> = app.state();
-        let runtime_paused = state.runtime_is_paused();
         stop_headroom_for_exit(&state);
         // Mark the quit-time clear as done so the RunEvent::Exit handler skips
         // its redundant clear_client_setups(). A second call would wipe the
@@ -8147,22 +7973,14 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         {
             let _ = client_adapters::clear_client_setups();
         }
-        runtime_paused
-    };
+    }
 
-    analytics::track_event(
-        app,
-        "app_quit_requested",
-        Some(app_quit_requested_properties(source, runtime_paused)),
-    );
-    // Aptabase alone could not answer whether a trial user who stopped had
-    // quit: half of those who stop after a day or two leave no app check-in
+    // Whether a trial user who stopped had quit: half of those who stop after a day or two leave no app check-in
     // after it (2026-10-26). The funnel row keys this install for that join.
     pricing::report_funnel_step_before_exit(
         "app_quit_requested",
         std::time::Duration::from_secs(2),
     );
-    analytics::shutdown(app);
     if let Some(client) = sentry::Hub::current().client() {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
@@ -8256,13 +8074,6 @@ fn signal_is_ignored(signum: i32) -> bool {
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
     let read = unsafe { libc::sigaction(signum, std::ptr::null(), &mut old) };
     read == 0 && old.sa_sigaction == libc::SIG_IGN
-}
-
-fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
-    json!({
-        "source": source.label(),
-        "runtime_paused": runtime_paused,
-    })
 }
 
 /// Tauri's build error is fatal either way, but on Windows the usual cause is a
@@ -8658,14 +8469,6 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
-            // First thing in setup, before anything that can pump the Windows
-            // message loop (set_size/center below re-enter the webview and can
-            // dispatch a frontend command): every analytics accessor resolves
-            // this state, and a command arriving before it existed aborted the
-            // process (Sentry RUST-HF/HG).
-            app.manage(analytics::AnalyticsClient::new(
-                app.package_info().version.to_string(),
-            ));
             // A previous bootstrap attempt that never reached a verdict: the
             // app was quit, crashed, or killed mid-install, so neither
             // bootstrap_completed nor the error branch ever ran. Production
@@ -8719,8 +8522,8 @@ pub fn run() {
                 );
                 // Funnel mirror of the capture, so the server-side stall query
                 // can tell "died mid-install but came back" from "gone for
-                // good". Needs the AnalyticsClient managed above. Unknown step
-                // names are ignored by servers that predate this one.
+                // good". Unknown step names are ignored by servers that
+                // predate this one.
                 pricing::report_funnel_step(app.handle(), "bootstrap_abandoned");
             }
             // A WebView2 runtime that is registered but broken passes Tauri's
@@ -8830,19 +8633,8 @@ pub fn run() {
             wsl_probe::spawn_probe();
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
-            analytics::set_headroom_ai_version(
-                &app_handle,
+            crate::logging::set_sentry_headroom_ai_version(
                 state.tool_manager.installed_headroom_version(),
-            );
-            analytics::track_event(
-                &app_handle,
-                "app_started",
-                Some(json!({
-                    "launch_experience": state.launch_experience_label(),
-                    "launch_count": state.launch_count(),
-                    "runtime_installed": state.tool_manager.python_runtime_installed(),
-                    "autostart_launch": launched_from_autostart
-                })),
             );
             // Per install, so the trial users whose app stops checking in can
             // be split into "never relaunched at login" and "quit" (paired
@@ -8861,9 +8653,8 @@ pub fn run() {
             // `HEADROOM_ABSORB_OSS_PLUGIN=0` opts out and restores.
             //
             // Off the setup closure: nothing downstream waits on the result,
-            // and the status probe opens a TCP connection to :8787. That must
-            // never sit on the main thread's launch path, least of all for the
-            // majority of users who do not have the plugin at all.
+            // and the CLI probe execs `headroom --version`. That must never sit
+            // on the main thread's launch path.
             // A plugin update lands a fresh version dir with the bare command
             // back, so one pass at startup is not enough for a tray app that
             // stays up for weeks. Re-check on a slow timer; the check itself is
@@ -8871,28 +8662,8 @@ pub fn run() {
             // already managing.
             const OSS_PLUGIN_RECHECK_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(300);
-            let oss_handle = app_handle.clone();
             std::thread::spawn(move || {
-                let oss = client_adapters::absorb_oss_plugin();
-                // Only worth an event when there is something to report; every
-                // launch already counts in `app_started`. `base_url_ours: false`
-                // alongside `oss_proxy_8787: true` is the state where the user
-                // ran `headroom init` themselves and their traffic bypasses us,
-                // so our savings under-report — measured, not fought.
-                if oss.plugin_installed || oss.oss_proxy_8787 {
-                    analytics::track_event(
-                        &oss_handle,
-                        "oss_plugin_detected",
-                        Some(json!({
-                            "plugin_installed": oss.plugin_installed,
-                            "hook_absorbed": oss.hook_absorbed,
-                            "cli_on_path": oss.cli_on_path,
-                            "oss_proxy_8787": oss.oss_proxy_8787,
-                            "base_url_ours": oss.base_url_ours
-                        })),
-                    );
-                }
-                // Startup cadence for the event, not for the repair.
+                client_adapters::absorb_oss_plugin();
                 loop {
                     std::thread::sleep(OSS_PLUGIN_RECHECK_INTERVAL);
                     if SHUTTING_DOWN.load(Ordering::Acquire) {
@@ -9150,7 +8921,6 @@ pub fn run() {
             pause_headroom,
             start_headroom,
             force_restart_headroom,
-            track_analytics_event,
             get_debug_overrides,
             show_dashboard_window,
             open_headroom_dashboard,
@@ -9211,24 +8981,6 @@ pub fn run() {
             run_exit_teardown(&state, false);
         }
     });
-}
-
-fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
-    match tier {
-        HeadroomSubscriptionTier::Pro => "pro",
-        HeadroomSubscriptionTier::Max5x => "max5x",
-        HeadroomSubscriptionTier::Max20x => "max20x",
-        HeadroomSubscriptionTier::Pro500 => "pro500",
-    }
-}
-
-fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
-    match milestone_tokens_saved {
-        1_000_000 => "first_1m",
-        5_000_000 => "first_5m",
-        10_000_000 => "first_10m",
-        _ => "repeating_10m",
-    }
 }
 
 /// How many recent days of savings travel with the milestone/heartbeat post.
@@ -11426,7 +11178,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     *TRAY_QUIT_HANDED_OFF_AT.lock() = Some(std::time::Instant::now());
                     let _ = app.emit("open-view", "confirm-quit");
                 } else {
-                    exit_headroom(app, QuitSource::TrayMenu);
+                    exit_headroom(app);
                 }
             }
             _ => {}
@@ -12350,7 +12102,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     state.stop_headroom();
                     consecutive_failures = 0;
                     match state.ensure_headroom_running() {
-                        Ok(()) => port_conflict::note_proxy_started(&app),
+                        Ok(()) => port_conflict::note_proxy_started(),
                         Err(err) => {
                             // Through the classifier, not the log bridge: the
                             // bridged warn carried the whole error chain (argv,
@@ -12362,7 +12114,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                             // denied loopback socket and a port conflict each
                             // get their own remedy and their own issue.
                             log::info!("watchdog: hung-kill restart failed: {err:#}");
-                            if !port_conflict::note_proxy_failed(&app, &err, false) {
+                            if !port_conflict::note_proxy_failed(&err, false) {
                                 capture_headroom_start_failure("watchdog hung-kill restart", &err);
                             }
                             state.redownload_lost_base_interpreter(&app);
@@ -12475,7 +12227,6 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // "stopped unexpectedly" banner with a Resume button.
                 state.set_runtime_auto_paused(true);
                 state.stop_headroom();
-                analytics::track_event(&app, "runtime_auto_paused", None);
                 // Once per down episode. Every failed self-heal retry ends back
                 // here, so a backend that never starts re-notified at 30s, 1m,
                 // 2m and then every 5 minutes for as long as the app ran.
@@ -12548,7 +12299,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 state.stop_headroom();
             }
             match state.ensure_headroom_running() {
-                Ok(()) => port_conflict::note_proxy_started(&app),
+                Ok(()) => port_conflict::note_proxy_started(),
                 Err(err) => {
                     // info! not warn!: FileLogger forwards warn!/error! to
                     // Sentry as a payload-less capture_message. This fires on
@@ -12557,7 +12308,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     // once per episode after MAX_CONSECUTIVE_FAILURES.
                     log::info!("watchdog: ensure_headroom_running failed: {err:#}");
                     // In-session retry: don't bump the launch counter.
-                    port_conflict::note_proxy_failed(&app, &err, false);
+                    port_conflict::note_proxy_failed(&err, false);
                     state.redownload_lost_base_interpreter(&app);
                 }
             }
@@ -12581,7 +12332,7 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         // User 2157's 0.9.42 sent none for three days of 86% failed Codex
         // requests, and the stuck-host alert never saw them (2026-10-24).
         let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
-        report_pending_milestones(&app, &state, &dashboard, &pending_milestones);
+        report_pending_milestones(&dashboard, &pending_milestones);
         let today_key = Local::now().format("%Y-%m-%d").to_string();
         // Both Headroom layers, matching the home chart's headline total.
         let savings = dashboard
@@ -12923,7 +12674,7 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
         return;
     }
     match state.ensure_headroom_running() {
-        Ok(()) => port_conflict::note_proxy_started(app),
+        Ok(()) => port_conflict::note_proxy_started(),
         Err(err) => {
             // The managed runtime can disappear out from under a running app
             // (disk cleanup, AV quarantine, a wiped Application Support dir), or
@@ -12945,7 +12696,7 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
             }
             // Tray open is in-session (not a fresh launch); pass false so the
             // launch counter is preserved instead of double-counting clicks.
-            let handled = port_conflict::note_proxy_failed(app, &err, false);
+            let handled = port_conflict::note_proxy_failed(&err, false);
             if !handled {
                 capture_headroom_start_failure("ensure_runtime_ready_for_tray failed", &err);
             }
@@ -13505,13 +13256,13 @@ mod tests {
     use super::ensure_launch_agent_interactive;
     use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
     use super::{
-        aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
-        build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
-        classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
-        classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
-        compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
+        aggregate_live_learnings, app_update_notification_body, auto_resume_backoff,
+        beta_channel_enabled_from, build_release_updater_config, build_watchdog_give_up_report,
+        check_headroom_learn_prereqs, child_state_fingerprint_key, classify_backend_readyz,
+        classify_bootstrap_failure, classify_update_check, classify_upgrade_error,
+        client_setup_error_kind, compute_panel_corner_position, compute_tray_window_position,
+        conflicting_openssl_dirs, count_memories_created_today, cpu_rate_indicates_burn,
+        debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, feed_failure_is_persistent, feed_pull_limit, fetch_request_bodies_from,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
@@ -13527,21 +13278,21 @@ mod tests {
         learn_failure_is_agent_config_broken, learn_failure_is_agent_install_broken,
         learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature, learn_failure_signature_source, learn_step_label,
-        lifetime_token_milestone_kind, lost_base_retry_backoff, missing_dependency_modules,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, snap_to_work_area_edges,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, upgrade_pip_network_refused,
-        user_message_for, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        lost_base_retry_backoff, missing_dependency_modules, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, savings_report, select_updater_endpoints,
+        snap_to_work_area_edges, startup_error_fingerprint_key, store_checked_update,
+        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link,
+        upgrade_pip_network_refused, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -13969,28 +13720,6 @@ mod tests {
             t0 + window + window,
             window
         ));
-    }
-
-    #[test]
-    fn app_quit_requested_properties_include_source_and_runtime_state() {
-        assert_eq!(
-            app_quit_requested_properties(QuitSource::SettingsButton, false),
-            json!({
-                "source": "settings_button",
-                "runtime_paused": false,
-            })
-        );
-        assert_eq!(
-            app_quit_requested_properties(QuitSource::TrayMenu, true),
-            json!({
-                "source": "tray_menu",
-                "runtime_paused": true,
-            })
-        );
-        assert_eq!(
-            app_quit_requested_properties(QuitSource::QuitConfirm, false)["source"],
-            "quit_confirm"
-        );
     }
 
     #[test]
@@ -15381,14 +15110,6 @@ mod tests {
                 height: 24,
             }
         );
-    }
-
-    #[test]
-    fn token_milestone_kind_labels_first_and_repeating_thresholds() {
-        assert_eq!(lifetime_token_milestone_kind(1_000_000), "first_1m");
-        assert_eq!(lifetime_token_milestone_kind(5_000_000), "first_5m");
-        assert_eq!(lifetime_token_milestone_kind(10_000_000), "first_10m");
-        assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
     }
 
     #[test]
