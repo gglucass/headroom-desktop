@@ -4545,6 +4545,11 @@ pub(crate) fn is_out_of_memory_signal(text: &str) -> bool {
 /// `DLL load failed` ImportError (RUST-7W/8V/8W) both stay out of it.
 pub(crate) fn is_missing_headroom_module_signal(text: &str) -> bool {
     text.contains("ModuleNotFoundError: No module named 'headroom")
+        // `from headroom import savings_ledger` with that file gone raises
+        // ImportError instead (RUST-CY, 0.9.61 Windows after an abandoned update).
+        || text.lines().any(|line| {
+            line.contains("ImportError: cannot import name '") && line.contains(" from 'headroom")
+        })
 }
 
 /// The requirements half of the above: the top-level modules of third-party
@@ -18981,6 +18986,10 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(tail)),
             Some("startup_venv_missing_module")
         );
+        // RUST-CY on 0.9.61 Windows: the same tear seen through `from headroom import`.
+        let from_import = "    from headroom import savings_ledger\nImportError: cannot import name \
+                           'savings_ledger' from 'headroom' (~\\venv\\Lib\\site-packages\\headroom\\__init__.py)\n";
+        assert!(is_missing_headroom_module_signal(from_import));
         // Third RUST-C8 shape: the base interpreter lost its stdlib. Its own
         // bucket, and bootstrap re-downloads the runtime on the next launch.
         assert_eq!(
@@ -18998,6 +19007,7 @@ Some unrelated content.
             "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
             "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: No module \
              named 'onnxruntime')",
+            "ImportError: cannot import name 'HTTPSHandler' from 'urllib.request'",
         ] {
             assert!(!is_missing_headroom_module_signal(other), "for: {other}");
         }
