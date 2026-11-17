@@ -34,7 +34,7 @@ export function VSCodeWrapperPanel() {
           <p className="panel-card__subtitle">
             Let Headroom restart Claude Code in the VS Code panel for Remote Control. Turn this off
             if your security policy blocks the process wrapper. Proxy routing and tool search stay
-            enabled. Off by default on Windows.
+            enabled.
           </p>
         </div>
         <button

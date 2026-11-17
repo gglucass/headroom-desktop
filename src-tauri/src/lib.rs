@@ -4,6 +4,7 @@ mod backend_port;
 mod bearer;
 mod claude_cli;
 mod claude_statusline;
+mod claude_wrapper;
 mod client_adapters;
 mod device;
 mod env_fault;
@@ -8313,6 +8314,12 @@ fn webview_lockfile_held(lockfile: &std::path::Path) -> bool {
 }
 
 pub fn run() {
+    // The VS Code wrapper is a signed copy of this binary (claude_wrapper.rs):
+    // it runs the Python wrapper and exits before anything of the app starts.
+    #[cfg(windows)]
+    if let Some(code) = claude_wrapper::run_as_wrapper() {
+        std::process::exit(code);
+    }
     // Launched through a symlink (`~/.local/bin/headroom` -> the bundle binary),
     // tauri's current_exe() refuses the path on macOS, so every update check
     // failed (RUST-KR/KS). Handing the updater an `executable_path` does not

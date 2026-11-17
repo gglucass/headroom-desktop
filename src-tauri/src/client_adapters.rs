@@ -272,12 +272,11 @@ pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
 }
 
-/// The Windows process wrapper is generated locally, so it has no publisher
-/// signature. Leave it off by default there for Smart App Control users.
+/// On by default everywhere: the Windows wrapper is a signed copy of the app
+/// (claude_wrapper.rs), so Smart App Control lets it run. 0.9.63 shipped it
+/// off on Windows, while the wrapper there was still unsigned.
 pub fn is_vscode_wrapper_enabled() -> bool {
-    load_setup_state()
-        .vscode_wrapper_enabled
-        .unwrap_or(!cfg!(windows))
+    load_setup_state().vscode_wrapper_enabled.unwrap_or(true)
 }
 
 pub fn set_vscode_wrapper_enabled(enabled: bool) -> Result<()> {
@@ -8693,11 +8692,12 @@ fn claude_code_shell_block(port: u16) -> String {
 /// own output lands first.
 fn claude_remote_control_wrapper_path() -> PathBuf {
     // An .exe on Windows: the extension spawns the wrapper with `shell: false`
-    // (`build_windows_wrapper_exe`).
+    // (a signed copy of the app, claude_wrapper.rs, beside its .py script).
+    let stem = crate::claude_wrapper::WRAPPER_STEM;
     let name = if cfg!(windows) {
-        "headroom-claude-wrapper.exe"
+        format!("{stem}.exe")
     } else {
-        "headroom-claude-wrapper.py"
+        format!("{stem}.py")
     };
     home_dir().join(".claude").join("hooks").join(name)
 }
@@ -9014,48 +9014,15 @@ while True:
     .to_string()
 }
 
-/// The Windows wrapper. The extension spawns it with `shell: false`, so it has
-/// to be an .exe; it is built the way pip builds console scripts: distlib's
-/// launcher stub, a shebang naming the interpreter, and a zip holding the
-/// wrapper as `__main__.py`. The stub finds the shebang just before the zip
-/// (the zip's own offsets locate its start, so they must count from it) and
-/// runs `<python> <exe> <args>`, and Python runs the zip.
-fn build_windows_wrapper_exe(stub: &[u8], python: &Path, source: &str) -> Result<Vec<u8>> {
-    use std::io::Write;
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    zip.start_file(
-        "__main__.py",
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-    )?;
-    zip.write_all(source.as_bytes())?;
-    let archive = zip.finish()?.into_inner();
-    let mut exe = stub.to_vec();
-    exe.extend_from_slice(format!("#!\"{}\"\n", python.display()).as_bytes());
-    exe.extend_from_slice(&archive);
-    Ok(exe)
-}
-
-/// The interpreter and launcher stub for the Windows wrapper, when both are
-/// there. The base interpreter, not the venv's: a running wrapper holds its
-/// executable open for the whole panel session, and the venv is the part a
-/// runtime repair deletes. The stub ships in the venv's pip.
-fn windows_wrapper_parts() -> Option<(PathBuf, PathBuf)> {
+/// The interpreter for the Windows wrapper, when the runtime has one. The
+/// base interpreter, not the venv's: a running wrapper holds its interpreter
+/// open for the whole panel session, and the venv is the part a runtime repair
+/// deletes.
+fn windows_wrapper_python() -> Option<PathBuf> {
     let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir());
-    let stub = if cfg!(target_arch = "aarch64") {
-        "t64-arm.exe"
-    } else {
-        "t64.exe"
-    };
-    let stub = runtime
-        .venv_dir
-        .join("Lib")
-        .join("site-packages")
-        .join("pip")
-        .join("_vendor")
-        .join("distlib")
-        .join(stub);
-    (runtime.standalone_runtime_intact() && stub.is_file())
-        .then(|| (runtime.standalone_python(), stub))
+    runtime
+        .standalone_runtime_intact()
+        .then(|| runtime.standalone_python())
 }
 
 /// Windows gets the VS Code panel restart only: the terminal one needs the
@@ -9066,7 +9033,7 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
         remove_owned_vscode_panel_command()?;
         return Ok((Vec::new(), Vec::new()));
     }
-    let Some((python, stub)) = windows_wrapper_parts() else {
+    let Some(python) = windows_wrapper_python() else {
         // No runtime yet: no wrapper, and no command offering a restart
         // nothing would perform. The next setup after bootstrap adds both.
         remove_vscode_process_wrapper()?;
@@ -9075,16 +9042,25 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     let mut changed = Vec::new();
     let mut backups = Vec::new();
     let wrapper = claude_remote_control_wrapper_path();
-    let exe = build_windows_wrapper_exe(
-        &std::fs::read(&stub).with_context(|| format!("reading {}", stub.display()))?,
+    if let Some(parent) = wrapper.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // The script first: the wrapper copy reads it at every start.
+    let script = wrapper.with_extension("py");
+    let source = crate::claude_wrapper::script_with_interpreter(
         &python,
         &build_claude_remote_control_wrapper(),
-    )?;
+    );
+    if std::fs::read_to_string(&script).ok().as_deref() != Some(source.as_str()) {
+        atomic_write(&script, source.as_bytes())?;
+        changed.push(script.display().to_string());
+    }
+    // A copy of this signed binary (claude_wrapper.rs): Smart App Control and
+    // App Control refuse an unsigned wrapper, and then the panel never starts.
+    let app = std::env::current_exe().context("locating Headroom's own binary")?;
+    let exe = std::fs::read(&app).with_context(|| format!("reading {}", app.display()))?;
     if std::fs::read(&wrapper).ok().as_deref() != Some(exe.as_slice()) {
-        if let Some(parent) = wrapper.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         match atomic_write(&wrapper, &exe) {
             Ok(()) => changed.push(wrapper.display().to_string()),
             // A panel session running it holds the file; the old wrapper still
@@ -9140,7 +9116,7 @@ fn remove_owned_vscode_panel_command() -> Result<()> {
 /// working /usr/bin/python3 (the wrapper's interpreter): without the Command
 /// Line Tools it is a stub that fails on macOS, a distro may not ship it at
 /// all, and every panel session would then fail to start. Windows checks its
-/// interpreter before building the .exe (`windows_wrapper_parts`).
+/// interpreter before writing the wrapper (`windows_wrapper_python`).
 fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
     if !is_vscode_wrapper_enabled() {
         remove_vscode_process_wrapper()?;
@@ -9229,6 +9205,9 @@ fn remove_vscode_wrapper_file_if_unreferenced() {
     }
     if let Err(err) = std::fs::remove_file(&wrapper) {
         log::warn!("cleanup: removing {} failed: {err}", wrapper.display());
+    }
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(wrapper.with_extension("py"));
     }
 }
 
@@ -12517,9 +12496,7 @@ mod tests {
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
         VSCODE_PROCESS_WRAPPER_KEY,
     };
-    use super::{
-        build_claude_remote_control_wrapper, build_windows_wrapper_exe, set_json_setting_at,
-    };
+    use super::{build_claude_remote_control_wrapper, set_json_setting_at};
     #[cfg(unix)]
     use super::{
         build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
@@ -20826,34 +20803,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
             .exists());
     }
 
-    #[test]
-    fn windows_wrapper_exe_puts_the_shebang_right_before_its_zip() {
-        let python = Path::new(r"C:\Users\A B\AppData\Roaming\Headroom\python.exe");
-        let exe = build_windows_wrapper_exe(b"MZstub", python, "print(1)\n").unwrap();
-        // What distlib's launcher does: locate the end-of-central-directory
-        // record, step back over the directory to the archive's start, and
-        // read the shebang line that ends there.
-        let eocd = exe
-            .windows(4)
-            .rposition(|w| w == b"PK\x05\x06")
-            .expect("end of central directory");
-        let u32_at = |at: usize| u32::from_le_bytes(exe[at..at + 4].try_into().unwrap()) as usize;
-        let start = eocd - u32_at(eocd + 12) - u32_at(eocd + 16);
-        assert_eq!(&exe[..6], b"MZstub");
-        assert_eq!(
-            &exe[6..start],
-            "#!\"C:\\Users\\A B\\AppData\\Roaming\\Headroom\\python.exe\"\n".as_bytes()
-        );
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&exe[start..])).unwrap();
-        let mut main = String::new();
-        std::io::Read::read_to_string(&mut zip.by_name("__main__.py").unwrap(), &mut main).unwrap();
-        assert_eq!(main, "print(1)\n");
-    }
-
     /// The Windows flow, run by the system Python with the Windows switch on:
     /// --confirm records the restart, and the wrapper ends its child after the
     /// turn's result and resumes the same session with Remote Control on. The
-    /// file is the real .exe layout minus the stub, which Python runs as a zip.
+    /// file is the real .py the signed wrapper copy runs, interpreter line and all.
     #[cfg(unix)]
     #[test]
     fn windows_wrapper_restarts_its_child_once_the_confirmed_turn_ends() {
@@ -20862,10 +20815,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         let source = build_claude_remote_control_wrapper()
             .replace("ENDS_CHILD = os.name == \"nt\"", "ENDS_CHILD = True");
         assert!(source.contains("ENDS_CHILD = True"));
-        let wrapper = home.path().join("wrapper.exe");
+        let wrapper = home.path().join("headroom-claude-wrapper.py");
         std::fs::write(
             &wrapper,
-            build_windows_wrapper_exe(b"", Path::new("/usr/bin/python3"), &source).unwrap(),
+            crate::claude_wrapper::script_with_interpreter(Path::new("/usr/bin/python3"), &source),
         )
         .unwrap();
         let log = home.path().join("argv.log");
