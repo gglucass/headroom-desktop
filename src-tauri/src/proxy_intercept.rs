@@ -3720,6 +3720,12 @@ fn report_upstream_error(
     {
         return;
     }
+    // xAI's cli-chat-proxy answers an outdated Grok CLI 426 ("Your Grok CLI
+    // version ... is outdated"), and the CLI shows that line itself; only
+    // `grok update` fixes it (RUST-WS).
+    if client == "grok-build" && status == 426 {
+        return;
+    }
     // 401 splits on the body, like the geo-block above: "Missing bearer" means
     // the client sent NO credentials -- a setup bug (ours to fix, and worth an
     // issue: the 2026-09-03 flagless-provider-block loop was invisible in

@@ -236,7 +236,7 @@ jobs:
     needs: guard
     if: needs.guard.outputs.should_release == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     env:
       # Same endpoint pair the macOS staging job bakes in, so an rc install
@@ -272,6 +272,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
@@ -284,16 +289,45 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Key signed Windows runtime
+        id: signed-runtime-key
+        shell: bash
+        run: echo "sha=$(python scripts/build-windows-signed-runtime.py cache-key)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore signed Windows runtime
+        id: signed-runtime-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/resources/windows-signed-runtime.tar.gz
+          key: signed-windows-runtime-v1-${{ steps.signed-runtime-key.outputs.sha }}
+
       - name: Install Azure Artifact Signing CLI
         # Pinned on purpose: this binary runs with the signing secrets in env.
         # crates.io versions are immutable; bump by hand after reviewing the diff.
         run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
+      - name: Build and verify signed Windows runtime
+        shell: pwsh
+        run: ./scripts/build-windows-signed-runtime.ps1
+
+      - name: Cache verified signed Windows runtime
+        if: steps.signed-runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/resources/windows-signed-runtime.tar.gz
+          key: signed-windows-runtime-v1-${{ steps.signed-runtime-key.outputs.sha }}
+
+      - name: Publish signed Windows runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish-windows-signed-runtime.sh
+
       - name: Build NSIS installer
         shell: bash
         # NSIS only: bundle.targets is "all", which also builds an MSI this
-        # workflow never publishes. signCommand signs both the inner .exe and
-        # the installer; SmartScreen still warns until reputation accrues.
+        # workflow never publishes. signCommand signs the app and installer;
+        # the app downloads the signed runtime published above.
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Collect Windows installer

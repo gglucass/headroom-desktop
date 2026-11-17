@@ -102,6 +102,7 @@ LOCKS = {
     "headroom-requirements.lock": ["darwin-arm64", "darwin-x86_64"],
     "headroom-linux-requirements.lock": ["linux-x86_64", "linux-aarch64"],
     "headroom-windows-requirements.lock": ["win-amd64"],
+    "markitdown-windows.lock": ["win-amd64"],
 }
 
 
@@ -208,6 +209,8 @@ def export(directory: Path) -> int:
     it runs on, so auditing a lock directly skips other platforms' pins (the
     Intel-Mac-only ones, on a Linux runner)."""
     directory.mkdir(parents=True, exist_ok=True)
+    # Two locks serve win-amd64 (the signed runtime's MarkItDown): one file per target.
+    exported: dict[str, list[str]] = {}
     for lock, targets in LOCKS.items():
         items = parse_lock((LOCK_DIR / lock).read_text())
         for target in targets:
@@ -221,8 +224,10 @@ def export(directory: Path) -> int:
                     continue
                 req.marker = None
                 entries.append(" \\\n".join([str(req), *(f"    --hash=sha256:{h}" for h in hashes)]))
-            (directory / f"{target}.txt").write_text("\n".join(entries) + "\n")
-            print(f"exported {target}.txt from {lock} ({len(entries)} pins)")
+            exported.setdefault(target, []).extend(entries)
+            print(f"exported {len(entries)} pins from {lock} to {target}.txt")
+    for target, entries in exported.items():
+        (directory / f"{target}.txt").write_text("\n".join(entries) + "\n")
     return 0
 
 

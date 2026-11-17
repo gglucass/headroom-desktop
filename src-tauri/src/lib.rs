@@ -1263,7 +1263,8 @@ async fn install_app_update(
 /// TempDir's drop deletes Headroom.app (and the user's clients then point at a
 /// dead port once it quits). An APFS clone taken before the install (instant,
 /// no extra space; `bundle_is_on_another_volume` keeps it on one volume) puts
-/// the bundle back. Dropping it removes the copy.
+/// the bundle back. Dropping it removes the copy. With no copy the install is
+/// refused (`NO_BUNDLE_COPY_MESSAGE`), so a failed swap can never lose the app.
 #[cfg(target_os = "macos")]
 struct BundleSafetyCopy {
     bundle: std::path::PathBuf,
@@ -1272,22 +1273,18 @@ struct BundleSafetyCopy {
 
 #[cfg(target_os = "macos")]
 impl BundleSafetyCopy {
-    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> Option<Self> {
+    fn take(bundle: &std::path::Path, copy: std::path::PathBuf) -> std::io::Result<Self> {
         use std::os::unix::ffi::OsStrExt;
         // A failed restore may have left the only working bundle in a prior
         // copy. Each attempt owns its path; never delete another attempt's.
         let copy = copy.with_extension(uuid::Uuid::new_v4().to_string());
-        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes()).ok()?;
-        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes()).ok()?;
+        let src = std::ffi::CString::new(bundle.as_os_str().as_bytes())?;
+        let dst = std::ffi::CString::new(copy.as_os_str().as_bytes())?;
         // SAFETY: both are valid NUL-terminated paths that outlive the call.
         if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
-            log::info!(
-                "update: no bundle safety copy: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
+            return Err(std::io::Error::last_os_error());
         }
-        Some(Self {
+        Ok(Self {
             bundle: bundle.to_path_buf(),
             copy,
         })
@@ -1542,16 +1539,22 @@ where
     #[cfg(target_os = "macos")]
     let overlapped = INSTALLING_UPDATE.load(Ordering::Acquire);
     // Both the webview command and the headless idle applier install here.
+    // INSTALL_LOCK rules out a concurrent swap, so every install takes a copy,
+    // and one that cannot (unreadable file, full disk) leaves this build running.
     #[cfg(target_os = "macos")]
     let safety_copy = bundle
         .as_deref()
-        .filter(|_| !overlapped)
-        .and_then(|bundle| {
+        .map(|bundle| {
             BundleSafetyCopy::take(
                 bundle,
                 std::env::temp_dir().join("headroom-update-bundle-copy"),
             )
-        });
+            .map_err(|err| {
+                log::info!("update: refusing install; no bundle safety copy of {bundle:?}: {err}");
+                format!("{NO_BUNDLE_COPY_MESSAGE} ({err})")
+            })
+        })
+        .transpose()?;
     INSTALLING_UPDATE.store(true, Ordering::Release);
     let result = update.install(progress).await;
     #[cfg(target_os = "macos")]
@@ -1702,6 +1705,15 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 const MOVED_BUNDLE_MESSAGE: &str =
     "Headroom cannot update itself because it was moved or deleted while running. \
      Quit Headroom, open it from its current location, then check for updates again.";
+
+/// The message shown when no safety copy of the bundle could be taken, so the
+/// install is refused (RUST-WB). See `BundleSafetyCopy`. The OS error follows
+/// it, which lets the frontend show a full disk as such.
+#[cfg(target_os = "macos")]
+const NO_BUNDLE_COPY_MESSAGE: &str =
+    "Headroom kept this version because it could not make a backup copy of itself to \
+     update safely. Download the newest version from https://extraheadroom.com/dl/mac \
+     and replace Headroom in your Applications folder.";
 
 /// The message shown when the running bundle is on another volume than
 /// `$TMPDIR`. See `bundle_is_on_another_volume`.
@@ -2550,6 +2562,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.tool_manager.seed_verbosity_baseline_if_needed();
 
         let ensure_result = state.ensure_headroom_running();
+        let mut proxy_reachable = false;
         state.set_runtime_starting(true);
 
         if let Err(err) = ensure_result {
@@ -2575,12 +2588,14 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 if state::headroom_proxy_reachable() {
+                    proxy_reachable = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
 
+        state.clear_upgrade_failure_after_bootstrap(proxy_reachable);
         state.set_runtime_starting(false);
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
@@ -4532,6 +4547,11 @@ pub(crate) fn is_out_of_memory_signal(text: &str) -> bool {
 /// `DLL load failed` ImportError (RUST-7W/8V/8W) both stay out of it.
 pub(crate) fn is_missing_headroom_module_signal(text: &str) -> bool {
     text.contains("ModuleNotFoundError: No module named 'headroom")
+        // `from headroom import savings_ledger` with that file gone raises
+        // ImportError instead (RUST-CY, 0.9.61 Windows after an abandoned update).
+        || text.lines().any(|line| {
+            line.contains("ImportError: cannot import name '") && line.contains(" from 'headroom")
+        })
 }
 
 /// The requirements half of the above: the top-level modules of third-party
@@ -6023,7 +6043,7 @@ fn run_activity_observation(app: &AppHandle) {
     // No point nudging the user to run Train if the claude CLI isn't installed —
     // they'd just hit an install prompt. The Optimize tab surfaces the install
     // UI in that case; let them fix prereqs first.
-    if state.headroom_learn_prereq_status().claude_cli_available {
+    if state.claude_cli_available() {
         let _ = state.observe_train_suggestions(&projects);
     }
 }
@@ -7527,6 +7547,17 @@ fn set_usage_data_enabled(enabled: bool) -> Result<bool, String> {
 #[tauri::command]
 fn get_claude_statusline_enabled() -> bool {
     !client_adapters::is_statusline_disabled()
+}
+
+#[tauri::command]
+fn get_vscode_wrapper_enabled() -> bool {
+    client_adapters::is_vscode_wrapper_enabled()
+}
+
+#[tauri::command]
+fn set_vscode_wrapper_enabled(enabled: bool) -> Result<bool, String> {
+    client_adapters::set_vscode_wrapper_enabled(enabled).map_err(|err| err.to_string())?;
+    Ok(client_adapters::is_vscode_wrapper_enabled())
 }
 
 /// Toggle the per-conversation savings line under Claude Code's prompt. Takes
@@ -9137,6 +9168,8 @@ pub fn run() {
             get_compression_diff,
             get_claude_statusline_enabled,
             set_claude_statusline_enabled,
+            get_vscode_wrapper_enabled,
+            set_vscode_wrapper_enabled,
             get_usage_data_enabled,
             set_usage_data_enabled,
             uninstall_and_quit,
@@ -10075,6 +10108,37 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
         .lines()
         .any(|line| line.trim_start().starts_with("ERROR: Connection failed:"))
     {
+        return true;
+    }
+    // RUST-WZ: codex giving up on the 5xx our backend answers when IT never
+    // reached the provider. The proxy's own failure reporting covers the
+    // cases that are ours (see `with_unreachable_cause`).
+    let mut lines = text.lines().peekable();
+    let mut upstream_unreachable = false;
+    while let Some(line) = lines.next() {
+        if !line.trim_start().starts_with("ERROR: unexpected status ") {
+            continue;
+        }
+        // Keep the status and its body together, including SSE's `data:`
+        // lines. A prior network retry must not hide a later internal error
+        // or a 400 caused by the prompt we built.
+        let mut diagnostic = line.to_string();
+        while lines
+            .peek()
+            .is_some_and(|line| !line.trim_start().starts_with("ERROR:"))
+        {
+            diagnostic.push('\n');
+            diagnostic.push_str(lines.next().unwrap());
+        }
+        if !line.trim_start().starts_with("ERROR: unexpected status 5")
+            || !(diagnostic.contains("\"upstream_unreachable\"")
+                || diagnostic.contains("\"upstream_timeout\""))
+        {
+            return false;
+        }
+        upstream_unreachable = true;
+    }
+    if upstream_unreachable {
         return true;
     }
     let mut statusless = false;
@@ -14706,25 +14770,65 @@ mod tests {
         );
     }
 
+    /// An installer whose swap deletes the bundle and fails (RUST-WB).
+    #[cfg(target_os = "macos")]
+    struct LosingUpdate(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl InstallableAppUpdate for LosingUpdate {
+        fn metadata(&self) -> AvailableAppUpdate {
+            unreachable!()
+        }
+        fn bundle_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.clone())
+        }
+        fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
+            Box::pin(async move {
+                std::fs::remove_dir_all(&self.0).unwrap();
+                Err("swap failed".into())
+            })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn install_pending_update_refuses_to_swap_without_a_safety_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Headroom.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
+        // One unreadable file makes clonefile fail with EACCES.
+        let unreadable = bundle.join("Contents/unreadable");
+        std::fs::write(&unreadable, b"x").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(install_pending_update(
+                &pending,
+                noop_app_update_progress_emitter(),
+            ))
+            .unwrap_err();
+        assert!(error.starts_with(super::NO_BUNDLE_COPY_MESSAGE), "{error}");
+        assert!(
+            error.ends_with("(Permission denied (os error 13))"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(bundle.join("Contents/Info.plist")).unwrap(),
+            b"old",
+            "the swap ran without a safety copy and lost the app"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial]
     fn install_pending_update_restores_a_bundle_lost_by_an_idle_install() {
-        struct LosingUpdate(std::path::PathBuf);
-        impl InstallableAppUpdate for LosingUpdate {
-            fn metadata(&self) -> AvailableAppUpdate {
-                unreachable!()
-            }
-            fn bundle_path(&self) -> Option<std::path::PathBuf> {
-                Some(self.0.clone())
-            }
-            fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
-                Box::pin(async move {
-                    std::fs::remove_dir_all(&self.0).unwrap();
-                    Err("swap failed".into())
-                })
-            }
-        }
         let root = tempfile::tempdir().unwrap();
         let bundle = root.path().join("Headroom.app");
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
@@ -16954,6 +17058,24 @@ Some unrelated content.
         );
     }
 
+    /// The observer runs from launch, before sign-in. Probing Codex there ran
+    /// an XProtect-flagged `codex` and macOS showed "Malware Blocked" over the
+    /// sign-in screen of a fresh install (2026-11-12).
+    #[test]
+    fn activity_observer_never_probes_codex() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let start = source
+            .find("\nfn run_activity_observation(")
+            .expect("observer fn");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("fn end")];
+        assert!(
+            body.contains("state.claude_cli_available()")
+                && !body.contains("learn_prereq")
+                && !body.to_lowercase().contains("codex"),
+            "the observer must not run codex: {body}"
+        );
+    }
+
     /// curl|bash (or irm|iex) runs 30-60s with no timeout; a sync body under
     /// `command(async)` pinned an async worker for all of it.
     #[test]
@@ -17880,6 +18002,15 @@ Some unrelated content.
         assert!(!learn_failure_is_agent_api_unreachable(
             "LLM analysis failed: `codex exec --skip-git-repo-check` did not respond within 900s. Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
         ));
+        // RUST-WZ, real tail: our backend never reached OpenAI, so codex's
+        // last word is the backend's 502.
+        assert!(learn_failure_is_agent_api_unreachable(
+            "ERROR: Reconnecting... 5/5\nERROR: unexpected status 502 Bad Gateway: event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect to upstream API. (request_id=hr_1794754342_000641)\", \"code\": \"upstream_unreachable\"}, \"request_id\": \"hr_1794754342_000641\"}, url: http://127.0.0.1:6767/v1/responses\n"
+        ));
+        // A 5xx that is our backend's own fault keeps reporting.
+        assert!(!learn_failure_is_agent_api_unreachable(
+            "ERROR: unexpected status 500 Internal Server Error: {\"error\": {\"type\": \"api_error\", \"code\": \"internal_error\"}}\n"
+        ));
     }
 
     #[test]
@@ -17907,6 +18038,24 @@ Some unrelated content.
                 "for: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn learn_network_retry_does_not_hide_a_later_prompt_or_internal_error() {
+        let network = "ERROR: unexpected status 502 Bad Gateway: event: error\ndata: {\"error\": {\"code\": \"upstream_unreachable\"}}\n";
+        assert!(learn_failure_is_agent_api_unreachable(network));
+        for final_error in [
+            "ERROR: unexpected status 400 Bad Request: {\"error\": {\"message\": \"prompt is too long\"}}\n",
+            "ERROR: unexpected status 500 Internal Server Error: {\"error\": {\"code\": \"internal_error\"}}\n",
+        ] {
+            assert!(
+                !learn_failure_is_agent_api_unreachable(&format!("{network}{final_error}")),
+                "the final failure must remain actionable: {final_error}"
+            );
+        }
+        assert!(learn_failure_is_agent_api_unreachable(&format!(
+            "{network}ERROR: unexpected status 504 Gateway Timeout: {{\"error\": {{\"code\": \"upstream_timeout\"}}}}\n"
+        )));
     }
 
     #[test]
@@ -18839,6 +18988,10 @@ Some unrelated content.
             startup_error_fingerprint_key(Some(tail)),
             Some("startup_venv_missing_module")
         );
+        // RUST-CY on 0.9.61 Windows: the same tear seen through `from headroom import`.
+        let from_import = "    from headroom import savings_ledger\nImportError: cannot import name \
+                           'savings_ledger' from 'headroom' (~\\venv\\Lib\\site-packages\\headroom\\__init__.py)\n";
+        assert!(is_missing_headroom_module_signal(from_import));
         // Third RUST-C8 shape: the base interpreter lost its stdlib. Its own
         // bucket, and bootstrap re-downloads the runtime on the next launch.
         assert_eq!(
@@ -18856,6 +19009,7 @@ Some unrelated content.
             "ImportError: DLL load failed while importing onnxruntime_pybind11_state",
             "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: No module \
              named 'onnxruntime')",
+            "ImportError: cannot import name 'HTTPSHandler' from 'urllib.request'",
         ] {
             assert!(!is_missing_headroom_module_signal(other), "for: {other}");
         }

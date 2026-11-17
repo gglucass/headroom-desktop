@@ -658,6 +658,8 @@ pub struct AppState {
     /// fallback shell probe can take up to 2s, so we keep this sticky and
     /// expose an invalidator for the user's "Re-check" button.
     cached_headroom_learn_prereq: Mutex<Option<HeadroomLearnPrereqStatus>>,
+    /// Cached `claude_cli_available`, cleared with the prereq cache.
+    cached_claude_cli_available: Mutex<Option<bool>>,
     /// Cached `runtime_status()` output. The tray-icon updater, proxy
     /// watchdog, and frontend pollers all ask for runtime status on tight
     /// intervals; each uncached call hits `is_headroom_proxy_reachable`
@@ -798,6 +800,7 @@ impl AppState {
             cached_claude_code_projects: Mutex::new(None),
             claude_projects_cache_gen: std::sync::atomic::AtomicU64::new(0),
             cached_headroom_learn_prereq: Mutex::new(None),
+            cached_claude_cli_available: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
             runtime_status_refill: Mutex::new(()),
             kompress_prefetch_attempted: AtomicBool::new(false),
@@ -2018,6 +2021,24 @@ impl AppState {
         let mut profile = self.launch_profile.lock();
         profile.last_runtime_upgrade_failure = None;
         persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
+    }
+
+    /// A bootstrap that left the runtime current and serving (launch recovery after a
+    /// failed signed-runtime repair, or Install) finished what the recorded
+    /// failure set out to do. Without this, Home kept "Headroom update didn't
+    /// finish" over a working runtime, undismissable since rollback_restored
+    /// was false (win-mini, 0.9.63-rc.13). A runtime still due maintenance
+    /// keeps the record and its retry budget.
+    pub(crate) fn clear_upgrade_failure_after_bootstrap(&self, proxy_reachable: bool) {
+        if proxy_reachable
+            && self.runtime_upgrade_failure().is_some()
+            && self.tool_manager.check_headroom_upgrade().is_none()
+            && !self.tool_manager.requirements_are_stale()
+        {
+            log::info!("runtime is current and serving after bootstrap; clearing the recorded upgrade failure");
+            self.clear_upgrade_failure();
+            self.invalidate_runtime_status_cache();
+        }
     }
 
     pub fn dismiss_upgrade_failure(&self) {
@@ -3248,8 +3269,23 @@ impl AppState {
         status
     }
 
+    /// The Claude half of the prereqs alone, for the background observer. It
+    /// runs from launch, before sign-in, and the full probe ran `codex
+    /// --version`: on a Codex build Apple's XProtect flags, macOS put "Malware
+    /// Blocked: codex" over Headroom's sign-in screen (a customer, 2026-11-12).
+    pub fn claude_cli_available(&self) -> bool {
+        if let Some(cached) = self.cached_headroom_learn_prereq.lock().as_ref() {
+            return cached.claude_cli_available;
+        }
+        *self
+            .cached_claude_cli_available
+            .lock()
+            .get_or_insert_with(|| crate::claude_cli::detect_claude_cli().is_some())
+    }
+
     pub fn invalidate_headroom_learn_prereq_cache(&self) {
         *self.cached_headroom_learn_prereq.lock() = None;
+        *self.cached_claude_cli_available.lock() = None;
     }
 
     fn list_claude_code_projects_uncached(&self) -> Result<Vec<ClaudeCodeProject>> {
@@ -15120,6 +15156,59 @@ mod tests {
 
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(plan.is_none());
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_bootstrap_that_left_the_runtime_current_clears_the_upgrade_failure() {
+        let failure = || RuntimeUpgradeFailure {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            target_headroom_version: crate::tool_manager::HEADROOM_PINNED_VERSION.into(),
+            fallback_headroom_version: None,
+            failure_phase: UpgradeFailurePhase::Install,
+            attempts: 0,
+            first_attempt_at: Utc::now(),
+            last_attempt_at: Utc::now(),
+            error_message: "Access is denied. (os error 5)".into(),
+            error_hint: None,
+            rollback_restored: false,
+        };
+        let base_dir = temp_test_dir("headroom-clear-failure-current");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // Still due a repair: the record and its retry budget stay.
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            "stale",
+        );
+        state.record_upgrade_failure(failure());
+        state.clear_upgrade_failure_after_bootstrap(true);
+        assert!(state.runtime_upgrade_failure().is_some());
+
+        // An import smoke test and current receipts do not prove the backend
+        // can start. A failed spawn or readiness timeout keeps the retry banner
+        // and its budget, including after the profile is loaded on next launch.
+        let current = crate::tool_manager::requirements_lock_sha(
+            crate::tool_manager::bootstrap_requirements_lock(),
+        );
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            &current,
+        );
+        state.clear_upgrade_failure_after_bootstrap(false);
+        assert!(state.runtime_upgrade_failure().is_some());
+        let reloaded = AppState::new_in(base_dir.clone()).expect("reload app state");
+        assert!(reloaded.runtime_upgrade_failure().is_some());
+
+        // Current and ready: the banner's record goes, even if this was an
+        // already-installed bootstrap retry rather than a new installation.
+        state.clear_upgrade_failure_after_bootstrap(true);
+        assert!(state.runtime_upgrade_failure().is_none());
+        let reloaded = AppState::new_in(base_dir.clone()).expect("reload healed app state");
+        assert!(reloaded.runtime_upgrade_failure().is_none());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

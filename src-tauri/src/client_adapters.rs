@@ -272,6 +272,33 @@ pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
 }
 
+/// The Windows process wrapper is generated locally, so it has no publisher
+/// signature. Leave it off by default there for Smart App Control users.
+pub fn is_vscode_wrapper_enabled() -> bool {
+    load_setup_state()
+        .vscode_wrapper_enabled
+        .unwrap_or(!cfg!(windows))
+}
+
+pub fn set_vscode_wrapper_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
+    let mut state = load_setup_state();
+    let previous = state.vscode_wrapper_enabled;
+    state.vscode_wrapper_enabled = Some(enabled);
+    write_setup_state(&state)?;
+    let applied = if enabled && is_claude_code_enabled() {
+        ensure_claude_remote_control_command().map(|_| ())
+    } else {
+        remove_vscode_process_wrapper().and_then(|_| remove_owned_vscode_panel_command())
+    };
+    if let Err(err) = applied {
+        state.vscode_wrapper_enabled = previous;
+        let _ = write_setup_state(&state);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Persist the statusline opt-out and apply it now: install it when Claude
 /// Code routes through Headroom, remove it otherwise.
 pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
@@ -3165,6 +3192,10 @@ struct ClientSetupState {
     /// true, client setup skips installing it.
     #[serde(default)]
     statusline_disabled: bool,
+    /// None follows the platform default: off on Windows, on elsewhere.
+    /// The Windows wrapper is generated on the user's machine and unsigned.
+    #[serde(default)]
+    vscode_wrapper_enabled: Option<bool>,
     /// User turned usage analytics and crash reports off in Settings
     /// (`analytics::sharing_enabled`).
     #[serde(default)]
@@ -9030,6 +9061,11 @@ fn windows_wrapper_parts() -> Option<(PathBuf, PathBuf)> {
 /// Windows gets the VS Code panel restart only: the terminal one needs the
 /// managed zsh/bash `claude` function, and PowerShell gets none.
 fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
+    if !is_vscode_wrapper_enabled() {
+        remove_vscode_process_wrapper()?;
+        remove_owned_vscode_panel_command()?;
+        return Ok((Vec::new(), Vec::new()));
+    }
     let Some((python, stub)) = windows_wrapper_parts() else {
         // No runtime yet: no wrapper, and no command offering a restart
         // nothing would perform. The next setup after bootstrap adds both.
@@ -9089,12 +9125,27 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
+fn remove_owned_vscode_panel_command() -> Result<()> {
+    let command = claude_remote_control_panel_command_path();
+    if std::fs::read_to_string(&command)
+        .is_ok_and(|content| content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
+    {
+        std::fs::remove_file(&command)
+            .with_context(|| format!("removing {}", command.display()))?;
+    }
+    Ok(())
+}
+
 /// Point the VS Code extension at the wrapper. On macOS and Linux only with a
 /// working /usr/bin/python3 (the wrapper's interpreter): without the Command
 /// Line Tools it is a stub that fails on macOS, a distro may not ship it at
 /// all, and every panel session would then fail to start. Windows checks its
 /// interpreter before building the .exe (`windows_wrapper_parts`).
 fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
+    if !is_vscode_wrapper_enabled() {
+        remove_vscode_process_wrapper()?;
+        return Ok((Vec::new(), Vec::new()));
+    }
     let settings_path = vscode_user_settings_path();
     if !settings_path.exists() {
         // No VS Code user settings at all: nothing launches through us yet, and
@@ -9375,6 +9426,10 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
     }
     let mut changed = Vec::new();
     let mut backups = Vec::new();
+    let panel_enabled = is_vscode_wrapper_enabled();
+    if !panel_enabled {
+        remove_owned_vscode_panel_command()?;
+    }
     for (path, content, executable) in [
         (
             claude_remote_control_script_path(),
@@ -9397,6 +9452,9 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             true,
         ),
     ] {
+        if path == claude_remote_control_panel_command_path() && !panel_enabled {
+            continue;
+        }
         // Our commands carry the marker; a same-name file without it is the
         // user's own and stays, as remove_claude_remote_control_command leaves it.
         if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER)
@@ -12926,6 +12984,7 @@ mod tests {
             rtk_disabled: false,
             auto_learn_disabled: false,
             statusline_disabled: false,
+            vscode_wrapper_enabled: None,
             usage_data_disabled: false,
             setup_versions: BTreeMap::new(),
         };
@@ -20619,6 +20678,66 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
 
     #[cfg(unix)]
     #[test]
+    fn vscode_wrapper_opt_out_survives_setup_repair() {
+        let _home = TestHome::new();
+        let vscode = vscode_user_settings_path();
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        std::fs::write(&vscode, "{\"editor.fontSize\": 13}\n").unwrap();
+        let mut setup = super::load_setup_state();
+        setup
+            .configured_clients
+            .insert("claude_code".into(), "2026-11-16T00:00:00Z".into());
+        super::write_setup_state(&setup).unwrap();
+
+        ensure_claude_remote_control_command().unwrap();
+        assert!(
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode)
+                .unwrap()
+                .contains_key(VSCODE_PROCESS_WRAPPER_KEY)
+        );
+
+        super::set_vscode_wrapper_enabled(false).unwrap();
+        assert!(!claude_remote_control_panel_command_path().exists());
+        ensure_claude_remote_control_command().unwrap();
+        assert!(!claude_remote_control_panel_command_path().exists());
+        assert!(claude_remote_control_command_path().exists());
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(!settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert_eq!(settings["editor.fontSize"], 13);
+        assert!(!super::is_vscode_wrapper_enabled());
+
+        super::set_vscode_wrapper_enabled(true).unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(claude_remote_control_panel_command_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_vscode_wrapper_while_disconnected_waits_for_client_setup() {
+        let _home = TestHome::new();
+        let vscode = vscode_user_settings_path();
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        std::fs::write(&vscode, "{\"editor.fontSize\": 13}\n").unwrap();
+
+        super::set_vscode_wrapper_enabled(false).unwrap();
+        super::set_vscode_wrapper_enabled(true).unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(!settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(!claude_remote_control_panel_command_path().exists());
+
+        ensure_claude_remote_control_command().unwrap();
+        let settings =
+            parse_json_object(&std::fs::read_to_string(&vscode).unwrap(), &vscode).unwrap();
+        assert!(settings.contains_key(VSCODE_PROCESS_WRAPPER_KEY));
+        assert!(claude_remote_control_panel_command_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_control_command_installs_and_removes_only_its_own_file() {
         let home = TestHome::new();
         // A VS Code settings file exists, so the wrapper setting is written too.
@@ -20888,11 +21007,18 @@ for line in sys.stdin:
         std::fs::create_dir_all(&bin).unwrap();
         // A symlink, not a copy: a copied platform binary wedges on macOS
         // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
-        std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
+        // Ubuntu 26.04's uutils sleep picks its tool from the kernel's exec path,
+        // so it refuses to run as `claude`; perl (always on Ubuntu) runs under
+        // any name. macOS's perl re-execs a versioned binary, so it keeps sleep.
+        #[cfg(target_os = "linux")]
+        let (target, args) = ("/usr/bin/perl", ["-e", "sleep 30"].as_slice());
+        #[cfg(not(target_os = "linux"))]
+        let (target, args) = ("/bin/sleep", ["30"].as_slice());
+        std::os::unix::fs::symlink(target, bin.join("claude")).unwrap();
         let spawn_claude = || {
             use std::os::unix::process::CommandExt;
             let mut cmd = crate::proc::command(bin.join("claude"));
-            cmd.arg("30");
+            cmd.args(args);
             // No controlling terminal, as on CI. With an empty
             // HEADROOM_REMOTE_CONTROL_TTY the script reads this pid's tty from
             // `ps`, so run from a terminal it found one and restarted.

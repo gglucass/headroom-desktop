@@ -28,6 +28,7 @@
 # 0.44.0: mcp 1.30.0 -> 2.3.0 with mcp-types, httpx2 and httpcore2 (#4603),
 # click 8.5.0, opentelemetry-api 1.45.1, tomlkit 0.15.2 and python-socks 3.2.0,
 # the new floors (see the macOS lock). No tree-sitter or opentelemetry-sdk here.
+# 2026-11-14: opentelemetry-api 1.45.1 -> 1.45.2 (CVE-2026-126360).
 # ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
 # only two binaries, used only by the opt-in --intercept-tool-results the app never
 # passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
@@ -54,8 +55,8 @@ mcp-types==2.3.0 \
 onnxruntime==1.26.0 \
     --hash=sha256:91f2bb870a4b9224eba0a6728c1fa7a9e552b8e59e1083c51fbbc3d013f2b5c0 \
     --hash=sha256:9b6dd70599005bd1bf29779f04a91978b92b5e719c11a20068a8f8e535f725b6
-opentelemetry-api==1.45.1 \
-    --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb
+opentelemetry-api==1.45.2 \
+    --hash=sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34
 openai==2.37.0 \
     --hash=sha256:814633888b8f3b1ffd6615697c6e4ef93632d08b7c2e28c8c5ef3556e5a10107
 orjson==3.11.9 \
