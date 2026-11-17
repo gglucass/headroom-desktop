@@ -58,9 +58,10 @@ fn signed_windows_runtime_url(sha: &str) -> String {
     )
 }
 
-/// What the installed runtime must match: the build's cache key, a hash of
-/// every input of the archive (scripts/build-windows-signed-runtime.py
-/// cache-key), so any change to it reaches installed users, not only a pin.
+/// What the installed runtime must match: a hash of every input that changes
+/// the installed files (scripts/build-windows-signed-runtime.py generation),
+/// so such a change reaches installed users, not only a pin. Build-script
+/// edits that only change signing or compression leave it alone.
 fn signed_windows_runtime_generation() -> Option<String> {
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {

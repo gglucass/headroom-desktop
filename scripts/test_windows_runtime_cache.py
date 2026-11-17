@@ -1,4 +1,4 @@
-"""Check that signed-runtime cache keys track binary inputs, not unrelated Rust edits."""
+"""Check that signed-runtime keys track binary inputs, not unrelated edits."""
 
 import contextlib
 import io
@@ -48,6 +48,42 @@ class RuntimeCacheKeyTest(unittest.TestCase):
             values["pinned"] = original_pinned
             values["LOCK"] = original_lock
             values["MARKITDOWN_LOCK"] = original_markitdown_lock
+
+    def test_build_script_edits_rebuild_the_archive_but_keep_the_generation(self):
+        scope = runpy.run_path(str(Path(__file__).with_name("build-windows-signed-runtime.py")))
+        values = scope["cache_key"].__globals__
+
+        def printed(command):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                scope[command]()
+            return output.getvalue().strip()
+
+        original_scripts = values["BUILD_SCRIPTS"]
+        original_launcher = values["LAUNCHER"]
+        original_layout = values["LAYOUT"]
+        try:
+            cache, generation = printed("cache_key"), printed("generation")
+            self.assertNotEqual(cache, generation)
+            with tempfile.TemporaryDirectory() as directory:
+                script = Path(directory) / "build.ps1"
+                script.write_bytes(original_scripts[0].read_bytes() + b"\n# faster signing\n")
+                values["BUILD_SCRIPTS"] = (script, original_scripts[1])
+                self.assertNotEqual(printed("cache_key"), cache)
+                self.assertEqual(printed("generation"), generation)
+                values["BUILD_SCRIPTS"] = original_scripts
+                launcher = Path(directory) / "launcher.rs"
+                launcher.write_bytes(original_launcher.read_bytes() + b"\n// changed\n")
+                values["LAUNCHER"] = launcher
+                self.assertNotEqual(printed("generation"), generation)
+                self.assertNotEqual(printed("cache_key"), cache)
+                values["LAUNCHER"] = original_launcher
+            values["LAYOUT"] = original_layout + "1"
+            self.assertNotEqual(printed("generation"), generation)
+        finally:
+            values["BUILD_SCRIPTS"] = original_scripts
+            values["LAUNCHER"] = original_launcher
+            values["LAYOUT"] = original_layout
 
 
 if __name__ == "__main__":

@@ -37,9 +37,10 @@ if (-not $cached) {
 }
 $sha = (Get-FileHash -Path $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
 Add-Content -Path $env:GITHUB_ENV -Value "HEADROOM_SIGNED_RUNTIME_SHA256=$sha"
-# The app's runtime generation: every build input, so any change reaches installed users.
-$key = python scripts/build-windows-signed-runtime.py cache-key
-if ($LASTEXITCODE -ne 0) { throw "Signed runtime cache key failed" }
+# The app's runtime generation: only inputs that change the installed files, so a
+# signing or compression tweak never makes installed users download the runtime again.
+$key = python scripts/build-windows-signed-runtime.py generation
+if ($LASTEXITCODE -ne 0) { throw "Signed runtime generation failed" }
 Add-Content -Path $env:GITHUB_ENV -Value "HEADROOM_SIGNED_RUNTIME_KEY=$key"
 Write-Host "Signed Windows runtime SHA-256: $sha"
 Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Signed Windows runtime: $($peFiles.Count) PE files, archive SHA-256 $sha"

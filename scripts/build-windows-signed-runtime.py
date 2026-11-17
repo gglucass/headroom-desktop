@@ -20,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "src-tauri/src/tool_manager.rs").read_text(encoding="utf-8")
 LOCK = ROOT / "src-tauri/python/headroom-windows-requirements.lock"
 MARKITDOWN_LOCK = ROOT / "src-tauri/python/markitdown-windows.lock"
+LAUNCHER = ROOT / "scripts/headroom-launcher.rs"
+BUILD_SCRIPTS = (ROOT / "scripts/build-windows-signed-runtime.ps1", Path(__file__))
+# Bump when an edit to BUILD_SCRIPTS changes the installed files (modules,
+# launchers, layout), so it reaches installed users. Signing or compression
+# changes stay out: they would cost every Windows user a re-download.
+LAYOUT = "1"
 
 
 def pinned(name):
@@ -238,8 +244,8 @@ def archive(runtime, output):
     print(digest.hexdigest())
 
 
-def cache_key():
-    digest = hashlib.sha256()
+def generation_digest():
+    digest = hashlib.sha256(LAYOUT.encode())
     for name in (
         "PYTHON_STANDALONE_RELEASE", "PYTHON_SHA256_WINDOWS_X86_64",
         "VENDOR_WHEELS_INDEX_URL", "MSVC_RUNTIME_WHEEL_URL",
@@ -248,19 +254,35 @@ def cache_key():
         digest.update(pinned(name).encode())
     for value in signed_wheel():
         digest.update(value.encode())
-    for path in (LOCK, MARKITDOWN_LOCK, ROOT / "scripts/headroom-launcher.rs", ROOT / "scripts/build-windows-signed-runtime.ps1", Path(__file__)):
+    for path in (LOCK, MARKITDOWN_LOCK, LAUNCHER):
+        digest.update(path.read_bytes())
+    return digest
+
+
+def generation():
+    """The app's HEADROOM_SIGNED_RUNTIME_KEY: installed Windows users download
+    the ~580 MB runtime again whenever it changes, so it hashes only what
+    lands on disk, never how the build signs or compresses it."""
+    print(generation_digest().hexdigest())
+
+
+def cache_key():
+    """CI's archive cache: the generation plus the build scripts, so any
+    script change rebuilds the archive (users keep theirs)."""
+    digest = generation_digest()
+    for path in BUILD_SCRIPTS:
         digest.update(path.read_bytes())
     print(digest.hexdigest())
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("prepare", "list-pe", "smoke", "archive", "cache-key"))
+    parser.add_argument("command", choices=("prepare", "list-pe", "smoke", "archive", "cache-key", "generation"))
     parser.add_argument("path", nargs="?", type=Path)
     parser.add_argument("output", nargs="?", type=Path)
     args = parser.parse_args()
-    if args.command == "cache-key":
-        cache_key()
+    if args.command in ("cache-key", "generation"):
+        (cache_key if args.command == "cache-key" else generation)()
         return
     if args.path is None:
         parser.error(f"{args.command} needs a path")
