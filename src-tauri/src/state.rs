@@ -2023,18 +2023,19 @@ impl AppState {
         persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
-    /// A full bootstrap that left the runtime current (launch recovery after a
+    /// A bootstrap that left the runtime current and serving (launch recovery after a
     /// failed signed-runtime repair, or Install) finished what the recorded
     /// failure set out to do. Without this, Home kept "Headroom update didn't
     /// finish" over a working runtime, undismissable since rollback_restored
     /// was false (win-mini, 0.9.63-rc.13). A runtime still due maintenance
     /// keeps the record and its retry budget.
-    pub(crate) fn clear_upgrade_failure_if_runtime_current(&self) {
-        if self.runtime_upgrade_failure().is_some()
+    pub(crate) fn clear_upgrade_failure_after_bootstrap(&self, proxy_reachable: bool) {
+        if proxy_reachable
+            && self.runtime_upgrade_failure().is_some()
             && self.tool_manager.check_headroom_upgrade().is_none()
             && !self.tool_manager.requirements_are_stale()
         {
-            log::info!("runtime is current after bootstrap; clearing the recorded upgrade failure");
+            log::info!("runtime is current and serving after bootstrap; clearing the recorded upgrade failure");
             self.clear_upgrade_failure();
             self.invalidate_runtime_status_cache();
         }
@@ -15183,10 +15184,12 @@ mod tests {
             "stale",
         );
         state.record_upgrade_failure(failure());
-        state.clear_upgrade_failure_if_runtime_current();
+        state.clear_upgrade_failure_after_bootstrap(true);
         assert!(state.runtime_upgrade_failure().is_some());
 
-        // Current: the banner's record goes.
+        // An import smoke test and current receipts do not prove the backend
+        // can start. A failed spawn or readiness timeout keeps the retry banner
+        // and its budget, including after the profile is loaded on next launch.
         let current = crate::tool_manager::requirements_lock_sha(
             crate::tool_manager::bootstrap_requirements_lock(),
         );
@@ -15195,8 +15198,17 @@ mod tests {
             crate::tool_manager::HEADROOM_PINNED_VERSION,
             &current,
         );
-        state.clear_upgrade_failure_if_runtime_current();
+        state.clear_upgrade_failure_after_bootstrap(false);
+        assert!(state.runtime_upgrade_failure().is_some());
+        let reloaded = AppState::new_in(base_dir.clone()).expect("reload app state");
+        assert!(reloaded.runtime_upgrade_failure().is_some());
+
+        // Current and ready: the banner's record goes, even if this was an
+        // already-installed bootstrap retry rather than a new installation.
+        state.clear_upgrade_failure_after_bootstrap(true);
         assert!(state.runtime_upgrade_failure().is_none());
+        let reloaded = AppState::new_in(base_dir.clone()).expect("reload healed app state");
+        assert!(reloaded.runtime_upgrade_failure().is_none());
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

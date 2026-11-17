@@ -2529,7 +2529,6 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 return;
             }
 
-            state.clear_upgrade_failure_if_runtime_current();
             if let Err(err) = client_adapters::ensure_rtk_integrations(
                 &state.tool_manager.rtk_entrypoint(),
                 &state.tool_manager.managed_python(),
@@ -2563,6 +2562,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.tool_manager.seed_verbosity_baseline_if_needed();
 
         let ensure_result = state.ensure_headroom_running();
+        let mut proxy_reachable = false;
         state.set_runtime_starting(true);
 
         if let Err(err) = ensure_result {
@@ -2588,12 +2588,14 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 if state::headroom_proxy_reachable() {
+                    proxy_reachable = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
 
+        state.clear_upgrade_failure_after_bootstrap(proxy_reachable);
         state.set_runtime_starting(false);
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
