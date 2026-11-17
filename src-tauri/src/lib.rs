@@ -9763,6 +9763,10 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // is the exhausted-balance line above; this one fires with a full
             // balance and no long-context entitlement.
             || lower.contains("credits are required")
+            // RUST-X7: `Fable 5.2 requires usage credits. Switch to another
+            // model, or manage usage credits ...` -- the same entitlement,
+            // worded per model.
+            || lower.contains("requires usage credits")
             // RUST-M8: `Your account is on hold and can't use Claude Code.
             // View details or appeal: https://claude.ai/restricted` -- an
             // account restriction, and the line carries its own appeal link.
@@ -17678,6 +17682,8 @@ Some unrelated content.
             // CLI asked for. Our digest is capped well under that, so the
             // entitlement is the whole cause.
             "Usage credits are required for long context requests.",
+            // RUST-X7 verbatim: the model the CLI picked needs credits.
+            "Fable 5.2 requires usage credits. Switch to another model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
             // RUST-M8 verbatim: an account restriction with its own appeal link.
             "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
             // RUST-Q2/Q4 verbatim, from `codex exec`.
