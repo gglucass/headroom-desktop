@@ -2113,7 +2113,7 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "1.1.0";
+const RTK_VERSION: &str = "1.2.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.9";
 const SERENA_PINNED_VERSION: &str =
     serena_pinned_version(cfg!(all(target_os = "macos", target_arch = "x86_64")));
@@ -2693,15 +2693,15 @@ fn fetch_plugin_version(repo: &str) -> Option<String> {
     manifest.get("version")?.as_str().map(str::to_string)
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "1623590dd8d65374f61589c599c764c08ba9ce993ebe6b601312a89a3c874558";
+    "1959bd6d89a729ccdee176b7141490bbe750820f032c74f29a752576f2495254";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "559156238dd3e148c84c88c3a62a7594b874f68793208994e1b02e77a9d9abf9";
+    "48f8cee63ae0b4853f9a77d7839e62ffcca18ef88c408f8a93d4e69986b1ab82";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "57a4fac13d18da77f0577ea8b68def7934b934bf76d0a6e161f0bfd06b1e1078";
+    "6d176358458801879b445f1b420e3a9b47d2f0898b4c590f99ff94518654091c";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "4dec94a64035e08189ae82fd5408fe4ae9ae27a665fc07e3e3ec3c4c2d8e8a3e";
+    "a28407dc13038bdc9c2a1f5a047b0c636e0c1d495b15523576e2adb992a06a17";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "9b076379be9d86011ca3f3a0264d0be4851da5535453a47f67fa46b4e893fbb2";
+    "d105aaaa55822252f04ac28989e9069c1ea61755ca561940d887cb0b89c785fc";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
