@@ -894,7 +894,7 @@ impl<R> Drop for ResponseSniffer<R> {
         if !is_reportable_upstream_error(&status) || self.buf.is_empty() {
             return;
         }
-        report_upstream_error(self.client_key, status, path, &self.buf, &[]);
+        report_upstream_error(self.client_key, status, path, None, &self.buf, &[]);
     }
 }
 
@@ -2655,8 +2655,17 @@ async fn handle(
                 .map(|p| p.path.clone())
                 .unwrap_or_default();
             let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
-            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt, counted)
-                .await;
+            let req_bytes = parsed_head.as_ref().and_then(|p| p.content_length);
+            splice_with_codex_capture(
+                client,
+                backend,
+                &codex_slot,
+                &req_path,
+                req_bytes,
+                prompt,
+                counted,
+            )
+            .await;
         } else {
             // Same shape as copy_bidirectional, split so the backend->client half
             // can stamp traffic liveness for the watchdog.
@@ -3060,6 +3069,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     backend: S,
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
+    req_bytes: Option<usize>,
     prompt: bool,
     counted: bool,
 ) {
@@ -3134,7 +3144,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-            report_upstream_error("codex", status, req_path, &head, &chunk);
+            report_upstream_error("codex", status, req_path, req_bytes, &head, &chunk);
             if let Some(end) = find_header_end(&head) {
                 error_body.extend_from_slice(&head[(end + 4).min(head.len())..]);
             }
@@ -3666,6 +3676,9 @@ fn report_upstream_error(
     client: &'static str,
     status: u16,
     req_path: &str,
+    // The request's declared Content-Length, so a body-limit 413 says how big
+    // the request was (RUST-WR: a huge conversation or a pruning gap).
+    req_bytes: Option<usize>,
     head: &[u8],
     chunk: &[u8],
 ) {
@@ -3685,7 +3698,7 @@ fn report_upstream_error(
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     log::warn!("{client} upstream error {status} on {path}: {raw_snippet}");
     if is_headroom_body_limit_error(&body) {
-        report_headroom_body_limit(client, "backend", status, None);
+        report_headroom_body_limit(client, "backend", status, req_bytes);
         return;
     }
     // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
