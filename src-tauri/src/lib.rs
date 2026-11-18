@@ -2410,13 +2410,12 @@ fn prefetch_bootstrap_artifacts(app: AppHandle) {
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     let already_installed = {
         let state: tauri::State<'_, AppState> = app.state();
-        let already_installed = state.tool_manager.python_runtime_installed();
-        let start = state.begin_bootstrap();
+        let already_installed = state.begin_bootstrap();
         // Sends the joined install's real progress over the caller's 2%.
         emit_bootstrap_progress(&app, &state);
-        if !start {
+        let Some(already_installed) = already_installed else {
             return Ok(());
-        }
+        };
         already_installed
     };
 

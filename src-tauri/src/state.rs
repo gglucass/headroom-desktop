@@ -3473,11 +3473,11 @@ impl AppState {
         self.bootstrap_progress.lock().clone()
     }
 
-    /// False when a bootstrap is already running: the caller joins it
-    /// instead of starting a second one.
-    pub fn begin_bootstrap(&self) -> bool {
-        let python_installed = self.tool_manager.python_runtime_installed();
+    /// `None` joins a running bootstrap. Otherwise returns whether the
+    /// runtime is already installed and the worker can skip installation.
+    pub fn begin_bootstrap(&self) -> Option<bool> {
         let mut progress = self.bootstrap_progress.lock();
+        let python_installed = self.tool_manager.python_runtime_installed();
         let (next, start) = begin_bootstrap_transition(&progress, python_installed);
         *progress = next;
         start
@@ -3499,16 +3499,7 @@ impl AppState {
     }
 
     pub fn mark_bootstrap_proxy_starting(&self) {
-        let mut progress = self.bootstrap_progress.lock();
-        *progress = BootstrapProgress {
-            running: true,
-            complete: false,
-            failed: false,
-            current_step: "Starting Headroom".into(),
-            message: "Starting Headroom for the first time (this can take ~1-2 minutes)…".into(),
-            current_step_eta_seconds: 45,
-            overall_percent: 95,
-        };
+        *self.bootstrap_progress.lock() = bootstrap_proxy_starting_state();
     }
 
     pub fn mark_bootstrap_complete(&self) {
@@ -11366,26 +11357,13 @@ fn merge_hourly_savings(
 fn begin_bootstrap_transition(
     current: &BootstrapProgress,
     python_installed: bool,
-) -> (BootstrapProgress, bool) {
-    if python_installed {
-        return (
-            BootstrapProgress {
-                running: false,
-                complete: true,
-                failed: false,
-                current_step: "Install complete".into(),
-                message: "Managed runtime already installed.".into(),
-                current_step_eta_seconds: 0,
-                overall_percent: 100,
-            },
-            true,
-        );
-    }
-    // A second Install click (or the other window's) joins the running
-    // install. Rejecting it showed "Install failed" over a healthy install
-    // and filed it to Sentry (RUST-X9).
+) -> (BootstrapProgress, Option<bool>) {
+    // The runtime can be on disk while the worker is still starting the proxy.
     if current.running {
-        return (current.clone(), false);
+        return (current.clone(), None);
+    }
+    if python_installed {
+        return (bootstrap_proxy_starting_state(), Some(true));
     }
     (
         BootstrapProgress {
@@ -11397,8 +11375,20 @@ fn begin_bootstrap_transition(
             current_step_eta_seconds: 3,
             overall_percent: 2,
         },
-        true,
+        Some(false),
     )
+}
+
+fn bootstrap_proxy_starting_state() -> BootstrapProgress {
+    BootstrapProgress {
+        running: true,
+        complete: false,
+        failed: false,
+        current_step: "Starting Headroom".into(),
+        message: "Starting Headroom for the first time (this can take ~1-2 minutes)…".into(),
+        current_step_eta_seconds: 45,
+        overall_percent: 95,
+    }
 }
 
 fn apply_bootstrap_step(
@@ -19247,17 +19237,17 @@ mod tests {
     #[test]
     fn begin_bootstrap_skips_install_when_python_already_installed() {
         let (next, start) = begin_bootstrap_transition(&idle_progress(), true);
-        assert!(start);
-        assert!(next.complete);
-        assert!(!next.running);
+        assert_eq!(start, Some(true));
+        assert!(!next.complete);
+        assert!(next.running);
         assert!(!next.failed);
-        assert_eq!(next.overall_percent, 100);
+        assert_eq!(next.current_step, "Starting Headroom");
     }
 
     #[test]
     fn begin_bootstrap_starts_when_python_missing() {
         let (next, start) = begin_bootstrap_transition(&idle_progress(), false);
-        assert!(start);
+        assert_eq!(start, Some(false));
         assert!(next.running);
         assert!(!next.complete);
         assert!(!next.failed);
@@ -19272,10 +19262,25 @@ mod tests {
             ..idle_progress()
         };
         let (next, start) = begin_bootstrap_transition(&running, false);
-        assert!(!start);
+        assert_eq!(start, None);
         // The running install's progress is kept, not reset to 2%.
         assert_eq!(next.overall_percent, 42);
         assert!(next.running);
+    }
+
+    #[test]
+    fn begin_bootstrap_keeps_proxy_starting_after_runtime_is_published() {
+        let running = BootstrapProgress {
+            running: true,
+            current_step: "Starting Headroom".into(),
+            overall_percent: 95,
+            ..idle_progress()
+        };
+        let (next, _) = begin_bootstrap_transition(&running, true);
+        assert!(next.running);
+        assert!(!next.complete);
+        assert_eq!(next.current_step, "Starting Headroom");
+        assert_eq!(next.overall_percent, 95);
     }
 
     #[test]
@@ -19287,7 +19292,7 @@ mod tests {
             ..idle_progress()
         };
         let (next, start) = begin_bootstrap_transition(&failed, false);
-        assert!(start);
+        assert_eq!(start, Some(false));
         assert!(next.running);
         assert!(!next.failed);
         assert_eq!(next.overall_percent, 2);
