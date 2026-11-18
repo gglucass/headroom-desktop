@@ -3473,12 +3473,14 @@ impl AppState {
         self.bootstrap_progress.lock().clone()
     }
 
-    pub fn begin_bootstrap(&self) -> Result<(), String> {
+    /// False when a bootstrap is already running: the caller joins it
+    /// instead of starting a second one.
+    pub fn begin_bootstrap(&self) -> bool {
         let python_installed = self.tool_manager.python_runtime_installed();
         let mut progress = self.bootstrap_progress.lock();
-        let (next, result) = begin_bootstrap_transition(&progress, python_installed);
+        let (next, start) = begin_bootstrap_transition(&progress, python_installed);
         *progress = next;
-        result
+        start
     }
 
     pub fn update_bootstrap_step(&self, step: BootstrapStepUpdate) {
@@ -11364,7 +11366,7 @@ fn merge_hourly_savings(
 fn begin_bootstrap_transition(
     current: &BootstrapProgress,
     python_installed: bool,
-) -> (BootstrapProgress, Result<(), String>) {
+) -> (BootstrapProgress, bool) {
     if python_installed {
         return (
             BootstrapProgress {
@@ -11376,11 +11378,14 @@ fn begin_bootstrap_transition(
                 current_step_eta_seconds: 0,
                 overall_percent: 100,
             },
-            Ok(()),
+            true,
         );
     }
+    // A second Install click (or the other window's) joins the running
+    // install. Rejecting it showed "Install failed" over a healthy install
+    // and filed it to Sentry (RUST-X9).
     if current.running {
-        return (current.clone(), Err("Bootstrap is already running.".into()));
+        return (current.clone(), false);
     }
     (
         BootstrapProgress {
@@ -11392,7 +11397,7 @@ fn begin_bootstrap_transition(
             current_step_eta_seconds: 3,
             overall_percent: 2,
         },
-        Ok(()),
+        true,
     )
 }
 
@@ -19241,8 +19246,8 @@ mod tests {
 
     #[test]
     fn begin_bootstrap_skips_install_when_python_already_installed() {
-        let (next, result) = begin_bootstrap_transition(&idle_progress(), true);
-        assert!(result.is_ok());
+        let (next, start) = begin_bootstrap_transition(&idle_progress(), true);
+        assert!(start);
         assert!(next.complete);
         assert!(!next.running);
         assert!(!next.failed);
@@ -19251,8 +19256,8 @@ mod tests {
 
     #[test]
     fn begin_bootstrap_starts_when_python_missing() {
-        let (next, result) = begin_bootstrap_transition(&idle_progress(), false);
-        assert!(result.is_ok());
+        let (next, start) = begin_bootstrap_transition(&idle_progress(), false);
+        assert!(start);
         assert!(next.running);
         assert!(!next.complete);
         assert!(!next.failed);
@@ -19260,15 +19265,15 @@ mod tests {
     }
 
     #[test]
-    fn begin_bootstrap_rejects_reentry_while_running() {
+    fn begin_bootstrap_joins_a_running_install() {
         let running = BootstrapProgress {
             running: true,
             overall_percent: 42,
             ..idle_progress()
         };
-        let (next, result) = begin_bootstrap_transition(&running, false);
-        assert!(result.is_err());
-        // State is preserved when re-entry is rejected.
+        let (next, start) = begin_bootstrap_transition(&running, false);
+        assert!(!start);
+        // The running install's progress is kept, not reset to 2%.
         assert_eq!(next.overall_percent, 42);
         assert!(next.running);
     }
@@ -19281,8 +19286,8 @@ mod tests {
             message: "boom".into(),
             ..idle_progress()
         };
-        let (next, result) = begin_bootstrap_transition(&failed, false);
-        assert!(result.is_ok());
+        let (next, start) = begin_bootstrap_transition(&failed, false);
+        assert!(start);
         assert!(next.running);
         assert!(!next.failed);
         assert_eq!(next.overall_percent, 2);

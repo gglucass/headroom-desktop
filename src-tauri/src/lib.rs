@@ -2411,8 +2411,12 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     let already_installed = {
         let state: tauri::State<'_, AppState> = app.state();
         let already_installed = state.tool_manager.python_runtime_installed();
-        state.begin_bootstrap()?;
+        let start = state.begin_bootstrap();
+        // Sends the joined install's real progress over the caller's 2%.
         emit_bootstrap_progress(&app, &state);
+        if !start {
+            return Ok(());
+        }
         already_installed
     };
 
