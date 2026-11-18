@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent 
 import { invoke } from "@tauri-apps/api/core";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
-import { trackAnalyticsEvent } from "../lib/analytics";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
 import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
 import type {
@@ -1150,12 +1149,10 @@ function TipRow({ event }: { event: TipEvent }) {
   const { action } = view;
   const dismiss = () => {
     setDismissed(true);
-    trackAnalyticsEvent("activity_tip_dismissed", { kind: event.kind });
     void invoke("dismiss_tip", { kind: event.kind }).catch(() => undefined);
   };
   // WebKitGTK can refuse clipboard writes (RUST-QT); the text then shows, selectable.
   const copy = async (text: string) => {
-    trackAnalyticsEvent("activity_tip_prompt_copied", { kind: event.kind });
     try {
       await navigator.clipboard.writeText(text);
       setCopyState("copied");

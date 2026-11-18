@@ -3,19 +3,17 @@
 //! we don't fire Sentry on every detection. Instead we persist a marker to
 //! disk and only escalate to Sentry once the same conflict has survived
 //! multiple app launches — i.e. the user came back, didn't free the port,
-//! and is stuck. Recovery (proxy comes up after a marker exists) is reported
-//! to analytics with a time-to-recovery, then the marker is cleared.
+//! and is stuck. Recovery (proxy comes up after a marker exists) clears the
+//! marker.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use tauri::AppHandle;
 
-use crate::analytics;
-use crate::storage::{app_data_dir, config_file, ensure_data_dirs};
+use crate::storage::{app_data_dir, config_file};
 
 const MARKER_FILE: &str = "port-conflict.json";
 
@@ -24,10 +22,8 @@ const MARKER_FILE: &str = "port-conflict.json";
 /// 2 = "user closed and reopened the app and it's still broken".
 const PERSISTENT_LAUNCH_THRESHOLD: u32 = 2;
 
-const FAILURE_EVENT: &str = "proxy_start_blocked_port_conflict";
-const RECOVERY_EVENT: &str = "proxy_start_recovered_port_conflict";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct PortConflictMarker {
     pub detected_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
@@ -40,27 +36,37 @@ fn marker_path() -> PathBuf {
     config_file(&app_data_dir(), MARKER_FILE)
 }
 
-fn read_at(path: &Path) -> Option<PortConflictMarker> {
-    let raw = fs::read(path).ok()?;
-    serde_json::from_slice(&raw).ok()
+fn read_at(path: &Path) -> anyhow::Result<Option<PortConflictMarker>> {
+    let raw = match crate::state::read_state_file(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    match serde_json::from_slice(&raw) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(err) => {
+            let backup = path.with_extension("json.corrupt");
+            log::warn!("{} is unparsable ({err}); backing it up", path.display());
+            crate::client_adapters::move_aside(path, &backup).with_context(|| {
+                format!("backing up {} to {}", path.display(), backup.display())
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 fn write_at(path: &Path, marker: &PortConflictMarker) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_vec_pretty(marker)?;
     crate::client_adapters::atomic_write(path, &json)
 }
 
-fn clear_at(path: &Path) -> Option<PortConflictMarker> {
-    let prior = read_at(path);
-    let _ = fs::remove_file(path);
-    prior
-}
-
-fn clear_marker() -> Option<PortConflictMarker> {
-    clear_at(&marker_path())
+fn clear_at(path: &Path) -> anyhow::Result<()> {
+    read_at(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// True if the anyhow error chain string is the
@@ -125,7 +131,7 @@ fn record_failure_at(
     now: DateTime<Utc>,
 ) -> anyhow::Result<PortConflictMarker> {
     let (cmd, pid) = parse_occupant(err_chain);
-    let prior = read_at(path);
+    let prior = read_at(path)?;
 
     let marker = match prior {
         Some(prior) => {
@@ -145,8 +151,10 @@ fn record_failure_at(
                 prior.consecutive_failed_launches
             };
             PortConflictMarker {
-                detected_at: if same_occupant {
+                detected_at: if same_occupant && prior.detected_at != DateTime::UNIX_EPOCH {
                     prior.detected_at
+                } else if same_occupant && prior.last_seen_at != DateTime::UNIX_EPOCH {
+                    prior.last_seen_at
                 } else {
                     now
                 },
@@ -177,23 +185,13 @@ pub fn record_failure(err_chain: &str, increment_launches: bool) -> Option<PortC
     if !is_port_conflict(err_chain) {
         return None;
     }
-    let _ = ensure_data_dirs(&app_data_dir());
-    record_failure_at(&marker_path(), err_chain, increment_launches, Utc::now()).ok()
-}
-
-fn build_failure_props(marker: &PortConflictMarker) -> Map<String, Value> {
-    let mut props = Map::new();
-    if let Some(cmd) = &marker.occupant_cmd {
-        props.insert("occupant_cmd".to_string(), Value::from(cmd.clone()));
+    match record_failure_at(&marker_path(), err_chain, increment_launches, Utc::now()) {
+        Ok(marker) => Some(marker),
+        Err(err) => {
+            log::info!("could not record port conflict: {err:#}");
+            None
+        }
     }
-    if let Some(pid) = marker.occupant_pid {
-        props.insert("occupant_pid".to_string(), Value::from(pid));
-    }
-    props.insert(
-        "consecutive_failed_launches".to_string(),
-        Value::from(marker.consecutive_failed_launches),
-    );
-    props
 }
 
 fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
@@ -233,7 +231,7 @@ fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
 /// Returns `true` if the failure was a port conflict (caller should skip
 /// `capture_headroom_start_failure` for it). For unrelated errors, returns
 /// `false` and the caller should keep its existing reporting.
-pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launches: bool) -> bool {
+pub fn note_proxy_failed(err: &anyhow::Error, increment_launches: bool) -> bool {
     let err_chain = format!("{err:#}");
     if !is_port_conflict(&err_chain) {
         return false;
@@ -241,12 +239,6 @@ pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launche
     let Some(marker) = record_failure(&err_chain, increment_launches) else {
         return true;
     };
-
-    analytics::track_event(
-        app,
-        FAILURE_EVENT,
-        Some(Value::Object(build_failure_props(&marker))),
-    );
 
     if increment_launches && marker.consecutive_failed_launches >= PERSISTENT_LAUNCH_THRESHOLD {
         capture_persistent_to_sentry(&marker);
@@ -256,26 +248,11 @@ pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launche
 }
 
 /// Top-level hook: call after `ensure_headroom_running` returns Ok. Clears
-/// the marker if one is present and emits a recovery analytics event with
-/// `time_to_recovery_seconds`.
-pub fn note_proxy_started(app: &AppHandle) {
-    let Some(prior) = clear_marker() else {
-        return;
-    };
-
-    let now = Utc::now();
-    let time_to_recovery_seconds = now
-        .signed_duration_since(prior.detected_at)
-        .num_seconds()
-        .max(0);
-
-    let mut props = build_failure_props(&prior);
-    props.insert(
-        "time_to_recovery_seconds".to_string(),
-        Value::from(time_to_recovery_seconds),
-    );
-
-    analytics::track_event(app, RECOVERY_EVENT, Some(Value::Object(props)));
+/// the marker if one is present, so the launch counter starts over.
+pub fn note_proxy_started() {
+    if let Err(err) = clear_at(&marker_path()) {
+        log::info!("could not clear port conflict: {err:#}");
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn record_failure_preserves_a_marker_missing_its_last_seen_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("marker.json");
+        let original = record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
+        let mut json = serde_json::to_value(original).unwrap();
+        json.as_object_mut().unwrap().remove("last_seen_at");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let marker = record_failure_at(&path, SAMPLE_BAIL, true, ts(2000)).unwrap();
+        assert_eq!(marker.consecutive_failed_launches, 2);
+        assert_eq!(marker.detected_at, ts(1000));
+        assert_eq!(marker.last_seen_at, ts(2000));
+    }
+
+    #[test]
+    fn record_failure_backs_up_a_corrupt_marker_before_replacing_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("marker.json");
+        let corrupt = b"{\"detected_at\":";
+        fs::write(&path, corrupt).unwrap();
+
+        let marker = record_failure_at(&path, SAMPLE_BAIL, true, ts(2000)).unwrap();
+        assert_eq!(marker.consecutive_failed_launches, 1);
+        assert_eq!(
+            fs::read(path.with_extension("json.corrupt")).unwrap(),
+            corrupt
+        );
+    }
+
+    #[test]
     fn record_failure_resets_counter_when_occupant_changes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
@@ -395,14 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn clear_returns_prior_marker_and_removes_file() {
+    fn clear_removes_file_and_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
         record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
-        let prior = clear_at(&path);
-        assert!(prior.is_some());
+        clear_at(&path).unwrap();
         assert!(!path.exists());
-        assert!(clear_at(&path).is_none(), "second clear is a no-op");
+        clear_at(&path).unwrap();
     }
 
     #[test]
@@ -410,7 +416,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
         let original = record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
-        let reloaded = read_at(&path).expect("marker should be readable");
+        let reloaded = read_at(&path).unwrap().expect("marker should be readable");
         assert_eq!(reloaded, original);
     }
 }

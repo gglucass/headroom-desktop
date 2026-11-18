@@ -272,12 +272,11 @@ pub fn is_statusline_disabled() -> bool {
     load_setup_state().statusline_disabled
 }
 
-/// The Windows process wrapper is generated locally, so it has no publisher
-/// signature. Leave it off by default there for Smart App Control users.
+/// On by default everywhere: the Windows wrapper is a signed copy of the app
+/// (claude_wrapper.rs), so Smart App Control lets it run. 0.9.63 shipped it
+/// off on Windows, while the wrapper there was still unsigned.
 pub fn is_vscode_wrapper_enabled() -> bool {
-    load_setup_state()
-        .vscode_wrapper_enabled
-        .unwrap_or(!cfg!(windows))
+    load_setup_state().vscode_wrapper_enabled.unwrap_or(true)
 }
 
 pub fn set_vscode_wrapper_enabled(enabled: bool) -> Result<()> {
@@ -8693,11 +8692,12 @@ fn claude_code_shell_block(port: u16) -> String {
 /// own output lands first.
 fn claude_remote_control_wrapper_path() -> PathBuf {
     // An .exe on Windows: the extension spawns the wrapper with `shell: false`
-    // (`build_windows_wrapper_exe`).
+    // (a signed copy of the app, claude_wrapper.rs, beside its .py script).
+    let stem = crate::claude_wrapper::WRAPPER_STEM;
     let name = if cfg!(windows) {
-        "headroom-claude-wrapper.exe"
+        format!("{stem}.exe")
     } else {
-        "headroom-claude-wrapper.py"
+        format!("{stem}.py")
     };
     home_dir().join(".claude").join("hooks").join(name)
 }
@@ -9014,90 +9014,70 @@ while True:
     .to_string()
 }
 
-/// The Windows wrapper. The extension spawns it with `shell: false`, so it has
-/// to be an .exe; it is built the way pip builds console scripts: distlib's
-/// launcher stub, a shebang naming the interpreter, and a zip holding the
-/// wrapper as `__main__.py`. The stub finds the shebang just before the zip
-/// (the zip's own offsets locate its start, so they must count from it) and
-/// runs `<python> <exe> <args>`, and Python runs the zip.
-fn build_windows_wrapper_exe(stub: &[u8], python: &Path, source: &str) -> Result<Vec<u8>> {
-    use std::io::Write;
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    zip.start_file(
-        "__main__.py",
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-    )?;
-    zip.write_all(source.as_bytes())?;
-    let archive = zip.finish()?.into_inner();
-    let mut exe = stub.to_vec();
-    exe.extend_from_slice(format!("#!\"{}\"\n", python.display()).as_bytes());
-    exe.extend_from_slice(&archive);
-    Ok(exe)
-}
-
-/// The interpreter and launcher stub for the Windows wrapper, when both are
-/// there. The base interpreter, not the venv's: a running wrapper holds its
-/// executable open for the whole panel session, and the venv is the part a
-/// runtime repair deletes. The stub ships in the venv's pip.
-fn windows_wrapper_parts() -> Option<(PathBuf, PathBuf)> {
+/// The interpreter for the Windows wrapper, when the runtime has one. The
+/// base interpreter, not the venv's: a running wrapper holds its interpreter
+/// open for the whole panel session, and the venv is the part a runtime repair
+/// deletes.
+fn windows_wrapper_python() -> Option<PathBuf> {
     let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir());
-    let stub = if cfg!(target_arch = "aarch64") {
-        "t64-arm.exe"
-    } else {
-        "t64.exe"
-    };
-    let stub = runtime
-        .venv_dir
-        .join("Lib")
-        .join("site-packages")
-        .join("pip")
-        .join("_vendor")
-        .join("distlib")
-        .join(stub);
-    (runtime.standalone_runtime_intact() && stub.is_file())
-        .then(|| (runtime.standalone_python(), stub))
+    runtime
+        .standalone_runtime_intact()
+        .then(|| runtime.standalone_python())
 }
 
 /// Windows gets the VS Code panel restart only: the terminal one needs the
 /// managed zsh/bash `claude` function, and PowerShell gets none.
-fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
+fn ensure_windows_remote_control_panel(wrapper: &Path) -> Result<(Vec<String>, Vec<String>)> {
     if !is_vscode_wrapper_enabled() {
-        remove_vscode_process_wrapper()?;
-        remove_owned_vscode_panel_command()?;
+        remove_windows_remote_control_panel()?;
         return Ok((Vec::new(), Vec::new()));
     }
-    let Some((python, stub)) = windows_wrapper_parts() else {
+    let Some(python) = windows_wrapper_python() else {
         // No runtime yet: no wrapper, and no command offering a restart
         // nothing would perform. The next setup after bootstrap adds both.
-        remove_vscode_process_wrapper()?;
+        remove_windows_remote_control_panel()?;
         return Ok((Vec::new(), Vec::new()));
     };
     let mut changed = Vec::new();
     let mut backups = Vec::new();
-    let wrapper = claude_remote_control_wrapper_path();
-    let exe = build_windows_wrapper_exe(
-        &std::fs::read(&stub).with_context(|| format!("reading {}", stub.display()))?,
+    if let Some(parent) = wrapper.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // The script first: the wrapper copy reads it at every start.
+    let script = wrapper.with_extension("py");
+    let source = crate::claude_wrapper::script_with_interpreter(
         &python,
         &build_claude_remote_control_wrapper(),
-    )?;
-    if std::fs::read(&wrapper).ok().as_deref() != Some(exe.as_slice()) {
-        if let Some(parent) = wrapper.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        match atomic_write(&wrapper, &exe) {
+    );
+    if std::fs::read_to_string(&script).ok().as_deref() != Some(source.as_str()) {
+        atomic_write(&script, source.as_bytes())?;
+        changed.push(script.display().to_string());
+    }
+    // A copy of this signed binary (claude_wrapper.rs): Smart App Control and
+    // App Control refuse an unsigned wrapper, and then the panel never starts.
+    let app = std::env::current_exe().context("locating Headroom's own binary")?;
+    let exe = std::fs::read(&app).with_context(|| format!("reading {}", app.display()))?;
+    if std::fs::read(wrapper).ok().as_deref() != Some(exe.as_slice()) {
+        match atomic_write(wrapper, &exe) {
             Ok(()) => changed.push(wrapper.display().to_string()),
             // A panel session running it holds the file; the old wrapper still
             // works, and the next setup replaces it.
-            Err(err) => {
+            Err(err) if wrapper.is_file() => {
                 log::info!("keeping the running {}: {err:#}", wrapper.display())
+            }
+            Err(err) => {
+                if let Err(cleanup_err) = remove_windows_remote_control_panel() {
+                    log::warn!("removing the incomplete VS Code wrapper setup: {cleanup_err:#}");
+                }
+                return Err(err);
             }
         }
     }
     let command = claude_remote_control_panel_command_path();
     let content = build_claude_remote_control_command_with(
         CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION,
-        &windows_remote_control_confirm(&wrapper),
+        &windows_remote_control_confirm(wrapper),
     );
     if std::fs::read_to_string(&command)
         .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
@@ -9125,6 +9105,12 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
+fn remove_windows_remote_control_panel() -> Result<()> {
+    let command = remove_owned_vscode_panel_command();
+    let wrapper = remove_vscode_process_wrapper();
+    command.and(wrapper)
+}
+
 fn remove_owned_vscode_panel_command() -> Result<()> {
     let command = claude_remote_control_panel_command_path();
     if std::fs::read_to_string(&command)
@@ -9140,7 +9126,7 @@ fn remove_owned_vscode_panel_command() -> Result<()> {
 /// working /usr/bin/python3 (the wrapper's interpreter): without the Command
 /// Line Tools it is a stub that fails on macOS, a distro may not ship it at
 /// all, and every panel session would then fail to start. Windows checks its
-/// interpreter before building the .exe (`windows_wrapper_parts`).
+/// interpreter before writing the wrapper (`windows_wrapper_python`).
 fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
     if !is_vscode_wrapper_enabled() {
         remove_vscode_process_wrapper()?;
@@ -9229,6 +9215,9 @@ fn remove_vscode_wrapper_file_if_unreferenced() {
     }
     if let Err(err) = std::fs::remove_file(&wrapper) {
         log::warn!("cleanup: removing {} failed: {err}", wrapper.display());
+    }
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(wrapper.with_extension("py"));
     }
 }
 
@@ -9422,7 +9411,7 @@ Otherwise reply only \"Staying in this session.\"\n"
 /// so Windows gets the VS Code panel's restart alone.
 fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> {
     if cfg!(target_os = "windows") {
-        return ensure_windows_remote_control_panel();
+        return ensure_windows_remote_control_panel(&claude_remote_control_wrapper_path());
     }
     let mut changed = Vec::new();
     let mut backups = Vec::new();
@@ -10532,31 +10521,6 @@ fn replace_oss_plugin_hook_command(path: &Path, from: &str, to: &str) -> Result<
     Ok(true)
 }
 
-/// What the open-source plugin/CLI look like on this machine right now.
-pub struct OssPluginStatus {
-    pub plugin_installed: bool,
-    pub hook_absorbed: bool,
-    pub cli_on_path: bool,
-    /// An open-source proxy is serving on :8787 (the OSS default port).
-    pub oss_proxy_8787: bool,
-    /// Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
-    pub base_url_ours: bool,
-}
-
-/// True when Claude Code's `ANTHROPIC_BASE_URL` still points at our proxy.
-fn claude_base_url_is_ours() -> bool {
-    std::fs::read_to_string(claude_settings_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| {
-            v.get("env")?
-                .get("ANTHROPIC_BASE_URL")?
-                .as_str()
-                .map(|url| url == HEADROOM_ANTHROPIC_BASE_URL)
-        })
-        .unwrap_or(false)
-}
-
 /// True when a real open-source `headroom` CLI exists for the plugin hook to
 /// run. `find_on_path` alone is not enough: a GUI launch inherits launchd's
 /// bare PATH, which never contains `~/.local/bin` -- exactly where the OSS
@@ -10568,7 +10532,8 @@ fn oss_cli_present() -> bool {
         || crate::claude_cli::probe_known_paths("headroom").is_some()
 }
 
-pub fn absorb_oss_plugin() -> OssPluginStatus {
+/// True when the plugin's bare hook command is now neutralized.
+pub fn absorb_oss_plugin() -> bool {
     // Probing runs `headroom --version` against every known install location,
     // so it execs whatever binary of that name happens to be on disk. Nobody
     // without the plugin needs that at every launch: the answer only decides
@@ -10604,27 +10569,17 @@ pub fn oss_plugin_hook_needs_absorbing() -> bool {
     })
 }
 
-fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> OssPluginStatus {
+fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> bool {
     let plugin_installed = oss_headroom_plugin_installed();
     let hooks = oss_headroom_plugin_hook_paths();
     let absorb = plugin_installed && !cli_on_path && !oss_absorb_disabled();
-    let hook_absorbed = {
-        let _guard = OSS_PLUGIN_HOOK_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
-            false
-        } else {
-            reconcile_oss_plugin_hooks(&hooks, absorb).0
-        }
-    };
-
-    OssPluginStatus {
-        plugin_installed,
-        hook_absorbed,
-        cli_on_path,
-        oss_proxy_8787: port_listening(8787),
-        base_url_ours: claude_base_url_is_ours(),
+    let _guard = OSS_PLUGIN_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+        false
+    } else {
+        reconcile_oss_plugin_hooks(&hooks, absorb).0
     }
 }
 
@@ -12552,7 +12507,8 @@ mod tests {
         VSCODE_PROCESS_WRAPPER_KEY,
     };
     use super::{
-        build_claude_remote_control_wrapper, build_windows_wrapper_exe, set_json_setting_at,
+        build_claude_remote_control_wrapper, claude_remote_control_panel_command_path,
+        claude_remote_control_wrapper_path, set_json_setting_at,
     };
     #[cfg(unix)]
     use super::{
@@ -12563,8 +12519,7 @@ mod tests {
     #[cfg(unix)]
     use super::{
         claude_code_shell_block, claude_remote_control_command_path,
-        claude_remote_control_hook_command, claude_remote_control_panel_command_path,
-        claude_remote_control_script_path, claude_remote_control_wrapper_path,
+        claude_remote_control_hook_command, claude_remote_control_script_path,
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
         remove_vscode_wrapper_file_if_unreferenced, vscode_user_settings_path,
         CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
@@ -20676,6 +20631,39 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         assert_eq!(render(r#"{"session_id":"aaaa-just-saved"}"#), "");
     }
 
+    #[test]
+    fn windows_panel_command_is_removed_when_its_runtime_is_missing() {
+        let _home = TestHome::new();
+        let command = claude_remote_control_panel_command_path();
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::write(&command, super::CLAUDE_REMOTE_CONTROL_COMMAND_MARKER).unwrap();
+
+        super::ensure_windows_remote_control_panel(&claude_remote_control_wrapper_path()).unwrap();
+
+        assert!(!command.exists());
+    }
+
+    #[test]
+    fn windows_panel_command_is_not_installed_when_wrapper_publish_fails() {
+        let _home = TestHome::new();
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&super::app_data_dir());
+        let python = runtime.standalone_python();
+        let stdlib = if cfg!(windows) {
+            "Lib"
+        } else {
+            "lib/python3.12"
+        };
+        std::fs::create_dir_all(runtime.python_dir.join(stdlib)).unwrap();
+        std::fs::write(runtime.python_dir.join(stdlib).join("os.py"), "").unwrap();
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(python, "").unwrap();
+        let wrapper = claude_remote_control_wrapper_path().with_extension("exe");
+        std::fs::create_dir_all(&wrapper).unwrap();
+
+        assert!(super::ensure_windows_remote_control_panel(&wrapper).is_err());
+        assert!(!claude_remote_control_panel_command_path().exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn vscode_wrapper_opt_out_survives_setup_repair() {
@@ -20860,34 +20848,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
             .exists());
     }
 
-    #[test]
-    fn windows_wrapper_exe_puts_the_shebang_right_before_its_zip() {
-        let python = Path::new(r"C:\Users\A B\AppData\Roaming\Headroom\python.exe");
-        let exe = build_windows_wrapper_exe(b"MZstub", python, "print(1)\n").unwrap();
-        // What distlib's launcher does: locate the end-of-central-directory
-        // record, step back over the directory to the archive's start, and
-        // read the shebang line that ends there.
-        let eocd = exe
-            .windows(4)
-            .rposition(|w| w == b"PK\x05\x06")
-            .expect("end of central directory");
-        let u32_at = |at: usize| u32::from_le_bytes(exe[at..at + 4].try_into().unwrap()) as usize;
-        let start = eocd - u32_at(eocd + 12) - u32_at(eocd + 16);
-        assert_eq!(&exe[..6], b"MZstub");
-        assert_eq!(
-            &exe[6..start],
-            "#!\"C:\\Users\\A B\\AppData\\Roaming\\Headroom\\python.exe\"\n".as_bytes()
-        );
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&exe[start..])).unwrap();
-        let mut main = String::new();
-        std::io::Read::read_to_string(&mut zip.by_name("__main__.py").unwrap(), &mut main).unwrap();
-        assert_eq!(main, "print(1)\n");
-    }
-
     /// The Windows flow, run by the system Python with the Windows switch on:
     /// --confirm records the restart, and the wrapper ends its child after the
     /// turn's result and resumes the same session with Remote Control on. The
-    /// file is the real .exe layout minus the stub, which Python runs as a zip.
+    /// file is the real .py the signed wrapper copy runs, interpreter line and all.
     #[cfg(unix)]
     #[test]
     fn windows_wrapper_restarts_its_child_once_the_confirmed_turn_ends() {
@@ -20896,10 +20860,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         let source = build_claude_remote_control_wrapper()
             .replace("ENDS_CHILD = os.name == \"nt\"", "ENDS_CHILD = True");
         assert!(source.contains("ENDS_CHILD = True"));
-        let wrapper = home.path().join("wrapper.exe");
+        let wrapper = home.path().join("headroom-claude-wrapper.py");
         std::fs::write(
             &wrapper,
-            build_windows_wrapper_exe(b"", Path::new("/usr/bin/python3"), &source).unwrap(),
+            crate::claude_wrapper::script_with_interpreter(Path::new("/usr/bin/python3"), &source),
         )
         .unwrap();
         let log = home.path().join("argv.log");
@@ -23661,26 +23625,22 @@ sys.exit(3)
         fs::create_dir_all(home.path().join(".local/bin")).unwrap();
 
         let before = snapshot_tree(home.path());
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
         let after = snapshot_tree(home.path());
 
         assert_eq!(before, after, "no-plugin users must see zero writes");
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
-        assert!(
-            status.base_url_ours,
-            "our routing is left exactly as it was"
-        );
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
     }
 
     #[test]
     fn state_1_app_alone_stays_inert() {
         let _home = TestHome::new();
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert!(!super::oss_plugin_hook_receipt_path().exists());
     }
 
@@ -23689,10 +23649,10 @@ sys.exit(3)
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(status.plugin_installed);
-        assert!(status.hook_absorbed);
+        assert!(super::oss_headroom_plugin_installed());
+        assert!(absorbed);
         let raw = fs::read_to_string(&hooks).unwrap();
         assert_eq!(
             raw.matches(&serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap())
@@ -23711,7 +23671,7 @@ sys.exit(3)
             seed_oss_plugin(home.path(), plugin_ref);
 
             assert!(
-                super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed,
+                super::absorb_oss_plugin_with_cli_on_path(false),
                 "{plugin_ref} should be recognised"
             );
         }
@@ -23722,7 +23682,7 @@ sys.exit(3)
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "ponytail@ponytail");
 
-        assert!(!super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(!super::oss_plugin_hook_receipt_path().exists());
     }
 
@@ -23730,12 +23690,11 @@ sys.exit(3)
     fn state_3_real_cli_on_path_is_never_shadowed() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(true);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(true);
 
-        assert!(status.cli_on_path);
-        assert!(!status.hook_absorbed);
+        assert!(!absorbed);
         assert_eq!(
             fs::read_to_string(hooks)
                 .unwrap()
@@ -23779,12 +23738,12 @@ sys.exit(3)
     fn removing_the_plugin_restores_its_hook_and_clears_the_receipt() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         seed_oss_plugin(home.path(), "ponytail@ponytail");
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
-        assert!(!status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
+        assert!(!super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert!(!super::oss_plugin_hook_receipt_path().exists());
         assert_eq!(
             fs::read_to_string(&hooks)
@@ -23803,7 +23762,7 @@ sys.exit(3)
         fs::write(&shim, "#!/bin/sh\necho not ours\n").unwrap();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert_eq!(
             fs::read_to_string(&shim).unwrap(),
             "#!/bin/sh\necho not ours\n"
@@ -23814,7 +23773,7 @@ sys.exit(3)
     fn failed_restore_preserves_the_receipt_for_a_later_retry() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         let managed = serde_json::to_string(super::OSS_PLUGIN_MANAGED_COMMAND).unwrap();
         let corrupt = format!("{} trailing", fs::read_to_string(&hooks).unwrap());
@@ -23828,9 +23787,9 @@ sys.exit(3)
     }
 
     #[test]
-    fn state_4_oss_proxy_bypass_is_measured_not_fought() {
+    fn state_4_oss_proxy_bypass_is_left_alone() {
         // The user ran `headroom init` themselves, so their ANTHROPIC_BASE_URL
-        // points at the open-source proxy. We report it and change nothing.
+        // points at the open-source proxy. We change nothing.
         let home = TestHome::new();
         fs::create_dir_all(home.path().join(".claude")).unwrap();
         let settings = home.path().join(".claude/settings.json");
@@ -23838,13 +23797,9 @@ sys.exit(3)
         fs::write(&settings, original.to_string()).unwrap();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
 
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        super::absorb_oss_plugin_with_cli_on_path(false);
 
-        assert!(status.plugin_installed);
-        assert!(
-            !status.base_url_ours,
-            "the bypass must be visible to telemetry"
-        );
+        assert!(super::oss_headroom_plugin_installed());
         assert_eq!(
             fs::read_to_string(&settings).unwrap(),
             original.to_string(),
@@ -23864,7 +23819,7 @@ sys.exit(3)
         // Nobody managed yet: an untouched plugin is not the recheck's job.
         assert!(!super::oss_plugin_hook_needs_absorbing());
 
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(
             !super::oss_plugin_hook_needs_absorbing(),
             "steady state must stay quiet"
@@ -23873,7 +23828,7 @@ sys.exit(3)
         // Claude Code updates the plugin: a new version dir, bare command back.
         let updated = seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
         assert!(super::oss_plugin_hook_needs_absorbing());
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         assert!(!fs::read_to_string(&updated)
             .unwrap()
             .contains(super::OSS_PLUGIN_HOOK_COMMAND));
@@ -23881,7 +23836,7 @@ sys.exit(3)
 
         // A real CLI appears, we hand the hook back, and the poll must not
         // immediately claim it again.
-        assert!(!super::absorb_oss_plugin_with_cli_on_path(true).hook_absorbed);
+        assert!(!super::absorb_oss_plugin_with_cli_on_path(true));
         assert!(
             !super::oss_plugin_hook_needs_absorbing(),
             "a restored user must not be re-absorbed on a timer"
@@ -23892,7 +23847,7 @@ sys.exit(3)
     fn the_recheck_respects_the_kill_switch() {
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace-v2");
         assert!(super::oss_plugin_hook_needs_absorbing());
 
@@ -23907,14 +23862,14 @@ sys.exit(3)
     fn the_kill_switch_absorbs_nothing_and_restores_what_it_finds() {
         let home = TestHome::new();
         let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         std::env::set_var("HEADROOM_ABSORB_OSS_PLUGIN", "0");
-        let status = super::absorb_oss_plugin_with_cli_on_path(false);
+        let absorbed = super::absorb_oss_plugin_with_cli_on_path(false);
         std::env::remove_var("HEADROOM_ABSORB_OSS_PLUGIN");
 
-        assert!(status.plugin_installed);
-        assert!(!status.hook_absorbed);
+        assert!(super::oss_headroom_plugin_installed());
+        assert!(!absorbed);
         assert_eq!(
             fs::read_to_string(&hooks)
                 .unwrap()
@@ -23929,7 +23884,7 @@ sys.exit(3)
     fn absorbing_the_hook_does_not_hide_a_real_oss_remnant() {
         let home = TestHome::new();
         seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
-        assert!(super::absorb_oss_plugin_with_cli_on_path(false).hook_absorbed);
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
 
         let foreign = home.path().join(".local/bin/headroom");
         fs::create_dir_all(foreign.parent().unwrap()).unwrap();

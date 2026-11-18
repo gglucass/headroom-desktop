@@ -742,6 +742,7 @@ struct ResponseSniffer<R> {
     /// Request path for error attribution; `None` disables error capture
     /// (local proxy paths like /stats, or an unparseable request head).
     capture_path: Option<String>,
+    request_bytes: Option<usize>,
     /// Count a failed status in `failed_requests` (see `is_counted_request`).
     count_failures: bool,
     /// Claude Code conversation this response belongs to. On a 2xx the head
@@ -769,6 +770,7 @@ impl<R> ResponseSniffer<R> {
             client_key,
             count_failures: capture_path.is_some(),
             capture_path,
+            request_bytes: None,
             savings_session: None,
             usage_pending: false,
             capturing: false,
@@ -894,7 +896,14 @@ impl<R> Drop for ResponseSniffer<R> {
         if !is_reportable_upstream_error(&status) || self.buf.is_empty() {
             return;
         }
-        report_upstream_error(self.client_key, status, path, &self.buf, &[]);
+        report_upstream_error(
+            self.client_key,
+            status,
+            path,
+            self.request_bytes,
+            &self.buf,
+            &[],
+        );
     }
 }
 
@@ -2646,6 +2655,7 @@ async fn handle(
         inner: backend,
         last: Arc::clone(&backend_activity),
     };
+    let req_bytes = parsed_head.as_ref().and_then(|p| p.content_length);
     let relay = async {
         if is_models_fetch {
             splice_with_models_lite_rewrite(client, backend).await;
@@ -2655,8 +2665,16 @@ async fn handle(
                 .map(|p| p.path.clone())
                 .unwrap_or_default();
             let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
-            splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt, counted)
-                .await;
+            splice_with_codex_capture(
+                client,
+                backend,
+                &codex_slot,
+                &req_path,
+                req_bytes,
+                prompt,
+                counted,
+            )
+            .await;
         } else {
             // Same shape as copy_bidirectional, split so the backend->client half
             // can stamp traffic liveness for the watchdog.
@@ -2698,6 +2716,7 @@ async fn handle(
                     error_path,
                 )
                 .with_savings_session(savings_session);
+                stamped.request_bytes = req_bytes;
                 stamped.count_failures &= counted;
                 let copied = tokio::io::copy(&mut stamped, &mut client_wr).await;
                 let _ = client_wr.shutdown().await;
@@ -3060,6 +3079,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     backend: S,
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
+    req_bytes: Option<usize>,
     prompt: bool,
     counted: bool,
 ) {
@@ -3134,7 +3154,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-            report_upstream_error("codex", status, req_path, &head, &chunk);
+            report_upstream_error("codex", status, req_path, req_bytes, &head, &chunk);
             if let Some(end) = find_header_end(&head) {
                 error_body.extend_from_slice(&head[(end + 4).min(head.len())..]);
             }
@@ -3666,6 +3686,9 @@ fn report_upstream_error(
     client: &'static str,
     status: u16,
     req_path: &str,
+    // The request's declared Content-Length, so a body-limit 413 says how big
+    // the request was (RUST-WR: a huge conversation or a pruning gap).
+    req_bytes: Option<usize>,
     head: &[u8],
     chunk: &[u8],
 ) {
@@ -3685,7 +3708,7 @@ fn report_upstream_error(
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     log::warn!("{client} upstream error {status} on {path}: {raw_snippet}");
     if is_headroom_body_limit_error(&body) {
-        report_headroom_body_limit(client, "backend", status, None);
+        report_headroom_body_limit(client, "backend", status, req_bytes);
         return;
     }
     // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
@@ -10615,6 +10638,76 @@ mod tests {
         ] {
             assert!(!super::is_headroom_body_limit_error(body));
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn backend_body_limit_report_carries_claude_request_size() {
+        use sentry::SentryFutureExt;
+        use std::sync::atomic::Ordering;
+
+        #[derive(Default)]
+        struct Capture(Mutex<Option<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Capture {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                *self.0.lock() = envelope.event().cloned();
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let sentry_client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(capture.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(sentry_client)),
+            Arc::default(),
+        ));
+        let (backend, backend_addr) = bind_ephemeral().await;
+        let (intercept, intercept_addr) = bind_ephemeral().await;
+        let mut client = TcpStream::connect(intercept_addr).await.unwrap();
+        let (accepted, _) = intercept.accept().await.unwrap();
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel();
+
+        // This test exercises the relay without sending onboarding beacons.
+        let optimized = FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel);
+        let prompt = super::FIRST_PROMPT_REQUEST_REPORTED.swap(true, Ordering::AcqRel);
+        backend_port::set(backend_addr.port());
+        let result = timeout(Duration::from_secs(5), async {
+            let relay = super::handle(
+                accepted,
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                fresh_bearer_tx,
+                Arc::new("http://127.0.0.1:9".to_string()),
+            )
+            .bind_hub(hub);
+            let backend_reply = async {
+                let (mut socket, _) = backend.accept().await.unwrap();
+                read_until_header_end(&mut socket).await;
+                socket.write_all(b"HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\n{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid request body: too large\"}}").await.unwrap();
+            };
+            let request = async {
+                client.write_all(b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: claude-cli/test\r\nContent-Length: 110000000\r\n\r\n").await.unwrap();
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await.unwrap();
+                response
+            };
+            tokio::join!(relay, backend_reply, request).2
+        }).await;
+        backend_port::reset_for_tests();
+        FIRST_OPTIMIZED_REQUEST_REPORTED.store(optimized, Ordering::Release);
+        super::FIRST_PROMPT_REQUEST_REPORTED.store(prompt, Ordering::Release);
+
+        assert!(result.unwrap().starts_with(b"HTTP/1.1 413"));
+        let event = capture.0.lock().take().expect("backend 413 Sentry event");
+        assert_eq!(event.tags["body_limit_source"], "backend");
+        assert_eq!(event.extra.get("request_bytes"), Some(&110_000_000.into()));
     }
 
     #[test]

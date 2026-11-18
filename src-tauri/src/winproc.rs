@@ -16,7 +16,8 @@
 //! - Who holds a file open, from the Restart Manager, for a pip run that gives
 //!   up on a sharing violation.
 //!
-//! Only proxy spawns join the job. The updater's installer, the relaunch
+//! Only proxy spawns join the app's job (the VS Code wrapper copy ties its
+//! child to a job of its own). The updater's installer, the relaunch
 //! helper and anything else that has to outlive the app never do.
 
 use std::os::windows::io::AsRawHandle;
@@ -47,47 +48,68 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
+/// A new Job Object that kills every process in it once its last handle
+/// closes. `None` (logged) when Windows refuses; callers then run unjobbed.
+fn kill_on_close_job(what: &str) -> Option<HANDLE> {
+    // SAFETY: null attributes and name are documented as valid; the returned
+    // handle is checked before use.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        log::info!(
+            "winproc: CreateJobObjectW failed ({}); {what} runs without a job",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `info` is a correctly sized, initialised struct for this
+    // information class, and `job` is a live handle.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        log::info!(
+            "winproc: setting kill-on-close failed ({}); {what} runs without a job",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `job` is a live handle we own.
+        unsafe { CloseHandle(job) };
+        return None;
+    }
+    Some(job)
+}
+
 /// The app's proxy job, created once. Stored as usize: a raw HANDLE is not
 /// Send/Sync, and this one is never closed (the OS closes it when the app
 /// exits, which is exactly the moment the kill-on-close has to fire). `None`
 /// when creation failed; spawns then run unjobbed, as they did before.
 fn proxy_job() -> Option<HANDLE> {
     static JOB: OnceLock<Option<usize>> = OnceLock::new();
-    JOB.get_or_init(|| {
-        // SAFETY: null attributes and name are documented as valid; the
-        // returned handle is checked before use.
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            log::info!(
-                "winproc: CreateJobObjectW failed ({}); proxy runs without a job",
-                std::io::Error::last_os_error()
-            );
-            return None;
-        }
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: `info` is a correctly sized, initialised struct for this
-        // information class, and `job` is a live handle.
-        let ok = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            log::info!(
-                "winproc: setting kill-on-close failed ({}); proxy runs without a job",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: `job` is a live handle we own.
-            unsafe { CloseHandle(job) };
-            return None;
-        }
-        Some(job as usize)
-    })
-    .map(|job| job as HANDLE)
+    JOB.get_or_init(|| kill_on_close_job("proxy").map(|job| job as usize))
+        .map(|job| job as HANDLE)
+}
+
+/// End `child` (and what it starts) when this process ends, however it ends:
+/// the VS Code wrapper copy, which the extension may kill outright. The job
+/// handle is never closed; the OS closes it with this process.
+pub(crate) fn tie_to_this_process(child: &std::process::Child) {
+    let Some(job) = kill_on_close_job("wrapper child") else {
+        return;
+    };
+    // SAFETY: the job is live (never closed) and `child` owns its handle.
+    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
+        log::info!(
+            "winproc: assigning pid {} to a job failed ({})",
+            child.id(),
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// Put a freshly spawned proxy into the app's kill-on-close job. Its children

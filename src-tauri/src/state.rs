@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::activity_facts::{ActivityFacts, WeeklyTotals};
-use crate::analytics;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::client_adapters::{
     detect_clients, ensure_rtk_integrations, is_rtk_disabled, rtk_integration_status,
@@ -953,11 +952,11 @@ impl AppState {
 
         match self.ensure_headroom_running() {
             Ok(()) => {
-                crate::port_conflict::note_proxy_started(app);
+                crate::port_conflict::note_proxy_started();
             }
             Err(err) => {
                 log::debug!("failed to auto-start headroom during app launch: {err}");
-                let handled = crate::port_conflict::note_proxy_failed(app, &err, true);
+                let handled = crate::port_conflict::note_proxy_failed(&err, true);
                 if !handled {
                     crate::capture_headroom_start_failure(
                         "headroom auto-start failed during launch",
@@ -1171,20 +1170,6 @@ impl AppState {
         drop(self.lifecycle_lock.lock());
         self.stop_headroom();
 
-        analytics::track_event(
-            app,
-            "runtime_upgrade_started",
-            Some(serde_json::json!({
-                "maintenance_kind": match maintenance_kind {
-                    RuntimeMaintenanceKind::Upgrade => "upgrade",
-                    RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
-                },
-                "from_version": installed_version,
-                "to_version": target_version,
-                "app_version": current_app_version,
-            })),
-        );
-
         let start = std::time::Instant::now();
         let app_for_progress = app.clone();
         // The callees only require FnMut (no 'static/Send), so capturing
@@ -1274,22 +1259,6 @@ impl AppState {
                     installed_version.as_deref(),
                     None,
                     None,
-                );
-                analytics::track_event(
-                    app,
-                    "runtime_upgrade_failed",
-                    Some(serde_json::json!({
-                        "phase": "install",
-                        "maintenance_kind": match maintenance_kind {
-                            RuntimeMaintenanceKind::Upgrade => "upgrade",
-                            RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
-                        },
-                        "attempt": self.upgrade_failure_attempts(&current_app_version),
-                        "app_version": current_app_version,
-                        "restored": restored,
-                        "restarted": restarted,
-                        "duration_ms": duration_ms,
-                    })),
                 );
                 self.set_upgrade_progress(|p| {
                     p.running = false;
@@ -1426,20 +1395,9 @@ impl AppState {
                 p.overall_percent = 100;
             });
             emit_runtime_upgrade_progress(app, self);
-            analytics::track_event(
-                app,
-                "runtime_upgrade_completed",
-                Some(serde_json::json!({
-                    "maintenance_kind": match maintenance_kind {
-                        RuntimeMaintenanceKind::Upgrade => "upgrade",
-                        RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
-                    },
-                    "from_version": installed_version,
-                    "to_version": target_version,
-                    "duration_ms": duration_ms,
-                })),
+            crate::logging::set_sentry_headroom_ai_version(
+                self.tool_manager.installed_headroom_version(),
             );
-            analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
             self.stop_python_if_any_gate();
             return;
         }
@@ -1510,7 +1468,9 @@ impl AppState {
         if let Err(err) = rollback_result {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
-        analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
+        crate::logging::set_sentry_headroom_ai_version(
+            self.tool_manager.installed_headroom_version(),
+        );
         let restarted = self.restart_after_failed_maintenance();
         self.stop_python_if_any_gate();
 
@@ -1603,22 +1563,6 @@ impl AppState {
             installed_version.as_deref(),
             log_tail.as_deref(),
             Some(boot_diagnostics),
-        );
-        analytics::track_event(
-            app,
-            "runtime_upgrade_failed",
-            Some(serde_json::json!({
-                "phase": "boot_validation",
-                "maintenance_kind": match maintenance_kind {
-                    RuntimeMaintenanceKind::Upgrade => "upgrade",
-                    RuntimeMaintenanceKind::RequirementsRepair => "requirements_repair",
-                },
-                "attempt": self.upgrade_failure_attempts(&current_app_version),
-                "app_version": current_app_version,
-                "restored": rollback_restored,
-                "restarted": restarted,
-                "duration_ms": duration_ms,
-            })),
         );
         // Reuse the headroom-ai labels constructed above for the error_hint —
         // same rationale: rollback is about the Python package, not the app.
@@ -2064,37 +2008,12 @@ impl AppState {
         persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
-    fn upgrade_failure_attempts(&self, app_version: &str) -> u32 {
-        self.launch_profile
-            .lock()
-            .last_runtime_upgrade_failure
-            .as_ref()
-            .filter(|f| f.app_version == app_version)
-            .map(|f| f.attempts)
-            .unwrap_or(0)
-    }
-
-    pub fn launch_count(&self) -> u64 {
-        self.launch_profile.lock().launch_count
-    }
-
     /// Saves the profile `AppState::new` loaded, launch_count bumped. Only the
     /// primary calls it, once a second launch would have been handed off.
     pub fn record_launch(&self) {
         self.launch_profile
             .lock()
             .persist_loaded(self.launch_profile_path.as_deref());
-    }
-
-    pub fn launch_experience_label(&self) -> &'static str {
-        if !self.setup_wizard_satisfied() {
-            return "first_run";
-        }
-        match self.launch_profile.lock().launch_experience {
-            LaunchExperience::FirstRun => "first_run",
-            LaunchExperience::Resume => "resume",
-            LaunchExperience::Dashboard => "dashboard",
-        }
     }
 
     pub fn setup_wizard_complete(&self) -> bool {
@@ -2573,7 +2492,7 @@ impl AppState {
         // Callers that take this read-only path (bootstrap finalize, account
         // activation) must NOT drain pending milestones — doing so silently
         // consumes crossings before `report_pending_milestones` (lib.rs) can
-        // fire the aptabase event and post them.
+        // post them.
         self.build_dashboard(false).0
     }
 
@@ -2690,11 +2609,10 @@ impl AppState {
     }
 
     /// The kinds of the tips this marked seen.
-    pub fn mark_tips_seen(&self) -> Vec<crate::models::TipKind> {
+    pub fn mark_tips_seen(&self) {
         let mut facts = self.activity_facts.lock();
-        let seen = facts.mark_tips_seen();
+        facts.mark_tips_seen();
         let _ = facts.save_if_dirty();
-        seen
     }
 
     pub fn dismiss_tip(&self, kind: crate::models::TipKind) {
@@ -3555,12 +3473,14 @@ impl AppState {
         self.bootstrap_progress.lock().clone()
     }
 
-    pub fn begin_bootstrap(&self) -> Result<(), String> {
-        let python_installed = self.tool_manager.python_runtime_installed();
+    /// `None` joins a running bootstrap. Otherwise returns whether the
+    /// runtime is already installed and the worker can skip installation.
+    pub fn begin_bootstrap(&self) -> Option<bool> {
         let mut progress = self.bootstrap_progress.lock();
-        let (next, result) = begin_bootstrap_transition(&progress, python_installed);
+        let python_installed = self.tool_manager.python_runtime_installed();
+        let (next, start) = begin_bootstrap_transition(&progress, python_installed);
         *progress = next;
-        result
+        start
     }
 
     pub fn update_bootstrap_step(&self, step: BootstrapStepUpdate) {
@@ -3579,16 +3499,7 @@ impl AppState {
     }
 
     pub fn mark_bootstrap_proxy_starting(&self) {
-        let mut progress = self.bootstrap_progress.lock();
-        *progress = BootstrapProgress {
-            running: true,
-            complete: false,
-            failed: false,
-            current_step: "Starting Headroom".into(),
-            message: "Starting Headroom for the first time (this can take ~1-2 minutes)…".into(),
-            current_step_eta_seconds: 45,
-            overall_percent: 95,
-        };
+        *self.bootstrap_progress.lock() = bootstrap_proxy_starting_state();
     }
 
     pub fn mark_bootstrap_complete(&self) {
@@ -11446,23 +11357,13 @@ fn merge_hourly_savings(
 fn begin_bootstrap_transition(
     current: &BootstrapProgress,
     python_installed: bool,
-) -> (BootstrapProgress, Result<(), String>) {
-    if python_installed {
-        return (
-            BootstrapProgress {
-                running: false,
-                complete: true,
-                failed: false,
-                current_step: "Install complete".into(),
-                message: "Managed runtime already installed.".into(),
-                current_step_eta_seconds: 0,
-                overall_percent: 100,
-            },
-            Ok(()),
-        );
-    }
+) -> (BootstrapProgress, Option<bool>) {
+    // The runtime can be on disk while the worker is still starting the proxy.
     if current.running {
-        return (current.clone(), Err("Bootstrap is already running.".into()));
+        return (current.clone(), None);
+    }
+    if python_installed {
+        return (bootstrap_proxy_starting_state(), Some(true));
     }
     (
         BootstrapProgress {
@@ -11474,8 +11375,20 @@ fn begin_bootstrap_transition(
             current_step_eta_seconds: 3,
             overall_percent: 2,
         },
-        Ok(()),
+        Some(false),
     )
+}
+
+fn bootstrap_proxy_starting_state() -> BootstrapProgress {
+    BootstrapProgress {
+        running: true,
+        complete: false,
+        failed: false,
+        current_step: "Starting Headroom".into(),
+        message: "Starting Headroom for the first time (this can take ~1-2 minutes)…".into(),
+        current_step_eta_seconds: 45,
+        overall_percent: 95,
+    }
 }
 
 fn apply_bootstrap_step(
@@ -15364,7 +15277,7 @@ mod tests {
         // Regression guard: `state.dashboard()` (tray updater, bootstrap
         // finalize, account activation) must not advance the milestone
         // high-water mark. Only `dashboard_with_pending_milestones()` — the
-        // path that fires the aptabase event, pricing report, and in-app
+        // path that fires the pricing report and in-app
         // notification — may consume crossings. A prior refactor drained on
         // every call, so the tray updater's 5s heartbeat silently ate crossings.
         let base_dir = temp_test_dir("headroom-milestone-preservation");
@@ -19323,18 +19236,18 @@ mod tests {
 
     #[test]
     fn begin_bootstrap_skips_install_when_python_already_installed() {
-        let (next, result) = begin_bootstrap_transition(&idle_progress(), true);
-        assert!(result.is_ok());
-        assert!(next.complete);
-        assert!(!next.running);
+        let (next, start) = begin_bootstrap_transition(&idle_progress(), true);
+        assert_eq!(start, Some(true));
+        assert!(!next.complete);
+        assert!(next.running);
         assert!(!next.failed);
-        assert_eq!(next.overall_percent, 100);
+        assert_eq!(next.current_step, "Starting Headroom");
     }
 
     #[test]
     fn begin_bootstrap_starts_when_python_missing() {
-        let (next, result) = begin_bootstrap_transition(&idle_progress(), false);
-        assert!(result.is_ok());
+        let (next, start) = begin_bootstrap_transition(&idle_progress(), false);
+        assert_eq!(start, Some(false));
         assert!(next.running);
         assert!(!next.complete);
         assert!(!next.failed);
@@ -19342,17 +19255,32 @@ mod tests {
     }
 
     #[test]
-    fn begin_bootstrap_rejects_reentry_while_running() {
+    fn begin_bootstrap_joins_a_running_install() {
         let running = BootstrapProgress {
             running: true,
             overall_percent: 42,
             ..idle_progress()
         };
-        let (next, result) = begin_bootstrap_transition(&running, false);
-        assert!(result.is_err());
-        // State is preserved when re-entry is rejected.
+        let (next, start) = begin_bootstrap_transition(&running, false);
+        assert_eq!(start, None);
+        // The running install's progress is kept, not reset to 2%.
         assert_eq!(next.overall_percent, 42);
         assert!(next.running);
+    }
+
+    #[test]
+    fn begin_bootstrap_keeps_proxy_starting_after_runtime_is_published() {
+        let running = BootstrapProgress {
+            running: true,
+            current_step: "Starting Headroom".into(),
+            overall_percent: 95,
+            ..idle_progress()
+        };
+        let (next, _) = begin_bootstrap_transition(&running, true);
+        assert!(next.running);
+        assert!(!next.complete);
+        assert_eq!(next.current_step, "Starting Headroom");
+        assert_eq!(next.overall_percent, 95);
     }
 
     #[test]
@@ -19363,8 +19291,8 @@ mod tests {
             message: "boom".into(),
             ..idle_progress()
         };
-        let (next, result) = begin_bootstrap_transition(&failed, false);
-        assert!(result.is_ok());
+        let (next, start) = begin_bootstrap_transition(&failed, false);
+        assert_eq!(start, Some(false));
         assert!(next.running);
         assert!(!next.failed);
         assert_eq!(next.overall_percent, 2);

@@ -219,7 +219,6 @@ import {
   whenWindowVisible,
   type TrayView
 } from "./lib/trayHelpers";
-import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
 import { ReferralCard, ReferralCodeEntry } from "./components/ReferralCard";
@@ -1944,7 +1943,6 @@ export default function App() {
   // at least once this session. The tray-focus pre-warm is gated on this so
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
   const [heavyTabEverOpened, setHeavyTabEverOpened] = useState(false);
-  const activityTabTrackedRef = useRef(false);
   // Hides the dot the moment Activity opens instead of at the next dashboard
   // poll. Holds the tips it cleared, so a later tip shows its own dot.
   const [seenTipIdentity, setSeenTipIdentity] = useState<string | null>(null);
@@ -2330,54 +2328,6 @@ export default function App() {
       if (fired) window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
     });
   }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
-
-  useEffect(() => {
-    const claudeConnector = getClaudeConnector(connectors);
-    if (!claudeConnector?.installed) {
-      return;
-    }
-    trackInstallMilestoneOnce("claude_code_detected", {
-      enabled: claudeConnector.enabled,
-      verified: claudeConnector.verified
-    });
-  }, [connectors]);
-
-  useEffect(() => {
-    const claudeConnector = getClaudeConnector(connectors);
-    if (!claudeConnector?.enabled) {
-      return;
-    }
-    trackInstallMilestoneOnce("optimization_enabled", {
-      verified: claudeConnector.verified
-    });
-  }, [connectors]);
-
-  useEffect(() => {
-    if (dashboard.lifetimeRequests <= 0) {
-      return;
-    }
-    trackInstallMilestoneOnce("first_optimized_request", {
-      lifetime_requests: dashboard.lifetimeRequests,
-      launch_experience: dashboard.launchExperience
-    });
-  }, [dashboard.launchExperience, dashboard.lifetimeRequests]);
-
-  useEffect(() => {
-    if (
-      dashboard.lifetimeEstimatedTokensSaved <= 0 &&
-      dashboard.lifetimeEstimatedSavingsUsd <= 0
-    ) {
-      return;
-    }
-    // Analytics only. The matching funnel beacon is sent from Rust
-    // (get_dashboard_state), which retries every launch until it lands —
-    // this localStorage gate is once-per-install with no retry, and losing
-    // one POST here permanently undercounted the funnel finish line.
-    trackInstallMilestoneOnce("first_savings_recorded", {
-      lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
-      lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
-    });
-  }, [dashboard.lifetimeEstimatedSavingsUsd, dashboard.lifetimeEstimatedTokensSaved]);
 
   useEffect(() => {
     let active = true;
@@ -3294,12 +3244,6 @@ export default function App() {
   useEffect(() => {
     if (activeView === "notifications" || activeView === "optimization") {
       setHeavyTabEverOpened(true);
-    }
-    // Once per app run, mirroring app_started's cadence so adoption ratios
-    // (activity users / app_started users) compare like with like.
-    if (activeView === "notifications" && !activityTabTrackedRef.current) {
-      activityTabTrackedRef.current = true;
-      trackAnalyticsEvent("activity_tab_opened");
     }
   }, [activeView]);
 
@@ -4369,11 +4313,9 @@ export default function App() {
     setConnectorsNotice(null);
     try {
       await invoke("install_claude_code_cli");
-      trackAnalyticsEvent("claude_code_installer_run", { ok: true });
       setConnectorsNotice("Claude Code installed. Connecting it...");
       await autoConfigureConnectorsForLauncher();
     } catch (error) {
-      trackAnalyticsEvent("claude_code_installer_run", { ok: false });
       setConnectorsError(
         describeInvokeError(error, "The Claude Code installer failed. Try the command below in your own terminal.")
       );
@@ -4513,7 +4455,6 @@ export default function App() {
               projectPath ??
               "");
     const startupSummary = `Running headroom learn for ${displayName}.`;
-    trackAnalyticsEvent("headroom_learn_run", { agent });
     setHeadroomLearnBusy(true);
     setHeadroomLearnStatus((current) => ({
       ...current,
