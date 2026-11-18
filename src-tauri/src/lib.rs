@@ -1206,13 +1206,9 @@ async fn install_app_update(
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
     });
-    let installed = install_pending_update(&pending_update.0, emitter).await;
-    // Windows never gets here (the installer exits the app); elsewhere the new
-    // build is on disk and runs at the next restart.
-    if installed.is_ok() {
-        UPDATE_STAGED.store(true, Ordering::Release);
-    }
-    installed
+    // Windows never returns Ok (the installer exits the app); elsewhere the
+    // new build is on disk and runs at the next restart.
+    install_pending_update(&pending_update.0, emitter).await
 }
 
 /// RUST-WB: tauri-plugin-updater 2.10.0's macOS swap moves the running bundle
@@ -1428,7 +1424,7 @@ fn spawn_idle_update_applier(app: AppHandle) {
                             )
                             .await
                             {
-                                Ok(()) => UPDATE_STAGED.store(true, Ordering::Release),
+                                Ok(()) => {}
                                 Err(err) => log::info!("update: idle staging failed: {err}"),
                             }
                         }
@@ -1480,10 +1476,17 @@ where
         // click landed here). The remedy is a fresh check, so say that instead of
         // "nothing is ready", which reads as a bug to the user staring at a
         // "Restart to update" affordance.
-        pending.take().ok_or_else(|| {
-            "The downloaded update is no longer staged. Check for updates again, then retry."
-                .to_string()
-        })?
+        match pending.take() {
+            Some(update) => update,
+            // Another install (the idle applier's, a quiet one, a retry) took
+            // the slot while this one waited on INSTALL_LOCK, and staged its
+            // build: this call has nothing left to do (RUST-HP on 0.9.62).
+            None if UPDATE_STAGED.load(Ordering::Acquire) => return Ok(()),
+            None => return Err(
+                "The downloaded update is no longer staged. Check for updates again, then retry."
+                    .to_string(),
+            ),
+        }
     };
 
     // The window hides 150ms after losing focus, and a .deb install raises a
@@ -1532,6 +1535,10 @@ where
         (result, _) => result,
     };
     INSTALLING_UPDATE.store(false, Ordering::Release);
+    // Set under INSTALL_LOCK, so a caller queued behind this one sees it.
+    if result.is_ok() {
+        UPDATE_STAGED.store(true, Ordering::Release);
+    }
     result
 }
 
@@ -14658,6 +14665,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_pending_update_requires_a_checked_update() {
+        crate::UPDATE_STAGED.store(false, std::sync::atomic::Ordering::Release);
         let pending = Mutex::new(None::<FakePendingUpdate>);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -14675,6 +14683,27 @@ mod tests {
             error,
             "The downloaded update is no longer staged. Check for updates again, then retry."
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_pending_update_queued_behind_a_staged_install_succeeds() {
+        // RUST-HP: two installs raced for one handle; the loser found the slot
+        // empty after the winner staged the build, and reported it as failed.
+        crate::UPDATE_STAGED.store(true, std::sync::atomic::Ordering::Release);
+        let pending = Mutex::new(None::<FakePendingUpdate>);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let result = runtime.block_on(install_pending_update(
+            &pending,
+            noop_app_update_progress_emitter(),
+        ));
+        crate::UPDATE_STAGED.store(false, std::sync::atomic::Ordering::Release);
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
