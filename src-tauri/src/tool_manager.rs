@@ -5852,16 +5852,19 @@ impl ToolManager {
         if staging.exists() {
             Self::retry_fs("clearing partial signed runtime", || {
                 std::fs::remove_dir_all(&staging)
-            })?;
+            })
+            .with_context(|| format!("clearing partial {}", staging.display()))?;
         }
-        std::fs::create_dir_all(&staging)?;
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("creating {}", staging.display()))?;
         progress(BootstrapStepUpdate {
             step: "Installing runtime",
             message: "Unpacking the signed Windows runtime.".into(),
             eta_seconds: 90,
             percent: 35,
         });
-        let archive = std::fs::File::open(&archive_path)?;
+        let archive = std::fs::File::open(&archive_path)
+            .with_context(|| format!("opening {}", archive_path.display()))?;
         Archive::new(GzDecoder::new(archive))
             .unpack(&staging)
             .context("unpacking signed Windows runtime")?;
@@ -5885,7 +5888,8 @@ impl ToolManager {
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
         let marker = self.runtime.runtime_dir.join("SIGNED_RUNTIME_GENERATION");
         if marker.exists() {
-            std::fs::remove_file(&marker)?;
+            std::fs::remove_file(&marker)
+                .with_context(|| format!("removing {}", marker.display()))?;
         }
         let old_python = self.runtime.runtime_dir.join("python.signed-backup");
         let old_venv = self.runtime.runtime_dir.join("venv.signed-backup");
@@ -5897,12 +5901,14 @@ impl ToolManager {
                 if live.exists() {
                     Self::retry_fs("clearing old runtime backup", || {
                         std::fs::remove_dir_all(backup)
-                    })?;
+                    })
+                    .with_context(|| format!("clearing old {}", backup.display()))?;
                 } else {
                     Self::retry_fs("restoring interrupted runtime install", || {
                         // direct-write: restore a Headroom-owned runtime directory after an interrupted swap.
                         std::fs::rename(backup, live)
-                    })?;
+                    })
+                    .with_context(|| format!("restoring {}", live.display()))?;
                 }
             }
         }
@@ -5924,19 +5930,24 @@ impl ToolManager {
                             let _ = std::fs::rename(old, path);
                         }
                     }
-                    return Err(err.into());
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("backing up previous {}", live.display())));
                 }
             }
         }
         let installed = (|| -> Result<()> {
-            Self::retry_fs("installing signed Python", || {
-                // direct-write: publish a complete Headroom-owned Python directory.
-                std::fs::rename(staging.join("python"), &self.runtime.python_dir)
-            })?;
-            Self::retry_fs("installing signed venv", || {
-                // direct-write: publish a complete Headroom-owned venv directory.
-                std::fs::rename(staging.join("venv"), &self.runtime.venv_dir)
-            })?;
+            publish_unpacked_dir(
+                "signed Python",
+                &staging.join("python"),
+                &self.runtime.python_dir,
+                Path::new("python.exe"),
+            )?;
+            publish_unpacked_dir(
+                "signed venv",
+                &staging.join("venv"),
+                &self.runtime.venv_dir,
+                Path::new("Scripts/python.exe"),
+            )?;
             run_python_command(
                 &self.runtime.managed_python(),
                 &["-c", "import headroom, headroom._core"],
@@ -6267,41 +6278,15 @@ impl ToolManager {
             })
             .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
-        let published = Self::retry_fs("publishing extracted python", || {
-            // direct-write: directory swap inside Headroom's managed runtime
-            std::fs::rename(&extracted_root, &self.runtime.python_dir)
-        });
-        match published {
-            Ok(()) => {}
-            // RUST-A8: Windows refuses to rename a directory while any file
-            // inside it is open without share-delete, and real-time AV scans
-            // every freshly unpacked file, outlasting the retry window on
-            // slow machines. Reading the files is still allowed, so copy.
-            // A sharing violation (os error 32) has no ErrorKind of its own.
-            Err(err)
-                if err.kind() == std::io::ErrorKind::PermissionDenied
-                    || (cfg!(windows) && err.raw_os_error() == Some(32)) =>
-            {
-                log::info!("publishing extracted python by rename denied ({err}); copying instead");
-                let interpreter = expected_python
-                    .strip_prefix(&extracted_root)
-                    .expect("interpreter lives under the extracted root")
-                    .to_path_buf();
-                copy_tree_interpreter_last(&extracted_root, &self.runtime.python_dir, &interpreter)
-                    .with_context(|| {
-                        format!(
-                            "publishing extracted python into {} (rename denied: {err}; copy)",
-                            self.runtime.python_dir.display()
-                        )
-                    })?;
-            }
-            Err(err) => {
-                return Err(anyhow::Error::new(err).context(format!(
-                    "publishing extracted python into {}",
-                    self.runtime.python_dir.display()
-                )));
-            }
-        }
+        let interpreter = expected_python
+            .strip_prefix(&extracted_root)
+            .expect("interpreter lives under the extracted root");
+        publish_unpacked_dir(
+            "extracted python",
+            &extracted_root,
+            &self.runtime.python_dir,
+            interpreter,
+        )?;
         // After a copy the scanner that denied the rename may still hold the
         // staging files; a silent failure strands a second ~100 MB tree.
         let _ = Self::retry_fs("removing python staging", || {
@@ -13414,6 +13399,38 @@ fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> 
         sha256: sha256.into(),
         index_sha256: index_sha256.into(),
     })
+}
+
+/// Moves a freshly unpacked `from` to `to`, copying when Windows denies the
+/// rename. RUST-A8: Windows refuses to rename a directory while any file
+/// inside it is open without share-delete, and real-time AV scans every
+/// freshly unpacked file, outlasting the retry window on slow machines.
+/// Reading the files is still allowed, so copy. The signed Windows runtime
+/// (0.9.63) renamed without this and brought RUST-A8 back on four hosts in a
+/// day. A sharing violation (os error 32) has no ErrorKind of its own.
+fn publish_unpacked_dir(what: &str, from: &Path, to: &Path, interpreter: &Path) -> Result<()> {
+    let published = ToolManager::retry_fs(&format!("publishing {what}"), || {
+        // direct-write: directory swap inside Headroom's managed runtime
+        std::fs::rename(from, to)
+    });
+    match published {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || (cfg!(windows) && err.raw_os_error() == Some(32)) =>
+        {
+            log::info!("publishing {what} by rename denied ({err}); copying instead");
+            copy_tree_interpreter_last(from, to, interpreter).with_context(|| {
+                format!(
+                    "publishing {what} into {} (rename denied: {err}; copy)",
+                    to.display()
+                )
+            })
+        }
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("publishing {what} into {}", to.display())))
+        }
+    }
 }
 
 /// Copies `src` into `dst` (created if missing), writing the file at
@@ -29715,6 +29732,34 @@ exit 0
             std::fs::read(dst.join("Lib").join("encodings").join("utf_8.py")).unwrap(),
             b"u8"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_unpacked_dir_copies_when_the_rename_is_denied() {
+        // RUST-A8 on the signed Windows runtime: AV holding a freshly
+        // unpacked file denies the directory rename. A read-only parent is
+        // the Unix way to get the same PermissionDenied from rename.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = dir.path().join("signed.extracting");
+        let src = staging.join("venv");
+        std::fs::create_dir_all(src.join("Scripts")).unwrap();
+        std::fs::write(src.join("Scripts").join("python.exe"), b"exe").unwrap();
+        std::fs::write(src.join("pyvenv.cfg"), b"cfg").unwrap();
+        let dst = dir.path().join("venv");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result =
+            super::publish_unpacked_dir("signed venv", &src, &dst, Path::new("Scripts/python.exe"));
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.expect("a denied rename falls back to a copy");
+        assert_eq!(
+            std::fs::read(dst.join("Scripts").join("python.exe")).unwrap(),
+            b"exe"
+        );
+        assert_eq!(std::fs::read(dst.join("pyvenv.cfg")).unwrap(), b"cfg");
     }
 
     #[test]
