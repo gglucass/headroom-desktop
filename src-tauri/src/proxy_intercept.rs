@@ -10644,6 +10644,7 @@ mod tests {
     #[serial]
     async fn backend_body_limit_report_carries_claude_request_size() {
         use sentry::SentryFutureExt;
+        use std::sync::atomic::Ordering;
 
         #[derive(Default)]
         struct Capture(Mutex<Option<sentry::protocol::Event<'static>>>);
@@ -10669,6 +10670,9 @@ mod tests {
         let (accepted, _) = intercept.accept().await.unwrap();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel();
 
+        // This test exercises the relay without sending onboarding beacons.
+        let optimized = FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel);
+        let prompt = super::FIRST_PROMPT_REQUEST_REPORTED.swap(true, Ordering::AcqRel);
         backend_port::set(backend_addr.port());
         let result = timeout(Duration::from_secs(5), async {
             let relay = super::handle(
@@ -10697,6 +10701,8 @@ mod tests {
             tokio::join!(relay, backend_reply, request).2
         }).await;
         backend_port::reset_for_tests();
+        FIRST_OPTIMIZED_REQUEST_REPORTED.store(optimized, Ordering::Release);
+        super::FIRST_PROMPT_REQUEST_REPORTED.store(prompt, Ordering::Release);
 
         assert!(result.unwrap().starts_with(b"HTTP/1.1 413"));
         let event = capture.0.lock().take().expect("backend 413 Sentry event");
