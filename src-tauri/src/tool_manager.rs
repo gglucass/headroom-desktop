@@ -4306,6 +4306,16 @@ impl ToolManager {
                         "HEADROOM_COMPRESSION_DEADLINE_MS",
                         user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "1500"),
                     )
+                    // Codex's tool list rides in an `additional_tools` input
+                    // item. Compacting its schemas saved ~240-440 tokens per
+                    // request but changed the head every Codex thread shares,
+                    // so a new thread's first request cached 0 tokens instead
+                    // of 12-15K (Windows, 2026-11-18). Kill switch:
+                    // HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=1.
+                    .env(
+                        "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT",
+                        user_env_or("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "0"),
+                    )
                     // Optimization mode. token: compress the frozen tool_result
                     // history for real raw-token savings. cache mode was tested and
                     // reverted -- on Claude Code subscription traffic it is ~a no-op
