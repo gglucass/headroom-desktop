@@ -12506,7 +12506,10 @@ mod tests {
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
         VSCODE_PROCESS_WRAPPER_KEY,
     };
-    use super::{build_claude_remote_control_wrapper, set_json_setting_at};
+    use super::{
+        build_claude_remote_control_wrapper, claude_remote_control_panel_command_path,
+        claude_remote_control_wrapper_path, set_json_setting_at,
+    };
     #[cfg(unix)]
     use super::{
         build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
@@ -12516,8 +12519,7 @@ mod tests {
     #[cfg(unix)]
     use super::{
         claude_code_shell_block, claude_remote_control_command_path,
-        claude_remote_control_hook_command, claude_remote_control_panel_command_path,
-        claude_remote_control_script_path, claude_remote_control_wrapper_path,
+        claude_remote_control_hook_command, claude_remote_control_script_path,
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
         remove_vscode_wrapper_file_if_unreferenced, vscode_user_settings_path,
         CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
