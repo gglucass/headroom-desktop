@@ -6,13 +6,14 @@
 //! and is stuck. Recovery (proxy comes up after a marker exists) clears the
 //! marker.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{app_data_dir, config_file, ensure_data_dirs};
+use crate::storage::{app_data_dir, config_file};
 
 const MARKER_FILE: &str = "port-conflict.json";
 
@@ -21,7 +22,8 @@ const MARKER_FILE: &str = "port-conflict.json";
 /// 2 = "user closed and reopened the app and it's still broken".
 const PERSISTENT_LAUNCH_THRESHOLD: u32 = 2;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct PortConflictMarker {
     pub detected_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
@@ -34,27 +36,37 @@ fn marker_path() -> PathBuf {
     config_file(&app_data_dir(), MARKER_FILE)
 }
 
-fn read_at(path: &Path) -> Option<PortConflictMarker> {
-    let raw = fs::read(path).ok()?;
-    serde_json::from_slice(&raw).ok()
+fn read_at(path: &Path) -> anyhow::Result<Option<PortConflictMarker>> {
+    let raw = match crate::state::read_state_file(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    match serde_json::from_slice(&raw) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(err) => {
+            let backup = path.with_extension("json.corrupt");
+            log::warn!("{} is unparsable ({err}); backing it up", path.display());
+            crate::client_adapters::move_aside(path, &backup).with_context(|| {
+                format!("backing up {} to {}", path.display(), backup.display())
+            })?;
+            Ok(None)
+        }
+    }
 }
 
 fn write_at(path: &Path, marker: &PortConflictMarker) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_vec_pretty(marker)?;
     crate::client_adapters::atomic_write(path, &json)
 }
 
-fn clear_at(path: &Path) -> Option<PortConflictMarker> {
-    let prior = read_at(path);
-    let _ = fs::remove_file(path);
-    prior
-}
-
-fn clear_marker() -> Option<PortConflictMarker> {
-    clear_at(&marker_path())
+fn clear_at(path: &Path) -> anyhow::Result<()> {
+    read_at(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// True if the anyhow error chain string is the
@@ -119,7 +131,7 @@ fn record_failure_at(
     now: DateTime<Utc>,
 ) -> anyhow::Result<PortConflictMarker> {
     let (cmd, pid) = parse_occupant(err_chain);
-    let prior = read_at(path);
+    let prior = read_at(path)?;
 
     let marker = match prior {
         Some(prior) => {
@@ -139,8 +151,10 @@ fn record_failure_at(
                 prior.consecutive_failed_launches
             };
             PortConflictMarker {
-                detected_at: if same_occupant {
+                detected_at: if same_occupant && prior.detected_at != DateTime::UNIX_EPOCH {
                     prior.detected_at
+                } else if same_occupant && prior.last_seen_at != DateTime::UNIX_EPOCH {
+                    prior.last_seen_at
                 } else {
                     now
                 },
@@ -171,8 +185,13 @@ pub fn record_failure(err_chain: &str, increment_launches: bool) -> Option<PortC
     if !is_port_conflict(err_chain) {
         return None;
     }
-    let _ = ensure_data_dirs(&app_data_dir());
-    record_failure_at(&marker_path(), err_chain, increment_launches, Utc::now()).ok()
+    match record_failure_at(&marker_path(), err_chain, increment_launches, Utc::now()) {
+        Ok(marker) => Some(marker),
+        Err(err) => {
+            log::info!("could not record port conflict: {err:#}");
+            None
+        }
+    }
 }
 
 fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
@@ -231,7 +250,9 @@ pub fn note_proxy_failed(err: &anyhow::Error, increment_launches: bool) -> bool 
 /// Top-level hook: call after `ensure_headroom_running` returns Ok. Clears
 /// the marker if one is present, so the launch counter starts over.
 pub fn note_proxy_started() {
-    clear_marker();
+    if let Err(err) = clear_at(&marker_path()) {
+        log::info!("could not clear port conflict: {err:#}");
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn record_failure_preserves_a_marker_missing_its_last_seen_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("marker.json");
+        let original = record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
+        let mut json = serde_json::to_value(original).unwrap();
+        json.as_object_mut().unwrap().remove("last_seen_at");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let marker = record_failure_at(&path, SAMPLE_BAIL, true, ts(2000)).unwrap();
+        assert_eq!(marker.consecutive_failed_launches, 2);
+        assert_eq!(marker.detected_at, ts(1000));
+        assert_eq!(marker.last_seen_at, ts(2000));
+    }
+
+    #[test]
+    fn record_failure_backs_up_a_corrupt_marker_before_replacing_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("marker.json");
+        let corrupt = b"{\"detected_at\":";
+        fs::write(&path, corrupt).unwrap();
+
+        let marker = record_failure_at(&path, SAMPLE_BAIL, true, ts(2000)).unwrap();
+        assert_eq!(marker.consecutive_failed_launches, 1);
+        assert_eq!(
+            fs::read(path.with_extension("json.corrupt")).unwrap(),
+            corrupt
+        );
+    }
+
+    #[test]
     fn record_failure_resets_counter_when_occupant_changes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
@@ -351,14 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn clear_returns_prior_marker_and_removes_file() {
+    fn clear_removes_file_and_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
         record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
-        let prior = clear_at(&path);
-        assert!(prior.is_some());
+        clear_at(&path).unwrap();
         assert!(!path.exists());
-        assert!(clear_at(&path).is_none(), "second clear is a no-op");
+        clear_at(&path).unwrap();
     }
 
     #[test]
@@ -366,7 +416,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("marker.json");
         let original = record_failure_at(&path, SAMPLE_BAIL, true, ts(1000)).unwrap();
-        let reloaded = read_at(&path).expect("marker should be readable");
+        let reloaded = read_at(&path).unwrap().expect("marker should be readable");
         assert_eq!(reloaded, original);
     }
 }
