@@ -4295,6 +4295,17 @@ impl ToolManager {
                     // so the raw error leaks back to the client. Fresh
                     // connection per request avoids reuse of a poisoned socket.
                     .env("HEADROOM_MAX_KEEPALIVE", "0")
+                    // Kompress runs before the request leaves, so its time is
+                    // the user's wait. The wheel's 20s per-request budget let
+                    // it add seconds to every Codex request on a slow CPU
+                    // (user 3319, Windows, 2026-11-18): Fast and Ultrafast felt
+                    // no faster. Past the budget the rest of the request goes
+                    // verbatim and that result is cached, so the prefix stays
+                    // byte-stable. Kill switch: HEADROOM_COMPRESSION_DEADLINE_MS=20000.
+                    .env(
+                        "HEADROOM_COMPRESSION_DEADLINE_MS",
+                        user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "1500"),
+                    )
                     // Optimization mode. token: compress the frozen tool_result
                     // history for real raw-token savings. cache mode was tested and
                     // reverted -- on Claude Code subscription traffic it is ~a no-op
