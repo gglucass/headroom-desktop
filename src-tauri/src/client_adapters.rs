@@ -9027,21 +9027,19 @@ fn windows_wrapper_python() -> Option<PathBuf> {
 
 /// Windows gets the VS Code panel restart only: the terminal one needs the
 /// managed zsh/bash `claude` function, and PowerShell gets none.
-fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
+fn ensure_windows_remote_control_panel(wrapper: &Path) -> Result<(Vec<String>, Vec<String>)> {
     if !is_vscode_wrapper_enabled() {
-        remove_vscode_process_wrapper()?;
-        remove_owned_vscode_panel_command()?;
+        remove_windows_remote_control_panel()?;
         return Ok((Vec::new(), Vec::new()));
     }
     let Some(python) = windows_wrapper_python() else {
         // No runtime yet: no wrapper, and no command offering a restart
         // nothing would perform. The next setup after bootstrap adds both.
-        remove_vscode_process_wrapper()?;
+        remove_windows_remote_control_panel()?;
         return Ok((Vec::new(), Vec::new()));
     };
     let mut changed = Vec::new();
     let mut backups = Vec::new();
-    let wrapper = claude_remote_control_wrapper_path();
     if let Some(parent) = wrapper.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -9060,20 +9058,26 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
     // App Control refuse an unsigned wrapper, and then the panel never starts.
     let app = std::env::current_exe().context("locating Headroom's own binary")?;
     let exe = std::fs::read(&app).with_context(|| format!("reading {}", app.display()))?;
-    if std::fs::read(&wrapper).ok().as_deref() != Some(exe.as_slice()) {
-        match atomic_write(&wrapper, &exe) {
+    if std::fs::read(wrapper).ok().as_deref() != Some(exe.as_slice()) {
+        match atomic_write(wrapper, &exe) {
             Ok(()) => changed.push(wrapper.display().to_string()),
             // A panel session running it holds the file; the old wrapper still
             // works, and the next setup replaces it.
-            Err(err) => {
+            Err(err) if wrapper.is_file() => {
                 log::info!("keeping the running {}: {err:#}", wrapper.display())
+            }
+            Err(err) => {
+                if let Err(cleanup_err) = remove_windows_remote_control_panel() {
+                    log::warn!("removing the incomplete VS Code wrapper setup: {cleanup_err:#}");
+                }
+                return Err(err);
             }
         }
     }
     let command = claude_remote_control_panel_command_path();
     let content = build_claude_remote_control_command_with(
         CLAUDE_REMOTE_CONTROL_PANEL_DESCRIPTION,
-        &windows_remote_control_confirm(&wrapper),
+        &windows_remote_control_confirm(wrapper),
     );
     if std::fs::read_to_string(&command)
         .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
@@ -9099,6 +9103,12 @@ fn ensure_windows_remote_control_panel() -> Result<(Vec<String>, Vec<String>)> {
         }
     }
     Ok((changed, backups))
+}
+
+fn remove_windows_remote_control_panel() -> Result<()> {
+    let command = remove_owned_vscode_panel_command();
+    let wrapper = remove_vscode_process_wrapper();
+    command.and(wrapper)
 }
 
 fn remove_owned_vscode_panel_command() -> Result<()> {
@@ -9401,7 +9411,7 @@ Otherwise reply only \"Staying in this session.\"\n"
 /// so Windows gets the VS Code panel's restart alone.
 fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> {
     if cfg!(target_os = "windows") {
-        return ensure_windows_remote_control_panel();
+        return ensure_windows_remote_control_panel(&claude_remote_control_wrapper_path());
     }
     let mut changed = Vec::new();
     let mut backups = Vec::new();
@@ -20617,6 +20627,39 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
         // Silent once the app is gone: the line outlives a quit.
         std::fs::remove_file(&app).unwrap();
         assert_eq!(render(r#"{"session_id":"aaaa-just-saved"}"#), "");
+    }
+
+    #[test]
+    fn windows_panel_command_is_removed_when_its_runtime_is_missing() {
+        let _home = TestHome::new();
+        let command = claude_remote_control_panel_command_path();
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::write(&command, super::CLAUDE_REMOTE_CONTROL_COMMAND_MARKER).unwrap();
+
+        super::ensure_windows_remote_control_panel(&claude_remote_control_wrapper_path()).unwrap();
+
+        assert!(!command.exists());
+    }
+
+    #[test]
+    fn windows_panel_command_is_not_installed_when_wrapper_publish_fails() {
+        let _home = TestHome::new();
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&super::app_data_dir());
+        let python = runtime.standalone_python();
+        let stdlib = if cfg!(windows) {
+            "Lib"
+        } else {
+            "lib/python3.12"
+        };
+        std::fs::create_dir_all(runtime.python_dir.join(stdlib)).unwrap();
+        std::fs::write(runtime.python_dir.join(stdlib).join("os.py"), "").unwrap();
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(python, "").unwrap();
+        let wrapper = claude_remote_control_wrapper_path().with_extension("exe");
+        std::fs::create_dir_all(&wrapper).unwrap();
+
+        assert!(super::ensure_windows_remote_control_panel(&wrapper).is_err());
+        assert!(!claude_remote_control_panel_command_path().exists());
     }
 
     #[cfg(unix)]
