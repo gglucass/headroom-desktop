@@ -5951,8 +5951,29 @@ impl ToolManager {
                             let _ = std::fs::rename(old, path);
                         }
                     }
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("backing up previous {}", live.display())));
+                    let err = anyhow::Error::new(err)
+                        .context(format!("backing up previous {}", live.display()));
+                    // A dir cannot be renamed while a process runs from it, and
+                    // since 0.9.64 the VS Code wrapper runs from the base python
+                    // (RUST-A8): name the interpreter's holders and any wrapper.
+                    let interpreter = if *live == self.runtime.python_dir {
+                        self.runtime.standalone_python()
+                    } else {
+                        self.runtime.managed_python()
+                    };
+                    let holders: Vec<String> = [
+                        interpreter,
+                        crate::client_adapters::claude_remote_control_wrapper_path(),
+                    ]
+                    .iter()
+                    .filter_map(|path| file_holders(path))
+                    .flatten()
+                    .collect();
+                    return Err(if holders.is_empty() {
+                        err
+                    } else {
+                        err.context(format!("file held by: {}", holders.join("; ")))
+                    });
                 }
             }
         }
@@ -16279,15 +16300,20 @@ fn sharing_violation_path(text: &str) -> Option<String> {
 /// kill (elevated, another account) or no venv process at all (antivirus).
 fn sharing_violation_holders(evidence: &str) -> Option<String> {
     let path = sharing_violation_path(evidence)?;
+    file_holders(Path::new(&path)).map(|holders| {
+        if holders.is_empty() {
+            "none listed".to_string()
+        } else {
+            holders.join("; ")
+        }
+    })
+}
+
+/// `winproc::file_holders` where it exists; `None` elsewhere.
+fn file_holders(path: &Path) -> Option<Vec<String>> {
     #[cfg(target_os = "windows")]
     {
-        crate::winproc::file_holders(Path::new(&path)).map(|holders| {
-            if holders.is_empty() {
-                "none listed".to_string()
-            } else {
-                holders.join("; ")
-            }
-        })
+        crate::winproc::file_holders(path)
     }
     #[cfg(not(target_os = "windows"))]
     {

@@ -8690,7 +8690,7 @@ fn claude_code_shell_block(port: u16) -> String {
 /// panels: nothing would relaunch it), and otherwise writes the tty-keyed
 /// marker and asks the session to exit from a detached child so the command's
 /// own output lands first.
-fn claude_remote_control_wrapper_path() -> PathBuf {
+pub(crate) fn claude_remote_control_wrapper_path() -> PathBuf {
     // An .exe on Windows: the extension spawns the wrapper with `shell: false`
     // (a signed copy of the app, claude_wrapper.rs, beside its .py script).
     let stem = crate::claude_wrapper::WRAPPER_STEM;
