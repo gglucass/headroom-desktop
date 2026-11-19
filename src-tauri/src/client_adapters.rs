@@ -6130,6 +6130,14 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<Cod
     Ok((vec![path.display().to_string()], backup_files, preserved))
 }
 
+/// Env Headroom pins on its own `headroom` MCP server in every client.
+/// HEADROOM_BEACON: on by default upstream, and the MCP server reports to it
+/// (the proxy already runs with it off). HEADROOM_MCP_STATS: hides
+/// `headroom_stats`, whose figures are scoped differently from the app's
+/// savings; wheels before upstream #4954 ignore it.
+pub(crate) const MCP_PINNED_ENV: [(&str, &str); 2] =
+    [("HEADROOM_BEACON", "off"), ("HEADROOM_MCP_STATS", "off")];
+
 /// Rewrite the `command` of the `[mcp_servers.headroom]` table in
 /// `~/.codex/config.toml` to the absolute `entrypoint`. The upstream Python
 /// registrar writes a bare `command = "headroom"` that relies on PATH; when
@@ -6145,9 +6153,7 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
 
 /// The shared rewrite behind [`pin_codex_mcp_command`] and
 /// [`pin_grok_mcp_command`]: both CLIs read the same `[mcp_servers.headroom]`
-/// table shape. Also turns the upstream beacon off in its
-/// `[mcp_servers.headroom.env]`: on by default upstream, and the MCP server
-/// reports to it (the proxy already runs with it off).
+/// table shape. Also pins [`MCP_PINNED_ENV`] in its `[mcp_servers.headroom.env]`.
 fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -6165,7 +6171,6 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
     // with "No such option '-m'" — so the args must be pinned together.
     let target_args_line = r#"args = ["mcp", "serve"]"#;
 
-    let beacon_line = r#"HEADROOM_BEACON = "off""#;
     let mut in_headroom_table = false;
     let mut in_env_table = false;
     let mut replaced = false;
@@ -6185,14 +6190,14 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
             in_env_table = trimmed == "[mcp_servers.headroom.env]";
             out.push(line.to_string());
             if in_env_table {
-                out.push(beacon_line.to_string());
+                out.extend(MCP_PINNED_ENV.map(|(key, value)| format!("{key} = \"{value}\"")));
             }
             continue;
         }
         if in_env_table
             && trimmed
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "HEADROOM_BEACON")
+                .is_some_and(|(key, _)| MCP_PINNED_ENV.iter().any(|(pin, _)| key.trim() == *pin))
         {
             continue;
         }
@@ -22800,6 +22805,10 @@ sys.exit(3)
             parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_BEACON"].as_str(),
             Some("off")
         );
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_MCP_STATS"].as_str(),
+            Some("off")
+        );
         assert!(parsed["mcp_servers"]["node_repl"].get("env").is_none());
 
         // Idempotent: a second run with the same entrypoint is a no-op.
@@ -22815,6 +22824,7 @@ sys.exit(3)
         let after = std::fs::read_to_string(&config).unwrap();
         assert_eq!(after.matches("HEADROOM_BEACON").count(), 1, "{after}");
         assert!(after.contains(r#"HEADROOM_BEACON = "off""#));
+        assert_eq!(after.matches("HEADROOM_MCP_STATS").count(), 1, "{after}");
     }
 
     #[test]
