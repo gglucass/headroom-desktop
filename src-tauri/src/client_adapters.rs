@@ -20500,12 +20500,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(stdin.as_bytes())
-                .unwrap();
+            // The script exits unread once the app is gone, so the write can lose that race.
+            if let Err(err) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+                assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+            }
             let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
