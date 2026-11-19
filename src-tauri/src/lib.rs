@@ -215,7 +215,19 @@ impl InstallableAppUpdate for TauriPendingUpdate {
     }
 }
 
-struct PendingAppUpdate(Mutex<Option<TauriPendingUpdate>>);
+struct PendingAppUpdate<U = TauriPendingUpdate> {
+    pending: Mutex<Option<U>>,
+    staged_version: Mutex<Option<String>>,
+}
+
+impl<U> PendingAppUpdate<U> {
+    fn new(pending: Option<U>) -> Self {
+        Self {
+            pending: Mutex::new(pending),
+            staged_version: Mutex::new(None),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ReleaseUpdaterConfig {
@@ -1079,7 +1091,7 @@ async fn check_for_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<Option<AvailableAppUpdate>, String> {
-    check_and_store_update(&app, &pending_update.0).await
+    check_and_store_update(&app, &pending_update.pending).await
 }
 
 /// When the last update check started, from the webview or the idle applier.
@@ -1161,6 +1173,7 @@ fn classify_update_check<U>(
 async fn install_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
+    version: String,
 ) -> Result<(), String> {
     // Ahead of the download, not after it: the install is the only step that
     // needs a writable folder, and failing it late costs the user the whole
@@ -1208,7 +1221,7 @@ async fn install_app_update(
     });
     // Windows never returns Ok (the installer exits the app); elsewhere the
     // new build is on disk and runs at the next restart.
-    install_pending_update(&pending_update.0, emitter).await
+    install_pending_update(&pending_update, &version, emitter).await
 }
 
 /// RUST-WB: tauri-plugin-updater 2.10.0's macOS swap moves the running bundle
@@ -1288,9 +1301,6 @@ fn annotate_bare_not_found(err: String, bundle_present: bool, overlapped: bool) 
     format!("{err} [bundle present after: {bundle_present}, another install running: {overlapped}]")
 }
 
-/// Set once an installed update is waiting for the restart that runs it.
-static UPDATE_STAGED: AtomicBool = AtomicBool::new(false);
-
 /// Minutes of awake time without client traffic before a ready update applies
 /// itself. Long enough that an agent between turns is not cut off mid-task,
 /// and past Claude Code's 1h prompt cache: a backend restart drops every
@@ -1367,7 +1377,8 @@ fn spawn_idle_update_applier(app: AppHandle) {
             {
                 continue;
             }
-            if UPDATE_STAGED.load(Ordering::Acquire) {
+            let updates = app.state::<PendingAppUpdate>();
+            if updates.staged_version.lock().is_some() {
                 log::info!(
                     "update: idle for {idle_minutes} minutes; restarting into the staged update"
                 );
@@ -1376,26 +1387,34 @@ fn spawn_idle_update_applier(app: AppHandle) {
                 return;
             }
             #[cfg(windows)]
-            if !install_attempted && app.state::<PendingAppUpdate>().0.lock().is_some() {
-                install_attempted = true;
-                log::info!(
-                    "update: idle for {idle_minutes} minutes; installing the pending update"
-                );
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let pending = app.state::<PendingAppUpdate>();
-                    // The installer's /R relaunch reuses this process's args.
-                    storage::mark_quiet_relaunch(&storage::app_data_dir());
-                    if let Err(err) =
-                        install_pending_update(&pending.0, Arc::new(|_: AppUpdateProgress| {}))
-                            .await
-                    {
-                        let _ = std::fs::remove_file(storage::quiet_relaunch_path(
-                            &storage::app_data_dir(),
-                        ));
-                        log::info!("update: idle install failed: {err}");
-                    }
-                });
+            if !install_attempted {
+                let version = updates
+                    .pending
+                    .lock()
+                    .as_ref()
+                    .map(|u| u.metadata().version);
+                if let Some(version) = version {
+                    install_attempted = true;
+                    log::info!("update: idle for {idle_minutes} minutes; installing {version}");
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let pending = app.state::<PendingAppUpdate>();
+                        // The installer's /R relaunch reuses this process's args.
+                        storage::mark_quiet_relaunch(&storage::app_data_dir());
+                        if let Err(err) = install_pending_update(
+                            &pending,
+                            &version,
+                            Arc::new(|_: AppUpdateProgress| {}),
+                        )
+                        .await
+                        {
+                            let _ = std::fs::remove_file(storage::quiet_relaunch_path(
+                                &storage::app_data_dir(),
+                            ));
+                            log::info!("update: idle install failed: {err}");
+                        }
+                    });
+                }
             }
             // The hourly check runs in the webview, and macOS stops a hidden
             // window's timers: the Mac mini, whose window nobody opens, made no
@@ -1410,7 +1429,7 @@ fn spawn_idle_update_applier(app: AppHandle) {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let pending = app.state::<PendingAppUpdate>();
-                    match check_and_store_update(&app, &pending.0).await {
+                    match check_and_store_update(&app, &pending.pending).await {
                         Ok(Some(update))
                             if quiet_install_allowed(
                                 update.notes.as_deref(),
@@ -1418,14 +1437,14 @@ fn spawn_idle_update_applier(app: AppHandle) {
                             ) =>
                         {
                             log::info!("update: staging {} while idle", update.version);
-                            match install_pending_update(
-                                &pending.0,
+                            if let Err(err) = install_pending_update(
+                                &pending,
+                                &update.version,
                                 Arc::new(|_: AppUpdateProgress| {}),
                             )
                             .await
                             {
-                                Ok(()) => {}
-                                Err(err) => log::info!("update: idle staging failed: {err}"),
+                                log::info!("update: idle staging failed: {err}");
                             }
                         }
                         Ok(_) => {}
@@ -1458,7 +1477,8 @@ where
 }
 
 async fn install_pending_update<U>(
-    pending_update: &Mutex<Option<U>>,
+    updates: &PendingAppUpdate<U>,
+    version: &str,
     progress: AppUpdateProgressEmitter,
 ) -> Result<(), String>
 where
@@ -1469,24 +1489,19 @@ where
     // swaps cannot delete each other's app or bypass the safety copy.
     static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _install = INSTALL_LOCK.lock().await;
+    if updates.staged_version.lock().as_deref() == Some(version) {
+        return Ok(());
+    }
     let update = {
-        let mut pending = pending_update.lock();
-        // `install` consumes the update handle, so a FAILED install empties the
-        // slot too (RUST-HA's read-only mount failed seven times, and the eighth
-        // click landed here). The remedy is a fresh check, so say that instead of
-        // "nothing is ready", which reads as a bug to the user staring at a
-        // "Restart to update" affordance.
-        match pending.take() {
-            Some(update) => update,
-            // Another install (the idle applier's, a quiet one, a retry) took
-            // the slot while this one waited on INSTALL_LOCK, and staged its
-            // build: this call has nothing left to do (RUST-HP on 0.9.62).
-            None if UPDATE_STAGED.load(Ordering::Acquire) => return Ok(()),
-            None => return Err(
+        let mut pending = updates.pending.lock();
+        // A failed install consumes the handle. A recheck can also replace
+        // it with a different release while this call waits for INSTALL_LOCK.
+        pending
+            .take_if(|update| update.metadata().version == version)
+            .ok_or_else(|| {
                 "The downloaded update is no longer staged. Check for updates again, then retry."
-                    .to_string(),
-            ),
-        }
+                    .to_string()
+            })?
     };
 
     // The window hides 150ms after losing focus, and a .deb install raises a
@@ -1534,11 +1549,11 @@ where
         }),
         (result, _) => result,
     };
-    INSTALLING_UPDATE.store(false, Ordering::Release);
     // Set under INSTALL_LOCK, so a caller queued behind this one sees it.
     if result.is_ok() {
-        UPDATE_STAGED.store(true, Ordering::Release);
+        *updates.staged_version.lock() = Some(version.to_owned());
     }
+    INSTALLING_UPDATE.store(false, Ordering::Release);
     result
 }
 
@@ -8871,7 +8886,7 @@ pub fn run() {
         })
         .on_window_event(handle_window_event)
         .manage(state)
-        .manage(PendingAppUpdate(Mutex::new(None)))
+        .manage(PendingAppUpdate::new(None::<TauriPendingUpdate>))
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             get_app_update_configuration,
@@ -13320,9 +13335,9 @@ mod tests {
         upgrade_pip_network_refused, user_message_for, watchdog_should_be_up,
         zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
         BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds,
+        PendingAppUpdate, PhysicalRect, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use super::{bootstrap_capture_key, bootstrap_other_category};
     #[cfg(target_os = "macos")]
@@ -14473,7 +14488,7 @@ mod tests {
 
         impl InstallableAppUpdate for FlagObservingUpdate {
             fn metadata(&self) -> AvailableAppUpdate {
-                unreachable!("metadata is not read on the install path")
+                sample_available_update("0.3.0")
             }
 
             fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
@@ -14486,7 +14501,7 @@ mod tests {
         }
 
         let seen = Arc::new(Mutex::new(None));
-        let pending = Mutex::new(Some(FlagObservingUpdate(Arc::clone(&seen))));
+        let pending = PendingAppUpdate::new(Some(FlagObservingUpdate(Arc::clone(&seen))));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14495,6 +14510,7 @@ mod tests {
         runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .expect("install");
@@ -14536,7 +14552,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl InstallableAppUpdate for LosingUpdate {
         fn metadata(&self) -> AvailableAppUpdate {
-            unreachable!()
+            sample_available_update("0.3.0")
         }
         fn bundle_path(&self) -> Option<std::path::PathBuf> {
             Some(self.0.clone())
@@ -14562,13 +14578,14 @@ mod tests {
         let unreadable = bundle.join("Contents/unreadable");
         std::fs::write(&unreadable, b"x").unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let pending = PendingAppUpdate::new(Some(LosingUpdate(bundle.clone())));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let error = runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .unwrap_err();
@@ -14592,13 +14609,14 @@ mod tests {
         let bundle = root.path().join("Headroom.app");
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
         std::fs::write(bundle.join("Contents/Info.plist"), b"old").unwrap();
-        let pending = Mutex::new(Some(LosingUpdate(bundle.clone())));
+        let pending = PendingAppUpdate::new(Some(LosingUpdate(bundle.clone())));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let error = runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .unwrap_err();
@@ -14674,8 +14692,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_pending_update_requires_a_checked_update() {
-        crate::UPDATE_STAGED.store(false, std::sync::atomic::Ordering::Release);
-        let pending = Mutex::new(None::<FakePendingUpdate>);
+        let pending = PendingAppUpdate::new(None::<FakePendingUpdate>);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14684,6 +14701,7 @@ mod tests {
         let error = runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .expect_err("missing update should fail");
@@ -14696,29 +14714,49 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn install_pending_update_queued_behind_a_staged_install_succeeds() {
-        // RUST-HP: two installs raced for one handle; the loser found the slot
-        // empty after the winner staged the build, and reported it as failed.
-        crate::UPDATE_STAGED.store(true, std::sync::atomic::Ordering::Release);
-        let pending = Mutex::new(None::<FakePendingUpdate>);
+    fn install_pending_update_only_acknowledges_the_requested_version() {
+        let updates = PendingAppUpdate::new(Some(FakePendingUpdate {
+            metadata: sample_available_update("0.3.0"),
+            install_result: Ok(()),
+        }));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
 
-        let result = runtime.block_on(install_pending_update(
-            &pending,
-            noop_app_update_progress_emitter(),
-        ));
-        crate::UPDATE_STAGED.store(false, std::sync::atomic::Ordering::Release);
+        let install = |version| {
+            runtime.block_on(install_pending_update(
+                &updates,
+                version,
+                noop_app_update_progress_emitter(),
+            ))
+        };
 
-        assert_eq!(result, Ok(()));
+        assert_eq!(install("0.3.0"), Ok(()));
+        // A caller that raced the successful install can acknowledge the same version.
+        assert_eq!(install("0.3.0"), Ok(()));
+        // A failed install of a newer release consumes only its pending handle.
+        *updates.pending.lock() = Some(FakePendingUpdate {
+            metadata: sample_available_update("0.4.0"),
+            install_result: Err("download dropped".into()),
+        });
+        assert_eq!(install("0.4.0"), Err("download dropped".into()));
+        assert!(install("0.4.0").is_err(), "only 0.3.0 is on disk");
+
+        // Another check racing the request can replace its pending handle.
+        *updates.pending.lock() = Some(FakePendingUpdate {
+            metadata: sample_available_update("0.5.0"),
+            install_result: Ok(()),
+        });
+        assert!(install("0.4.0").is_err(), "0.5.0 was never requested");
+        assert_eq!(install("0.5.0"), Ok(()));
     }
 
     #[test]
     #[serial_test::serial]
     fn install_pending_update_serializes_a_rechecked_update() {
         struct OrderedUpdate {
+            version: &'static str,
             events: Arc<Mutex<Vec<&'static str>>>,
             started: &'static str,
             finished: &'static str,
@@ -14726,7 +14764,7 @@ mod tests {
         }
         impl InstallableAppUpdate for OrderedUpdate {
             fn metadata(&self) -> AvailableAppUpdate {
-                unreachable!()
+                sample_available_update(self.version)
             }
             fn install(self, _progress: AppUpdateProgressEmitter) -> InstallPendingUpdateFuture {
                 Box::pin(async move {
@@ -14742,7 +14780,8 @@ mod tests {
         }
         let events = Arc::new(Mutex::new(Vec::new()));
         let (ready, started) = tokio::sync::oneshot::channel();
-        let pending = Mutex::new(Some(OrderedUpdate {
+        let pending = PendingAppUpdate::new(Some(OrderedUpdate {
+            version: "0.3.0",
             events: Arc::clone(&events),
             started: "first started",
             finished: "first finished",
@@ -14752,17 +14791,19 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let first = install_pending_update(&pending, noop_app_update_progress_emitter());
+            let first =
+                install_pending_update(&pending, "0.3.0", noop_app_update_progress_emitter());
             let rechecked = async {
                 started.await.unwrap();
                 // A concurrent feed check stages another handle mid-download.
-                *pending.lock() = Some(OrderedUpdate {
+                *pending.pending.lock() = Some(OrderedUpdate {
+                    version: "0.4.0",
                     events: Arc::clone(&events),
                     started: "second started",
                     finished: "second finished",
                     ready: None,
                 });
-                install_pending_update(&pending, noop_app_update_progress_emitter()).await
+                install_pending_update(&pending, "0.4.0", noop_app_update_progress_emitter()).await
             };
             let (first, second) = tokio::join!(biased; first, rechecked);
             first.unwrap();
@@ -14782,7 +14823,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_pending_update_runs_the_installer_and_clears_the_slot() {
-        let pending = Mutex::new(Some(FakePendingUpdate {
+        let pending = PendingAppUpdate::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
             install_result: Ok(()),
         }));
@@ -14794,11 +14835,12 @@ mod tests {
         runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .expect("install succeeds");
 
-        assert!(pending.lock().is_none());
+        assert!(pending.pending.lock().is_none());
     }
 
     #[test]
@@ -14824,7 +14866,7 @@ mod tests {
             }
         }
 
-        let pending = Mutex::new(Some(ProgressEmittingFake {
+        let pending = PendingAppUpdate::new(Some(ProgressEmittingFake {
             metadata: sample_available_update("0.3.0"),
             events: vec![
                 AppUpdateProgress::Downloading {
@@ -14850,7 +14892,7 @@ mod tests {
             .expect("tokio runtime");
 
         runtime
-            .block_on(install_pending_update(&pending, emitter))
+            .block_on(install_pending_update(&pending, "0.3.0", emitter))
             .expect("install succeeds");
 
         let events = captured.lock().clone();
@@ -14908,7 +14950,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn install_pending_update_returns_install_failures_after_taking_the_slot() {
-        let pending = Mutex::new(Some(FakePendingUpdate {
+        let pending = PendingAppUpdate::new(Some(FakePendingUpdate {
             metadata: sample_available_update("0.3.0"),
             install_result: Err("signature mismatch".into()),
         }));
@@ -14920,12 +14962,13 @@ mod tests {
         let error = runtime
             .block_on(install_pending_update(
                 &pending,
+                "0.3.0",
                 noop_app_update_progress_emitter(),
             ))
             .expect_err("install failure");
 
         assert_eq!(error, "signature mismatch");
-        assert!(pending.lock().is_none());
+        assert!(pending.pending.lock().is_none());
     }
 
     #[test]
