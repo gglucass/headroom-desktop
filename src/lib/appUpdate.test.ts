@@ -363,7 +363,7 @@ describe("app update helpers", () => {
       invokeFn,
     });
 
-    expect(invokeFn).toHaveBeenCalledWith("install_app_update");
+    expect(invokeFn).toHaveBeenCalledWith("install_app_update", { version: "0.3.0" });
     expect(result).toEqual({
       stagedVersion: "0.3.0",
       showDialog: true,
@@ -438,10 +438,10 @@ describe("app update helpers", () => {
 
     const result = await runAppUpdateInstall({ availableUpdate, quiet: true, invokeFn });
 
-    expect(invokeFn.mock.calls.map((call) => call[0])).toEqual([
-      "install_app_update",
-      "check_for_app_update",
-      "install_app_update",
+    expect(invokeFn.mock.calls).toEqual([
+      ["install_app_update", { version: "0.3.0" }],
+      ["check_for_app_update"],
+      ["install_app_update", { version: "0.3.0" }],
     ]);
     expect(result.stagedVersion).toBe("0.3.0");
     expect(Sentry.captureException).not.toHaveBeenCalled();
@@ -567,10 +567,10 @@ describe("app update helpers", () => {
 
     const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
 
-    expect(invokeFn.mock.calls.map((call) => call[0])).toEqual([
-      "install_app_update",
-      "check_for_app_update",
-      "install_app_update",
+    expect(invokeFn.mock.calls).toEqual([
+      ["install_app_update", { version: "0.3.0" }],
+      ["check_for_app_update"],
+      ["install_app_update", { version: "0.3.0" }],
     ]);
     expect(result).toEqual({
       stagedVersion: "0.3.0",

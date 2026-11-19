@@ -4295,6 +4295,27 @@ impl ToolManager {
                     // so the raw error leaks back to the client. Fresh
                     // connection per request avoids reuse of a poisoned socket.
                     .env("HEADROOM_MAX_KEEPALIVE", "0")
+                    // Kompress runs before the request leaves, so its time is
+                    // the user's wait. The wheel's 20s per-request budget let
+                    // it add seconds to every Codex request on a slow CPU
+                    // (user 3319, Windows, 2026-11-18): Fast and Ultrafast felt
+                    // no faster. Past the budget the rest of the request goes
+                    // verbatim and that result is cached, so the prefix stays
+                    // byte-stable. Kill switch: HEADROOM_COMPRESSION_DEADLINE_MS=20000.
+                    .env(
+                        "HEADROOM_COMPRESSION_DEADLINE_MS",
+                        user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "1500"),
+                    )
+                    // Codex's tool list rides in an `additional_tools` input
+                    // item. Compacting its schemas saved ~240-440 tokens per
+                    // request but changed the head every Codex thread shares,
+                    // so a new thread's first request cached 0 tokens instead
+                    // of 12-15K (Windows, 2026-11-18). Kill switch:
+                    // HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=1.
+                    .env(
+                        "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT",
+                        user_env_or("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "0"),
+                    )
                     // Optimization mode. token: compress the frozen tool_result
                     // history for real raw-token savings. cache mode was tested and
                     // reverted -- on Claude Code subscription traffic it is ~a no-op
@@ -5930,8 +5951,29 @@ impl ToolManager {
                             let _ = std::fs::rename(old, path);
                         }
                     }
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("backing up previous {}", live.display())));
+                    let err = anyhow::Error::new(err)
+                        .context(format!("backing up previous {}", live.display()));
+                    // A dir cannot be renamed while a process runs from it, and
+                    // since 0.9.64 the VS Code wrapper runs from the base python
+                    // (RUST-A8): name the interpreter's holders and any wrapper.
+                    let interpreter = if *live == self.runtime.python_dir {
+                        self.runtime.standalone_python()
+                    } else {
+                        self.runtime.managed_python()
+                    };
+                    let holders: Vec<String> = [
+                        interpreter,
+                        crate::client_adapters::claude_remote_control_wrapper_path(),
+                    ]
+                    .iter()
+                    .filter_map(|path| file_holders(path))
+                    .flatten()
+                    .collect();
+                    return Err(if holders.is_empty() {
+                        err
+                    } else {
+                        err.context(format!("file held by: {}", holders.join("; ")))
+                    });
                 }
             }
         }
@@ -16258,15 +16300,20 @@ fn sharing_violation_path(text: &str) -> Option<String> {
 /// kill (elevated, another account) or no venv process at all (antivirus).
 fn sharing_violation_holders(evidence: &str) -> Option<String> {
     let path = sharing_violation_path(evidence)?;
+    file_holders(Path::new(&path)).map(|holders| {
+        if holders.is_empty() {
+            "none listed".to_string()
+        } else {
+            holders.join("; ")
+        }
+    })
+}
+
+/// `winproc::file_holders` where it exists; `None` elsewhere.
+fn file_holders(path: &Path) -> Option<Vec<String>> {
     #[cfg(target_os = "windows")]
     {
-        crate::winproc::file_holders(Path::new(&path)).map(|holders| {
-            if holders.is_empty() {
-                "none listed".to_string()
-            } else {
-                holders.join("; ")
-            }
-        })
+        crate::winproc::file_holders(path)
     }
     #[cfg(not(target_os = "windows"))]
     {

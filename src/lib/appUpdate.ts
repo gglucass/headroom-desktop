@@ -364,8 +364,9 @@ export async function runAppUpdateInstall({
   }
 
   try {
+    const installArgs = { version: availableUpdate.version };
     try {
-      await invokeFn("install_app_update");
+      await invokeFn("install_app_update", installArgs);
     } catch (error) {
       // `install` consumes the staged handle even when it FAILS (RUST-HA's
       // read-only mount, then RUST-HP), so the retry the error text asks for
@@ -388,7 +389,7 @@ export async function runAppUpdateInstall({
       if (rechecked?.version !== availableUpdate.version) {
         throw error;
       }
-      await invokeFn("install_app_update");
+      await invokeFn("install_app_update", installArgs);
     }
     return {
       stagedVersion: availableUpdate.version,

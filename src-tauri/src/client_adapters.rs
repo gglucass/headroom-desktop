@@ -8690,7 +8690,7 @@ fn claude_code_shell_block(port: u16) -> String {
 /// panels: nothing would relaunch it), and otherwise writes the tty-keyed
 /// marker and asks the session to exit from a detached child so the command's
 /// own output lands first.
-fn claude_remote_control_wrapper_path() -> PathBuf {
+pub(crate) fn claude_remote_control_wrapper_path() -> PathBuf {
     // An .exe on Windows: the extension spawns the wrapper with `shell: false`
     // (a signed copy of the app, claude_wrapper.rs, beside its .py script).
     let stem = crate::claude_wrapper::WRAPPER_STEM;
@@ -20500,12 +20500,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(stdin.as_bytes())
-                .unwrap();
+            // The script exits unread once the app is gone, so the write can lose that race.
+            if let Err(err) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+                assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+            }
             let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
