@@ -2379,9 +2379,8 @@ async fn handle(
         // (426, 0.9.2x-0.9.65) kept Codex on HTTPS, where OpenAI answers each
         // turn slower: no prewarm, no incremental turns, a fresh TLS connection
         // per request. Through Headroom that took a 5-step task from 13.7s to
-        // 18-20s (user 3319, 2026-11-18). Every direct path below still answers
-        // a handshake 426 (`forward_direct_with_optional_body_permit`), Codex's
-        // cue to move the session to HTTPS, since it cannot relay an upgrade.
+        // 18-20s (user 3319, 2026-11-18). The direct forwarder still answers
+        // Codex Responses upgrades with 426 to keep its HTTP fallback.
     }
 
     // Ollama's placeholder key reached OpenAI once Headroom owned Codex's
@@ -4522,18 +4521,6 @@ async fn forward_direct_with_optional_body_permit(
         return;
     };
 
-    // This forwarder re-sends requests over its own HTTP client, which cannot
-    // relay an upgrade. 426 is Codex's cue to move the session to HTTPS at
-    // once, without retrying (codex-rs client.rs, UPGRADE_REQUIRED).
-    if request_has_header(&header_buf[..header_end], "upgrade") {
-        let _ = client
-            .write_all(
-                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-        return;
-    }
-
     // Routed, just not compressed: without this a session whose first request
     // went direct (backend booting on first launch, in-flight cap full) reads
     // "not active in this session: restart Claude Code" until a request reaches
@@ -4556,6 +4543,23 @@ async fn forward_direct_with_optional_body_permit(
     if is_local_proxy_path(&parsed.path) {
         let _ = client
             .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // Preserve Codex's HTTP fallback in direct mode. Other clients and
+    // provider routes still use the upgrade tunnel below.
+    if parsed.path.split('?').next() == Some("/v1/responses")
+        && plugin_route.is_none()
+        && !extract_header_value(&header_buf, "user-agent")
+            .is_some_and(|ua| ua.starts_with("opencode/"))
+        && !is_grok_request(&header_buf)
+        && request_head_has_header(&parsed, "upgrade")
+    {
+        let _ = client
+            .write_all(
+                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
             .await;
         return;
     }
@@ -4606,11 +4610,8 @@ async fn forward_direct_with_optional_body_permit(
             .map(|(_, v)| v.as_str())
     };
 
-    // A WebSocket/upgrade handshake needs its own path: Upgrade/Connection are
-    // hop-by-hop for the plain forward below, and Codex's current transport is
-    // WS on /v1/responses — a 501 here would hard-break Codex in exactly the
-    // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
-    // connection takeover instead.
+    // The plain forward below drops hop-by-hop headers. Keep the handshake
+    // and tunnel upgrades via hyper's connection takeover.
     if header_value("upgrade").is_some() {
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
@@ -4805,8 +4806,7 @@ async fn forward_direct_with_optional_body_permit(
 
 /// Tunnel a WebSocket/upgrade handshake to the upstream through the shared
 /// reqwest client. hyper keeps the connection on a 101 and hands it over via
-/// `Response::upgrade()`, after which both sockets are spliced verbatim. Used
-/// by the bypass forwarder so gated/bypassed Codex WS sessions keep working.
+/// `Response::upgrade()`, after which both sockets are spliced verbatim.
 async fn tunnel_upgrade_direct(
     mut client: TcpStream,
     parsed: &ParsedRequestHead,
@@ -7139,6 +7139,47 @@ mod tests {
 
         run_task.abort();
         backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_codex_websocket_handshake_is_tunneled_to_the_direct_upstream() {
+        backend_port::reset_for_tests();
+        let (upstream, upstream_addr) = bind_ephemeral().await;
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.expect("upstream accept");
+            let head = read_until_header_end(&mut socket).await;
+            assert!(head.starts_with(b"GET /v1/messages "));
+            socket.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .expect("upstream 101");
+            let mut frame = [0; 5];
+            socket.read_exact(&mut frame).await.expect("client frame");
+            socket.write_all(&frame).await.expect("echo client frame");
+        });
+        let (intercept_addr, run_task) = start_intercept(format!("http://{upstream_addr}")).await;
+        let mut client = TcpStream::connect(intercept_addr).await.expect("intercept");
+        client.write_all(
+            b"GET /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write handshake");
+        let head = timeout(Duration::from_secs(5), read_until_header_end(&mut client))
+            .await
+            .expect("upgrade response");
+        assert!(head.starts_with(b"HTTP/1.1 101 "), "{head:?}");
+        client.write_all(b"frame").await.expect("write frame");
+        let mut echoed = [0; 5];
+        timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("echo response")
+            .expect("read echo");
+        assert_eq!(&echoed, b"frame");
+
+        upstream_task.await.expect("upstream task");
+        run_task.abort();
     }
 
     #[tokio::test]
