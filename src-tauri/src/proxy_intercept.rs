@@ -650,6 +650,48 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
     }
 }
 
+/// A client sends a control frame (ping, pong, close) in at most this many
+/// bytes: 2 header + 4 mask + 125 payload (RFC 6455 5.5).
+const WS_CLIENT_CONTROL_FRAME_MAX: usize = 131;
+
+/// The client half of a Codex relay. On a WebSocket its turns are frames on
+/// one GET, which `is_counted_request` and the per-request stamps never see.
+/// So once the backend switched protocols, a read bigger than any control
+/// frame is a turn: it stamps client traffic (the idle update must not restart
+/// mid-turn, Quit must warn) and the first one counts the socket as one Codex
+/// request (Home's "Active", the unrouted detector, the first-prompt row).
+/// `codex doctor`'s bare handshake and keepalive pings do neither.
+struct CodexWsFrames<R> {
+    inner: R,
+    switched: Arc<AtomicBool>,
+    counted: bool,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CodexWsFrames<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(())))
+            && buf.filled().len() - before > WS_CLIENT_CONTROL_FRAME_MAX
+            && self.switched.load(Ordering::Acquire)
+        {
+            CLIENT_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
+            if !self.counted {
+                self.counted = true;
+                crate::usage_counters::record_request("codex");
+                if !FIRST_PROMPT_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
+                    crate::pricing::report_funnel_step_device_only("first_prompt_request");
+                }
+            }
+        }
+        poll
+    }
+}
+
 /// Whether the wall clock moved a minute past a relay idle check since the
 /// previous one: a system sleep, which kills every connection. Wall clock,
 /// because Windows' `Instant` counts the sleep, so a relay's open time could
@@ -2807,7 +2849,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     prompt: bool,
     counted: bool,
 ) {
-    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (client_rd, mut client_wr) = tokio::io::split(client);
     let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
 
     // Set once the client stops sending — EOF or error on its read half. When
@@ -2816,9 +2858,19 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
     // consequence, not a Headroom fault. See the terminal-event check below.
     let client_gone = Arc::new(AtomicBool::new(false));
 
-    // client -> backend: opaque copy (request body / pipelined requests).
+    // Set before the backend's 101 reaches the client, so its first frame
+    // already finds it.
+    let switched = Arc::new(AtomicBool::new(false));
+
+    // client -> backend: opaque copy (request body / pipelined requests, or a
+    // WebSocket's frames once the backend switched protocols).
     let upstream = {
         let client_gone = Arc::clone(&client_gone);
+        let mut client_rd = CodexWsFrames {
+            inner: client_rd,
+            switched: Arc::clone(&switched),
+            counted: false,
+        };
         async move {
             let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
             client_gone.store(true, Ordering::Relaxed);
@@ -2847,8 +2899,10 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
             }
-            if parse_response_status(&head) == Some(429) {
-                crate::usage_counters::record_429("codex");
+            match parse_response_status(&head) {
+                Some(429) => crate::usage_counters::record_429("codex"),
+                Some(101) => switched.store(true, Ordering::Release),
+                _ => {}
             }
         }
 
@@ -7057,10 +7111,22 @@ mod tests {
     const CODEX_WS_HANDSHAKE: &[u8] = b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
 
     /// Codex's WebSocket reaches the backend, which compresses each turn's
-    /// frame: the 101 comes back and frames flow both ways after it.
+    /// frame: the 101 comes back and frames flow both ways after it. The
+    /// socket counts as one Codex request once a turn-sized frame goes up, not
+    /// on the handshake or a control frame (`codex doctor` sends no more).
     #[tokio::test]
     #[serial]
     async fn codex_websocket_handshake_is_relayed_to_the_backend() {
+        let codex_requests_today = || {
+            let today = crate::storage::user_day(chrono::Local::now())
+                .format("%Y-%m-%d")
+                .to_string();
+            crate::usage_counters::recent_days()
+                .get(&today)
+                .and_then(|d| d.client_requests.get("codex").copied())
+                .unwrap_or(0)
+        };
+        let codex_before = codex_requests_today();
         let (backend_listener, backend_addr) = bind_ephemeral().await;
         backend_port::set(backend_addr.port());
         let backend_task = tokio::spawn(async move {
@@ -7076,6 +7142,10 @@ mod tests {
                 .await
                 .expect("frame from client");
             sock.write_all(&frame).await.expect("frame to client");
+            let mut turns = vec![0u8; 8192];
+            sock.read_exact(&mut turns)
+                .await
+                .expect("turns from client");
             head
         });
         let (intercept_addr, run_task) = start_plain_intercept().await;
@@ -7100,12 +7170,25 @@ mod tests {
             .expect("frame relayed back")
             .expect("read frame");
         assert_eq!(&echoed, b"frame");
+        assert_eq!(
+            codex_requests_today(),
+            codex_before,
+            "handshake + control frame"
+        );
+        for _ in 0..2 {
+            client.write_all(&[7u8; 4096]).await.expect("turn frame");
+        }
 
         let forwarded = String::from_utf8_lossy(&backend_task.await.expect("backend task"))
             .to_ascii_lowercase();
         assert!(forwarded.starts_with("get /v1/responses "), "{forwarded}");
         assert!(forwarded.contains("upgrade: websocket"), "{forwarded}");
         assert!(forwarded.contains("x-client: codex"), "{forwarded}");
+        assert_eq!(
+            codex_requests_today(),
+            codex_before + 1,
+            "one socket, one request"
+        );
 
         run_task.abort();
         backend_port::reset_for_tests();
