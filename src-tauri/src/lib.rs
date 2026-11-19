@@ -3454,10 +3454,13 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     // A base interpreter that lost a stdlib file (antivirus quarantine,
     // RUST-SM) is the machine's fault, and the next launch re-downloads the
     // base: Warning, as the upgrade path files the same cause (RUST-K0). So is
-    // a machine out of memory (RUST-BA), which the hint tells the user.
+    // a machine out of memory (RUST-BA), which the hint tells the user, and a
+    // zero-filled venv file, which the watchdog's rebuild replaces.
     let level = if matches!(
         startup_error_fingerprint_key(Some(technical_err.as_str())),
-        Some("startup_runtime_missing_stdlib") | Some("startup_out_of_memory")
+        Some("startup_runtime_missing_stdlib")
+            | Some("startup_out_of_memory")
+            | Some("startup_venv_zero_filled_file")
     ) {
         sentry::Level::Warning
     } else {
@@ -3610,6 +3613,12 @@ pub(crate) fn startup_error_fingerprint_key(
         // back to bootstrap's re-download, so this is a distinct cause with a
         // distinct remedy and does not belong in the exit-1 bucket.
         Some("startup_runtime_missing_stdlib")
+    } else if err.contains("source code string cannot contain null bytes") {
+        // A venv file reads back as zeros, an unflushed write before a crash
+        // (RUST-CY on 0.9.64: zstandard and pywin32's bootstrap). The
+        // watchdog's rebuild re-extracts the runtime, so it is not the exit-1
+        // grab-bag. Base-stdlib damage is matched above.
+        Some("startup_venv_zero_filled_file")
     } else if is_missing_headroom_module_signal(err) {
         // Ours to fix, unlike the three above: the in-startup repair
         // force-reinstalls the pinned wheel, so an event here means that
@@ -18952,6 +18961,17 @@ Some unrelated content.
             )),
             Some("startup_loopback_socket_denied")
         );
+        // RUST-CY on 0.9.64 Windows: venv files read back as zeros. Its own
+        // key, and still one the watchdog rebuilds the runtime for.
+        let zeroed = "exited with status exit code: 1 before opening port 6768\n--- log tail ---\n\
+                      File \"~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\site-packages\\\
+                      httpx\\_decoders.py\", line 31, in <module>\n    import zstandard\n\
+                      SyntaxError: source code string cannot contain null bytes";
+        assert_eq!(
+            startup_error_fingerprint_key(Some(zeroed)),
+            Some("startup_venv_zero_filled_file")
+        );
+        assert!(super::startup_death_needs_rebuild(Some(zeroed)));
     }
 
     #[test]
