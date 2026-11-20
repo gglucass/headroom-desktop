@@ -84,17 +84,7 @@ enum RuntimeMaintenancePlan {
 #[derive(Debug, Default, Clone)]
 pub struct PendingMilestones {
     pub token: Vec<u64>,
-    /// Current lifetime token total to POST as a cumulative-savings heartbeat,
-    /// set when the throttle window has elapsed and the total has grown. `None`
-    /// most ticks; the server records it as `max`, so it's idempotent.
-    pub cumulative_report: Option<u64>,
 }
-
-/// How often the desktop posts its lifetime token total to keep the server's
-/// `cumulative_tokens_saved` / `last_active_at` fresh between 1M milestones.
-/// ponytail: in-memory throttle (resets on restart → one harmless post on
-/// launch); shorten if admin freshness needs to be tighter.
-const CUMULATIVE_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Default, Clone)]
 pub struct ActivityObservation {
@@ -585,10 +575,7 @@ pub struct AppState {
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
     last_known_good_plan_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
-    /// `(last_reported_total, reported_at)` for the cumulative-savings
-    /// heartbeat. In-memory, so it resets on restart. See
-    /// [`CUMULATIVE_REPORT_INTERVAL`].
-    cumulative_report_throttle: Mutex<Option<(u64, Instant)>>,
+    pub(crate) savings_reporter: Mutex<pricing::SavingsReporter>,
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     /// `(stats, fetched_at, hold)`: `hold` is how long this poll's outcome
@@ -779,7 +766,7 @@ impl AppState {
             last_known_good_plan: Mutex::new(last_known_good_plan),
             last_known_good_plan_path,
             savings_tracker: Mutex::new(savings_tracker),
-            cumulative_report_throttle: Mutex::new(None),
+            savings_reporter: Mutex::default(),
             activity_facts: Mutex::new(activity_facts),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
@@ -3063,25 +3050,6 @@ impl AppState {
             if !crossed.is_empty() {
                 let _ = tracker.persist_state();
                 pending_milestones.token.extend(crossed);
-            }
-        }
-
-        // Cumulative-savings heartbeat: post the current lifetime total on a
-        // throttled cadence (not just at 1M milestones) so the server's
-        // cumulative_tokens_saved / last_active_at don't lag by millions of
-        // tokens. First observation each session reports immediately.
-        if drain_pending_milestones && lifetime_estimated_tokens_saved > 0 {
-            let mut throttle = self.cumulative_report_throttle.lock();
-            let due = match *throttle {
-                Some((reported, at)) => {
-                    lifetime_estimated_tokens_saved > reported
-                        && at.elapsed() >= CUMULATIVE_REPORT_INTERVAL
-                }
-                None => true,
-            };
-            if due {
-                *throttle = Some((lifetime_estimated_tokens_saved, Instant::now()));
-                pending_milestones.cumulative_report = Some(lifetime_estimated_tokens_saved);
             }
         }
 

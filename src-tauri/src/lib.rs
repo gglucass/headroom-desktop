@@ -995,24 +995,30 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
         .sum();
 }
 
-/// Posts the milestones `build_dashboard` found due, with the savings snapshot
-/// whose per-day rows carry the stuck-host alert's request and failure counts.
+/// Delivers savings from either dashboard poller, with milestones prompting an immediate report.
 fn report_pending_milestones(
+    state: &AppState,
     dashboard: &DashboardState,
     pending_milestones: &state::PendingMilestones,
 ) {
-    let report = (!pending_milestones.token.is_empty()
-        || pending_milestones.cumulative_report.is_some())
-    .then(|| savings_report(dashboard))
-    .flatten();
-
-    for milestone_tokens_saved in &pending_milestones.token {
-        pricing::report_milestone(*milestone_tokens_saved, report.as_ref());
-    }
-
-    if let Some(total) = pending_milestones.cumulative_report {
-        pricing::report_milestone(total, report.as_ref());
-    }
+    // Home and the tray can poll together. The next poll can pick up changes
+    // that arrived during an upload without waiting on the network here.
+    let Some(mut reporter) = state.savings_reporter.try_lock() else {
+        return;
+    };
+    reporter.report_if_due(
+        dashboard.lifetime_estimated_tokens_saved,
+        !pending_milestones.token.is_empty(),
+        std::time::Instant::now(),
+        || {
+            if analytics::sharing_enabled() {
+                savings_report(dashboard)
+            } else {
+                None
+            }
+        },
+        pricing::report_milestone,
+    );
 }
 
 #[tauri::command]
@@ -1021,7 +1027,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         let state: State<'_, AppState> = app.state();
         let (mut dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
         // From the REAL dashboard, before the demo-data injector below.
-        report_pending_milestones(&dashboard, &pending_milestones);
+        report_pending_milestones(&state, &dashboard, &pending_milestones);
 
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
@@ -9077,8 +9083,8 @@ fn reported_output_reduction(
 /// denominators, and the server overwrites its stored snapshot
 /// unconditionally, so those zeros clobber the previous good report and the
 /// admin profile renders blank rates (user 1681, 2026-09-02). The milestone
-/// heartbeat still posts without the snapshot; the next due report carries
-/// the real figures.
+/// heartbeat still posts without the snapshot; history readiness makes the
+/// first complete snapshot due even if the lifetime total stays flat.
 fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> {
     let breakdown = dashboard.savings_breakdown.as_ref()?;
     let output_reduction = reportable_output_reduction(dashboard.output_reduction.as_ref());
@@ -12377,7 +12383,7 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         // User 2157's 0.9.42 sent none for three days of 86% failed Codex
         // requests, and the stuck-host alert never saw them (2026-10-24).
         let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
-        report_pending_milestones(&dashboard, &pending_milestones);
+        report_pending_milestones(&state, &dashboard, &pending_milestones);
         let today_key = Local::now().format("%Y-%m-%d").to_string();
         // Both Headroom layers, matching the home chart's headline total.
         let savings = dashboard
@@ -13621,6 +13627,51 @@ mod tests {
         // A report built before /stats-history answers would post zero rate
         // denominators, which the server stores over a previous good snapshot.
         assert!(savings_report(&dashboard_for_report(None)).is_none());
+    }
+
+    #[test]
+    fn savings_report_uploads_after_history_loads_and_retries_without_token_growth() {
+        use std::time::{Duration, Instant};
+
+        let mut dashboard = dashboard_for_report(None);
+        let mut reporter = crate::pricing::SavingsReporter::default();
+        let mut attempts = Vec::new();
+        let start = Instant::now();
+        let total = dashboard.lifetime_estimated_tokens_saved;
+        let mut poll = |dashboard: &crate::models::DashboardState, seconds, success| {
+            reporter.report_if_due(
+                total,
+                false,
+                start + Duration::from_secs(seconds),
+                || savings_report(dashboard),
+                |reported_total, snapshot| {
+                    assert_eq!(reported_total, total);
+                    attempts.push((seconds, snapshot.map(|s| s.total_input_tokens)));
+                    success
+                },
+            );
+        };
+
+        poll(&dashboard, 0, true);
+        dashboard.savings_breakdown = Some(crate::models::SavingsBreakdown {
+            total_input_tokens: 200,
+            ..Default::default()
+        });
+        poll(&dashboard, 5, false);
+        poll(&dashboard, 10, true);
+        poll(&dashboard, 65, true);
+        poll(&dashboard, 665, true);
+        dashboard
+            .savings_breakdown
+            .as_mut()
+            .unwrap()
+            .total_input_tokens = 500;
+        poll(&dashboard, 670, true);
+
+        assert_eq!(
+            attempts,
+            vec![(0, None), (5, Some(200)), (65, Some(200)), (670, Some(500))]
+        );
     }
 
     #[test]
