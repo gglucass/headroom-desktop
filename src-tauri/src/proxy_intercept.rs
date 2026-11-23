@@ -230,9 +230,10 @@ static HEAD_READ_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
 /// millisecond, so the answer was lost inside this relay.
 static READYZ_RELAYS: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static READYZ_RELAY_OTHER_FAILURES: AtomicU64 = AtomicU64::new(0);
 static READYZ_RELAY_FAILURES_REPORTED: AtomicBool = AtomicBool::new(false);
 
-/// `/readyz` relays torn by a socket error within `READYZ_FILTER_RESET_WINDOW`
+/// `/readyz` relays torn by a connection reset within `READYZ_FILTER_RESET_WINDOW`
 /// of accept, and the epoch-second they last made up a systemic share of all
 /// relays (0 = never). That is a traffic filter cutting the 6767 front door:
 /// AdGuard for Windows on RUST-NG (Costa, 2026-10-06; disabling it stopped
@@ -439,11 +440,11 @@ fn note_head_read_failure(err: Option<&std::io::Error>, bytes: usize, waited: Du
 /// Record a `/readyz` relayed to the backend. `failure` is why its answer never
 /// reached the client (None = delivered); `head_read` is how long the request
 /// head took to arrive after accept, which tells a relay that stalled from one
-/// whose request was already slow to come in. `socket_error` is a failure the
-/// socket itself raised (a reset), as opposed to a stall or an empty answer.
+/// whose request was already slow to come in. `socket_reset` means the socket
+/// failed with a connection reset.
 fn note_readyz_relay(
     failure: Option<String>,
-    socket_error: bool,
+    socket_reset: bool,
     head_read: Duration,
     total: Duration,
 ) {
@@ -452,7 +453,8 @@ fn note_readyz_relay(
         return;
     };
     let failures = READYZ_RELAY_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-    if socket_error && total < READYZ_FILTER_RESET_WINDOW {
+    let fast_reset = socket_reset && total < READYZ_FILTER_RESET_WINDOW;
+    if fast_reset {
         let resets = READYZ_RELAY_FAST_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
         if intercept_failures_are_systemic(resets, relays) {
             LOCAL_CONNECTION_FILTER_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
@@ -465,16 +467,16 @@ fn note_readyz_relay(
             head_read.as_millis()
         );
     }
-    // A traffic filter is the known cause and the dashboard already names it;
-    // no change on our side fixes it, so it stays in the local log (RUST-NG:
-    // every event 11-17..23 was a fast 10054 reset on 3 filtered Windows hosts).
-    if intercept_failures_are_systemic(READYZ_RELAY_FAST_RESETS.load(Ordering::Relaxed), relays) {
+    // Fast resets have their own dashboard hint (RUST-NG). A history of those
+    // resets must not hide a separate, systemic relay failure.
+    if fast_reset {
         return;
     }
+    let other_failures = READYZ_RELAY_OTHER_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
     report_intercept_failures_once(
         "readyz relay",
         &READYZ_RELAY_FAILURES_REPORTED,
-        failures,
+        other_failures,
         relays,
         format!(
             "{failure} after {}ms, head read after {}ms",
@@ -2775,14 +2777,18 @@ async fn handle(
                     relay.await
                 }
             };
-            let socket_error = !stalled && copied.is_err();
+            let socket_reset = !stalled
+                && copied
+                    .as_ref()
+                    .err()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::ConnectionReset);
             let failure = match copied {
                 _ if stalled => Some("stalled".to_string()),
                 Ok(0) => Some("backend sent nothing".to_string()),
                 Ok(_) => None,
                 Err(e) => Some(describe_io_error(&e)),
             };
-            note_readyz_relay(failure, socket_error, head_read, accepted_at.elapsed());
+            note_readyz_relay(failure, socket_reset, head_read, accepted_at.elapsed());
         }
     };
     if upgrade {
@@ -5680,6 +5686,12 @@ mod tests {
             Ordering::Relaxed,
         );
         assert!(super::local_connection_filter_hint().is_none());
+        // The reset share is still systemic (30 of 90), and an independent
+        // failure can also become systemic on the same long-running process.
+        for _ in 0..30 {
+            relay(Some("stalled"), false, 5_000);
+        }
+        assert!(reported(), "fast resets must not hide a separate outage");
         reset();
     }
 
