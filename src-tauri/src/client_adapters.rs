@@ -6130,6 +6130,14 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<Cod
     Ok((vec![path.display().to_string()], backup_files, preserved))
 }
 
+/// Env Headroom pins on its own `headroom` MCP server in every client.
+/// HEADROOM_BEACON: on by default upstream, and the MCP server reports to it
+/// (the proxy already runs with it off). HEADROOM_MCP_STATS: hides
+/// `headroom_stats`, whose figures are scoped differently from the app's
+/// savings; wheels before upstream #4954 ignore it.
+pub(crate) const MCP_PINNED_ENV: [(&str, &str); 2] =
+    [("HEADROOM_BEACON", "off"), ("HEADROOM_MCP_STATS", "off")];
+
 /// Rewrite the `command` of the `[mcp_servers.headroom]` table in
 /// `~/.codex/config.toml` to the absolute `entrypoint`. The upstream Python
 /// registrar writes a bare `command = "headroom"` that relies on PATH; when
@@ -6145,9 +6153,7 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
 
 /// The shared rewrite behind [`pin_codex_mcp_command`] and
 /// [`pin_grok_mcp_command`]: both CLIs read the same `[mcp_servers.headroom]`
-/// table shape. Also turns the upstream beacon off in its
-/// `[mcp_servers.headroom.env]`: on by default upstream, and the MCP server
-/// reports to it (the proxy already runs with it off).
+/// table shape. Also pins [`MCP_PINNED_ENV`] in its `[mcp_servers.headroom.env]`.
 fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -6165,7 +6171,6 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
     // with "No such option '-m'" — so the args must be pinned together.
     let target_args_line = r#"args = ["mcp", "serve"]"#;
 
-    let beacon_line = r#"HEADROOM_BEACON = "off""#;
     let mut in_headroom_table = false;
     let mut in_env_table = false;
     let mut replaced = false;
@@ -6185,14 +6190,14 @@ fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>
             in_env_table = trimmed == "[mcp_servers.headroom.env]";
             out.push(line.to_string());
             if in_env_table {
-                out.push(beacon_line.to_string());
+                out.extend(MCP_PINNED_ENV.map(|(key, value)| format!("{key} = \"{value}\"")));
             }
             continue;
         }
         if in_env_table
             && trimmed
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "HEADROOM_BEACON")
+                .is_some_and(|(key, _)| MCP_PINNED_ENV.iter().any(|(pin, _)| key.trim() == *pin))
         {
             continue;
         }
@@ -6289,13 +6294,13 @@ fn strip_grok_managed_toml(content: &str) -> String {
 /// Locate the `[table]` table in `lines`: returns the header line index and,
 /// when present, the index of its `key` line.
 fn find_toml_table_key(lines: &[&str], table: &str, key: &str) -> Option<(usize, Option<usize>)> {
-    let header = format!("[{table}]");
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        // A BOM (Windows PowerShell 5.1 writes one) is not whitespace to trim.
+        let trimmed = line.trim().trim_start_matches('\u{feff}');
         let code = trimmed.split('#').next().unwrap_or("").trim_end();
         if code.starts_with('[') && code.ends_with(']') {
-            if code == header {
+            if toml_header_names(code, table) {
                 header_idx = Some(idx);
             } else if let Some(header) = header_idx {
                 // Next table started: the table had no such key.
@@ -6307,12 +6312,33 @@ fn find_toml_table_key(lines: &[&str], table: &str, key: &str) -> Option<(usize,
             if trimmed
                 .split_once('=')
                 .is_some_and(|(name, _)| name.trim() == key)
+                || toml::from_str::<toml::Table>(trimmed)
+                    .is_ok_and(|line| line.len() == 1 && line.contains_key(key))
             {
                 return Some((header, Some(idx)));
             }
         }
     }
     header_idx.map(|h| (h, None))
+}
+
+/// Whether a `[header]` line opens the dotted `table`, however the user spelled
+/// it (`[ endpoints ]`, `[model."grok-build"]`): a spelling the text compare
+/// missed got a second table appended, which Grok refuses (RUST-T8 on 0.9.64).
+/// `#` inside a quoted key is cut by the caller's comment strip and then fails
+/// to parse, so it stays a miss and the render's parse check refuses it.
+fn toml_header_names(code: &str, table: &str) -> bool {
+    let Ok(parsed) = code.parse::<toml::Table>() else {
+        return false;
+    };
+    let mut level = &parsed;
+    for part in table.split('.') {
+        match level.get(part) {
+            Some(toml::Value::Table(next)) if level.len() == 1 => level = next,
+            _ => return false,
+        }
+    }
+    level.is_empty()
 }
 
 /// Extract the string value of a `key = "value"` TOML line. The line is read
@@ -6408,6 +6434,44 @@ fn render_grok_config(existing: &str) -> String {
     format!("{mid}\n\n{block}")
 }
 
+fn grok_proxy_table<'a>(config: &'a toml::Table, path: &str) -> Option<&'a toml::Table> {
+    path.split('.')
+        .try_fold(config, |table, name| table.get(name)?.as_table())
+}
+
+fn grok_proxy_routes_match(config: &toml::Table) -> bool {
+    GROK_PROXY_KEYS.iter().all(|(path, key)| {
+        grok_proxy_table(config, path).and_then(|table| table.get(*key)?.as_str())
+            == Some(HEADROOM_GROK_PROXY_BASE_URL)
+    })
+}
+
+/// A valid render can still edit a header-looking line in a multiline value
+/// or swallow unrelated settings inside a marker. Compare the parsed files
+/// after discarding the routes and their empty parent tables.
+fn grok_config_without_proxy_routes(mut config: toml::Table) -> Result<String> {
+    fn remove_route(config: &mut toml::Table, path: &str, key: &str) {
+        let (name, child) = path.split_once('.').unwrap_or((path, ""));
+        let Some(table) = config.get_mut(name).and_then(toml::Value::as_table_mut) else {
+            return;
+        };
+        if child.is_empty() {
+            table.remove(key);
+        } else {
+            remove_route(table, child, key);
+        }
+        if table.is_empty() {
+            config.remove(name);
+        }
+    }
+
+    for (path, key) in GROK_PROXY_KEYS {
+        remove_route(&mut config, path, key);
+    }
+    // Compare serialized values so a valid NaN setting also compares equal.
+    Ok(toml::to_string(&config)?)
+}
+
 fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let path = grok_config_toml_path();
     if let Some(parent) = path.parent() {
@@ -6422,25 +6486,37 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
 
     // Grok cannot read a file that does not parse either, and a block added
     // to it still failed verify as "not found" (RUST-S9/SC): tell the user.
-    if let Err(err) = existing.parse::<toml::Table>() {
-        return Err(anyhow!(
+    let original = existing.parse::<toml::Table>().map_err(|err| {
+        anyhow!(
             "parsing {} failed ({}: {}); {UNPARSEABLE_SETTINGS}",
             path.display(),
             err.to_string().lines().next().unwrap_or_default(),
             err.message()
-        ));
-    }
+        )
+    })?;
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
     }
     // A table header the text scan misses (quoted key, odd spacing) would get
     // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
-    if updated.parse::<toml::Table>().is_err() {
-        return Err(anyhow!(
-            "rendered {} is not valid TOML; refusing to overwrite",
+    // The error names keys and a position, never values: it goes to Sentry.
+    let rendered = updated.parse::<toml::Table>().map_err(|err| {
+        anyhow!(
+            "rendered {} is not valid TOML ({}: {}); refusing to overwrite",
+            path.display(),
+            err.to_string().lines().next().unwrap_or_default(),
+            err.message()
+        )
+    })?;
+    if !grok_proxy_routes_match(&rendered)
+        || grok_config_without_proxy_routes(original)?
+            != grok_config_without_proxy_routes(rendered)?
+    {
+        anyhow::bail!(
+            "rendered {} could not safely redirect the Grok proxy routes; refusing to overwrite",
             path.display()
-        ));
+        );
     }
 
     let backup = backup_if_exists(&path)?;
@@ -6464,13 +6540,7 @@ fn grok_proxy_block_matches() -> Result<bool> {
     let Ok(config) = content.parse::<toml::Table>() else {
         return Ok(false);
     };
-    Ok(GROK_PROXY_KEYS.iter().all(|(table, key)| {
-        table
-            .split('.')
-            .try_fold(&config, |parent, name| parent.get(name)?.as_table())
-            .and_then(|table| table.get(*key)?.as_str())
-            == Some(HEADROOM_GROK_PROXY_BASE_URL)
-    }))
+    Ok(grok_proxy_routes_match(&config))
 }
 
 fn remove_grok_proxy_block() -> Result<()> {
@@ -6494,6 +6564,16 @@ fn remove_grok_proxy_block() -> Result<()> {
     };
     if normalized == existing {
         return Ok(());
+    }
+    if let Ok(original) = existing.parse::<toml::Table>() {
+        let rendered = normalized.parse::<toml::Table>().map_err(|_| {
+            anyhow!("removing the Grok proxy routes from {} would make it invalid TOML; refusing to overwrite", path.display())
+        })?;
+        if grok_config_without_proxy_routes(original)?
+            != grok_config_without_proxy_routes(rendered)?
+        {
+            anyhow::bail!("removing the Grok proxy routes from {} would change other settings; refusing to overwrite", path.display());
+        }
     }
     let _ = backup_if_exists(&path)?;
     atomic_write(&path, normalized.as_bytes())?;
@@ -8690,7 +8770,7 @@ fn claude_code_shell_block(port: u16) -> String {
 /// panels: nothing would relaunch it), and otherwise writes the tty-keyed
 /// marker and asks the session to exit from a detached child so the command's
 /// own output lands first.
-fn claude_remote_control_wrapper_path() -> PathBuf {
+pub(crate) fn claude_remote_control_wrapper_path() -> PathBuf {
     // An .exe on Windows: the extension spawns the wrapper with `shell: false`
     // (a signed copy of the app, claude_wrapper.rs, beside its .py script).
     let stem = crate::claude_wrapper::WRAPPER_STEM;
@@ -18185,12 +18265,35 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "original base_url restored, got:\n{after}"
         );
 
-        // A spelling the text scan still misses must not be turned into a
-        // duplicate table: refuse and keep the user's file.
-        let quoted = "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n";
-        fs::write(&config, quoted).unwrap();
-        assert!(super::apply_client_setup("grok_build").is_err());
-        assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
+        // Other spellings of the same header (RUST-T8): redirected in place,
+        // never a second table.
+        for spelled in [
+            "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n",
+            "\u{feff}[ model . grok-build ]\n\"base_url\" = \"https://gw.example/v1\"\n",
+        ] {
+            fs::write(&config, spelled).unwrap();
+            super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+            let toml = fs::read_to_string(&config).unwrap();
+            assert!(
+                toml.parse::<toml::Value>().is_ok(),
+                "valid TOML, got:\n{toml}"
+            );
+            assert!(
+                toml.contains("# was: https://gw.example/v1"),
+                "redirected in place, got:\n{toml}"
+            );
+            assert!(super::grok_proxy_block_matches().unwrap(), "got:\n{toml}");
+            super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        }
+
+        // A form the line scan cannot edit (dotted keys) must not be turned
+        // into a duplicate table: refuse, keep the user's file, say which key.
+        let dotted = "model.grok-build.base_url = \"https://gw.example/v1\"\n";
+        fs::write(&config, dotted).unwrap();
+        let err = super::apply_client_setup("grok_build").unwrap_err();
+        assert!(format!("{err:#}").contains("grok-build"), "{err:#}");
+        assert!(!format!("{err:#}").contains("gw.example"), "{err:#}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), dotted);
 
         // A file that is already invalid is the user's to fix: say where,
         // keep it, and stay out of Sentry like every other parse refusal.
@@ -18201,6 +18304,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(shown.contains("line 2, column 10"), "{shown}");
         assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
         assert_eq!(fs::read_to_string(&config).unwrap(), broken);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_does_not_rewrite_table_examples_in_multiline_values() {
+        let home = TestHome::new();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        let config = grok_dir.join("config.toml");
+        let example = "instructions = '''\n[model.\"grok-build\"]\nbase_url = \"https://example.test/v1\"\n'''\n";
+        fs::write(&config, example).unwrap();
+        assert!(example.parse::<toml::Table>().is_ok());
+        assert!(super::apply_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), example);
+
+        let already_routed = format!(
+            "{}\n[model.grok-build]\nbase_url = \"{}\"\n",
+            example.replace(
+                "https://example.test/v1",
+                super::HEADROOM_GROK_PROXY_BASE_URL
+            ),
+            super::HEADROOM_GROK_PROXY_BASE_URL,
+        );
+        fs::write(&config, &already_routed).unwrap();
+        assert!(super::disable_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), already_routed);
     }
 
     #[test]
@@ -20500,12 +20629,10 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDe
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(stdin.as_bytes())
-                .unwrap();
+            // The script exits unread once the app is gone, so the write can lose that race.
+            if let Err(err) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+                assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+            }
             let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
@@ -22802,6 +22929,10 @@ sys.exit(3)
             parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_BEACON"].as_str(),
             Some("off")
         );
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_MCP_STATS"].as_str(),
+            Some("off")
+        );
         assert!(parsed["mcp_servers"]["node_repl"].get("env").is_none());
 
         // Idempotent: a second run with the same entrypoint is a no-op.
@@ -22817,6 +22948,7 @@ sys.exit(3)
         let after = std::fs::read_to_string(&config).unwrap();
         assert_eq!(after.matches("HEADROOM_BEACON").count(), 1, "{after}");
         assert!(after.contains(r#"HEADROOM_BEACON = "off""#));
+        assert_eq!(after.matches("HEADROOM_MCP_STATS").count(), 1, "{after}");
     }
 
     #[test]

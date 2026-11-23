@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::backend_port::{self, AllForeign, SelectedFallback};
+use crate::client_adapters::MCP_PINNED_ENV;
 use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
@@ -4295,6 +4296,27 @@ impl ToolManager {
                     // so the raw error leaks back to the client. Fresh
                     // connection per request avoids reuse of a poisoned socket.
                     .env("HEADROOM_MAX_KEEPALIVE", "0")
+                    // Kompress runs before the request leaves, so its time is
+                    // the user's wait. The wheel's 20s per-request budget let
+                    // it add seconds to every Codex request on a slow CPU
+                    // (user 3319, Windows, 2026-11-18): Fast and Ultrafast felt
+                    // no faster. Past the budget the rest of the request goes
+                    // verbatim and that result is cached, so the prefix stays
+                    // byte-stable. Kill switch: HEADROOM_COMPRESSION_DEADLINE_MS=20000.
+                    .env(
+                        "HEADROOM_COMPRESSION_DEADLINE_MS",
+                        user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "1500"),
+                    )
+                    // Codex's tool list rides in an `additional_tools` input
+                    // item. Compacting its schemas saved ~240-440 tokens per
+                    // request but changed the head every Codex thread shares,
+                    // so a new thread's first request cached 0 tokens instead
+                    // of 12-15K (Windows, 2026-11-18). Kill switch:
+                    // HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=1.
+                    .env(
+                        "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT",
+                        user_env_or("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "0"),
+                    )
                     // Optimization mode. token: compress the frozen tool_result
                     // history for real raw-token savings. cache mode was tested and
                     // reverted -- on Claude Code subscription traffic it is ~a no-op
@@ -5930,8 +5952,29 @@ impl ToolManager {
                             let _ = std::fs::rename(old, path);
                         }
                     }
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("backing up previous {}", live.display())));
+                    let err = anyhow::Error::new(err)
+                        .context(format!("backing up previous {}", live.display()));
+                    // A dir cannot be renamed while a process runs from it, and
+                    // since 0.9.64 the VS Code wrapper runs from the base python
+                    // (RUST-A8): name the interpreter's holders and any wrapper.
+                    let interpreter = if *live == self.runtime.python_dir {
+                        self.runtime.standalone_python()
+                    } else {
+                        self.runtime.managed_python()
+                    };
+                    let holders: Vec<String> = [
+                        interpreter,
+                        crate::client_adapters::claude_remote_control_wrapper_path(),
+                    ]
+                    .iter()
+                    .filter_map(|path| file_holders(path))
+                    .flatten()
+                    .collect();
+                    return Err(if holders.is_empty() {
+                        err
+                    } else {
+                        err.context(format!("file held by: {}", holders.join("; ")))
+                    });
                 }
             }
         }
@@ -8159,7 +8202,7 @@ impl ToolManager {
         {
             if crate::client_adapters::claude_code_connector_wanted() {
                 // Heals entries registered before the install path set it.
-                turn_off_claude_mcp_beacon();
+                pin_claude_mcp_env();
             } else if let Err(err) = remove_headroom_from_claude_json() {
                 // Also heals a connector turned off before toggle-off removed
                 // the entry. Info, as for the beacon: an unparsable
@@ -8381,7 +8424,7 @@ impl ToolManager {
             }
             return Ok(McpInstallMethod::ClaudeConnectorOff);
         }
-        turn_off_claude_mcp_beacon();
+        pin_claude_mcp_env();
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -10027,8 +10070,7 @@ impl ToolManager {
             // Explicit per-category fingerprint; the bridged warn is local-only
             // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
             // install path -- see `plugin_install_failure_category`.
-            let category = plugin_install_failure_category(&detail);
-            if plugin_install_failure_reported(category) {
+            if let Some(category) = reportable_plugin_failure_category(&errors) {
                 sentry::with_scope(
                     |scope| {
                         scope.set_fingerprint(Some(&["plugin-install-partial", category]));
@@ -10130,7 +10172,7 @@ impl ToolManager {
             let detail = errors.join("; ");
             // Same split as the install path: a host holding the plugin whose
             // CLI cannot be found is the user's machine (RUST-MV). Local log.
-            if plugin_install_failure_reported(plugin_install_failure_category(&detail)) {
+            if reportable_plugin_failure_category(&errors).is_some() {
                 log::warn!("{id} toggled on some hosts but not all: {detail}");
             } else {
                 log::info!("{id} toggled on some hosts but not all: {detail}");
@@ -11009,13 +11051,9 @@ fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<(
 }
 
 fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &str) -> Result<()> {
-    let desired = json!({
-        "command": entrypoint,
-        "args": ["mcp", "serve"],
-        // The upstream beacon is on by default and its MCP server reports
-        // to it; the proxy runs with it off (see HEADROOM_BEACON there).
-        "env": { "HEADROOM_PROXY_URL": proxy_url, "HEADROOM_BEACON": "off" },
-    });
+    let mut env = serde_json::Map::from_iter([("HEADROOM_PROXY_URL".into(), json!(proxy_url))]);
+    env.extend(MCP_PINNED_ENV.map(|(key, value)| (key.into(), json!(value))));
+    let desired = json!({ "command": entrypoint, "args": ["mcp", "serve"], "env": env });
     update_claude_json_at(path, |config| {
         if config
             .get("mcpServers")
@@ -11057,25 +11095,25 @@ fn remove_headroom_from_claude_json_at(path: &Path) -> Result<()> {
     })
 }
 
-/// Best-effort [`turn_off_claude_mcp_beacon_at`] on the real `~/.claude.json`.
-fn turn_off_claude_mcp_beacon() {
+/// Best-effort [`pin_claude_mcp_env_at`] on the real `~/.claude.json`.
+fn pin_claude_mcp_env() {
     let Some(home) = dirs::home_dir() else {
         return;
     };
-    if let Err(err) = turn_off_claude_mcp_beacon_at(&home.join(".claude.json")) {
+    if let Err(err) = pin_claude_mcp_env_at(&home.join(".claude.json")) {
         // info, not warn: warn is bridged to Sentry and an unparsable
         // ~/.claude.json would re-report on every launch.
-        log::info!("[tool_manager] could not turn the MCP beacon off in ~/.claude.json: {err:#}");
+        log::info!("[tool_manager] could not pin the MCP env in ~/.claude.json: {err:#}");
     }
 }
 
-/// Sets `HEADROOM_BEACON=off` in Claude Code's existing `headroom` MCP entry.
-/// The registrar's usual path (`claude mcp add`) writes no such env, so the
-/// MCP server ran with the upstream beacon at its default (on) and uploaded a
-/// session summary after any `headroom_compress` call. Codex and Grok get the
-/// same key from `pin_toml_mcp_command`. Touches only that key, and nothing
-/// without an entry or with a non-object `env`.
-fn turn_off_claude_mcp_beacon_at(path: &Path) -> Result<()> {
+/// Sets [`MCP_PINNED_ENV`] in Claude Code's existing `headroom` MCP entry.
+/// The registrar's usual path (`claude mcp add`) writes none of it, so the
+/// MCP server ran with the upstream beacon on and uploaded a session summary
+/// after any `headroom_compress` call. Codex and Grok get the same keys from
+/// `pin_toml_mcp_command`. Touches only those keys, and nothing without an
+/// entry or with a non-object `env`.
+fn pin_claude_mcp_env_at(path: &Path) -> Result<()> {
     update_claude_json_at(path, |config| {
         let Some(env) = config
             .pointer_mut("/mcpServers/headroom")
@@ -11085,11 +11123,14 @@ fn turn_off_claude_mcp_beacon_at(path: &Path) -> Result<()> {
         else {
             return Ok(false);
         };
-        if env.get("HEADROOM_BEACON").and_then(Value::as_str) == Some("off") {
-            return Ok(false);
+        let mut changed = false;
+        for (key, value) in MCP_PINNED_ENV {
+            if env.get(key).and_then(Value::as_str) != Some(value) {
+                env.insert(key.into(), json!(value));
+                changed = true;
+            }
         }
-        env.insert("HEADROOM_BEACON".into(), json!("off"));
-        Ok(true)
+        Ok(changed)
     })
 }
 
@@ -15948,8 +15989,10 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 /// The user's machine lacks git (the UI says so), a host holds the plugin but
 /// no CLI for it can be found (RUST-MV), the user's own settings.json does
 /// not parse (RUST-DQ; our own writers already keep that refusal out of
-/// Sentry), or its network cannot reach GitHub (the CLI's error says so):
-/// nothing we ship fixes any of them.
+/// Sentry), its network cannot reach GitHub (the CLI's error says so), or
+/// Claude Code cannot parse its marketplace list (RUST-RA, RUST-XE). Headroom
+/// writes other host config, including Codex's config.toml, so keep generic
+/// config errors reportable.
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
@@ -15958,7 +16001,15 @@ fn plugin_install_failure_reported(category: &str) -> bool {
             | "cli-missing"
             | "settings-unparseable"
             | "github-unreachable"
+            | "claude-marketplace-config-invalid"
     )
+}
+
+fn reportable_plugin_failure_category(errors: &[String]) -> Option<&'static str> {
+    errors
+        .iter()
+        .map(|error| plugin_install_failure_category(error))
+        .find(|category| plugin_install_failure_reported(category))
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -16028,6 +16079,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // reason as git-missing (RUST-P0 on 0.9.62: a Codex marketplace add
         // that stalled).
         "host-cli-stalled"
+    } else if lower.starts_with("claude code:")
+        && lower.contains("failed to load marketplace configuration: json parse error")
+    {
+        "claude-marketplace-config-invalid"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -16044,9 +16099,7 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("duplicate key")
         || lower.contains("toml parse error")
     {
-        // The host CLI cannot read its own config, so nothing we do lands
-        // (RUST-RA on 0.9.62: Claude Code's marketplace list starting with a
-        // byte-order mark, "JSON Parse error: Unrecognized token").
+        // Headroom can write this config too, so keep the failure visible.
         "host-config-invalid"
     } else if lower.contains("invalid json syntax in settings file") {
         // Claude Code refusing a ~/.claude/settings.json the user broke by
@@ -16258,15 +16311,20 @@ fn sharing_violation_path(text: &str) -> Option<String> {
 /// kill (elevated, another account) or no venv process at all (antivirus).
 fn sharing_violation_holders(evidence: &str) -> Option<String> {
     let path = sharing_violation_path(evidence)?;
+    file_holders(Path::new(&path)).map(|holders| {
+        if holders.is_empty() {
+            "none listed".to_string()
+        } else {
+            holders.join("; ")
+        }
+    })
+}
+
+/// `winproc::file_holders` where it exists; `None` elsewhere.
+fn file_holders(path: &Path) -> Option<Vec<String>> {
     #[cfg(target_os = "windows")]
     {
-        crate::winproc::file_holders(Path::new(&path)).map(|holders| {
-            if holders.is_empty() {
-                "none listed".to_string()
-            } else {
-                holders.join("; ")
-            }
-        })
+        crate::winproc::file_holders(path)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -16886,7 +16944,7 @@ fn settle_plugin_hosts(
             // partial path in `install_plugin`; a too-old CLI alone is not an
             // error and stays out.
             let category = plugin_install_failure_category(&detail);
-            if plugin_install_failure_reported(category) {
+            if let Some(category) = reportable_plugin_failure_category(&errors) {
                 sentry::with_scope(
                     |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
                     || {
@@ -28540,7 +28598,7 @@ exit 0
     }
 
     #[test]
-    fn claude_mcp_beacon_is_turned_off_in_a_cli_registered_entry() {
+    fn claude_mcp_env_is_pinned_in_a_cli_registered_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
         // What `claude mcp add` leaves behind: no HEADROOM_BEACON.
@@ -28550,11 +28608,12 @@ exit 0
         )
         .unwrap();
 
-        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        super::pin_claude_mcp_env_at(&path).unwrap();
 
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let entry = &after["mcpServers"]["headroom"];
         assert_eq!(entry["env"]["HEADROOM_BEACON"], "off");
+        assert_eq!(entry["env"]["HEADROOM_MCP_STATS"], "off");
         assert_eq!(entry["env"]["HEADROOM_PROXY_URL"], "http://127.0.0.1:6767");
         assert_eq!(entry["command"], "/u/.local/bin/headroom");
         assert_eq!(entry["type"], "stdio");
@@ -28566,7 +28625,7 @@ exit 0
             .unwrap()
             .replace(r#""HEADROOM_BEACON": "off""#, r#""HEADROOM_BEACON": "on""#);
         fs::write(&path, &on).unwrap();
-        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
+        super::pin_claude_mcp_env_at(&path).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             after["mcpServers"]["headroom"]["env"]["HEADROOM_BEACON"],
@@ -28575,14 +28634,14 @@ exit 0
     }
 
     #[test]
-    fn claude_mcp_beacon_repair_leaves_a_file_without_our_entry_untouched() {
+    fn claude_mcp_env_repair_leaves_a_file_without_our_entry_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
         let original = r#"{"mcpServers":{"other":{"command":"x"}}}"#;
         fs::write(&path, original).unwrap();
 
-        super::turn_off_claude_mcp_beacon_at(&path).unwrap();
-        super::turn_off_claude_mcp_beacon_at(&dir.path().join("missing.json")).unwrap();
+        super::pin_claude_mcp_env_at(&path).unwrap();
+        super::pin_claude_mcp_env_at(&dir.path().join("missing.json")).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!dir.path().join("missing.json").exists());
@@ -29648,7 +29707,7 @@ exit 0
                  \"ponytail@ponytail\"...\n\nstderr:\n\u{d7} Failed to install plugin \
                  \"ponytail@ponytail\": Failed to load marketplace configuration: JSON Parse \
                  error: Unrecognized token '\u{feff}'",
-                "host-config-invalid",
+                "claude-marketplace-config-invalid",
             ),
             ("Codex: something we have not seen", "other"),
         ];
@@ -29671,6 +29730,28 @@ exit 0
         assert!(
             seen.len() >= 8,
             "each known cause shape must land in its own bucket, got: {seen:?}"
+        );
+        assert!(super::plugin_install_failure_reported(
+            "host-config-invalid"
+        ));
+        assert!(!super::plugin_install_failure_reported(
+            "claude-marketplace-config-invalid"
+        ));
+        assert!(super::plugin_install_failure_reported(
+            "marketplace-missing"
+        ));
+    }
+
+    #[test]
+    fn plugin_install_failure_reports_an_actionable_sibling_of_a_bad_marketplace() {
+        let mut errors = vec![
+            "Claude Code: Failed to load marketplace configuration: JSON Parse error".to_string(),
+        ];
+        assert_eq!(super::reportable_plugin_failure_category(&errors), None);
+        errors.push("Codex: failed to load configuration: config.toml: duplicate key".into());
+        assert_eq!(
+            super::reportable_plugin_failure_category(&errors),
+            Some("host-config-invalid")
         );
     }
 

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::device;
@@ -2017,7 +2018,7 @@ pub(crate) fn activate_account_with_retry_backoff(
 /// differencing them mixes tokenizer scales and can go negative (see
 /// `outcome.py`: "must never be differenced"). The dollar pair comes from one
 /// pricing function and is safe. Tokens travel for display only.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SavingsReport {
     pub lifetime_savings_usd: f64,
     pub lifetime_tokens_saved: u64,
@@ -2043,7 +2044,7 @@ pub struct SavingsReport {
     pub days: Vec<SavingsDay>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SavingsDay {
     pub date: String,
     /// UTC end boundary of this local calendar day, used for trial-day accounting.
@@ -2083,31 +2084,104 @@ pub struct SavingsDay {
     pub failure_kinds: Option<std::collections::BTreeMap<String, u64>>,
 }
 
-/// Fire-and-forget: reports a milestone to the server so it can trigger
-/// the feedback email for users who were below the threshold at sign-up.
-/// Silently no-ops if the user is not signed in or the request fails.
-pub fn report_milestone(milestone_tokens_saved: u64, savings: Option<&SavingsReport>) {
-    let token = match read_session_token() {
-        Ok(Some(t)) => t,
-        _ => return,
+const SAVINGS_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(600);
+const SAVINGS_REPORT_RETRY_INTERVAL: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Default)]
+pub(crate) struct SavingsReporter {
+    last_success: Option<SentSavingsReport>,
+    retry_at: Option<Instant>,
+}
+
+struct SentSavingsReport {
+    total: u64,
+    snapshot: Option<SavingsReport>,
+    at: Instant,
+}
+
+impl SavingsReporter {
+    pub(crate) fn report_if_due(
+        &mut self,
+        total: u64,
+        crossed_milestone: bool,
+        now: Instant,
+        build_snapshot: impl FnOnce() -> Option<SavingsReport>,
+        send: impl FnOnce(u64, Option<&SavingsReport>) -> bool,
+    ) {
+        if total == 0 || self.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+
+        let snapshot = build_snapshot();
+        if let Some(last) = &self.last_success {
+            let first_snapshot = snapshot.is_some() && last.snapshot.is_none();
+            let milestone_due = crossed_milestone && total > last.total;
+            let changed = total > last.total
+                || snapshot
+                    .as_ref()
+                    .is_some_and(|value| Some(value) != last.snapshot.as_ref());
+            let refresh_due = changed && now.duration_since(last.at) >= SAVINGS_REPORT_INTERVAL;
+            if self.retry_at.is_none() && !first_snapshot && !milestone_due && !refresh_due {
+                return;
+            }
+        }
+
+        if send(total, snapshot.as_ref()) {
+            self.last_success = Some(SentSavingsReport {
+                total,
+                snapshot,
+                at: now,
+            });
+            self.retry_at = None;
+        } else {
+            self.retry_at = Some(now + SAVINGS_REPORT_RETRY_INTERVAL);
+        }
+    }
+}
+
+/// Returns true only when the server accepts the heartbeat and its optional snapshot.
+pub(crate) fn report_milestone(
+    milestone_tokens_saved: u64,
+    savings: Option<&SavingsReport>,
+) -> bool {
+    let Ok(Some(token)) = read_session_token() else {
+        return false;
     };
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok(client) = http_client() else {
+        return false;
     };
     let identity = IdentityPayload::device_only();
     let builder = client
         .post(api_url("desktop/milestones"))
         .header("Authorization", format!("Bearer {token}"));
-    let _ = identity
-        .apply_headers(builder)
+    post_milestone(
+        identity.apply_headers(builder),
+        milestone_tokens_saved,
+        savings,
+        crate::analytics::sharing_enabled,
+    )
+}
+
+fn post_milestone(
+    builder: RequestBuilder,
+    milestone_tokens_saved: u64,
+    savings: Option<&SavingsReport>,
+    sharing_enabled: impl FnOnce() -> bool,
+) -> bool {
+    // Building a snapshot and reading the session can take time. Check the
+    // opt-out again immediately before putting usage data on the wire.
+    let allowed = savings.filter(|_| sharing_enabled());
+    let accepted = builder
         .json(&serde_json::json!({
             "milestone_tokens_saved": milestone_tokens_saved,
             // The token count is the account's activation and referral credit;
             // the snapshot only feeds the admin profile.
-            "savings": savings.filter(|_| crate::analytics::sharing_enabled()),
+            "savings": allowed,
         }))
-        .send();
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    // The reporter must keep an omitted snapshot eligible for its next poll.
+    accepted && (savings.is_none() || allowed.is_some())
 }
 
 /// The weekly-limit nudge the desktop should report, with the disable threshold
@@ -6987,6 +7061,79 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (port, handle)
+    }
+
+    #[test]
+    fn savings_report_upload_requires_http_success() {
+        for (status, accepted) in [
+            ("HTTP/1.1 503 Service Unavailable", false),
+            ("HTTP/1.1 200 OK", true),
+        ] {
+            let (port, server) = spawn_canned_response_server(serde_json::Value::Null, status);
+            let request = super::http_client()
+                .unwrap()
+                .post(format!("http://127.0.0.1:{port}/desktop/milestones"));
+            assert_eq!(super::post_milestone(request, 100, None, || true), accepted);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn savings_report_rechecks_analytics_at_upload_time() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; content_length.unwrap()];
+            stream.read_exact(&mut body).unwrap();
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        });
+        let snapshot = super::SavingsReport {
+            lifetime_savings_usd: 1.0,
+            lifetime_tokens_saved: 100,
+            total_input_tokens: 200,
+            cache_read_tokens: 0,
+            total_input_cost_usd: 1.0,
+            cache_savings_usd: 0.0,
+            output_reduction_percent: None,
+            output_reduction_method: None,
+            output_reduction_requests: None,
+            output_reduction_coverage_percent: None,
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
+            days: vec![],
+        };
+        let request = super::http_client()
+            .unwrap()
+            .post(format!("http://{address}/desktop/milestones"));
+        assert!(!super::post_milestone(
+            request,
+            100,
+            Some(&snapshot),
+            || false
+        ));
+        let body = server.join().unwrap();
+        assert_eq!(body["milestone_tokens_saved"], 100);
+        assert!(body["savings"].is_null());
     }
 
     /// A 401 no headroom-web layer stamped: a company proxy or firewall.
