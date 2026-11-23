@@ -6434,6 +6434,44 @@ fn render_grok_config(existing: &str) -> String {
     format!("{mid}\n\n{block}")
 }
 
+fn grok_proxy_table<'a>(config: &'a toml::Table, path: &str) -> Option<&'a toml::Table> {
+    path.split('.')
+        .try_fold(config, |table, name| table.get(name)?.as_table())
+}
+
+fn grok_proxy_routes_match(config: &toml::Table) -> bool {
+    GROK_PROXY_KEYS.iter().all(|(path, key)| {
+        grok_proxy_table(config, path).and_then(|table| table.get(*key)?.as_str())
+            == Some(HEADROOM_GROK_PROXY_BASE_URL)
+    })
+}
+
+/// A valid render can still edit a header-looking line in a multiline value
+/// or swallow unrelated settings inside a marker. Compare the parsed files
+/// after discarding the routes and their empty parent tables.
+fn grok_config_without_proxy_routes(mut config: toml::Table) -> Result<String> {
+    fn remove_route(config: &mut toml::Table, path: &str, key: &str) {
+        let (name, child) = path.split_once('.').unwrap_or((path, ""));
+        let Some(table) = config.get_mut(name).and_then(toml::Value::as_table_mut) else {
+            return;
+        };
+        if child.is_empty() {
+            table.remove(key);
+        } else {
+            remove_route(table, child, key);
+        }
+        if table.is_empty() {
+            config.remove(name);
+        }
+    }
+
+    for (path, key) in GROK_PROXY_KEYS {
+        remove_route(&mut config, path, key);
+    }
+    // Compare serialized values so a valid NaN setting also compares equal.
+    Ok(toml::to_string(&config)?)
+}
+
 fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let path = grok_config_toml_path();
     if let Some(parent) = path.parent() {
@@ -6448,14 +6486,14 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
 
     // Grok cannot read a file that does not parse either, and a block added
     // to it still failed verify as "not found" (RUST-S9/SC): tell the user.
-    if let Err(err) = existing.parse::<toml::Table>() {
-        return Err(anyhow!(
+    let original = existing.parse::<toml::Table>().map_err(|err| {
+        anyhow!(
             "parsing {} failed ({}: {}); {UNPARSEABLE_SETTINGS}",
             path.display(),
             err.to_string().lines().next().unwrap_or_default(),
             err.message()
-        ));
-    }
+        )
+    })?;
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
@@ -6463,13 +6501,22 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     // A table header the text scan misses (quoted key, odd spacing) would get
     // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
     // The error names keys and a position, never values: it goes to Sentry.
-    if let Err(err) = updated.parse::<toml::Table>() {
-        return Err(anyhow!(
+    let rendered = updated.parse::<toml::Table>().map_err(|err| {
+        anyhow!(
             "rendered {} is not valid TOML ({}: {}); refusing to overwrite",
             path.display(),
             err.to_string().lines().next().unwrap_or_default(),
             err.message()
-        ));
+        )
+    })?;
+    if !grok_proxy_routes_match(&rendered)
+        || grok_config_without_proxy_routes(original)?
+            != grok_config_without_proxy_routes(rendered)?
+    {
+        anyhow::bail!(
+            "rendered {} could not safely redirect the Grok proxy routes; refusing to overwrite",
+            path.display()
+        );
     }
 
     let backup = backup_if_exists(&path)?;
@@ -6493,13 +6540,7 @@ fn grok_proxy_block_matches() -> Result<bool> {
     let Ok(config) = content.parse::<toml::Table>() else {
         return Ok(false);
     };
-    Ok(GROK_PROXY_KEYS.iter().all(|(table, key)| {
-        table
-            .split('.')
-            .try_fold(&config, |parent, name| parent.get(name)?.as_table())
-            .and_then(|table| table.get(*key)?.as_str())
-            == Some(HEADROOM_GROK_PROXY_BASE_URL)
-    }))
+    Ok(grok_proxy_routes_match(&config))
 }
 
 fn remove_grok_proxy_block() -> Result<()> {
@@ -6523,6 +6564,16 @@ fn remove_grok_proxy_block() -> Result<()> {
     };
     if normalized == existing {
         return Ok(());
+    }
+    if let Ok(original) = existing.parse::<toml::Table>() {
+        let rendered = normalized.parse::<toml::Table>().map_err(|_| {
+            anyhow!("removing the Grok proxy routes from {} would make it invalid TOML; refusing to overwrite", path.display())
+        })?;
+        if grok_config_without_proxy_routes(original)?
+            != grok_config_without_proxy_routes(rendered)?
+        {
+            anyhow::bail!("removing the Grok proxy routes from {} would change other settings; refusing to overwrite", path.display());
+        }
     }
     let _ = backup_if_exists(&path)?;
     atomic_write(&path, normalized.as_bytes())?;
@@ -18253,6 +18304,32 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(shown.contains("line 2, column 10"), "{shown}");
         assert!(shown.contains(super::UNPARSEABLE_SETTINGS), "{shown}");
         assert_eq!(fs::read_to_string(&config).unwrap(), broken);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_does_not_rewrite_table_examples_in_multiline_values() {
+        let home = TestHome::new();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        let config = grok_dir.join("config.toml");
+        let example = "instructions = '''\n[model.\"grok-build\"]\nbase_url = \"https://example.test/v1\"\n'''\n";
+        fs::write(&config, example).unwrap();
+        assert!(example.parse::<toml::Table>().is_ok());
+        assert!(super::apply_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), example);
+
+        let already_routed = format!(
+            "{}\n[model.grok-build]\nbase_url = \"{}\"\n",
+            example.replace(
+                "https://example.test/v1",
+                super::HEADROOM_GROK_PROXY_BASE_URL
+            ),
+            super::HEADROOM_GROK_PROXY_BASE_URL,
+        );
+        fs::write(&config, &already_routed).unwrap();
+        assert!(super::disable_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), already_routed);
     }
 
     #[test]
