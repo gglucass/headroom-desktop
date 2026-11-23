@@ -2158,6 +2158,7 @@ pub(crate) fn report_milestone(
         identity.apply_headers(builder),
         milestone_tokens_saved,
         savings,
+        crate::analytics::sharing_enabled,
     )
 }
 
@@ -2165,16 +2166,22 @@ fn post_milestone(
     builder: RequestBuilder,
     milestone_tokens_saved: u64,
     savings: Option<&SavingsReport>,
+    sharing_enabled: impl FnOnce() -> bool,
 ) -> bool {
-    builder
+    // Building a snapshot and reading the session can take time. Check the
+    // opt-out again immediately before putting usage data on the wire.
+    let allowed = savings.filter(|_| sharing_enabled());
+    let accepted = builder
         .json(&serde_json::json!({
             "milestone_tokens_saved": milestone_tokens_saved,
             // The token count is the account's activation and referral credit;
             // the snapshot only feeds the admin profile.
-            "savings": savings,
+            "savings": allowed,
         }))
         .send()
-        .is_ok_and(|response| response.status().is_success())
+        .is_ok_and(|response| response.status().is_success());
+    // The reporter must keep an omitted snapshot eligible for its next poll.
+    accepted && (savings.is_none() || allowed.is_some())
 }
 
 /// The weekly-limit nudge the desktop should report, with the disable threshold
@@ -7066,9 +7073,67 @@ mod tests {
             let request = super::http_client()
                 .unwrap()
                 .post(format!("http://127.0.0.1:{port}/desktop/milestones"));
-            assert_eq!(super::post_milestone(request, 100, None), accepted);
+            assert_eq!(super::post_milestone(request, 100, None, || true), accepted);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn savings_report_rechecks_analytics_at_upload_time() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; content_length.unwrap()];
+            stream.read_exact(&mut body).unwrap();
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        });
+        let snapshot = super::SavingsReport {
+            lifetime_savings_usd: 1.0,
+            lifetime_tokens_saved: 100,
+            total_input_tokens: 200,
+            cache_read_tokens: 0,
+            total_input_cost_usd: 1.0,
+            cache_savings_usd: 0.0,
+            output_reduction_percent: None,
+            output_reduction_method: None,
+            output_reduction_requests: None,
+            output_reduction_coverage_percent: None,
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
+            days: vec![],
+        };
+        let request = super::http_client()
+            .unwrap()
+            .post(format!("http://{address}/desktop/milestones"));
+        assert!(!super::post_milestone(
+            request,
+            100,
+            Some(&snapshot),
+            || false
+        ));
+        let body = server.join().unwrap();
+        assert_eq!(body["milestone_tokens_saved"], 100);
+        assert!(body["savings"].is_null());
     }
 
     /// A 401 no headroom-web layer stamped: a company proxy or firewall.
