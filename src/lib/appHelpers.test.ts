@@ -362,6 +362,21 @@ describe("app helpers", () => {
     expect(higher.reversionLine).toBe("You own Max for life, so you pay only the difference");
   });
 
+  it("quotes full price to an AppSumo free-year holder once the deal is over", () => {
+    const result = getUpgradePlans(
+      "individual", "max20x", undefined, "pro", true, false, "annual",
+      null, "lifetime", undefined, undefined, undefined, undefined, true,
+      "2027-03-01T00:00:00Z", 0, null, undefined, undefined, "checkout"
+    );
+
+    const [owned, ...higher] = result.plans;
+    expect(owned.centeredPriceLabel).toBe("free year • via AppSumo");
+    for (const plan of higher) {
+      expect(plan.saleBadge).toBeUndefined();
+      expect(plan.reversionLine ?? "").not.toMatch(/for life/);
+    }
+  });
+
   it("shows tiers under an AppSumo lifetime license as already owned", () => {
     const result = getUpgradePlans(
       "individual", "max20x", undefined, "max20x", true, false, "annual",
