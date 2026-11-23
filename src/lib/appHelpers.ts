@@ -921,8 +921,10 @@ export function getUpgradePlans(
       if (upgradeAction !== "appsumo" && upgradeAction !== "checkout") {
         return plan;
       }
+      // An AppSumo entitlement with an end date is the free year, not a lifetime plan.
+      const freeYear = Boolean(subscriptionEndsAt);
       if (plan.id === activeHeadroomPlanId) {
-        return { ...plan, centeredPriceLabel: "lifetime plan • via AppSumo" };
+        return { ...plan, centeredPriceLabel: freeYear ? "free year • via AppSumo" : "lifetime plan • via AppSumo" };
       }
       if (upgradeAction === "checkout") {
         // Deal over: a higher tier is a Polar subscription, and the server
@@ -931,7 +933,8 @@ export function getUpgradePlans(
         const owned = activeHeadroomPlanId;
         const target = planPrice(plan.id as HeadroomSubscriptionTier, billingPeriod).fullCents;
         const ownedCents = owned ? planPrice(owned, billingPeriod).fullCents : 0;
-        if (!owned || !(target > ownedCents) || !plan.ctaLabel.startsWith("Upgrade")) {
+        // The free year earns no credit (it ends), so those cards keep full price.
+        if (!owned || freeYear || !(target > ownedCents) || !plan.ctaLabel.startsWith("Upgrade")) {
           return plan;
         }
         return {
