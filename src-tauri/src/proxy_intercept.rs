@@ -465,6 +465,12 @@ fn note_readyz_relay(
             head_read.as_millis()
         );
     }
+    // A traffic filter is the known cause and the dashboard already names it;
+    // no change on our side fixes it, so it stays in the local log (RUST-NG:
+    // every event 11-17..23 was a fast 10054 reset on 3 filtered Windows hosts).
+    if intercept_failures_are_systemic(READYZ_RELAY_FAST_RESETS.load(Ordering::Relaxed), relays) {
+        return;
+    }
     report_intercept_failures_once(
         "readyz relay",
         &READYZ_RELAY_FAILURES_REPORTED,
@@ -5634,7 +5640,9 @@ mod tests {
             super::READYZ_RELAY_FAILURES.store(0, Ordering::Relaxed);
             super::READYZ_RELAY_FAST_RESETS.store(0, Ordering::Relaxed);
             super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(0, Ordering::Relaxed);
+            super::READYZ_RELAY_FAILURES_REPORTED.store(false, Ordering::Relaxed);
         };
+        let reported = || super::READYZ_RELAY_FAILURES_REPORTED.load(Ordering::Relaxed);
         let relay = |failure: Option<&str>, socket_error: bool, total_ms: u64| {
             super::note_readyz_relay(
                 failure.map(str::to_string),
@@ -5651,6 +5659,7 @@ mod tests {
             relay(Some("backend sent nothing"), false, 10);
         }
         assert!(super::local_connection_filter_hint().is_none());
+        assert!(reported());
 
         reset();
         for _ in 0..30 {
@@ -5660,6 +5669,10 @@ mod tests {
         assert_eq!(
             super::local_connection_filter_hint(),
             Some(super::LOCAL_CONNECTION_FILTER_HINT)
+        );
+        assert!(
+            !reported(),
+            "a filter the dashboard names is not a Sentry event"
         );
 
         super::LOCAL_CONNECTION_FILTER_LAST_SEEN.store(
