@@ -6294,13 +6294,13 @@ fn strip_grok_managed_toml(content: &str) -> String {
 /// Locate the `[table]` table in `lines`: returns the header line index and,
 /// when present, the index of its `key` line.
 fn find_toml_table_key(lines: &[&str], table: &str, key: &str) -> Option<(usize, Option<usize>)> {
-    let header = format!("[{table}]");
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        // A BOM (Windows PowerShell 5.1 writes one) is not whitespace to trim.
+        let trimmed = line.trim().trim_start_matches('\u{feff}');
         let code = trimmed.split('#').next().unwrap_or("").trim_end();
         if code.starts_with('[') && code.ends_with(']') {
-            if code == header {
+            if toml_header_names(code, table) {
                 header_idx = Some(idx);
             } else if let Some(header) = header_idx {
                 // Next table started: the table had no such key.
@@ -6312,12 +6312,33 @@ fn find_toml_table_key(lines: &[&str], table: &str, key: &str) -> Option<(usize,
             if trimmed
                 .split_once('=')
                 .is_some_and(|(name, _)| name.trim() == key)
+                || toml::from_str::<toml::Table>(trimmed)
+                    .is_ok_and(|line| line.len() == 1 && line.contains_key(key))
             {
                 return Some((header, Some(idx)));
             }
         }
     }
     header_idx.map(|h| (h, None))
+}
+
+/// Whether a `[header]` line opens the dotted `table`, however the user spelled
+/// it (`[ endpoints ]`, `[model."grok-build"]`): a spelling the text compare
+/// missed got a second table appended, which Grok refuses (RUST-T8 on 0.9.64).
+/// `#` inside a quoted key is cut by the caller's comment strip and then fails
+/// to parse, so it stays a miss and the render's parse check refuses it.
+fn toml_header_names(code: &str, table: &str) -> bool {
+    let Ok(parsed) = code.parse::<toml::Table>() else {
+        return false;
+    };
+    let mut level = &parsed;
+    for part in table.split('.') {
+        match level.get(part) {
+            Some(toml::Value::Table(next)) if level.len() == 1 => level = next,
+            _ => return false,
+        }
+    }
+    level.is_empty()
 }
 
 /// Extract the string value of a `key = "value"` TOML line. The line is read
@@ -6441,10 +6462,13 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     }
     // A table header the text scan misses (quoted key, odd spacing) would get
     // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
-    if updated.parse::<toml::Table>().is_err() {
+    // The error names keys and a position, never values: it goes to Sentry.
+    if let Err(err) = updated.parse::<toml::Table>() {
         return Err(anyhow!(
-            "rendered {} is not valid TOML; refusing to overwrite",
-            path.display()
+            "rendered {} is not valid TOML ({}: {}); refusing to overwrite",
+            path.display(),
+            err.to_string().lines().next().unwrap_or_default(),
+            err.message()
         ));
     }
 
@@ -18190,12 +18214,35 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "original base_url restored, got:\n{after}"
         );
 
-        // A spelling the text scan still misses must not be turned into a
-        // duplicate table: refuse and keep the user's file.
-        let quoted = "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n";
-        fs::write(&config, quoted).unwrap();
-        assert!(super::apply_client_setup("grok_build").is_err());
-        assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
+        // Other spellings of the same header (RUST-T8): redirected in place,
+        // never a second table.
+        for spelled in [
+            "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n",
+            "\u{feff}[ model . grok-build ]\n\"base_url\" = \"https://gw.example/v1\"\n",
+        ] {
+            fs::write(&config, spelled).unwrap();
+            super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+            let toml = fs::read_to_string(&config).unwrap();
+            assert!(
+                toml.parse::<toml::Value>().is_ok(),
+                "valid TOML, got:\n{toml}"
+            );
+            assert!(
+                toml.contains("# was: https://gw.example/v1"),
+                "redirected in place, got:\n{toml}"
+            );
+            assert!(super::grok_proxy_block_matches().unwrap(), "got:\n{toml}");
+            super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        }
+
+        // A form the line scan cannot edit (dotted keys) must not be turned
+        // into a duplicate table: refuse, keep the user's file, say which key.
+        let dotted = "model.grok-build.base_url = \"https://gw.example/v1\"\n";
+        fs::write(&config, dotted).unwrap();
+        let err = super::apply_client_setup("grok_build").unwrap_err();
+        assert!(format!("{err:#}").contains("grok-build"), "{err:#}");
+        assert!(!format!("{err:#}").contains("gw.example"), "{err:#}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), dotted);
 
         // A file that is already invalid is the user's to fix: say where,
         // keep it, and stay out of Sentry like every other parse refusal.
