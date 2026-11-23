@@ -658,20 +658,73 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Touched<S> {
     }
 }
 
-/// A client sends a control frame (ping, pong, close) in at most this many
-/// bytes: 2 header + 4 mask + 125 payload (RFC 6455 5.5).
-const WS_CLIENT_CONTROL_FRAME_MAX: usize = 131;
+/// Observe client frame headers independently of TCP read boundaries. The
+/// relay still forwards every byte. Only the fixed header and extended length
+/// are buffered here. Masking keys and payloads are skipped by length.
+#[derive(Default)]
+struct ClientWsFrameHeaders {
+    header: [u8; 10],
+    header_len: usize,
+    remaining: u64,
+}
+
+impl ClientWsFrameHeaders {
+    fn observe(&mut self, mut bytes: &[u8]) -> bool {
+        let mut started_message = false;
+        while !bytes.is_empty() {
+            if self.remaining > 0 {
+                let skipped = self.remaining.min(bytes.len() as u64) as usize;
+                self.remaining -= skipped as u64;
+                bytes = &bytes[skipped..];
+                continue;
+            }
+
+            let header_size = if self.header_len < 2 {
+                2
+            } else {
+                match self.header[1] & 0x7f {
+                    126 => 4,
+                    127 => 10,
+                    _ => 2,
+                }
+            };
+            let copied = (header_size - self.header_len).min(bytes.len());
+            self.header[self.header_len..self.header_len + copied]
+                .copy_from_slice(&bytes[..copied]);
+            self.header_len += copied;
+            bytes = &bytes[copied..];
+            if self.header_len < 2 {
+                break;
+            }
+
+            let payload_len = match self.header[1] & 0x7f {
+                126 if self.header_len == 4 => {
+                    u16::from_be_bytes([self.header[2], self.header[3]]).into()
+                }
+                127 if self.header_len == 10 => {
+                    u64::from_be_bytes(self.header[2..].try_into().unwrap())
+                }
+                126 | 127 => continue,
+                len => u64::from(len),
+            };
+            let masked = self.header[1] & 0x80 != 0;
+            self.remaining = payload_len.saturating_add(if masked { 4 } else { 0 });
+            self.header_len = 0;
+            started_message |= masked && matches!(self.header[0] & 0x0f, 1 | 2);
+        }
+        started_message
+    }
+}
 
 /// The client half of a Codex relay. On a WebSocket its turns are frames on
 /// one GET, which `is_counted_request` and the per-request stamps never see.
-/// So once the backend switched protocols, a read bigger than any control
-/// frame is a turn: it stamps client traffic (the idle update must not restart
-/// mid-turn, Quit must warn) and the first one counts the socket as one Codex
-/// request (Home's "Active", the unrouted detector, the first-prompt row).
-/// `codex doctor`'s bare handshake and keepalive pings do neither.
+/// The first data message counts the socket as one Codex request for the Home
+/// badge and unrouted detector. Later messages still stamp client traffic.
+/// A bare handshake or protocol control frames do neither.
 struct CodexWsFrames<R> {
     inner: R,
     switched: Arc<AtomicBool>,
+    frames: ClientWsFrameHeaders,
     counted: bool,
 }
 
@@ -684,8 +737,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for CodexWsFrames<R> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, std::task::Poll::Ready(Ok(())))
-            && buf.filled().len() - before > WS_CLIENT_CONTROL_FRAME_MAX
             && self.switched.load(Ordering::Acquire)
+            && self.frames.observe(&buf.filled()[before..])
         {
             CLIENT_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
             if !self.counted {
@@ -2881,6 +2934,7 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
         let mut client_rd = CodexWsFrames {
             inner: client_rd,
             switched: Arc::clone(&switched),
+            frames: ClientWsFrameHeaders::default(),
             counted: false,
         };
         async move {
@@ -2913,7 +2967,12 @@ async fn splice_with_codex_capture<S: AsyncRead + AsyncWrite + Unpin>(
             }
             match parse_response_status(&head) {
                 Some(429) => crate::usage_counters::record_429("codex"),
-                Some(101) => switched.store(true, Ordering::Release),
+                Some(101)
+                    if extract_header_value(&head, "upgrade")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("websocket")) =>
+                {
+                    switched.store(true, Ordering::Release);
+                }
                 _ => {}
             }
         }
@@ -7136,9 +7195,8 @@ mod tests {
     const CODEX_WS_HANDSHAKE: &[u8] = b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
 
     /// Codex's WebSocket reaches the backend, which compresses each turn's
-    /// frame: the 101 comes back and frames flow both ways after it. The
-    /// socket counts as one Codex request once a turn-sized frame goes up, not
-    /// on the handshake or a control frame (`codex doctor` sends no more).
+    /// frame. Control frames can arrive together, and a real message can be
+    /// shorter than one ping and split across reads.
     #[tokio::test]
     #[serial]
     async fn codex_websocket_handshake_is_relayed_to_the_backend() {
@@ -7152,6 +7210,19 @@ mod tests {
                 .unwrap_or(0)
         };
         let codex_before = codex_requests_today();
+        let mut ping = [0u8; 131];
+        ping[..2].copy_from_slice(&[0x89, 0x80 | 125]);
+        let pings = [ping, ping].concat();
+        let mut pong = [0u8; 127];
+        pong[..2].copy_from_slice(&[0x8a, 125]);
+        let payload = br#"{"type":"response.create","input":"hi"}"#;
+        let turn = [
+            &[0x81, 0x80 | payload.len() as u8, 0, 0, 0, 0],
+            &payload[..],
+        ]
+        .concat();
+        let expected_pings = pings.clone();
+        let expected_turn = turn.clone();
         let (backend_listener, backend_addr) = bind_ephemeral().await;
         backend_port::set(backend_addr.port());
         let backend_task = tokio::spawn(async move {
@@ -7162,15 +7233,23 @@ mod tests {
             )
             .await
             .expect("backend 101");
-            let mut frame = [0u8; 5];
-            sock.read_exact(&mut frame)
+            let mut received = vec![0u8; expected_pings.len()];
+            sock.read_exact(&mut received)
                 .await
-                .expect("frame from client");
-            sock.write_all(&frame).await.expect("frame to client");
-            let mut turns = vec![0u8; 8192];
-            sock.read_exact(&mut turns)
+                .expect("pings from client");
+            assert_eq!(received, expected_pings);
+            sock.write_all(&pong).await.expect("pong to client");
+            let mut received = vec![0u8; expected_turn.len()];
+            sock.read_exact(&mut received[..1])
                 .await
-                .expect("turns from client");
+                .expect("first byte");
+            sock.write_all(&pong).await.expect("confirm first byte");
+            sock.read_exact(&mut received[1..])
+                .await
+                .expect("rest of turn");
+            assert_eq!(received, expected_turn);
+            sock.read_exact(&mut received).await.expect("second turn");
+            assert_eq!(received, expected_turn);
             head
         });
         let (intercept_addr, run_task) = start_plain_intercept().await;
@@ -7188,21 +7267,25 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&head)
         );
-        client.write_all(b"frame").await.expect("client frame");
-        let mut echoed = [0u8; 5];
+        client.write_all(&pings).await.expect("pings");
+        let mut echoed = [0u8; 127];
         timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
             .await
-            .expect("frame relayed back")
-            .expect("read frame");
-        assert_eq!(&echoed, b"frame");
+            .expect("pong relayed back")
+            .expect("read pong");
+        assert_eq!(echoed, pong);
         assert_eq!(
             codex_requests_today(),
             codex_before,
-            "handshake + control frame"
+            "handshake and coalesced pings"
         );
-        for _ in 0..2 {
-            client.write_all(&[7u8; 4096]).await.expect("turn frame");
-        }
+        client.write_all(&turn[..1]).await.expect("first byte");
+        timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("first byte reached the backend")
+            .expect("read pong");
+        client.write_all(&turn[1..]).await.expect("rest of turn");
+        client.write_all(&turn).await.expect("second turn");
 
         let forwarded = String::from_utf8_lossy(&backend_task.await.expect("backend task"))
             .to_ascii_lowercase();
