@@ -10070,8 +10070,7 @@ impl ToolManager {
             // Explicit per-category fingerprint; the bridged warn is local-only
             // (skip_sentry rule) so this doesn't double-report. Mirrors the pip
             // install path -- see `plugin_install_failure_category`.
-            let category = plugin_install_failure_category(&detail);
-            if plugin_install_failure_reported(category) {
+            if let Some(category) = reportable_plugin_failure_category(&errors) {
                 sentry::with_scope(
                     |scope| {
                         scope.set_fingerprint(Some(&["plugin-install-partial", category]));
@@ -10173,7 +10172,7 @@ impl ToolManager {
             let detail = errors.join("; ");
             // Same split as the install path: a host holding the plugin whose
             // CLI cannot be found is the user's machine (RUST-MV). Local log.
-            if plugin_install_failure_reported(plugin_install_failure_category(&detail)) {
+            if reportable_plugin_failure_category(&errors).is_some() {
                 log::warn!("{id} toggled on some hosts but not all: {detail}");
             } else {
                 log::info!("{id} toggled on some hosts but not all: {detail}");
@@ -15990,10 +15989,10 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 /// The user's machine lacks git (the UI says so), a host holds the plugin but
 /// no CLI for it can be found (RUST-MV), the user's own settings.json does
 /// not parse (RUST-DQ; our own writers already keep that refusal out of
-/// Sentry), its network cannot reach GitHub (the CLI's error says so), or the
-/// host CLI cannot parse its own config and says so (RUST-RA, RUST-XE: Claude
-/// Code's marketplace list on two Windows hosts; we never write it): nothing
-/// we ship fixes any of them.
+/// Sentry), its network cannot reach GitHub (the CLI's error says so), or
+/// Claude Code cannot parse its marketplace list (RUST-RA, RUST-XE). Headroom
+/// writes other host config, including Codex's config.toml, so keep generic
+/// config errors reportable.
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
@@ -16002,8 +16001,15 @@ fn plugin_install_failure_reported(category: &str) -> bool {
             | "cli-missing"
             | "settings-unparseable"
             | "github-unreachable"
-            | "host-config-invalid"
+            | "claude-marketplace-config-invalid"
     )
+}
+
+fn reportable_plugin_failure_category(errors: &[String]) -> Option<&'static str> {
+    errors
+        .iter()
+        .map(|error| plugin_install_failure_category(error))
+        .find(|category| plugin_install_failure_reported(category))
 }
 
 /// A host that cannot resolve or connect to files.pythonhosted.org is its own
@@ -16073,6 +16079,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // reason as git-missing (RUST-P0 on 0.9.62: a Codex marketplace add
         // that stalled).
         "host-cli-stalled"
+    } else if lower.starts_with("claude code:")
+        && lower.contains("failed to load marketplace configuration: json parse error")
+    {
+        "claude-marketplace-config-invalid"
     } else if lower.contains("not found in marketplace") {
         // Our marketplace registration did not take. Cause now travels with it
         // (see install_plugin_into), so this bucket carries the real reason.
@@ -16089,9 +16099,7 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("duplicate key")
         || lower.contains("toml parse error")
     {
-        // The host CLI cannot read its own config, so nothing we do lands
-        // (RUST-RA on 0.9.62: Claude Code's marketplace list starting with a
-        // byte-order mark, "JSON Parse error: Unrecognized token").
+        // Headroom can write this config too, so keep the failure visible.
         "host-config-invalid"
     } else if lower.contains("invalid json syntax in settings file") {
         // Claude Code refusing a ~/.claude/settings.json the user broke by
@@ -16936,7 +16944,7 @@ fn settle_plugin_hosts(
             // partial path in `install_plugin`; a too-old CLI alone is not an
             // error and stays out.
             let category = plugin_install_failure_category(&detail);
-            if plugin_install_failure_reported(category) {
+            if let Some(category) = reportable_plugin_failure_category(&errors) {
                 sentry::with_scope(
                     |scope| scope.set_fingerprint(Some(&["plugin-install-failed", category])),
                     || {
@@ -29699,7 +29707,7 @@ exit 0
                  \"ponytail@ponytail\"...\n\nstderr:\n\u{d7} Failed to install plugin \
                  \"ponytail@ponytail\": Failed to load marketplace configuration: JSON Parse \
                  error: Unrecognized token '\u{feff}'",
-                "host-config-invalid",
+                "claude-marketplace-config-invalid",
             ),
             ("Codex: something we have not seen", "other"),
         ];
@@ -29723,12 +29731,28 @@ exit 0
             seen.len() >= 8,
             "each known cause shape must land in its own bucket, got: {seen:?}"
         );
-        assert!(!super::plugin_install_failure_reported(
+        assert!(super::plugin_install_failure_reported(
             "host-config-invalid"
+        ));
+        assert!(!super::plugin_install_failure_reported(
+            "claude-marketplace-config-invalid"
         ));
         assert!(super::plugin_install_failure_reported(
             "marketplace-missing"
         ));
+    }
+
+    #[test]
+    fn plugin_install_failure_reports_an_actionable_sibling_of_a_bad_marketplace() {
+        let mut errors = vec![
+            "Claude Code: Failed to load marketplace configuration: JSON Parse error".to_string(),
+        ];
+        assert_eq!(super::reportable_plugin_failure_category(&errors), None);
+        errors.push("Codex: failed to load configuration: config.toml: duplicate key".into());
+        assert_eq!(
+            super::reportable_plugin_failure_category(&errors),
+            Some("host-config-invalid")
+        );
     }
 
     #[test]
