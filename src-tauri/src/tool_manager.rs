@@ -15990,8 +15990,10 @@ fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
 /// The user's machine lacks git (the UI says so), a host holds the plugin but
 /// no CLI for it can be found (RUST-MV), the user's own settings.json does
 /// not parse (RUST-DQ; our own writers already keep that refusal out of
-/// Sentry), or its network cannot reach GitHub (the CLI's error says so):
-/// nothing we ship fixes any of them.
+/// Sentry), its network cannot reach GitHub (the CLI's error says so), or the
+/// host CLI cannot parse its own config and says so (RUST-RA, RUST-XE: Claude
+/// Code's marketplace list on two Windows hosts; we never write it): nothing
+/// we ship fixes any of them.
 fn plugin_install_failure_reported(category: &str) -> bool {
     !matches!(
         category,
@@ -16000,6 +16002,7 @@ fn plugin_install_failure_reported(category: &str) -> bool {
             | "cli-missing"
             | "settings-unparseable"
             | "github-unreachable"
+            | "host-config-invalid"
     )
 }
 
@@ -29720,6 +29723,12 @@ exit 0
             seen.len() >= 8,
             "each known cause shape must land in its own bucket, got: {seen:?}"
         );
+        assert!(!super::plugin_install_failure_reported(
+            "host-config-invalid"
+        ));
+        assert!(super::plugin_install_failure_reported(
+            "marketplace-missing"
+        ));
     }
 
     #[test]
