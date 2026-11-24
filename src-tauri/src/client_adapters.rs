@@ -6890,7 +6890,6 @@ fn legacy_opencode_plugin_path() -> PathBuf {
 /// Write (or refresh after an app update) the vendored plugin directory.
 fn ensure_opencode_plugin_dir() -> Result<PathBuf> {
     let dir = opencode_plugin_install_path();
-    create_dir_all_explained(&dir)?;
     for (name, bytes) in OPENCODE_PLUGIN_FILES {
         let path = dir.join(name);
         if std::fs::read(&path).ok().as_deref() != Some(bytes) {
@@ -10597,9 +10596,6 @@ fn save_oss_plugin_hook_receipt(paths: &[PathBuf]) -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        create_dir_all_explained(parent)?;
-    }
     atomic_write(&path, &serde_json::to_vec_pretty(paths)?)
 }
 
@@ -13989,6 +13985,33 @@ print(settings({"cwd": sys.argv[2]}) is None)
             .unwrap_err()
             .to_string();
         assert!(message.contains(&expected), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn denied_app_data_subfolder_creation_reports_a_machine_fault() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let app_dir = super::app_data_dir();
+        let receipt_path = super::oss_plugin_hook_receipt_path();
+        fs::remove_dir(receipt_path.parent().unwrap()).unwrap();
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let can_create = fs::create_dir(app_dir.join("probe")).is_ok();
+        let plugin = super::ensure_opencode_plugin_dir();
+        let receipt = super::save_oss_plugin_hook_receipt(&[home.path().join("hooks.json")]);
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if can_create {
+            eprintln!("skipped: file modes do not apply to this user");
+            return;
+        }
+
+        // A successful write clears the machine fault for subsequent tests.
+        super::ensure_opencode_plugin_dir().unwrap();
+        for err in [plugin.unwrap_err(), receipt.unwrap_err()] {
+            assert!(err.to_string().contains(crate::env_fault::NOTE), "{err:#}");
+        }
     }
 
     #[test]
