@@ -3473,32 +3473,35 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// `create_dir_all` whose error names what is in the way.
 fn create_dir_all_explained(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|err| {
-        let in_the_way = dir_in_the_way(dir, &err);
+        let in_the_way = dir_in_the_way(dir);
         anyhow::Error::new(err).context(format!("creating {}{in_the_way}", dir.display()))
     })
 }
 
-/// std's `create_dir_all` answers EEXIST when an ancestor exists but
-/// `is_dir()` cannot follow it, which says nothing about why: three Macs
-/// failed "creating ~/.claude: File exists" (RUST-WH/WJ/XJ). Names the first
-/// existing ancestor and its shape, never a link's target path.
-fn dir_in_the_way(dir: &Path, err: &std::io::Error) -> String {
-    if err.kind() != std::io::ErrorKind::AlreadyExists {
-        return String::new();
-    }
-    let Some(path) = dir
-        .ancestors()
-        .find(|path| std::fs::symlink_metadata(path).is_ok())
-    else {
+/// Inspect the nearest existing ancestor after a directory creation fails.
+/// A file can yield EEXIST at the requested path or ENOTDIR below it.
+/// Name the obstructing entry without including a link's target path.
+fn dir_in_the_way(dir: &Path) -> String {
+    let Some((path, metadata)) = dir.ancestors().find_map(|path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (path, metadata))
+    }) else {
         return String::new();
     };
-    let what = match std::fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => return String::new(),
-        Ok(_) => "a file, not a folder".to_string(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            "a link to a missing folder".to_string()
+    let what = if metadata.file_type().is_symlink() {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => return String::new(),
+            Ok(_) => "a link to a file".to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "a link to a missing folder".to_string()
+            }
+            Err(e) => format!("a link Headroom cannot follow: {e}"),
         }
-        Err(e) => format!("a link Headroom cannot follow: {e}"),
+    } else if metadata.is_dir() {
+        return String::new();
+    } else {
+        "a file, not a folder".to_string()
     };
     format!(" ({} is {what})", path.display())
 }
@@ -3524,7 +3527,7 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
-                let in_the_way = dir_in_the_way(parent, &err);
+                let in_the_way = dir_in_the_way(parent);
                 anyhow!("creating {}{in_the_way}: {err}{note}", parent.display())
             })?;
         }
@@ -13948,6 +13951,16 @@ print(settings({"cwd": sys.argv[2]}) is None)
             "{message}"
         );
 
+        let link_to_file = root.join(".config");
+        std::os::unix::fs::symlink(&file, &link_to_file).expect("link to file");
+        let err = super::create_dir_all_explained(&link_to_file.join("opencode")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(".config is a link to a file)"),
+            "{message}"
+        );
+        assert!(!message.contains(".codex"), "{message}");
+
         let message = format!(
             "{:#}",
             super::atomic_write(&dangling.join("settings.json"), b"{}").unwrap_err()
@@ -13957,6 +13970,25 @@ print(settings({"cwd": sys.argv[2]}) is None)
             "{message}"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_dir_create_error_names_a_file_blocking_an_ancestor() {
+        let root = tempfile::tempdir().expect("create root");
+        let file = root.path().join(".claude");
+        fs::write(&file, "").expect("plant file");
+        let hooks = file.join("hooks");
+        let expected = format!("({} is a file, not a folder)", file.display());
+
+        let message = super::create_dir_all_explained(&hooks)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&expected), "{message}");
+
+        let message = super::atomic_write(&hooks.join("headroom.sh"), b"")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&expected), "{message}");
     }
 
     #[test]
