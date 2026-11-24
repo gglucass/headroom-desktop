@@ -3470,6 +3470,39 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     })
 }
 
+/// `create_dir_all` whose error names what is in the way.
+fn create_dir_all_explained(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|err| {
+        let in_the_way = dir_in_the_way(dir, &err);
+        anyhow::Error::new(err).context(format!("creating {}{in_the_way}", dir.display()))
+    })
+}
+
+/// std's `create_dir_all` answers EEXIST when an ancestor exists but
+/// `is_dir()` cannot follow it, which says nothing about why: three Macs
+/// failed "creating ~/.claude: File exists" (RUST-WH/WJ/XJ). Names the first
+/// existing ancestor and its shape, never a link's target path.
+fn dir_in_the_way(dir: &Path, err: &std::io::Error) -> String {
+    if err.kind() != std::io::ErrorKind::AlreadyExists {
+        return String::new();
+    }
+    let Some(path) = dir
+        .ancestors()
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+    else {
+        return String::new();
+    };
+    let what = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => return String::new(),
+        Ok(_) => "a file, not a folder".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "a link to a missing folder".to_string()
+        }
+        Err(e) => format!("a link Headroom cannot follow: {e}"),
+    };
+    format!(" ({} is {what})", path.display())
+}
+
 fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
     // writers to the same file: A renames tmp->path, then B's rename finds its
@@ -3491,7 +3524,8 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
-                anyhow!("creating {}: {err}{note}", parent.display())
+                let in_the_way = dir_in_the_way(parent, &err);
+                anyhow!("creating {}{in_the_way}: {err}{note}", parent.display())
             })?;
         }
     }
@@ -4258,8 +4292,7 @@ fn set_markitdown_bash_permission(
     }
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let _ = backup_if_exists(&settings_path)?;
     atomic_write(
@@ -4533,8 +4566,7 @@ fn configure_claude_settings_env_impl(
     }
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let backup = backup_if_exists(settings_path)?;
@@ -4766,8 +4798,7 @@ fn ensure_claude_settings_hook(
     }));
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let backup = backup_if_exists(&settings_path)?;
@@ -6001,8 +6032,7 @@ fn restore_codex_root_key(key: &str, value: &str) -> Result<()> {
     };
     let _ = backup_if_exists(&path)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     atomic_write(&path, rebuilt.as_bytes())?;
     Ok(())
@@ -6089,8 +6119,7 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
 fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<CodexPreservedKey>)> {
     let path = codex_config_toml_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
@@ -6475,8 +6504,7 @@ fn grok_config_without_proxy_routes(mut config: toml::Table) -> Result<String> {
 fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let path = grok_config_toml_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
@@ -6819,8 +6847,7 @@ fn remove_opencode_provider_base_url(config: &mut serde_json::Value, provider: &
 
 fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let mut payload = serde_json::to_string_pretty(config)
         .with_context(|| format!("serializing {}", path.display()))?;
@@ -6860,7 +6887,7 @@ fn legacy_opencode_plugin_path() -> PathBuf {
 /// Write (or refresh after an app update) the vendored plugin directory.
 fn ensure_opencode_plugin_dir() -> Result<PathBuf> {
     let dir = opencode_plugin_install_path();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    create_dir_all_explained(&dir)?;
     for (name, bytes) in OPENCODE_PLUGIN_FILES {
         let path = dir.join(name);
         if std::fs::read(&path).ok().as_deref() != Some(bytes) {
@@ -8017,8 +8044,7 @@ fn register_hook_entries(
 
     let backup = backup_if_exists(hooks_path)?;
     if let Some(parent) = hooks_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     atomic_write(
         hooks_path,
@@ -9121,8 +9147,7 @@ fn ensure_windows_remote_control_panel(wrapper: &Path) -> Result<(Vec<String>, V
     let mut changed = Vec::new();
     let mut backups = Vec::new();
     if let Some(parent) = wrapper.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     // The script first: the wrapper copy reads it at every start.
     let script = wrapper.with_extension("py");
@@ -9907,8 +9932,7 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
         }
     }
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let _ = backup_if_exists(&settings_path)?;
     atomic_write(
@@ -10063,8 +10087,7 @@ fn upsert_managed_block(
     block_body: &str,
 ) -> Result<(bool, Option<PathBuf>)> {
     if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let existing = if file_path.exists() {
@@ -10140,8 +10163,7 @@ fn write_file_if_changed(
     #[cfg(not(unix))]
     let _ = executable; // only used for chmod on unix
     if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let existing = if file_path.exists() {
@@ -10573,8 +10595,7 @@ fn save_oss_plugin_hook_receipt(paths: &[PathBuf]) -> Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     atomic_write(&path, &serde_json::to_vec_pretty(paths)?)
 }
@@ -11204,8 +11225,7 @@ fn set_json_setting_at(settings_path: &Path, path: &[&str], value: Value) -> Res
     }
     object.insert((*last).to_string(), value);
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     backup_if_exists(settings_path)?;
     atomic_write(
@@ -13900,6 +13920,43 @@ print(settings({"cwd": sys.argv[2]}) is None)
 
         assert!(remove_managed_block(&path, "managed_rtk").unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_create_error_names_what_is_in_the_way() {
+        let root = unique_temp_dir("headroom-dir-in-the-way");
+        fs::create_dir_all(&root).expect("create root");
+        let dangling = root.join(".claude");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).expect("dangling link");
+        let err = super::create_dir_all_explained(&dangling.join("hooks")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(".claude is a link to a missing folder)"),
+            "{message}"
+        );
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "io cause kept"
+        );
+
+        let file = root.join(".codex");
+        fs::write(&file, "").expect("plant file");
+        let message = format!("{:#}", super::create_dir_all_explained(&file).unwrap_err());
+        assert!(
+            message.contains(".codex is a file, not a folder)"),
+            "{message}"
+        );
+
+        let message = format!(
+            "{:#}",
+            super::atomic_write(&dangling.join("settings.json"), b"{}").unwrap_err()
+        );
+        assert!(
+            message.contains("is a link to a missing folder)"),
+            "{message}"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
