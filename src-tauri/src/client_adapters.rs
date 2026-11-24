@@ -10567,13 +10567,14 @@ fn oss_plugin_hook_receipt_path() -> PathBuf {
     config_file(&app_data_dir(), "oss-plugin-hooks.json")
 }
 
-fn load_oss_plugin_hook_receipt() -> Vec<PathBuf> {
+fn load_oss_plugin_hook_receipt() -> Result<Vec<PathBuf>> {
     let path = oss_plugin_hook_receipt_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+    let bytes = match crate::state::read_state_file(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        other => other.with_context(|| format!("reading {}", path.display()))?,
     };
     match serde_json::from_slice(&bytes) {
-        Ok(paths) => paths,
+        Ok(paths) => Ok(paths),
         Err(err) => {
             // This file is the only record of which third-party hooks we
             // rewrote. Silently overwriting an unreadable one strands them
@@ -10582,8 +10583,8 @@ fn load_oss_plugin_hook_receipt() -> Vec<PathBuf> {
                 "oss plugin hook: unreadable receipt {}: {err}",
                 path.display()
             );
-            let _ = backup_if_exists(&path);
-            Vec::new()
+            backup_if_exists(&path)?;
+            Ok(Vec::new())
         }
     }
 }
@@ -10656,7 +10657,9 @@ pub fn oss_plugin_hook_needs_absorbing() -> bool {
     if oss_absorb_disabled() {
         return false;
     }
-    let receipt = load_oss_plugin_hook_receipt();
+    let Ok(receipt) = load_oss_plugin_hook_receipt() else {
+        return false;
+    };
     if receipt.is_empty() {
         return false;
     }
@@ -10687,7 +10690,14 @@ fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> bool {
 /// paths after plugin removal, so uninstall can still restore inactive caches.
 fn reconcile_oss_plugin_hooks(current_hooks: &[PathBuf], absorb: bool) -> (bool, Vec<String>) {
     let managed = OSS_PLUGIN_MANAGED_COMMAND;
-    let mut hooks = load_oss_plugin_hook_receipt();
+    let mut hooks = match load_oss_plugin_hook_receipt() {
+        Ok(hooks) => hooks,
+        Err(err) => {
+            log::warn!("oss plugin hook: loading receipt failed: {err:#}");
+            // During restoration, keep the data folder for a later cleanup retry.
+            return (!absorb, Vec::new());
+        }
+    };
     hooks.extend_from_slice(current_hooks);
     hooks = dedupe_paths(hooks);
 
@@ -24028,6 +24038,39 @@ sys.exit(3)
         assert!(super::app_data_dir().exists());
         assert!(super::oss_plugin_hook_receipt_path().exists());
         assert!(fs::read_to_string(hooks).unwrap().contains(&managed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_oss_hook_receipt_keeps_restoration_pending() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
+        let receipt = super::oss_plugin_hook_receipt_path();
+        let saved = fs::read(&receipt).unwrap();
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o200)).unwrap();
+        if fs::read(&receipt).is_ok() {
+            eprintln!("skipped: file modes do not apply to this user");
+            return;
+        }
+
+        // An unregistered plugin cache is discoverable only through its receipt.
+        let (pending, changed) = super::reconcile_oss_plugin_hooks(&[], false);
+        assert!(
+            receipt.is_file(),
+            "the receipt was deleted after a failed read"
+        );
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&receipt).unwrap(), saved);
+        assert!(pending && changed.is_empty());
+
+        let (pending, changed) = super::reconcile_oss_plugin_hooks(&[], false);
+        assert!(!pending);
+        assert_eq!(changed, [hooks.display().to_string()]);
+        assert!(!receipt.exists());
     }
 
     #[test]
