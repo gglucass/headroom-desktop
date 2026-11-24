@@ -3594,8 +3594,11 @@ fn report_upstream_error(
     }
     // xAI's cli-chat-proxy answers an outdated Grok CLI 426 ("Your Grok CLI
     // version ... is outdated"), and the CLI shows that line itself; only
-    // `grok update` fixes it (RUST-WS).
-    if client == "grok-build" && status == 426 {
+    // `grok update` fixes it (RUST-WS). OpenCode Zen does the same for an
+    // opencode below its version floor (`UpgradeRequired`, RUST-MG).
+    if (client == "grok-build" && status == 426)
+        || (client == "opencode" && is_outdated_opencode_error(&body))
+    {
         return;
     }
     // 401 splits on the body, like the geo-block above: "Missing bearer" means
@@ -3766,6 +3769,13 @@ fn is_geo_blocked_anthropic_error(body: &[u8]) -> bool {
 /// whose top-level `type` is `RegionError` (RUST-TS, 4 hosts in 4 days).
 fn is_geo_blocked_opencode_error(body: &[u8]) -> bool {
     codex_error_class(body)[0] == "RegionError"
+}
+
+/// True when OpenCode Zen refused an opencode older than its version floor:
+/// a 426 whose top-level `type` is `UpgradeRequired`. Only updating opencode
+/// fixes it.
+fn is_outdated_opencode_error(body: &[u8]) -> bool {
+    codex_error_class(body)[0] == "UpgradeRequired"
 }
 
 /// True when a 413 is the backend refusing to forward after its own compression
@@ -5765,7 +5775,7 @@ mod tests {
         is_failed_request_status, is_geo_blocked_anthropic_error, is_geo_blocked_codex_error,
         is_geo_blocked_opencode_error, is_grok_inference_path, is_grok_request,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_missing_auth_error, is_openai_path, is_outdated_opencode_error, is_prompt_request_head,
         is_reportable_upstream_error, is_vscode_claude_ua, ollama_codex_direct_base, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
@@ -10435,6 +10445,18 @@ mod tests {
             br#"{"type":"FreeTierError","error":"m"}"#
         ));
         assert!(!is_geo_blocked_opencode_error(b""));
+    }
+
+    #[test]
+    fn outdated_opencode_error_is_zens_upgrade_type_only() {
+        // RUST-MG's body shape, `object{error,type}`.
+        assert!(is_outdated_opencode_error(
+            br#"{"type":"UpgradeRequired","error":"m"}"#
+        ));
+        assert!(!is_outdated_opencode_error(
+            br#"{"type":"FreeTierError","error":"m"}"#
+        ));
+        assert!(!is_outdated_opencode_error(b""));
     }
 
     #[test]
