@@ -3272,19 +3272,6 @@ details[open] .optimize-minimal__details summary::after {
   font-variant-numeric: tabular-nums;
 }
 
-/* The client's cache discount: context, not a Headroom claim. Visually set
-   apart from the Headroom rows above it. */
-.savings-breakdown__row--context {
-  margin-top: 4px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--border-default);
-  color: var(--text-muted);
-}
-
-.savings-breakdown__row--context strong {
-  color: var(--text-secondary);
-}
-
 /* Collapsed by default. The explainer already runs past a 560px window, and
    the per-model split is supporting detail rather than part of the claim, so
    it should cost nothing until someone asks for it. */

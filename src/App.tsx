@@ -8787,19 +8787,6 @@ export default function App() {
                         </p>
                       </>
                     ) : null}
-                    {dashboard.savingsBreakdown.cacheSavingsUsd >= 0.005 ? (
-                      <>
-                        <div className="savings-breakdown__row savings-breakdown__row--context">
-                          <span>Prompt caching (your AI client)</span>
-                          <strong>{currency(dashboard.savingsBreakdown.cacheSavingsUsd)}</strong>
-                        </div>
-                        <p className="savings-breakdown__note">
-                          Cache discounts are earned by your coding agent's own prompt caching. Headroom
-                          never counts them as its savings. Headroom compression is cache-aligned:
-                          it only touches content outside the cache.
-                        </p>
-                      </>
-                    ) : null}
                   </div>
                 ) : null}
                 <div className="modal-actions">
