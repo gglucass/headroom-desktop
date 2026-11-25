@@ -195,13 +195,11 @@ pub fn report_unfinished_restart(base_dir: &Path) {
         ),
         Ok(_) => log::info!("restart: relaunch completed (requested by {})", note.trim()),
         Err(_) => {
-            let log_file = crate::logging::log_path();
-            let mut text = std::fs::read(log_file.with_extension("log.old")).unwrap_or_default();
-            text.extend(std::fs::read(&log_file).unwrap_or_default());
+            let text = crate::logging::recent_desktop_log(&crate::logging::log_path());
             log::warn!(
                 "restart: the previous update-restart never relaunched the app; \
                  its detached helper {} (requested by {})",
-                restart_helper_trace(&String::from_utf8_lossy(&text), &note),
+                restart_helper_trace(&text, &note),
                 note.trim()
             )
         }
