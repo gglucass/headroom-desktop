@@ -201,7 +201,7 @@ pub fn report_unfinished_restart(base_dir: &Path) {
             log::warn!(
                 "restart: the previous update-restart never relaunched the app; \
                  its detached helper {} (requested by {})",
-                restart_helper_trace(&String::from_utf8_lossy(&text)),
+                restart_helper_trace(&String::from_utf8_lossy(&text), &note),
                 note.trim()
             )
         }
@@ -213,15 +213,47 @@ pub fn report_unfinished_restart(base_dir: &Path) {
 /// How far the last restart's helper got, read from the desktop log it writes
 /// to. RUST-XM's one event could not say whether the helper never ran or died
 /// mid-wait, and those point at different causes.
-fn restart_helper_trace(log_text: &str) -> &'static str {
-    // Logged before the spawn, so the helper's own line can only follow it.
-    let Some(at) = log_text.rfind("restart_app: relaunching via") else {
-        return "died before reaching `open` (the log no longer holds that restart)";
+fn restart_helper_trace(log_text: &str, pending_note: &str) -> &'static str {
+    const NO_TRACE: &str = "has no matching restart trace in the desktop log";
+    let Some(requested) = pending_note
+        .trim()
+        .split_once(" at ")
+        .and_then(|(_, stamp)| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+    else {
+        return NO_TRACE;
     };
-    if log_text[at..].contains("helper: detached, waiting for pid") {
-        "started, then died before reaching `open`"
+
+    // The pending marker uses UTC. Both log writers use local wall time, and
+    // the shell prints only whole seconds. A short window keeps an older
+    // restart or a later, unrelated helper out of this report.
+    let requested = requested.with_timezone(&chrono::Local).naive_local();
+    let latest = requested + chrono::Duration::seconds(30);
+    let mut announced = None;
+    for line in log_text.lines() {
+        const ANNOUNCE: &str =
+            " INFO  headroom_desktop_lib: restart_app: relaunching via `open -n`";
+        if let Some((stamp, _)) = line.split_once(ANNOUNCE) {
+            announced = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.3f")
+                .ok()
+                .filter(|at| {
+                    // Compare at the Rust logger's millisecond precision.
+                    at.and_utc().timestamp_millis() >= requested.and_utc().timestamp_millis()
+                        && *at <= latest
+                });
+        } else if let Some((spawned, (stamp, _))) =
+            announced.zip(line.split_once(" helper: detached, waiting for pid "))
+        {
+            if chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S").is_ok_and(|at| {
+                at.and_utc().timestamp() >= spawned.and_utc().timestamp() && at <= latest
+            }) {
+                return "logged its start before reaching `open`";
+            }
+        }
+    }
+    if announced.is_some() {
+        "has no start record in the desktop log"
     } else {
-        "never started"
+        NO_TRACE
     }
 }
 
@@ -322,23 +354,36 @@ mod restart_marker_tests {
     }
 
     #[test]
-    fn helper_trace_tells_never_started_from_died_mid_wait() {
-        let spawned = "x INFO headroom: restart_app: relaunching via `open -n` against bundle\n";
+    fn helper_trace_matches_the_pending_restart_time() {
+        use chrono::TimeZone;
+
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 11, 23, 11, 52, 25)
+            .unwrap();
+        let utc = local.to_utc() + chrono::Duration::microseconds(750);
+        let note = format!("0.9.64 at {}", utc.to_rfc3339());
+        let spawned = "2026-11-23 11:52:25.000 INFO  headroom_desktop_lib: restart_app: relaunching via `open -n` against bundle\n";
         let started = "2026-11-23 11:52:25 helper: detached, waiting for pid 9\n";
+        let trace = |log: &str| restart_helper_trace(log, &note);
+        let missing = "has no matching restart trace in the desktop log";
+        let no_start = "has no start record in the desktop log";
+        // The app can die after writing pending but before announcing the
+        // restart, leaving the previous restart as the newest one in the log.
+        let older = format!("{spawned}{started}").replace("11:52:25", "11:51:25");
+        assert_eq!(trace(&older), trace(""));
+        assert_eq!(trace(""), missing);
+        assert_eq!(trace(spawned), no_start);
         assert_eq!(
-            restart_helper_trace(""),
-            restart_helper_trace("unrelated\n")
+            trace(&format!("{spawned}{started}")),
+            "logged its start before reaching `open`"
         );
-        assert!(restart_helper_trace("").contains("no longer holds"));
-        assert_eq!(restart_helper_trace(spawned), "never started");
+        assert_eq!(trace(&format!("{older}{spawned}")), no_start);
+        // A later helper (e.g. the bundle trasher) sheds no light on this restart.
+        let later = started.replace("11:52:25", "11:53:25");
+        assert_eq!(trace(&format!("{spawned}{later}")), no_start);
         assert_eq!(
-            restart_helper_trace(&format!("{spawned}{started}")),
-            "started, then died before reaching `open`"
-        );
-        // An earlier restart's helper line says nothing about the last one.
-        assert_eq!(
-            restart_helper_trace(&format!("{spawned}{started}{spawned}")),
-            "never started"
+            restart_helper_trace(&format!("{spawned}{started}"), "0.9.18 at now"),
+            missing
         );
     }
 }
