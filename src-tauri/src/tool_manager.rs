@@ -35,7 +35,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.44.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.45.0";
 
 // Release CI embeds the SHA of a prebuilt runtime after signing every PE in
 // it. A Windows release without that build input fails at compile time.
@@ -676,7 +676,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
         _hd_old_cap = 100 * 1024 * 1024
         _hd_codex_cap = 256 * 1024 * 1024
         if (_hd_os.environ.get("HEADROOM_CODEX_IMAGE_HISTORY", "1") != "0"
-            and _hd_metadata.version("headroom-ai") == "0.44.0"
+            and _hd_metadata.version("headroom-ai") == "0.45.0"
             and _hd_body_helpers.MAX_REQUEST_BODY_SIZE == _hd_old_cap
             and _hd_body_helpers.MAX_DECOMPRESSED_BODY_SIZE == _hd_old_cap):
             _hd_original_body_limit_call = _hd_body_limit.RequestBodyLimitMiddleware.__call__
@@ -839,13 +839,13 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
     # Codex savings on Claude Code's rule (upstream PR, branch
     # fix/responses-savings-per-request). Anthropic books each request's own
-    # removals, re-sent cached history included; 0.44.0 books a /v1/responses
+    # removals, re-sent cached history included; 0.45.0 books a /v1/responses
     # request net of what its conversation's earlier turns removed, so Codex
     # read several times lower for the same work. A ledger that declines
     # ("this path does not distinguish") sends the funnel to its per-request
     # fallback, the figure every other path books. The upstream fix deletes
     # the ledger, so this stands down on the wheel that ships it. Exact-pin
-    # 0.44.0. Kill switch: HEADROOM_RESPONSES_SAVINGS_PER_REQUEST=0.
+    # 0.45.0. Kill switch: HEADROOM_RESPONSES_SAVINGS_PER_REQUEST=0.
     try:
         if _hd_os.environ.get(
             "HEADROOM_RESPONSES_SAVINGS_PER_REQUEST", "1"
@@ -854,7 +854,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
             import headroom.proxy.conversation_savings as _hd_rs_cs
 
-            if _hd_rs_meta.version("headroom-ai") == "0.44.0" and hasattr(
+            if _hd_rs_meta.version("headroom-ai") == "0.45.0" and hasattr(
                 _hd_rs_cs, "ConversationSavings"
             ):
                 _hd_rs_cs.ConversationSavings.novel = (
@@ -872,7 +872,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # four-argument signature raised TypeError on every Anthropic request.
     try:
         from importlib import metadata as _hd_ci_meta
-        if (_hd_ci_meta.version("headroom-ai") == "0.44.0" and
+        if (_hd_ci_meta.version("headroom-ai") == "0.45.0" and
             _hd_os.environ.get("HEADROOM_CACHE_INTEGRITY", "1").strip().lower()
                 not in ("0", "false", "no", "off")):
             import contextvars as _hd_ci_cv
@@ -1347,13 +1347,13 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 # insert inside the message (valid whether the body is JSON or an SSE error event),
 # guarded so it never touches a StreamingResponse, a non-400, or an already-hinted
 # body. Fail-open: any error returns the original response untouched.
-# Exact-pin gated to wheel 0.44.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
+# Exact-pin gated to wheel 0.45.0. Kill switch: HEADROOM_TOOL_REF_HINT=0.
 _hd_hint_flag = _hd_os.environ.get("HEADROOM_TOOL_REF_HINT", "1")
 if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_hint_meta
 
-        if _hd_hint_meta.version("headroom-ai") == "0.44.0":
+        if _hd_hint_meta.version("headroom-ai") == "0.45.0":
             from headroom.proxy.handlers import streaming as _hd_hint_mod
 
             _hd_hint_sig = b"not found in available tools"
@@ -1406,7 +1406,7 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # sending response headers, but the raw exception reaches the outer 502 catch
 # instead. Only translate EPERM during a Codex Responses connection; other TLS
 # errors (notably certificate verification) retain their original diagnosis.
-# Exact-pin gated to 0.44.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
+# Exact-pin gated to 0.45.0. Kill switch: HEADROOM_CODEX_TLS_RETRY=0.
 _hd_tls_flag = _hd_os.environ.get("HEADROOM_CODEX_TLS_RETRY", "1")
 if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
@@ -1415,7 +1415,7 @@ if _hd_tls_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         import ssl as _hd_tls_ssl
         import httpx as _hd_tls_httpx
 
-        if _hd_tls_meta.version("headroom-ai") == "0.44.0":
+        if _hd_tls_meta.version("headroom-ai") == "0.45.0":
             _hd_tls_orig_send = _hd_tls_httpx.AsyncClient.send
 
             async def _hd_tls_send(self, request, *args, **kwargs):
@@ -1474,13 +1474,13 @@ if _hd_mw_size.isdigit() and int(_hd_mw_size) > 0:
 # forwards on the guard's name verdict, the 0.38.0 behaviour; direct routes stay
 # pinned and internal answers are still refused. No self-neutralization: the
 # wheel has no blanket allow to detect, so re-check on each bump whether it grew
-# one. Exact-pin gated to wheel 0.44.0.
+# one. Exact-pin gated to wheel 0.45.0.
 _hd_pgu_flag = _hd_os.environ.get("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "")
 if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
     try:
         import importlib.metadata as _hd_pgu_meta
 
-        if _hd_pgu_meta.version("headroom-ai") == "0.44.0":
+        if _hd_pgu_meta.version("headroom-ai") == "0.45.0":
             from headroom.proxy import upstream_pinning as _hd_pgu_mod
 
             _hd_pgu_cls = _hd_pgu_mod.GuardedUpstreamRefusingTransport
@@ -1522,7 +1522,7 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
 # so a backend restarted sooner lost its warm-up replies (the train guest sat at
 # 10 after 35 of them, 2026-10-17): each warm-up reply is written until the
 # baseline reaches the target. Not a wheel bug, so it never self-neutralizes.
-# Exact-pin gated to wheel 0.44.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
+# Exact-pin gated to wheel 0.45.0. Kill switch: HEADROOM_OUTPUT_WARMUP=0.
 _hd_ow_flag = _hd_os.environ.get("HEADROOM_OUTPUT_WARMUP", "200").strip().lower()
 if _hd_os.environ.get(
     "HEADROOM_SDK"
@@ -1530,7 +1530,7 @@ if _hd_os.environ.get(
     try:
         import importlib.metadata as _hd_ow_meta
 
-        if _hd_ow_meta.version("headroom-ai") == "0.44.0":
+        if _hd_ow_meta.version("headroom-ai") == "0.45.0":
             import contextvars as _hd_ow_cv
 
             from headroom.proxy import output_savings as _hd_ow_os
@@ -1627,14 +1627,14 @@ if _hd_os.environ.get(
 # block, and the prompt asks for a prior heading to be reused as written.
 # ClaudeCodeWriter ignores context_file, so only the analysis input changes.
 # The wheel merges worktrees itself (#3854), so merged projects are covered.
-# Exact-pin gated to wheel 0.44.0; self-neutralizes once the plugin or the
+# Exact-pin gated to wheel 0.45.0; self-neutralizes once the plugin or the
 # analyzer names CLAUDE.local.md. Kill switch: HEADROOM_LEARN_PRIOR_LOCAL=0.
 _hd_lpl_flag = _hd_os.environ.get("HEADROOM_LEARN_PRIOR_LOCAL", "1")
 if _hd_lpl_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     try:
         import importlib.metadata as _hd_lpl_meta
 
-        if _hd_lpl_meta.version("headroom-ai") == "0.44.0":
+        if _hd_lpl_meta.version("headroom-ai") == "0.45.0":
             import inspect as _hd_lpl_inspect
             from pathlib import Path as _hd_lpl_Path
 
@@ -13406,24 +13406,24 @@ pub(crate) fn pinned_headroom_release() -> Result<HeadroomRelease> {
 fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> {
     let (url, sha256) = match (os, arch) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/42/b7/1ab4da6f7a091fd1a102b5194828f9a588b6b4f11b522f38b86b125770a3/headroom_ai-0.44.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "9b084f4cd9918af2d0970450ff3e990fffc29a8220dc5e24fa0f33a4dd0359cc",
+            "https://files.pythonhosted.org/packages/f5/38/1530981783c165d4350a5aee0556662ea6459d8edebbc64466acb26f7861/headroom_ai-0.45.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "3b7f9ee266039ab5a8b10c5da5868f9b640f1f949d34005dc26362be526a5165",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/37/58/cb856a12253468d2c70ea6223531a34558f57f294196f75172343833f164/headroom_ai-0.44.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "2ab9d0c7ced1b94220597b2a48996693ebc0a61dd1ce38749709ae299b3f51da",
+            "https://files.pythonhosted.org/packages/30/81/47813dbd1591c3fc72dd430a293adbc1c913b198849b27eba2bb361d94fe/headroom_ai-0.45.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "8a7d039f3f99664b9f8518e1dcb966363d67c75e33a8f28e08c8f2ebc50f2f19",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/5e/d9/2ff01892de67c0824d024cdb0152e371bb8cd5ced8ed6c2a66ad5c5f13a4/headroom_ai-0.44.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "58f2e6ac736fe882f83cae0a3bffad7ce574d12587eb999d6501bffd053a75cd",
+            "https://files.pythonhosted.org/packages/15/8b/8ee31bb6164670f91734b6580422bf2fb5e50517df9494c383afa6a3e459/headroom_ai-0.45.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "61bf883957bcd81d3f0ca08f2e0d1af6828fd710ec7dad2a07efe7998b7eb17b",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/8f/63/39c8f6bd317714bc6a68775be5da5e15bca9e91d5f95e259bc00e6de6f7f/headroom_ai-0.44.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "3b5c7fd289e7d227dcd9b896615541ea9d3d37388bd97b3257fc8769c4b7ef70",
+            "https://files.pythonhosted.org/packages/26/bc/aee4580f537985e7b9fa03b5ef2300f9e03828455c457e660911c25e2d6e/headroom_ai-0.45.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "75c386fb9d9124ea9259a61567ffa46128759f2695691459c6e7d751f9d4c2ca",
         ),
         ("windows", "x86_64") => (
-            "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-0.44.0/headroom_ai-0.44.0-cp310-abi3-win_amd64.whl",
-            "bc7b95ca60485f86cb61ecae3edb023d79a72051a089be8d5a1756e7125671bc",
+            "https://github.com/gglucass/headroom-desktop/releases/download/signed-wheel-0.45.0/headroom_ai-0.45.0-cp310-abi3-win_amd64.whl",
+            "08efc2c5a4da327eef4072c23d2786bcfba5a19fedfa19603d4854ed04700e29",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -13432,7 +13432,7 @@ fn pinned_headroom_release_for(os: &str, arch: &str) -> Result<HeadroomRelease> 
     // unsigned one of every new release, and the upgrade rolled back to a wheel
     // the pinned vendors skip (RUST-W1). The index fallback stays PyPI's file.
     let index_sha256 = match os {
-        "windows" => "a7853a0d81f1e3f6d4b00de6114791732ff458c09b8af05a06c4ae2d8c492d68",
+        "windows" => "9ddcf12e6a70c73525783a7db31b7261a612215e47dcedec2e94d72260aa2648",
         _ => sha256,
     };
 
@@ -17997,7 +17997,7 @@ asyncio.run(main())
         // this pins the shape.
         let py = super::SITECUSTOMIZE_PY;
         assert!(py.contains("HEADROOM_TOOL_REF_HINT"));
-        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.44.0""#));
+        assert!(py.contains(r#"_hd_hint_meta.version("headroom-ai") == "0.45.0""#));
         // Wraps the buffered-error seam and post-processes its Response.
         assert!(py.contains("_hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped"));
         assert!(py.contains("def _hd_hint_apply(result):"));
@@ -18487,7 +18487,7 @@ with open(_p, encoding="utf-8") as _f:
             "else {}",
             crate::output_savings::OUTPUT_WARMUP_REPLIES
         )));
-        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.44.0""#));
+        assert!(py.contains(r#"_hd_ow_meta.version("headroom-ai") == "0.45.0""#));
         assert!(py.contains("for _hd_ow_mod in (_hd_ow_pol, _hd_ow_os):"));
         assert!(py.contains("_hd_ow_os.SavingsLedger.record = _hd_ow_record"));
         assert!(py.contains("_hd_ow_os.SavingsRecorder._reload_baseline_locked = _hd_ow_reload"));

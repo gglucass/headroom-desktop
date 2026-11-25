@@ -29,6 +29,7 @@
 # click 8.5.0, opentelemetry-api 1.45.1, tomlkit 0.15.2 and python-socks 3.2.0,
 # the new floors (see the macOS lock). No tree-sitter or opentelemetry-sdk here.
 # 2026-11-14: opentelemetry-api 1.45.1 -> 1.45.2 (CVE-2026-126360).
+# 0.45.0: no pin change (see the macOS lock).
 # ast-grep-cli is deliberately ABSENT though headroom-ai requires it: the wheel is
 # only two binaries, used only by the opt-in --intercept-tool-results the app never
 # passes, and a web filter 403'd its win_amd64 .exe wheel and blocked a bootstrap
