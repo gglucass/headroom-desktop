@@ -194,14 +194,35 @@ pub fn report_unfinished_restart(base_dir: &Path) {
             note.trim()
         ),
         Ok(_) => log::info!("restart: relaunch completed (requested by {})", note.trim()),
-        Err(_) => log::warn!(
-            "restart: the previous update-restart never relaunched the app; \
-             its detached helper died before reaching `open` (requested by {})",
-            note.trim()
-        ),
+        Err(_) => {
+            let log_file = crate::logging::log_path();
+            let mut text = std::fs::read(log_file.with_extension("log.old")).unwrap_or_default();
+            text.extend(std::fs::read(&log_file).unwrap_or_default());
+            log::warn!(
+                "restart: the previous update-restart never relaunched the app; \
+                 its detached helper {} (requested by {})",
+                restart_helper_trace(&String::from_utf8_lossy(&text)),
+                note.trim()
+            )
+        }
     }
     let _ = std::fs::remove_file(&pending);
     let _ = std::fs::remove_file(&attempted);
+}
+
+/// How far the last restart's helper got, read from the desktop log it writes
+/// to. RUST-XM's one event could not say whether the helper never ran or died
+/// mid-wait, and those point at different causes.
+fn restart_helper_trace(log_text: &str) -> &'static str {
+    // Logged before the spawn, so the helper's own line can only follow it.
+    let Some(at) = log_text.rfind("restart_app: relaunching via") else {
+        return "died before reaching `open` (the log no longer holds that restart)";
+    };
+    if log_text[at..].contains("helper: detached, waiting for pid") {
+        "started, then died before reaching `open`"
+    } else {
+        "never started"
+    }
 }
 
 /// Written by the idle update applier just before it restarts or installs.
@@ -297,6 +318,27 @@ mod restart_marker_tests {
         assert!(
             !restart_attempted_path(base).exists(),
             "a stale attempted marker reads as success on the next failure"
+        );
+    }
+
+    #[test]
+    fn helper_trace_tells_never_started_from_died_mid_wait() {
+        let spawned = "x INFO headroom: restart_app: relaunching via `open -n` against bundle\n";
+        let started = "2026-11-23 11:52:25 helper: detached, waiting for pid 9\n";
+        assert_eq!(
+            restart_helper_trace(""),
+            restart_helper_trace("unrelated\n")
+        );
+        assert!(restart_helper_trace("").contains("no longer holds"));
+        assert_eq!(restart_helper_trace(spawned), "never started");
+        assert_eq!(
+            restart_helper_trace(&format!("{spawned}{started}")),
+            "started, then died before reaching `open`"
+        );
+        // An earlier restart's helper line says nothing about the last one.
+        assert_eq!(
+            restart_helper_trace(&format!("{spawned}{started}{spawned}")),
+            "never started"
         );
     }
 }
