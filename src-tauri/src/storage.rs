@@ -179,14 +179,22 @@ pub fn mark_restart_pending(base_dir: &Path, from_version: &str) {
 /// `open`" from "it tried", which a missing log line cannot, and the warn
 /// carries it to Sentry so this is not per-machine archaeology next time.
 pub fn report_unfinished_restart(base_dir: &Path) {
+    use std::io::ErrorKind;
+
     let pending = restart_pending_path(base_dir);
-    let Ok(note) = std::fs::read_to_string(&pending) else {
-        return;
+    let note = match read_restart_marker(&pending) {
+        Ok(note) => note,
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                log::info!("restart: reading the pending marker failed: {err}");
+            }
+            return;
+        }
     };
     let attempted = restart_attempted_path(base_dir);
     // The helper records `open`'s exit code in the marker. Empty is a helper
     // from a build that only touched it (the OLD build runs the restart).
-    match std::fs::read_to_string(&attempted) {
+    match read_restart_marker(&attempted) {
         Ok(rc) if !matches!(rc.trim(), "" | "0") => log::warn!(
             "restart: the previous update-restart's `open` failed (rc={}); the app \
              only came back when relaunched by hand (requested by {})",
@@ -194,7 +202,7 @@ pub fn report_unfinished_restart(base_dir: &Path) {
             note.trim()
         ),
         Ok(_) => log::info!("restart: relaunch completed (requested by {})", note.trim()),
-        Err(_) => {
+        Err(err) if err.kind() == ErrorKind::NotFound => {
             let text = crate::logging::recent_desktop_log(&crate::logging::log_path());
             log::warn!(
                 "restart: the previous update-restart never relaunched the app; \
@@ -203,9 +211,20 @@ pub fn report_unfinished_restart(base_dir: &Path) {
                 note.trim()
             )
         }
+        Err(err) => {
+            // An unreadable marker may still hold the result. Retry at the
+            // next launch instead of losing the evidence for this restart.
+            log::info!("restart: reading the attempted marker failed: {err}");
+            return;
+        }
     }
     let _ = std::fs::remove_file(&pending);
     let _ = std::fs::remove_file(&attempted);
+}
+
+fn read_restart_marker(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(crate::state::read_state_file(path)?)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.utf8_error()))
 }
 
 /// How far the last restart's helper got, read from the desktop log it writes
@@ -349,6 +368,25 @@ mod restart_marker_tests {
             !restart_attempted_path(base).exists(),
             "a stale attempted marker reads as success on the next failure"
         );
+    }
+
+    #[test]
+    fn unreadable_attempt_marker_keeps_the_restart_pending_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = restart_pending_path(dir.path());
+        let attempted = restart_attempted_path(dir.path());
+        let note = "0.9.64 at 2026-11-23T11:52:25+00:00";
+        std::fs::write(&pending, note).unwrap();
+        std::fs::create_dir(&attempted).unwrap();
+
+        report_unfinished_restart(dir.path());
+        assert_eq!(std::fs::read_to_string(&pending).unwrap(), note);
+
+        std::fs::remove_dir(&attempted).unwrap();
+        std::fs::write(&attempted, "0\n").unwrap();
+        report_unfinished_restart(dir.path());
+        assert!(!pending.exists());
+        assert!(!attempted.exists());
     }
 
     #[test]
