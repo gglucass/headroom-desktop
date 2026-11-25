@@ -4302,10 +4302,12 @@ impl ToolManager {
                     // (user 3319, Windows, 2026-11-18): Fast and Ultrafast felt
                     // no faster. Past the budget the rest of the request goes
                     // verbatim and that result is cached, so the prefix stays
-                    // byte-stable. Kill switch: HEADROOM_COMPRESSION_DEADLINE_MS=20000.
+                    // byte-stable. 750 over 1500 (2026-11-25 replay, 420 Claude
+                    // Code requests): stalls over 1s 17 -> 2, tokens saved -1.5%.
+                    // Kill switch: HEADROOM_COMPRESSION_DEADLINE_MS=20000.
                     .env(
                         "HEADROOM_COMPRESSION_DEADLINE_MS",
-                        user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "1500"),
+                        user_env_or("HEADROOM_COMPRESSION_DEADLINE_MS", "750"),
                     )
                     // Codex's tool list rides in an `additional_tools` input
                     // item. Compacting its schemas saved ~240-440 tokens per
