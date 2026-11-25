@@ -3470,6 +3470,42 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     })
 }
 
+/// `create_dir_all` whose error names what is in the way.
+fn create_dir_all_explained(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|err| {
+        let in_the_way = dir_in_the_way(dir);
+        anyhow::Error::new(err).context(format!("creating {}{in_the_way}", dir.display()))
+    })
+}
+
+/// Inspect the nearest existing ancestor after a directory creation fails.
+/// A file can yield EEXIST at the requested path or ENOTDIR below it.
+/// Name the obstructing entry without including a link's target path.
+fn dir_in_the_way(dir: &Path) -> String {
+    let Some((path, metadata)) = dir.ancestors().find_map(|path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (path, metadata))
+    }) else {
+        return String::new();
+    };
+    let what = if metadata.file_type().is_symlink() {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => return String::new(),
+            Ok(_) => "a link to a file".to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "a link to a missing folder".to_string()
+            }
+            Err(e) => format!("a link Headroom cannot follow: {e}"),
+        }
+    } else if metadata.is_dir() {
+        return String::new();
+    } else {
+        "a file, not a folder".to_string()
+    };
+    format!(" ({} is {what})", path.display())
+}
+
 fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
     // writers to the same file: A renames tmp->path, then B's rename finds its
@@ -3491,7 +3527,8 @@ fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 let note = crate::env_fault::failed(path, crate::env_fault::Op::Write, &err);
-                anyhow!("creating {}: {err}{note}", parent.display())
+                let in_the_way = dir_in_the_way(parent);
+                anyhow!("creating {}{in_the_way}: {err}{note}", parent.display())
             })?;
         }
     }
@@ -4258,8 +4295,7 @@ fn set_markitdown_bash_permission(
     }
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let _ = backup_if_exists(&settings_path)?;
     atomic_write(
@@ -4533,8 +4569,7 @@ fn configure_claude_settings_env_impl(
     }
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let backup = backup_if_exists(settings_path)?;
@@ -4766,8 +4801,7 @@ fn ensure_claude_settings_hook(
     }));
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let backup = backup_if_exists(&settings_path)?;
@@ -6001,8 +6035,7 @@ fn restore_codex_root_key(key: &str, value: &str) -> Result<()> {
     };
     let _ = backup_if_exists(&path)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     atomic_write(&path, rebuilt.as_bytes())?;
     Ok(())
@@ -6089,8 +6122,7 @@ fn recover_zeroed_codex_config(path: &Path, existing: &str) -> String {
 fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<CodexPreservedKey>)> {
     let path = codex_config_toml_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
@@ -6475,8 +6507,7 @@ fn grok_config_without_proxy_routes(mut config: toml::Table) -> Result<String> {
 fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let path = grok_config_toml_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
@@ -6819,8 +6850,7 @@ fn remove_opencode_provider_base_url(config: &mut serde_json::Value, provider: &
 
 fn write_opencode_config(path: &Path, config: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let mut payload = serde_json::to_string_pretty(config)
         .with_context(|| format!("serializing {}", path.display()))?;
@@ -6860,7 +6890,6 @@ fn legacy_opencode_plugin_path() -> PathBuf {
 /// Write (or refresh after an app update) the vendored plugin directory.
 fn ensure_opencode_plugin_dir() -> Result<PathBuf> {
     let dir = opencode_plugin_install_path();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     for (name, bytes) in OPENCODE_PLUGIN_FILES {
         let path = dir.join(name);
         if std::fs::read(&path).ok().as_deref() != Some(bytes) {
@@ -8017,8 +8046,7 @@ fn register_hook_entries(
 
     let backup = backup_if_exists(hooks_path)?;
     if let Some(parent) = hooks_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     atomic_write(
         hooks_path,
@@ -9121,8 +9149,7 @@ fn ensure_windows_remote_control_panel(wrapper: &Path) -> Result<(Vec<String>, V
     let mut changed = Vec::new();
     let mut backups = Vec::new();
     if let Some(parent) = wrapper.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     // The script first: the wrapper copy reads it at every start.
     let script = wrapper.with_extension("py");
@@ -9907,8 +9934,7 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
         }
     }
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     let _ = backup_if_exists(&settings_path)?;
     atomic_write(
@@ -10063,8 +10089,7 @@ fn upsert_managed_block(
     block_body: &str,
 ) -> Result<(bool, Option<PathBuf>)> {
     if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let existing = if file_path.exists() {
@@ -10140,8 +10165,7 @@ fn write_file_if_changed(
     #[cfg(not(unix))]
     let _ = executable; // only used for chmod on unix
     if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
 
     let existing = if file_path.exists() {
@@ -10543,13 +10567,14 @@ fn oss_plugin_hook_receipt_path() -> PathBuf {
     config_file(&app_data_dir(), "oss-plugin-hooks.json")
 }
 
-fn load_oss_plugin_hook_receipt() -> Vec<PathBuf> {
+fn load_oss_plugin_hook_receipt() -> Result<Vec<PathBuf>> {
     let path = oss_plugin_hook_receipt_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+    let bytes = match crate::state::read_state_file(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        other => other.with_context(|| format!("reading {}", path.display()))?,
     };
     match serde_json::from_slice(&bytes) {
-        Ok(paths) => paths,
+        Ok(paths) => Ok(paths),
         Err(err) => {
             // This file is the only record of which third-party hooks we
             // rewrote. Silently overwriting an unreadable one strands them
@@ -10558,8 +10583,8 @@ fn load_oss_plugin_hook_receipt() -> Vec<PathBuf> {
                 "oss plugin hook: unreadable receipt {}: {err}",
                 path.display()
             );
-            let _ = backup_if_exists(&path);
-            Vec::new()
+            backup_if_exists(&path)?;
+            Ok(Vec::new())
         }
     }
 }
@@ -10571,10 +10596,6 @@ fn save_oss_plugin_hook_receipt(paths: &[PathBuf]) -> Result<()> {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
         return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
     }
     atomic_write(&path, &serde_json::to_vec_pretty(paths)?)
 }
@@ -10636,7 +10657,9 @@ pub fn oss_plugin_hook_needs_absorbing() -> bool {
     if oss_absorb_disabled() {
         return false;
     }
-    let receipt = load_oss_plugin_hook_receipt();
+    let Ok(receipt) = load_oss_plugin_hook_receipt() else {
+        return false;
+    };
     if receipt.is_empty() {
         return false;
     }
@@ -10667,7 +10690,14 @@ fn absorb_oss_plugin_with_cli_on_path(cli_on_path: bool) -> bool {
 /// paths after plugin removal, so uninstall can still restore inactive caches.
 fn reconcile_oss_plugin_hooks(current_hooks: &[PathBuf], absorb: bool) -> (bool, Vec<String>) {
     let managed = OSS_PLUGIN_MANAGED_COMMAND;
-    let mut hooks = load_oss_plugin_hook_receipt();
+    let mut hooks = match load_oss_plugin_hook_receipt() {
+        Ok(hooks) => hooks,
+        Err(err) => {
+            log::warn!("oss plugin hook: loading receipt failed: {err:#}");
+            // During restoration, keep the data folder for a later cleanup retry.
+            return (!absorb, Vec::new());
+        }
+    };
     hooks.extend_from_slice(current_hooks);
     hooks = dedupe_paths(hooks);
 
@@ -11204,8 +11234,7 @@ fn set_json_setting_at(settings_path: &Path, path: &[&str], value: Value) -> Res
     }
     object.insert((*last).to_string(), value);
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_dir_all_explained(parent)?;
     }
     backup_if_exists(settings_path)?;
     atomic_write(
@@ -13900,6 +13929,99 @@ print(settings({"cwd": sys.argv[2]}) is None)
 
         assert!(remove_managed_block(&path, "managed_rtk").unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_create_error_names_what_is_in_the_way() {
+        let root = unique_temp_dir("headroom-dir-in-the-way");
+        fs::create_dir_all(&root).expect("create root");
+        let dangling = root.join(".claude");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).expect("dangling link");
+        let err = super::create_dir_all_explained(&dangling.join("hooks")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(".claude is a link to a missing folder)"),
+            "{message}"
+        );
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "io cause kept"
+        );
+
+        let file = root.join(".codex");
+        fs::write(&file, "").expect("plant file");
+        let message = format!("{:#}", super::create_dir_all_explained(&file).unwrap_err());
+        assert!(
+            message.contains(".codex is a file, not a folder)"),
+            "{message}"
+        );
+
+        let link_to_file = root.join(".config");
+        std::os::unix::fs::symlink(&file, &link_to_file).expect("link to file");
+        let err = super::create_dir_all_explained(&link_to_file.join("opencode")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(".config is a link to a file)"),
+            "{message}"
+        );
+        assert!(!message.contains(".codex"), "{message}");
+
+        let message = format!(
+            "{:#}",
+            super::atomic_write(&dangling.join("settings.json"), b"{}").unwrap_err()
+        );
+        assert!(
+            message.contains("is a link to a missing folder)"),
+            "{message}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_dir_create_error_names_a_file_blocking_an_ancestor() {
+        let root = tempfile::tempdir().expect("create root");
+        let file = root.path().join(".claude");
+        fs::write(&file, "").expect("plant file");
+        let hooks = file.join("hooks");
+        let expected = format!("({} is a file, not a folder)", file.display());
+
+        let message = super::create_dir_all_explained(&hooks)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&expected), "{message}");
+
+        let message = super::atomic_write(&hooks.join("headroom.sh"), b"")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&expected), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn denied_app_data_subfolder_creation_reports_a_machine_fault() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let app_dir = super::app_data_dir();
+        let receipt_path = super::oss_plugin_hook_receipt_path();
+        fs::remove_dir(receipt_path.parent().unwrap()).unwrap();
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let can_create = fs::create_dir(app_dir.join("probe")).is_ok();
+        let plugin = super::ensure_opencode_plugin_dir();
+        let receipt = super::save_oss_plugin_hook_receipt(&[home.path().join("hooks.json")]);
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if can_create {
+            eprintln!("skipped: file modes do not apply to this user");
+            return;
+        }
+
+        // A successful write clears the machine fault for subsequent tests.
+        super::ensure_opencode_plugin_dir().unwrap();
+        for err in [plugin.unwrap_err(), receipt.unwrap_err()] {
+            assert!(err.to_string().contains(crate::env_fault::NOTE), "{err:#}");
+        }
     }
 
     #[test]
@@ -23916,6 +24038,39 @@ sys.exit(3)
         assert!(super::app_data_dir().exists());
         assert!(super::oss_plugin_hook_receipt_path().exists());
         assert!(fs::read_to_string(hooks).unwrap().contains(&managed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_oss_hook_receipt_keeps_restoration_pending() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let hooks = seed_oss_plugin(home.path(), "headroom@headroom-marketplace");
+        assert!(super::absorb_oss_plugin_with_cli_on_path(false));
+        let receipt = super::oss_plugin_hook_receipt_path();
+        let saved = fs::read(&receipt).unwrap();
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o200)).unwrap();
+        if fs::read(&receipt).is_ok() {
+            eprintln!("skipped: file modes do not apply to this user");
+            return;
+        }
+
+        // An unregistered plugin cache is discoverable only through its receipt.
+        let (pending, changed) = super::reconcile_oss_plugin_hooks(&[], false);
+        assert!(
+            receipt.is_file(),
+            "the receipt was deleted after a failed read"
+        );
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&receipt).unwrap(), saved);
+        assert!(pending && changed.is_empty());
+
+        let (pending, changed) = super::reconcile_oss_plugin_hooks(&[], false);
+        assert!(!pending);
+        assert_eq!(changed, [hooks.display().to_string()]);
+        assert!(!receipt.exists());
     }
 
     #[test]

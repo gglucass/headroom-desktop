@@ -3594,8 +3594,11 @@ fn report_upstream_error(
     }
     // xAI's cli-chat-proxy answers an outdated Grok CLI 426 ("Your Grok CLI
     // version ... is outdated"), and the CLI shows that line itself; only
-    // `grok update` fixes it (RUST-WS).
-    if client == "grok-build" && status == 426 {
+    // `grok update` fixes it (RUST-WS). OpenCode Zen does the same for an
+    // opencode below its version floor (`UpgradeRequired`, RUST-MG).
+    if status == 426
+        && (client == "grok-build" || (client == "opencode" && is_outdated_opencode_error(&body)))
+    {
         return;
     }
     // 401 splits on the body, like the geo-block above: "Missing bearer" means
@@ -3766,6 +3769,13 @@ fn is_geo_blocked_anthropic_error(body: &[u8]) -> bool {
 /// whose top-level `type` is `RegionError` (RUST-TS, 4 hosts in 4 days).
 fn is_geo_blocked_opencode_error(body: &[u8]) -> bool {
     codex_error_class(body)[0] == "RegionError"
+}
+
+/// True when OpenCode Zen refused an opencode older than its version floor:
+/// a 426 whose top-level `type` is `UpgradeRequired`. Only updating opencode
+/// fixes it.
+fn is_outdated_opencode_error(body: &[u8]) -> bool {
+    error_body_json(body).is_some_and(|v| v["type"] == "UpgradeRequired")
 }
 
 /// True when a 413 is the backend refusing to forward after its own compression
@@ -5765,7 +5775,7 @@ mod tests {
         is_failed_request_status, is_geo_blocked_anthropic_error, is_geo_blocked_codex_error,
         is_geo_blocked_opencode_error, is_grok_inference_path, is_grok_request,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_missing_auth_error, is_openai_path, is_outdated_opencode_error, is_prompt_request_head,
         is_reportable_upstream_error, is_vscode_claude_ua, ollama_codex_direct_base, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         plugin_direct_url, probe_port, read_http_headers, request_has_header,
@@ -10435,6 +10445,66 @@ mod tests {
             br#"{"type":"FreeTierError","error":"m"}"#
         ));
         assert!(!is_geo_blocked_opencode_error(b""));
+    }
+
+    #[test]
+    fn outdated_opencode_error_is_zens_upgrade_type_only() {
+        // RUST-MG's body shape, `object{error,type}`.
+        assert!(is_outdated_opencode_error(
+            br#"{"type":"UpgradeRequired","error":"m"}"#
+        ));
+        assert!(!is_outdated_opencode_error(
+            br#"{"type":"FreeTierError","error":"m"}"#
+        ));
+        assert!(!is_outdated_opencode_error(
+            br#"{"error":{"type":"UpgradeRequired","message":"m"}}"#
+        ));
+        assert!(!is_outdated_opencode_error(b""));
+    }
+
+    #[test]
+    fn only_the_zen_version_refusal_is_excluded_from_upstream_reporting() {
+        #[derive(Default)]
+        struct Capture(Mutex<Vec<String>>);
+        impl sentry::Transport for Capture {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(message) = envelope.event().and_then(|event| event.message.clone()) {
+                    self.0.lock().push(message);
+                }
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let sentry_client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(capture.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(sentry_client)),
+            Arc::default(),
+        ));
+        let zen = br#"{"error":"m","type":"UpgradeRequired"}"#;
+        let other = br#"{"error":{"message":"m","type":"UpgradeRequired"}}"#;
+        let report = |status, path, body: &[u8]| {
+            let head = format!("HTTP/1.1 {status} Test response\r\n\r\n");
+            super::report_upstream_error("opencode", status, path, None, head.as_bytes(), body);
+        };
+        sentry::Hub::run(hub, || {
+            report(426, "/zen", zen);
+            report(426, "/other", other);
+            report(409, "/conflict", zen);
+        });
+        super::UPSTREAM_ERROR_LAST_REPORTED
+            .lock()
+            .retain(|((client, status), _)| *client != "opencode" || !matches!(status, 409 | 426));
+        assert_eq!(
+            *capture.0.lock(),
+            [
+                "opencode upstream error 426 on /other",
+                "opencode upstream error 409 on /conflict",
+            ]
+        );
     }
 
     #[test]

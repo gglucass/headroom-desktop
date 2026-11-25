@@ -11,8 +11,8 @@
 // so a logging failure can never crash the app.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use log::{Level, Log, Metadata, Record, SetLoggerError};
@@ -1071,8 +1071,53 @@ pub(crate) fn log_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("headroom-desktop.log"))
 }
 
+/// Recent desktop log text in chronological order, including one rotation.
+pub(crate) fn recent_desktop_log(path: &Path) -> String {
+    let mut text = Vec::new();
+    for path in [path.with_extension("log.old"), path.to_path_buf()] {
+        let _ = append_desktop_log_tail(&path, &mut text);
+        text.push(b'\n');
+    }
+    String::from_utf8_lossy(&text).into_owned()
+}
+
+fn append_desktop_log_tail(path: &Path, text: &mut Vec<u8>) -> std::io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(MAX_LOG_BYTES)))?;
+    file.take(MAX_LOG_BYTES).read_to_end(text)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_desktop_log_bounds_both_files_and_keeps_their_order() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("desktop.log");
+        for (path, tail) in [
+            (log.with_extension("log.old"), "parent announcement"),
+            (log.clone(), "helper start"),
+        ] {
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(b"expired prefix\n").unwrap();
+            file.seek(SeekFrom::Start(super::MAX_LOG_BYTES + 32))
+                .unwrap();
+            file.write_all(tail.as_bytes()).unwrap();
+        }
+
+        let text = super::recent_desktop_log(&log);
+        assert!(text.len() <= 2 * super::MAX_LOG_BYTES as usize + 2);
+        assert!(!text.contains("expired prefix"));
+        assert!(text.find("parent announcement\n").unwrap() < text.find("helper start\n").unwrap());
+    }
+
     #[test]
     fn os_failure_fingerprint_groups_localized_failures_together() {
         let f = super::os_failure_fingerprint;
