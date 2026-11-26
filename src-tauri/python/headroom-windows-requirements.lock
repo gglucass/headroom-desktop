@@ -38,6 +38,7 @@
 # (see the macOS lock).
 # 2026-11-14: opentelemetry 1.45.1 / 0.66b1 -> 1.45.2 / 0.66b2
 # (CVE-2026-126360 in opentelemetry-api).
+# 0.45.0: no pin change (see the macOS lock).
 #
 # Below: `sys_platform == "win32"` conditional deps excluded from this lock's
 # macOS-side resolution. `pip install --no-deps` skips dependency resolution

@@ -83,6 +83,9 @@
 #     upstream's v0.44.0 uv.lock; every other pin is unchanged, and the whole
 #     closure resolves wheels-only for arm64 and x86_64 (uv, macOS 14).
 #     litellm stays below the 1.96.2 floor, as at 0.38.0.
+#   - 0.45.0: no pin change. requires_dist only raises the opentelemetry-api
+#     floor to 1.45.2 (pinned since the 2026-11-14 top-up) and adds a `tray`
+#     extra (pillow, pystray) that `all` does not include.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
