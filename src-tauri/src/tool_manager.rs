@@ -4286,16 +4286,9 @@ impl ToolManager {
                     // proxy, as on 0.38.0 (sitecustomize vendor).
                     .env("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "1")
                     .env("HEADROOM_HTTP2", "false")
-                    // Disable the HTTP/1.1 keep-alive pool for the upstream
-                    // (proxy -> api.anthropic.com) client. Claude Code cancels
-                    // streaming requests constantly (ESC, aborted tool calls,
-                    // subagent cancellations), which can leave a pooled TLS
-                    // connection desynced; reusing it surfaces as
-                    // "SSLV3_ALERT_BAD_RECORD_MAC" on the next request. The
-                    // proxy's retry path does not catch SSL/RemoteProtocolError,
-                    // so the raw error leaks back to the client. Fresh
-                    // connection per request avoids reuse of a poisoned socket.
-                    .env("HEADROOM_MAX_KEEPALIVE", "0")
+                    // No HEADROOM_MAX_KEEPALIVE=0 since 0.45.0 (#4775, #4776):
+                    // upstream connections pool again (docs/wheel-bump.md).
+                    // Kill switch: put the env back.
                     // Kompress runs before the request leaves, so its time is
                     // the user's wait. The wheel's 20s per-request budget let
                     // it add seconds to every Codex request on a slow CPU
